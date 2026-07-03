@@ -90,6 +90,6 @@
   </g>
 
   <!-- honest footnote -->
-  <text x="36" y="668" font-size="10.5" fill="#94a3b8">One illustrative task. Median across the benchmark: ~3–4× fewer billed tokens and ~2× faster end-to-end (search context ~12×). Against an uncoached agent that</text>
-  <text x="36" y="682" font-size="10.5" fill="#94a3b8">reads freely (no discipline), the same r047 task took 33 tool calls and 45× the search context — grepplus's lead grows the less careful the agent is.</text>
+  <text x="36" y="668" font-size="10.5" fill="#94a3b8">One illustrative task. Median across the benchmark: ~3–4× fewer billed tokens and ~2× faster end-to-end. Against an uncoached agent that</text>
+  <text x="36" y="682" font-size="10.5" fill="#94a3b8">reads freely (no discipline), the same r047 task took 33 tool calls — 16× more model rounds than grepplus. Its lead grows the less careful the agent is.</text>
 </svg>
