@@ -1,0 +1,15 @@
+[package]
+name = "grepplus-resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "grepplus-rs import, call, and type resolution"
+
+[dependencies]
+grepplus-core = { path = "../core" }
+grepplus-parser = { path = "../parser" }
+grepplus-store = { path = "../store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }

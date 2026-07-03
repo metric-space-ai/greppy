@@ -1,0 +1,166 @@
+name: CI
+
+# Track C — CI + release-build battle/soak validation.
+#
+# Gates every push and pull request on:
+#   * cargo build  --workspace
+#   * cargo test   --workspace
+#   * cargo clippy --workspace --all-targets -- -D warnings
+#   * cargo fmt    --check        (informational; see note below)
+#   * a --release build + the black-box battle suite
+#     (bash bench/battle/run_battle.sh)
+#
+# The Rust toolchain is pinned by the repo's rust-toolchain.toml
+# (channel 1.95.0, components rustfmt + clippy); we do NOT override the
+# channel here so local and CI builds use the identical compiler.
+#
+# Note on `cargo fmt --check`: the working tree is not currently
+# rustfmt-clean and there is no rustfmt.toml in the repo. Formatting the
+# crates is a source-owning change outside this CI track, so the fmt
+# step is run as informational (continue-on-error) to surface drift
+# without failing unrelated PRs. Flip `continue-on-error` to false once
+# the tree is formatted to make it a hard gate.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: build / test / lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel + components; this action
+      # reads it and installs exactly that toolchain. No `toolchain:`
+      # override so the pin is the single source of truth.
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # The battle scripts shell out to sqlite3 (PRAGMA integrity_check,
+      # node/edge dumps). macOS runners ship it; Ubuntu needs the CLI.
+      - name: Install sqlite3 (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Informational only (see header note). Does not fail the job.
+      - name: cargo fmt --check (informational)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: cargo build --release --bins
+        run: cargo build --release --bins
+
+      # Black-box battle suite against the freshly built binaries. The
+      # default suite is fast; the long soak loop and the release
+      # invariant are opt-in via env (BATTLE_SOAK / BATTLE_RELEASE) so
+      # the per-push signal stays quick. We run the default suite here.
+      - name: battle suite (bench/battle/run_battle.sh)
+        env:
+          # Point the harness at the debug binaries we just built.
+          GREPPLUS_BIN: ${{ github.workspace }}/target/debug/grepplus
+          GREPPLUS_GREP_BIN: ${{ github.workspace }}/target/debug/grepplus-grep
+        run: bash bench/battle/run_battle.sh
+
+  # Heavier validation: the soak/stress loop + the release-build
+  # invariant. Runs only on pull_request and on the default branch to
+  # avoid spending the long runtime on every feature-branch push.
+  soak:
+    name: soak + release invariant (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-soak-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-soak-
+            ${{ runner.os }}-cargo-
+
+      - name: Install sqlite3 (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Build debug + release binaries
+        run: |
+          cargo build --bins
+          cargo build --release --bins
+
+      # BATTLE_RELEASE folds in a release-build invariant; BATTLE_SOAK
+      # appends the soak loop. We use a reduced iteration count so the
+      # job finishes in a few minutes while still soaking the loop.
+      - name: battle suite + soak + release invariant
+        env:
+          GREPPLUS_BIN: ${{ github.workspace }}/target/debug/grepplus
+          GREPPLUS_GREP_BIN: ${{ github.workspace }}/target/debug/grepplus-grep
+          BATTLE_SOAK: "1"
+          BATTLE_RELEASE: "1"
+          BATTLE_SOAK_ITERS: "100"
+          BATTLE_SOAK_FILES: "40"
+        run: bash bench/battle/run_battle.sh

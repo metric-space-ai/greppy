@@ -1,0 +1,2186 @@
+[
+  {
+    "id": "r001",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `allow_transparent` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: check_transparent. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/internals/check.rs",
+      "line": 455,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "allow_transparent",
+      "expect_members": [
+        "check_transparent"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r002",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `check_internal_tag_field_name_conflict` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: check. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/internals/check.rs",
+      "line": 300,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "check_internal_tag_field_name_conflict",
+      "expect_members": [
+        "check"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r003",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `deserialize_externally_tagged_newtype_variant` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: deserialize_externally_tagged_variant. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/de/enum_externally.rs",
+      "line": 177,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "deserialize_externally_tagged_newtype_variant",
+      "expect_members": [
+        "deserialize_externally_tagged_variant"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r004",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `deserialize_transparent` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: deserialize_body. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/de.rs",
+      "line": 383,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "deserialize_transparent",
+      "expect_members": [
+        "deserialize_body"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r005",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `get_lit_str` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 5 caller(s). Known callers include: parse_lit_into_expr_path, parse_lit_into_lifetimes, parse_lit_into_path, parse_lit_into_ty. Caller file evidence: serde_derive/src/internals/attr.rs. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/internals/attr.rs",
+      "line": 1411,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "get_lit_str",
+      "expect_members": [
+        "parse_lit_into_expr_path",
+        "parse_lit_into_lifetimes",
+        "parse_lit_into_path",
+        "parse_lit_into_ty"
+      ],
+      "file_evidence": [
+        "serde_derive/src/internals/attr.rs"
+      ],
+      "min_count": 5,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r006",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `is_primitive_path` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: is_primitive_type. Caller file evidence: serde_derive/src/internals/attr.rs. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/internals/attr.rs",
+      "line": 1702,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "is_primitive_path",
+      "expect_members": [
+        "is_primitive_type"
+      ],
+      "file_evidence": [
+        "serde_derive/src/internals/attr.rs"
+      ],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r007",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `pretend_fields_used` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: pretend_used. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/pretend.rs",
+      "line": 65,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "pretend_fields_used",
+      "expect_members": [
+        "pretend_used"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r008",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `serialize_externally_tagged_variant` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: serialize_variant. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/ser.rs",
+      "line": 502,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "serialize_externally_tagged_variant",
+      "expect_members": [
+        "serialize_variant"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r009",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `serialize_variant` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: serialize_enum. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/ser.rs",
+      "line": 421,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "serialize_variant",
+      "expect_members": [
+        "serialize_enum"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r010",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `with_self_bound` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: build_generics. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "serde_derive/src/bound.rs",
+      "line": 327,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "with_self_bound",
+      "expect_members": [
+        "build_generics"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r011",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `_called_with_wrong_args` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: find_app_by_string, find_best_app. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/cli.py",
+      "line": 94,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "_called_with_wrong_args",
+      "expect_members": [
+        "find_app_by_string",
+        "find_best_app"
+      ],
+      "file_evidence": [],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r012",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `FlaskGroup._load_plugin_commands` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: get_command, list_commands. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/cli.py",
+      "line": 600,
+      "owner_class": "FlaskGroup"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "_load_plugin_commands",
+      "expect_members": [
+        "get_command",
+        "list_commands"
+      ],
+      "file_evidence": [],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r013",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `add_ctx` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: __init_subclass__. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/app.py",
+      "line": 97,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "add_ctx",
+      "expect_members": [
+        "__init_subclass__"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r014",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `Flask.do_teardown_request` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: pop. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/app.py",
+      "line": 1420,
+      "owner_class": "Flask"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "do_teardown_request",
+      "expect_members": [
+        "pop"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r015",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `SessionInterface.get_cookie_partitioned` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: save_session. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/sessions.py",
+      "line": 215,
+      "owner_class": "SessionInterface"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "get_cookie_partitioned",
+      "expect_members": [
+        "save_session"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r016",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `Flask.handle_user_exception` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: full_dispatch_request. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/app.py",
+      "line": 865,
+      "owner_class": "Flask"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "handle_user_exception",
+      "expect_members": [
+        "full_dispatch_request"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r017",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `Flask.preprocess_request` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: full_dispatch_request. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "src/flask/app.py",
+      "line": 1366,
+      "owner_class": "Flask"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "preprocess_request",
+      "expect_members": [
+        "full_dispatch_request"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r018",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `MapClass.addBase` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: testInterfaceTypeMap, testInterfaceTypeMapWithSerializer. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/test/java/com/google/gson/functional/MapTest.java",
+      "line": 782,
+      "owner_class": "MapClass"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "addBase",
+      "expect_members": [
+        "testInterfaceTypeMap",
+        "testInterfaceTypeMapWithSerializer"
+      ],
+      "file_evidence": [],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r019",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `TypeAdapters.atomicLongAdapter` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: createFactories. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java",
+      "line": 306,
+      "owner_class": "TypeAdapters"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "atomicLongAdapter",
+      "expect_members": [
+        "createFactories"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r020",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ExposeAnnotationExclusionStrategyTest.createFieldAttributes` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 5 caller(s). Known callers include: testDifferentSerializeAndDeserializeField, testNeverSkipExplicitlyExposedAnnotatedFields, testNeverSkipExposedAnnotatedFields, testSkipExplicitlySkippedFields, testSkipNonAnnotatedFields. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/test/java/com/google/gson/ExposeAnnotationExclusionStrategyTest.java",
+      "line": 85,
+      "owner_class": "ExposeAnnotationExclusionStrategyTest"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "createFieldAttributes",
+      "expect_members": [
+        "testDifferentSerializeAndDeserializeField",
+        "testNeverSkipExplicitlyExposedAnnotatedFields",
+        "testNeverSkipExposedAnnotatedFields",
+        "testSkipExplicitlySkippedFields",
+        "testSkipNonAnnotatedFields"
+      ],
+      "file_evidence": [],
+      "min_count": 5,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r021",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `GsonBuilder.disableJdkUnsafe` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 3 caller(s). Known callers include: runTestNoJdkUnsafe, testDisableJdkUnsafe, testNoJdkUnsafe. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/GsonBuilder.java",
+      "line": 882,
+      "owner_class": "GsonBuilder"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "disableJdkUnsafe",
+      "expect_members": [
+        "runTestNoJdkUnsafe",
+        "testDisableJdkUnsafe",
+        "testNoJdkUnsafe"
+      ],
+      "file_evidence": [],
+      "min_count": 3,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r022",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ToNumberPolicyTest.fromStringLenient` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: testLongOrDouble. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/test/java/com/google/gson/ToNumberPolicyTest.java",
+      "line": 174,
+      "owner_class": "ToNumberPolicyTest"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "fromStringLenient",
+      "expect_members": [
+        "testLongOrDouble"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r023",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `FieldAttributes.getDeclaredType` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: testDeclaredTypeAndClass. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/FieldAttributes.java",
+      "line": 84,
+      "owner_class": "FieldAttributes"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "getDeclaredType",
+      "expect_members": [
+        "testDeclaredTypeAndClass"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r024",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `JavaVersion.getMajorJavaVersion` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: testGetMajorJavaVersion. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/JavaVersion.java",
+      "line": 82,
+      "owner_class": "JavaVersion"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "getMajorJavaVersion",
+      "expect_members": [
+        "testGetMajorJavaVersion"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r025",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `PreJava9DateFormatProvider.getUsDateTimeFormat` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: DefaultDateTypeAdapter. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/PreJava9DateFormatProvider.java",
+      "line": 30,
+      "owner_class": "PreJava9DateFormatProvider"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "getUsDateTimeFormat",
+      "expect_members": [
+        "DefaultDateTypeAdapter"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r026",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `JsonPrimitive.isBoolean` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 7 caller(s). Known callers include: getAsBoolean, getAsString, peek, testBoolean, testParsingStringAsBoolean, write. Caller file evidence: gson/src/main/java/com/google/gson/internal/bind/MapTypeAdapterFactory.java. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/JsonPrimitive.java",
+      "line": 103,
+      "owner_class": "JsonPrimitive"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "isBoolean",
+      "expect_members": [
+        "getAsBoolean",
+        "getAsString",
+        "peek",
+        "testBoolean",
+        "testParsingStringAsBoolean",
+        "write"
+      ],
+      "file_evidence": [
+        "gson/src/main/java/com/google/gson/internal/bind/MapTypeAdapterFactory.java"
+      ],
+      "min_count": 7,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r027",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `JsonReader.isLiteral` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 3 caller(s). Known callers include: doPeek, peekKeyword, peekNumber. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/stream/JsonReader.java",
+      "line": 894,
+      "owner_class": "JsonReader"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "isLiteral",
+      "expect_members": [
+        "doPeek",
+        "peekKeyword",
+        "peekNumber"
+      ],
+      "file_evidence": [],
+      "min_count": 3,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r028",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `JavaTimeTypeAdapters.localDateTime` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 3 caller(s). Known callers include: offsetDateTime, zonedDateTime. Caller file evidence: gson/src/main/java/com/google/gson/internal/bind/JavaTimeTypeAdapters.java. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/bind/JavaTimeTypeAdapters.java",
+      "line": 113,
+      "owner_class": "JavaTimeTypeAdapters"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "localDateTime",
+      "expect_members": [
+        "offsetDateTime",
+        "zonedDateTime"
+      ],
+      "file_evidence": [
+        "gson/src/main/java/com/google/gson/internal/bind/JavaTimeTypeAdapters.java"
+      ],
+      "min_count": 3,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r029",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ConstructorConstructor.newSpecialCollectionConstructor` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: get. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/ConstructorConstructor.java",
+      "line": 177,
+      "owner_class": "ConstructorConstructor"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "newSpecialCollectionConstructor",
+      "expect_members": [
+        "get"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r030",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `JsonReader.peekNumber` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: doPeek. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/stream/JsonReader.java",
+      "line": 782,
+      "owner_class": "JsonReader"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "peekNumber",
+      "expect_members": [
+        "doPeek"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r031",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ClassWithSubInterfacesOfCollection.setContains` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: testSubInterfacesOfCollectionDeserialization. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/test/java/com/google/gson/functional/InheritanceTest.java",
+      "line": 244,
+      "owner_class": "ClassWithSubInterfacesOfCollection"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "setContains",
+      "expect_members": [
+        "testSubInterfacesOfCollectionDeserialization"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r032",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `JsonWriter.setSerializeNulls` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 4 caller(s). Known callers include: newJsonWriter, testSerializeNullsFalse, testSerializeNullsTrue, toJson. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/stream/JsonWriter.java",
+      "line": 386,
+      "owner_class": "JsonWriter"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "setSerializeNulls",
+      "expect_members": [
+        "newJsonWriter",
+        "testSerializeNullsFalse",
+        "testSerializeNullsTrue",
+        "toJson"
+      ],
+      "file_evidence": [],
+      "min_count": 4,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r033",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ReflectionHelper.tryMakeAccessible` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: newDefaultConstructor. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/reflect/ReflectionHelper.java",
+      "line": 166,
+      "owner_class": "ReflectionHelper"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "tryMakeAccessible",
+      "expect_members": [
+        "newDefaultConstructor"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r034",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `DIRTY` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: _parse. Caller file evidence: packages/zod/src/v3/types.ts. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/zod/src/v3/helpers/parseUtil.ts",
+      "line": 163,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "DIRTY",
+      "expect_members": [
+        "_parse"
+      ],
+      "file_evidence": [
+        "packages/zod/src/v3/types.ts"
+      ],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r035",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ZodType._processInputParams` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 17 caller(s). Known callers include: _parse. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/zod/src/v3/types.ts",
+      "line": 191,
+      "owner_class": "ZodType"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "_processInputParams",
+      "expect_members": [
+        "_parse"
+      ],
+      "file_evidence": [],
+      "min_count": 17,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r036",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `finalize` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 4 caller(s). Known callers include: createStandardJSONSchemaMethod, createToJSONSchemaMethod, emit, toJSONSchema. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/zod/src/v4/core/to-json-schema.ts",
+      "line": 359,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "finalize",
+      "expect_members": [
+        "createStandardJSONSchemaMethod",
+        "createToJSONSchemaMethod",
+        "emit",
+        "toJSONSchema"
+      ],
+      "file_evidence": [],
+      "min_count": 4,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r037",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `getUnitTypeFromNumber` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: error. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/zod/src/v4/locales/lt.ts",
+      "line": 12,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "getUnitTypeFromNumber",
+      "expect_members": [
+        "error"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r038",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `isValid` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 5 caller(s). Known callers include: \"~validate\", _parse, handleResult. Caller file evidence: packages/zod/src/v3/tests/parseUtil.test.ts, packages/zod/src/v3/types.ts. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/zod/src/v3/helpers/parseUtil.ts",
+      "line": 174,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "isValid",
+      "expect_members": [
+        "\"~validate\"",
+        "_parse",
+        "handleResult"
+      ],
+      "file_evidence": [
+        "packages/zod/src/v3/tests/parseUtil.test.ts",
+        "packages/zod/src/v3/types.ts"
+      ],
+      "min_count": 5,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r039",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the method `ParseStatus.mergeObjectAsync` in this repository? List the calling functions or methods, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: _parse. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/zod/src/v3/helpers/parseUtil.ts",
+      "line": 112,
+      "owner_class": "ParseStatus"
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "mergeObjectAsync",
+      "expect_members": [
+        "_parse"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r040",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "graph_discovery",
+    "q": "Who calls the function `stripMdxComments` in this repository? List the calling functions, and give the total number of callers you find.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: extractTabsBlocks. An agent finding MORE true callers than the floor must pass.",
+    "target": {
+      "file": "packages/docs/content/api.test.ts",
+      "line": 100,
+      "owner_class": null
+    },
+    "check": {
+      "kind": "who_calls",
+      "symbol": "stripMdxComments",
+      "expect_members": [
+        "extractTabsBlocks"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r041",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which routine converts a struct member's identifier into the spelling used on the wire? Name the function or method and the file that implements it.",
+    "ground_truth": "apply_to_field in serde_derive/src/internals/case.rs (line 82).",
+    "target": {
+      "file": "serde_derive/src/internals/case.rs",
+      "line": 82,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "apply_to_field",
+      "expect_file": "serde_derive/src/internals/case.rs",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r042",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which function works out whether deserialized values may point straight into the original text rather than owning their own copies? Name the function or method and the file that implements it.",
+    "ground_truth": "borrowable_lifetimes in serde_derive/src/internals/attr.rs (line 1716).",
+    "target": {
+      "file": "serde_derive/src/internals/attr.rs",
+      "line": 1716,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "borrowable_lifetimes",
+      "expect_file": "serde_derive/src/internals/attr.rs",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r043",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where do the derive macros stash the problems found while checking attributes so all of them can be reported at the end? Name the function or method and the file that implements it.",
+    "ground_truth": "error_spanned_by in serde_derive/src/internals/ctxt.rs (line 31).",
+    "target": {
+      "file": "serde_derive/src/internals/ctxt.rs",
+      "line": 31,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "error_spanned_by",
+      "expect_file": "serde_derive/src/internals/ctxt.rs",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r044",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where does the derive rewrite mentions of `Self` inside a remote type definition into the concrete named target? Name the function or method and the file that implements it.",
+    "ground_truth": "replace_receiver in serde_derive/src/internals/receiver.rs (line 10).",
+    "target": {
+      "file": "serde_derive/src/internals/receiver.rs",
+      "line": 10,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "replace_receiver",
+      "expect_file": "serde_derive/src/internals/receiver.rs",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r045",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where does the derive widen the trait obligations of the emitted impl so every touched type variable satisfies them? Name the function or method and the file that implements it.",
+    "ground_truth": "with_bound in serde_derive/src/bound.rs (line 98).",
+    "target": {
+      "file": "serde_derive/src/bound.rs",
+      "line": 98,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "with_bound",
+      "expect_file": "serde_derive/src/bound.rs",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r046",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "When a request raises a failure, which method checks blueprint scope and then the project-wide table to pick the function meant to deal with it? Name the function or method and the file that implements it.",
+    "ground_truth": "_find_error_handler in src/flask/sansio/app.py (line 868).",
+    "target": {
+      "file": "src/flask/sansio/app.py",
+      "line": 868,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "_find_error_handler",
+      "expect_file": "src/flask/sansio/app.py",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r047",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which routine expands a dotted nesting name into all of its ancestor prefixes? Name the function or method and the file that implements it.",
+    "ground_truth": "_split_blueprint_path in src/flask/helpers.py (line 645).",
+    "target": {
+      "file": "src/flask/helpers.py",
+      "line": 645,
+      "edge_type": "USAGE"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "_split_blueprint_path",
+      "expect_file": "src/flask/helpers.py",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r048",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which method computes where the per-deployment folder should sit next to the package when the user did not supply one? Name the function or method and the file that implements it.",
+    "ground_truth": "auto_find_instance_path in src/flask/sansio/app.py (line 507).",
+    "target": {
+      "file": "src/flask/sansio/app.py",
+      "line": 507,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "auto_find_instance_path",
+      "expect_file": "src/flask/sansio/app.py",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r049",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which helper composes the human-readable rundown of every place the renderer looked for a page source that turned out to be missing? Name the function or method and the file that implements it.",
+    "ground_truth": "explain_template_loading_attempts in src/flask/debughelpers.py (line 124).",
+    "target": {
+      "file": "src/flask/debughelpers.py",
+      "line": 124,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "explain_template_loading_attempts",
+      "expect_file": "src/flask/debughelpers.py",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r050",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which factory builds the object that cryptographically protects the data kept in the user's browser between requests? Name the function or method and the file that implements it.",
+    "ground_truth": "get_signing_serializer in src/flask/sessions.py (line 303).",
+    "target": {
+      "file": "src/flask/sessions.py",
+      "line": 303,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "get_signing_serializer",
+      "expect_file": "src/flask/sessions.py",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r051",
+    "repo": "flask",
+    "lang": "python",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which check climbs the record-emitter hierarchy to see if anything will actually write out entries of the given severity? Name the function or method and the file that implements it.",
+    "ground_truth": "has_level_handler in src/flask/logging.py (line 31).",
+    "target": {
+      "file": "src/flask/logging.py",
+      "line": 31,
+      "edge_type": "USAGE"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "has_level_handler",
+      "expect_file": "src/flask/logging.py",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r052",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where is the initial sizing figure computed so a lookup container can hold an expected number of entries without resizing? Name the function or method and the file that implements it.",
+    "ground_truth": "calculateHashMapCapacity in gson/src/main/java/com/google/gson/internal/bind/EnumTypeAdapter.java (line 56).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/bind/EnumTypeAdapter.java",
+      "line": 56,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "calculateHashMapCapacity",
+      "expect_file": "gson/src/main/java/com/google/gson/internal/bind/EnumTypeAdapter.java",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r053",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which utility rewrites a reflective description into an equivalent normal form so two descriptions of the same construct compare as identical? Name the function or method and the file that implements it.",
+    "ground_truth": "canonicalize in gson/src/main/java/com/google/gson/internal/GsonTypes.java (line 104).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/GsonTypes.java",
+      "line": 104,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "canonicalize",
+      "expect_file": "gson/src/main/java/com/google/gson/internal/GsonTypes.java",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r054",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which method builds the clock portion of the locale-dependent display style used on legacy runtimes? Name the function or method and the file that implements it.",
+    "ground_truth": "getTimePartOfDateTimePattern in gson/src/main/java/com/google/gson/internal/PreJava9DateFormatProvider.java (line 51).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/PreJava9DateFormatProvider.java",
+      "line": 51,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "getTimePartOfDateTimePattern",
+      "expect_file": "gson/src/main/java/com/google/gson/internal/PreJava9DateFormatProvider.java",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r055",
+    "repo": "gson",
+    "lang": "java",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which predicate reports whether a class is one of the boxed counterparts of the built-in scalar kinds? Name the function or method and the file that implements it.",
+    "ground_truth": "isWrapperType in gson/src/main/java/com/google/gson/internal/Primitives.java (line 41).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/Primitives.java",
+      "line": 41,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "isWrapperType",
+      "expect_file": "gson/src/main/java/com/google/gson/internal/Primitives.java",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r056",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where do validation failures get recorded onto the shared state while a schema evaluates its input? Name the function or method and the file that implements it.",
+    "ground_truth": "addIssueToContext in packages/zod/src/v3/helpers/parseUtil.ts (line 72).",
+    "target": {
+      "file": "packages/zod/src/v3/helpers/parseUtil.ts",
+      "line": 72,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "addIssueToContext",
+      "expect_file": "packages/zod/src/v3/helpers/parseUtil.ts",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r057",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which tiny utility upper-cases the leading letter of a phrase in one of the Baltic language packs? Name the function or method and the file that implements it.",
+    "ground_truth": "capitalizeFirstCharacter in packages/zod/src/v4/locales/lt.ts (line 5).",
+    "target": {
+      "file": "packages/zod/src/v4/locales/lt.ts",
+      "line": 5,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "capitalizeFirstCharacter",
+      "expect_file": "packages/zod/src/v4/locales/lt.ts",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r058",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where does the internal source generator assemble its accumulated body into a callable it can hand back? Name the function or method and the file that implements it.",
+    "ground_truth": "compile in packages/zod/src/v4/core/doc.ts (line 36).",
+    "target": {
+      "file": "packages/zod/src/v4/core/doc.ts",
+      "line": 36,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "compile",
+      "expect_file": "packages/zod/src/v4/core/doc.ts",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r059",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Where does the documentation site retrieve the repository's GitHub popularity figure for display? Name the function or method and the file that implements it.",
+    "ground_truth": "fetchStars in packages/docs/loaders/stars.ts (line 4).",
+    "target": {
+      "file": "packages/docs/loaders/stars.ts",
+      "line": 4,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "fetchStars",
+      "expect_file": "packages/docs/loaders/stars.ts",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r060",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "locate",
+    "class": "fuzzy_discovery",
+    "q": "Which helper picks the correct noun form for a count in the Slavic locale that distinguishes three grammatical variants? Name the function or method and the file that implements it.",
+    "ground_truth": "getRussianPlural in packages/zod/src/v4/locales/ru.ts (line 5).",
+    "target": {
+      "file": "packages/zod/src/v4/locales/ru.ts",
+      "line": 5,
+      "edge_type": "CALLS"
+    },
+    "check": {
+      "kind": "search_symbols",
+      "query": "getRussianPlural",
+      "expect_file": "packages/zod/src/v4/locales/ru.ts",
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r061",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `assert_de_tokens_ignore` (defined in test_suite/tests/test_de.rs) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: test, test_osstring. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.0169 < 0.3).",
+    "target": {
+      "file": "test_suite/tests/test_de.rs",
+      "line": 188
+    },
+    "multihop_gate": {
+      "reach1": 2,
+      "reach_total": 118,
+      "ratio": 0.0169,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "assert_de_tokens_ignore",
+      "direction": "incoming",
+      "expect_members": [
+        "test",
+        "test_osstring"
+      ],
+      "file_evidence": [],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r062",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Trace how `pretend_used` ultimately reaches `pretend_fields_used_struct_packed` through the call graph in this repository. Give the chain of calls in order from `pretend_used` to `pretend_fields_used_struct_packed`.",
+    "ground_truth": "pretend_used -> pretend_fields_used -> pretend_fields_used_struct_packed is one witnessed chain (oracle floor; other chains may exist).",
+    "target": {
+      "file": "serde_derive/src/pretend.rs",
+      "line": 94
+    },
+    "multihop_gate": {
+      "reach1": 1,
+      "reach_total": 6,
+      "ratio": 0.1667,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "path",
+      "frm": "pretend_used",
+      "to": "pretend_fields_used_struct_packed",
+      "via": [
+        "pretend_fields_used"
+      ],
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r063",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `serialize_struct_variant_with_flatten` (defined in serde_derive/src/ser.rs) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: serialize_struct_variant. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.1 < 0.3).",
+    "target": {
+      "file": "serde_derive/src/ser.rs",
+      "line": 968
+    },
+    "multihop_gate": {
+      "reach1": 1,
+      "reach_total": 10,
+      "ratio": 0.1,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "serialize_struct_variant_with_flatten",
+      "direction": "incoming",
+      "expect_members": [
+        "serialize_struct_variant"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r064",
+    "repo": "serde",
+    "lang": "rust",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Trace how `serialize_variant` ultimately reaches `with_lifetime_bound` through the call graph in this repository. Give the chain of calls in order from `serialize_variant` to `with_lifetime_bound`.",
+    "ground_truth": "serialize_variant -> serialize_adjacently_tagged_variant -> with_lifetime_bound is one witnessed chain (oracle floor; other chains may exist).",
+    "target": {
+      "file": "serde_derive/src/bound.rs",
+      "line": 354
+    },
+    "multihop_gate": {
+      "reach1": 3,
+      "reach_total": 22,
+      "ratio": 0.1364,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "path",
+      "frm": "serialize_variant",
+      "to": "with_lifetime_bound",
+      "via": [
+        "serialize_adjacently_tagged_variant"
+      ],
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r065",
+    "repo": "flask",
+    "lang": "python",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Trace how `open` ultimately reaches `_copy_environ` through the call graph in this repository. Give the chain of calls in order from `open` to `_copy_environ`.",
+    "ground_truth": "open -> _request_from_builder_args -> _copy_environ is one witnessed chain (oracle floor; other chains may exist).",
+    "target": {
+      "file": "src/flask/testing.py",
+      "line": 185
+    },
+    "multihop_gate": {
+      "reach1": 2,
+      "reach_total": 35,
+      "ratio": 0.0571,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "path",
+      "frm": "open",
+      "to": "_copy_environ",
+      "via": [
+        "_request_from_builder_args"
+      ],
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r066",
+    "repo": "flask",
+    "lang": "python",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `_request_from_builder_args` (defined in src/flask/testing.py) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: open. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.0294 < 0.3).",
+    "target": {
+      "file": "src/flask/testing.py",
+      "line": 193
+    },
+    "multihop_gate": {
+      "reach1": 1,
+      "reach_total": 34,
+      "ratio": 0.0294,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "_request_from_builder_args",
+      "direction": "incoming",
+      "expect_members": [
+        "open"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r067",
+    "repo": "flask",
+    "lang": "python",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `make_default_options_response` (defined in src/flask/app.py) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: dispatch_request. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.25 < 0.3).",
+    "target": {
+      "file": "src/flask/app.py",
+      "line": 1053
+    },
+    "multihop_gate": {
+      "reach1": 1,
+      "reach_total": 4,
+      "ratio": 0.25,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "make_default_options_response",
+      "direction": "incoming",
+      "expect_members": [
+        "dispatch_request"
+      ],
+      "file_evidence": [],
+      "min_count": 1,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r068",
+    "repo": "gson",
+    "lang": "java",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Trace how `Gson` ultimately reaches `atomicLongArrayAdapter` through the call graph in this repository. Give the chain of calls in order from `Gson` to `atomicLongArrayAdapter`.",
+    "ground_truth": "Gson -> createFactories -> atomicLongArrayAdapter is one witnessed chain (oracle floor; other chains may exist).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java",
+      "line": 372
+    },
+    "multihop_gate": {
+      "reach1": 1,
+      "reach_total": 163,
+      "ratio": 0.0061,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "path",
+      "frm": "Gson",
+      "to": "atomicLongArrayAdapter",
+      "via": [
+        "createFactories"
+      ],
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r069",
+    "repo": "gson",
+    "lang": "java",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Trace how `assertExcludesField` ultimately reaches `excludeClass` through the call graph in this repository. Give the chain of calls in order from `assertExcludesField` to `excludeClass`.",
+    "ground_truth": "assertExcludesField -> excludeField -> excludeClass is one witnessed chain (oracle floor; other chains may exist).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/internal/Excluder.java",
+      "line": 197
+    },
+    "multihop_gate": {
+      "reach1": 7,
+      "reach_total": 29,
+      "ratio": 0.2414,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "path",
+      "frm": "assertExcludesField",
+      "to": "excludeClass",
+      "via": [
+        "excludeField"
+      ],
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r070",
+    "repo": "gson",
+    "lang": "java",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `getNewline` (defined in gson/src/main/java/com/google/gson/FormattingStyle.java) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 3 caller(s). Known callers include: newline, setFormattingStyle, testSetGetFormattingStyle. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.0337 < 0.3).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/FormattingStyle.java",
+      "line": 134
+    },
+    "multihop_gate": {
+      "reach1": 3,
+      "reach_total": 89,
+      "ratio": 0.0337,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "getNewline",
+      "direction": "incoming",
+      "expect_members": [
+        "newline",
+        "setFormattingStyle",
+        "testSetGetFormattingStyle"
+      ],
+      "file_evidence": [],
+      "min_count": 3,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r071",
+    "repo": "gson",
+    "lang": "java",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `isString` (defined in gson/src/main/java/com/google/gson/JsonPrimitive.java) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 5 caller(s). Known callers include: peek, testDefaultLongSerialization, testStringLongSerialization, testStringsAndChar. Caller file evidence: gson/src/main/java/com/google/gson/internal/bind/MapTypeAdapterFactory.java. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.2083 < 0.3).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/JsonPrimitive.java",
+      "line": 153
+    },
+    "multihop_gate": {
+      "reach1": 5,
+      "reach_total": 24,
+      "ratio": 0.2083,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "isString",
+      "direction": "incoming",
+      "expect_members": [
+        "peek",
+        "testDefaultLongSerialization",
+        "testStringLongSerialization",
+        "testStringsAndChar"
+      ],
+      "file_evidence": [
+        "gson/src/main/java/com/google/gson/internal/bind/MapTypeAdapterFactory.java"
+      ],
+      "min_count": 5,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r072",
+    "repo": "gson",
+    "lang": "java",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `nextNonWhitespace` (defined in gson/src/main/java/com/google/gson/stream/JsonReader.java) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: consumeNonExecutePrefix, doPeek. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.1111 < 0.3).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/stream/JsonReader.java",
+      "line": 1546
+    },
+    "multihop_gate": {
+      "reach1": 2,
+      "reach_total": 18,
+      "ratio": 0.1111,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "nextNonWhitespace",
+      "direction": "incoming",
+      "expect_members": [
+        "consumeNonExecutePrefix",
+        "doPeek"
+      ],
+      "file_evidence": [],
+      "min_count": 2,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r073",
+    "repo": "gson",
+    "lang": "java",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `setVersion` (defined in gson/src/main/java/com/google/gson/GsonBuilder.java) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 3 caller(s). Known callers include: gsonWithVersion, testSetVersionInvalid, testVersionAnnotations. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.2143 < 0.3).",
+    "target": {
+      "file": "gson/src/main/java/com/google/gson/GsonBuilder.java",
+      "line": 203
+    },
+    "multihop_gate": {
+      "reach1": 3,
+      "reach_total": 14,
+      "ratio": 0.2143,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "setVersion",
+      "direction": "incoming",
+      "expect_members": [
+        "gsonWithVersion",
+        "testSetVersionInvalid",
+        "testVersionAnnotations"
+      ],
+      "file_evidence": [],
+      "min_count": 3,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r074",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `_parseSync` (defined in packages/zod/src/v3/types.ts) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 8 caller(s). Known callers include: \"~validate\", _parse, safeParse. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.0609 < 0.3).",
+    "target": {
+      "file": "packages/zod/src/v3/types.ts",
+      "line": 210
+    },
+    "multihop_gate": {
+      "reach1": 7,
+      "reach_total": 115,
+      "ratio": 0.0609,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "_parseSync",
+      "direction": "incoming",
+      "expect_members": [
+        "\"~validate\"",
+        "_parse",
+        "safeParse"
+      ],
+      "file_evidence": [],
+      "min_count": 8,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r075",
+    "repo": "zod",
+    "lang": "ts",
+    "type": "research",
+    "class": "research_multihop",
+    "q": "Suppose the behavior of `initializeContext` (defined in packages/zod/src/v4/core/to-json-schema.ts) changes. What is the blast radius through the call graph -- which functions depend on it, directly or transitively? List the affected callers.",
+    "ground_truth": "Oracle floor: at least 4 caller(s). Known callers include: constructor, createStandardJSONSchemaMethod, createToJSONSchemaMethod, toJSONSchema. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.0968 < 0.3).",
+    "target": {
+      "file": "packages/zod/src/v4/core/to-json-schema.ts",
+      "line": 118
+    },
+    "multihop_gate": {
+      "reach1": 3,
+      "reach_total": 31,
+      "ratio": 0.0968,
+      "max_ratio": 0.3,
+      "measured_by": "grepplus impact --depth 1 vs --depth 12 (isolated store)"
+    },
+    "check": {
+      "kind": "impact",
+      "symbol": "initializeContext",
+      "direction": "incoming",
+      "expect_members": [
+        "constructor",
+        "createStandardJSONSchemaMethod",
+        "createToJSONSchemaMethod",
+        "toJSONSchema"
+      ],
+      "file_evidence": [],
+      "min_count": 4,
+      "semantics": "floor"
+    }
+  },
+  {
+    "id": "r076",
+    "class": "literal_control",
+    "source_id": "t005",
+    "repo": "rust_medium",
+    "lang": "rust",
+    "type": "locate",
+    "q": "Find the definition site of clamp_value.",
+    "ground_truth": "clamp_value is defined in src/core/clampval.rs.",
+    "check": {
+      "kind": "search_symbols",
+      "query": "clamp_value",
+      "expect_file": "clampval.rs"
+    }
+  },
+  {
+    "id": "r077",
+    "class": "literal_control",
+    "source_id": "t017",
+    "repo": "python_large",
+    "lang": "python",
+    "type": "locate",
+    "q": "Find the definition of validate_amount.",
+    "ground_truth": "validate_amount is defined in app/core/validate.py.",
+    "check": {
+      "kind": "search_symbols",
+      "query": "validate_amount",
+      "expect_file": "validate.py"
+    }
+  },
+  {
+    "id": "r078",
+    "class": "literal_control",
+    "source_id": "t018",
+    "repo": "python_large",
+    "lang": "python",
+    "type": "locate",
+    "q": "Where is a major-to-minor currency conversion (amount * 100) implemented? Return the code.",
+    "ground_truth": "In to_minor_units in app/core/money.py (int(round(amount * 100))).",
+    "check": {
+      "kind": "search_code",
+      "query": "to_minor_units",
+      "expect_file": "money.py"
+    }
+  },
+  {
+    "id": "r079",
+    "class": "literal_control",
+    "source_id": "t029",
+    "repo": "go_small",
+    "lang": "go",
+    "type": "locate",
+    "q": "Find the definition of ClampInt and return the clamping code.",
+    "ground_truth": "ClampInt is defined in core/clamp.go.",
+    "check": {
+      "kind": "search_code",
+      "query": "ClampInt",
+      "expect_file": "clamp.go"
+    }
+  },
+  {
+    "id": "r080",
+    "class": "literal_control",
+    "source_id": "t038",
+    "repo": "java_medium",
+    "lang": "java",
+    "type": "locate",
+    "q": "Find the definition of clampValue and return the clamping code.",
+    "ground_truth": "clampValue is defined in src/main/java/corpus/core/Clamp.java.",
+    "check": {
+      "kind": "search_code",
+      "query": "clampValue",
+      "expect_file": "Clamp.java"
+    }
+  },
+  {
+    "id": "r081",
+    "class": "literal_control",
+    "source_id": "t057",
+    "repo": "ts_large",
+    "lang": "typescript",
+    "type": "locate",
+    "q": "Find the definition of processSvc100. Return its code.",
+    "ground_truth": "processSvc100 is defined in src/service/svc100.ts.",
+    "check": {
+      "kind": "search_code",
+      "query": "processSvc100",
+      "expect_file": "svc100.ts"
+    }
+  },
+  {
+    "id": "r082",
+    "class": "literal_control",
+    "source_id": "t060",
+    "repo": "ts_large",
+    "lang": "typescript",
+    "type": "research",
+    "q": "What would break if roundMinor changed? Identify its in-file caller.",
+    "ground_truth": "toMinorUnits depends on roundMinor (src/core/money.ts).",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "roundMinor",
+      "expect_members": [
+        "toMinorUnits"
+      ],
+      "min_count": 1
+    }
+  },
+  {
+    "id": "r083",
+    "class": "literal_control",
+    "source_id": "t090",
+    "repo": "rust_medium",
+    "lang": "rust",
+    "type": "locate",
+    "q": "Show the code that merges two checksums.",
+    "ground_truth": "merge_checksums in src/core/checksum.rs.",
+    "check": {
+      "kind": "search_code",
+      "query": "merge_checksums",
+      "expect_file": "checksum.rs"
+    }
+  },
+  {
+    "id": "r084",
+    "class": "literal_control",
+    "source_id": "t091",
+    "repo": "python_large",
+    "lang": "python",
+    "type": "locate",
+    "q": "Show the code that posts a ledger entry.",
+    "ground_truth": "post_entry in app/core/ledger.py.",
+    "check": {
+      "kind": "search_code",
+      "query": "post_entry",
+      "expect_file": "ledger.py"
+    }
+  },
+  {
+    "id": "r085",
+    "class": "graph_control_synth",
+    "source_id": "t001",
+    "repo": "rust_medium",
+    "lang": "rust",
+    "type": "locate",
+    "q": "Who calls the function compute_checksum? List the calling functions.",
+    "ground_truth": "compute_checksum is called by merge_checksums, by normalize_record, and by every process_svcNN service function (74 call sites total).",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "compute_checksum",
+      "expect_members": [
+        "normalize_record",
+        "merge_checksums",
+        "process_svc00"
+      ],
+      "min_count": 70
+    }
+  },
+  {
+    "id": "r086",
+    "class": "graph_control_synth",
+    "source_id": "t010",
+    "repo": "rust_medium",
+    "lang": "rust",
+    "type": "research",
+    "q": "Trace from run_pipeline to clamp_value. Give the path of functions.",
+    "ground_truth": "run_pipeline -> process_svcNN -> normalize_record -> clamp_value.",
+    "check": {
+      "kind": "path",
+      "frm": "run_pipeline",
+      "to": "clamp_value"
+    }
+  },
+  {
+    "id": "r087",
+    "class": "graph_control_synth",
+    "source_id": "t022",
+    "repo": "python_large",
+    "lang": "python",
+    "type": "research",
+    "q": "Trace from run_pipeline to validate_amount.",
+    "ground_truth": "run_pipeline -> process_svcNNN -> post_entry -> to_minor_units -> validate_amount.",
+    "check": {
+      "kind": "path",
+      "frm": "run_pipeline",
+      "to": "validate_amount"
+    }
+  },
+  {
+    "id": "r088",
+    "class": "graph_control_synth",
+    "source_id": "t034",
+    "repo": "java_medium",
+    "lang": "java",
+    "type": "locate",
+    "q": "Who calls computeChecksum? List the calling methods.",
+    "ground_truth": "computeChecksum is called by normalizeRecord and by every processSvcNN.",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "computeChecksum",
+      "expect_members": [
+        "normalizeRecord",
+        "processSvc00"
+      ],
+      "min_count": 70
+    }
+  },
+  {
+    "id": "r089",
+    "class": "graph_control_synth",
+    "source_id": "t042",
+    "repo": "java_medium",
+    "lang": "java",
+    "type": "research",
+    "q": "Trace from runPipeline to clampValue.",
+    "ground_truth": "runPipeline -> processSvcNN -> normalizeRecord -> clampValue.",
+    "check": {
+      "kind": "path",
+      "frm": "runPipeline",
+      "to": "clampValue"
+    }
+  },
+  {
+    "id": "r090",
+    "class": "graph_control_synth",
+    "source_id": "t051",
+    "repo": "js_small",
+    "lang": "javascript",
+    "type": "research",
+    "q": "What would break inside the pipeline if collect changed? Identify its caller.",
+    "ground_truth": "runPipeline depends on collect; it is the only in-file caller.",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "collect",
+      "expect_members": [
+        "runPipeline"
+      ],
+      "min_count": 1
+    }
+  },
+  {
+    "id": "r091",
+    "class": "graph_control_synth",
+    "source_id": "t064",
+    "repo": "rust_medium",
+    "lang": "rust",
+    "type": "locate",
+    "q": "Who calls process_svc09? Name the caller and its file.",
+    "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc09.",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "process_svc09",
+      "expect_members": [
+        "run_pipeline"
+      ],
+      "min_count": 1
+    }
+  },
+  {
+    "id": "r092",
+    "class": "graph_control_synth",
+    "source_id": "t070",
+    "repo": "python_large",
+    "lang": "python",
+    "type": "locate",
+    "q": "Who calls process_svc005? Name the caller.",
+    "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc005.",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "process_svc005",
+      "expect_members": [
+        "run_pipeline"
+      ],
+      "min_count": 1
+    }
+  },
+  {
+    "id": "r093",
+    "class": "graph_control_synth",
+    "source_id": "t077",
+    "repo": "java_medium",
+    "lang": "java",
+    "type": "locate",
+    "q": "Who calls processSvc19? Name the calling method.",
+    "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc19.",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "processSvc19",
+      "expect_members": [
+        "runPipeline"
+      ],
+      "min_count": 1
+    }
+  },
+  {
+    "id": "r094",
+    "class": "graph_control_synth",
+    "source_id": "t084",
+    "repo": "go_small",
+    "lang": "go",
+    "type": "locate",
+    "q": "Who calls ProcessSvc07?",
+    "ground_truth": "RunPipeline (app/pipeline.go) calls ProcessSvc07.",
+    "check": {
+      "kind": "who_calls",
+      "symbol": "ProcessSvc07",
+      "expect_members": [
+        "RunPipeline"
+      ],
+      "min_count": 1
+    }
+  }
+]

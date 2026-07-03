@@ -1,0 +1,40 @@
+[package]
+name = "grepplus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "grepplus unified CLI (subcommand dispatcher for grep-plus tools)"
+
+[[bin]]
+name = "grepplus"
+path = "src/main.rs"
+
+[dependencies]
+grepplus-core = { path = "../core" }
+grepplus-discover = { path = "../discover" }
+grepplus-embeddinggemma = { path = "../embeddinggemma" }
+grepplus-freshness = { path = "../freshness" }
+grepplus-grep = { path = "../grepplus" }
+grepplus-indexer = { path = "../indexer" }
+grepplus-search = { path = "../search" }
+grepplus-store = { path = "../store" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+# GPU inference for EmbeddingGemma. NOT enabled by default: per-invocation
+# Metal init costs more than it saves for the single-query, single-shot
+# CLI (measured; see the latency report). Enable only for experiments:
+# `cargo build --release --features metal`.
+metal = ["grepplus-embeddinggemma/metal"]
+accelerate = ["grepplus-embeddinggemma/accelerate"]
+cuda = ["grepplus-embeddinggemma/cuda"]
+# Bake the EmbeddingGemma weights into the binary. With this on, semantic /
+# fuzzy vector search works with no external model file and no --embedding-*
+# flag or env (the embedded weights are used automatically; an explicit
+# external model still wins). Produces a ~400MB single self-contained binary.
+embed-weights = ["grepplus-embeddinggemma/embed-weights"]

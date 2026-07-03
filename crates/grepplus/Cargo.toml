@@ -1,0 +1,31 @@
+[package]
+name = "grepplus-grep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "grepplus-rs grep drop-in wrapper (real grep passthrough + heuristics)"
+
+[[bin]]
+name = "grepplus-grep"
+path = "src/main.rs"
+
+[[example]]
+name = "freshness-probe"
+path = "examples/freshness-probe.rs"
+
+[[example]]
+name = "parity-dump"
+path = "examples/parity-dump.rs"
+
+[dependencies]
+grepplus-core = { path = "../core" }
+grepplus-freshness = { path = "../freshness" }
+grepplus-search = { path = "../search" }
+grepplus-store = { path = "../store" }
+grepplus-indexer = { path = "../indexer" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+which = { workspace = true }

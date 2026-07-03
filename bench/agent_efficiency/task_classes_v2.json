@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "purpose": "Machine-readable corpus-v2 router/regression classes for the real-repo agent benchmark (serde/flask/gson/zod) plus reused synthetic v1 controls.",
+  "source_evidence": [
+    "bench/agent_efficiency/realcorpus/candidates.json",
+    "bench/agent_efficiency/realcorpus/MANIFEST.json",
+    "bench/agent_efficiency/tasks.json",
+    "bench/agent_efficiency/task_classes.json",
+    "grepplus-10x/bench/agent_efficiency/REALCORPUS_TASKGEN_SPEC.md"
+  ],
+  "generator": "bench/agent_efficiency/gen_real_tasks.py -- deterministic function of the inputs; no randomness, no timestamps.",
+  "input_candidates_sha256": "9279b869575e704668fa54b45150ea988664462733faceae202429ddc5f7f5d0",
+  "grading_semantics": "floor: expect_members = real caller-name subset floor, file_evidence = path-only match, min_count = floor; the C oracle undercounts, so an agent finding MORE true callers must pass.",
+  "classes": {
+    "graph_discovery": {
+      "role": "avoid_embedding",
+      "description": "Who-calls questions built 1:1 from audited CALLS targets in the real repos; exact graph/literal search should answer without vector retrieval.",
+      "ids": [
+        "r001",
+        "r002",
+        "r003",
+        "r004",
+        "r005",
+        "r006",
+        "r007",
+        "r008",
+        "r009",
+        "r010",
+        "r011",
+        "r012",
+        "r013",
+        "r014",
+        "r015",
+        "r016",
+        "r017",
+        "r018",
+        "r019",
+        "r020",
+        "r021",
+        "r022",
+        "r023",
+        "r024",
+        "r025",
+        "r026",
+        "r027",
+        "r028",
+        "r029",
+        "r030",
+        "r031",
+        "r032",
+        "r033",
+        "r034",
+        "r035",
+        "r036",
+        "r037",
+        "r038",
+        "r039",
+        "r040"
+      ],
+      "acceptance": {
+        "embedding_must_not_be_invoked": true,
+        "direct_scope_must_not_be_reported_as_transitive": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "fuzzy_discovery": {
+      "role": "embedding_candidate",
+      "description": "Synonym-vocabulary (lexicon B) behaviour descriptions with a mechanical firewall guaranteeing the question shares no stemmed content word with the target symbol/filename and is not rg-solvable to the target file (top-3 rule).",
+      "ids": [
+        "r041",
+        "r042",
+        "r043",
+        "r044",
+        "r045",
+        "r046",
+        "r047",
+        "r048",
+        "r049",
+        "r050",
+        "r051",
+        "r052",
+        "r053",
+        "r054",
+        "r055",
+        "r056",
+        "r057",
+        "r058",
+        "r059",
+        "r060"
+      ],
+      "acceptance": {
+        "median_tool_calls_max": 2.5,
+        "context_median_must_not_regress_vs_current_grepplus": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "research_multihop": {
+      "role": "avoid_embedding",
+      "description": "Impact/blast-radius and call-chain questions on targets passing the multi-hop gate (impact reach@1/reach@total < 0.3); graph traversal, not vector similarity, is the intended tool.",
+      "ids": [
+        "r061",
+        "r062",
+        "r063",
+        "r064",
+        "r065",
+        "r066",
+        "r067",
+        "r068",
+        "r069",
+        "r070",
+        "r071",
+        "r072",
+        "r073",
+        "r074",
+        "r075"
+      ],
+      "acceptance": {
+        "embedding_must_not_be_invoked": true,
+        "direct_scope_must_not_be_reported_as_transitive": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "literal_control": {
+      "role": "avoid_embedding",
+      "description": "Literal/local/exact tasks reused verbatim from the synthetic v1 corpus (regression control; vector search must not be invoked).",
+      "ids": [
+        "r076",
+        "r077",
+        "r078",
+        "r079",
+        "r080",
+        "r081",
+        "r082",
+        "r083",
+        "r084"
+      ],
+      "acceptance": {
+        "embedding_must_not_be_invoked": true,
+        "candidate_must_not_expand_transitively_unless_asked": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "graph_control_synth": {
+      "role": "avoid_embedding",
+      "description": "Exact graph tasks reused verbatim from the synthetic v1 graph_control class (regression control for the shared resolver; must not regress on rust/python).",
+      "ids": [
+        "r085",
+        "r086",
+        "r087",
+        "r088",
+        "r089",
+        "r090",
+        "r091",
+        "r092",
+        "r093",
+        "r094"
+      ],
+      "acceptance": {
+        "embedding_must_not_be_invoked": true,
+        "direct_scope_must_not_be_reported_as_transitive": true,
+        "quality_must_not_regress": true
+      }
+    }
+  }
+}

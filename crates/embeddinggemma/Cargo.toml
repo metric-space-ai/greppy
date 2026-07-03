@@ -1,0 +1,29 @@
+[package]
+name = "grepplus-embeddinggemma"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Native Rust EmbeddingGemma inference for grepplus fuzzy graph search"
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+memmap2 = "0.9"
+rmp-serde = "1"
+
+[features]
+default = []
+# Bake the quantized EmbeddingGemma GGUF + tokenizer into the binary via
+# include_bytes! (see build.rs), so grepplus is a single self-contained file
+# needing no external model. OFF by default: the feature build is ~400MB vs
+# the ~130MB default that loads weights from external files.
+embed-weights = []
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]

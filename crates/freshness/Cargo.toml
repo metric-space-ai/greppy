@@ -1,0 +1,18 @@
+[package]
+name = "grepplus-freshness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "grepplus-rs workspace fingerprint and freshness tracking"
+
+[dependencies]
+grepplus-core = { path = "../core" }
+grepplus-discover = { path = "../discover" }
+grepplus-parser = { path = "../parser" }
+grepplus-store = { path = "../store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+rusqlite = { workspace = true }

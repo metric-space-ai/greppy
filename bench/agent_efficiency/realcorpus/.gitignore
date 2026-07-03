@@ -1,0 +1,6 @@
+/serde/
+/flask/
+/gson/
+/zod/
+!MANIFEST.json
+!candidates.json
