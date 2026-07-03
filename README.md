@@ -122,26 +122,26 @@ This is **project-scoped**: the `export PATH` only affects the agent's own sessi
 
 ## What it saves
 
-Real medians from the agent benchmark (MiniMax-M3, discovery target aggregate of 85 tasks; the 9 literal-control tasks are grep's home turf and excluded). grepplus agent vs. an uncoached agent baseline. **The fixed system prompt is warmup and is factored out of every ratio.**
+Real medians from the agent benchmark (MiniMax-M3; discovery aggregate of 82 tasks — the 9 literal-control tasks are grep's home turf and excluded). grepplus agent vs. an uncoached agent baseline. **The fixed system prompt is warmup and is factored out of every ratio.**
 
 | Axis | Factor (median) | What it measures |
 |---|---:|---|
-| Tool-call rounds | **2.5×** | how many times the agent calls the model |
-| Billed input tokens (prompt-neutral) | **2.2×** | loop input, minus the fixed system prompt |
-| Output tokens | **2.1×** | agent output |
-| Wall-clock time (session, no setup) | **1.9×** | end-to-end agent loop time |
-| Search-context tokens | **6.4×** | bytes the agent must read to *find* the answer |
+| Tool-call rounds | **4.0×** | how many times the agent calls the model |
+| Billed input tokens (prompt-neutral) | **3.7×** | loop input, minus the fixed system prompt |
+| Output tokens | **2.9×** | agent output |
+| Wall-clock time (session, no setup) | **2.0×** | end-to-end agent loop time |
+| Search-context tokens | **11.9×** | bytes the agent must read to *find* the answer |
 
 The gain is **not uniform** — it's largest where `grep` structurally fails, and ~1× where `grep` is already optimal:
 
 | Task class | Search-context median | Why |
 |---|---:|---|
-| research / impact / trace | **12.6×** | one `impact`/`path` call replaces a manual graph walk |
-| who-calls / callees | **8.4×** | one graph call instead of grep+read per caller |
-| vocabulary-gap discovery | **2.9×** | vector search finds what grep keywords miss |
-| find a definition (literal) | **~1.0×** | grep is already optimal — grepplus just must not lose |
+| structural graph queries (who-calls / callees / impact) | **~19×** | one resolved graph call instead of grep+read per caller |
+| research / multi-hop trace | **13.5×** | one `impact`/`path` call replaces a manual graph walk |
+| vocabulary-gap discovery (semantic) | **2.4×** | vector search finds what grep keywords miss; capped by the small Q4 model |
+| literal definition search | **~1×** | grep's home turf — grepplus passes straight through |
 
-The headline "~2×" is the conservative billed-token / wall-clock median; discovery-context savings are much larger.
+The median search-context saving clears **10×**; the conservative headline of **~2× faster** (wall-clock) and **~3–4× cheaper** (billed tokens) is what you can count on across the mix.
 
 ---
 
