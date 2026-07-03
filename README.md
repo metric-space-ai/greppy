@@ -22,9 +22,31 @@ grep brief _split_blueprint_path            # definition + callers + callees, on
 
 ---
 
-## Give it to your coding agent (the one line that matters)
+## Setup — two steps
 
-Paste this into your agent's system prompt / rules file (`CLAUDE.md`, `AGENTS.md`, `.cursor/rules`). It positions `grep` as backward-compatible **plus** the extra commands — no other integration:
+**1. Install it as `grep`** and index the repo (one time):
+
+```bash
+cargo build --release --bin grepplus                              # build the one binary
+sudo install -m 0755 target/release/grepplus /usr/local/bin/grep  # install it AS grep (system /bin/grep is untouched)
+grepplus index /path/to/repo                                      # index once (setup cost, not per query)
+#   for semantic ("find code by meaning") search, add:
+#     --embeddings --embedding-gguf <embeddinggemma-300M-Q4_K.gguf> --embedding-tokenizer <tokenizer.json>
+```
+
+Prefer a prebuilt binary? Download one for macOS / Linux / Windows from the [Releases](../../releases) page and put it on your `PATH` as `grep`. (Uninstall: remove the binary and `rm -rf "${GREPPLUS_STORE_DIR:-$HOME/Library/Caches/grepplus}"`.)
+
+**2. Tell your agent** — paste the text below **verbatim** into the file your agent reads for project instructions. This is the *only* integration:
+
+| Agent | Paste it into |
+|---|---|
+| **Claude Code** | `CLAUDE.md` in the repo root |
+| **OpenAI Codex** | `AGENTS.md` in the repo root |
+| **Cursor** | `.cursor/rules` |
+| **Windsurf** | `.windsurfrules` |
+| **Anything else / raw API** | the model's **system prompt** |
+
+The exact text to paste:
 
 ```text
 This project's `grep` is a backward-compatible superset of grep: every normal
@@ -73,22 +95,6 @@ All of it comes from one thing: **fewer model round-trips.** The savings concent
 - **One-shot briefings.** `brief SYM` returns definition + callers + callees in one call; `impact SYM` returns the whole transitive blast-radius in one call.
 - **Freshness-gated incremental index** so a stale graph never hands the agent a confidently-wrong answer; re-indexing reparses only changed files.
 - **One native Rust binary.** At runtime it links only system libraries; tree-sitter parsers and SQLite are compiled in statically.
-
----
-
-## Install
-
-```bash
-cargo build --release --bin grepplus            # one binary
-install -m 0755 target/release/grepplus /usr/local/bin/grep   # install it AS grep (or symlink)
-grepplus index /path/to/repo                    # index once (setup cost, not per-query)
-#   semantic path: grepplus index /path/to/repo --embeddings \
-#     --embedding-gguf <embeddinggemma-300M-Q4_K.gguf> --embedding-tokenizer <tokenizer.json>
-```
-
-Ready-made binaries for macOS (arm64/x86_64), Linux and Windows are attached to each [GitHub Release](../../releases) (built by `.github/workflows/release.yml`).
-
-Uninstall: remove the binary/symlink and `rm -rf "${GREPPLUS_STORE_DIR:-$HOME/Library/Caches/grepplus}"`.
 
 ---
 
