@@ -33,6 +33,7 @@
 
 pub mod diagnostics;
 pub mod edge;
+pub mod expand_pack;
 pub mod file_content;
 pub mod file_state;
 pub mod fts;
@@ -54,6 +55,7 @@ pub mod workspace_state;
 
 pub use diagnostics::{ProjectDiagnostics, StoreDiagnostics};
 pub use edge::{Edge, NewEdge};
+pub use expand_pack::{ExpandPack, NewExpandPack, DEFAULT_EXPAND_TTL_SECS};
 pub use file_content::{ContentRow, FileContentHit};
 pub use file_state::FileState;
 pub use index_skip::{IndexSkip, IndexSkipReasonCount};

@@ -8,15 +8,38 @@ use crate::migrate;
 use crate::store_error::{Error, Result};
 
 /// Open-mode flags for [`Store::open`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Open the database read-only. SQLite will refuse any write attempt.
     pub read_only: bool,
+    /// Run `PRAGMA integrity_check` after opening a writable store.
+    pub integrity_check: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            integrity_check: true,
+        }
+    }
 }
 
 impl OpenOptions {
     pub const fn read_only() -> Self {
-        Self { read_only: true }
+        Self {
+            read_only: true,
+            integrity_check: false,
+        }
+    }
+
+    /// Writable query hotpath open: apply migrations and allow small writes,
+    /// but skip the full DB integrity scan reserved for index writers.
+    pub const fn query_writer() -> Self {
+        Self {
+            read_only: false,
+            integrity_check: false,
+        }
     }
 }
 
@@ -65,14 +88,14 @@ impl Store {
                 source: std::io::Error::other(e.to_string()),
             })?
         };
-        Self::from_connection_with_options(conn, opts.read_only)
+        Self::from_connection_with_options(conn, opts)
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
-        Self::from_connection_with_options(conn, false)
+        Self::from_connection_with_options(conn, OpenOptions::default())
     }
 
-    fn from_connection_with_options(conn: Connection, read_only: bool) -> Result<Self> {
+    fn from_connection_with_options(conn: Connection, opts: OpenOptions) -> Result<Self> {
         // Performance pragmas for the WRITE path (i.e. `greppy index`).
         // Default SQLite is journal_mode=DELETE + synchronous=FULL, which
         // fsyncs on every transaction commit. The indexer commits once per
@@ -85,7 +108,7 @@ impl Store {
         // is a rebuildable cache anyway). temp_store=MEMORY keeps FTS merge
         // scratch off disk. Readers don't set these (they open read-only and
         // tolerate whatever the DB has).
-        if !read_only {
+        if !opts.read_only {
             // journal_mode returns a row; use query_row, not execute.
             let _: String = conn
                 .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
@@ -102,7 +125,7 @@ impl Store {
         // `freshness-probe` bench was tripping on 2026-06-29).
         // Readers tolerate whatever schema the DB has; the
         // `greppy index` writer upgrades on the next write.
-        if !read_only {
+        if !opts.read_only {
             migrate::migrate(&conn)?;
         }
         let s = Self { conn };
@@ -116,7 +139,7 @@ impl Store {
         // image), so it never silently returns wrong data. This keeps the
         // agent-facing query path fast (the token-efficiency benchmark showed
         // per-open integrity_check was the dominant query latency).
-        if !read_only {
+        if !opts.read_only && opts.integrity_check {
             s.integrity_check()?;
         }
         Ok(s)

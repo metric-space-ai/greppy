@@ -163,6 +163,13 @@ fn run_with_env(
     )
 }
 
+fn expand_id_from_stdout(out: &str) -> Option<String> {
+    out.lines()
+        .find(|line| line.starts_with("Expand: greppy expand "))
+        .and_then(|line| line.split_whitespace().nth(3))
+        .map(str::to_string)
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -246,6 +253,49 @@ fn who_calls_lists_cross_file_caller_with_file_line() {
     assert!(
         !out.contains("(no callers)"),
         "who-calls must find at least one caller; got: {out:?}"
+    );
+}
+
+#[test]
+fn who_calls_prints_line_span_and_expand_pack_round_trips() {
+    let (repo, store) = index_fixture("whocalls-expand");
+
+    let (code, out, err) = run(&["who-calls", "do_it"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls should exit 0; stderr={err}\nstdout={out}"
+    );
+    let caller_line = out
+        .lines()
+        .find(|line| line.contains("caller") && line.contains("src/lib.rs:"))
+        .unwrap_or_else(|| panic!("missing caller line in stdout: {out:?}"));
+    assert!(
+        caller_line.contains('-'),
+        "caller line must include start-end span, got: {caller_line:?}"
+    );
+    let id = expand_id_from_stdout(&out)
+        .unwrap_or_else(|| panic!("missing Expand line in stdout: {out:?}"));
+
+    let (code, expanded, err) = run(&["expand", &id], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "expand should exit 0; stderr={err}\nstdout={expanded}"
+    );
+    assert!(
+        expanded.contains("helper::do_it()") && expanded.contains("source:"),
+        "expand pack must include prepared source evidence, got: {expanded:?}"
+    );
+}
+
+#[test]
+fn expand_missing_id_reports_clear_message() {
+    let (repo, store) = index_fixture("expand-missing");
+
+    let (code, out, err) = run(&["expand", "does-not-exist"], &repo, &store);
+    assert_eq!(code, 1, "missing expand id should exit 1; stderr={err}");
+    assert!(
+        out.contains("expand: id not found or expired: does-not-exist"),
+        "missing expand id must be visible on stdout; got: {out:?}"
     );
 }
 
@@ -392,6 +442,12 @@ fn direct_navigation_json_reports_exact_counts() {
         assert_eq!(v["shown"], 1);
         assert_eq!(v["omitted"], 0);
         assert_eq!(v["truncated"], false);
+        assert_eq!(v["expand"]["available"], true);
+        assert_eq!(v["expand"]["kind"], "evidence_pack");
+        assert!(
+            v["expand"]["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "{cmd} JSON must expose expand id: {v:?}"
+        );
         let hits = v["hits"].as_array().expect("hits array");
         assert_eq!(hits.len(), 1);
         assert!(
@@ -1100,6 +1156,10 @@ fn who_calls_caps_output_and_all_lifts_it() {
     assert!(
         !out.contains("shown of"),
         "--all must not print a truncation footer; got: {out}"
+    );
+    assert!(
+        !out.contains("Expand:"),
+        "--all already emits the full result set and must not advertise expand; got: {out}"
     );
 }
 

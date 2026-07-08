@@ -83,10 +83,15 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "vector_embeddings_chunks",
         sql: include_str!("migrations/0012_vector_embeddings_chunks.sql"),
     },
+    Migration {
+        version: 13,
+        name: "expand_packs",
+        sql: include_str!("migrations/0013_expand_packs.sql"),
+    },
 ];
 
 /// Current schema version this crate knows about.
-pub const CURRENT_VERSION: u32 = 12;
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Apply pending migrations. Returns the number of migrations applied.
 pub fn migrate(conn: &Connection) -> Result<usize, Error> {

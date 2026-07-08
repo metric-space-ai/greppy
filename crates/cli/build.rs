@@ -5,15 +5,12 @@
 //! REPO (`crates/cli/assets/embedded-model/`, tracked via Git LFS because the
 //! GGUF is ~228 MB). No download, no external path, no env var is required.
 //!
-//! The `embedded-model` feature is ON BY DEFAULT (see Cargo.toml), so a plain
-//! `cargo build` bakes the model. build.rs copies the in-repo assets into
-//! `OUT_DIR` (where `lib.rs` `include_bytes!`s them) after verifying their
-//! SHA256, and FAILS LOUDLY if an asset is missing or altered — a binary
-//! without its model must not be buildable.
-//!
-//! An optional local override (`GREPPY_BUILD_MODEL_GGUF` /
-//! `GREPPY_BUILD_MODEL_TOKENIZER`) exists only for offline model-refresh
-//! work; it is never required and still SHA-checked.
+//! The `embedded-model` feature is mandatory (see Cargo.toml), so a plain
+//! `cargo build` bakes the model and `--no-default-features` is a build error.
+//! build.rs copies the in-repo assets into `OUT_DIR` (where `lib.rs`
+//! `include_bytes!`s them) after verifying their SHA256, and FAILS LOUDLY if an
+//! asset is missing or altered — a binary without its model must not be
+//! buildable.
 
 use std::path::{Path, PathBuf};
 
@@ -23,53 +20,43 @@ const TOK_NAME: &str = "tokenizer.json";
 const TOK_SHA: &str = "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e";
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=GREPPY_BUILD_MODEL_GGUF");
-    println!("cargo:rerun-if-env-changed=GREPPY_BUILD_MODEL_TOKENIZER");
     println!("cargo:rustc-env=GREPPY_EMBEDDED_GGUF_SHA={GGUF_SHA}");
     println!("cargo:rustc-env=GREPPY_EMBEDDED_TOK_SHA={TOK_SHA}");
-    if std::env::var("CARGO_FEATURE_EMBEDDED_MODEL").is_err() {
-        return;
-    }
+    assert!(
+        std::env::var("CARGO_FEATURE_EMBEDDED_MODEL").is_ok(),
+        "greppy cannot be built without the embedded EmbeddingGemma model. \
+         Do not use --no-default-features; every greppy binary must bake the \
+         repo-owned model into the binary."
+    );
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let assets = manifest.join("assets").join("embedded-model");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     bake(
         &assets.join(GGUF_NAME),
         &out.join(GGUF_NAME),
-        std::env::var("GREPPY_BUILD_MODEL_GGUF").ok(),
         GGUF_NAME,
         GGUF_SHA,
     );
     bake(
         &assets.join(TOK_NAME),
         &out.join(TOK_NAME),
-        std::env::var("GREPPY_BUILD_MODEL_TOKENIZER").ok(),
         TOK_NAME,
         TOK_SHA,
     );
 }
 
-/// Copy the in-repo asset (`repo_asset`, or an explicit local `override_path`)
-/// into `dest` in OUT_DIR, verifying SHA256 on both ends. Panics — with a
-/// message that says exactly what is wrong — rather than baking an unverified
-/// or absent model.
-fn bake(repo_asset: &Path, dest: &Path, override_path: Option<String>, name: &str, want_sha: &str) {
+/// Copy the in-repo asset into `dest` in OUT_DIR, verifying SHA256 on both
+/// ends. Panics — with a message that says exactly what is wrong — rather than
+/// baking an unverified or absent model.
+fn bake(repo_asset: &Path, dest: &Path, name: &str, want_sha: &str) {
     println!("cargo:rerun-if-changed={}", repo_asset.display());
-    let src = match override_path {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            println!("cargo:rerun-if-changed={}", path.display());
-            path
-        }
-        None => repo_asset.to_path_buf(),
-    };
+    let src = repo_asset.to_path_buf();
     assert!(
         src.exists(),
         "embedded model asset `{name}` not found at {}.\n\
-         The model must live in the repo (Git LFS): run `git lfs install && git lfs pull`,\n\
-         or set GREPPY_BUILD_MODEL_{} to a local copy. Refusing to build a binary without its model.",
+         The model must live in the repo (Git LFS): run `git lfs install && git lfs pull`.\n\
+         Refusing to build a binary without its repo-owned model.",
         src.display(),
-        if name == GGUF_NAME { "GGUF" } else { "TOKENIZER" },
     );
     if dest.exists() && sha256_file(dest) == want_sha {
         return; // already baked from a previous build

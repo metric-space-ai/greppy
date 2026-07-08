@@ -26,9 +26,10 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 # Owner rule: greppy works OUT OF THE BOX. The EmbeddingGemma model is baked
-# into every build by default (feature `embedded-model`, model files live in
+# into every build (mandatory feature `embedded-model`, model files live in
 # `assets/embedded-model/` in this repo) — no download, no runtime flags, no
-# env. GPU is auto-detected at runtime (device default = `auto`).
+# env. `--no-default-features` is intentionally rejected by build.rs/lib.rs.
+# GPU is auto-detected at runtime (device default = `auto`).
 [features]
 default = ["embedded-model"]
 embedded-model = []

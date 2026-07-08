@@ -16,6 +16,13 @@
 //! with a documented non-zero code (EX_UNAVAILABLE = 69). The "out of
 //! scope" subcommands do the same with the `OutOfScope` variant.
 
+#[cfg(not(feature = "embedded-model"))]
+compile_error!(
+    "greppy cannot be built without the embedded EmbeddingGemma model. \
+     Every greppy binary must bake crates/cli/assets/embedded-model/* \
+     from this repo into the binary."
+);
+
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
 use greppy_core::workspace as workspace_locator;
@@ -54,6 +61,7 @@ const ENV_VECTOR_EXACT_CANDIDATE_LIMIT: &str = "GREPPY_VECTOR_EXACT_CANDIDATE_LI
 const ENV_PROVIDER_POLICY: &str = "GREPPY_PROVIDER_POLICY";
 const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
+const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 #[cfg(debug_assertions)]
@@ -277,6 +285,13 @@ pub enum Command {
         #[arg(long)]
         all: bool,
         /// Accepted for agent ergonomics — no-op.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a prepared evidence pack created by a previous query command.
+    Expand {
+        id: Option<String>,
+        /// Emit machine-readable JSON wrapper with metadata and payload.
         #[arg(long)]
         json: bool,
     },
@@ -514,6 +529,7 @@ pub enum Command {
     /// Semantic query. Default is algorithmic lexical semantic
     /// ranking; `--vectors` uses EmbeddingGemma vector search over indexed
     /// code-span embeddings.
+    #[command(alias = "semantic-search")]
     Semantic {
         query: Option<String>,
         /// Use EmbeddingGemma vector search over indexed code-span embeddings.
@@ -667,6 +683,7 @@ const SUBCOMMANDS: &[&str] = &[
     "trace",
     "impact",
     "brief",
+    "expand",
     "who-calls",
     "callees",
     "find-usages",
@@ -679,6 +696,7 @@ const SUBCOMMANDS: &[&str] = &[
     "search-symbols",
     "plus",
     "semantic",
+    "semantic-search",
     "context",
     "install",
     "uninstall",
@@ -744,7 +762,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 eprintln!("usage: {usage}");
             } else {
                 eprintln!(
-                    "usage: grep <command> --help  (commands: index, who-calls, callees, \
+                    "usage: greppy <command> --help  (commands: index, who-calls, callees, \
                      find-usages, impact, brief, context, search-code, search-symbols, \
                      path, index status)"
                 );
@@ -760,22 +778,24 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
 /// costs the agent a turn of thinking plus a tool call).
 fn subcommand_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "who-calls" => "grep who-calls SYMBOL [--code|--json] [--all] [--root DIR]",
-        "callees" => "grep callees SYMBOL [--code|--json] [--all] [--root DIR]",
+        "who-calls" => "greppy who-calls SYMBOL [--code|--json] [--all] [--root DIR]",
+        "callees" => "greppy callees SYMBOL [--code|--json] [--all] [--root DIR]",
         "find-usages" | "references" => {
-            "grep find-usages SYMBOL [--code|--json] [--all] [--root DIR]"
+            "greppy find-usages SYMBOL [--code|--json] [--all] [--root DIR]"
         }
         "impact" => {
-            "grep impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
+            "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
-        "brief" => "grep brief SYMBOL [--root DIR]",
-        "context" => "grep context \"QUERY\" [--root DIR]",
-        "search-code" => "grep search-code QUERY [--json] [--root DIR]",
+        "brief" => "greppy brief SYMBOL [--root DIR]",
+        "expand" => "greppy expand ID [--json] [--root DIR]",
+        "semantic-search" => "greppy semantic-search \"QUERY\" [--root DIR]",
+        "context" => "greppy context \"QUERY\" [--root DIR]",
+        "search-code" => "greppy search-code QUERY [--json] [--root DIR]",
         "search-symbols" => {
-            "grep search-symbols NAME [--kind function|method|struct|class] [--json] [--root DIR]"
+            "greppy search-symbols NAME [--kind function|method|struct|class] [--json] [--root DIR]"
         }
-        "path" => "grep path --from SYMBOL --to SYMBOL [--root DIR]",
-        "index" => "grep index PATH [--embeddings --embedding-gguf F --embedding-tokenizer F]",
+        "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
+        "index" => "greppy index PATH [--embeddings --embedding-gguf F --embedding-tokenizer F]",
         _ => return None,
     })
 }
@@ -1046,6 +1066,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             all: _,
             json: _,
         } => dispatch_brief(symbol.as_deref(), root),
+        Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
@@ -1773,6 +1794,8 @@ const NAV_LIMIT: usize = 40;
 /// "show me the callers' bodies" without letting it flood the agent's
 /// context. `--all` still lifts the cap for the rare exhaustive case.
 const CODE_NAV_LIMIT: usize = 6;
+const EXPAND_NAV_EVIDENCE_LIMIT: usize = 80;
+const EXPAND_CALLSITE_LINES_PER_NODE: usize = 8;
 
 /// Freshness budget for explicit machine-readable navigation queries. The
 /// grep drop-in hotpath uses 200 ms; explicit graph JSON can afford a little
@@ -2059,6 +2082,373 @@ fn print_nav_more_footer(total: usize, shown: usize) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ExpandHandle {
+    id: String,
+    summary: String,
+}
+
+struct ExpandEvidenceNode<'a> {
+    title: String,
+    node: &'a greppy_store::Node,
+    site_lines: Vec<u32>,
+    extra_json: serde_json::Value,
+}
+
+impl ExpandHandle {
+    fn text_line(&self) -> String {
+        format!(
+            "Expand: greppy expand {}  (prepared evidence: {})",
+            self.id, self.summary
+        )
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "available": true,
+            "kind": "evidence_pack",
+            "summary": self.summary,
+        })
+    }
+}
+
+fn expand_ttl_secs() -> u64 {
+    std::env::var(ENV_EXPAND_TTL_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(greppy_store::DEFAULT_EXPAND_TTL_SECS)
+}
+
+fn insert_expand_pack_best_effort(
+    store: &greppy_store::Store,
+    project: &str,
+    command: &str,
+    query: &str,
+    graph_generation: u64,
+    summary: serde_json::Value,
+    payload_text: String,
+    payload_json: Option<serde_json::Value>,
+) -> Option<ExpandHandle> {
+    if payload_text.trim().is_empty() {
+        return None;
+    }
+    let summary_text = expand_summary_text(&summary);
+    let pack = greppy_store::NewExpandPack {
+        project: project.to_string(),
+        command: command.to_string(),
+        query: query.to_string(),
+        graph_generation,
+        summary_json: summary,
+        payload_text,
+        payload_json,
+        ttl_secs: expand_ttl_secs(),
+    };
+    store.insert_expand_pack(&pack).ok().map(|id| ExpandHandle {
+        id,
+        summary: summary_text,
+    })
+}
+
+fn expand_summary_text(summary: &serde_json::Value) -> String {
+    summary
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "evidence pack".into())
+}
+
+fn line_span(file_path: &str, start_line: i64, end_line: i64) -> String {
+    if end_line > 0 && end_line >= start_line {
+        format!("{file_path}:{start_line}-{end_line}")
+    } else {
+        format!("{file_path}:{start_line}")
+    }
+}
+
+fn node_line_span(node: &greppy_store::Node) -> String {
+    line_span(&node.file_path, node.start_line, node.end_line)
+}
+
+fn sorted_site_lines(lines: Option<&Vec<u32>>) -> Vec<u32> {
+    let mut out = lines.cloned().unwrap_or_default();
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(EXPAND_CALLSITE_LINES_PER_NODE);
+    out
+}
+
+fn append_node_evidence(
+    out: &mut String,
+    root: &std::path::Path,
+    node: &greppy_store::Node,
+    title: &str,
+    site_lines: &[u32],
+) {
+    out.push_str(&format!("== {title} ({}) ==\n", node_line_span(node)));
+    if !site_lines.is_empty() {
+        out.push_str("callsites:\n");
+        for line in site_lines {
+            if let Some(text) = read_source_line(root, &node.file_path, *line) {
+                out.push_str(&format!("  {}:{}: {}\n", node.file_path, line, text));
+            }
+        }
+    }
+    if let Some(span) = read_span(
+        root,
+        &node.file_path,
+        node.start_line,
+        node.end_line,
+        CODE_SPAN_CAP,
+        false,
+    ) {
+        out.push_str("source:\n");
+        out.push_str(&span);
+        if !span.ends_with('\n') {
+            out.push('\n');
+        }
+    } else {
+        out.push_str("source unavailable\n");
+    }
+    out.push('\n');
+}
+
+fn append_span_evidence(
+    out: &mut String,
+    root: &std::path::Path,
+    title: &str,
+    file_path: &str,
+    start_line: i64,
+    end_line: i64,
+    cap: usize,
+) {
+    out.push_str(&format!(
+        "== {title} ({}) ==\n",
+        line_span(file_path, start_line, end_line)
+    ));
+    if let Some(span) = read_span(root, file_path, start_line, end_line, cap, false) {
+        out.push_str(&span);
+        if !span.ends_with('\n') {
+            out.push('\n');
+        }
+    } else {
+        out.push_str("source unavailable\n");
+    }
+    out.push('\n');
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_nav_expand_pack(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    command: &str,
+    query: &str,
+    total: usize,
+    rows: &[ExpandEvidenceNode<'_>],
+) -> Option<ExpandHandle> {
+    if rows.is_empty() {
+        return None;
+    }
+    let root_path = resolve_root(root).ok()?;
+    let limit = rows.len().min(EXPAND_NAV_EVIDENCE_LIMIT);
+    let mut text = String::new();
+    text.push_str(&format!("# evidence pack: {command} {query}\n"));
+    text.push_str(&format!("# rows: {} shown of {} total\n\n", limit, total));
+    let mut callsite_count = 0usize;
+    let mut json_rows = Vec::new();
+    for row in rows.iter().take(limit) {
+        callsite_count += row.site_lines.len();
+        append_node_evidence(&mut text, &root_path, row.node, &row.title, &row.site_lines);
+        json_rows.push(serde_json::json!({
+            "title": row.title,
+            "qualified_name": &row.node.qualified_name,
+            "label": &row.node.label,
+            "file_path": &row.node.file_path,
+            "start_line": row.node.start_line,
+            "end_line": row.node.end_line,
+            "site_lines": &row.site_lines,
+            "extra": &row.extra_json,
+        }));
+    }
+    let summary_text = if callsite_count == 0 {
+        format!("{limit} spans")
+    } else {
+        format!("{limit} spans, {callsite_count} callsites")
+    };
+    let summary = serde_json::json!({
+        "text": summary_text,
+        "spans": limit,
+        "callsites": callsite_count,
+        "total": total,
+    });
+    let payload_json = serde_json::json!({
+        "command": command,
+        "query": query,
+        "total": total,
+        "shown": limit,
+        "hits": json_rows,
+    });
+    insert_expand_pack_best_effort(
+        store,
+        project,
+        command,
+        query,
+        current_graph_generation_or_zero(store, root),
+        summary,
+        text,
+        Some(payload_json),
+    )
+}
+
+fn insert_semantic_algorithmic_expand_pack(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    query: &str,
+    hits: &[greppy_search::SemanticHit],
+) -> Option<ExpandHandle> {
+    if hits.is_empty() {
+        return None;
+    }
+    let root_path = resolve_root(root).ok()?;
+    let limit = hits.len().min(6);
+    let mut text = String::new();
+    text.push_str(&format!("# evidence pack: semantic {query}\n"));
+    text.push_str(&format!(
+        "# spans: {limit} shown of {} hits\n\n",
+        hits.len()
+    ));
+    let mut json_rows = Vec::new();
+    for (idx, hit) in hits.iter().take(limit).enumerate() {
+        let title = format!(
+            "{:.3} {} {}",
+            hit.score,
+            hit.node.label,
+            display_row_name(&hit.node)
+        );
+        append_span_evidence(
+            &mut text,
+            &root_path,
+            &title,
+            &hit.node.file_path,
+            hit.node.start_line,
+            hit.node.end_line,
+            if idx == 0 {
+                CONTEXT_SPAN_CAP
+            } else {
+                CODE_SPAN_CAP
+            },
+        );
+        json_rows.push(serde_json::json!({
+            "score": hit.score,
+            "label": &hit.node.label,
+            "qualified_name": &hit.node.qualified_name,
+            "file_path": &hit.node.file_path,
+            "start_line": hit.node.start_line,
+            "end_line": hit.node.end_line,
+        }));
+    }
+    let summary = serde_json::json!({
+        "text": format!("{limit} spans"),
+        "spans": limit,
+        "callsites": 0,
+        "total": hits.len(),
+    });
+    let payload_json = serde_json::json!({
+        "command": "semantic",
+        "mode": "algorithmic",
+        "query": query,
+        "shown": limit,
+        "hits": json_rows,
+    });
+    insert_expand_pack_best_effort(
+        store,
+        project,
+        "semantic",
+        query,
+        current_graph_generation_or_zero(store, root),
+        summary,
+        text,
+        Some(payload_json),
+    )
+}
+
+fn insert_semantic_vector_expand_pack(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    query: &str,
+    graph_generation: u64,
+    hits: &[greppy_store::VectorSearchHit],
+) -> Option<ExpandHandle> {
+    if hits.is_empty() {
+        return None;
+    }
+    let root_path = resolve_root(root).ok()?;
+    let limit = hits.len().min(6);
+    let mut text = String::new();
+    text.push_str(&format!("# evidence pack: semantic --vectors {query}\n"));
+    text.push_str(&format!(
+        "# spans: {limit} shown of {} hits\n\n",
+        hits.len()
+    ));
+    let mut json_rows = Vec::new();
+    for (idx, hit) in hits.iter().take(limit).enumerate() {
+        let title = format!("{:.3} {}", hit.score, hit.embedding.qualified_name);
+        append_span_evidence(
+            &mut text,
+            &root_path,
+            &title,
+            &hit.embedding.file_path,
+            hit.embedding.start_line,
+            hit.embedding.end_line,
+            if idx == 0 {
+                CONTEXT_SPAN_CAP
+            } else {
+                CODE_SPAN_CAP
+            },
+        );
+        json_rows.push(serde_json::json!({
+            "score": hit.score,
+            "qualified_name": &hit.embedding.qualified_name,
+            "file_path": &hit.embedding.file_path,
+            "start_line": hit.embedding.start_line,
+            "end_line": hit.embedding.end_line,
+            "content_sha256": &hit.embedding.content_sha256,
+            "graph_generation": hit.embedding.graph_generation,
+        }));
+    }
+    let summary = serde_json::json!({
+        "text": format!("{limit} spans"),
+        "spans": limit,
+        "callsites": 0,
+        "total": hits.len(),
+    });
+    let payload_json = serde_json::json!({
+        "command": "semantic",
+        "mode": "vector",
+        "query": query,
+        "shown": limit,
+        "hits": json_rows,
+    });
+    insert_expand_pack_best_effort(
+        store,
+        project,
+        "semantic",
+        query,
+        graph_generation,
+        summary,
+        text,
+        Some(payload_json),
+    )
+}
+
+fn current_graph_generation_or_zero(store: &greppy_store::Store, root: Option<&str>) -> u64 {
+    current_graph_generation(store, root).unwrap_or(0)
+}
+
 fn node_hit_json(node: &greppy_store::Node) -> serde_json::Value {
     serde_json::json!({
         "qualified_name": &node.qualified_name,
@@ -2081,6 +2471,35 @@ fn nav_counts_json(
     all: bool,
     hits: Vec<serde_json::Value>,
 ) -> Result<()> {
+    nav_counts_json_with_expand(
+        store,
+        root,
+        command,
+        symbol,
+        project,
+        symbol_found,
+        total_exact,
+        shown,
+        all,
+        hits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nav_counts_json_with_expand(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    command: &str,
+    symbol: &str,
+    project: &str,
+    symbol_found: bool,
+    total_exact: usize,
+    shown: usize,
+    all: bool,
+    hits: Vec<serde_json::Value>,
+    expand: Option<&ExpandHandle>,
+) -> Result<()> {
     let omitted = total_exact.saturating_sub(shown);
     let freshness = nav_freshness_json(store, root, project);
     let fresh = freshness
@@ -2088,7 +2507,7 @@ fn nav_counts_json(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let incomplete_providers = incomplete_provider_json(store, project)?;
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "command": command,
         "symbol": symbol,
         "project": project,
@@ -2105,6 +2524,9 @@ fn nav_counts_json(
         "all": all,
         "hits": hits,
     });
+    if let Some(expand) = expand {
+        v["expand"] = expand.json_value();
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&v)
@@ -2432,6 +2854,35 @@ fn impact_counts_json(
     meta: ImpactJsonMeta<'_>,
     hits: Vec<serde_json::Value>,
 ) -> Result<()> {
+    impact_counts_json_with_expand(
+        store,
+        root,
+        symbol,
+        project,
+        symbol_found,
+        total_exact,
+        shown,
+        all,
+        meta,
+        hits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn impact_counts_json_with_expand(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    symbol: &str,
+    project: &str,
+    symbol_found: bool,
+    total_exact: usize,
+    shown: usize,
+    all: bool,
+    meta: ImpactJsonMeta<'_>,
+    hits: Vec<serde_json::Value>,
+    expand: Option<&ExpandHandle>,
+) -> Result<()> {
     let omitted = total_exact.saturating_sub(shown);
     let freshness = nav_freshness_json(store, root, project);
     let fresh = freshness
@@ -2441,7 +2892,7 @@ fn impact_counts_json(
     // Only real code providers count toward impact completeness; `.stderr` /
     // `.snap` snapshot files are not callers (see `code_incomplete_provider_json`).
     let incomplete_providers = code_incomplete_provider_json(store, project)?;
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "command": "impact",
         "symbol": symbol,
         "project": project,
@@ -2463,6 +2914,9 @@ fn impact_counts_json(
         "all": all,
         "hits": hits,
     });
+    if let Some(expand) = expand {
+        v["expand"] = expand.json_value();
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&v)
@@ -3005,9 +3459,7 @@ fn nav_freshness_json(
     ) {
         Ok(report) => {
             let (fresh, state_name, reasons) = match report.state.outcome {
-                greppy_freshness::FreshnessOutcome::Fresh => {
-                    (true, "fresh", Vec::<String>::new())
-                }
+                greppy_freshness::FreshnessOutcome::Fresh => (true, "fresh", Vec::<String>::new()),
                 greppy_freshness::FreshnessOutcome::Cold => {
                     (false, "cold", vec!["no persisted workspace state".into()])
                 }
@@ -3016,9 +3468,7 @@ fn nav_freshness_json(
                     "root_mismatch",
                     vec!["workspace root mismatch".into()],
                 ),
-                greppy_freshness::FreshnessOutcome::Stale { reasons } => {
-                    (false, "stale", reasons)
-                }
+                greppy_freshness::FreshnessOutcome::Stale { reasons } => (false, "stale", reasons),
             };
             serde_json::json!({
                 "fresh": fresh,
@@ -3897,7 +4347,7 @@ fn dispatch_impact(
             root,
         );
     }
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
     let query_symbol = symbol.unwrap_or("");
     let mut graph_gate_extra = serde_json::json!({
@@ -4043,6 +4493,26 @@ fn dispatch_impact(
                 .cmp(&(nav_sample_rank(&b.node.file_path, &b.node.name), b.hops))
         });
     }
+    let expand = if !all {
+        let mut nodes = Vec::new();
+        for n in &reached {
+            if let Some(node) = store.get_node(n.node.id)? {
+                nodes.push((n.hops, display_row_name(&n.node), node));
+            }
+        }
+        let rows = nodes
+            .iter()
+            .map(|(hops, name, node)| ExpandEvidenceNode {
+                title: format!("hop {hops} {name}"),
+                node,
+                site_lines: Vec::new(),
+                extra_json: serde_json::json!({"hops": hops}),
+            })
+            .collect::<Vec<_>>();
+        insert_nav_expand_pack(&store, root, &project, "impact", query_symbol, total, &rows)
+    } else {
+        None
+    };
     if json {
         let hits = reached[..shown]
             .iter()
@@ -4057,7 +4527,7 @@ fn dispatch_impact(
                 })
             })
             .collect();
-        impact_counts_json(
+        impact_counts_json_with_expand(
             &store,
             root,
             query_symbol,
@@ -4074,19 +4544,22 @@ fn dispatch_impact(
                 scope: "transitive",
             },
             hits,
+            expand.as_ref(),
         )?;
         return Ok(0);
     }
     for n in &reached[..shown] {
         println!(
-            "hop {} {} {}:{}",
+            "hop {} {} {}",
             n.hops,
             display_row_name(&n.node),
-            n.node.file_path,
-            n.node.start_line
+            line_span(&n.node.file_path, n.node.start_line, n.node.end_line)
         );
     }
     print_nav_more_footer(total, shown);
+    if let Some(expand) = &expand {
+        println!("{}", expand.text_line());
+    }
     Ok(0)
 }
 
@@ -4185,6 +4658,7 @@ fn dispatch_impact_diff_scope(
                             "qualified_name": &source.qualified_name,
                             "file_path": &source.file_path,
                             "start_line": source.start_line,
+                            "end_line": source.end_line,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -4230,10 +4704,13 @@ fn dispatch_impact_diff_scope(
     );
     for source in &sources[..source_shown] {
         println!(
-            "source {} {}:{}",
+            "source {} {}",
             display_row_name(&source.row),
-            source.row.file_path,
-            source.row.start_line
+            line_span(
+                &source.row.file_path,
+                source.row.start_line,
+                source.row.end_line
+            )
         );
     }
     if hits.is_empty() {
@@ -4249,11 +4726,10 @@ fn dispatch_impact_diff_scope(
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "hop {} {} {}:{} sources={}",
+            "hop {} {} {} sources={}",
             hit.hops,
             display_row_name(&hit.node),
-            hit.node.file_path,
-            hit.node.start_line,
+            line_span(&hit.node.file_path, hit.node.start_line, hit.node.end_line),
             source_names
         );
     }
@@ -4272,8 +4748,9 @@ const BRIEF_LIMIT: usize = 15;
 /// SINGLE call instead of three, which is exactly where the benchmark showed
 /// research-task iteration eating the token/time savings.
 fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
+    let query_symbol = symbol.unwrap_or("");
     if let Some(code) = graph_stale_gate(
         &store,
         root,
@@ -4301,12 +4778,18 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
         return content_fallback(&store, root, symbol.unwrap_or(""), "brief");
     }
     let root_path = resolve_root(root)?;
+    let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
 
     // Definition(s) + source span.
     let mut seen_def = std::collections::BTreeSet::new();
     for id in &targets {
         if let Some(n) = store.get_node(*id)? {
             if seen_def.insert(n.id) {
+                evidence_nodes.push((
+                    format!("definition {}", display_node_name(&n)),
+                    n.clone(),
+                    serde_json::json!({"section": "definition"}),
+                ));
                 println!(
                     "== {} ({}:{}-{}) ==",
                     display_node_name(&n),
@@ -4323,12 +4806,12 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
     let cshown = callers.len().min(BRIEF_LIMIT);
     println!("\n-- CALLERS ({}) --", callers.len());
     for n in &callers[..cshown] {
-        println!(
-            "  {} {}:{}",
-            display_node_name(n),
-            n.file_path,
-            n.start_line
-        );
+        evidence_nodes.push((
+            format!("caller {}", display_node_name(n)),
+            n.clone(),
+            serde_json::json!({"section": "callers"}),
+        ));
+        println!("  {} {}", display_node_name(n), node_line_span(n));
     }
     print_nav_more_footer(callers.len(), cshown);
 
@@ -4337,12 +4820,18 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
         let refs = greppy_search::find_references_to_any(&store, &targets, BRIEF_LIMIT)?;
         println!("\n-- REFERENCES ({}) --", total);
         for r in &refs {
+            if let Some(node) = store.get_node(r.node.id)? {
+                evidence_nodes.push((
+                    format!("reference {} {}", r.edge_type, display_node_name(&node)),
+                    node,
+                    serde_json::json!({"section": "references", "edge_type": r.edge_type}),
+                ));
+            }
             println!(
-                "  {} {} {}:{}",
+                "  {} {} {}",
                 r.edge_type,
                 display_row_name(&r.node),
-                r.node.file_path,
-                r.node.start_line
+                line_span(&r.node.file_path, r.node.start_line, r.node.end_line)
             );
         }
         print_nav_more_footer(total, refs.len());
@@ -4362,14 +4851,71 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
     let eshown = callees.len().min(BRIEF_LIMIT);
     println!("\n-- CALLS ({}) --", callees.len());
     for n in callees.values().take(eshown) {
-        println!(
-            "  {} {}:{}",
-            display_node_name(n),
-            n.file_path,
-            n.start_line
-        );
+        evidence_nodes.push((
+            format!("callee {}", display_node_name(n)),
+            n.clone(),
+            serde_json::json!({"section": "calls"}),
+        ));
+        println!("  {} {}", display_node_name(n), node_line_span(n));
     }
     print_nav_more_footer(callees.len(), eshown);
+    let evidence_rows = evidence_nodes
+        .iter()
+        .map(|(title, node, extra_json)| ExpandEvidenceNode {
+            title: title.clone(),
+            node,
+            site_lines: Vec::new(),
+            extra_json: extra_json.clone(),
+        })
+        .collect::<Vec<_>>();
+    if let Some(expand) = insert_nav_expand_pack(
+        &store,
+        root,
+        &project,
+        "brief",
+        query_symbol,
+        evidence_rows.len(),
+        &evidence_rows,
+    ) {
+        println!("{}", expand.text_line());
+    }
+    Ok(0)
+}
+
+fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
+    let id = id.unwrap_or("").trim();
+    if id.is_empty() {
+        return Err(Error::Invalid("expand requires an id".into()));
+    }
+    let store = open_default_store_query_writer(root)?;
+    let Some(pack) = store.get_expand_pack(id)? else {
+        println!("expand: id not found or expired: {id}");
+        return Ok(1);
+    };
+    if json {
+        let v = serde_json::json!({
+            "id": pack.id,
+            "project": pack.project,
+            "command": pack.command,
+            "query": pack.query,
+            "graph_generation": pack.graph_generation,
+            "created_at": pack.created_at,
+            "expires_at": pack.expires_at,
+            "summary": pack.summary_json,
+            "payload_text": pack.payload_text,
+            "payload_json": pack.payload_json,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&v)
+                .map_err(|e| Error::Invalid(format!("serialize expand JSON: {e}")))?
+        );
+    } else {
+        print!("{}", pack.payload_text);
+        if !pack.payload_text.ends_with('\n') {
+            println!();
+        }
+    }
     Ok(0)
 }
 
@@ -4912,7 +5458,7 @@ fn dispatch_who_calls(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -5027,10 +5573,32 @@ fn dispatch_who_calls(
     let total = nodes.len();
     let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
     let shown = if all { total } else { total.min(cap) };
+    let expand = if !all && !code {
+        let rows = nodes
+            .iter()
+            .map(|n| ExpandEvidenceNode {
+                title: display_node_name(n),
+                node: n,
+                site_lines: sorted_site_lines(sites.get(&n.id)),
+                extra_json: serde_json::json!({"role": "caller"}),
+            })
+            .collect::<Vec<_>>();
+        insert_nav_expand_pack(
+            &store,
+            root,
+            &project,
+            "who-calls",
+            query_symbol,
+            total,
+            &rows,
+        )
+    } else {
+        None
+    };
     if json {
         let project = project_for(root)?;
         let hits = nodes[..shown].iter().map(node_hit_json).collect();
-        nav_counts_json(
+        nav_counts_json_with_expand(
             &store,
             root,
             "who-calls",
@@ -5041,12 +5609,13 @@ fn dispatch_who_calls(
             shown,
             all,
             hits,
+            expand.as_ref(),
         )?;
         return Ok(0);
     }
     let repo_root = resolve_root(root)?;
     for n in &nodes[..shown] {
-        println!("{} {}:{}", display_node_name(n), n.file_path, n.start_line);
+        println!("{} {}", display_node_name(n), node_line_span(n));
         if let Some(lines) = sites.get(&n.id) {
             let mut lines = lines.clone();
             lines.sort_unstable();
@@ -5074,6 +5643,9 @@ fn dispatch_who_calls(
     }
     .print();
     print_textual_call_candidates(&store, &project, query_symbol, &targets, &nodes)?;
+    if let Some(expand) = &expand {
+        println!("{}", expand.text_line());
+    }
     Ok(0)
 }
 
@@ -5154,10 +5726,7 @@ fn print_textual_call_candidates(
     }
     let total = out.len();
     let shown = total.min(CANDIDATE_CAP);
-    println!(
-        "+{total} textual name match{}:",
-        if total == 1 { "" } else { "es" }
-    );
+    println!("unresolved textual candidates: {total}");
     for (loc, snippet) in out.iter().take(shown) {
         println!("  {loc}: {snippet}");
     }
@@ -5184,7 +5753,7 @@ fn dispatch_callees(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -5279,10 +5848,32 @@ fn dispatch_callees(
     let total = callees.len();
     let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
     let shown = if all { total } else { total.min(cap) };
+    let expand = if !all && !code {
+        let rows = callees
+            .values()
+            .map(|n| ExpandEvidenceNode {
+                title: display_node_name(n),
+                node: n,
+                site_lines: Vec::new(),
+                extra_json: serde_json::json!({"role": "callee"}),
+            })
+            .collect::<Vec<_>>();
+        insert_nav_expand_pack(
+            &store,
+            root,
+            &project,
+            "callees",
+            query_symbol,
+            total,
+            &rows,
+        )
+    } else {
+        None
+    };
     if json {
         let project = project_for(root)?;
         let hits = callees.values().take(shown).map(node_hit_json).collect();
-        nav_counts_json(
+        nav_counts_json_with_expand(
             &store,
             root,
             "callees",
@@ -5293,11 +5884,12 @@ fn dispatch_callees(
             shown,
             all,
             hits,
+            expand.as_ref(),
         )?;
         return Ok(0);
     }
     for n in callees.values().take(shown) {
-        println!("{} {}:{}", display_node_name(n), n.file_path, n.start_line);
+        println!("{} {}", display_node_name(n), node_line_span(n));
         // Track A: with `--code`, print the callee's body so the agent
         // sees the callee definition without a separate Read.
         if let Some(root_path) = span_root.as_deref() {
@@ -5314,6 +5906,9 @@ fn dispatch_callees(
         provider_incomplete,
     }
     .print();
+    if let Some(expand) = &expand {
+        println!("{}", expand.text_line());
+    }
     Ok(0)
 }
 
@@ -5328,7 +5923,7 @@ fn dispatch_find_usages(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -5452,6 +6047,28 @@ fn dispatch_find_usages(
     let total = rows.len();
     let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
     let shown = if all { total } else { total.min(cap) };
+    let expand = if !all && !code {
+        let evidence_rows = rows
+            .iter()
+            .map(|(edge_type, n)| ExpandEvidenceNode {
+                title: format!("{edge_type} {}", display_node_name(n)),
+                node: n,
+                site_lines: sorted_site_lines(sites.get(&(edge_type.clone(), n.id))),
+                extra_json: serde_json::json!({"edge_type": edge_type}),
+            })
+            .collect::<Vec<_>>();
+        insert_nav_expand_pack(
+            &store,
+            root,
+            &project,
+            "find-usages",
+            query_symbol,
+            total,
+            &evidence_rows,
+        )
+    } else {
+        None
+    };
     if json {
         let project = project_for(root)?;
         let hits = rows[..shown]
@@ -5466,7 +6083,7 @@ fn dispatch_find_usages(
                 })
             })
             .collect();
-        nav_counts_json(
+        nav_counts_json_with_expand(
             &store,
             root,
             "find-usages",
@@ -5477,17 +6094,17 @@ fn dispatch_find_usages(
             shown,
             all,
             hits,
+            expand.as_ref(),
         )?;
         return Ok(0);
     }
     let repo_root = resolve_root(root)?;
     for (edge_type, n) in &rows[..shown] {
         println!(
-            "{} {} {}:{}",
+            "{} {} {}",
             edge_type,
             display_node_name(n),
-            n.file_path,
-            n.start_line
+            node_line_span(n)
         );
         if let Some(lines) = sites.get(&(edge_type.clone(), n.id)) {
             let mut lines = lines.clone();
@@ -5515,6 +6132,9 @@ fn dispatch_find_usages(
         provider_incomplete,
     }
     .print();
+    if let Some(expand) = &expand {
+        println!("{}", expand.text_line());
+    }
     Ok(0)
 }
 
@@ -5530,7 +6150,7 @@ fn dispatch_references(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -5586,13 +6206,41 @@ fn dispatch_references(
     let fetch_limit = if all {
         greppy_search::MAX_REACH_RESULTS
     } else {
-        cap
+        EXPAND_NAV_EVIDENCE_LIMIT.max(cap)
     };
     let refs = greppy_search::find_references_to_any(&store, &targets, fetch_limit)?;
-    let shown = refs.len();
+    let shown = if all { refs.len() } else { refs.len().min(cap) };
+    let expand = if !all && !code {
+        let mut nodes = Vec::new();
+        for r in &refs {
+            if let Some(node) = store.get_node(r.node.id)? {
+                nodes.push((r.edge_type.clone(), node));
+            }
+        }
+        let evidence_rows = nodes
+            .iter()
+            .map(|(edge_type, node)| ExpandEvidenceNode {
+                title: format!("{edge_type} {}", display_node_name(node)),
+                node,
+                site_lines: Vec::new(),
+                extra_json: serde_json::json!({"edge_type": edge_type}),
+            })
+            .collect::<Vec<_>>();
+        insert_nav_expand_pack(
+            &store,
+            root,
+            &project,
+            "references",
+            query_symbol,
+            total,
+            &evidence_rows,
+        )
+    } else {
+        None
+    };
 
     if json {
-        let hits = refs
+        let hits = refs[..shown]
             .iter()
             .map(|r| {
                 serde_json::json!({
@@ -5607,7 +6255,7 @@ fn dispatch_references(
                 })
             })
             .collect();
-        nav_counts_json(
+        nav_counts_json_with_expand(
             &store,
             root,
             "references",
@@ -5618,6 +6266,7 @@ fn dispatch_references(
             shown,
             all,
             hits,
+            expand.as_ref(),
         )?;
         return Ok(0);
     }
@@ -5632,13 +6281,12 @@ fn dispatch_references(
     } else {
         None
     };
-    for r in &refs {
+    for r in &refs[..shown] {
         println!(
-            "{} {} {}:{}",
+            "{} {} {}",
             r.edge_type,
             display_row_name(&r.node),
-            r.node.file_path,
-            r.node.start_line
+            line_span(&r.node.file_path, r.node.start_line, r.node.end_line)
         );
         if let Some(root_path) = span_root.as_deref() {
             if let Some(node) = store.get_node(r.node.id)? {
@@ -5647,6 +6295,9 @@ fn dispatch_references(
         }
     }
     print_nav_more_footer(total, shown);
+    if let Some(expand) = &expand {
+        println!("{}", expand.text_line());
+    }
     Ok(0)
 }
 
@@ -8066,7 +8717,7 @@ fn dispatch_semantic(
         return Err(Error::Invalid("semantic requires a query".into()));
     }
 
-    let store = open_default_store(root)?;
+    let store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
     // D2 fail-open: refuse only when no usable index exists; a stale
     // index serves labeled results (auto-healed first when small). The
@@ -8201,8 +8852,11 @@ fn dispatch_semantic(
             Ok(query_vector) => {
                 scope.limit = 20;
                 let hits = greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
+                let expand = insert_semantic_vector_expand_pack(
+                    &store, root, &project, q, generation, &hits,
+                );
                 if json {
-                    semantic_vector_json(
+                    semantic_vector_json_with_expand(
                         &store,
                         &project,
                         &cfg,
@@ -8212,6 +8866,7 @@ fn dispatch_semantic(
                         Some(&freshness),
                         "ok",
                         &hits,
+                        expand.as_ref(),
                     )?;
                 } else if hits.is_empty() {
                     println!("(no vector matches)");
@@ -8231,6 +8886,9 @@ fn dispatch_semantic(
                             h.embedding.end_line
                         );
                     }
+                    if let Some(expand) = &expand {
+                        println!("{}", expand.text_line());
+                    }
                 }
                 return Ok(if hits.is_empty() { 1 } else { 0 });
             }
@@ -8241,8 +8899,16 @@ fn dispatch_semantic(
     }
 
     let hits = greppy_search::semantic_query(&store, q, None, Some(&project), 20)?;
+    let expand = insert_semantic_algorithmic_expand_pack(&store, root, &project, q, &hits);
     if json {
-        semantic_algorithmic_json(&store, &project, "ok", Some(&freshness), &hits)?;
+        semantic_algorithmic_json_with_expand(
+            &store,
+            &project,
+            "ok",
+            Some(&freshness),
+            &hits,
+            expand.as_ref(),
+        )?;
         return Ok(if hits.is_empty() { 1 } else { 0 });
     }
     if hits.is_empty() {
@@ -8263,12 +8929,16 @@ fn dispatch_semantic(
                 flags.push("file");
             }
             println!(
-                "{:.3}  {}  {}  [{}]",
+                "{:.3}  {}  {}  {}  [{}]",
                 h.score,
                 h.node.label,
                 h.node.qualified_name,
+                line_span(&h.node.file_path, h.node.start_line, h.node.end_line),
                 flags.join(",")
             );
+        }
+        if let Some(expand) = &expand {
+            println!("{}", expand.text_line());
         }
     }
     Ok(0)
@@ -8299,6 +8969,33 @@ fn semantic_vector_json(
     status: &str,
     hits: &[greppy_store::VectorSearchHit],
 ) -> Result<()> {
+    semantic_vector_json_with_expand(
+        store,
+        project,
+        cfg,
+        graph_generation,
+        total,
+        candidate_limit,
+        freshness,
+        status,
+        hits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn semantic_vector_json_with_expand(
+    store: &greppy_store::Store,
+    project: &str,
+    cfg: &EmbeddingModelConfig,
+    graph_generation: u64,
+    total: i64,
+    candidate_limit: Option<i64>,
+    freshness: Option<&serde_json::Value>,
+    status: &str,
+    hits: &[greppy_store::VectorSearchHit],
+    expand: Option<&ExpandHandle>,
+) -> Result<()> {
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let rows = hits
         .iter()
@@ -8315,36 +9012,40 @@ fn semantic_vector_json(
         })
         .collect::<Vec<_>>();
     let shown = rows.len() as i64;
+    let mut v = serde_json::json!({
+        "command": "semantic",
+        "mode": "vector",
+        "status": status,
+        "project": project,
+        "backend": "exact_cosine",
+        "scope": "embeddinggemma_code_retrieval_current_generation",
+        "model_id": cfg.model_id,
+        "prompt_version": greppy_embed_native::PROMPT_VERSION,
+        "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
+        "graph_generation": graph_generation,
+        "fresh": freshness
+            .and_then(|v| v.get("fresh"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "freshness": freshness.cloned().unwrap_or(serde_json::Value::Null),
+        "provider_complete": incomplete_providers.is_empty(),
+        "incomplete_provider_count": incomplete_providers.len(),
+        "incomplete_providers": incomplete_providers,
+        "candidate_limit": candidate_limit,
+        "candidate_limit_env": ENV_VECTOR_EXACT_CANDIDATE_LIMIT,
+        "total_exact": total,
+        "shown": shown,
+        "omitted": total.saturating_sub(shown),
+        "truncated": shown < total,
+        "hits": rows,
+    });
+    if let Some(expand) = expand {
+        v["expand"] = expand.json_value();
+    }
     println!(
         "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "semantic",
-            "mode": "vector",
-            "status": status,
-            "project": project,
-            "backend": "exact_cosine",
-            "scope": "embeddinggemma_code_retrieval_current_generation",
-            "model_id": cfg.model_id,
-            "prompt_version": greppy_embed_native::PROMPT_VERSION,
-            "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
-            "graph_generation": graph_generation,
-            "fresh": freshness
-                .and_then(|v| v.get("fresh"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            "freshness": freshness.cloned().unwrap_or(serde_json::Value::Null),
-            "provider_complete": incomplete_providers.is_empty(),
-            "incomplete_provider_count": incomplete_providers.len(),
-            "incomplete_providers": incomplete_providers,
-            "candidate_limit": candidate_limit,
-            "candidate_limit_env": ENV_VECTOR_EXACT_CANDIDATE_LIMIT,
-            "total_exact": total,
-            "shown": shown,
-            "omitted": total.saturating_sub(shown),
-            "truncated": shown < total,
-            "hits": rows,
-        }))
-        .map_err(|e| Error::Invalid(format!("serialize vector semantic JSON: {e}")))?
+        serde_json::to_string_pretty(&v)
+            .map_err(|e| Error::Invalid(format!("serialize vector semantic JSON: {e}")))?
     );
     Ok(())
 }
@@ -8355,6 +9056,17 @@ fn semantic_algorithmic_json(
     status: &str,
     freshness: Option<&serde_json::Value>,
     hits: &[greppy_search::SemanticHit],
+) -> Result<()> {
+    semantic_algorithmic_json_with_expand(store, project, status, freshness, hits, None)
+}
+
+fn semantic_algorithmic_json_with_expand(
+    store: &greppy_store::Store,
+    project: &str,
+    status: &str,
+    freshness: Option<&serde_json::Value>,
+    hits: &[greppy_search::SemanticHit],
+    expand: Option<&ExpandHandle>,
 ) -> Result<()> {
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let rows = hits
@@ -8378,28 +9090,32 @@ fn semantic_algorithmic_json(
             })
         })
         .collect::<Vec<_>>();
+    let mut v = serde_json::json!({
+        "command": "semantic",
+        "mode": "algorithmic",
+        "status": status,
+        "project": project,
+        "fresh": freshness
+            .and_then(|v| v.get("fresh"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "freshness": freshness.cloned().unwrap_or(serde_json::Value::Null),
+        "provider_complete": incomplete_providers.is_empty(),
+        "incomplete_provider_count": incomplete_providers.len(),
+        "incomplete_providers": incomplete_providers,
+        "total_exact": rows.len(),
+        "shown": rows.len(),
+        "omitted": 0,
+        "truncated": false,
+        "hits": rows,
+    });
+    if let Some(expand) = expand {
+        v["expand"] = expand.json_value();
+    }
     println!(
         "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "semantic",
-            "mode": "algorithmic",
-            "status": status,
-            "project": project,
-            "fresh": freshness
-                .and_then(|v| v.get("fresh"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            "freshness": freshness.cloned().unwrap_or(serde_json::Value::Null),
-            "provider_complete": incomplete_providers.is_empty(),
-            "incomplete_provider_count": incomplete_providers.len(),
-            "incomplete_providers": incomplete_providers,
-            "total_exact": rows.len(),
-            "shown": rows.len(),
-            "omitted": 0,
-            "truncated": false,
-            "hits": rows,
-        }))
-        .map_err(|e| Error::Invalid(format!("serialize semantic JSON: {e}")))?
+        serde_json::to_string_pretty(&v)
+            .map_err(|e| Error::Invalid(format!("serialize semantic JSON: {e}")))?
     );
     Ok(())
 }
@@ -9144,10 +9860,10 @@ const CONTEXT_DIGEST_MAX_CALLEES: usize = 8;
 /// bodies is the answer).
 ///
 /// A single SHORT header precedes the locators, telling the agent these are
-/// ranked semantic matches (most-relevant first) so it takes #1 and STOPS
-/// instead of re-querying. The header is deliberately terse — the H2 slim lesson
-/// is that a verbose hedge backfires (a 22-token hedge doubled outputs and was
-/// reverted), so this is one line, no per-hit caveats.
+/// ranked semantic matches (most-relevant first). The header is deliberately
+/// terse — the H2 slim lesson is that a verbose hedge backfires (a 22-token
+/// hedge doubled outputs and was reverted), so this is one line, no per-hit
+/// caveats.
 ///
 /// JSON mode keeps the structured def-span metadata (a separate machine
 /// consumer) via `emit_context_locators`; only the human/text output is leaned.
@@ -9175,8 +9891,7 @@ fn emit_context_vector_locators(
         return Ok(1);
     }
 
-    // TRUST/STOP signal: one short line, most-relevant-first, so the agent
-    // takes the #1 hit and stops rather than iterating rephrase/search-symbols.
+    // One short line, most-relevant-first.
     // EXCEPT when the top scores nearly tie (vocabulary-mismatch queries):
     // claiming "#1 is the most likely answer" over a near-tie of plausible
     // wrong candidates sent an agent into a 39-call verify spiral (r042).
@@ -9184,25 +9899,21 @@ fn emit_context_vector_locators(
     // it does not violate the no-false-hedges rule — it saves the agent from
     // serially disproving candidates the ranking itself cannot separate.
     // Show the #1 structural digest for any conceptual query — confident OR
-    // near-tie. The near-tie case is exactly where the agent used to rephrase
-    // and re-search (the dominant cost-loss spiral), because the old message
-    // told it to "search for a domain-specific identifier instead". Instead we
-    // show the #1 call map and point at #2/#3's locations, with an explicit
-    // "do not re-search" — the digest lets the agent PICK and read, not re-query.
+    // near-tie. The near-tie case is exactly where agents used to rephrase
+    // and re-search (the dominant cost-loss spiral). The digest exposes the
+    // evidence without giving procedural instructions.
     // A short/locate query (< min words) stays sig-only, protecting "where is X".
     let show_top_body = conceptual;
     if low_confidence {
         println!(
-            "# semantic candidates (top scores are close). The #1 call map is shown below — if it matches, open it and read to answer; otherwise open #2/#3 by their file:line. Do NOT re-run search with reworded queries."
+            "# semantic candidates (top scores are close). The #1 call map is shown below; #2/#3 locators follow."
         );
     } else if show_top_body {
         println!(
-            "# top semantic matches (most relevant first). The #1 call map is shown below — open it and read to answer; re-running search with reworded queries will not surface new locations."
+            "# top semantic matches (most relevant first). The #1 call map is shown below; additional locators follow."
         );
     } else {
-        println!(
-        "# top semantic matches (most relevant first) — the #1 result is the most likely answer."
-        );
+        println!("# top semantic matches (most relevant first).");
     }
     for (idx, def) in defs.iter().take(CONTEXT_VECTOR_LEAN_TOP_N).enumerate() {
         let display_name = display_context_def_name(store, def);
@@ -9582,10 +10293,8 @@ fn embedding_config_optional(args: EmbeddingCliArgs<'_>) -> Result<Option<Embedd
 /// bytes, so stale or torn cache entries self-repair without hashing the model
 /// on every CLI invocation.
 mod embedded_model {
-    #[cfg(feature = "embedded-model")]
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    #[cfg(feature = "embedded-model")]
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
@@ -9598,7 +10307,6 @@ mod embedded_model {
         Some((gguf, tok))
     }
 
-    #[cfg(feature = "embedded-model")]
     fn extract(
         root: &std::path::Path,
         expected_sha: &str,
@@ -9639,7 +10347,6 @@ mod embedded_model {
         }
     }
 
-    #[cfg(feature = "embedded-model")]
     fn cache_entry_is_valid(
         dest: &std::path::Path,
         marker: &std::path::Path,
@@ -9657,7 +10364,6 @@ mod embedded_model {
             .unwrap_or(false)
     }
 
-    #[cfg(feature = "embedded-model")]
     fn write_verified_cache_entry(
         tmp: &std::path::Path,
         dest: &std::path::Path,
@@ -9681,7 +10387,6 @@ mod embedded_model {
         Ok(())
     }
 
-    #[cfg(feature = "embedded-model")]
     fn ensure_len(path: &std::path::Path, expected_len: usize) -> std::io::Result<()> {
         let len = std::fs::metadata(path)?.len();
         if len == expected_len as u64 {
@@ -9694,11 +10399,6 @@ mod embedded_model {
                 path.display()
             ),
         ))
-    }
-
-    #[cfg(not(feature = "embedded-model"))]
-    pub fn paths() -> Option<(String, String)> {
-        None
     }
 }
 
@@ -10122,6 +10822,25 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     Ok(store)
 }
 
+fn open_default_store_query_writer(root: Option<&str>) -> Result<greppy_store::Store> {
+    let effective_root = resolve_root(root)?;
+    let path = workspace_locator::store_path(&effective_root);
+    if !path.exists() {
+        // Reuse the normal query open to trigger the existing first-use
+        // auto-index/error path, then reopen writable for the evidence write.
+        drop(open_default_store(root)?);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = workspace_locator::ensure_store_dir(parent);
+    }
+    let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())?;
+    let _ = workspace_locator::ensure_db_mode(&path);
+    if let Some(store_dir) = path.parent() {
+        workspace_locator::touch_lastused(store_dir);
+    }
+    Ok(store)
+}
+
 /// Feature A helper — build a fresh GRAPH index (no embeddings) for the
 /// workspace at `root` on an empty/absent store, holding the writer
 /// lock. Returns true when the index was written cleanly.
@@ -10383,8 +11102,7 @@ fn index_atomic_snapshot(
     };
 
     let report =
-        match greppy_indexer::index_with_options(&mut temp_store, target, project, index_options)
-        {
+        match greppy_indexer::index_with_options(&mut temp_store, target, project, index_options) {
             Ok(report) => report,
             Err(e) => {
                 drop(temp_store);
@@ -11417,6 +12135,14 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let cli = Cli::try_parse_from(["grepplus", "semantic-search", "retry handler"]).unwrap();
+        match cli.command {
+            Some(Command::Semantic { query, .. }) => {
+                assert_eq!(query.as_deref(), Some("retry handler"));
+            }
+            other => panic!("unexpected command for semantic-search alias: {other:?}"),
+        }
     }
 
     #[test]
@@ -11717,8 +12443,8 @@ mod tests {
 
     #[test]
     fn search_code_staged_parses_as_explicit_scope() {
-        let cli = Cli::try_parse_from(["greppy", "search-code", "--staged", "--json", "needle"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["greppy", "search-code", "--staged", "--json", "needle"]).unwrap();
         match cli.command {
             Some(Command::SearchCode {
                 query,
@@ -12042,22 +12768,12 @@ mod tests {
         assert!(is_grep_passthrough(&mk(&["greppy", "-R", "foo", "."])));
         assert!(is_grep_passthrough(&mk(&["greppy", "foo", "f.txt"])));
         // Explicit `grep` subcommand → NOT passthrough (clap handles it).
-        assert!(!is_grep_passthrough(&mk(&[
-            "greppy", "grep", "-R", "foo"
-        ])));
+        assert!(!is_grep_passthrough(&mk(&["greppy", "grep", "-R", "foo"])));
         // Structured subcommands → NOT passthrough.
         assert!(!is_grep_passthrough(&mk(&["greppy", "index", "."])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "doctor"])));
-        assert!(!is_grep_passthrough(&mk(&[
-            "greppy",
-            "find-usages",
-            "Foo"
-        ])));
-        assert!(!is_grep_passthrough(&mk(&[
-            "greppy",
-            "references",
-            "Foo"
-        ])));
+        assert!(!is_grep_passthrough(&mk(&["greppy", "find-usages", "Foo"])));
+        assert!(!is_grep_passthrough(&mk(&["greppy", "references", "Foo"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "fan-in"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "fan-out"])));
         assert!(!is_grep_passthrough(&mk(&[
