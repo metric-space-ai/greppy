@@ -500,7 +500,7 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
 
     let (code, out, err) = run_with_env(
         &[
-            "semantic",
+            "semantic-search",
             "--vectors",
             "--json",
             "--embedding-gguf",
@@ -523,7 +523,7 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "semantic");
+    assert_eq!(v["command"], "semantic-search");
     assert_eq!(v["mode"], "vector");
     assert_eq!(v["status"], "skipped_incomplete_provider");
     assert_eq!(v["provider_complete"], false);
@@ -1007,7 +1007,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
 
     let (code, out, err) = run_with_env(
         &[
-            "semantic",
+            "semantic-search",
             "--vectors",
             "--json",
             "--embedding-gguf",
@@ -1070,7 +1070,7 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
 
     let (code, out, err) = run(
         &[
-            "semantic",
+            "semantic-search",
             "--vectors",
             "--json",
             "--embedding-gguf",
@@ -1119,7 +1119,7 @@ fn semantic_algorithmic_stale_index_serves_labeled_hits() {
     .unwrap();
 
     let (code, out, err) = run_with_env(
-        &["semantic", "--json", "semantic_stale_marker"],
+        &["semantic-search", "--json", "semantic_stale_marker"],
         &repo,
         &store_dir,
         &[("GREPPY_AUTO_REINDEX", "0")],

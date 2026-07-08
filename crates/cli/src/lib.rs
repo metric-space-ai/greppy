@@ -3,18 +3,17 @@
 //! Subcommand surface:
 //! - `grep`         — drop-in wrapper, delegates to real grep.
 //! - `index`        — index a repo.
-//! - `search-graph` — graph search
-//! - `trace`        — call-graph trace     (not implemented)
-//! - `search-code`  — code search          (not implemented)
-//! - `semantic`     — semantic query       (not implemented)
+//! - `search-graph` — graph search.
+//! - `who-calls` / `callees` / `find-usages` / `impact` / `brief` — graph navigation.
+//! - `semantic-search` (`semantic`) — meaning-based code search.
+//! - `search-code` / `search-symbols` — indexed code and symbol search.
 //! - `install`      — agent installer      (out of scope)
 //! - `uninstall`    — agent uninstaller    (out of scope)
 //! - `update`       — agent updater        (out of scope)
 //! - `config`       — runtime config       (out of scope)
 //!
-//! All "not implemented" subcommands print a structured error and exit
-//! with a documented non-zero code (EX_UNAVAILABLE = 69). The "out of
-//! scope" subcommands do the same with the `OutOfScope` variant.
+//! Out-of-scope lifecycle subcommands print a structured error and exit
+//! with a documented non-zero code (EX_UNAVAILABLE = 69).
 
 #[cfg(not(feature = "embedded-model"))]
 compile_error!(
@@ -132,7 +131,7 @@ enum EmbeddingModelSource {
     name = "grep",
     bin_name = "grep",
     version,
-    about = "A drop-in grep that also answers code-structure questions over an indexed codebase (who-calls / callees / impact / context).",
+    about = "A drop-in grep that also answers code-structure questions over an indexed codebase (who-calls / callees / impact / semantic-search).",
     long_about = None,
     allow_external_subcommands = true,
     disable_help_subcommand = true,
@@ -142,7 +141,7 @@ enum EmbeddingModelSource {
 pub struct Cli {
     /// Explicit repository root (RV-006). When set, `index` and every
     /// query subcommand (search-graph / trace / search-code /
-    /// search-symbols / semantic) key the on-disk store and the project
+    /// search-symbols / semantic-search) key the on-disk store and the project
     /// identity on this path instead of detecting the repo root by
     /// walking up from the current directory. `global = true` lets it be
     /// passed either before or after the subcommand:
@@ -271,7 +270,7 @@ pub enum Command {
     /// One-call briefing for a symbol: its definition (with source), its direct
     /// callers, and its direct callees — everything an agent needs to answer
     /// "how does S work / what is its role / what depends on it" in a SINGLE
-    /// call, instead of iterating context + who-calls + callees separately.
+    /// call, instead of iterating semantic-search + who-calls + callees separately.
     Brief {
         symbol: Option<String>,
         /// Accepted for agent ergonomics: brief already prints the
@@ -529,7 +528,7 @@ pub enum Command {
     /// Semantic query. Default is algorithmic lexical semantic
     /// ranking; `--vectors` uses EmbeddingGemma vector search over indexed
     /// code-span embeddings.
-    #[command(alias = "semantic-search")]
+    #[command(name = "semantic-search", alias = "semantic")]
     Semantic {
         query: Option<String>,
         /// Use EmbeddingGemma vector search over indexed code-span embeddings.
@@ -560,6 +559,10 @@ pub enum Command {
         #[arg(long)]
         no_gpu: bool,
     },
+    /// Legacy compatibility command for resolving definitions. Prefer
+    /// `semantic-search` for meaning-based search and `brief` for a compact
+    /// structural digest.
+    ///
     /// Resolve the most relevant definitions for `<query>` and print their
     /// ACTUAL SOURCE SPANS (not just file:line pointers), so an agent reads
     /// the relevant function/struct bodies directly instead of opening the
@@ -570,15 +573,15 @@ pub enum Command {
     /// note.
     ///
     /// For MULTI-WORD natural-language queries (which contain spaces), when
-    /// exact/FTS/algorithmic-semantic resolution finds nothing, `context`
+    /// exact/FTS/algorithmic-semantic resolution finds nothing, this legacy command
     /// automatically falls back to NATIVE EmbeddingGemma vector similarity
     /// over the indexed code-span embeddings — the case where the question
     /// shares no literal words with the target definition. Bare single
     /// identifiers keep the lean exact find-definition path and never invoke
     /// the model, so exact-name / graph queries stay vector-free (router
     /// contract: `avoid_embedding` classes never touch the embedding model).
-    /// If no embedding model is configured (see the flags / env below) the
-    /// fallback degrades gracefully with a stderr note; it never crashes.
+    /// The vector fallback uses greppy's bundled embedding model.
+    #[command(hide = true)]
     Context {
         /// The natural-language or symbol query to resolve to definitions.
         query: Option<String>,
@@ -695,8 +698,8 @@ const SUBCOMMANDS: &[&str] = &[
     "search-code",
     "search-symbols",
     "plus",
-    "semantic",
     "semantic-search",
+    "semantic",
     "context",
     "install",
     "uninstall",
@@ -763,7 +766,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             } else {
                 eprintln!(
                     "usage: greppy <command> --help  (commands: index, who-calls, callees, \
-                     find-usages, impact, brief, context, search-code, search-symbols, \
+                     find-usages, impact, brief, semantic-search, search-code, search-symbols, \
                      path, index status)"
                 );
             }
@@ -788,7 +791,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "brief" => "greppy brief SYMBOL [--root DIR]",
         "expand" => "greppy expand ID [--json] [--root DIR]",
-        "semantic-search" => "greppy semantic-search \"QUERY\" [--root DIR]",
+        "semantic-search" | "semantic" => "greppy semantic-search \"QUERY\" [--root DIR]",
         "context" => "greppy context \"QUERY\" [--root DIR]",
         "search-code" => "greppy search-code QUERY [--json] [--root DIR]",
         "search-symbols" => {
@@ -935,7 +938,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     println!("   or: grep <command> [--root DIR]      commands:");
     println!("       index PATH [--embeddings]  who-calls S   callees S   find-usages S");
     println!("       references S (who depends on S)   impact S [--direction incoming|outgoing]");
-    println!("       brief S   context \"QUERY\"");
+    println!("       brief S   semantic-search \"QUERY\"");
     println!("       search-code Q   search-symbols NAME [--kind function|method|struct|class]");
     println!("       index status   (--help for full details)");
     Ok(EXIT_USAGE as i32)
@@ -2315,7 +2318,7 @@ fn insert_semantic_algorithmic_expand_pack(
     let root_path = resolve_root(root).ok()?;
     let limit = hits.len().min(6);
     let mut text = String::new();
-    text.push_str(&format!("# evidence pack: semantic {query}\n"));
+    text.push_str(&format!("# evidence pack: semantic-search {query}\n"));
     text.push_str(&format!(
         "# spans: {limit} shown of {} hits\n\n",
         hits.len()
@@ -2357,7 +2360,7 @@ fn insert_semantic_algorithmic_expand_pack(
         "total": hits.len(),
     });
     let payload_json = serde_json::json!({
-        "command": "semantic",
+        "command": "semantic-search",
         "mode": "algorithmic",
         "query": query,
         "shown": limit,
@@ -2366,7 +2369,7 @@ fn insert_semantic_algorithmic_expand_pack(
     insert_expand_pack_best_effort(
         store,
         project,
-        "semantic",
+        "semantic-search",
         query,
         current_graph_generation_or_zero(store, root),
         summary,
@@ -2389,7 +2392,9 @@ fn insert_semantic_vector_expand_pack(
     let root_path = resolve_root(root).ok()?;
     let limit = hits.len().min(6);
     let mut text = String::new();
-    text.push_str(&format!("# evidence pack: semantic --vectors {query}\n"));
+    text.push_str(&format!(
+        "# evidence pack: semantic-search --vectors {query}\n"
+    ));
     text.push_str(&format!(
         "# spans: {limit} shown of {} hits\n\n",
         hits.len()
@@ -2427,7 +2432,7 @@ fn insert_semantic_vector_expand_pack(
         "total": hits.len(),
     });
     let payload_json = serde_json::json!({
-        "command": "semantic",
+        "command": "semantic-search",
         "mode": "vector",
         "query": query,
         "shown": limit,
@@ -2436,7 +2441,7 @@ fn insert_semantic_vector_expand_pack(
     insert_expand_pack_best_effort(
         store,
         project,
-        "semantic",
+        "semantic-search",
         query,
         graph_generation,
         summary,
@@ -5340,7 +5345,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         if vectors_missing_with_model {
             println!(
                 "vectors: none stored though an embedding model is configured \
-                 — semantic `context` will build them on first use, or run \
+                 — `semantic-search --vectors` will build them on first use, or run \
                  `grep index --embeddings ...` now"
             );
         }
@@ -8714,7 +8719,7 @@ fn dispatch_semantic(
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
-        return Err(Error::Invalid("semantic requires a query".into()));
+        return Err(Error::Invalid("semantic-search requires a query".into()));
     }
 
     let store = open_default_store_query_writer(root)?;
@@ -8744,7 +8749,10 @@ fn dispatch_semantic(
                     &[],
                 )?;
             } else {
-                println!("{}", semantic_stale_skip_message("semantic", freshness));
+                println!(
+                    "{}",
+                    semantic_stale_skip_message("semantic-search", freshness)
+                );
             }
             return Ok(1);
         }
@@ -8762,7 +8770,7 @@ fn dispatch_semantic(
         } else {
             println!(
                 "{}",
-                provider_incomplete_skip_message("semantic", incomplete_providers.len())
+                provider_incomplete_skip_message("semantic-search", incomplete_providers.len())
             );
         }
         return Ok(1);
@@ -8821,7 +8829,7 @@ fn dispatch_semantic(
             } else {
                 println!(
                     "{}",
-                    vector_stale_skip_message("semantic --vectors", &freshness)
+                    vector_stale_skip_message("semantic-search --vectors", &freshness)
                 );
             }
             return Ok(1);
@@ -8842,7 +8850,7 @@ fn dispatch_semantic(
             } else {
                 println!(
                     "{}",
-                    vector_exact_scan_skip_message("semantic --vectors", total, limit)
+                    vector_exact_scan_skip_message("semantic-search --vectors", total, limit)
                 );
             }
             return Ok(1);
@@ -8893,7 +8901,7 @@ fn dispatch_semantic(
                 return Ok(if hits.is_empty() { 1 } else { 0 });
             }
             Err(e) => {
-                log_embedding_skip_once("semantic --vectors", &e);
+                log_embedding_skip_once("semantic-search --vectors", &e);
             }
         }
     }
@@ -9013,7 +9021,7 @@ fn semantic_vector_json_with_expand(
         .collect::<Vec<_>>();
     let shown = rows.len() as i64;
     let mut v = serde_json::json!({
-        "command": "semantic",
+        "command": "semantic-search",
         "mode": "vector",
         "status": status,
         "project": project,
@@ -9091,7 +9099,7 @@ fn semantic_algorithmic_json_with_expand(
         })
         .collect::<Vec<_>>();
     let mut v = serde_json::json!({
-        "command": "semantic",
+        "command": "semantic-search",
         "mode": "algorithmic",
         "status": status,
         "project": project,
@@ -9129,7 +9137,7 @@ fn semantic_provider_incomplete_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "command": "semantic",
+            "command": "semantic-search",
             "mode": mode,
             "status": "skipped_incomplete_provider",
             "project": project,
@@ -12109,7 +12117,7 @@ mod tests {
     fn parse_semantic_vector_flags() {
         let cli = Cli::try_parse_from([
             "greppy",
-            "semantic",
+            "semantic-search",
             "--vectors",
             "--json",
             "--embedding-model-dir",
@@ -12136,12 +12144,12 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["grepplus", "semantic-search", "retry handler"]).unwrap();
+        let cli = Cli::try_parse_from(["greppy", "semantic", "retry handler"]).unwrap();
         match cli.command {
             Some(Command::Semantic { query, .. }) => {
                 assert_eq!(query.as_deref(), Some("retry handler"));
             }
-            other => panic!("unexpected command for semantic-search alias: {other:?}"),
+            other => panic!("unexpected command for semantic alias: {other:?}"),
         }
     }
 
@@ -12211,7 +12219,7 @@ mod tests {
     fn cli_device_flags_parse_on_embedding_commands() {
         let cli = Cli::try_parse_from([
             "grep",
-            "semantic",
+            "semantic-search",
             "--vectors",
             "--device",
             "cuda",

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "greppy unified CLI (subcommand dispatcher for grep-plus tools)"
+description = "greppy unified CLI for grep-compatible search, code navigation, and semantic search"
 
 [[bin]]
 name = "greppy"

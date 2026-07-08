@@ -145,7 +145,7 @@ fn spawn_daemon(
 
 /// O5: nudge the daemon into existence (and model load) in the BACKGROUND
 /// from the first graph command of a session, so the session's first
-/// `context` query hits a warm model instead of paying the cold start.
+/// semantic query hits a warm model instead of paying the cold start.
 /// Fire-and-forget and strictly best-effort; respects the opt-out. Only
 /// fires when the caller has already established that semantic search is
 /// actually in play (model configured AND the store holds vectors) — a
