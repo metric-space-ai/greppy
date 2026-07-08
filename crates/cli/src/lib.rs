@@ -1177,7 +1177,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
         ),
         Command::Semantic {
             query,
-            vectors,
+            vectors: _,
             json,
             embedding_model_dir,
             embedding_gguf,
@@ -1188,10 +1188,11 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             no_gpu,
         } => dispatch_semantic(
             query.as_deref(),
-            vectors,
+            // Owner hard rule: semantic-search is ALWAYS vector embedding search.
+            true,
             json,
             EmbeddingCliArgs {
-                enabled: vectors,
+                enabled: true,
                 model_dir: embedding_model_dir.as_deref(),
                 gguf: embedding_gguf.as_deref(),
                 tokenizer: embedding_tokenizer.as_deref(),
@@ -10453,9 +10454,20 @@ fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingMode
             ));
         }
         (None, None, None) => {
-            return Err(Error::Invalid(format!(
-                "EmbeddingGemma model required: pass --embedding-model-dir, or --embedding-gguf with --embedding-tokenizer, or set {ENV_EMBED_MODEL_DIR}/{ENV_EMBED_GGUF}/{ENV_EMBED_TOKENIZER}"
-            )));
+            // Owner hard rule: embeddings always work by default. With no
+            // explicit model, fall back to the EmbeddingGemma baked into the
+            // binary (feature `embedded-model`) — exactly like the index path.
+            match embedded_model::paths() {
+                Some((gguf, tokenizer)) => EmbeddingModelSource::Gguf {
+                    gguf: gguf.into(),
+                    tokenizer: tokenizer.into(),
+                },
+                None => {
+                    return Err(Error::Invalid(format!(
+                        "EmbeddingGemma model required: pass --embedding-model-dir, or --embedding-gguf with --embedding-tokenizer, or set {ENV_EMBED_MODEL_DIR}/{ENV_EMBED_GGUF}/{ENV_EMBED_TOKENIZER}"
+                    )));
+                }
+            }
         }
     };
     Ok(EmbeddingModelConfig {
@@ -12212,6 +12224,30 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, Error::Invalid(msg) if msg.contains("either --embedding-model-dir or --embedding-gguf"))
+        );
+    }
+
+    #[test]
+    fn embedding_config_defaults_to_embedded_model_when_no_flags() {
+        // OWNER HARD RULE (regression guard): embeddings must ALWAYS work by
+        // default. With no --embedding-* flag/env, the resolver MUST fall back
+        // to the baked-in EmbeddingGemma (never the "model required" error).
+        // This locks the fix for the regression where semantic-search silently
+        // ran on the lexical/algorithmic path with no vectors at all.
+        let cfg = embedding_config_required(EmbeddingCliArgs {
+            enabled: true,
+            model_dir: None,
+            gguf: None,
+            tokenizer: None,
+            model_id: None,
+            max_length: None,
+            device: None,
+            no_gpu: true,
+        })
+        .expect("no-flags embedding config must resolve to the embedded model, not error");
+        assert!(
+            matches!(cfg.source, EmbeddingModelSource::Gguf { .. }),
+            "default embedding source must be the baked-in GGUF (embeddings never off)"
         );
     }
 
