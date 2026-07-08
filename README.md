@@ -25,6 +25,10 @@ greppy semantic-search "restrict a value to a range"   # find code by meaning
 greppy brief _split_blueprint_path             # definition + callers + callees
 ```
 
+<img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
+
+<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. greppy resolves the callers in a single `greppy who-calls` call instead of a grep-and-read spiral: **2.3× faster, 14 → 5 tool calls, ~9× fewer input tokens**. Counters are live from the recorded run.</sub>
+
 ---
 
 ## Setup — two steps
