@@ -2,7 +2,7 @@
 
 # greppy
 
-**Standard `grep`, plus a few commands your coding agent can use to navigate code — `who-calls`, `impact`, `semantic-search`, `brief`. Agents finish code-navigation tasks ~2× faster, ~3–4× cheaper, and more accurately. One native Rust binary.**
+**Standard `grep`, plus a few commands your coding agent uses to navigate code — `who-calls`, `impact`, `semantic-search`, `brief`. On structural code-navigation questions the agent answers correctly ~87% of the time instead of ~53% with plain grep — using fewer tokens. One native Rust binary.**
 
 [![Release](https://img.shields.io/github/v/release/metric-space-ai/greppy?display_name=tag&sort=semver&color=22c55e&label=release)](https://github.com/metric-space-ai/greppy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -94,27 +94,24 @@ finds code you cannot name.
 
 What an agent actually pays for is **billed tokens** and **wall-clock time.**
 
-<img src="docs/assets/nav-wins.svg" width="100%" alt="Per-task: on navigation questions the agent answers better and cheaper with greppy"/>
+<img src="docs/assets/nav-wins.svg" width="100%" alt="On structural code-navigation questions the agent answers correctly 87% with greppy vs 53% with plain grep, using fewer tokens"/>
 
-The benchmark: a real coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers **94 code questions** — *who-calls*, impact/blast-radius, call-chain traces, and vocabulary-gap "find the code that does X" — across **four real repositories** (Rust `serde`, Python `flask`, Java `gson`, TypeScript `zod`). The same agent runs each task twice: once with plain `grep`, once with `greppy`. The fixed system prompt is warmup and is excluded from every ratio. The harness is in [`bench/agent_efficiency/`](bench/agent_efficiency/). Medians:
+The benchmark: **14 coding-agent models** (Claude Opus/Sonnet/Fable, GPT-5.5, Gemini, Grok, DeepSeek, Qwen, GLM, Kimi, MiniMax-M3, …), each driven by [Pi Code](https://pi.dev), answer **35 code-navigation questions** across **7 real repositories** (Rust `serde` + `tokio`, Python `flask` + `django`, Java `gson`, TypeScript `zod`, Go `hugo`). Every task runs twice — once with plain `grep`, once with `greppy`, **same agent, same prompt.** Answers are **floor-graded**: a pass must name the ground-truth symbol/file (each anchor rg-verified at generation time). The harness is in [`bench/agent_efficiency/`](bench/agent_efficiency/).
 
-| What you actually pay | Median | |
-|---|---:|---|
-| **Search-context tokens** | **~7.8×** | cheaper |
-| **Loop prompt tokens** | **~2.3–2.9×** | cheaper |
-| **Output tokens** | **~2.0×** | fewer |
-| **Wall-clock time** | **~2.0×** | faster |
-| **Tool-call rounds** | **~2.9×** | fewer |
+**Correctness is the headline.** On **structural navigation** — *who-calls*, *callees*, *impact/blast-radius*, *find-symbol* — the agent answers correctly **87% of the time with greppy vs 53% with plain grep** (graded by the repo's own [`grade_answers.py`](bench/agent_efficiency/grade_answers.py)). Across all 35 questions: **90% vs 63%.** Plain grep is cheap but frequently confidently wrong; greppy resolves the relationship in one call.
 
-And it is not a speed-for-accuracy trade: on the same graded 94 questions the `greppy` agent answered **85 correctly (1 wrong)** vs plain grep's **77 (2 wrong)** — cheaper *and* more correct.
+| On structural navigation questions | grep | greppy |
+|---|---:|---:|
+| **Answered correctly** (floor-graded) | 53% | **87%** |
+| **Input tokens** (median · mean saving) | 1× | **1.2× · 2.3× fewer** |
+| **Search-context tokens** (median · mean) | 1× | **1.7× · 5.1× less** |
+| **Output tokens** (median) | 1× | **1.2× fewer** |
 
-**The gain depends on the model.** The extra commands only help a model that routes to them well — across a 14-model sweep the per-model efficiency gain varied widely and did **not** track a model's general agentic-benchmark score. Benchmark your own model; the median model still comes out ahead.
+So it is not a cost-for-accuracy trade: on structural questions greppy is **both more correct and cheaper.**
 
-<img src="docs/assets/gain-vs-agentic.svg" width="100%" alt="Real dollar saving per model vs Artificial Analysis Agentic Index — correlation near zero"/>
+**Where plain grep keeps up:** open-ended *"how does this subsystem work"* questions. Both tools reach the answer there (~98% correct either way), but greppy's precise locator makes the agent read more to explain the *mechanism*, so it costs a little **more**. greppy's edge is **pinpoint / structural** questions — the semantic path is being tuned to also lead the agent to the answer in one step.
 
-_Preliminary (being re-measured on the diverse multi-language set)._
-
-The win comes from one thing: **fewer model round-trips.** It is largest on structural questions (`who-calls`/`impact`) and vocabulary-gap searches (`semantic-search`), and ~1× on a plain literal search, where `grep` is already the right tool.
+**The gain depends on the model.** Across the 14 models the structural token-saving ranged from ~parity (Opus 4.8, Gemini 3.1 Pro) to **~1.8×** (Sonnet 5, Fable 5, MiniMax-M3), and did **not** track a model's general agentic-benchmark score. Benchmark your own model — most come out ahead, and every model gets the correctness lift.
 
 ---
 
