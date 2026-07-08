@@ -190,6 +190,13 @@ pub fn index_code_embeddings_for_project(
                     continue;
                 }
             };
+            // Skip minified / generated spans (a single line longer than this is
+            // machine-generated): embedding them is noise and pathologically slow.
+            const MAX_EMBED_LINE_BYTES: usize = 2048;
+            if span_has_overlong_line(source, node.start_line, node.end_line, MAX_EMBED_LINE_BYTES) {
+                report.nodes_skipped_oversize += 1;
+                continue;
+            }
             let title = format!(
                 "{}:{}-{} {}",
                 node.file_path, node.start_line, node.end_line, node.qualified_name
@@ -689,15 +696,26 @@ fn overlapped_next_body_idx(
     let body_tokens =
         body_token_count(lines, header, body_start_idx, body_end_idx, title, provider)?;
     let target = ((body_tokens as f64) * 0.15).ceil().max(1.0) as usize;
-    let mut idx = body_end_idx;
-    while idx > body_start_idx {
-        let overlap_tokens = body_token_count(lines, header, idx, body_end_idx, title, provider)?;
+    // `body_token_count(idx..body_end)` grows monotonically as `idx` decreases,
+    // so the largest `idx` whose overlap still reaches `target` can be found with
+    // a binary search instead of re-tokenizing `[idx..body_end]` for every line
+    // (which is O(body_bytes^2) and stalls on minified / very long bodies).
+    let mut lo = body_start_idx + 1;
+    let mut hi = body_end_idx;
+    let mut ans = body_end_idx + 1;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let overlap_tokens = body_token_count(lines, header, mid, body_end_idx, title, provider)?;
         if overlap_tokens >= target {
-            return Ok(idx);
+            ans = mid;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
         }
-        idx -= 1;
     }
-    Ok(body_end_idx + 1)
+    Ok(ans)
 }
 
 fn append_oversize_body_line_chunks(
@@ -827,30 +845,50 @@ fn max_fitting_segment_len(
     if text.is_empty() {
         return Ok(Some(0));
     }
-    let boundaries = text
-        .char_indices()
-        .map(|(i, c)| i + c.len_utf8())
-        .collect::<Vec<_>>();
-    let mut lo = 0usize;
-    let mut hi = boundaries.len();
-    let mut best = None;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let end = boundaries[mid];
-        let mut candidate = String::with_capacity(prefix.len() + end + 1);
-        candidate.push_str(prefix);
-        candidate.push_str(&text[..end]);
-        if !candidate.ends_with('\n') {
-            candidate.push('\n');
+    // A fitting segment holds at most `max_tokens` tokens, so its byte length is
+    // bounded. Search within a byte window rather than the whole `text`, so each
+    // call is O(window) instead of O(text.len()) - the callers invoke this in a
+    // `while byte_start < len` loop, and without the window a minified /
+    // single-line blob (e.g. a bundled JS file hundreds of KB long) makes that
+    // loop O(n^2) and stalls indexing for minutes. If the whole window turns out
+    // to fit, the window doubles and retries, so the exact maximum is still
+    // returned for genuinely token-sparse text.
+    let mut window = max_tokens.saturating_mul(64).max(1);
+    loop {
+        let mut cap = window.min(text.len());
+        while cap < text.len() && !text.is_char_boundary(cap) {
+            cap += 1;
         }
-        if prompt_fits(provider, title, &candidate, max_tokens)? {
-            best = Some(end);
-            lo = mid + 1;
-        } else {
-            hi = mid;
+        let search = &text[..cap];
+        let boundaries = search
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .collect::<Vec<_>>();
+        let mut lo = 0usize;
+        let mut hi = boundaries.len();
+        let mut best = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let end = boundaries[mid];
+            let mut candidate = String::with_capacity(prefix.len() + end + 1);
+            candidate.push_str(prefix);
+            candidate.push_str(&text[..end]);
+            if !candidate.ends_with('\n') {
+                candidate.push('\n');
+            }
+            if prompt_fits(provider, title, &candidate, max_tokens)? {
+                best = Some(end);
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
+        if best == Some(cap) && cap < text.len() {
+            window = window.saturating_mul(2);
+            continue;
+        }
+        return Ok(best);
     }
-    Ok(best)
 }
 
 #[cfg(test)]
@@ -877,6 +915,34 @@ fn source_span(source: &str, start_line: i64, end_line: i64) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+/// True if any source line within `[start_line, end_line]` is longer than
+/// `max_line_bytes`. Such a line is machine-generated (minified / bundled), not
+/// human-authored code; embedding it is noise for semantic search and, because
+/// many symbols can share one huge line, pathologically expensive to chunk.
+fn span_has_overlong_line(source: &str, start_line: i64, end_line: i64, max_line_bytes: usize) -> bool {
+    if start_line <= 0 {
+        return false;
+    }
+    let start = (start_line as usize).saturating_sub(1);
+    let end = if end_line >= start_line {
+        (end_line as usize).saturating_sub(1)
+    } else {
+        start
+    };
+    for (idx, line) in source.lines().enumerate() {
+        if idx < start {
+            continue;
+        }
+        if idx > end {
+            break;
+        }
+        if line.len() > max_line_bytes {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_embedding_candidate_label(label: &str) -> bool {
