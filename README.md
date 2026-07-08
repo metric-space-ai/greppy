@@ -71,8 +71,14 @@ SEMANTIC SEARCH — use when you do NOT know the symbol's name:
   greppy semantic-search "PLAIN-ENGLISH DESCRIPTION"
       Describe the behaviour or code you are looking for in plain English
       (e.g. "restrict a value to a range", "retry a failed HTTP request").
-      Returns the signature and file:line of the closest-matching definitions
-      to OPEN AND READ — a locator, not a written answer.
+      Returns the closest-matching definitions by meaning (signature + file:line).
+
+EXPAND — get the full source in one call instead of opening files by hand:
+  greppy expand ID
+      who-calls / callees / impact / semantic-search may end their output with a
+      line `Expand: greppy expand <id>`. Run it to print the prepared evidence
+      pack — the full source of the top matches, bundled — in a single call,
+      instead of reading each file:line yourself.
 
 FLAGS (append to any command above):
   --code            include each result's source lines (so no separate read is needed)
