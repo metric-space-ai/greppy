@@ -1,16 +1,15 @@
-//! Build-time embedding of the EmbeddingGemma-300M Q4_K model.
+//! Build-time embedding of the EmbeddingGemma-300M and Qwen3.5-0.8B Q4_K models.
 //!
 //! Owner rule: greppy works OUT OF THE BOX — semantic search must ALWAYS
 //! work, so the model ships INSIDE the binary and the model files live IN THIS
-//! REPO (`crates/cli/assets/embedded-model/`, tracked via Git LFS because the
-//! GGUF is ~228 MB). No download, no external path, no env var is required.
+//! REPO (`crates/cli/assets/embeddinggemma-300m-q4k/` and
+//! `crates/cli/assets/qwen35-0.8b-q4km/`, tracked via Git LFS). No download,
+//! external path, feature switch, or environment variable is required.
 //!
-//! The `embedded-model` feature is mandatory (see Cargo.toml), so a plain
-//! `cargo build` bakes the model and `--no-default-features` is a build error.
-//! build.rs copies the in-repo assets into `OUT_DIR` (where `lib.rs`
-//! `include_bytes!`s them) after verifying their SHA256, and FAILS LOUDLY if an
-//! asset is missing or altered — a binary without its model must not be
-//! buildable.
+//! A plain `cargo build` copies the in-repo assets into `OUT_DIR` (where
+//! `lib.rs` `include_bytes!`s them) after verifying their SHA256, and fails
+//! loudly if an asset is missing or altered. A binary without either model is
+//! not buildable.
 
 use std::path::{Path, PathBuf};
 
@@ -18,18 +17,14 @@ const GGUF_NAME: &str = "embeddinggemma-300M-Q4_K.gguf";
 const GGUF_SHA: &str = "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2";
 const TOK_NAME: &str = "tokenizer.json";
 const TOK_SHA: &str = "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e";
+const QWEN_GGUF_NAME: &str = "Qwen3.5-0.8B-Q4_K_M.gguf";
+const QWEN_TOK_NAME: &str = "tokenizer.json";
 
 fn main() {
     println!("cargo:rustc-env=GREPPY_EMBEDDED_GGUF_SHA={GGUF_SHA}");
     println!("cargo:rustc-env=GREPPY_EMBEDDED_TOK_SHA={TOK_SHA}");
-    assert!(
-        std::env::var("CARGO_FEATURE_EMBEDDED_MODEL").is_ok(),
-        "greppy cannot be built without the embedded EmbeddingGemma model. \
-         Do not use --no-default-features; every greppy binary must bake the \
-         repo-owned model into the binary."
-    );
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let assets = manifest.join("assets").join("embedded-model");
+    let assets = manifest.join("assets").join("embeddinggemma-300m-q4k");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     bake(
         &assets.join(GGUF_NAME),
@@ -42,6 +37,23 @@ fn main() {
         &out.join(TOK_NAME),
         TOK_NAME,
         TOK_SHA,
+    );
+    let qwen_assets = manifest.join("assets").join("qwen35-0.8b-q4km");
+    let qwen_gguf_sha = read_sha256_sidecar(&qwen_assets.join(format!("{QWEN_GGUF_NAME}.sha256")));
+    let qwen_tok_sha = read_sha256_sidecar(&qwen_assets.join(format!("{QWEN_TOK_NAME}.sha256")));
+    println!("cargo:rustc-env=GREPPY_EMBEDDED_QWEN35_GGUF_SHA={qwen_gguf_sha}");
+    println!("cargo:rustc-env=GREPPY_EMBEDDED_QWEN35_TOK_SHA={qwen_tok_sha}");
+    bake(
+        &qwen_assets.join(QWEN_GGUF_NAME),
+        &out.join(QWEN_GGUF_NAME),
+        QWEN_GGUF_NAME,
+        &qwen_gguf_sha,
+    );
+    bake(
+        &qwen_assets.join(QWEN_TOK_NAME),
+        &out.join(format!("qwen35-{QWEN_TOK_NAME}")),
+        QWEN_TOK_NAME,
+        &qwen_tok_sha,
     );
 }
 
@@ -93,4 +105,24 @@ fn sha256_file(path: &Path) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn read_sha256_sidecar(path: &Path) -> String {
+    println!("cargo:rerun-if-changed={}", path.display());
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "embedded Qwen3.5 sidecar {} is required for every greppy build: {e}",
+            path.display()
+        )
+    });
+    let sha = raw.trim();
+    assert!(
+        sha.len() == 64
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "embedded Qwen3.5 sidecar {} must contain a 64-byte lowercase SHA256",
+        path.display()
+    );
+    sha.to_string()
 }

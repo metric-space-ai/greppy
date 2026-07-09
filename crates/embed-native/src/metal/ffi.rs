@@ -50,6 +50,7 @@ use crate::metal::errors::set_last_error;
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 static BUFFER_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static BUFFER_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static METALLIB_LOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BufferAllocStats {
@@ -329,10 +330,12 @@ fn load_library_from_blob(
     // `dispatch2` dep just for one call. Cheaper path: write the blob
     // to a temp file and use `newLibraryWithURL:error:`. The cost is
     // a few ms at startup — irrelevant next to model load.
+    let seq = METALLIB_LOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!(
-        "greppy_embed_native_{}_{}.metallib",
+        "greppy_embed_native_{}_{}_{}.metallib",
         flavor,
         std::process::id(),
+        seq,
     ));
     if let Err(e) = std::fs::write(&tmp, blob) {
         set_last_error(format!(
@@ -712,19 +715,12 @@ fn use_wait_until_completed() -> bool {
 
 // ─── Global device accessor ─────────────────────────────────────────
 
-static GLOBAL_DEVICE: OnceLock<Device> = OnceLock::new();
+static GLOBAL_DEVICE: OnceLock<Option<Device>> = OnceLock::new();
 
 /// Shared device for the whole crate. First call initializes.
 /// Returns `None` if the Metal stack is unavailable.
 pub fn global_device() -> Option<&'static Device> {
-    if let Some(d) = GLOBAL_DEVICE.get() {
-        return Some(d);
-    }
-    // race-safe: if two threads hit this concurrently only one
-    // succeeds; the loser drops its `Device` on the floor.
-    let d = Device::default_system()?;
-    let _ = GLOBAL_DEVICE.set(d);
-    GLOBAL_DEVICE.get()
+    GLOBAL_DEVICE.get_or_init(Device::default_system).as_ref()
 }
 
 // ─── Tiny dead-code link to silence unused-warning ──────────────────

@@ -639,6 +639,7 @@ dependencies = [
  "greppy-freshness",
  "greppy-grep",
  "greppy-indexer",
+ "greppy-qwen35-native",
  "greppy-search",
  "greppy-store",
  "serde_json",
@@ -813,6 +814,17 @@ dependencies = [
  "tree-sitter-vue-next",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+]
+
+[[package]]
+name = "greppy-qwen35-native"
+version = "0.1.2"
+dependencies = [
+ "greppy-embed-native",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokenizers",
 ]
 
 [[package]]

@@ -98,6 +98,7 @@ fn map_dtype(dtype: GgmlDType) -> Result<GgmlType> {
         GgmlDType::Q5_0 => GgmlType::Q5_0,
         GgmlDType::Q8_0 => GgmlType::Q8_0,
         GgmlDType::Q4K => GgmlType::Q4_K,
+        GgmlDType::Q5K => GgmlType::Q5_K,
         GgmlDType::Q6K => GgmlType::Q6_K,
         other => return Err(Error::UnsupportedDType(other)),
     })

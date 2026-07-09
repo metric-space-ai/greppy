@@ -27,6 +27,7 @@ const QK_K: usize = 256;
 const Q5_0_SIZE: usize = 2 + 4 + QK5_0 / 2;
 const Q8_0_SIZE: usize = 2 + QK8_0;
 const Q4_K_SIZE: usize = 2 + 2 + 12 + QK_K / 2;
+const Q5_K_SIZE: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2;
 const Q6_K_SIZE: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
 
 pub fn cpu_simd_backend() -> &'static str {
@@ -93,9 +94,10 @@ enum QuantStorage {
     F32(Vec<f32>),
     Q4K {
         blocks: Vec<BlockQ4K>,
-        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        #[cfg(target_arch = "aarch64")]
         x8: Option<Vec<BlockQ4Kx8>>,
     },
+    Q5K(Vec<BlockQ5K>),
     Q6K(Vec<BlockQ6K>),
     Q8_0(Vec<BlockQ8_0>),
     Q5_0(Vec<BlockQ5_0>),
@@ -109,7 +111,16 @@ struct BlockQ4K {
     qs: [u8; QK_K / 2],
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[derive(Debug, Clone)]
+struct BlockQ5K {
+    d: f16,
+    dmin: f16,
+    scales: [u8; 12],
+    qh: [u8; QK_K / 8],
+    qs: [u8; QK_K / 2],
+}
+
+#[cfg(target_arch = "aarch64")]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct BlockQ4Kx8 {
@@ -150,10 +161,21 @@ struct BlockQ5_0 {
 impl QuantMatrix {
     pub fn from_model(model: &GgufModel, name: &str) -> Result<Self> {
         let tensor = model.tensor(name)?;
-        Self::from_tensor(name, tensor)
+        Self::from_tensor_impl(name, tensor, false)
+    }
+
+    /// Qwen CPU path: prepack Q4_K rows for the Apple `sdot` x8 kernel.
+    /// Other consumers keep the compact GGUF layout unless explicitly opted in.
+    pub fn from_model_q4_x8(model: &GgufModel, name: &str) -> Result<Self> {
+        let tensor = model.tensor(name)?;
+        Self::from_tensor_impl(name, tensor, true)
     }
 
     pub fn from_tensor(name: &str, tensor: TensorView<'_>) -> Result<Self> {
+        Self::from_tensor_impl(name, tensor, false)
+    }
+
+    fn from_tensor_impl(name: &str, tensor: TensorView<'_>, force_q4_x8: bool) -> Result<Self> {
         if tensor.shape.len() != 2 {
             return Err(Error::InvalidGguf(format!(
                 "matrix tensor '{name}' must be rank 2, got {:?}",
@@ -166,7 +188,7 @@ impl QuantMatrix {
             GgmlDType::F32 => QuantStorage::F32(tensor.to_f32()?),
             GgmlDType::Q4K => {
                 let blocks = parse_q4k(tensor.raw_bytes)?;
-                #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+                #[cfg(target_arch = "aarch64")]
                 {
                     let use_x8 = match std::env::var("EMBED_NATIVE_Q4_X8_MODE").as_deref() {
                         Ok("all") => true,
@@ -184,14 +206,18 @@ impl QuantMatrix {
                         }
                         _ => false,
                     };
-                    let x8 = (use_x8 && rows % 8 == 0).then(|| pack_to_q4kx8(&blocks, rows));
+                    let x8 = ((force_q4_x8 || use_x8)
+                        && std::arch::is_aarch64_feature_detected!("dotprod")
+                        && rows % 8 == 0)
+                        .then(|| pack_to_q4kx8(&blocks, rows));
                     QuantStorage::Q4K { blocks, x8 }
                 }
-                #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+                #[cfg(not(target_arch = "aarch64"))]
                 {
                     QuantStorage::Q4K { blocks }
                 }
             }
+            GgmlDType::Q5K => QuantStorage::Q5K(parse_q5k(tensor.raw_bytes)?),
             GgmlDType::Q6K => QuantStorage::Q6K(parse_q6k(tensor.raw_bytes)?),
             GgmlDType::Q8_0 => QuantStorage::Q8_0(parse_q8_0(tensor.raw_bytes)?),
             GgmlDType::Q5_0 => QuantStorage::Q5_0(parse_q5_0(tensor.raw_bytes)?),
@@ -239,115 +265,305 @@ impl QuantMatrix {
         let mut out = vec![0.0f32; lhs_rows * self.rows];
         match &self.storage {
             QuantStorage::F32(rhs) => {
-                out.par_chunks_mut(self.rows)
-                    .enumerate()
-                    .for_each(|(row_idx, dst)| {
-                        let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
-                        for (out_col, y) in rhs.chunks_exact(self.cols).enumerate() {
-                            dst[out_col] = dot_f32(x, y);
-                        }
-                    });
+                if lhs_rows == 1 {
+                    out.par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(chunk_idx, dst)| {
+                            let first = chunk_idx * 64;
+                            for (local, value) in dst.iter_mut().enumerate() {
+                                let out_col = first + local;
+                                let y = &rhs[out_col * self.cols..(out_col + 1) * self.cols];
+                                *value = dot_f32(lhs, y);
+                            }
+                        });
+                } else {
+                    out.par_chunks_mut(self.rows)
+                        .enumerate()
+                        .for_each(|(row_idx, dst)| {
+                            let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
+                            for (out_col, y) in rhs.chunks_exact(self.cols).enumerate() {
+                                dst[out_col] = dot_f32(x, y);
+                            }
+                        });
+                }
             }
             QuantStorage::Q4K {
                 blocks: rhs,
-                #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+                #[cfg(target_arch = "aarch64")]
                 x8,
             } => {
                 let row_blocks = self.cols / QK_K;
-                out.par_chunks_mut(self.rows)
-                    .enumerate()
-                    .for_each(|(row_idx, dst)| {
-                        let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
-                        let xq = quantize_q8k(x);
-                        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-                        if let Some(x8) = x8 {
-                            for group in 0..self.rows / 8 {
-                                let y = &x8[group * row_blocks..(group + 1) * row_blocks];
-                                let values = unsafe { dot8_q4k_q8k_neon(y, &xq) };
-                                dst[group * 8..group * 8 + 8].copy_from_slice(&values);
+                if lhs_rows >= 4 {
+                    #[cfg(target_arch = "aarch64")]
+                    if let Some(x8) = x8 {
+                        out = matmul_q4kx8_batched(x8, lhs, lhs_rows, self.rows, self.cols);
+                    } else {
+                        out = matmul_q4k_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        out = matmul_q4k_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
+                    }
+                } else if lhs_rows == 1 {
+                    let xq = quantize_q8k(lhs);
+                    #[cfg(target_arch = "aarch64")]
+                    let used_x8 = if let Some(x8) = x8 {
+                        out.par_chunks_mut(64)
+                            .enumerate()
+                            .for_each(|(chunk_idx, dst)| {
+                                let first_group = chunk_idx * 8;
+                                for (local_group, values) in dst.chunks_exact_mut(8).enumerate() {
+                                    let group = first_group + local_group;
+                                    let y = &x8[group * row_blocks..(group + 1) * row_blocks];
+                                    values.copy_from_slice(unsafe { &dot8_q4k_q8k_neon(y, &xq) });
+                                }
+                            });
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let used_x8 = false;
+                    if !used_x8 {
+                        out.par_chunks_mut(64)
+                            .enumerate()
+                            .for_each(|(chunk_idx, dst)| {
+                                let first = chunk_idx * 64;
+                                let n_quad = dst.len() & !3;
+                                for local in (0..n_quad).step_by(4) {
+                                    let out_col = first + local;
+                                    let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                    let y1 = &rhs
+                                        [(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                    let y2 = &rhs
+                                        [(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                    let y3 = &rhs
+                                        [(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                    let (d0, d1, d2, d3) = dot4_q4k_q8k(y0, y1, y2, y3, &xq);
+                                    dst[local] = d0;
+                                    dst[local + 1] = d1;
+                                    dst[local + 2] = d2;
+                                    dst[local + 3] = d3;
+                                }
+                                for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
+                                    let out_col = first + local;
+                                    let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                    *value = dot_q4k_q8k(y, &xq);
+                                }
+                            });
+                    }
+                } else {
+                    out.par_chunks_mut(self.rows)
+                        .enumerate()
+                        .for_each(|(row_idx, dst)| {
+                            let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
+                            let xq = quantize_q8k(x);
+                            #[cfg(target_arch = "aarch64")]
+                            if let Some(x8) = x8 {
+                                for group in 0..self.rows / 8 {
+                                    let y = &x8[group * row_blocks..(group + 1) * row_blocks];
+                                    let values = unsafe { dot8_q4k_q8k_neon(y, &xq) };
+                                    dst[group * 8..group * 8 + 8].copy_from_slice(&values);
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        let n_quad = self.rows & !3;
-                        for out_col in (0..n_quad).step_by(4) {
-                            let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            let y1 = &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
-                            let y2 = &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
-                            let y3 = &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
-                            let (d0, d1, d2, d3) = dot4_q4k_q8k(y0, y1, y2, y3, &xq);
-                            dst[out_col] = d0;
-                            dst[out_col + 1] = d1;
-                            dst[out_col + 2] = d2;
-                            dst[out_col + 3] = d3;
-                        }
-                        for out_col in n_quad..self.rows {
-                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            dst[out_col] = dot_q4k_q8k(y, &xq);
-                        }
-                    });
+                            let n_quad = self.rows & !3;
+                            for out_col in (0..n_quad).step_by(4) {
+                                let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                let y1 =
+                                    &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                let y2 =
+                                    &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                let y3 =
+                                    &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                let (d0, d1, d2, d3) = dot4_q4k_q8k(y0, y1, y2, y3, &xq);
+                                dst[out_col] = d0;
+                                dst[out_col + 1] = d1;
+                                dst[out_col + 2] = d2;
+                                dst[out_col + 3] = d3;
+                            }
+                            for out_col in n_quad..self.rows {
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                dst[out_col] = dot_q4k_q8k(y, &xq);
+                            }
+                        });
+                }
+            }
+            QuantStorage::Q5K(rhs) => {
+                let row_blocks = self.cols / QK_K;
+                if lhs_rows >= 4 {
+                    out = matmul_q5k_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
+                } else if lhs_rows == 1 {
+                    let xq = quantize_q8k(lhs);
+                    out.par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(chunk_idx, dst)| {
+                            let first = chunk_idx * 64;
+                            for (local, value) in dst.iter_mut().enumerate() {
+                                let out_col = first + local;
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                *value = dot_q5k_q8k(y, &xq);
+                            }
+                        });
+                } else {
+                    out.par_chunks_mut(self.rows)
+                        .enumerate()
+                        .for_each(|(row_idx, dst)| {
+                            let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
+                            let xq = quantize_q8k(x);
+                            for out_col in 0..self.rows {
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                dst[out_col] = dot_q5k_q8k(y, &xq);
+                            }
+                        });
+                }
             }
             QuantStorage::Q6K(rhs) => {
                 let row_blocks = self.cols / QK_K;
-                out.par_chunks_mut(self.rows)
-                    .enumerate()
-                    .for_each(|(row_idx, dst)| {
-                        let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
-                        let xq = quantize_q8k(x);
-                        let n_quad = self.rows & !3;
-                        for out_col in (0..n_quad).step_by(4) {
-                            let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            let y1 = &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
-                            let y2 = &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
-                            let y3 = &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
-                            let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, &xq);
-                            dst[out_col] = d0;
-                            dst[out_col + 1] = d1;
-                            dst[out_col + 2] = d2;
-                            dst[out_col + 3] = d3;
-                        }
-                        for out_col in n_quad..self.rows {
-                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            dst[out_col] = dot_q6k_q8k(y, &xq);
-                        }
-                    });
+                if lhs_rows >= 4 {
+                    out = matmul_q6k_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
+                } else if lhs_rows == 1 {
+                    let xq = quantize_q8k(lhs);
+                    out.par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(chunk_idx, dst)| {
+                            let first = chunk_idx * 64;
+                            let n_quad = dst.len() & !3;
+                            for local in (0..n_quad).step_by(4) {
+                                let out_col = first + local;
+                                let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                let y1 =
+                                    &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                let y2 =
+                                    &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                let y3 =
+                                    &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, &xq);
+                                dst[local] = d0;
+                                dst[local + 1] = d1;
+                                dst[local + 2] = d2;
+                                dst[local + 3] = d3;
+                            }
+                            for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
+                                let out_col = first + local;
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                *value = dot_q6k_q8k(y, &xq);
+                            }
+                        });
+                } else {
+                    out.par_chunks_mut(self.rows)
+                        .enumerate()
+                        .for_each(|(row_idx, dst)| {
+                            let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
+                            let xq = quantize_q8k(x);
+                            let n_quad = self.rows & !3;
+                            for out_col in (0..n_quad).step_by(4) {
+                                let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                let y1 =
+                                    &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                let y2 =
+                                    &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                let y3 =
+                                    &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, &xq);
+                                dst[out_col] = d0;
+                                dst[out_col + 1] = d1;
+                                dst[out_col + 2] = d2;
+                                dst[out_col + 3] = d3;
+                            }
+                            for out_col in n_quad..self.rows {
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                dst[out_col] = dot_q6k_q8k(y, &xq);
+                            }
+                        });
+                }
             }
             QuantStorage::Q8_0(rhs) => {
                 let row_blocks = self.cols / QK8_0;
-                out.par_chunks_mut(self.rows)
-                    .enumerate()
-                    .for_each(|(row_idx, dst)| {
-                        let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
-                        let xq = quantize_q8_0(x);
-                        let n_quad = self.rows & !3;
-                        for out_col in (0..n_quad).step_by(4) {
-                            let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            let y1 = &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
-                            let y2 = &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
-                            let y3 = &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
-                            let (d0, d1, d2, d3) = dot4_q8_0_q8_0(y0, y1, y2, y3, &xq);
-                            dst[out_col] = d0;
-                            dst[out_col + 1] = d1;
-                            dst[out_col + 2] = d2;
-                            dst[out_col + 3] = d3;
-                        }
-                        for out_col in n_quad..self.rows {
-                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            dst[out_col] = dot_q8_0_q8_0(y, &xq);
-                        }
-                    });
+                if lhs_rows >= 4 {
+                    out = matmul_q8_0_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
+                } else if lhs_rows == 1 {
+                    let xq = quantize_q8_0(lhs);
+                    out.par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(chunk_idx, dst)| {
+                            let first = chunk_idx * 64;
+                            let n_quad = dst.len() & !3;
+                            for local in (0..n_quad).step_by(4) {
+                                let out_col = first + local;
+                                let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                let y1 =
+                                    &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                let y2 =
+                                    &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                let y3 =
+                                    &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                let (d0, d1, d2, d3) = dot4_q8_0_q8_0(y0, y1, y2, y3, &xq);
+                                dst[local] = d0;
+                                dst[local + 1] = d1;
+                                dst[local + 2] = d2;
+                                dst[local + 3] = d3;
+                            }
+                            for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
+                                let out_col = first + local;
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                *value = dot_q8_0_q8_0(y, &xq);
+                            }
+                        });
+                } else {
+                    out.par_chunks_mut(self.rows)
+                        .enumerate()
+                        .for_each(|(row_idx, dst)| {
+                            let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
+                            let xq = quantize_q8_0(x);
+                            let n_quad = self.rows & !3;
+                            for out_col in (0..n_quad).step_by(4) {
+                                let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                let y1 =
+                                    &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                let y2 =
+                                    &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                let y3 =
+                                    &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                let (d0, d1, d2, d3) = dot4_q8_0_q8_0(y0, y1, y2, y3, &xq);
+                                dst[out_col] = d0;
+                                dst[out_col + 1] = d1;
+                                dst[out_col + 2] = d2;
+                                dst[out_col + 3] = d3;
+                            }
+                            for out_col in n_quad..self.rows {
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                dst[out_col] = dot_q8_0_q8_0(y, &xq);
+                            }
+                        });
+                }
             }
             QuantStorage::Q5_0(rhs) => {
                 let row_blocks = self.cols / QK5_0;
-                out.par_chunks_mut(self.rows)
-                    .enumerate()
-                    .for_each(|(row_idx, dst)| {
-                        let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
-                        let xq = quantize_q8_0(x);
-                        for out_col in 0..self.rows {
-                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                            dst[out_col] = dot_q5_0_q8_0(y, &xq);
-                        }
-                    });
+                if lhs_rows == 1 {
+                    let xq = quantize_q8_0(lhs);
+                    out.par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(chunk_idx, dst)| {
+                            let first = chunk_idx * 64;
+                            for (local, value) in dst.iter_mut().enumerate() {
+                                let out_col = first + local;
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                *value = dot_q5_0_q8_0(y, &xq);
+                            }
+                        });
+                } else {
+                    out.par_chunks_mut(self.rows)
+                        .enumerate()
+                        .for_each(|(row_idx, dst)| {
+                            let x = &lhs[row_idx * self.cols..(row_idx + 1) * self.cols];
+                            let xq = quantize_q8_0(x);
+                            for out_col in 0..self.rows {
+                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                dst[out_col] = dot_q5_0_q8_0(y, &xq);
+                            }
+                        });
+                }
             }
         }
         Ok(out)
@@ -405,6 +621,10 @@ impl QuantMatrix {
                 let row_blocks = self.cols / QK_K;
                 dequantize_q4k_row(&blocks[row * row_blocks..(row + 1) * row_blocks], dst);
             }
+            QuantStorage::Q5K(blocks) => {
+                let row_blocks = self.cols / QK_K;
+                dequantize_q5k_row(&blocks[row * row_blocks..(row + 1) * row_blocks], dst);
+            }
             QuantStorage::Q6K(blocks) => {
                 let row_blocks = self.cols / QK_K;
                 dequantize_q6k_row(&blocks[row * row_blocks..(row + 1) * row_blocks], dst);
@@ -422,11 +642,227 @@ impl QuantMatrix {
     }
 }
 
+fn transpose_batched_output(transposed: &[f32], lhs_rows: usize, matrix_rows: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; lhs_rows * matrix_rows];
+    out.par_chunks_mut(matrix_rows)
+        .enumerate()
+        .for_each(|(input_row, dst)| {
+            for output_row in 0..matrix_rows {
+                dst[output_row] = transposed[output_row * lhs_rows + input_row];
+            }
+        });
+    out
+}
+
+fn matmul_q4k_batched(
+    rhs: &[BlockQ4K],
+    lhs: &[f32],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    matrix_cols: usize,
+) -> Vec<f32> {
+    let row_blocks = matrix_cols / QK_K;
+    let activations = lhs
+        .par_chunks(matrix_cols)
+        .map(quantize_q8k)
+        .collect::<Vec<_>>();
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let y0 = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                let y1 = &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks];
+                let y2 = &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks];
+                let y3 = &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    let (d0, d1, d2, d3) = dot4_q4k_q8k(y0, y1, y2, y3, xq);
+                    chunk[local * lhs_rows + input_row] = d0;
+                    chunk[(local + 1) * lhs_rows + input_row] = d1;
+                    chunk[(local + 2) * lhs_rows + input_row] = d2;
+                    chunk[(local + 3) * lhs_rows + input_row] = d3;
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let y = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q4k_q8k(y, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn matmul_q4kx8_batched(
+    rhs: &[BlockQ4Kx8],
+    lhs: &[f32],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    matrix_cols: usize,
+) -> Vec<f32> {
+    let row_blocks = matrix_cols / QK_K;
+    let activations = lhs
+        .par_chunks(matrix_cols)
+        .map(quantize_q8k)
+        .collect::<Vec<_>>();
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first_group = chunk_idx * 8;
+            for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
+                let group = first_group + local_group;
+                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    let values = unsafe { dot8_q4k_q8k_neon(weights, xq) };
+                    for output_lane in 0..8 {
+                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                    }
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+fn matmul_q6k_batched(
+    rhs: &[BlockQ6K],
+    lhs: &[f32],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    matrix_cols: usize,
+) -> Vec<f32> {
+    let row_blocks = matrix_cols / QK_K;
+    let activations = lhs
+        .par_chunks(matrix_cols)
+        .map(quantize_q8k)
+        .collect::<Vec<_>>();
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let y0 = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                let y1 = &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks];
+                let y2 = &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks];
+                let y3 = &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, xq);
+                    chunk[local * lhs_rows + input_row] = d0;
+                    chunk[(local + 1) * lhs_rows + input_row] = d1;
+                    chunk[(local + 2) * lhs_rows + input_row] = d2;
+                    chunk[(local + 3) * lhs_rows + input_row] = d3;
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let y = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q6k_q8k(y, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+fn matmul_q5k_batched(
+    rhs: &[BlockQ5K],
+    lhs: &[f32],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    matrix_cols: usize,
+) -> Vec<f32> {
+    let row_blocks = matrix_cols / QK_K;
+    let activations = lhs
+        .par_chunks(matrix_cols)
+        .map(quantize_q8k)
+        .collect::<Vec<_>>();
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            for local in 0..output_rows {
+                let output_row = first + local;
+                let y = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q5k_q8k(y, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+fn matmul_q8_0_batched(
+    rhs: &[BlockQ8_0],
+    lhs: &[f32],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    matrix_cols: usize,
+) -> Vec<f32> {
+    let row_blocks = matrix_cols / QK8_0;
+    let activations = lhs
+        .par_chunks(matrix_cols)
+        .map(quantize_q8_0)
+        .collect::<Vec<_>>();
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let y0 = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                let y1 = &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks];
+                let y2 = &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks];
+                let y3 = &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    let (d0, d1, d2, d3) = dot4_q8_0_q8_0(y0, y1, y2, y3, xq);
+                    chunk[local * lhs_rows + input_row] = d0;
+                    chunk[(local + 1) * lhs_rows + input_row] = d1;
+                    chunk[(local + 2) * lhs_rows + input_row] = d2;
+                    chunk[(local + 3) * lhs_rows + input_row] = d3;
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let y = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q8_0_q8_0(y, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
 impl QuantStorage {
     fn block_count(&self) -> usize {
         match self {
             Self::F32(v) => v.len(),
             Self::Q4K { blocks, .. } => blocks.len(),
+            Self::Q5K(v) => v.len(),
             Self::Q6K(v) => v.len(),
             Self::Q8_0(v) => v.len(),
             Self::Q5_0(v) => v.len(),
@@ -461,7 +897,7 @@ fn parse_q4k(raw: &[u8]) -> Result<Vec<BlockQ4K>> {
     Ok(out)
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[cfg(target_arch = "aarch64")]
 fn pack_to_q4kx8(blocks: &[BlockQ4K], n: usize) -> Vec<BlockQ4Kx8> {
     if n == 0 || n % 8 != 0 {
         return Vec::new();
@@ -534,6 +970,36 @@ fn pack_to_q4kx8(blocks: &[BlockQ4K], n: usize) -> Vec<BlockQ4Kx8> {
         }
     }
     packed
+}
+
+fn parse_q5k(raw: &[u8]) -> Result<Vec<BlockQ5K>> {
+    if raw.len() % Q5_K_SIZE != 0 {
+        return Err(Error::InvalidGguf(format!(
+            "Q5_K raw len {} is not divisible by {Q5_K_SIZE}",
+            raw.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(raw.len() / Q5_K_SIZE);
+    for (idx, block) in raw.chunks_exact(Q5_K_SIZE).enumerate() {
+        let mut scales = [0u8; 12];
+        scales.copy_from_slice(&block[4..16]);
+        let mut qh = [0u8; QK_K / 8];
+        qh.copy_from_slice(&block[16..48]);
+        let mut qs = [0u8; QK_K / 2];
+        qs.copy_from_slice(&block[48..176]);
+        let d = read_f16(&block[0..2]);
+        let dmin = read_f16(&block[2..4]);
+        validate_f16_scale("Q5_K.d", idx, d)?;
+        validate_f16_scale("Q5_K.dmin", idx, dmin)?;
+        out.push(BlockQ5K {
+            d,
+            dmin,
+            scales,
+            qh,
+            qs,
+        });
+    }
+    Ok(out)
 }
 
 fn parse_q6k(raw: &[u8]) -> Result<Vec<BlockQ6K>> {
@@ -845,6 +1311,23 @@ fn dot_q4k_q8k(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     }
 
     sumf + sums.iter().sum::<f32>()
+}
+
+fn dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        return dot_q5k_q8k_neon(xs, ys);
+    }
+
+    let mut sum = 0.0f32;
+    let mut values = [0.0f32; QK_K];
+    for (x, y) in xs.iter().zip(ys) {
+        dequantize_q5k_row(std::slice::from_ref(x), &mut values);
+        for (value, quantized) in values.iter().zip(&y.qs) {
+            sum += *value * (*quantized as f32 * y.d);
+        }
+    }
+    sum
 }
 
 fn dot_q6k_q8k(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
@@ -1291,7 +1774,7 @@ unsafe fn dot4_q6k_q8k_neon(
     (sum0 as f32, sum1 as f32, sum2 as f32, sum3 as f32)
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn load_f16x4(ptr: *const f16) -> float32x4_t {
     let raw = vld1_u64(ptr as *const u64);
@@ -1305,7 +1788,7 @@ unsafe fn load_f16x4(ptr: *const f16) -> float32x4_t {
     result
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sdot_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let mut out = acc;
@@ -1319,7 +1802,7 @@ unsafe fn sdot_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     out
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn decode_q4kx8_scales(scales_in: *const u8) -> (int16x8_t, int16x8_t) {
     const KMASK1: u32 = 0x3f3f3f3f;
@@ -1341,7 +1824,7 @@ unsafe fn decode_q4kx8_scales(scales_in: *const u8) -> (int16x8_t, int16x8_t) {
     (out_mins, out_scales)
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[cfg(target_arch = "aarch64")]
 unsafe fn dot8_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8K]) -> [f32; 8] {
     let mut out = [0.0f32; 8];
     let mut vacc_0 = vdupq_n_f32(0.0);
@@ -1469,8 +1952,7 @@ unsafe fn dot8_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8K]) -> [f32; 8] {
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline(always)]
 unsafe fn neon_vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    #[cfg(target_feature = "dotprod")]
-    {
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
         let mut acc: int32x4_t = vdupq_n_s32(0);
         core::arch::asm!(
             "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
@@ -1479,14 +1961,11 @@ unsafe fn neon_vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
             b = in(vreg) b,
             options(nostack, nomem),
         );
-        acc
+        return acc;
     }
-    #[cfg(not(target_feature = "dotprod"))]
-    {
-        let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-        let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-        vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
-    }
+    let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+    vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -1497,8 +1976,7 @@ unsafe fn neon_vdotq_s32_pair(
     a1: int8x16_t,
     b1: int8x16_t,
 ) -> int32x4_t {
-    #[cfg(target_feature = "dotprod")]
-    {
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
         let mut acc: int32x4_t = vdupq_n_s32(0);
         core::arch::asm!(
             "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
@@ -1510,19 +1988,16 @@ unsafe fn neon_vdotq_s32_pair(
             b1 = in(vreg) b1,
             options(nostack, nomem),
         );
-        acc
+        return acc;
     }
-    #[cfg(not(target_feature = "dotprod"))]
-    {
-        let p0 = vmull_s8(vget_low_s8(a0), vget_low_s8(b0));
-        let p1 = vmull_s8(vget_high_s8(a0), vget_high_s8(b0));
-        let p2 = vmull_s8(vget_low_s8(a1), vget_low_s8(b1));
-        let p3 = vmull_s8(vget_high_s8(a1), vget_high_s8(b1));
-        vaddq_s32(
-            vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
-            vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)),
-        )
-    }
+    let p0 = vmull_s8(vget_low_s8(a0), vget_low_s8(b0));
+    let p1 = vmull_s8(vget_high_s8(a0), vget_high_s8(b0));
+    let p2 = vmull_s8(vget_low_s8(a1), vget_low_s8(b1));
+    let p3 = vmull_s8(vget_high_s8(a1), vget_high_s8(b1));
+    vaddq_s32(
+        vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+        vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)),
+    )
 }
 
 fn dot4_q8_0_q8_0(
@@ -1635,6 +2110,74 @@ unsafe fn dot_q8_0_q8_0_neon(xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
         );
     }
     vaddvq_f32(sumv0)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn dot_q5k_q8k_neon(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let m4b = vdupq_n_u8(0x0f);
+    let mone = vdupq_n_u8(1);
+    let mtwo = vdupq_n_u8(2);
+    let mut sum = 0.0f32;
+
+    for (x, y) in xs.iter().zip(ys) {
+        let d = y.d * x.d.to_f32();
+        let dmin = y.d * x.dmin.to_f32();
+        let q8sums = vpaddq_s16(
+            vld1q_s16(y.bsums.as_ptr()),
+            vld1q_s16(y.bsums.as_ptr().add(8)),
+        );
+
+        let mut packed = [0u32; 4];
+        packed[0] = read_u32_le(&x.scales[0..4]);
+        packed[1] = read_u32_le(&x.scales[4..8]);
+        packed[2] = read_u32_le(&x.scales[8..12]);
+        packed[3] = ((packed[2] >> 4) & KMASK2) | (((packed[1] >> 6) & KMASK3) << 4);
+        let aux = packed[1] & KMASK1;
+        packed[1] = (packed[2] & KMASK2) | (((packed[0] >> 6) & KMASK3) << 4);
+        packed[2] = aux;
+        packed[0] &= KMASK1;
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        write_u32_le_into(&packed[..2], &mut scales);
+        write_u32_le_into(&packed[2..], &mut mins);
+        let mut min_sum = 0i32;
+        for i in 0..8 {
+            min_sum += (y.bsums[2 * i] as i32 + y.bsums[2 * i + 1] as i32) * mins[i] as i32;
+        }
+
+        let mut qhbits = vld1q_u8_x2(x.qh.as_ptr());
+        let mut q5 = x.qs.as_ptr();
+        let mut q8 = y.qs.as_ptr();
+        let mut scaled_sum = 0i32;
+        for group in 0..QK_K / 64 {
+            let q5bits = vld1q_u8_x2(q5);
+            q5 = q5.add(32);
+            let q8bytes = vld1q_s8_x4(q8);
+            q8 = q8.add(64);
+
+            let q5h0 = vshlq_n_u8(vandq_u8(mone, qhbits.0), 4);
+            let q5h1 = vshlq_n_u8(vandq_u8(mone, qhbits.1), 4);
+            let q5h2 = vshlq_n_u8(vandq_u8(mtwo, qhbits.0), 3);
+            let q5h3 = vshlq_n_u8(vandq_u8(mtwo, qhbits.1), 3);
+            qhbits.0 = vshrq_n_u8(qhbits.0, 2);
+            qhbits.1 = vshrq_n_u8(qhbits.1, 2);
+
+            let q50 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q5bits.0, m4b), q5h0));
+            let q51 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q5bits.1, m4b), q5h1));
+            let q52 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q5bits.0, 4), q5h2));
+            let q53 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q5bits.1, 4), q5h3));
+            scaled_sum += vaddvq_s32(neon_vdotq_s32_pair(q50, q8bytes.0, q51, q8bytes.1))
+                * scales[2 * group] as i32;
+            scaled_sum += vaddvq_s32(neon_vdotq_s32_pair(q52, q8bytes.2, q53, q8bytes.3))
+                * scales[2 * group + 1] as i32;
+        }
+        sum += d * scaled_sum as f32 - dmin * min_sum as f32;
+    }
+    sum
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -2097,6 +2640,39 @@ fn dequantize_q4k_row(blocks: &[BlockQ4K], dst: &mut [f32]) {
     }
 }
 
+fn dequantize_q5k_row(blocks: &[BlockQ5K], dst: &mut [f32]) {
+    for (block, y) in blocks.iter().zip(dst.chunks_exact_mut(QK_K)) {
+        let d = block.d.to_f32();
+        let dmin = block.dmin.to_f32();
+        let mut scale_idx = 0;
+        let mut qs_base = 0;
+        let mut high_lo = 1u8;
+        let mut high_hi = 2u8;
+        for out_base in (0..QK_K).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(scale_idx, &block.scales);
+            let (sc2, m2) = get_scale_min_k4(scale_idx + 1, &block.scales);
+            let scale1 = d * sc1 as f32;
+            let scale2 = d * sc2 as f32;
+            let min1 = dmin * m1 as f32;
+            let min2 = dmin * m2 as f32;
+            for l in 0..32 {
+                let q4 = block.qs[qs_base + l] & 0x0f;
+                let high = if block.qh[l] & high_lo != 0 { 16 } else { 0 };
+                y[out_base + l] = scale1 * (q4 as f32 + high as f32) - min1;
+            }
+            for l in 0..32 {
+                let q4 = block.qs[qs_base + l] >> 4;
+                let high = if block.qh[l] & high_hi != 0 { 16 } else { 0 };
+                y[out_base + 32 + l] = scale2 * (q4 as f32 + high as f32) - min2;
+            }
+            scale_idx += 2;
+            qs_base += 32;
+            high_lo <<= 2;
+            high_hi <<= 2;
+        }
+    }
+}
+
 fn dequantize_q6k_row(blocks: &[BlockQ6K], dst: &mut [f32]) {
     for (block, y) in blocks.iter().zip(dst.chunks_exact_mut(QK_K)) {
         let d = block.d.to_f32();
@@ -2159,6 +2735,17 @@ fn write_u32_le_into(src: &[u32], dst: &mut [u8]) {
     for (chunk, value) in dst.chunks_exact_mut(4).zip(src) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
+}
+
+fn dot_q5k_f32(blocks: &[BlockQ5K], input: &[f32]) -> f32 {
+    let mut tmp = [0.0f32; QK_K];
+    let mut acc = 0.0f32;
+    for (block_idx, block) in blocks.iter().enumerate() {
+        dequantize_q5k_row(std::slice::from_ref(block), &mut tmp);
+        let x = &input[block_idx * QK_K..(block_idx + 1) * QK_K];
+        acc += dot_f32(&tmp, x);
+    }
+    acc
 }
 
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {

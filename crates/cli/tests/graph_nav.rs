@@ -71,7 +71,11 @@ fn make(_x: types::Marker) {}
     )
     .unwrap();
 
-    std::fs::write(src.join("helper.rs"), "pub fn do_it() -> u32 { 42 }\n").unwrap();
+    std::fs::write(
+        src.join("helper.rs"),
+        "pub fn do_it() -> u32 {\n    let answer = 42;\n    answer\n}\n",
+    )
+    .unwrap();
 
     std::fs::write(
         src.join("types.rs"),
@@ -151,7 +155,8 @@ fn run_with_env(
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .current_dir(cwd)
-        .env("GREPPY_STORE_DIR", store_dir);
+        .env("GREPPY_STORE_DIR", store_dir)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1");
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -1431,6 +1436,19 @@ fn brief_bundles_definition_callers_and_callees_in_one_call() {
     assert!(
         out.contains("do_it") && out.contains("pub fn do_it"),
         "brief must show the definition with source; got: {out}"
+    );
+    assert!(
+        out.contains("(src/helper.rs:1-4)"),
+        "brief header must report the actual expanded source span; got: {out}"
+    );
+    let header = out.find("== ").expect("brief output must contain a header");
+    let source = out
+        .find("    pub fn do_it")
+        .expect("brief output must contain indented source");
+    let between = &out[header..source];
+    assert!(
+        !between.lines().any(|line| line.starts_with("  - ")),
+        "test-only inference bypass must preserve deterministic brief output; got: {out}"
     );
     assert!(
         out.contains("-- CALLERS") && out.contains("caller"),

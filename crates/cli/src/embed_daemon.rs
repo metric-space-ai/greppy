@@ -4,9 +4,9 @@
 //!
 //! Resource lifecycle (owner requirement — never hold GPU memory while idle):
 //! the daemon lazy-loads the model on the FIRST request, DROPS it after
-//! `GREPPY_EMBED_DAEMON_MODEL_TTL_S` idle seconds (default 60 — frees VRAM
+//! `GREPPY_EMBED_DAEMON_MODEL_TTL_S` idle seconds (default 300 — frees VRAM
 //! via the backend Drop impls), and EXITS after
-//! `GREPPY_EMBED_DAEMON_EXIT_TTL_S` idle seconds (default 300, socket
+//! `GREPPY_EMBED_DAEMON_EXIT_TTL_S` idle seconds (default 1800, socket
 //! unlinked). One socket per MODEL IDENTITY: the socket file name embeds a
 //! hash of the query-cache key (model id + prompt version + file
 //! fingerprints), so a swapped GGUF simply routes to a fresh daemon and the
@@ -28,8 +28,8 @@ const ENV_DISABLE: &str = "GREPPY_NO_EMBED_DAEMON";
 const ENV_MODEL_TTL: &str = "GREPPY_EMBED_DAEMON_MODEL_TTL_S";
 const ENV_EXIT_TTL: &str = "GREPPY_EMBED_DAEMON_EXIT_TTL_S";
 const ENV_LOG: &str = "GREPPY_EMBED_DAEMON_LOG";
-const DEFAULT_MODEL_TTL_S: u64 = 60;
-const DEFAULT_EXIT_TTL_S: u64 = 300;
+const DEFAULT_MODEL_TTL_S: u64 = 300;
+const DEFAULT_EXIT_TTL_S: u64 = 1800;
 /// Generous: the first request pays the lazy model load (incl. GPU init).
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -339,5 +339,16 @@ fn respond(
             *model = None;
             serde_json::json!({"error": format!("embed: {e}")})
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_ttls_cover_agent_session_bursts() {
+        assert_eq!(DEFAULT_MODEL_TTL_S, 300);
+        assert_eq!(DEFAULT_EXIT_TTL_S, 1800);
     }
 }

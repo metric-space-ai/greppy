@@ -1,0 +1,23 @@
+[package]
+name = "greppy-qwen35-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Native Qwen3.5-0.8B summarizer contract for greppy brief."
+
+[dependencies]
+greppy-embed-native = { path = "../embed-native" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+
+[features]
+default = []
+metal = ["greppy-embed-native/metal"]
+cuda = ["greppy-embed-native/cuda"]
+
+[lints.clippy]
+manual_clamp = "allow"

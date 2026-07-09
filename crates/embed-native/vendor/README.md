@@ -17,11 +17,11 @@ The MIT notice is also reproduced at the top of several upstream headers
 
 | Path | Origin | License |
 |------|--------|---------|
-| `cuda/ggml-cuda/*.cu`, `*.cuh` | ggml `src/ggml-cuda/` (quantize + MMQ kernels, dot products, tensor-core MMA primitives) | MIT (ggml authors) |
+| `cuda/ggml-cuda/*.cu`, `*.cuh` | ggml `src/ggml-cuda/` (quantize + MMQ/MMVQ kernels, dot products, tensor-core MMA primitives) | MIT (ggml authors) |
 | `cuda/ggml-cuda/vendors/cuda.h` | ggml `src/ggml-cuda/vendors/` | MIT (ggml authors) |
 | `cuda/ggml-include/*.h` | ggml `include/` public headers | MIT (ggml authors) |
 | `metal/shaders/ggml/ggml-metal.metal`, `ggml-metal-impl.h`, `ggml-common.h` | ggml `src/ggml-metal/` | MIT (ggml authors) |
-| **`cuda/embed_native_cuda.cu`** | **greppy-authored** wrapper that packs f32 activations via ggml `quantize_mmq_q8_1` and dispatches ggml `mul_mat_q`; includes and links the vendored ggml kernels | MIT (greppy authors); derivative — see note below |
+| **`cuda/embed_native_cuda.cu`** | **greppy-authored** wrapper that packs f32 activations via ggml `quantize_mmq_q8_1`/`quantize_row_q8_1` and dispatches ggml `mul_mat_q`/`mul_mat_vec_q`; includes and links the vendored ggml kernels | MIT (greppy authors); derivative — see note below |
 | **`metal/shaders/ggml/embed_native.metal`** | **greppy-authored** mean-pool + dispatch shader | MIT (greppy authors) |
 
 The two `embed_native_*` files are original greppy code; they `#include`
@@ -34,9 +34,10 @@ here.
 `greppy-embed-native` is a from-scratch Rust EmbeddingGemma engine (CPU path
 is 100% Rust via the `gemm` crate + hand-written Q4_K/Q6_K/Q8_0 SIMD dot
 kernels). It does **not** depend on `ggml`/`llama.cpp` as a library. For the
-opt-in GPU backends we reuse ggml's numerically-exact quantized matmul (MMQ)
-and quantization kernels rather than reimplement them, compiling this small
-subset directly:
+opt-in GPU backends we reuse ggml's numerically-exact quantized matmul
+kernels rather than reimplement them: MMQ for batched/prefill-style matmul,
+MMVQ for batch-1 decode matvec, plus the matching quantization kernels.
+This small subset is compiled directly:
 
 - **CUDA** (`--features cuda`): `build.rs` invokes `nvcc` over
   `cuda/embed_native_cuda.cu` + `cuda/ggml-cuda/quantize.cu`.

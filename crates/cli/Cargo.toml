@@ -18,6 +18,7 @@ greppy-embed-native = { path = "../embed-native" }
 greppy-freshness = { path = "../freshness" }
 greppy-grep = { path = "../greppy" }
 greppy-indexer = { path = "../indexer" }
+greppy-qwen35-native = { path = "../qwen35-native" }
 greppy-search = { path = "../search" }
 greppy-store = { path = "../store" }
 clap = { workspace = true }
@@ -25,22 +26,19 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
-# Owner rule: greppy works OUT OF THE BOX. The EmbeddingGemma model is baked
-# into every build (mandatory feature `embedded-model`, model files live in
-# `assets/embedded-model/` in this repo) — no download, no runtime flags, no
-# env. `--no-default-features` is intentionally rejected by build.rs/lib.rs.
-# GPU is auto-detected at runtime (device default = `auto`).
+# EmbeddingGemma and Qwen3.5 are product assets, not optional features. Every
+# build bakes both models and tokenizers into the binary. The only inference
+# build choices are the accelerated backends; CPU is always available.
 [features]
-default = ["embedded-model"]
-embedded-model = []
+default = []
 # GPU inference for EmbeddingGemma. Selected per platform at BUILD time (the
 # per-platform release binaries enable it; the runtime auto-detects and uses
 # the GPU with no `--device` flag). On macOS per-invocation Metal init can cost
 # more than it saves for a single one-shot query, so it stays build-opt-in:
 # `cargo build --release --features metal` (Linux/Windows CUDA: `--features cuda`).
-metal = ["greppy-embed-native/metal", "greppy-indexer/metal"]
+metal = ["greppy-embed-native/metal", "greppy-indexer/metal", "greppy-qwen35-native/metal"]
 accelerate = []
-cuda = ["greppy-embed-native/cuda", "greppy-indexer/cuda"]
+cuda = ["greppy-embed-native/cuda", "greppy-indexer/cuda", "greppy-qwen35-native/cuda"]
 
 [build-dependencies]
 sha2 = "0.10"

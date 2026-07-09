@@ -48,6 +48,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       # rust-toolchain.toml pins the channel + components; this action
       # reads it and installs exactly that toolchain. No `toolchain:`
@@ -143,6 +145,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable

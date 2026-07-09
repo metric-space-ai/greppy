@@ -1,0 +1,53 @@
+/// Versioned prompt/output contract used by the daemon protocol.
+pub const PROMPT_VERSION: &str = "qwen35-brief-purpose-v3";
+pub const TRIAGE_PROMPT_VERSION: &str = "qwen35-triage-v3";
+
+/// Exact prompt used for every definition source span.
+pub fn brief_prompt(source: &str) -> String {
+    format!("Summarize: What is this function for?\n\n{source}")
+}
+
+pub fn triage_prompt(query: &str, span_loc: &str, span_code: &str) -> String {
+    format!(
+        "Given the user's question and ONE code span, decide if this span is worth the developer opening. Reply with a verdict `READ` or `SKIP` and a 3-5 word reason. If unsure, READ. Do NOT answer the question. Do NOT explain the code.\n\nQuestion:\n{query}\n\nSpan: {span_loc}\n{span_code}"
+    )
+}
+
+/// Qwen3.5's tokenizer_config chat template emits this assistant prefix when
+/// `add_generation_prompt=true` and `enable_thinking=false`.
+pub fn non_thinking_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        user_prompt.trim()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_is_exact_contract() {
+        assert_eq!(
+            brief_prompt("fn f() {}\n"),
+            "Summarize: What is this function for?\n\nfn f() {}\n"
+        );
+    }
+
+    #[test]
+    fn triage_prompt_contains_query_loc_and_code() {
+        let prompt = triage_prompt("who starts workers?", "src/lib.rs:10-20", "fn start() {}\n");
+        assert!(prompt.starts_with("Given the user's question and ONE code span"));
+        assert!(prompt.contains("If unsure, READ."));
+        assert!(prompt.contains("Question:\nwho starts workers?"));
+        assert!(prompt.contains("Span: src/lib.rs:10-20\nfn start() {}\n"));
+    }
+
+    #[test]
+    fn non_thinking_chat_prompt_matches_qwen_template_prefix() {
+        assert_eq!(
+            non_thinking_chat_prompt("Summarize: What is this function for?\n\nfn f() {}\n"),
+            "<|im_start|>user\nSummarize: What is this function for?\n\nfn f() {}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+}

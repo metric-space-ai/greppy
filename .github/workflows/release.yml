@@ -56,17 +56,15 @@ jobs:
             features: cpu
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      - name: Fetch embedded model asset (LFS-tracked; CI checkout gets pointers)
+      - name: Verify bundled inference assets
         shell: bash
         run: |
-          mkdir -p crates/cli/assets/embedded-model
-          gh release download model-embeddinggemma-q4k-v1 \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir crates/cli/assets/embedded-model --clobber
-          ls -l crates/cli/assets/embedded-model
-        env:
-          GH_TOKEN: ${{ github.token }}
+          git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-q4km/*'
+          ls -lh crates/cli/assets/embeddinggemma-300m-q4k
+          ls -lh crates/cli/assets/qwen35-0.8b-q4km
 
       - name: Install Rust (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -88,7 +86,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build release binary
-        run: cargo build --release --bin greppy --features embedded-model${{ matrix.features != 'cpu' && format(',{0}', matrix.features) || '' }}
+        run: cargo build --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
 
       # Tag builds must ship a binary whose --version matches the tag —
       # v0.1.1 shipped reporting "grep 0.1.0" because the workspace version

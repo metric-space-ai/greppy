@@ -58,6 +58,140 @@ struct embed_native_kargs_post_attn_ffn_norm {
     int32_t pad;
 };
 
+struct embed_native_kargs_qwen_norm {
+    int32_t rows;
+    int32_t dim;
+    float eps;
+    int32_t qwen_scale;
+};
+
+struct embed_native_kargs_qwen_add {
+    int32_t total;
+};
+
+struct embed_native_kargs_qwen_conv {
+    int32_t channels;
+    int32_t k_width;
+};
+
+struct embed_native_kargs_qwen_conv_rows {
+    int32_t rows;
+    int32_t channels;
+    int32_t k_width;
+    int32_t pad;
+};
+
+struct embed_native_kargs_qwen_heads {
+    int32_t heads;
+    int32_t head_dim;
+    float eps;
+    int32_t pad;
+};
+
+struct embed_native_kargs_qwen_heads_rows {
+    int32_t rows;
+    int32_t heads;
+    int32_t head_dim;
+    int32_t q_stride;
+    int32_t k_stride;
+    float eps;
+    int32_t pad0;
+    int32_t pad1;
+};
+
+struct embed_native_kargs_qwen_deltanet {
+    int32_t heads;
+    int32_t head_dim;
+};
+
+struct embed_native_kargs_qwen_deltanet_rows {
+    int32_t rows;
+    int32_t heads;
+    int32_t head_dim;
+    int32_t q_stride;
+    int32_t k_stride;
+    int32_t v_stride;
+    int32_t beta_stride;
+    int32_t alpha_stride;
+    int32_t out_stride;
+    int32_t pad0;
+    int32_t pad1;
+    int32_t pad2;
+};
+
+struct embed_native_kargs_qwen_rope {
+    int32_t heads;
+    int32_t head_dim;
+    int32_t rope_dim;
+    int32_t position;
+    float base_freq;
+    int32_t pad0;
+    int32_t pad1;
+    int32_t pad2;
+};
+
+struct embed_native_kargs_qwen_rope_rows {
+    int32_t rows;
+    int32_t heads;
+    int32_t head_dim;
+    int32_t rope_dim;
+    int32_t position;
+    int32_t stride;
+    float base_freq;
+    int32_t pad;
+};
+
+struct embed_native_kargs_qwen_cache {
+    int32_t position;
+    int32_t heads;
+    int32_t head_dim;
+    int32_t max_context;
+};
+
+struct embed_native_kargs_qwen_cache_rows {
+    int32_t rows;
+    int32_t position;
+    int32_t heads;
+    int32_t head_dim;
+    int32_t max_context;
+    int32_t src_stride;
+    int32_t pad0;
+    int32_t pad1;
+};
+
+struct embed_native_kargs_qwen_attn {
+    int32_t position;
+    int32_t q_heads;
+    int32_t kv_heads;
+    int32_t dim;
+    int32_t max_context;
+    float scale;
+    int32_t pad0;
+    int32_t pad1;
+};
+
+struct embed_native_kargs_qwen_attn_rows {
+    int32_t rows;
+    int32_t position;
+    int32_t q_heads;
+    int32_t kv_heads;
+    int32_t dim;
+    int32_t max_context;
+    int32_t q_stride;
+    int32_t score_stride;
+    float scale;
+    int32_t pad0;
+    int32_t pad1;
+    int32_t pad2;
+};
+
+struct embed_native_kargs_qwen_gate_rows {
+    int32_t rows;
+    int32_t width;
+    int32_t value_stride;
+    int32_t gate_stride;
+};
+
 kernel void embed_native_mean_pool_f32(
         constant embed_native_kargs_mean_pool & args [[buffer(0)]],
         device const float * hidden [[buffer(1)]],
@@ -402,4 +536,803 @@ kernel void embed_native_post_ffn_next_attn_norm_f32(
     for (uint i = tid; i < (uint) args.dim; i += ntg) {
         next_attn_norm[base + i] = out_state[base + i] * next_scale * next_attn_weight[i];
     }
+}
+
+kernel void embed_native_qwen_rms_norm_f32(
+        constant embed_native_kargs_qwen_norm & args [[buffer(0)]],
+        device const float * src    [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        device       float * dst    [[buffer(3)]],
+        threadgroup float * shmem   [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    if (row >= (uint) args.rows) {
+        return;
+    }
+    const uint64_t base = (uint64_t) row * args.dim;
+    float sumf = 0.0f;
+    for (uint i = tid; i < (uint) args.dim; i += ntg) {
+        const float v = src[base + i];
+        sumf += v * v;
+    }
+    shmem[tid] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = rsqrt(shmem[0] / float(args.dim) + args.eps);
+    for (uint i = tid; i < (uint) args.dim; i += ntg) {
+        dst[base + i] = src[base + i] * inv * weight[i];
+    }
+}
+
+kernel void embed_native_qwen_add_rms_norm_f32(
+        constant embed_native_kargs_qwen_norm & args [[buffer(0)]],
+        device const float * lhs     [[buffer(1)]],
+        device const float * rhs     [[buffer(2)]],
+        device const float * weight  [[buffer(3)]],
+        device       float * sum_out [[buffer(4)]],
+        device       float * norm_out [[buffer(5)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    if (row >= (uint) args.rows) {
+        return;
+    }
+    const uint64_t base = (uint64_t) row * args.dim;
+    float sumf = 0.0f;
+    for (uint i = tid; i < (uint) args.dim; i += ntg) {
+        const float v = lhs[base + i] + rhs[base + i];
+        sumf += v * v;
+    }
+    shmem[tid] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = rsqrt(shmem[0] / float(args.dim) + args.eps);
+    for (uint i = tid; i < (uint) args.dim; i += ntg) {
+        const float v = lhs[base + i] + rhs[base + i];
+        sum_out[base + i] = v;
+        norm_out[base + i] = v * inv * weight[i];
+    }
+}
+
+kernel void embed_native_qwen_swiglu_f32(
+        constant embed_native_kargs_qwen_add & args [[buffer(0)]],
+        device const float * gate [[buffer(1)]],
+        device const float * up   [[buffer(2)]],
+        device       float * dst  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= (uint) args.total) {
+        return;
+    }
+    const float x = gate[gid];
+    dst[gid] = (x / (1.0f + exp(-x))) * up[gid];
+}
+
+kernel void embed_native_qwen_apply_silu_gate_f32(
+        constant embed_native_kargs_qwen_add & args [[buffer(0)]],
+        device       float * values [[buffer(1)]],
+        device const float * gate   [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= (uint) args.total) {
+        return;
+    }
+    const float x = gate[gid];
+    values[gid] *= x / (1.0f + exp(-x));
+}
+
+kernel void embed_native_qwen_apply_sigmoid_gate_f32(
+        constant embed_native_kargs_qwen_add & args [[buffer(0)]],
+        device       float * values [[buffer(1)]],
+        device const float * gate   [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= (uint) args.total) {
+        return;
+    }
+    values[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
+}
+
+kernel void embed_native_qwen_add_f32(
+        constant embed_native_kargs_qwen_add & args [[buffer(0)]],
+        device const float * lhs [[buffer(1)]],
+        device const float * rhs [[buffer(2)]],
+        device       float * dst [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= (uint) args.total) {
+        return;
+    }
+    dst[gid] = lhs[gid] + rhs[gid];
+}
+
+kernel void embed_native_qwen_causal_conv1d_silu_f32(
+        constant embed_native_kargs_qwen_conv & args [[buffer(0)]],
+        device       float * values [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        device       float * state  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int ch = int(gid);
+    if (ch >= args.channels) {
+        return;
+    }
+    const uint64_t base = (uint64_t) ch * args.k_width;
+    for (int i = 0; i < args.k_width - 1; ++i) {
+        state[base + i] = state[base + i + 1];
+    }
+    state[base + args.k_width - 1] = values[ch];
+    float acc = 0.0f;
+    for (int i = 0; i < args.k_width; ++i) {
+        acc += state[base + i] * weight[base + i];
+    }
+    values[ch] = acc / (1.0f + exp(-acc));
+}
+
+kernel void embed_native_qwen_causal_conv1d_silu_rows_f32(
+        constant embed_native_kargs_qwen_conv_rows & args [[buffer(0)]],
+        device       float * values [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        device       float * state  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int ch = int(gid);
+    if (ch >= args.channels) {
+        return;
+    }
+    const uint64_t base = (uint64_t) ch * args.k_width;
+    for (int row = 0; row < args.rows; ++row) {
+        const uint64_t value_idx = (uint64_t) row * args.channels + ch;
+        for (int i = 0; i < args.k_width - 1; ++i) {
+            state[base + i] = state[base + i + 1];
+        }
+        state[base + args.k_width - 1] = values[value_idx];
+        float acc = 0.0f;
+        for (int i = 0; i < args.k_width; ++i) {
+            acc += state[base + i] * weight[base + i];
+        }
+        values[value_idx] = acc / (1.0f + exp(-acc));
+    }
+}
+
+kernel void embed_native_qwen_normalize_linear_qk_f32(
+        constant embed_native_kargs_qwen_heads & args [[buffer(0)]],
+        device float * q [[buffer(1)]],
+        device float * k [[buffer(2)]],
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    if (head >= (uint) args.heads) {
+        return;
+    }
+    threadgroup float * sq = shmem;
+    threadgroup float * sk = shmem + ntg;
+    const uint64_t base = (uint64_t) head * args.head_dim;
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    for (uint i = tid; i < (uint) args.head_dim; i += ntg) {
+        const float qv = q[base + i];
+        const float kv = k[base + i];
+        sum_q += qv * qv;
+        sum_k += kv * kv;
+    }
+    sq[tid] = sum_q;
+    sk[tid] = sum_k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sq[tid] += sq[tid + stride];
+            sk[tid] += sk[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float q_scale = rsqrt(sq[0] + args.eps) * rsqrt(float(args.head_dim));
+    const float k_scale = rsqrt(sk[0] + args.eps);
+    for (uint i = tid; i < (uint) args.head_dim; i += ntg) {
+        q[base + i] *= q_scale;
+        k[base + i] *= k_scale;
+    }
+}
+
+kernel void embed_native_qwen_normalize_linear_qk_rows_f32(
+        constant embed_native_kargs_qwen_heads_rows & args [[buffer(0)]],
+        device float * q [[buffer(1)]],
+        device float * k [[buffer(2)]],
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const uint row = tgpig.x;
+    const uint head = tgpig.y;
+    if (row >= (uint) args.rows || head >= (uint) args.heads) {
+        return;
+    }
+    threadgroup float * sq = shmem;
+    threadgroup float * sk = shmem + nthreads;
+    const uint64_t q_base = (uint64_t) row * args.q_stride + (uint64_t) head * args.head_dim;
+    const uint64_t k_base = (uint64_t) row * args.k_stride + (uint64_t) head * args.head_dim;
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    for (uint i = tid; i < (uint) args.head_dim; i += nthreads) {
+        const float qv = q[q_base + i];
+        const float kv = k[k_base + i];
+        sum_q += qv * qv;
+        sum_k += kv * kv;
+    }
+    sq[tid] = sum_q;
+    sk[tid] = sum_k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sq[tid] += sq[tid + stride];
+            sk[tid] += sk[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float q_scale = rsqrt(sq[0] + args.eps) * rsqrt(float(args.head_dim));
+    const float k_scale = rsqrt(sk[0] + args.eps);
+    for (uint i = tid; i < (uint) args.head_dim; i += nthreads) {
+        q[q_base + i] *= q_scale;
+        k[k_base + i] *= k_scale;
+    }
+}
+
+kernel void embed_native_qwen_deinterleave_q_gate_rows_f32(
+        constant embed_native_kargs_qwen_heads_rows & args [[buffer(0)]],
+        device const float * packed [[buffer(1)]],
+        device       float * q_out  [[buffer(2)]],
+        device       float * gate_out [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int per_row = args.heads * args.head_dim;
+    const int idx = int(gid);
+    if (idx >= args.rows * per_row) {
+        return;
+    }
+    const int row = idx / per_row;
+    const int local = idx - row * per_row;
+    const int head = local / args.head_dim;
+    const int lane = local - head * args.head_dim;
+    const uint64_t src =
+        (uint64_t) row * args.q_stride + (uint64_t) head * args.head_dim * 2 + lane;
+    const uint64_t dst = (uint64_t) row * args.k_stride + local;
+    q_out[dst] = packed[src];
+    gate_out[dst] = packed[src + args.head_dim];
+}
+
+kernel void embed_native_qwen_rms_norm_strided_rows_f32(
+        constant embed_native_kargs_qwen_heads_rows & args [[buffer(0)]],
+        device float * values [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const uint row = tgpig.x;
+    const uint head = tgpig.y;
+    if (row >= (uint) args.rows || head >= (uint) args.heads) {
+        return;
+    }
+    const uint64_t base = (uint64_t) row * args.q_stride + (uint64_t) head * args.head_dim;
+    float sumf = 0.0f;
+    for (uint i = tid; i < (uint) args.head_dim; i += nthreads) {
+        const float v = values[base + i];
+        sumf += v * v;
+    }
+    shmem[tid] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale = rsqrt(shmem[0] / float(args.head_dim) + args.eps);
+    for (uint i = tid; i < (uint) args.head_dim; i += nthreads) {
+        values[base + i] *= scale * weight[i];
+    }
+}
+
+kernel void embed_native_qwen_deltanet_decode_f32(
+        constant embed_native_kargs_qwen_deltanet & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k       [[buffer(2)]],
+        device const float * v       [[buffer(3)]],
+        device const float * beta    [[buffer(4)]],
+        device const float * alpha   [[buffer(5)]],
+        device const float * a_log   [[buffer(6)]],
+        device const float * dt_bias [[buffer(7)]],
+        device       float * state   [[buffer(8)]],
+        device       float * out     [[buffer(9)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int head = int(tgpig.x);
+    const int value_idx = int(tgpig.y);
+    if (head >= args.heads || value_idx >= args.head_dim) {
+        return;
+    }
+    threadgroup float * sprior = shmem;
+    threadgroup float * sattn = shmem + nthreads;
+    const uint64_t head_base = (uint64_t) head * args.head_dim;
+    const uint64_t row_base = ((uint64_t) head * args.head_dim + value_idx) * args.head_dim;
+    const float beta_h = 1.0f / (1.0f + exp(-beta[head]));
+    const float x = alpha[head] + dt_bias[head];
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    float decay = exp(-exp(a_log[head]) * sp);
+    decay = min(max(decay, 0.0f), 1.0f);
+
+    float prior = 0.0f;
+    for (uint key_idx = tid; key_idx < (uint) args.head_dim; key_idx += nthreads) {
+        prior += state[row_base + key_idx] * k[head_base + key_idx];
+    }
+    sprior[tid] = prior;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sprior[tid] += sprior[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float delta = (v[head_base + value_idx] - decay * sprior[0]) * beta_h;
+
+    float attn = 0.0f;
+    for (uint key_idx = tid; key_idx < (uint) args.head_dim; key_idx += nthreads) {
+        const uint64_t idx = row_base + key_idx;
+        const float updated = decay * state[idx] + k[head_base + key_idx] * delta;
+        state[idx] = updated;
+        attn += updated * q[head_base + key_idx];
+    }
+    sattn[tid] = attn;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sattn[tid] += sattn[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[head_base + value_idx] = sattn[0];
+    }
+}
+
+kernel void embed_native_qwen_deltanet_decode_rows_f32(
+        constant embed_native_kargs_qwen_deltanet_rows & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k       [[buffer(2)]],
+        device const float * v       [[buffer(3)]],
+        device const float * beta    [[buffer(4)]],
+        device const float * alpha   [[buffer(5)]],
+        device const float * a_log   [[buffer(6)]],
+        device const float * dt_bias [[buffer(7)]],
+        device       float * state   [[buffer(8)]],
+        device       float * out     [[buffer(9)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int head = int(tgpig.x);
+    const int value_idx = int(tgpig.y);
+    if (head >= args.heads || value_idx >= args.head_dim) {
+        return;
+    }
+    threadgroup float * sprior = shmem;
+    threadgroup float * sattn = shmem + nthreads;
+    const uint64_t head_base = (uint64_t) head * args.head_dim;
+    const uint64_t row_base = ((uint64_t) head * args.head_dim + value_idx) * args.head_dim;
+    for (int row = 0; row < args.rows; ++row) {
+        const uint64_t q_base = (uint64_t) row * args.q_stride + head_base;
+        const uint64_t k_base = (uint64_t) row * args.k_stride + head_base;
+        const uint64_t v_base = (uint64_t) row * args.v_stride + head_base;
+        const uint64_t beta_base = (uint64_t) row * args.beta_stride;
+        const uint64_t alpha_base = (uint64_t) row * args.alpha_stride;
+        const float beta_h = 1.0f / (1.0f + exp(-beta[beta_base + head]));
+        const float x = alpha[alpha_base + head] + dt_bias[head];
+        const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+        float decay = exp(-exp(a_log[head]) * sp);
+        decay = min(max(decay, 0.0f), 1.0f);
+
+        float prior = 0.0f;
+        for (uint key_idx = tid; key_idx < (uint) args.head_dim; key_idx += nthreads) {
+            prior += state[row_base + key_idx] * k[k_base + key_idx];
+        }
+        sprior[tid] = prior;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                sprior[tid] += sprior[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float delta = (v[v_base + value_idx] - decay * sprior[0]) * beta_h;
+
+        float attn = 0.0f;
+        for (uint key_idx = tid; key_idx < (uint) args.head_dim; key_idx += nthreads) {
+            const uint64_t idx = row_base + key_idx;
+            const float updated = decay * state[idx] + k[k_base + key_idx] * delta;
+            state[idx] = updated;
+            attn += updated * q[q_base + key_idx];
+        }
+        sattn[tid] = attn;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                sattn[tid] += sattn[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            out[(uint64_t) row * args.out_stride + head_base + value_idx] = sattn[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void embed_native_qwen_rope_decode_f32(
+        constant embed_native_kargs_qwen_rope & args [[buffer(0)]],
+        device float * values [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int rope_half = args.rope_dim / 2;
+    const int total = args.heads * rope_half;
+    const int idx = int(gid);
+    if (idx >= total) {
+        return;
+    }
+    const int i = idx % rope_half;
+    const int head = idx / rope_half;
+    const uint64_t base = (uint64_t) head * args.head_dim;
+    const float x1 = values[base + i];
+    const float x2 = values[base + rope_half + i];
+    const float inv = pow(args.base_freq, -2.0f * float(i) / float(args.rope_dim));
+    const float theta = float(args.position) * inv;
+    const float s = sin(theta);
+    const float c = cos(theta);
+    values[base + i] = x1 * c - x2 * s;
+    values[base + rope_half + i] = x1 * s + x2 * c;
+}
+
+kernel void embed_native_qwen_rope_rows_f32(
+        constant embed_native_kargs_qwen_rope_rows & args [[buffer(0)]],
+        device float * values [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int rope_half = args.rope_dim / 2;
+    const int per_row = args.heads * rope_half;
+    const int idx = int(gid);
+    if (idx >= args.rows * per_row) {
+        return;
+    }
+    const int row = idx / per_row;
+    const int local = idx - row * per_row;
+    const int i = local % rope_half;
+    const int head = local / rope_half;
+    const uint64_t base = (uint64_t) row * args.stride + (uint64_t) head * args.head_dim;
+    const float x1 = values[base + i];
+    const float x2 = values[base + rope_half + i];
+    const float inv = pow(args.base_freq, -2.0f * float(i) / float(args.rope_dim));
+    const float theta = float(args.position + row) * inv;
+    const float s = sin(theta);
+    const float c = cos(theta);
+    values[base + i] = x1 * c - x2 * s;
+    values[base + rope_half + i] = x1 * s + x2 * c;
+}
+
+kernel void embed_native_qwen_cache_write_f32(
+        constant embed_native_kargs_qwen_cache & args [[buffer(0)]],
+        device const float * src   [[buffer(1)]],
+        device       float * cache [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int total = args.heads * args.head_dim;
+    const int idx = int(gid);
+    if (idx >= total) {
+        return;
+    }
+    cache[((uint64_t) args.position * args.heads * args.head_dim) + idx] = src[idx];
+}
+
+kernel void embed_native_qwen_cache_write_rows_f32(
+        constant embed_native_kargs_qwen_cache_rows & args [[buffer(0)]],
+        device const float * src   [[buffer(1)]],
+        device       float * cache [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int row_width = args.heads * args.head_dim;
+    const int idx = int(gid);
+    if (idx >= args.rows * row_width) {
+        return;
+    }
+    const int row = idx / row_width;
+    const int local = idx - row * row_width;
+    cache[((uint64_t) (args.position + row) * args.heads * args.head_dim) + local] =
+        src[(uint64_t) row * args.src_stride + local];
+}
+
+kernel void embed_native_qwen_attention_scores_decode_f32(
+        constant embed_native_kargs_qwen_attn & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k_cache [[buffer(2)]],
+        device       float * scores  [[buffer(3)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int pos = int(tgpig.x);
+    const int q_head = int(tgpig.y);
+    if (pos > args.position || q_head >= args.q_heads) {
+        return;
+    }
+    const int gqa = args.q_heads / args.kv_heads;
+    const int kv_head = q_head / gqa;
+    const uint64_t q_base = (uint64_t) q_head * args.dim;
+    const uint64_t k_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+    float acc = 0.0f;
+    for (uint i = tid; i < (uint) args.dim; i += nthreads) {
+        acc += q[q_base + i] * k_cache[k_base + i];
+    }
+    shmem[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        scores[(uint64_t) q_head * args.max_context + pos] = shmem[0] * args.scale;
+    }
+}
+
+kernel void embed_native_qwen_attention_scores_rows_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k_cache [[buffer(2)]],
+        device       float * scores  [[buffer(3)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int pos = int(tgpig.x);
+    const int q_head = int(tgpig.y);
+    const int row = int(tgpig.z);
+    if (row >= args.rows || q_head >= args.q_heads || pos > args.position + row) {
+        return;
+    }
+    const int gqa = args.q_heads / args.kv_heads;
+    const int kv_head = q_head / gqa;
+    const uint64_t q_base = (uint64_t) row * args.q_stride + (uint64_t) q_head * args.dim;
+    const uint64_t k_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+    float acc = 0.0f;
+    for (uint i = tid; i < (uint) args.dim; i += nthreads) {
+        acc += q[q_base + i] * k_cache[k_base + i];
+    }
+    shmem[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        scores[(uint64_t) row * args.score_stride + (uint64_t) q_head * args.max_context + pos] =
+            shmem[0] * args.scale;
+    }
+}
+
+kernel void embed_native_qwen_softmax_decode_f32(
+        constant embed_native_kargs_qwen_attn & args [[buffer(0)]],
+        device float * scores [[buffer(1)]],
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    if (head >= (uint) args.q_heads) {
+        return;
+    }
+    const uint64_t base = (uint64_t) head * args.max_context;
+    float local_max = -INFINITY;
+    for (uint pos = tid; pos <= (uint) args.position; pos += ntg) {
+        local_max = max(local_max, scores[base + pos]);
+    }
+    shmem[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] = max(shmem[tid], shmem[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_v = shmem[0];
+    float local_sum = 0.0f;
+    for (uint pos = tid; pos <= (uint) args.position; pos += ntg) {
+        const float v = exp(scores[base + pos] - max_v);
+        scores[base + pos] = v;
+        local_sum += v;
+    }
+    shmem[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = 1.0f / max(shmem[0], 1.0e-20f);
+    for (uint pos = tid; pos <= (uint) args.position; pos += ntg) {
+        scores[base + pos] *= inv;
+    }
+}
+
+kernel void embed_native_qwen_softmax_rows_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device float * scores [[buffer(1)]],
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int row = int(tgpig.x);
+    const int head = int(tgpig.y);
+    if (row >= args.rows || head >= args.q_heads) {
+        return;
+    }
+    const int position = args.position + row;
+    const uint64_t base = (uint64_t) row * args.score_stride + (uint64_t) head * args.max_context;
+    float local_max = -INFINITY;
+    for (uint pos = tid; pos <= (uint) position; pos += nthreads) {
+        local_max = max(local_max, scores[base + pos]);
+    }
+    shmem[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] = max(shmem[tid], shmem[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_v = shmem[0];
+    float local_sum = 0.0f;
+    for (uint pos = tid; pos <= (uint) position; pos += nthreads) {
+        const float v = exp(scores[base + pos] - max_v);
+        scores[base + pos] = v;
+        local_sum += v;
+    }
+    shmem[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = 1.0f / max(shmem[0], 1.0e-20f);
+    for (uint pos = tid; pos <= (uint) position; pos += nthreads) {
+        scores[base + pos] *= inv;
+    }
+}
+
+kernel void embed_native_qwen_attention_values_decode_f32(
+        constant embed_native_kargs_qwen_attn & args [[buffer(0)]],
+        device const float * scores  [[buffer(1)]],
+        device const float * v_cache [[buffer(2)]],
+        device       float * out     [[buffer(3)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int q_head = int(tgpig.x);
+    const int value_idx = int(tgpig.y);
+    if (q_head >= args.q_heads || value_idx >= args.dim) {
+        return;
+    }
+    const int gqa = args.q_heads / args.kv_heads;
+    const int kv_head = q_head / gqa;
+    const uint64_t score_base = (uint64_t) q_head * args.max_context;
+    float acc = 0.0f;
+    for (uint pos = tid; pos <= (uint) args.position; pos += nthreads) {
+        const uint64_t v_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+        acc += scores[score_base + pos] * v_cache[v_base + value_idx];
+    }
+    shmem[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[(uint64_t) q_head * args.dim + value_idx] = shmem[0];
+    }
+}
+
+kernel void embed_native_qwen_attention_values_rows_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device const float * scores  [[buffer(1)]],
+        device const float * v_cache [[buffer(2)]],
+        device       float * out     [[buffer(3)]],
+        threadgroup float * shmem    [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nthreads = ntg.x;
+    const int row = int(tgpig.x);
+    const int q_head = int(tgpig.y);
+    const int value_idx = int(tgpig.z);
+    if (row >= args.rows || q_head >= args.q_heads || value_idx >= args.dim) {
+        return;
+    }
+    const int position = args.position + row;
+    const int gqa = args.q_heads / args.kv_heads;
+    const int kv_head = q_head / gqa;
+    const uint64_t score_base =
+        (uint64_t) row * args.score_stride + (uint64_t) q_head * args.max_context;
+    float acc = 0.0f;
+    for (uint pos = tid; pos <= (uint) position; pos += nthreads) {
+        const uint64_t v_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+        acc += scores[score_base + pos] * v_cache[v_base + value_idx];
+    }
+    shmem[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[(uint64_t) row * args.q_heads * args.dim + (uint64_t) q_head * args.dim + value_idx] =
+            shmem[0];
+    }
+}
+
+kernel void embed_native_qwen_apply_silu_gate_rows_f32(
+        constant embed_native_kargs_qwen_gate_rows & args [[buffer(0)]],
+        device       float * values [[buffer(1)]],
+        device const float * gate   [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int idx = int(gid);
+    if (idx >= args.rows * args.width) {
+        return;
+    }
+    const int row = idx / args.width;
+    const int col = idx - row * args.width;
+    const float x = gate[(uint64_t) row * args.gate_stride + col];
+    values[(uint64_t) row * args.value_stride + col] *= x / (1.0f + exp(-x));
+}
+
+kernel void embed_native_qwen_apply_sigmoid_gate_rows_f32(
+        constant embed_native_kargs_qwen_gate_rows & args [[buffer(0)]],
+        device       float * values [[buffer(1)]],
+        device const float * gate   [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const int idx = int(gid);
+    if (idx >= args.rows * args.width) {
+        return;
+    }
+    const int row = idx / args.width;
+    const int col = idx - row * args.width;
+    const float x = gate[(uint64_t) row * args.gate_stride + col];
+    values[(uint64_t) row * args.value_stride + col] *= 1.0f / (1.0f + exp(-x));
 }

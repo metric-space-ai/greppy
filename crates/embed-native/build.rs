@@ -44,10 +44,16 @@ fn build_cuda() {
     let ggml_include = cuda_dir.join("ggml-include");
     let wrapper = cuda_dir.join("embed_native_cuda.cu");
     let quantize = ggml_cuda.join("quantize.cu");
+    let mmvq = ggml_cuda.join("mmvq.cu");
+    let mmvq_h = ggml_cuda.join("mmvq.cuh");
+    let unary_h = ggml_cuda.join("unary.cuh");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
     println!("cargo:rerun-if-changed={}", wrapper.display());
     println!("cargo:rerun-if-changed={}", quantize.display());
+    println!("cargo:rerun-if-changed={}", mmvq.display());
+    println!("cargo:rerun-if-changed={}", mmvq_h.display());
+    println!("cargo:rerun-if-changed={}", unary_h.display());
     println!("cargo:rerun-if-changed={}", ggml_cuda.display());
     println!("cargo:rerun-if-changed={}", ggml_include.display());
 
@@ -133,19 +139,43 @@ fn compile_cuda_dylib(
         // Microsoft Visual Studio version"). Our kernels don't touch the
         // version-sensitive surface, so allow the newer host compiler.
         cmd.arg("-allow-unsupported-compiler");
+        let cuda_include = PathBuf::from(cuda_home).join("include");
+        if cuda_include.is_dir() {
+            cmd.arg(format!("-I{}", cuda_include.display()));
+        }
         let cuda_lib = PathBuf::from(cuda_home).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
         }
     } else {
-        let cuda_lib64 = PathBuf::from(cuda_home).join("lib64");
+        let cuda_home = PathBuf::from(cuda_home);
+        let cuda_include = cuda_home.join("include");
+        let cuda_target = cuda_home.join("targets").join("x86_64-linux");
+        let cuda_target_include = cuda_target.join("include");
+        if cuda_include.is_dir() {
+            cmd.arg(format!("-I{}", cuda_include.display()));
+        }
+        if cuda_target_include.is_dir() {
+            cmd.arg(format!("-I{}", cuda_target_include.display()));
+        }
+        let cuda_lib64 = cuda_home.join("lib64");
         let cuda_stubs = cuda_lib64.join("stubs");
+        let cuda_target_lib = cuda_target.join("lib");
+        let cuda_target_stubs = cuda_target_lib.join("stubs");
         if cuda_lib64.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib64.display()));
             cmd.args(["-Xlinker", "-rpath", "-Xlinker"]).arg(cuda_lib64);
         }
         if cuda_stubs.is_dir() {
             cmd.arg(format!("-L{}", cuda_stubs.display()));
+        }
+        if cuda_target_lib.is_dir() {
+            cmd.arg(format!("-L{}", cuda_target_lib.display()));
+            cmd.args(["-Xlinker", "-rpath", "-Xlinker"])
+                .arg(cuda_target_lib);
+        }
+        if cuda_target_stubs.is_dir() {
+            cmd.arg(format!("-L{}", cuda_target_stubs.display()));
         }
     }
     cmd.args(["-DGGML_CUDA_FORCE_MMQ", "-I"])

@@ -9,6 +9,7 @@ members = [
     "crates/resolver",
     "crates/search",
     "crates/embed-native",
+    "crates/qwen35-native",
     "crates/freshness",
     "crates/greppy",
     "crates/cli",

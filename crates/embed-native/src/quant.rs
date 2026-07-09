@@ -141,6 +141,7 @@ pub fn dequantize(dtype: GgmlDType, raw: &[u8], elem_count: usize) -> Result<Vec
         GgmlDType::Q5_0 => dequantize_q5_0(raw, &mut out)?,
         GgmlDType::Q8_0 => dequantize_q8_0(raw, &mut out)?,
         GgmlDType::Q4K => dequantize_q4_k(raw, &mut out)?,
+        GgmlDType::Q5K => dequantize_q5_k(raw, &mut out)?,
         GgmlDType::Q6K => dequantize_q6_k(raw, &mut out)?,
         other => return Err(Error::UnsupportedDType(other)),
     }
@@ -239,6 +240,45 @@ fn dequantize_q4_k(raw: &[u8], out: &mut [f32]) -> Result<()> {
                 out_idx += 1;
             }
             is += 2;
+        }
+    }
+    Ok(())
+}
+
+fn dequantize_q5_k(raw: &[u8], out: &mut [f32]) -> Result<()> {
+    for (block_idx, block) in raw.chunks_exact(Q5_K_SIZE).enumerate() {
+        let d = read_f16(&block[0..2])?;
+        let dmin = read_f16(&block[2..4])?;
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..176];
+        let y = &mut out[block_idx * QK_K..(block_idx + 1) * QK_K];
+
+        let mut scale_idx = 0;
+        let mut qs_base = 0;
+        let mut high_lo = 1u8;
+        let mut high_hi = 2u8;
+        for out_base in (0..QK_K).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(scale_idx, scales);
+            let (sc2, m2) = get_scale_min_k4(scale_idx + 1, scales);
+            let scale1 = d * sc1 as f32;
+            let scale2 = d * sc2 as f32;
+            let min1 = dmin * m1 as f32;
+            let min2 = dmin * m2 as f32;
+            for l in 0..32 {
+                let q4 = qs[qs_base + l] & 0x0f;
+                let high = if qh[l] & high_lo != 0 { 16 } else { 0 };
+                y[out_base + l] = scale1 * (q4 as f32 + high as f32) - min1;
+            }
+            for l in 0..32 {
+                let q4 = qs[qs_base + l] >> 4;
+                let high = if qh[l] & high_hi != 0 { 16 } else { 0 };
+                y[out_base + 32 + l] = scale2 * (q4 as f32 + high as f32) - min2;
+            }
+            scale_idx += 2;
+            qs_base += 32;
+            high_lo <<= 2;
+            high_hi <<= 2;
         }
     }
     Ok(())

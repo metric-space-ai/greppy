@@ -2285,6 +2285,7 @@ fn op_type(dtype: GgmlType) -> Result<OpType> {
         GgmlType::Q8_0 => OpType::Q8_0,
         GgmlType::Bf16 => OpType::Bf16,
         GgmlType::Q4_K => OpType::Q4_K,
+        GgmlType::Q5_K => OpType::Q5_K,
         GgmlType::Q6_K => OpType::Q6_K,
         other => {
             return Err(Error::InvalidGguf(format!(

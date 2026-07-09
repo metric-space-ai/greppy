@@ -24,3 +24,11 @@ text is preserved there at `crates/embed-native/vendor/LICENSE-ggml`, and
 per-file provenance (which files are upstream ggml vs. greppy-authored
 wrappers) is documented in `crates/embed-native/vendor/README.md`. The default
 build (`default = []`) ships no ggml code.
+
+## Qwen3.5 native summarizer kernels
+
+The Qwen3.5 summarizer crate (`crates/qwen35-native`) is original Rust source.
+Its opt-in CUDA and Metal backends reuse the same MIT-compatible vendored ggml
+kernel slice documented above under `crates/embed-native/vendor/`; no separate
+Qwen3.5 runtime dependency on llama.cpp, libggml/libllama, Candle, ONNX,
+Python, or an external server is introduced.

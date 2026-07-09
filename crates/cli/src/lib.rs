@@ -9,18 +9,11 @@
 //! - `search-code` / `search-symbols` — indexed code and symbol search.
 //! - `install`      — agent installer      (out of scope)
 //! - `uninstall`    — agent uninstaller    (out of scope)
-//! - `update`       — agent updater        (out of scope)
+//! - `update`       — self-updater for GitHub release binaries
 //! - `config`       — runtime config       (out of scope)
 //!
 //! Out-of-scope lifecycle subcommands print a structured error and exit
 //! with a documented non-zero code (EX_UNAVAILABLE = 69).
-
-#[cfg(not(feature = "embedded-model"))]
-compile_error!(
-    "greppy cannot be built without the embedded EmbeddingGemma model. \
-     Every greppy binary must bake crates/cli/assets/embedded-model/* \
-     from this repo into the binary."
-);
 
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
@@ -29,6 +22,8 @@ use greppy_freshness::LockOutcome;
 
 #[cfg(unix)]
 mod embed_daemon;
+#[cfg(unix)]
+mod summarize_daemon;
 
 /// Exit code for subcommands that are recognised but not yet implemented
 /// in the current phase. EX_UNAVAILABLE (69) is the standard BSD sysexits
@@ -48,7 +43,6 @@ pub const EXIT_IO: u8 = 73;
 pub const EXIT_TEMPFAIL: u8 = 75;
 
 const DEFAULT_EMBEDDINGGEMMA_MODEL_ID: &str = "google/embeddinggemma-300m";
-const ENV_EMBED_INDEX: &str = "GREPPY_EMBEDDINGGEMMA_INDEX";
 const ENV_EMBED_MODEL_DIR: &str = "GREPPY_EMBEDDINGGEMMA_MODEL";
 const ENV_EMBED_GGUF: &str = "GREPPY_EMBEDDINGGEMMA_GGUF";
 const ENV_EMBED_TOKENIZER: &str = "GREPPY_EMBEDDINGGEMMA_TOKENIZER";
@@ -61,16 +55,28 @@ const ENV_PROVIDER_POLICY: &str = "GREPPY_PROVIDER_POLICY";
 const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
+const DEFAULT_UPDATE_REPO: &str = "metric-space-ai/greppy";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
+#[cfg(debug_assertions)]
+const ENV_TEST_SKIP_INFERENCE: &str = "GREPPY_TEST_SKIP_INFERENCE";
+
+#[cfg(debug_assertions)]
+fn test_inference_skipped() -> bool {
+    std::env::var_os(ENV_TEST_SKIP_INFERENCE).is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn test_inference_skipped() -> bool {
+    false
+}
 
 #[derive(Debug, Clone, Copy)]
 struct EmbeddingCliArgs<'a> {
-    enabled: bool,
     model_dir: Option<&'a str>,
     gguf: Option<&'a str>,
     tokenizer: Option<&'a str>,
@@ -78,12 +84,6 @@ struct EmbeddingCliArgs<'a> {
     max_length: Option<usize>,
     device: Option<&'a str>,
     no_gpu: bool,
-}
-
-impl EmbeddingCliArgs<'_> {
-    fn has_model_source_arg(&self) -> bool {
-        self.model_dir.is_some() || self.gguf.is_some() || self.tokenizer.is_some()
-    }
 }
 
 fn discover_overrides_from_env() -> Result<greppy_discover::WalkOverrides> {
@@ -124,6 +124,14 @@ enum EmbeddingModelSource {
         gguf: std::path::PathBuf,
         tokenizer: std::path::PathBuf,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QwenSummaryConfig {
+    model_id: String,
+    gguf: std::path::PathBuf,
+    tokenizer: std::path::PathBuf,
+    device: greppy_qwen35_native::DevicePreference,
 }
 
 #[derive(Debug, Parser)]
@@ -169,8 +177,8 @@ pub enum Command {
     Index {
         /// Path to the repository root (default: cwd).
         path: Option<String>,
-        /// Build EmbeddingGemma code-span vectors into the published snapshot.
-        #[arg(long)]
+        /// Compatibility no-op; EmbeddingGemma vectors are always built.
+        #[arg(long, hide = true)]
         embeddings: bool,
         /// Safetensors model directory containing config.json, tokenizer.json and model.safetensors.
         #[arg(long)]
@@ -525,14 +533,12 @@ pub enum Command {
         #[arg(long)]
         no_gpu: bool,
     },
-    /// Semantic query. Default is algorithmic lexical semantic
-    /// ranking; `--vectors` uses EmbeddingGemma vector search over indexed
-    /// code-span embeddings.
+    /// Semantic query using EmbeddingGemma vectors with Qwen purpose hints.
     #[command(name = "semantic-search", alias = "semantic")]
     Semantic {
         query: Option<String>,
-        /// Use EmbeddingGemma vector search over indexed code-span embeddings.
-        #[arg(long)]
+        /// Compatibility no-op; vector search is always enabled.
+        #[arg(long, hide = true)]
         vectors: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
@@ -632,10 +638,24 @@ pub enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Agent updater — out of scope.
+    /// Update greppy from the latest GitHub release.
+    #[command(alias = "upgrade")]
     Update {
+        /// Only check whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// Resolve the release and asset, but do not download or replace the binary.
+        #[arg(long)]
+        dry_run: bool,
+        /// Install without an interactive confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Install a specific release tag instead of the latest release.
+        #[arg(long)]
+        tag: Option<String>,
+        /// GitHub repository slug to read releases from (OWNER/REPO).
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Runtime config — out of scope.
     Config { subcmd: Option<String> },
@@ -660,6 +680,24 @@ pub enum Command {
         device: String,
         /// Load the model immediately at startup (session prewarm) instead
         /// of on the first request.
+        #[arg(long)]
+        prewarm: bool,
+    },
+    /// Internal: warm Qwen3.5 summarization daemon for `brief`.
+    #[cfg(unix)]
+    #[command(hide = true, name = "summarize-daemon")]
+    SummarizeDaemon {
+        #[arg(long)]
+        socket: String,
+        #[arg(long)]
+        gguf: String,
+        #[arg(long)]
+        tokenizer: String,
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "auto")]
+        device: String,
+        /// Load the model immediately at startup instead of on first request.
         #[arg(long)]
         prewarm: bool,
     },
@@ -704,8 +742,10 @@ const SUBCOMMANDS: &[&str] = &[
     "install",
     "uninstall",
     "update",
+    "upgrade",
     "config",
     "embed-daemon",
+    "summarize-daemon",
 ];
 
 /// Top-level entry point that captures argv as `OsString` BEFORE clap
@@ -799,6 +839,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--embeddings --embedding-gguf F --embedding-tokenizer F]",
+        "update" | "upgrade" => "greppy update [--check|--dry-run] [-y] [--tag TAG]",
         _ => return None,
     })
 }
@@ -969,6 +1010,24 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             };
             embed_daemon::daemon_main(std::path::PathBuf::from(socket), cfg, prewarm)
         }
+        #[cfg(unix)]
+        Command::SummarizeDaemon {
+            socket,
+            gguf,
+            tokenizer,
+            model_id,
+            device,
+            prewarm,
+        } => {
+            let cfg = QwenSummaryConfig {
+                model_id,
+                gguf: std::path::PathBuf::from(gguf),
+                tokenizer: std::path::PathBuf::from(tokenizer),
+                device: greppy_qwen35_native::DevicePreference::parse(&device)
+                    .map_err(|e| Error::Invalid(format!("summarize-daemon --device: {e}")))?,
+            };
+            summarize_daemon::daemon_main(std::path::PathBuf::from(socket), cfg, prewarm)
+        }
         Command::Index {
             path,
             embeddings,
@@ -1006,7 +1065,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                     path.as_deref(),
                     root,
                     EmbeddingCliArgs {
-                        enabled: embeddings,
                         model_dir: embedding_model_dir.as_deref(),
                         gguf: embedding_gguf.as_deref(),
                         tokenizer: embedding_tokenizer.as_deref(),
@@ -1164,7 +1222,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             json,
             vectors,
             EmbeddingCliArgs {
-                enabled: vectors,
                 model_dir: embedding_model_dir.as_deref(),
                 gguf: embedding_gguf.as_deref(),
                 tokenizer: embedding_tokenizer.as_deref(),
@@ -1192,7 +1249,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             true,
             json,
             EmbeddingCliArgs {
-                enabled: true,
                 model_dir: embedding_model_dir.as_deref(),
                 gguf: embedding_gguf.as_deref(),
                 tokenizer: embedding_tokenizer.as_deref(),
@@ -1223,7 +1279,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             lines,
             json,
             EmbeddingCliArgs {
-                enabled: true,
                 model_dir: embedding_model_dir.as_deref(),
                 gguf: embedding_gguf.as_deref(),
                 tokenizer: embedding_tokenizer.as_deref(),
@@ -1236,9 +1291,709 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
         ),
         Command::Install { .. } => Err(Error::out_of_scope("grep install")),
         Command::Uninstall { .. } => Err(Error::out_of_scope("grep uninstall")),
-        Command::Update { .. } => Err(Error::out_of_scope("grep update")),
+        Command::Update {
+            check,
+            dry_run,
+            yes,
+            tag,
+            repo,
+        } => dispatch_update(check, dry_run, yes, tag.as_deref(), repo.as_deref()),
         Command::Config { .. } => Err(Error::out_of_scope("grep config")),
     }
+}
+
+fn dispatch_update(
+    check: bool,
+    dry_run: bool,
+    yes: bool,
+    tag: Option<&str>,
+    repo: Option<&str>,
+) -> Result<i32> {
+    let repo = update_repo_slug(repo)?;
+    let release = fetch_github_release(&repo, tag)?;
+    let current = env!("CARGO_PKG_VERSION");
+    let newer = release_is_newer(&release.tag, current);
+
+    if check {
+        if newer {
+            println!(
+                "greppy update available: {} -> {} ({})",
+                current, release.tag, release.html_url
+            );
+        } else {
+            println!(
+                "greppy {} is current (latest: {}, {})",
+                current, release.tag, release.html_url
+            );
+        }
+        return Ok(0);
+    }
+
+    if tag.is_none() && !newer {
+        println!(
+            "greppy {} is current (latest: {}, {})",
+            current, release.tag, release.html_url
+        );
+        return Ok(0);
+    }
+
+    let asset = select_release_asset(
+        &release.assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+    .ok_or_else(|| {
+        Error::Config(format!(
+            "release {} has no greppy asset for {}-{}",
+            release.tag,
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        ))
+    })?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| Error::io("locate current greppy executable", e))?;
+
+    println!("greppy update: {} -> {}", current, release.tag.as_str());
+    println!("release: {}", release.html_url);
+    println!(
+        "asset: {} ({} bytes) for {}",
+        asset.name,
+        asset.size,
+        current_platform_label()
+    );
+    println!("target: {}", current_exe.display());
+
+    if dry_run {
+        println!("dry-run: no download or replacement performed");
+        return Ok(0);
+    }
+
+    if !confirm_update(yes, &release, asset, &current_exe)? {
+        println!("greppy update cancelled");
+        return Ok(0);
+    }
+
+    let temp_dir = create_update_temp_dir()?;
+    let result = (|| {
+        let candidate = download_and_prepare_release_asset(asset, &temp_dir)?;
+        let outcome = replace_current_exe(&candidate, &current_exe)?;
+        match outcome {
+            ReplaceOutcome::Replaced => {
+                println!("greppy updated to {}", release.tag);
+            }
+            #[cfg(windows)]
+            ReplaceOutcome::ScheduledAfterExit => {
+                println!(
+                    "greppy update to {} is scheduled and will finish after this process exits",
+                    release.tag
+                );
+            }
+        }
+        Ok(0)
+    })();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubRelease {
+    tag: String,
+    html_url: String,
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseAsset {
+    name: String,
+    download_url: String,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaceOutcome {
+    Replaced,
+    #[cfg(windows)]
+    ScheduledAfterExit,
+}
+
+fn update_repo_slug(repo: Option<&str>) -> Result<String> {
+    let raw = repo.unwrap_or(DEFAULT_UPDATE_REPO);
+    let parts: Vec<&str> = raw.split('/').collect();
+    if parts.len() != 2
+        || parts.iter().any(|p| p.is_empty())
+        || !parts.iter().all(|p| {
+            p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    {
+        return Err(Error::Invalid(format!(
+            "--repo must be OWNER/REPO, got {raw:?}"
+        )));
+    }
+    Ok(raw.to_string())
+}
+
+fn fetch_github_release(repo: &str, tag: Option<&str>) -> Result<GithubRelease> {
+    let endpoint = match tag {
+        Some(tag) => format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"),
+        None => format!("https://api.github.com/repos/{repo}/releases/latest"),
+    };
+    let raw = curl_to_string(&endpoint)?;
+    parse_github_release(&raw)
+}
+
+fn parse_github_release(raw: &str) -> Result<GithubRelease> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| Error::Parse(format!("GitHub release JSON: {e}")))?;
+    if let Some(message) = v.get("message").and_then(|m| m.as_str()) {
+        return Err(Error::Config(format!(
+            "GitHub release lookup failed: {message}"
+        )));
+    }
+    let tag = v
+        .get("tag_name")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| Error::Parse("GitHub release JSON missing tag_name".into()))?
+        .to_string();
+    let html_url = v
+        .get("html_url")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let assets = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| Error::Parse("GitHub release JSON missing assets".into()))?
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name")?.as_str()?.to_string();
+            let download_url = a.get("browser_download_url")?.as_str()?.to_string();
+            let size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            Some(ReleaseAsset {
+                name,
+                download_url,
+                size,
+            })
+        })
+        .collect();
+    Ok(GithubRelease {
+        tag,
+        html_url,
+        assets,
+    })
+}
+
+fn curl_to_string(url: &str) -> Result<String> {
+    let out = std::process::Command::new("curl")
+        .arg("-fsSL")
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .arg("-H")
+        .arg("User-Agent: greppy-updater")
+        .arg(url)
+        .output()
+        .map_err(|e| Error::io("run curl for greppy update", e))?;
+    if !out.status.success() {
+        return Err(Error::Config(format!(
+            "curl failed for {url}: {}",
+            stderr_summary(&out.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn curl_download(url: &str, dest: &std::path::Path) -> Result<()> {
+    let out = std::process::Command::new("curl")
+        .arg("-fL")
+        .arg("--show-error")
+        .arg("--silent")
+        .arg("-H")
+        .arg("User-Agent: greppy-updater")
+        .arg("-o")
+        .arg(dest)
+        .arg(url)
+        .output()
+        .map_err(|e| Error::io("run curl for greppy update download", e))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(dest);
+        return Err(Error::Config(format!(
+            "download failed for {url}: {}",
+            stderr_summary(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn stderr_summary(stderr: &[u8]) -> String {
+    let s = String::from_utf8_lossy(stderr);
+    s.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("command exited unsuccessfully")
+        .trim()
+        .to_string()
+}
+
+fn release_is_newer(tag: &str, current: &str) -> bool {
+    matches!(
+        compare_version_numbers(tag, current),
+        Some(std::cmp::Ordering::Greater)
+    )
+}
+
+fn compare_version_numbers(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let a = numeric_version_parts(a)?;
+    let b = numeric_version_parts(b)?;
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let left = *a.get(i).unwrap_or(&0);
+        let right = *b.get(i).unwrap_or(&0);
+        match left.cmp(&right) {
+            std::cmp::Ordering::Equal => {}
+            other => return Some(other),
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
+fn numeric_version_parts(s: &str) -> Option<Vec<u64>> {
+    let trimmed = s.trim_start_matches(['v', 'V']);
+    let parts: Vec<u64> = trimmed
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse::<u64>().ok())
+        .collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn select_release_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    os: &str,
+    arch: &str,
+) -> Option<&'a ReleaseAsset> {
+    let os_aliases = os_aliases(os);
+    let arch_aliases = arch_aliases(arch);
+    let mut best: Option<(&ReleaseAsset, i32)> = None;
+    for asset in assets {
+        let lower = asset.name.to_ascii_lowercase();
+        if update_asset_is_auxiliary(&lower) || !lower.contains("greppy") {
+            continue;
+        }
+        let os_match = os_aliases.iter().any(|token| lower.contains(token));
+        let arch_match = arch_aliases.iter().any(|token| lower.contains(token))
+            || (os == "macos" && lower.contains("universal"));
+        if !os_match || !arch_match {
+            continue;
+        }
+        let mut score = 100;
+        if lower.contains("greppy-") || lower.starts_with("greppy") {
+            score += 20;
+        }
+        if lower.contains(&format!("{arch}-")) || lower.contains(&format!("-{arch}")) {
+            score += 20;
+        }
+        if lower.contains(".tar.") || lower.ends_with(".tgz") || lower.ends_with(".zip") {
+            score += 10;
+        }
+        if lower.contains("debug") {
+            score -= 30;
+        }
+        match best {
+            Some((_, best_score)) if best_score >= score => {}
+            _ => best = Some((asset, score)),
+        }
+    }
+    best.map(|(asset, _)| asset)
+}
+
+fn os_aliases(os: &str) -> Vec<&'static str> {
+    match os {
+        "macos" => vec!["apple-darwin", "darwin", "macos"],
+        "linux" => vec!["unknown-linux", "linux", "musl", "gnu"],
+        "windows" => vec!["pc-windows", "windows", "msvc", "mingw"],
+        _ => vec![],
+    }
+}
+
+fn arch_aliases(arch: &str) -> Vec<&'static str> {
+    match arch {
+        "x86_64" => vec!["x86_64", "amd64", "x64"],
+        "aarch64" => vec!["aarch64", "arm64"],
+        "arm" => vec!["armv7", "arm"],
+        _ => vec![],
+    }
+}
+
+fn update_asset_is_auxiliary(lower_name: &str) -> bool {
+    lower_name.ends_with(".sha256")
+        || lower_name.ends_with(".sha256sum")
+        || lower_name.ends_with(".sig")
+        || lower_name.ends_with(".asc")
+        || lower_name.ends_with(".pem")
+        || lower_name.ends_with(".txt")
+        || lower_name.contains("checksum")
+}
+
+fn current_platform_label() -> String {
+    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+fn confirm_update(
+    yes: bool,
+    release: &GithubRelease,
+    asset: &ReleaseAsset,
+    current_exe: &std::path::Path,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::Invalid(
+            "greppy update requires -y/--yes when stdin is not a terminal".into(),
+        ));
+    }
+    eprint!(
+        "Install {} from {} over {}? [y/N] ",
+        release.tag,
+        asset.name,
+        current_exe.display()
+    );
+    std::io::stderr()
+        .flush()
+        .map_err(|e| Error::io("flush update prompt", e))?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| Error::io("read update prompt", e))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn create_update_temp_dir() -> Result<std::path::PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("greppy-update-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::io(format!("create temp dir {}", dir.display()), e))?;
+    Ok(dir)
+}
+
+fn download_and_prepare_release_asset(
+    asset: &ReleaseAsset,
+    temp_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let download_path = temp_dir.join(sanitize_update_filename(&asset.name));
+    println!("downloading {}", asset.download_url);
+    curl_download(&asset.download_url, &download_path)?;
+    prepare_downloaded_asset(&download_path, &asset.name, temp_dir)
+}
+
+fn sanitize_update_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "greppy-download".into()
+    } else {
+        sanitized
+    }
+}
+
+fn prepare_downloaded_asset(
+    download_path: &std::path::Path,
+    asset_name: &str,
+    temp_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let lower = asset_name.to_ascii_lowercase();
+    let candidate = if lower.ends_with(".zip") {
+        let extract_dir = temp_dir.join("extract");
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| Error::io(format!("create {}", extract_dir.display()), e))?;
+        extract_zip_asset(download_path, &extract_dir)?;
+        find_greppy_binary(&extract_dir)?
+    } else if lower.ends_with(".tar")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".txz")
+    {
+        let extract_dir = temp_dir.join("extract");
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| Error::io(format!("create {}", extract_dir.display()), e))?;
+        extract_tar_asset(download_path, &extract_dir)?;
+        find_greppy_binary(&extract_dir)?
+    } else {
+        download_path.to_path_buf()
+    };
+    ensure_update_binary_permissions(&candidate)?;
+    Ok(candidate)
+}
+
+fn extract_tar_asset(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let out = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .output()
+        .map_err(|e| Error::io("run tar for greppy update", e))?;
+    if !out.status.success() {
+        return Err(Error::Config(format!(
+            "tar failed to extract {}: {}",
+            archive.display(),
+            stderr_summary(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn extract_zip_asset(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let unzip = std::process::Command::new("unzip")
+        .arg("-qq")
+        .arg(archive)
+        .arg("-d")
+        .arg(dest)
+        .output();
+    match unzip {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => {
+            let tar = std::process::Command::new("tar")
+                .arg("-xf")
+                .arg(archive)
+                .arg("-C")
+                .arg(dest)
+                .output()
+                .map_err(|e| Error::io("run tar fallback for greppy zip update", e))?;
+            if tar.status.success() {
+                return Ok(());
+            }
+            Err(Error::Config(format!(
+                "zip extraction failed for {}: unzip: {}; tar: {}",
+                archive.display(),
+                stderr_summary(&out.stderr),
+                stderr_summary(&tar.stderr)
+            )))
+        }
+        Err(unzip_err) => {
+            let tar = std::process::Command::new("tar")
+                .arg("-xf")
+                .arg(archive)
+                .arg("-C")
+                .arg(dest)
+                .output()
+                .map_err(|e| Error::io("run tar fallback for greppy zip update", e))?;
+            if tar.status.success() {
+                return Ok(());
+            }
+            Err(Error::Config(format!(
+                "zip extraction failed for {}: unzip unavailable ({unzip_err}); tar: {}",
+                archive.display(),
+                stderr_summary(&tar.stderr)
+            )))
+        }
+    }
+}
+
+fn find_greppy_binary(root: &std::path::Path) -> Result<std::path::PathBuf> {
+    let exact = update_binary_file_name();
+    let mut stack = vec![root.to_path_buf()];
+    let mut fallback = None;
+    while let Some(dir) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| Error::io(format!("scan {}", dir.display()), e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::io(format!("scan {}", dir.display()), e))?;
+            let path = entry.path();
+            let ty = entry
+                .file_type()
+                .map_err(|e| Error::io(format!("stat {}", path.display()), e))?;
+            if ty.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if lower == exact {
+                return Ok(path);
+            }
+            if fallback.is_none()
+                && lower.starts_with("greppy")
+                && !update_asset_is_auxiliary(&lower)
+            {
+                fallback = Some(path);
+            }
+        }
+    }
+    fallback.ok_or_else(|| {
+        Error::Config(format!(
+            "release archive did not contain {}",
+            update_binary_file_name()
+        ))
+    })
+}
+
+fn update_binary_file_name() -> &'static str {
+    if cfg!(windows) {
+        "greppy.exe"
+    } else {
+        "greppy"
+    }
+}
+
+#[cfg(unix)]
+fn ensure_update_binary_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .map_err(|e| Error::io(format!("stat {}", path.display()), e))?
+        .permissions();
+    let mode = perms.mode() | 0o755;
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| Error::io(format!("chmod {}", path.display()), e))
+}
+
+#[cfg(not(unix))]
+fn ensure_update_binary_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_current_exe(
+    candidate: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> Result<ReplaceOutcome> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let new_path = update_sibling_path(current_exe, "new");
+    let backup_path = update_sibling_path(current_exe, "old");
+    let current_mode = std::fs::metadata(current_exe)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o755);
+
+    std::fs::copy(candidate, &new_path).map_err(|e| {
+        Error::io(
+            format!(
+                "copy update candidate {} to {}",
+                candidate.display(),
+                new_path.display()
+            ),
+            e,
+        )
+    })?;
+    std::fs::set_permissions(
+        &new_path,
+        std::fs::Permissions::from_mode(current_mode | 0o111),
+    )
+    .map_err(|e| Error::io(format!("chmod {}", new_path.display()), e))?;
+    sync_file(&new_path)?;
+
+    if let Err(e) = std::fs::rename(current_exe, &backup_path) {
+        let _ = std::fs::remove_file(&new_path);
+        return Err(Error::io(
+            format!(
+                "replace {} with downloaded greppy binary (rename current to {})",
+                current_exe.display(),
+                backup_path.display()
+            ),
+            e,
+        ));
+    }
+
+    match std::fs::rename(&new_path, current_exe) {
+        Ok(()) => {
+            sync_file(current_exe)?;
+            let _ = std::fs::remove_file(&backup_path);
+            sync_parent_dir(current_exe)?;
+            Ok(ReplaceOutcome::Replaced)
+        }
+        Err(e) => {
+            let publish_error = Error::io(
+                format!(
+                    "replace {} with downloaded greppy binary",
+                    current_exe.display()
+                ),
+                e,
+            );
+            match std::fs::rename(&backup_path, current_exe) {
+                Ok(()) => Err(publish_error),
+                Err(restore_error) => Err(Error::Store(format!(
+                    "{publish_error}; failed to restore previous binary {} from {}: {restore_error}",
+                    current_exe.display(),
+                    backup_path.display()
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_current_exe(
+    candidate: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> Result<ReplaceOutcome> {
+    let new_path = update_sibling_path(current_exe, "new.exe");
+    std::fs::copy(candidate, &new_path).map_err(|e| {
+        Error::io(
+            format!(
+                "copy update candidate {} to {}",
+                candidate.display(),
+                new_path.display()
+            ),
+            e,
+        )
+    })?;
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Wait-Process -Id {}; Move-Item -LiteralPath {} -Destination {} -Force",
+        std::process::id(),
+        powershell_quote_path(&new_path),
+        powershell_quote_path(current_exe)
+    );
+    std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .spawn()
+        .map_err(|e| Error::io("spawn PowerShell updater", e))?;
+    Ok(ReplaceOutcome::ScheduledAfterExit)
+}
+
+fn update_sibling_path(path: &std::path::Path, label: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("greppy");
+    path.with_file_name(format!(
+        ".{file_name}.{label}.{}.{}",
+        std::process::id(),
+        stamp
+    ))
+}
+
+#[cfg(windows)]
+fn powershell_quote_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
 fn dispatch_search_graph(
@@ -3829,7 +4584,6 @@ fn auto_rebuild_vectors_inline(
     report: &greppy_indexer::IndexReport,
 ) {
     let no_args = EmbeddingCliArgs {
-        enabled: false,
         model_dir: None,
         gguf: None,
         tokenizer: None,
@@ -4081,6 +4835,7 @@ fn read_span_with_meta(
     // indexer that records true multi-line spans).
     let end_idx_inclusive = std::cmp::max(stored_end_idx, computed_end_idx);
     let total_lines = end_idx_inclusive - start_idx + 1;
+    let actual_end_line = start_line + total_lines as i64 - 1;
     let shown = std::cmp::min(total_lines, cap);
     let mut out = String::new();
     for (offset, line) in all[start_idx..start_idx + shown].iter().enumerate() {
@@ -4101,6 +4856,7 @@ fn read_span_with_meta(
     let omitted_lines = total_lines - shown;
     Some(SpanRead {
         text: out,
+        end_line: actual_end_line,
         total_lines,
         shown_lines: shown,
         omitted_lines,
@@ -4145,9 +4901,13 @@ fn print_code_span(root: &std::path::Path, node: &greppy_store::Node, cap: usize
         cap,
         false,
     ) {
-        for line in span.lines() {
-            println!("    {line}");
-        }
+        print_code_span_text(&span);
+    }
+}
+
+fn print_code_span_text(span: &str) {
+    for line in span.lines() {
+        println!("    {line}");
     }
 }
 
@@ -4747,6 +5507,21 @@ fn dispatch_impact_diff_scope(
 /// NAV_LIMIT because a briefing is a summary, not an exhaustive listing.
 const BRIEF_LIMIT: usize = 15;
 
+fn summarize_definition_span(source_span: &str) -> Option<Vec<String>> {
+    #[cfg(unix)]
+    {
+        let cfg = qwen_summary_config_optional().ok().flatten()?;
+        let model_key = qwen_summary_model_key(&cfg);
+        summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, source_span)
+            .filter(|bullets| !bullets.is_empty())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source_span;
+        None
+    }
+}
+
 /// `greppy brief S` — a one-call briefing: the definition (with source
 /// span), the direct callers, and the direct callees. Composes the same
 /// resolution/edge helpers as context/who-calls/callees so an agent can
@@ -4796,14 +5571,36 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
                     n.clone(),
                     serde_json::json!({"section": "definition"}),
                 ));
+                let span = read_span_with_meta(
+                    &root_path,
+                    &n.file_path,
+                    n.start_line,
+                    n.end_line,
+                    CONTEXT_SPAN_CAP,
+                    false,
+                );
+                let header_end_line = span
+                    .as_ref()
+                    .map(|span| span.end_line)
+                    .unwrap_or(n.end_line);
                 println!(
                     "== {} ({}:{}-{}) ==",
                     display_node_name(&n),
                     n.file_path,
                     n.start_line,
-                    n.end_line
+                    header_end_line
                 );
-                print_code_span(&root_path, &n, CONTEXT_SPAN_CAP);
+                if let Some(span) = span {
+                    if let Some(summary) = summarize_definition_span(&span.text) {
+                        for bullet in summary {
+                            println!("  - {bullet}");
+                        }
+                        if !span.text.is_empty() {
+                            println!();
+                        }
+                    }
+                    print_code_span_text(&span.text);
+                }
             }
         }
     }
@@ -5284,7 +6081,6 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
     };
     let vectors_missing_with_model = {
         let no_args = EmbeddingCliArgs {
-            enabled: false,
             model_dir: None,
             gguf: None,
             tokenizer: None,
@@ -8052,7 +8848,7 @@ fn dispatch_plus(
         }
     }
     let vector_config = if vectors && vector_control_intent.is_none() {
-        Some(embedding_config_required(embedding_args)?)
+        Some(embedding_config_for_required_use(embedding_args)?)
     } else {
         None
     };
@@ -8778,7 +9574,7 @@ fn dispatch_semantic(
     }
 
     let vector_config = if vectors {
-        Some(embedding_config_required(embedding_args)?)
+        Some(embedding_config_for_required_use(embedding_args)?)
     } else {
         None
     };
@@ -8861,8 +9657,15 @@ fn dispatch_semantic(
             Ok(query_vector) => {
                 scope.limit = 20;
                 let hits = greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
+                let purposes = semantic_vector_purposes(&store, root, &hits)?;
+                let display_hits = hits.clone();
                 let expand = insert_semantic_vector_expand_pack(
-                    &store, root, &project, q, generation, &hits,
+                    &store,
+                    root,
+                    &project,
+                    q,
+                    generation,
+                    &display_hits,
                 );
                 if json {
                     semantic_vector_json_with_expand(
@@ -8874,26 +9677,16 @@ fn dispatch_semantic(
                         candidate_limit,
                         Some(&freshness),
                         "ok",
-                        &hits,
+                        &display_hits,
+                        purposes.as_deref(),
                         expand.as_ref(),
                     )?;
                 } else if hits.is_empty() {
                     println!("(no vector matches)");
                     return Ok(1);
                 } else {
-                    println!(
-                        "# semantic mode: vector (EmbeddingGemma code retrieval; model {}; generation {})",
-                        cfg.model_id, generation
-                    );
-                    for h in &hits {
-                        println!(
-                            "{:.3}  {}  {}:{}-{}  [vector]",
-                            h.score,
-                            h.embedding.qualified_name,
-                            h.embedding.file_path,
-                            h.embedding.start_line,
-                            h.embedding.end_line
-                        );
+                    for h in &display_hits {
+                        print_semantic_vector_hit(h, purposes.as_deref());
                     }
                     if let Some(expand) = &expand {
                         println!("{}", expand.text_line());
@@ -8953,6 +9746,189 @@ fn dispatch_semantic(
     Ok(0)
 }
 
+const SEMANTIC_PURPOSE_LIMIT: usize = 8;
+const SEMANTIC_PURPOSE_SPAN_CAP_LINES: usize = 40;
+const SEMANTIC_PURPOSE_SPAN_MAX_BYTES: usize = 2 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticVectorPurpose {
+    hit_loc: String,
+    display_loc: String,
+    signature: String,
+    bullets: Vec<String>,
+}
+
+fn vector_hit_loc(hit: &greppy_store::VectorSearchHit) -> String {
+    line_span(
+        &hit.embedding.file_path,
+        hit.embedding.start_line,
+        hit.embedding.end_line,
+    )
+}
+
+fn semantic_vector_purposes(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    hits: &[greppy_store::VectorSearchHit],
+) -> Result<Option<Vec<SemanticVectorPurpose>>> {
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        let Some(cfg) = qwen_summary_config_optional()? else {
+            return Ok(None);
+        };
+        let root_path = match resolve_root(root) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let model_key = qwen_summary_model_key(&cfg);
+        let mut purposes = Vec::new();
+        for hit in hits.iter().take(SEMANTIC_PURPOSE_LIMIT) {
+            let hit_loc = vector_hit_loc(hit);
+            let node = hit
+                .embedding
+                .node_id
+                .and_then(|id| store.get_node(id).ok().flatten());
+            let file_path = node
+                .as_ref()
+                .map(|n| n.file_path.as_str())
+                .unwrap_or(&hit.embedding.file_path);
+            let start_line = node
+                .as_ref()
+                .map(|n| n.start_line)
+                .unwrap_or(hit.embedding.start_line);
+            let end_line = node
+                .as_ref()
+                .map(|n| n.end_line)
+                .unwrap_or(hit.embedding.end_line);
+            let Some(span) = read_span_with_meta(
+                &root_path,
+                file_path,
+                start_line,
+                end_line,
+                SEMANTIC_PURPOSE_SPAN_CAP_LINES,
+                false,
+            ) else {
+                continue;
+            };
+            let display_loc = line_span(file_path, start_line, span.end_line);
+            let signature = semantic_signature_from_span(&span.text)
+                .unwrap_or_else(|| hit.embedding.qualified_name.clone());
+            let bullets = if semantic_signature_is_function_like(
+                &signature,
+                node.as_ref().map(|n| n.label.as_str()),
+            ) {
+                let code = cap_semantic_purpose_span(&span.text);
+                summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, &code)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            purposes.push(SemanticVectorPurpose {
+                hit_loc,
+                display_loc,
+                signature,
+                bullets,
+            });
+        }
+        if purposes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(purposes))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, hits);
+        Ok(None)
+    }
+}
+
+fn cap_semantic_purpose_span(code: &str) -> String {
+    let mut out = code
+        .lines()
+        .take(SEMANTIC_PURPOSE_SPAN_CAP_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if code.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    truncate_utf8_bytes(&out, SEMANTIC_PURPOSE_SPAN_MAX_BYTES)
+}
+
+fn semantic_signature_from_span(code: &str) -> Option<String> {
+    code.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| line.trim_end_matches('{').trim().to_string())
+}
+
+fn semantic_signature_is_function_like(signature: &str, label: Option<&str>) -> bool {
+    if let Some(label) = label {
+        let lower = label.to_ascii_lowercase();
+        if lower.contains("function") || lower.contains("method") {
+            return true;
+        }
+        if lower.contains("struct")
+            || lower.contains("class")
+            || lower.contains("enum")
+            || lower.contains("trait")
+            || lower.contains("interface")
+            || lower.contains("module")
+        {
+            return false;
+        }
+    }
+    let s = signature.trim_start();
+    s.starts_with("fn ")
+        || s.starts_with("pub fn ")
+        || s.starts_with("async fn ")
+        || s.starts_with("pub async fn ")
+        || s.starts_with("def ")
+        || s.starts_with("async def ")
+        || s.starts_with("function ")
+        || s.contains(" function ")
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes.saturating_sub(3);
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = s[..cut].to_string();
+    out.push_str("...");
+    out
+}
+
+fn vector_purpose_for_loc<'a>(
+    purposes: Option<&'a [SemanticVectorPurpose]>,
+    loc: &str,
+) -> Option<&'a SemanticVectorPurpose> {
+    purposes?.iter().find(|v| v.hit_loc == loc)
+}
+
+fn print_semantic_vector_hit(
+    hit: &greppy_store::VectorSearchHit,
+    purposes: Option<&[SemanticVectorPurpose]>,
+) {
+    let loc = vector_hit_loc(hit);
+    if let Some(purpose) = vector_purpose_for_loc(purposes, &loc) {
+        println!("{}", purpose.display_loc);
+        println!("    {}", purpose.signature);
+        for bullet in &purpose.bullets {
+            println!("        {bullet}");
+        }
+    } else {
+        println!("{loc}");
+        println!("    {}", hit.embedding.qualified_name);
+    }
+    println!();
+}
+
 fn current_graph_generation(store: &greppy_store::Store, root: Option<&str>) -> Result<u64> {
     let root_path = resolve_root(root)?;
     let root_key = root_path.to_string_lossy().into_owned();
@@ -8989,6 +9965,7 @@ fn semantic_vector_json(
         status,
         hits,
         None,
+        None,
     )
 }
 
@@ -9003,13 +9980,15 @@ fn semantic_vector_json_with_expand(
     freshness: Option<&serde_json::Value>,
     status: &str,
     hits: &[greppy_store::VectorSearchHit],
+    purposes: Option<&[SemanticVectorPurpose]>,
     expand: Option<&ExpandHandle>,
 ) -> Result<()> {
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let rows = hits
         .iter()
         .map(|h| {
-            serde_json::json!({
+            let loc = vector_hit_loc(h);
+            let mut row = serde_json::json!({
                 "score": h.score,
                 "qualified_name": h.embedding.qualified_name,
                 "file_path": h.embedding.file_path,
@@ -9017,7 +9996,17 @@ fn semantic_vector_json_with_expand(
                 "end_line": h.embedding.end_line,
                 "content_sha256": h.embedding.content_sha256,
                 "graph_generation": h.embedding.graph_generation,
-            })
+            });
+            if let Some(purpose) = vector_purpose_for_loc(purposes, &loc) {
+                row["signature"] = serde_json::json!(&purpose.signature);
+                row["summary_loc"] = serde_json::json!(&purpose.display_loc);
+                if !purpose.bullets.is_empty() {
+                    row["summary"] = serde_json::json!(&purpose.bullets);
+                    row["summary_prompt_version"] =
+                        serde_json::json!(greppy_qwen35_native::PROMPT_VERSION);
+                }
+            }
+            row
         })
         .collect::<Vec<_>>();
     let shown = rows.len() as i64;
@@ -9190,6 +10179,7 @@ fn display_context_def_name(store: &greppy_store::Store, def: &ContextDef) -> St
 
 struct SpanRead {
     text: String,
+    end_line: i64,
     total_lines: usize,
     shown_lines: usize,
     omitted_lines: usize,
@@ -10249,19 +11239,21 @@ fn project_for(root: Option<&str>) -> Result<String> {
 }
 
 fn embedding_config_for_index(args: EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>> {
-    let requested = args.enabled || args.has_model_source_arg() || env_bool(ENV_EMBED_INDEX)?;
-    if !requested {
+    if test_inference_skipped() {
         return Ok(None);
     }
-    // Out of the box: `index --embeddings` uses the baked-in EmbeddingGemma with
-    // NO flags/env, exactly like the query path (embedded_model::paths via
-    // embedding_config_optional). Explicit --embedding-* / env still override.
-    // Only when embeddings are requested AND no source AND no baked model exists
-    // (a non-embedded build) do we surface the clear "model required" error
-    // instead of silently skipping the vectors the caller asked for.
+    // Every index contains EmbeddingGemma vectors. Explicit model/device
+    // arguments may override the source or backend, but cannot disable it.
     match embedding_config_optional(args)? {
         Some(cfg) => Ok(Some(cfg)),
         None => Ok(Some(embedding_config_required(args)?)),
+    }
+}
+
+fn embedding_config_for_required_use(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
+    match embedding_config_optional(args)? {
+        Some(cfg) => Ok(cfg),
+        None => embedding_config_required(args),
     }
 }
 
@@ -10278,10 +11270,10 @@ fn embedding_config_optional(args: EmbeddingCliArgs<'_>) -> Result<Option<Embedd
         || cli_or_env(args.tokenizer, ENV_EMBED_TOKENIZER).is_some();
     if !has_source {
         // Owner rule: semantic search must ALWAYS work. Release binaries
-        // carry EmbeddingGemma inside (feature `embedded-model`); when no
+        // carry EmbeddingGemma inside; when no
         // explicit source is configured, extract it once to the data dir
         // and use it. Env/CLI settings above still override.
-        if let Some((gguf, tokenizer)) = embedded_model::paths() {
+        if let Some((gguf, tokenizer)) = embeddinggemma_assets::paths() {
             let args = EmbeddingCliArgs {
                 gguf: Some(&gguf),
                 tokenizer: Some(&tokenizer),
@@ -10294,14 +11286,15 @@ fn embedding_config_optional(args: EmbeddingCliArgs<'_>) -> Result<Option<Embedd
     embedding_config_required(args).map(Some)
 }
 
-/// Built-in EmbeddingGemma (feature `embedded-model`): the Q4_K GGUF and
+/// Built-in EmbeddingGemma: the Q4_K GGUF and
 /// tokenizer are baked into the binary at build time and extracted once
-/// to `<data>/greppy/embedded-model/<sha>/` (mmap needs a real file). The
+/// to `<data>/greppy/models/embeddinggemma-300m-q4k/<sha>/` (mmap needs a real
+/// file). The
 /// extraction is atomic (tmp + rename) and trusts cached files only when their
 /// tiny marker file matches the baked SHA and their length matches the baked
 /// bytes, so stale or torn cache entries self-repair without hashing the model
 /// on every CLI invocation.
-mod embedded_model {
+mod embeddinggemma_assets {
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     pub fn paths() -> Option<(String, String)> {
@@ -10310,7 +11303,9 @@ mod embedded_model {
         static GGUF: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/embeddinggemma-300M-Q4_K.gguf"));
         static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer.json"));
-        let root = greppy_core::workspace::store_cache_root()?.join("embedded-model");
+        let root = greppy_core::workspace::store_cache_root()?
+            .join("models")
+            .join("embeddinggemma-300m-q4k");
         let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
         let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
         Some((gguf, tok))
@@ -10411,6 +11406,171 @@ mod embedded_model {
     }
 }
 
+mod qwen35_assets {
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub fn paths() -> Option<(String, String)> {
+        const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
+        const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
+        static GGUF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Qwen3.5-0.8B-Q4_K_M.gguf"));
+        static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35-tokenizer.json"));
+        let root = greppy_core::workspace::store_cache_root()?
+            .join("models")
+            .join("qwen35-0.8b-q4km");
+        let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-Q4_K_M.gguf", GGUF)?;
+        let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+        Some((gguf, tok))
+    }
+
+    fn extract(
+        root: &std::path::Path,
+        expected_sha: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Option<String> {
+        let root = root.join(expected_sha);
+        let dest = root.join(name);
+        let marker = root.join(format!("{name}.sha256"));
+        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            return Some(dest.to_string_lossy().into_owned());
+        }
+
+        std::fs::create_dir_all(&root).ok()?;
+        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            return Some(dest.to_string_lossy().into_owned());
+        }
+
+        let nonce = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = root.join(format!("{name}.tmp.{}.{}", std::process::id(), nonce));
+        let marker_tmp = root.join(format!(
+            "{name}.sha256.tmp.{}.{}",
+            std::process::id(),
+            nonce
+        ));
+        let written =
+            write_verified_cache_entry(&tmp, &dest, &marker_tmp, &marker, expected_sha, bytes);
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&marker_tmp);
+        }
+
+        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            Some(dest.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    }
+
+    fn cache_entry_is_valid(
+        dest: &std::path::Path,
+        marker: &std::path::Path,
+        expected_sha: &str,
+        expected_len: usize,
+    ) -> bool {
+        let marker_ok = std::fs::read_to_string(marker)
+            .map(|s| s.trim() == expected_sha)
+            .unwrap_or(false);
+        if !marker_ok {
+            return false;
+        }
+        std::fs::metadata(dest)
+            .map(|m| m.len() == expected_len as u64)
+            .unwrap_or(false)
+    }
+
+    fn write_verified_cache_entry(
+        tmp: &std::path::Path,
+        dest: &std::path::Path,
+        marker_tmp: &std::path::Path,
+        marker: &std::path::Path,
+        expected_sha: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        std::fs::write(tmp, bytes)?;
+        ensure_len(tmp, bytes.len())?;
+        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(dest);
+        std::fs::rename(tmp, dest)?;
+        ensure_len(dest, bytes.len())?;
+        std::fs::write(marker_tmp, expected_sha.as_bytes())?;
+        std::fs::rename(marker_tmp, marker)?;
+        Ok(())
+    }
+
+    fn ensure_len(path: &std::path::Path, expected_len: usize) -> std::io::Result<()> {
+        let len = std::fs::metadata(path)?.len();
+        if len == expected_len as u64 {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "embedded Qwen3.5 cache entry {} has length {len}, expected {expected_len}",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>> {
+    if test_inference_skipped() {
+        return Ok(None);
+    }
+    let Some((gguf, tokenizer)) = qwen35_assets::paths() else {
+        return Ok(None);
+    };
+    Ok(Some(QwenSummaryConfig {
+        model_id: greppy_qwen35_native::MODEL_ID.to_string(),
+        gguf: gguf.into(),
+        tokenizer: tokenizer.into(),
+        device: qwen_summary_device_preference()?,
+    }))
+}
+
+fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePreference> {
+    if env_bool(ENV_NO_GPU)? {
+        return Ok(greppy_qwen35_native::DevicePreference::Cpu);
+    }
+    let raw = env_nonempty(ENV_DEVICE).unwrap_or_else(|| "auto".to_string());
+    greppy_qwen35_native::DevicePreference::parse(&raw).map_err(|e| Error::Invalid(e.to_string()))
+}
+
+fn load_qwen35_summarizer(
+    cfg: &QwenSummaryConfig,
+) -> Result<greppy_qwen35_native::Qwen35Summarizer> {
+    let options = greppy_qwen35_native::LoadOptions {
+        device: cfg.device.clone(),
+    };
+    greppy_qwen35_native::Qwen35Summarizer::load_gguf(&cfg.gguf, &cfg.tokenizer, options)
+        .map_err(|e| Error::Store(format!("load Qwen3.5 summarizer {}: {e}", cfg.model_id)))
+}
+
+fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
+    fn file_fp(path: &std::path::Path) -> String {
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mtime_ns = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                format!("{}:{}:{}", path.display(), meta.len(), mtime_ns)
+            }
+            Err(_) => format!("{}:unknown", path.display()),
+        }
+    }
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        cfg.model_id,
+        greppy_qwen35_native::PROMPT_VERSION,
+        greppy_qwen35_native::TRIAGE_PROMPT_VERSION,
+        cfg.device.as_str(),
+        file_fp(&cfg.gguf),
+        file_fp(&cfg.tokenizer)
+    )
+}
+
 fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
     let model_dir = cli_or_env(args.model_dir, ENV_EMBED_MODEL_DIR);
     let gguf = cli_or_env(args.gguf, ENV_EMBED_GGUF);
@@ -10456,8 +11616,8 @@ fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingMode
         (None, None, None) => {
             // Owner hard rule: embeddings always work by default. With no
             // explicit model, fall back to the EmbeddingGemma baked into the
-            // binary (feature `embedded-model`) — exactly like the index path.
-            match embedded_model::paths() {
+            // binary, exactly like the index path.
+            match embeddinggemma_assets::paths() {
                 Some((gguf, tokenizer)) => EmbeddingModelSource::Gguf {
                     gguf: gguf.into(),
                     tokenizer: tokenizer.into(),
@@ -10819,7 +11979,6 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     #[cfg(unix)]
     {
         let no_args = EmbeddingCliArgs {
-            enabled: false,
             model_dir: None,
             gguf: None,
             tokenizer: None,
@@ -12089,6 +13248,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_and_upgrade_alias() {
+        let cli = Cli::try_parse_from(["greppy", "update", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: true,
+                dry_run: false,
+                yes: false,
+                tag: None,
+                repo: None,
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "upgrade",
+            "--dry-run",
+            "-y",
+            "--tag",
+            "v0.2.0",
+            "--repo",
+            "metric-space-ai/greppy",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: false,
+                dry_run: true,
+                yes: true,
+                tag: Some(ref tag),
+                repo: Some(ref repo),
+            }) if tag == "v0.2.0" && repo == "metric-space-ai/greppy"
+        ));
+    }
+
+    #[test]
+    fn release_version_comparison_handles_v_prefix_and_width() {
+        assert!(release_is_newer("v0.10.0", "0.9.9"));
+        assert!(release_is_newer("0.1.3", "0.1.2"));
+        assert!(!release_is_newer("v0.1.2", "0.1.2"));
+        assert!(!release_is_newer("v0.1.1", "0.1.2"));
+    }
+
+    #[test]
+    fn update_asset_selection_matches_platform_and_skips_checksums() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "greppy-x86_64-apple-darwin.tar.gz".into(),
+                download_url: "https://example.invalid/darwin".into(),
+                size: 1,
+            },
+            ReleaseAsset {
+                name: "greppy-aarch64-apple-darwin.tar.gz.sha256".into(),
+                download_url: "https://example.invalid/checksum".into(),
+                size: 1,
+            },
+            ReleaseAsset {
+                name: "greppy-aarch64-apple-darwin.tar.gz".into(),
+                download_url: "https://example.invalid/arm64".into(),
+                size: 1,
+            },
+        ];
+        let selected = select_release_asset(&assets, "macos", "aarch64").unwrap();
+        assert_eq!(selected.name, "greppy-aarch64-apple-darwin.tar.gz");
+    }
+
+    #[test]
     fn parse_index_embedding_flags() {
         let cli = Cli::try_parse_from([
             "greppy",
@@ -12212,7 +13439,6 @@ mod tests {
     #[test]
     fn embedding_config_rejects_conflicting_model_sources() {
         let err = embedding_config_required(EmbeddingCliArgs {
-            enabled: true,
             model_dir: Some("/models/safetensors"),
             gguf: Some("/models/model.gguf"),
             tokenizer: Some("/models/tokenizer.json"),
@@ -12228,7 +13454,7 @@ mod tests {
     }
 
     #[test]
-    fn embedding_config_defaults_to_embedded_model_when_no_flags() {
+    fn embedding_config_defaults_to_bundled_embeddinggemma_when_no_flags() {
         // OWNER HARD RULE (regression guard): embeddings must ALWAYS work by
         // default. With no --embedding-* flag/env, the resolver MUST fall back
         // to the baked-in EmbeddingGemma (never the "model required" error).
@@ -12327,6 +13553,95 @@ mod tests {
         }
         let err = embedding_device_preference(Some("vulkan"), false).unwrap_err();
         assert!(matches!(err, Error::Invalid(msg) if msg.contains("auto|cpu|metal|cuda")));
+    }
+
+    fn vector_hit_for_test(
+        file_path: &str,
+        start_line: i64,
+        end_line: i64,
+        qualified_name: &str,
+        score: f32,
+    ) -> greppy_store::VectorSearchHit {
+        greppy_store::VectorSearchHit {
+            embedding: greppy_store::VectorEmbedding {
+                id: 0,
+                project: "p".into(),
+                model_id: "m".into(),
+                prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
+                task: greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE.into(),
+                node_id: None,
+                chunk_idx: 0,
+                qualified_name: qualified_name.into(),
+                file_path: file_path.into(),
+                start_line,
+                end_line,
+                content_sha256: "0".repeat(64),
+                graph_generation: 1,
+                dim: 2,
+                vector_norm: 1.0,
+                vector: vec![1.0, 0.0],
+                created_at: "2026-07-08T00:00:00Z".into(),
+            },
+            score,
+        }
+    }
+
+    #[test]
+    fn semantic_vector_purpose_lookup_is_loc_keyed() {
+        let hits = vec![
+            vector_hit_for_test("src/noise.rs", 30, 33, "noise", 0.99),
+            vector_hit_for_test("src/read.rs", 10, 12, "read", 0.77),
+        ];
+        let purposes = vec![SemanticVectorPurpose {
+            hit_loc: "src/read.rs:10-12".into(),
+            display_loc: "src/read.rs:10-15".into(),
+            signature: "fn read()".into(),
+            bullets: vec!["opens the matching data path".into()],
+        }];
+
+        assert!(vector_purpose_for_loc(Some(&purposes), &vector_hit_loc(&hits[0])).is_none());
+        let purpose = vector_purpose_for_loc(Some(&purposes), &vector_hit_loc(&hits[1])).unwrap();
+        assert_eq!(purpose.signature, "fn read()");
+        assert_eq!(purpose.display_loc, "src/read.rs:10-15");
+        assert_eq!(purpose.bullets, ["opens the matching data path"]);
+    }
+
+    #[test]
+    fn semantic_signature_from_span_uses_first_code_line() {
+        let code = "\n    // comment\n    fn steal_into(&self, dst: &mut Local<T>) -> Option<T> {\n        None\n    }\n";
+
+        let signature = semantic_signature_from_span(code).unwrap();
+
+        assert_eq!(
+            signature,
+            "fn steal_into(&self, dst: &mut Local<T>) -> Option<T>"
+        );
+    }
+
+    #[test]
+    fn semantic_signature_function_like_skips_structs() {
+        assert!(semantic_signature_is_function_like(
+            "pub fn run_task() -> T",
+            Some("Function")
+        ));
+        assert!(!semantic_signature_is_function_like(
+            "pub struct Local<T>",
+            Some("Struct")
+        ));
+    }
+
+    #[test]
+    fn semantic_purpose_span_cap_limits_lines_and_bytes() {
+        let code = (0..80)
+            .map(|i| format!("let line_{i} = \"{}\";", "é".repeat(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let capped = cap_semantic_purpose_span(&code);
+
+        assert!(capped.lines().count() <= SEMANTIC_PURPOSE_SPAN_CAP_LINES);
+        assert!(capped.len() <= SEMANTIC_PURPOSE_SPAN_MAX_BYTES);
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
     }
 
     #[test]

@@ -72,6 +72,7 @@ impl CudaTensor {
             GgmlDType::Q5_0 => 6,
             GgmlDType::Q8_0 => 8,
             GgmlDType::Q4K => 12,
+            GgmlDType::Q5K => 13,
             GgmlDType::Q6K => 14,
             other => return Err(Error::UnsupportedDType(other)),
         })
@@ -118,6 +119,6 @@ fn pad_for_mmq(dtype: GgmlDType, shape: &[usize], raw: &[u8]) -> Result<(Vec<u8>
 fn is_mmq_quant(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
-        GgmlDType::Q5_0 | GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K
+        GgmlDType::Q5_0 | GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
     )
 }

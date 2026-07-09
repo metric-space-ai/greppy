@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::cuda::ffi::{
-    check, gp_attention_scores, gp_attention_values, gp_embed_q6k, gp_geglu, gp_l2_norm,
-    gp_mean_pool, gp_merge_heads, gp_mmq_matmul, gp_rms_norm, gp_rms_norm_add, gp_rms_norm_heads,
-    gp_rope_neox, gp_softmax_mask, gp_split_heads, CudaDevice, DeviceBuffer,
+    check, gp_attention_scores, gp_attention_values, gp_embed_q4k, gp_embed_q6k, gp_geglu,
+    gp_l2_norm, gp_mean_pool, gp_merge_heads, gp_mmq_matmul, gp_rms_norm, gp_rms_norm_add,
+    gp_rms_norm_heads, gp_rope_neox, gp_softmax_mask, gp_split_heads, CudaDevice, DeviceBuffer,
 };
 use crate::cuda::weights::CudaWeights;
 use crate::gguf::{GgufModel, Value};
@@ -188,23 +188,38 @@ impl CudaEmbeddingModel {
 
     fn record_embedding(&self, ids: &DeviceBuffer, dst: &DeviceBuffer, rows: usize) -> Result<()> {
         let token = self.weights.require("token_embd.weight")?;
-        if token.dtype != GgmlDType::Q6K {
-            return Err(Error::UnsupportedDType(token.dtype));
+        let scale = (self.cfg.hidden_size as f32).sqrt();
+        match token.dtype {
+            GgmlDType::Q4K => check(
+                unsafe {
+                    gp_embed_q4k(
+                        token.buffer.ptr(),
+                        ids.as_u32(),
+                        dst.as_f32(),
+                        rows as i32,
+                        self.cfg.hidden_size as i32,
+                        scale,
+                        self.dev.stream(),
+                    )
+                },
+                "cuda embed_q4k",
+            ),
+            GgmlDType::Q6K => check(
+                unsafe {
+                    gp_embed_q6k(
+                        token.buffer.ptr(),
+                        ids.as_u32(),
+                        dst.as_f32(),
+                        rows as i32,
+                        self.cfg.hidden_size as i32,
+                        scale,
+                        self.dev.stream(),
+                    )
+                },
+                "cuda embed_q6k",
+            ),
+            other => Err(Error::UnsupportedDType(other)),
         }
-        check(
-            unsafe {
-                gp_embed_q6k(
-                    token.buffer.ptr(),
-                    ids.as_u32(),
-                    dst.as_f32(),
-                    rows as i32,
-                    self.cfg.hidden_size as i32,
-                    (self.cfg.hidden_size as f32).sqrt(),
-                    self.dev.stream(),
-                )
-            },
-            "cuda embed_q6k",
-        )
     }
 
     fn record_layer(
