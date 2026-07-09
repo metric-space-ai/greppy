@@ -57,6 +57,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch embedded model asset (LFS-tracked; CI checkout gets pointers)
+        shell: bash
+        run: |
+          mkdir -p crates/cli/assets/embedded-model
+          gh release download model-embeddinggemma-q4k-v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir crates/cli/assets/embedded-model --clobber
+          ls -l crates/cli/assets/embedded-model
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Install Rust (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
 
