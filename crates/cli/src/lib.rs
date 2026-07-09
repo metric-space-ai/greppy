@@ -177,9 +177,6 @@ pub enum Command {
     Index {
         /// Path to the repository root (default: cwd).
         path: Option<String>,
-        /// Compatibility no-op; EmbeddingGemma vectors are always built.
-        #[arg(long, hide = true)]
-        embeddings: bool,
         /// Safetensors model directory containing config.json, tokenizer.json and model.safetensors.
         #[arg(long)]
         embedding_model_dir: Option<String>,
@@ -537,9 +534,6 @@ pub enum Command {
     #[command(name = "semantic-search", alias = "semantic")]
     Semantic {
         query: Option<String>,
-        /// Compatibility no-op; vector search is always enabled.
-        #[arg(long, hide = true)]
-        vectors: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -838,7 +832,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy search-symbols NAME [--kind function|method|struct|class] [--json] [--root DIR]"
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
-        "index" => "greppy index PATH [--embeddings --embedding-gguf F --embedding-tokenizer F]",
+        "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
         "update" | "upgrade" => "greppy update [--check|--dry-run] [-y] [--tag TAG]",
         _ => return None,
     })
@@ -977,7 +971,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     // token bombs teach nothing (P3). `--help` still prints everything.
     println!("usage: grep PATTERN [FILES..]           (drop-in grep)");
     println!("   or: grep <command> [--root DIR]      commands:");
-    println!("       index PATH [--embeddings]  who-calls S   callees S   find-usages S");
+    println!("       index PATH  who-calls S   callees S   find-usages S");
     println!("       references S (who depends on S)   impact S [--direction incoming|outgoing]");
     println!("       brief S   semantic-search \"QUERY\"");
     println!("       search-code Q   search-symbols NAME [--kind function|method|struct|class]");
@@ -1030,7 +1024,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
         }
         Command::Index {
             path,
-            embeddings,
             embedding_model_dir,
             embedding_gguf,
             embedding_tokenizer,
@@ -1041,8 +1034,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             json,
         } => {
             if path.as_deref() == Some("status") {
-                if embeddings
-                    || embedding_model_dir.is_some()
+                if embedding_model_dir.is_some()
                     || embedding_gguf.is_some()
                     || embedding_tokenizer.is_some()
                     || embedding_model_id.is_some()
@@ -1234,7 +1226,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
         ),
         Command::Semantic {
             query,
-            vectors: _,
             json,
             embedding_model_dir,
             embedding_gguf,
@@ -1245,8 +1236,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             no_gpu,
         } => dispatch_semantic(
             query.as_deref(),
-            // Owner hard rule: semantic-search is ALWAYS vector embedding search.
-            true,
             json,
             EmbeddingCliArgs {
                 model_dir: embedding_model_dir.as_deref(),
@@ -2870,6 +2859,13 @@ impl ExpandHandle {
             "summary": self.summary,
         })
     }
+
+    fn semantic_text_line(&self, further_hits: usize) -> String {
+        format!(
+            "greppy expand {}  → source evidence for {further_hits} further hits",
+            self.id
+        )
+    }
 }
 
 fn expand_ttl_secs() -> u64 {
@@ -3061,79 +3057,6 @@ fn insert_nav_expand_pack(
     )
 }
 
-fn insert_semantic_algorithmic_expand_pack(
-    store: &greppy_store::Store,
-    root: Option<&str>,
-    project: &str,
-    query: &str,
-    hits: &[greppy_search::SemanticHit],
-) -> Option<ExpandHandle> {
-    if hits.is_empty() {
-        return None;
-    }
-    let root_path = resolve_root(root).ok()?;
-    let limit = hits.len().min(6);
-    let mut text = String::new();
-    text.push_str(&format!("# evidence pack: semantic-search {query}\n"));
-    text.push_str(&format!(
-        "# spans: {limit} shown of {} hits\n\n",
-        hits.len()
-    ));
-    let mut json_rows = Vec::new();
-    for (idx, hit) in hits.iter().take(limit).enumerate() {
-        let title = format!(
-            "{:.3} {} {}",
-            hit.score,
-            hit.node.label,
-            display_row_name(&hit.node)
-        );
-        append_span_evidence(
-            &mut text,
-            &root_path,
-            &title,
-            &hit.node.file_path,
-            hit.node.start_line,
-            hit.node.end_line,
-            if idx == 0 {
-                CONTEXT_SPAN_CAP
-            } else {
-                CODE_SPAN_CAP
-            },
-        );
-        json_rows.push(serde_json::json!({
-            "score": hit.score,
-            "label": &hit.node.label,
-            "qualified_name": &hit.node.qualified_name,
-            "file_path": &hit.node.file_path,
-            "start_line": hit.node.start_line,
-            "end_line": hit.node.end_line,
-        }));
-    }
-    let summary = serde_json::json!({
-        "text": format!("{limit} spans"),
-        "spans": limit,
-        "callsites": 0,
-        "total": hits.len(),
-    });
-    let payload_json = serde_json::json!({
-        "command": "semantic-search",
-        "mode": "algorithmic",
-        "query": query,
-        "shown": limit,
-        "hits": json_rows,
-    });
-    insert_expand_pack_best_effort(
-        store,
-        project,
-        "semantic-search",
-        query,
-        current_graph_generation_or_zero(store, root),
-        summary,
-        text,
-        Some(payload_json),
-    )
-}
-
 fn insert_semantic_vector_expand_pack(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -3146,25 +3069,32 @@ fn insert_semantic_vector_expand_pack(
         return None;
     }
     let root_path = resolve_root(root).ok()?;
-    let limit = hits.len().min(6);
+    let purposes = semantic_vector_purposes(store, root, hits, false)
+        .ok()
+        .flatten()?;
+    let limit = purposes.len();
+    if limit == 0 {
+        return None;
+    }
     let mut text = String::new();
+    text.push_str(&format!("# evidence pack: semantic-search {query}\n"));
     text.push_str(&format!(
-        "# evidence pack: semantic-search --vectors {query}\n"
-    ));
-    text.push_str(&format!(
-        "# spans: {limit} shown of {} hits\n\n",
+        "# spans: {limit} further of {} retrieved hits\n\n",
         hits.len()
     ));
     let mut json_rows = Vec::new();
-    for (idx, hit) in hits.iter().take(limit).enumerate() {
-        let title = format!("{:.3} {}", hit.score, hit.embedding.qualified_name);
+    for (idx, purpose) in purposes.iter().enumerate() {
+        let hit = hits
+            .iter()
+            .find(|hit| hit.embedding.id == purpose.embedding_id)?;
+        let title = format!("{:.3} {}", hit.score, purpose.signature);
         append_span_evidence(
             &mut text,
             &root_path,
             &title,
-            &hit.embedding.file_path,
-            hit.embedding.start_line,
-            hit.embedding.end_line,
+            &purpose.file_path,
+            purpose.start_line,
+            purpose.end_line,
             if idx == 0 {
                 CONTEXT_SPAN_CAP
             } else {
@@ -3174,15 +3104,16 @@ fn insert_semantic_vector_expand_pack(
         json_rows.push(serde_json::json!({
             "score": hit.score,
             "qualified_name": &hit.embedding.qualified_name,
-            "file_path": &hit.embedding.file_path,
-            "start_line": hit.embedding.start_line,
-            "end_line": hit.embedding.end_line,
+            "file_path": &purpose.file_path,
+            "start_line": purpose.start_line,
+            "end_line": purpose.end_line,
+            "signature": &purpose.signature,
             "content_sha256": &hit.embedding.content_sha256,
             "graph_generation": hit.embedding.graph_generation,
         }));
     }
     let summary = serde_json::json!({
-        "text": format!("{limit} spans"),
+        "text": format!("{limit} further hits"),
         "spans": limit,
         "callsites": 0,
         "total": hits.len(),
@@ -3191,7 +3122,7 @@ fn insert_semantic_vector_expand_pack(
         "command": "semantic-search",
         "mode": "vector",
         "query": query,
-        "shown": limit,
+        "further_hits": limit,
         "hits": json_rows,
     });
     insert_expand_pack_best_effort(
@@ -4531,8 +4462,8 @@ fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     // Remember whether this store served code-span vectors BEFORE the
     // reindex bumps the generation: an inline graph-only reindex would
     // otherwise strand every existing vector row on the old generation and
-    // silently degrade `context`/`semantic --vectors` until a manual
-    // `grep index --embeddings` run (the owner's "gains" path dying quietly).
+    // silently degrade `context`/`semantic-search` until a manual
+    // `grep index` run (the owner's "gains" path dying quietly).
     let had_vectors = !store
         .vector_model_ids(&project)
         .unwrap_or_default()
@@ -4597,7 +4528,7 @@ fn auto_rebuild_vectors_inline(
         Ok(None) => {
             eprintln!(
                 "grep: reindex left code-span vectors on an old generation \
-                 (embedding model not configured); run `grep index --embeddings ...` to restore vector search"
+                 (embedding model unavailable); run `grep index` to restore vector search"
             );
             return;
         }
@@ -4639,7 +4570,7 @@ fn project_is_small_enough_for_inline_embed(store: &greppy_store::Store, project
         .unwrap_or(false)
 }
 
-/// Kick off `grep index <root> --embeddings` as a detached child so the
+/// Kick off `grep index <root>` as a detached child so the
 /// semantic index builds in the background (P11). The current binary
 /// carries the embedded model, so no env is needed. Best-effort: a failure
 /// to spawn just means the next query heals inline instead.
@@ -4655,7 +4586,6 @@ fn spawn_background_embed(root: Option<&str>) {
         .arg(&root_path)
         .arg("--root")
         .arg(&root_path)
-        .arg("--embeddings")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -6142,8 +6072,8 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         if vectors_missing_with_model {
             println!(
                 "vectors: none stored though an embedding model is configured \
-                 — `semantic-search --vectors` will build them on first use, or run \
-                 `grep index --embeddings ...` now"
+                 — `semantic-search` will build them on first use, or run \
+                 `grep index` now"
             );
         }
         println!("root: {}", effective_root.display());
@@ -9509,7 +9439,6 @@ fn parse_grep_code_hit(line: &str) -> Option<greppy_search::CodeHit> {
 
 fn dispatch_semantic(
     query: Option<&str>,
-    vectors: bool,
     json: bool,
     embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
@@ -9530,37 +9459,17 @@ fn dispatch_semantic(
     // generation (auto_rebuild_vectors_inline). Without a resolvable model
     // an inline reindex would bump the generation and orphan the very
     // vectors it queries, so we keep the old skip behaviour.
-    let allow_reindex = !vectors || vector_auto_reindex_can_rebuild(embedding_args);
+    let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
     let decision =
-        freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, !vectors);
+        freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false);
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
-
-    if !vectors {
-        if let FreshnessServe::Refuse(freshness) = &decision {
-            if json {
-                semantic_algorithmic_json(
-                    &store,
-                    &project,
-                    "skipped_stale_index",
-                    Some(freshness),
-                    &[],
-                )?;
-            } else {
-                println!(
-                    "{}",
-                    semantic_stale_skip_message("semantic-search", freshness)
-                );
-            }
-            return Ok(1);
-        }
-    }
     let freshness = decision.freshness().clone();
 
     if provider_policy_blocks_query(&incomplete_providers)? {
         if json {
             semantic_provider_incomplete_json(
                 &project,
-                if vectors { "vector" } else { "algorithmic" },
+                "vector",
                 Some(&freshness),
                 &incomplete_providers,
             )?;
@@ -9573,19 +9482,14 @@ fn dispatch_semantic(
         return Ok(1);
     }
 
-    let vector_config = if vectors {
-        Some(embedding_config_for_required_use(embedding_args)?)
-    } else {
-        None
-    };
-
-    if let Some(cfg) = vector_config {
+    let cfg = embedding_config_for_required_use(embedding_args)?;
+    {
         let generation = current_graph_generation(&store, root)?;
         let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
             &project,
             &cfg.model_id,
             Some(generation),
-            20,
+            SEMANTIC_VECTOR_CANDIDATE_LIMIT,
         );
         let total = greppy_search::count_vector_search_scope(&store, &scope)?;
         let candidate_limit = vector_exact_candidate_limit()?;
@@ -9604,7 +9508,7 @@ fn dispatch_semantic(
                 )?;
             } else {
                 println!(
-                    "(no vector embeddings for model {}; run `grep index --embeddings ...` first)",
+                    "(no vector embeddings for model {}; run `grep index` first)",
                     cfg.model_id
                 );
             }
@@ -9626,7 +9530,7 @@ fn dispatch_semantic(
             } else {
                 println!(
                     "{}",
-                    vector_stale_skip_message("semantic-search --vectors", &freshness)
+                    vector_stale_skip_message("semantic-search", &freshness)
                 );
             }
             return Ok(1);
@@ -9647,7 +9551,7 @@ fn dispatch_semantic(
             } else {
                 println!(
                     "{}",
-                    vector_exact_scan_skip_message("semantic-search --vectors", total, limit)
+                    vector_exact_scan_skip_message("semantic-search", total, limit)
                 );
             }
             return Ok(1);
@@ -9655,17 +9559,20 @@ fn dispatch_semantic(
 
         match embed_query_cached(&cfg, root, q) {
             Ok(query_vector) => {
-                scope.limit = 20;
-                let hits = greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
-                let purposes = semantic_vector_purposes(&store, root, &hits)?;
-                let display_hits = hits.clone();
+                scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
+                let candidates = greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
+                let hits = dedupe_semantic_vector_hits(candidates, SEMANTIC_VECTOR_RESULT_LIMIT);
+                let shown = hits.len().min(SEMANTIC_VECTOR_DISPLAY_LIMIT);
+                let display_hits = hits[..shown].to_vec();
+                let further_hits = &hits[shown..];
+                let purposes = semantic_vector_purposes(&store, root, &display_hits, true)?;
                 let expand = insert_semantic_vector_expand_pack(
                     &store,
                     root,
                     &project,
                     q,
                     generation,
-                    &display_hits,
+                    further_hits,
                 );
                 if json {
                     semantic_vector_json_with_expand(
@@ -9689,70 +9596,28 @@ fn dispatch_semantic(
                         print_semantic_vector_hit(h, purposes.as_deref());
                     }
                     if let Some(expand) = &expand {
-                        println!("{}", expand.text_line());
+                        println!("{}", expand.semantic_text_line(further_hits.len()));
                     }
                 }
                 return Ok(if hits.is_empty() { 1 } else { 0 });
             }
-            Err(e) => {
-                log_embedding_skip_once("semantic-search --vectors", &e);
-            }
+            Err(e) => return Err(e),
         }
     }
-
-    let hits = greppy_search::semantic_query(&store, q, None, Some(&project), 20)?;
-    let expand = insert_semantic_algorithmic_expand_pack(&store, root, &project, q, &hits);
-    if json {
-        semantic_algorithmic_json_with_expand(
-            &store,
-            &project,
-            "ok",
-            Some(&freshness),
-            &hits,
-            expand.as_ref(),
-        )?;
-        return Ok(if hits.is_empty() { 1 } else { 0 });
-    }
-    if hits.is_empty() {
-        println!("(no matches)");
-    } else {
-        println!(
-            "# semantic mode: algorithmic (TF-IDF + MinHash; pass --vectors for EmbeddingGemma)"
-        );
-        for h in &hits {
-            let mut flags = Vec::new();
-            if h.signals.token_overlap {
-                flags.push("tok");
-            }
-            if h.signals.label_affinity {
-                flags.push("lbl");
-            }
-            if h.signals.file_proximity {
-                flags.push("file");
-            }
-            println!(
-                "{:.3}  {}  {}  {}  [{}]",
-                h.score,
-                h.node.label,
-                h.node.qualified_name,
-                line_span(&h.node.file_path, h.node.start_line, h.node.end_line),
-                flags.join(",")
-            );
-        }
-        if let Some(expand) = &expand {
-            println!("{}", expand.text_line());
-        }
-    }
-    Ok(0)
 }
 
-const SEMANTIC_PURPOSE_LIMIT: usize = 8;
+const SEMANTIC_VECTOR_DISPLAY_LIMIT: usize = 3;
+const SEMANTIC_VECTOR_RESULT_LIMIT: usize = 6;
+const SEMANTIC_VECTOR_CANDIDATE_LIMIT: usize = 24;
 const SEMANTIC_PURPOSE_SPAN_CAP_LINES: usize = 40;
 const SEMANTIC_PURPOSE_SPAN_MAX_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SemanticVectorPurpose {
-    hit_loc: String,
+    embedding_id: i64,
+    file_path: String,
+    start_line: i64,
+    end_line: i64,
     display_loc: String,
     signature: String,
     bullets: Vec<String>,
@@ -9766,82 +9631,113 @@ fn vector_hit_loc(hit: &greppy_store::VectorSearchHit) -> String {
     )
 }
 
+fn dedupe_semantic_vector_hits(
+    hits: Vec<greppy_store::VectorSearchHit>,
+    limit: usize,
+) -> Vec<greppy_store::VectorSearchHit> {
+    let mut seen = std::collections::HashSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            let key = hit
+                .embedding
+                .node_id
+                .map(|id| format!("node:{id}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "span:{}:{}:{}",
+                        hit.embedding.file_path, hit.embedding.start_line, hit.embedding.end_line
+                    )
+                });
+            seen.insert(key)
+        })
+        .take(limit)
+        .collect()
+}
+
 fn semantic_vector_purposes(
     store: &greppy_store::Store,
     root: Option<&str>,
     hits: &[greppy_store::VectorSearchHit],
+    summarize: bool,
 ) -> Result<Option<Vec<SemanticVectorPurpose>>> {
     if hits.is_empty() {
         return Ok(None);
     }
+    let root_path = match resolve_root(root) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
     #[cfg(unix)]
-    {
-        let Some(cfg) = qwen_summary_config_optional()? else {
-            return Ok(None);
-        };
-        let root_path = match resolve_root(root) {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let model_key = qwen_summary_model_key(&cfg);
-        let mut purposes = Vec::new();
-        for hit in hits.iter().take(SEMANTIC_PURPOSE_LIMIT) {
-            let hit_loc = vector_hit_loc(hit);
-            let node = hit
-                .embedding
-                .node_id
-                .and_then(|id| store.get_node(id).ok().flatten());
-            let file_path = node
-                .as_ref()
-                .map(|n| n.file_path.as_str())
-                .unwrap_or(&hit.embedding.file_path);
-            let start_line = node
-                .as_ref()
-                .map(|n| n.start_line)
-                .unwrap_or(hit.embedding.start_line);
-            let end_line = node
-                .as_ref()
-                .map(|n| n.end_line)
-                .unwrap_or(hit.embedding.end_line);
-            let Some(span) = read_span_with_meta(
-                &root_path,
-                file_path,
-                start_line,
-                end_line,
-                SEMANTIC_PURPOSE_SPAN_CAP_LINES,
-                false,
-            ) else {
-                continue;
-            };
-            let display_loc = line_span(file_path, start_line, span.end_line);
-            let signature = semantic_signature_from_span(&span.text)
-                .unwrap_or_else(|| hit.embedding.qualified_name.clone());
-            let bullets = if semantic_signature_is_function_like(
-                &signature,
-                node.as_ref().map(|n| n.label.as_str()),
-            ) {
-                let code = cap_semantic_purpose_span(&span.text);
-                summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, &code)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            purposes.push(SemanticVectorPurpose {
-                hit_loc,
-                display_loc,
-                signature,
-                bullets,
-            });
-        }
-        if purposes.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(purposes))
+    let summary_runtime = if summarize {
+        qwen_summary_config_optional().ok().flatten()
+    } else {
+        None
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, hits);
+    .map(|cfg| {
+        let model_key = qwen_summary_model_key(&cfg);
+        (cfg, model_key)
+    });
+    let mut purposes = Vec::new();
+    for hit in hits {
+        let node = hit
+            .embedding
+            .node_id
+            .and_then(|id| store.get_node(id).ok().flatten());
+        let file_path = node
+            .as_ref()
+            .map(|n| n.file_path.as_str())
+            .unwrap_or(&hit.embedding.file_path);
+        let start_line = node
+            .as_ref()
+            .map(|n| n.start_line)
+            .unwrap_or(hit.embedding.start_line);
+        let stored_end_line = node
+            .as_ref()
+            .map(|n| n.end_line)
+            .unwrap_or(hit.embedding.end_line);
+        let Some(span) = read_span_with_meta(
+            &root_path,
+            file_path,
+            start_line,
+            stored_end_line,
+            SEMANTIC_PURPOSE_SPAN_CAP_LINES,
+            false,
+        ) else {
+            continue;
+        };
+        let signature = node
+            .as_ref()
+            .and_then(|node| node.properties.get("source_signature"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| semantic_signature_from_span(&span.text));
+        let Some(signature) = signature else {
+            continue;
+        };
+        let mut bullets = Vec::new();
+        #[cfg(unix)]
+        if semantic_signature_is_function_like(&signature, node.as_ref().map(|n| n.label.as_str()))
+        {
+            if let Some((cfg, model_key)) = summary_runtime.as_ref() {
+                let code = cap_semantic_purpose_span(&span.text);
+                bullets = summarize_daemon::summarize_source_via_daemon(cfg, model_key, &code)
+                    .unwrap_or_default();
+            }
+        }
+        purposes.push(SemanticVectorPurpose {
+            embedding_id: hit.embedding.id,
+            file_path: file_path.to_string(),
+            start_line,
+            end_line: span.end_line,
+            display_loc: line_span(file_path, start_line, span.end_line),
+            signature,
+            bullets,
+        });
+    }
+    if purposes.is_empty() {
         Ok(None)
+    } else {
+        Ok(Some(purposes))
     }
 }
 
@@ -9858,10 +9754,96 @@ fn cap_semantic_purpose_span(code: &str) -> String {
 }
 
 fn semantic_signature_from_span(code: &str) -> Option<String> {
-    code.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("//"))
-        .map(|line| line.trim_end_matches('{').trim().to_string())
+    let mut leading_offset = 0usize;
+    for line in code.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.trim().is_empty() || trimmed.starts_with("//") {
+            leading_offset += line.len();
+        } else {
+            break;
+        }
+    }
+    let start = code[leading_offset..]
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(leading_offset + idx))?;
+    let bytes = code.as_bytes();
+    let mut round_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment_depth = 0usize;
+    let mut end = code.len();
+    let mut idx = start;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        let next = bytes.get(idx + 1).copied();
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if block_comment_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_comment_depth += 1;
+                idx += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_comment_depth -= 1;
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if byte == b'/' && next == Some(b'/') {
+            line_comment = true;
+            idx += 2;
+            continue;
+        }
+        if byte == b'/' && next == Some(b'*') {
+            block_comment_depth = 1;
+            idx += 2;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'(' => round_depth += 1,
+            b')' => round_depth = round_depth.saturating_sub(1),
+            b'[' => square_depth += 1,
+            b']' => square_depth = square_depth.saturating_sub(1),
+            b'<' => angle_depth += 1,
+            b'>' if angle_depth > 0 => angle_depth -= 1,
+            b'{' if round_depth == 0 && square_depth == 0 && angle_depth == 0 => {
+                end = idx;
+                break;
+            }
+            b';' if round_depth == 0 && square_depth == 0 && angle_depth == 0 => {
+                end = idx;
+                break;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    let signature = code[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!signature.is_empty()).then_some(signature)
 }
 
 fn semantic_signature_is_function_like(signature: &str, label: Option<&str>) -> bool {
@@ -9904,11 +9886,13 @@ fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
     out
 }
 
-fn vector_purpose_for_loc<'a>(
+fn vector_purpose_for_hit<'a>(
     purposes: Option<&'a [SemanticVectorPurpose]>,
-    loc: &str,
+    hit: &greppy_store::VectorSearchHit,
 ) -> Option<&'a SemanticVectorPurpose> {
-    purposes?.iter().find(|v| v.hit_loc == loc)
+    purposes?
+        .iter()
+        .find(|purpose| purpose.embedding_id == hit.embedding.id)
 }
 
 fn print_semantic_vector_hit(
@@ -9916,7 +9900,7 @@ fn print_semantic_vector_hit(
     purposes: Option<&[SemanticVectorPurpose]>,
 ) {
     let loc = vector_hit_loc(hit);
-    if let Some(purpose) = vector_purpose_for_loc(purposes, &loc) {
+    if let Some(purpose) = vector_purpose_for_hit(purposes, hit) {
         println!("{}", purpose.display_loc);
         println!("    {}", purpose.signature);
         for bullet in &purpose.bullets {
@@ -9924,9 +9908,40 @@ fn print_semantic_vector_hit(
         }
     } else {
         println!("{loc}");
-        println!("    {}", hit.embedding.qualified_name);
     }
     println!();
+}
+
+fn semantic_vector_json_row(
+    hit: &greppy_store::VectorSearchHit,
+    purpose: Option<&SemanticVectorPurpose>,
+    expand: Option<&ExpandHandle>,
+) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "score": hit.score,
+        "qualified_name": hit.embedding.qualified_name,
+        "file_path": hit.embedding.file_path,
+        "start_line": hit.embedding.start_line,
+        "end_line": hit.embedding.end_line,
+        "content_sha256": hit.embedding.content_sha256,
+        "graph_generation": hit.embedding.graph_generation,
+        "summary": [],
+    });
+    if let Some(purpose) = purpose {
+        row["file_path"] = serde_json::json!(&purpose.file_path);
+        row["start_line"] = serde_json::json!(purpose.start_line);
+        row["end_line"] = serde_json::json!(purpose.end_line);
+        row["signature"] = serde_json::json!(&purpose.signature);
+        row["summary_loc"] = serde_json::json!(&purpose.display_loc);
+        row["summary"] = serde_json::json!(&purpose.bullets);
+        if !purpose.bullets.is_empty() {
+            row["summary_prompt_version"] = serde_json::json!(greppy_qwen35_native::PROMPT_VERSION);
+        }
+    }
+    if let Some(expand) = expand {
+        row["expand_id"] = serde_json::json!(&expand.id);
+    }
+    row
 }
 
 fn current_graph_generation(store: &greppy_store::Store, root: Option<&str>) -> Result<u64> {
@@ -9986,28 +10001,7 @@ fn semantic_vector_json_with_expand(
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let rows = hits
         .iter()
-        .map(|h| {
-            let loc = vector_hit_loc(h);
-            let mut row = serde_json::json!({
-                "score": h.score,
-                "qualified_name": h.embedding.qualified_name,
-                "file_path": h.embedding.file_path,
-                "start_line": h.embedding.start_line,
-                "end_line": h.embedding.end_line,
-                "content_sha256": h.embedding.content_sha256,
-                "graph_generation": h.embedding.graph_generation,
-            });
-            if let Some(purpose) = vector_purpose_for_loc(purposes, &loc) {
-                row["signature"] = serde_json::json!(&purpose.signature);
-                row["summary_loc"] = serde_json::json!(&purpose.display_loc);
-                if !purpose.bullets.is_empty() {
-                    row["summary"] = serde_json::json!(&purpose.bullets);
-                    row["summary_prompt_version"] =
-                        serde_json::json!(greppy_qwen35_native::PROMPT_VERSION);
-                }
-            }
-            row
-        })
+        .map(|hit| semantic_vector_json_row(hit, vector_purpose_for_hit(purposes, hit), expand))
         .collect::<Vec<_>>();
     let shown = rows.len() as i64;
     let mut v = serde_json::json!({
@@ -10039,81 +10033,12 @@ fn semantic_vector_json_with_expand(
     });
     if let Some(expand) = expand {
         v["expand"] = expand.json_value();
+        v["expand_id"] = serde_json::json!(&expand.id);
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&v)
             .map_err(|e| Error::Invalid(format!("serialize vector semantic JSON: {e}")))?
-    );
-    Ok(())
-}
-
-fn semantic_algorithmic_json(
-    store: &greppy_store::Store,
-    project: &str,
-    status: &str,
-    freshness: Option<&serde_json::Value>,
-    hits: &[greppy_search::SemanticHit],
-) -> Result<()> {
-    semantic_algorithmic_json_with_expand(store, project, status, freshness, hits, None)
-}
-
-fn semantic_algorithmic_json_with_expand(
-    store: &greppy_store::Store,
-    project: &str,
-    status: &str,
-    freshness: Option<&serde_json::Value>,
-    hits: &[greppy_search::SemanticHit],
-    expand: Option<&ExpandHandle>,
-) -> Result<()> {
-    let incomplete_providers = incomplete_provider_json(store, project)?;
-    let rows = hits
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "score": h.score,
-                "label": h.node.label,
-                "qualified_name": h.node.qualified_name,
-                "file_path": h.node.file_path,
-                "start_line": h.node.start_line,
-                "end_line": h.node.end_line,
-                "signals": {
-                    "token_overlap": h.signals.token_overlap,
-                    "label_affinity": h.signals.label_affinity,
-                    "file_proximity": h.signals.file_proximity,
-                    "simhash": h.signals.simhash,
-                    "qname_path": h.signals.qname_path,
-                    "edge_proximity": h.signals.edge_proximity,
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut v = serde_json::json!({
-        "command": "semantic-search",
-        "mode": "algorithmic",
-        "status": status,
-        "project": project,
-        "fresh": freshness
-            .and_then(|v| v.get("fresh"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        "freshness": freshness.cloned().unwrap_or(serde_json::Value::Null),
-        "provider_complete": incomplete_providers.is_empty(),
-        "incomplete_provider_count": incomplete_providers.len(),
-        "incomplete_providers": incomplete_providers,
-        "total_exact": rows.len(),
-        "shown": rows.len(),
-        "omitted": 0,
-        "truncated": false,
-        "hits": rows,
-    });
-    if let Some(expand) = expand {
-        v["expand"] = expand.json_value();
-    }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&v)
-            .map_err(|e| Error::Invalid(format!("serialize semantic JSON: {e}")))?
     );
     Ok(())
 }
@@ -10543,8 +10468,8 @@ fn context_vector_fallback(
         }
         if total == 0 {
             eprintln!(
-                "context: no indexed vectors for model {} (run `grep index \
-                 --embeddings ...`); skipping vector fallback.",
+                "context: no indexed vectors for model {} (run `grep index`); \
+                 skipping vector fallback.",
                 cfg.model_id
             );
             return Ok(None);
@@ -11850,13 +11775,6 @@ fn plus_stale_skip_message(freshness: &serde_json::Value) -> String {
     )
 }
 
-fn semantic_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
-    format!(
-        "{command}: algorithmic semantic search skipped because {}; no stale indexed hits emitted",
-        stale_freshness_reason(freshness)
-    )
-}
-
 fn context_stale_skip_message(freshness: &serde_json::Value) -> String {
     format!(
         "context: source-span lookup skipped because {}; no stale indexed spans emitted",
@@ -11919,8 +11837,8 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     // (`GREPPY_AUTO_REINDEX=0` restores the old hard error). If the
     // inline index fails for any reason we fall back to the actionable
     // diagnostic below. Embeddings are NOT computed here — the vector
-    // path (`context` / `semantic`) still asks for `grep index
-    // --embeddings` when it needs vectors.
+    // path (`context` / `semantic`) still asks for `grep index` when it
+    // needs vectors.
     // (Query commands only — the grep passthrough path never reaches here,
     // so the byte-exact passthrough contract is untouched.)
     if !path.exists() {
@@ -12348,7 +12266,7 @@ fn index_embeddings_into_temp_store(
     let model = match load_embedding_model(cfg, tokenizer_cache_dir) {
         Ok(model) => model,
         Err(e) => {
-            log_embedding_skip_once("index --embeddings", &e);
+            log_embedding_skip_once("index", &e);
             return Ok(greppy_indexer::EmbeddingIndexReport::default());
         }
     };
@@ -13316,11 +13234,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_index_embedding_flags() {
+    fn parse_index_embedding_configuration() {
         let cli = Cli::try_parse_from([
             "greppy",
             "index",
-            "--embeddings",
             "--embedding-gguf",
             "model.gguf",
             "--embedding-tokenizer",
@@ -13333,14 +13250,12 @@ mod tests {
         match cli.command {
             Some(Command::Index {
                 path,
-                embeddings,
                 embedding_gguf,
                 embedding_tokenizer,
                 embedding_model_id,
                 ..
             }) => {
                 assert_eq!(path.as_deref(), Some("."));
-                assert!(embeddings);
                 assert_eq!(embedding_gguf.as_deref(), Some("model.gguf"));
                 assert_eq!(embedding_tokenizer.as_deref(), Some("tokenizer.json"));
                 assert_eq!(
@@ -13350,14 +13265,15 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        assert!(Cli::try_parse_from(["greppy", "index", "--embeddings", "."]).is_err());
     }
 
     #[test]
-    fn parse_semantic_vector_flags() {
+    fn parse_semantic_search_flags() {
         let cli = Cli::try_parse_from([
             "greppy",
             "semantic-search",
-            "--vectors",
             "--json",
             "--embedding-model-dir",
             "/models/embeddinggemma",
@@ -13367,13 +13283,11 @@ mod tests {
         match cli.command {
             Some(Command::Semantic {
                 query,
-                vectors,
                 json,
                 embedding_model_dir,
                 ..
             }) => {
                 assert_eq!(query.as_deref(), Some("retry handler"));
-                assert!(vectors);
                 assert!(json);
                 assert_eq!(
                     embedding_model_dir.as_deref(),
@@ -13382,6 +13296,11 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        assert!(
+            Cli::try_parse_from(["greppy", "semantic-search", "--vectors", "retry handler"])
+                .is_err()
+        );
 
         let cli = Cli::try_parse_from(["greppy", "semantic", "retry handler"]).unwrap();
         match cli.command {
@@ -13461,7 +13380,6 @@ mod tests {
         // This locks the fix for the regression where semantic-search silently
         // ran on the lexical/algorithmic path with no vectors at all.
         let cfg = embedding_config_required(EmbeddingCliArgs {
-            enabled: true,
             model_dir: None,
             gguf: None,
             tokenizer: None,
@@ -13482,7 +13400,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "grep",
             "semantic-search",
-            "--vectors",
             "--device",
             "cuda",
             "--no-gpu",
@@ -13492,13 +13409,11 @@ mod tests {
         match cli.command {
             Some(Command::Semantic {
                 query,
-                vectors,
                 device,
                 no_gpu,
                 ..
             }) => {
                 assert_eq!(query.as_deref(), Some("refund workflow"));
-                assert!(vectors);
                 assert_eq!(device.as_deref(), Some("cuda"));
                 assert!(no_gpu);
             }
@@ -13564,7 +13479,7 @@ mod tests {
     ) -> greppy_store::VectorSearchHit {
         greppy_store::VectorSearchHit {
             embedding: greppy_store::VectorEmbedding {
-                id: 0,
+                id: start_line,
                 project: "p".into(),
                 model_id: "m".into(),
                 prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
@@ -13587,23 +13502,164 @@ mod tests {
     }
 
     #[test]
-    fn semantic_vector_purpose_lookup_is_loc_keyed() {
+    fn semantic_vector_purpose_lookup_is_embedding_id_keyed() {
         let hits = vec![
             vector_hit_for_test("src/noise.rs", 30, 33, "noise", 0.99),
             vector_hit_for_test("src/read.rs", 10, 12, "read", 0.77),
         ];
         let purposes = vec![SemanticVectorPurpose {
-            hit_loc: "src/read.rs:10-12".into(),
+            embedding_id: 10,
+            file_path: "src/read.rs".into(),
+            start_line: 10,
+            end_line: 15,
             display_loc: "src/read.rs:10-15".into(),
             signature: "fn read()".into(),
             bullets: vec!["opens the matching data path".into()],
         }];
 
-        assert!(vector_purpose_for_loc(Some(&purposes), &vector_hit_loc(&hits[0])).is_none());
-        let purpose = vector_purpose_for_loc(Some(&purposes), &vector_hit_loc(&hits[1])).unwrap();
+        assert!(vector_purpose_for_hit(Some(&purposes), &hits[0]).is_none());
+        let purpose = vector_purpose_for_hit(Some(&purposes), &hits[1]).unwrap();
         assert_eq!(purpose.signature, "fn read()");
         assert_eq!(purpose.display_loc, "src/read.rs:10-15");
         assert_eq!(purpose.bullets, ["opens the matching data path"]);
+    }
+
+    #[test]
+    fn semantic_vector_hits_are_deduplicated_by_definition() {
+        let mut first = vector_hit_for_test("src/lib.rs", 10, 20, "first", 0.99);
+        first.embedding.id = 1;
+        first.embedding.node_id = Some(7);
+        let mut duplicate_chunk = first.clone();
+        duplicate_chunk.embedding.id = 2;
+        duplicate_chunk.embedding.chunk_idx = 1;
+        duplicate_chunk.score = 0.98;
+        let mut second = vector_hit_for_test("src/lib.rs", 30, 40, "second", 0.97);
+        second.embedding.id = 3;
+        second.embedding.node_id = Some(8);
+
+        let hits = dedupe_semantic_vector_hits(vec![first, duplicate_chunk, second], 6);
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].embedding.id, 1);
+        assert_eq!(hits[1].embedding.id, 3);
+    }
+
+    #[test]
+    fn semantic_vector_json_row_matches_agent_contract() {
+        let hit = vector_hit_for_test(
+            "serde_derive/src/internals/case.rs",
+            82,
+            82,
+            "serde_derive/src/internals/case.rs::RenameRule::apply_to_field",
+            0.91,
+        );
+        let purpose = SemanticVectorPurpose {
+            embedding_id: 82,
+            file_path: "serde_derive/src/internals/case.rs".into(),
+            start_line: 82,
+            end_line: 109,
+            display_loc: "serde_derive/src/internals/case.rs:82-109".into(),
+            signature: "pub fn apply_to_field(self, field: &str) -> String".into(),
+            bullets: vec!["Applies the configured rename/case rule to a struct field name.".into()],
+        };
+        let expand = ExpandHandle {
+            id: "semantic-valid-id".into(),
+            summary: "3 further hits".into(),
+        };
+
+        let row = semantic_vector_json_row(&hit, Some(&purpose), Some(&expand));
+
+        assert_eq!(row["file_path"], "serde_derive/src/internals/case.rs");
+        assert_eq!(row["start_line"], 82);
+        assert_eq!(row["end_line"], 109);
+        assert_eq!(
+            row["signature"],
+            "pub fn apply_to_field(self, field: &str) -> String"
+        );
+        assert_eq!(
+            row["summary"],
+            serde_json::json!(["Applies the configured rename/case rule to a struct field name."])
+        );
+        assert_eq!(row["expand_id"], "semantic-valid-id");
+    }
+
+    #[test]
+    fn semantic_expand_pack_round_trips_full_source_span() {
+        let root = test_tempdir("semantic-expand-contract");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn apply_to_field(self_value: Rule, field: &str) -> String {\n    let renamed = self_value.apply(field);\n    renamed\n}\n",
+        )
+        .unwrap();
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-07-09T00:00:00Z".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let node_id = store
+            .insert_node(&greppy_store::NewNode {
+                project: "p".into(),
+                label: "Function".into(),
+                name: "apply_to_field".into(),
+                qualified_name: "src/lib.rs::Function::apply_to_field".into(),
+                file_path: "src/lib.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        let mut hit = vector_hit_for_test(
+            "src/lib.rs",
+            1,
+            1,
+            "src/lib.rs::Function::apply_to_field",
+            0.91,
+        );
+        hit.embedding.node_id = Some(node_id);
+
+        let purposes = semantic_vector_purposes(
+            &store,
+            Some(root.to_str().unwrap()),
+            std::slice::from_ref(&hit),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(purposes[0].end_line, 4);
+        assert_eq!(
+            purposes[0].signature,
+            "pub fn apply_to_field(self_value: Rule, field: &str) -> String"
+        );
+
+        let handle = insert_semantic_vector_expand_pack(
+            &store,
+            Some(root.to_str().unwrap()),
+            "p",
+            "rename a field",
+            7,
+            &[hit],
+        )
+        .expect("stored expand handle");
+        let pack = store
+            .get_expand_pack(&handle.id)
+            .unwrap()
+            .expect("expand handle remains readable");
+        assert!(pack.expires_at > pack.created_at);
+        assert!(pack.payload_text.contains("let renamed ="));
+        let row = &pack.payload_json.as_ref().unwrap()["hits"][0];
+        assert_eq!(row["start_line"], 1);
+        assert_eq!(row["end_line"], 4);
+        assert_eq!(
+            row["signature"],
+            "pub fn apply_to_field(self_value: Rule, field: &str) -> String"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -13615,6 +13671,36 @@ mod tests {
         assert_eq!(
             signature,
             "fn steal_into(&self, dst: &mut Local<T>) -> Option<T>"
+        );
+    }
+
+    #[test]
+    fn semantic_signature_from_span_preserves_multiline_source_signature() {
+        let code = r#"pub unsafe extern "C" fn transform<'a, T: Clone>(
+    value: &'a T,
+) -> Option<&'a T>
+where
+    T: Send,
+{
+    Some(value)
+}
+"#;
+
+        let signature = semantic_signature_from_span(code).unwrap();
+
+        assert_eq!(
+            signature,
+            "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
+        );
+    }
+
+    #[test]
+    fn semantic_signature_from_span_does_not_add_unit_return() {
+        let code = "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n}\n";
+
+        assert_eq!(
+            semantic_signature_from_span(code).as_deref(),
+            Some("pub fn rename_by_rules(&mut self, rules: RenameAllRules)")
         );
     }
 

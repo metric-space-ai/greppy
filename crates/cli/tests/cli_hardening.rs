@@ -501,7 +501,6 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
     let (code, out, err) = run_with_env(
         &[
             "semantic-search",
-            "--vectors",
             "--json",
             "--embedding-gguf",
             "/missing/embeddinggemma.gguf",
@@ -1008,7 +1007,6 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     let (code, out, err) = run_with_env(
         &[
             "semantic-search",
-            "--vectors",
             "--json",
             "--embedding-gguf",
             "/missing/embeddinggemma.gguf",
@@ -1071,7 +1069,6 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
     let (code, out, err) = run(
         &[
             "semantic-search",
-            "--vectors",
             "--json",
             "--embedding-gguf",
             "/missing/embeddinggemma.gguf",

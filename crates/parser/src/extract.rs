@@ -886,6 +886,25 @@ fn signature_info(source: &[u8], func: Node<'_>) -> Option<SignatureInfo> {
     })
 }
 
+/// Return the complete source-level function signature, including visibility,
+/// modifiers, name, generics, parameters, return type, and where-clause. The
+/// body opener and a declaration-only trailing semicolon are excluded.
+fn function_source_signature(source: &[u8], func: Node<'_>) -> Option<String> {
+    let end = func
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or_else(|| func.end_byte());
+    let raw = std::str::from_utf8(source.get(func.start_byte()..end)?).ok()?;
+    let joined = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let signature = joined.trim().trim_end_matches(';').trim();
+    (!signature.is_empty()).then(|| signature.to_string())
+}
+
 /// Modifier flags captured off a `function_item`
 /// (`visibility` + `async`/`unsafe`/`const`).
 #[derive(Default)]
@@ -2362,6 +2381,10 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     }
                     _ => format!("{file_path}::{label}::{text}"),
                 };
+                // Captures name the identifier, while the parent is the full
+                // definition item. Persist the item span so navigation and
+                // semantic output cover the complete function body.
+                let def_node = node.parent().unwrap_or(node);
                 // The enclosing-function qname of this def itself
                 // (used when emitting a call edge whose endpoint is
                 // THIS function — i.e., a method's qname when a
@@ -2375,8 +2398,8 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     label: label.clone(),
                     name: text.to_string(),
                     qname: qname.clone(),
-                    start_line: node.start_position().row as u32 + 1,
-                    end_line: node.end_position().row as u32 + 1,
+                    start_line: def_node.start_position().row as u32 + 1,
+                    end_line: def_node.end_position().row as u32 + 1,
                     enclosing_function_qname: enclosing,
                 });
                 // Docstring: the leading `///` / `/** */` doc comment attached
@@ -2385,7 +2408,6 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 // and the full (possibly multi-line) text as `doc_full`. The
                 // comment is a preceding sibling of the *definition* node, not
                 // the name identifier, so we walk up to it.
-                let def_node = node.parent().unwrap_or(node);
                 let mut properties = serde_json::Map::new();
                 if let Some(doc) = extract_docstring(source, def_node) {
                     let summary = docstring_summary(&doc).to_string();
@@ -2429,6 +2451,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             );
                         }
                     }
+                    if let Some(signature) = function_source_signature(source, def_node) {
+                        properties.insert(
+                            "source_signature".into(),
+                            serde_json::Value::String(signature),
+                        );
+                    }
 
                     // BOUND edges: def → bound trait, one per `T: Trait`
                     // constraint (angle-bracket + where-clause). The `name`
@@ -2461,8 +2489,8 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     name: text.to_string(),
                     qualified_name: qname,
                     file_path: file_path.to_string(),
-                    start_line: node.start_position().row as u32 + 1,
-                    end_line: node.end_position().row as u32 + 1,
+                    start_line: def_node.start_position().row as u32 + 1,
+                    end_line: def_node.end_position().row as u32 + 1,
                     properties,
                 });
             }
@@ -14957,6 +14985,53 @@ fn plain() {}
             Some("count")
         );
         assert_eq!(params[1].get("type").and_then(|v| v.as_str()), Some("u32"));
+    }
+
+    #[test]
+    fn rust_function_node_uses_full_item_span_and_source_signature() {
+        const SRC: &str = "impl Rules {\n    pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n        self.serialize = rules.serialize;\n        self.deserialize = rules.deserialize;\n    }\n}\n";
+        let r = extract(Language::Rust, SRC.as_bytes(), "src/lib.rs").unwrap();
+        let node = r
+            .nodes
+            .iter()
+            .find(|node| node.name == "rename_by_rules")
+            .expect("rename_by_rules node");
+
+        assert_eq!((node.start_line, node.end_line), (2, 5));
+        assert_eq!(
+            node.properties
+                .get("source_signature")
+                .and_then(|value| value.as_str()),
+            Some("pub fn rename_by_rules(&mut self, rules: RenameAllRules)")
+        );
+        assert!(!node
+            .properties
+            .get("source_signature")
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .contains("-> ()"));
+    }
+
+    #[test]
+    fn rust_source_signature_preserves_modifiers_generics_and_where_clause() {
+        const SRC: &str = r#"
+            pub unsafe extern "C" fn transform<'a, T: Clone>(
+                value: &'a T,
+            ) -> Option<&'a T>
+            where
+                T: Send,
+            {
+                Some(value)
+            }
+        "#;
+        let p = node_props(SRC, "transform");
+
+        assert_eq!(
+            p.get("source_signature").and_then(|value| value.as_str()),
+            Some(
+                "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
+            )
+        );
     }
 
     #[test]
