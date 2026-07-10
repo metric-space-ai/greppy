@@ -129,6 +129,29 @@ impl MetalQwen35Model {
         if self.inventory.has_mtp() {
             return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
         }
+        self.generate_target_only(tokenizer, prompt, prompt_ids, params)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generate_target_only_for_test(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        params: GenerationParams,
+    ) -> Result<String> {
+        let encoding = tokenizer
+            .encode(prompt, true)
+            .map_err(|error| Error::Tokenizer(error.to_string()))?;
+        self.generate_target_only(tokenizer, prompt, encoding.get_ids(), params)
+    }
+
+    fn generate_target_only(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<String> {
         let max_context = prompt_ids
             .len()
             .saturating_add(params.max_tokens)
@@ -185,9 +208,11 @@ impl MetalQwen35Model {
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
         let vocab_size = self.inventory.vocab_size;
+        let mut perf = crate::MtpPerfTimer::new();
         let mut target_state = self.new_forward_state(max_context)?;
         let mut target_workspace = self.new_forward_workspace(max_context)?;
         let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
+        perf.begin_target_prefill();
         for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(METAL_PREFILL_BATCH_ROWS) {
             prompt_hidden.extend(self.prefill_tokens_hidden(tokens, &mut target_state)?);
         }
@@ -197,11 +222,13 @@ impl MetalQwen35Model {
             &mut target_workspace,
         )?;
         prompt_hidden.extend_from_slice(&target.hidden);
+        perf.finish_target_prefill();
 
         let zero_hidden = vec![0.0f32; hidden_size];
         let prompt_conditioning =
             mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
         let mut mtp_state = self.new_mtp_state(max_context)?;
+        perf.begin_mtp_prefill();
         for start in (0..prompt_ids.len()).step_by(METAL_PREFILL_BATCH_ROWS) {
             let end = (start + METAL_PREFILL_BATCH_ROWS).min(prompt_ids.len());
             self.mtp_prefill_tokens(
@@ -210,6 +237,7 @@ impl MetalQwen35Model {
                 &mut mtp_state,
             )?;
         }
+        perf.finish_input();
 
         let mut generated = Vec::with_capacity(params.max_tokens);
         let mut rng = SamplerRng::new(prompt_seed(prompt));
@@ -229,11 +257,27 @@ impl MetalQwen35Model {
         let mut drafted_total = 0usize;
         let mut accepted_total = 0usize;
         let mut cycles = 0usize;
+        let mut mtp_fallback = false;
         let mut speculative_target_state = self.new_forward_state(max_context)?;
         let mut draft_mtp_state = self.new_mtp_state(max_context)?;
 
         while generated.len() < params.max_tokens {
             let remaining = params.max_tokens - generated.len();
+            if mtp_fallback {
+                let stage = perf.begin_stage();
+                let mut logits =
+                    self.forward_token_logits(next, &mut target_state, &mut target_workspace)?;
+                perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
+                let Some(token) = sample_token(&mut logits, &generated, params, &mut rng) else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                continue;
+            }
             if remaining == 1 {
                 let previous_hidden = pending_target_hidden;
                 let mut output = self.forward_token_logits_hidden(
@@ -258,12 +302,15 @@ impl MetalQwen35Model {
             cycles += 1;
             let previous_hidden = pending_target_hidden.clone();
             let draft_limit = MTP_DRAFT_MAX.min(remaining - 1);
+            let stage = perf.begin_stage();
             self.copy_mtp_state(&mtp_state, &mut draft_mtp_state)?;
+            perf.finish_stage(crate::MtpPerfStage::MtpStateCopy, stage);
             let mut draft_rng = rng.clone();
             let mut draft_history = generated.clone();
             let mut draft_tokens = Vec::with_capacity(draft_limit);
             let mut draft_input = next;
             let mut draft_hidden = previous_hidden.clone();
+            let stage = perf.begin_stage();
             for _ in 0..draft_limit {
                 let mut draft = self.mtp_forward_tokens_logits_hidden(
                     &[draft_input],
@@ -283,6 +330,7 @@ impl MetalQwen35Model {
                 draft_input = token;
                 draft_hidden = draft.hidden;
             }
+            perf.finish_stage(crate::MtpPerfStage::Draft, stage);
 
             if draft_tokens.is_empty() {
                 let mut output = self.forward_token_logits_hidden(
@@ -313,11 +361,15 @@ impl MetalQwen35Model {
             let mut verification_tokens = Vec::with_capacity(1 + draft_tokens.len());
             verification_tokens.push(next);
             verification_tokens.extend_from_slice(&draft_tokens);
+            let stage = perf.begin_stage();
             self.copy_forward_state(&target_state, &mut speculative_target_state)?;
+            perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
+            let stage = perf.begin_stage();
             let mut verification = self.forward_tokens_logits_hidden(
                 &verification_tokens,
                 &mut speculative_target_state,
             )?;
+            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
             let mut accepted = 0usize;
             let mut mismatch = None;
             let mut finished = false;
@@ -357,6 +409,7 @@ impl MetalQwen35Model {
             if finished {
                 break;
             }
+            mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
 
             if accepted == draft_tokens.len() {
                 let row_start = accepted * vocab_size;
@@ -384,20 +437,26 @@ impl MetalQwen35Model {
                     verification_tokens.len(),
                     hidden_size,
                 )?;
+                let stage = perf.begin_stage();
                 self.mtp_prefill_tokens(&verification_tokens, &conditioning, &mut mtp_state)?;
+                perf.finish_stage(crate::MtpPerfStage::MtpCommit, stage);
             } else {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
+                let stage = perf.begin_stage();
                 let committed_hidden =
                     self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
+                perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,
                     commit_count,
                     hidden_size,
                 )?;
+                let stage = perf.begin_stage();
                 self.mtp_prefill_tokens(commit_tokens, &conditioning, &mut mtp_state)?;
+                perf.finish_stage(crate::MtpPerfStage::MtpCommit, stage);
                 pending_target_hidden =
                     last_hidden_row(&committed_hidden, commit_count, hidden_size)?.to_vec();
                 next = target_token;
@@ -409,6 +468,15 @@ impl MetalQwen35Model {
                 "qwen35-mtp-debug backend=metal cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
             );
         }
+        perf.report(
+            "metal",
+            prompt_ids.len(),
+            generated.len(),
+            cycles,
+            drafted_total,
+            accepted_total,
+            mtp_fallback,
+        );
         tokenizer
             .decode(&generated, true)
             .map_err(|error| Error::Tokenizer(error.to_string()))
@@ -3664,6 +3732,35 @@ mod tests {
             [709, 369],
             "Metal MTP drafts differ from llama.cpp golden tokens"
         );
+    }
+
+    #[test]
+    fn qwen35_metal_mtp_generation_matches_target_when_env_set() {
+        let (Some(gguf_path), Some(tokenizer_path)) = (
+            std::env::var_os("QWEN35_NATIVE_MTP_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let gguf = GgufModel::open(&gguf_path).expect("open Qwen3.5 MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 MTP inventory");
+        let metal =
+            MetalQwen35Model::from_gguf(&gguf, inventory, 248_044).expect("Metal Qwen MTP model");
+        let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
+        let prompt = crate::prompt::non_thinking_chat_prompt(
+            "Summarize: What is this function for?\n\npub fn add_user(users: &mut Vec<String>, name: &str) -> usize {\n    users.push(name.trim().to_string());\n    users.len()\n}",
+        );
+        let params = GenerationParams {
+            max_tokens: 32,
+            ..crate::BRIEF_GENERATION_PARAMS
+        };
+        let expected = metal
+            .generate_target_only_for_test(&tokenizer, &prompt, params)
+            .expect("Metal target-only generation");
+        let actual = metal
+            .generate(&tokenizer, &prompt, params)
+            .expect("Metal MTP generation");
+        assert_eq!(actual, expected, "Metal MTP changed target sampling output");
     }
 
     #[test]

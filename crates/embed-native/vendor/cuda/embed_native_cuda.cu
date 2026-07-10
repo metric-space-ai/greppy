@@ -169,6 +169,9 @@ GP_CUDA_EXPORT int gp_cuda_graph_abort(void * stream) {
     cudaGraph_t graph = nullptr;
     const cudaError_t err = cudaStreamEndCapture((cudaStream_t)stream, &graph);
     if (graph != nullptr) cudaGraphDestroy(graph);
+    // Kernel wrappers use cudaPeekAtLastError so a failed capture can leave
+    // the status pending. Clear it before the caller retries without a graph.
+    cudaGetLastError();
     return err == cudaErrorStreamCaptureInvalidated ? 0 : (int)err;
 }
 
