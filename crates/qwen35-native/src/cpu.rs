@@ -946,9 +946,15 @@ fn add(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
 fn add_rows(dst: &mut [f32], lhs: &[f32], rhs: &[f32]) {
     debug_assert_eq!(dst.len(), lhs.len());
     debug_assert_eq!(dst.len(), rhs.len());
-    for ((dst, lhs), rhs) in dst.iter_mut().zip(lhs).zip(rhs) {
-        *dst = *lhs + *rhs;
-    }
+    const CHUNK_VALUES: usize = 4096;
+    dst.par_chunks_mut(CHUNK_VALUES)
+        .zip(lhs.par_chunks(CHUNK_VALUES))
+        .zip(rhs.par_chunks(CHUNK_VALUES))
+        .for_each(|((dst, lhs), rhs)| {
+            for ((dst, lhs), rhs) in dst.iter_mut().zip(lhs).zip(rhs) {
+                *dst = *lhs + *rhs;
+            }
+        });
 }
 
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
@@ -1140,9 +1146,9 @@ fn rms_norm_qwen(x: &mut [f32], w: &[f32]) {
 }
 
 fn rms_norm_rows_qwen(values: &mut [f32], weights: &[f32], dim: usize) {
-    for row in values.chunks_exact_mut(dim) {
-        rms_norm_qwen(row, weights);
-    }
+    values
+        .par_chunks_mut(dim)
+        .for_each(|row| rms_norm_qwen(row, weights));
 }
 
 fn rms_norm_plain(x: &mut [f32], w: &[f32]) {
