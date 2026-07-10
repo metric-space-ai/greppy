@@ -3988,10 +3988,14 @@ unsafe fn dot4_q4k_q8k_neon(
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
 
-    let mut sum0 = 0.0f64;
-    let mut sum1 = 0.0f64;
-    let mut sum2 = 0.0f64;
-    let mut sum3 = 0.0f64;
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+    let mut correction0 = 0.0f32;
+    let mut correction1 = 0.0f32;
+    let mut correction2 = 0.0f32;
+    let mut correction3 = 0.0f32;
 
     let mut utmp = [0u32; 4];
     let mut sc0 = [0u8; 16];
@@ -4060,19 +4064,27 @@ unsafe fn dot4_q4k_q8k_neon(
         let d2 = yd * x2.d.to_f32();
         let d3 = yd * x3.d.to_f32();
 
+        macro_rules! accumulate {
+            ($sum:ident, $correction:ident, $term:expr) => {{
+                let corrected = $term - $correction;
+                let next = $sum + corrected;
+                $correction = (next - $sum) - corrected;
+                $sum = next;
+            }};
+        }
         macro_rules! min_correct {
-            ($mins:ident, $dmin:expr, $sum:ident) => {{
+            ($mins:ident, $dmin:expr, $sum:ident, $correction:ident) => {{
                 let prod = vaddq_s32(
                     vmull_s16(vget_low_s16(q8sums), vget_low_s16($mins)),
                     vmull_s16(vget_high_s16(q8sums), vget_high_s16($mins)),
                 );
-                $sum -= $dmin as f64 * vaddvq_s32(prod) as f64;
+                accumulate!($sum, $correction, -$dmin * vaddvq_s32(prod) as f32);
             }};
         }
-        min_correct!(mins0, yd * x0.dmin.to_f32(), sum0);
-        min_correct!(mins1, yd * x1.dmin.to_f32(), sum1);
-        min_correct!(mins2, yd * x2.dmin.to_f32(), sum2);
-        min_correct!(mins3, yd * x3.dmin.to_f32(), sum3);
+        min_correct!(mins0, yd * x0.dmin.to_f32(), sum0, correction0);
+        min_correct!(mins1, yd * x1.dmin.to_f32(), sum1, correction1);
+        min_correct!(mins2, yd * x2.dmin.to_f32(), sum2, correction2);
+        min_correct!(mins3, yd * x3.dmin.to_f32(), sum3, correction3);
 
         let mut q4_0 = x0.qs.as_ptr();
         let mut q4_1 = x1.qs.as_ptr();
@@ -4101,13 +4113,29 @@ unsafe fn dot4_q4k_q8k_neon(
             dot_col!(q4_3, sc3, s3a, s3b, q8lo, q8hi, j, m4b);
         }
 
-        sum0 += d0 as f64 * vaddvq_s32(vaddq_s32(s0a, s0b)) as f64;
-        sum1 += d1 as f64 * vaddvq_s32(vaddq_s32(s1a, s1b)) as f64;
-        sum2 += d2 as f64 * vaddvq_s32(vaddq_s32(s2a, s2b)) as f64;
-        sum3 += d3 as f64 * vaddvq_s32(vaddq_s32(s3a, s3b)) as f64;
+        accumulate!(
+            sum0,
+            correction0,
+            d0 * vaddvq_s32(vaddq_s32(s0a, s0b)) as f32
+        );
+        accumulate!(
+            sum1,
+            correction1,
+            d1 * vaddvq_s32(vaddq_s32(s1a, s1b)) as f32
+        );
+        accumulate!(
+            sum2,
+            correction2,
+            d2 * vaddvq_s32(vaddq_s32(s2a, s2b)) as f32
+        );
+        accumulate!(
+            sum3,
+            correction3,
+            d3 * vaddvq_s32(vaddq_s32(s3a, s3b)) as f32
+        );
     }
 
-    (sum0 as f32, sum1 as f32, sum2 as f32, sum3 as f32)
+    (sum0, sum1, sum2, sum3)
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -5120,7 +5148,8 @@ unsafe fn dot_q4k_q8k_neon(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
 
-    let mut sumf = 0.0f64;
+    let mut sumf = 0.0f32;
+    let mut correction = 0.0f32;
     let mut utmp = [0u32; 4];
     let mut scales = [0u8; 16];
     let m4b = vdupq_n_u8(0x0f);
@@ -5151,7 +5180,11 @@ unsafe fn dot_q4k_q8k_neon(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
             vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins)),
             vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)),
         );
-        sumf -= dmin as f64 * vaddvq_s32(prod) as f64;
+        let term = -dmin * vaddvq_s32(prod) as f32;
+        let corrected = term - correction;
+        let next = sumf + corrected;
+        correction = (next - sumf) - corrected;
+        sumf = next;
 
         write_u32_le_into(&utmp, &mut scales);
 
@@ -5183,9 +5216,13 @@ unsafe fn dot_q4k_q8k_neon(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
             let p3 = neon_vdotq_s32(q4bytes.1, q8bytes.1);
             sumi2 += vaddvq_s32(vaddq_s32(p2, p3)) * scales[2 * j + 1] as i32;
         }
-        sumf += d as f64 * (sumi1 + sumi2) as f64;
+        let term = d * (sumi1 + sumi2) as f32;
+        let corrected = term - correction;
+        let next = sumf + corrected;
+        correction = (next - sumf) - corrected;
+        sumf = next;
     }
-    sumf as f32
+    sumf
 }
 
 #[cfg(target_arch = "x86_64")]
