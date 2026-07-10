@@ -876,6 +876,10 @@ fn matmul_q6k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return matmul_q6k_batched_neon(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+    }
     #[cfg(target_arch = "x86_64")]
     if x86_kernel_kind() == X86KernelKind::AvxVnni {
         return matmul_q6k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
@@ -980,6 +984,72 @@ fn matmul_q6k_batched_avxvnni(
     transpose_batched_output(&transposed, lhs_rows, matrix_rows)
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+fn matmul_q6k_batched_neon(
+    rhs: &[BlockQ6K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
+    let tiled_input_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let weights = [
+                    &rhs[output_row * row_blocks..(output_row + 1) * row_blocks],
+                    &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks],
+                    &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks],
+                    &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks],
+                ];
+                for input_row in (0..tiled_input_rows).step_by(4) {
+                    let inputs = [
+                        activations[input_row].as_slice(),
+                        activations[input_row + 1].as_slice(),
+                        activations[input_row + 2].as_slice(),
+                        activations[input_row + 3].as_slice(),
+                    ];
+                    let values = unsafe { dot4x4_q6k_q8k_neon(weights, inputs) };
+                    for input_lane in 0..4 {
+                        for output_lane in 0..4 {
+                            chunk[(local + output_lane) * lhs_rows + input_row + input_lane] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for input_row in tiled_input_rows..lhs_rows {
+                    let (d0, d1, d2, d3) = dot4_q6k_q8k(
+                        weights[0],
+                        weights[1],
+                        weights[2],
+                        weights[3],
+                        &activations[input_row],
+                    );
+                    chunk[local * lhs_rows + input_row] = d0;
+                    chunk[(local + 1) * lhs_rows + input_row] = d1;
+                    chunk[(local + 2) * lhs_rows + input_row] = d2;
+                    chunk[(local + 3) * lhs_rows + input_row] = d3;
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let weights = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q6k_q8k(weights, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
 fn matmul_q5k_batched(
     rhs: &[BlockQ5K],
     lhs: &[f32],
@@ -992,6 +1062,10 @@ fn matmul_q5k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return matmul_q5k_batched_neon(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+    }
     #[cfg(target_arch = "x86_64")]
     if x86_kernel_kind() == X86KernelKind::AvxVnni {
         return matmul_q5k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
@@ -1049,6 +1123,65 @@ fn matmul_q5k_batched_avxvnni(
                         activations[input_row + 3].as_slice(),
                     ];
                     let values = unsafe { dot4x4_q5k_q8k_avxvnni(weights, inputs) };
+                    for input_lane in 0..4 {
+                        for output_lane in 0..4 {
+                            chunk[(local + output_lane) * lhs_rows + input_row + input_lane] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for input_row in tiled_input_rows..lhs_rows {
+                    for output_lane in 0..4 {
+                        chunk[(local + output_lane) * lhs_rows + input_row] =
+                            dot_q5k_q8k(weights[output_lane], &activations[input_row]);
+                    }
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let weights = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q5k_q8k(weights, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+fn matmul_q5k_batched_neon(
+    rhs: &[BlockQ5K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
+    let tiled_input_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let weights = [
+                    &rhs[output_row * row_blocks..(output_row + 1) * row_blocks],
+                    &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks],
+                    &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks],
+                    &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks],
+                ];
+                for input_row in (0..tiled_input_rows).step_by(4) {
+                    let inputs = [
+                        activations[input_row].as_slice(),
+                        activations[input_row + 1].as_slice(),
+                        activations[input_row + 2].as_slice(),
+                        activations[input_row + 3].as_slice(),
+                    ];
+                    let values = unsafe { dot4x4_q5k_q8k_neon(weights, inputs) };
                     for input_lane in 0..4 {
                         for output_lane in 0..4 {
                             chunk[(local + output_lane) * lhs_rows + input_row + input_lane] =
@@ -2699,6 +2832,56 @@ unsafe fn dot_q5k_q8k_neon(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn dot4x4_q5k_q8k_neon(
+    weights: [&[BlockQ5K]; 4],
+    inputs: [&[BlockQ8K]; 4],
+) -> [[f32; 4]; 4] {
+    let mut sums = [[0.0f32; 4]; 4];
+    let mut decoded = [[0u8; QK_K]; 4];
+    for block in 0..weights[0].len() {
+        let scale_mins: [([u8; 8], [u8; 8]); 4] = std::array::from_fn(|output| {
+            decode_q5k_u8(&weights[output][block], &mut decoded[output]);
+            decode_q4k_scales_mins(&weights[output][block].scales)
+        });
+        for input in 0..4 {
+            for output in 0..4 {
+                let x = &weights[output][block];
+                let y = &inputs[input][block];
+                let (scaled_sum, min_sum) =
+                    dot_q5k_u8_q8k_neon(&decoded[output], &scale_mins[output], y);
+                sums[input][output] +=
+                    x.d.to_f32() * y.d * scaled_sum as f32 - x.dmin.to_f32() * y.d * min_sum as f32;
+            }
+        }
+    }
+    sums
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn dot_q5k_u8_q8k_neon(
+    decoded: &[u8; QK_K],
+    scale_mins: &([u8; 8], [u8; 8]),
+    input: &BlockQ8K,
+) -> (i32, i32) {
+    let mut accumulator = vdupq_n_s32(0);
+    let mut min_sum = 0i32;
+    for group in 0..QK_K / 32 {
+        let values0 = vreinterpretq_s8_u8(vld1q_u8(decoded.as_ptr().add(group * 32)));
+        let values1 = vreinterpretq_s8_u8(vld1q_u8(decoded.as_ptr().add(group * 32 + 16)));
+        let input0 = vld1q_s8(input.qs.as_ptr().add(group * 32));
+        let input1 = vld1q_s8(input.qs.as_ptr().add(group * 32 + 16));
+        let dot = vaddq_s32(
+            sdot_acc(vdupq_n_s32(0), values0, input0),
+            sdot_acc(vdupq_n_s32(0), values1, input1),
+        );
+        accumulator = vmlaq_s32(accumulator, dot, vdupq_n_s32(scale_mins.0[group] as i32));
+        min_sum += (input.bsums[group * 2] as i32 + input.bsums[group * 2 + 1] as i32)
+            * scale_mins.1[group] as i32;
+    }
+    (vaddvq_s32(accumulator), min_sum)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 unsafe fn dot_q6k_q8k_neon(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
     let mut sum = 0.0f64;
     let m4b = vdupq_n_u8(0x0f);
@@ -2788,6 +2971,45 @@ unsafe fn dot_q6k_q8k_neon(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
         sum += d_all as f64 * y.d as f64 * ((isum - 32 * isum_mins) as f64);
     }
     sum as f32
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn dot4x4_q6k_q8k_neon(
+    weights: [&[BlockQ6K]; 4],
+    inputs: [&[BlockQ8K]; 4],
+) -> [[f32; 4]; 4] {
+    let mut sums = [[0.0f64; 4]; 4];
+    let mut decoded = [[0i8; QK_K]; 4];
+    for block in 0..weights[0].len() {
+        for output in 0..4 {
+            decode_q6k_i8(&weights[output][block], &mut decoded[output]);
+        }
+        for input in 0..4 {
+            for output in 0..4 {
+                let x = &weights[output][block];
+                let y = &inputs[input][block];
+                let integer_sum = dot_q6k_i8_q8k_neon(&decoded[output], &x.scales, y);
+                sums[input][output] += x.d.to_f32() as f64 * y.d as f64 * integer_sum as f64;
+            }
+        }
+    }
+    std::array::from_fn(|input| std::array::from_fn(|output| sums[input][output] as f32))
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn dot_q6k_i8_q8k_neon(
+    decoded: &[i8; QK_K],
+    scales: &[i8; QK_K / 16],
+    input: &BlockQ8K,
+) -> i32 {
+    let mut accumulator = vdupq_n_s32(0);
+    for group in 0..QK_K / 16 {
+        let values = vld1q_s8(decoded.as_ptr().add(group * 16));
+        let quantized = vld1q_s8(input.qs.as_ptr().add(group * 16));
+        let dot = sdot_acc(vdupq_n_s32(0), values, quantized);
+        accumulator = vmlaq_s32(accumulator, dot, vdupq_n_s32(scales[group] as i32));
+    }
+    vaddvq_s32(accumulator)
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -3161,7 +3383,7 @@ unsafe fn dot4x4_q5k_q8k_avxvnni(
     sums
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn decode_q5k_u8(x: &BlockQ5K, out: &mut [u8; QK_K]) {
     let mut qs_base = 0;
     let mut high_low = 1u8;
@@ -3338,7 +3560,7 @@ unsafe fn hsum_i32x8_avx2(v: __m256i) -> i32 {
     tmp.iter().sum()
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn decode_q4k_scales_mins(q: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     const KMASK1: u32 = 0x3f3f3f3f;
     const KMASK2: u32 = 0x0f0f0f0f;
@@ -3361,7 +3583,7 @@ fn decode_q4k_scales_mins(q: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     (scales, mins)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn decode_q6k_i8(x: &BlockQ6K, aux8: &mut [i8; QK_K]) {
     for j in (0..QK_K).step_by(128) {
         for l in 0..32 {
