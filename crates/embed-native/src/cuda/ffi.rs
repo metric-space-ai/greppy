@@ -39,6 +39,10 @@ type GpCudaGraphEnd = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *
 type GpCudaGraphAbort = unsafe extern "C" fn(*mut c_void) -> i32;
 type GpCudaGraphLaunch = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
 type GpCudaGraphDestroy = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+type GpF32Matmul =
+    unsafe extern "C" fn(*mut c_void, *const f32, *const f32, *mut f32, i32, i32, i32) -> i32;
+type GpF32Matvec =
+    unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32, i32, *mut c_void) -> i32;
 
 type GpEmbedQ4k =
     unsafe extern "C" fn(*const c_void, *const u32, *mut f32, i32, i32, f32, *mut c_void) -> i32;
@@ -333,6 +337,8 @@ struct CudaApi {
     gp_cuda_graph_abort: GpCudaGraphAbort,
     gp_cuda_graph_launch: GpCudaGraphLaunch,
     gp_cuda_graph_destroy: GpCudaGraphDestroy,
+    gp_f32_matmul: GpF32Matmul,
+    gp_f32_matvec: GpF32Matvec,
     gp_embed_q4k: GpEmbedQ4k,
     gp_embed_q6k: GpEmbedQ6k,
     gp_rms_norm: GpRmsNorm,
@@ -421,6 +427,8 @@ fn load_cuda_api() -> std::result::Result<CudaApi, String> {
             gp_cuda_graph_abort: load_symbol(&lib, b"gp_cuda_graph_abort\0")?,
             gp_cuda_graph_launch: load_symbol(&lib, b"gp_cuda_graph_launch\0")?,
             gp_cuda_graph_destroy: load_symbol(&lib, b"gp_cuda_graph_destroy\0")?,
+            gp_f32_matmul: load_symbol(&lib, b"gp_f32_matmul\0")?,
+            gp_f32_matvec: load_symbol(&lib, b"gp_f32_matvec\0")?,
             gp_embed_q4k: load_symbol(&lib, b"gp_embed_q4k\0")?,
             gp_embed_q6k: load_symbol(&lib, b"gp_embed_q6k\0")?,
             gp_rms_norm: load_symbol(&lib, b"gp_rms_norm\0")?,
@@ -2505,6 +2513,37 @@ pub unsafe fn gp_l2_norm(
 ) -> i32 {
     match cuda_api() {
         Ok(api) => unsafe { (api.gp_l2_norm)(src, dst, rows, dim, stream) },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+pub unsafe fn gp_f32_matmul(
+    blas: *mut c_void,
+    weights: *const f32,
+    src: *const f32,
+    dst: *mut f32,
+    cols: i32,
+    output_rows: i32,
+    input_rows: i32,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_f32_matmul)(blas, weights, src, dst, cols, output_rows, input_rows)
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+pub unsafe fn gp_f32_matvec(
+    weights: *const f32,
+    src: *const f32,
+    dst: *mut f32,
+    cols: i32,
+    output_rows: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe { (api.gp_f32_matvec)(weights, src, dst, cols, output_rows, stream) },
         Err(_) => CUDA_BACKEND_UNAVAILABLE,
     }
 }

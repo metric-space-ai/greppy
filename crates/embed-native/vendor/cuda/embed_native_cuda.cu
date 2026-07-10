@@ -2736,6 +2736,80 @@ GP_CUDA_EXPORT int gp_mmq_matmul(
         ncols_x, stride_row_x, nrows_x, ncols_dst, stream_ptr);
 }
 
+GP_CUDA_EXPORT int gp_f32_matmul(
+        void * blas,
+        const float * weights,
+        const float * src,
+        float * dst,
+        int cols,
+        int output_rows,
+        int input_rows) {
+    if (blas == nullptr || weights == nullptr || src == nullptr || dst == nullptr ||
+        cols <= 0 || output_rows <= 0 || input_rows <= 0) {
+        return (int) cudaErrorInvalidValue;
+    }
+    cublasHandle_t handle = (cublasHandle_t) blas;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasSgemm(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        output_rows,
+        input_rows,
+        cols,
+        &alpha,
+        weights,
+        cols,
+        src,
+        cols,
+        &beta,
+        dst,
+        output_rows);
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : 10000 + (int) status;
+}
+
+__global__ void gp_f32_matvec_kernel(
+        const float * __restrict__ weights,
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        int cols) {
+    __shared__ float partial[256];
+    const int output_row = (int) blockIdx.x;
+    const float * row = weights + (int64_t) output_row * cols;
+    float sum = 0.0f;
+    for (int col = (int) threadIdx.x; col < cols; col += (int) blockDim.x) {
+        sum += row[col] * src[col];
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int) threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        dst[output_row] = partial[0];
+    }
+}
+
+GP_CUDA_EXPORT int gp_f32_matvec(
+        const float * weights,
+        const float * src,
+        float * dst,
+        int cols,
+        int output_rows,
+        void * stream) {
+    if (weights == nullptr || src == nullptr || dst == nullptr ||
+        cols <= 0 || output_rows <= 0) {
+        return (int) cudaErrorInvalidValue;
+    }
+    gp_f32_matvec_kernel<<<output_rows, 256, 0, (cudaStream_t) stream>>>(
+        weights, src, dst, cols);
+    return (int) cudaPeekAtLastError();
+}
+
 GP_CUDA_EXPORT int gp_mmvq_quantize(
         const float * src,
         void * q8_scratch,

@@ -689,6 +689,264 @@ mod cpu_perf_tests {
     }
 
     #[test]
+    fn qwen35_cpu_batched_verification_matches_tokenwise_when_env_set() {
+        let (Some(gguf), Some(tokenizer)) = (
+            std::env::var_os("QWEN35_NATIVE_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let summarizer = Qwen35Summarizer::load_gguf(
+            gguf,
+            tokenizer,
+            LoadOptions {
+                device: DevicePreference::Cpu,
+            },
+        )
+        .expect("load CPU Qwen3.5 summarizer");
+        let model = match &summarizer.backend {
+            Backend::Cpu(model) => model,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => panic!("expected CPU backend"),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(_) => panic!("expected CPU backend"),
+        };
+        let ids = summarizer
+            .tokenizer
+            .encode(
+                crate::prompt::non_thinking_chat_prompt(
+                    "Summarize: What is this function for?\n\nfn steal(src: &mut Queue, dst: &mut Queue) { dst.extend(src.take_half()); }",
+                ),
+                true,
+            )
+            .expect("tokenize CPU verification prompt")
+            .get_ids()
+            .to_vec();
+        let verify_count = 3;
+        let prefix = &ids[..ids.len() - verify_count];
+        let verify = &ids[ids.len() - verify_count..];
+        let max_context = ids.len() + 1;
+
+        let mut tokenwise_state = model.new_state(max_context);
+        model
+            .prefill_tokens(prefix, &mut tokenwise_state)
+            .expect("CPU tokenwise verification prefix");
+        let mut tokenwise_hidden = Vec::new();
+        let mut tokenwise_logits = Vec::new();
+        for &token in verify {
+            let output = model
+                .forward_token_logits_hidden(token, &mut tokenwise_state)
+                .expect("CPU tokenwise verification row");
+            tokenwise_hidden.extend(output.hidden);
+            tokenwise_logits.extend(output.logits);
+        }
+
+        let mut batched_state = model.new_state(max_context);
+        model
+            .prefill_tokens(prefix, &mut batched_state)
+            .expect("CPU batched verification prefix");
+        let batched = model
+            .forward_tokens_logits_hidden(verify, &mut batched_state)
+            .expect("CPU batched verification rows");
+
+        let hidden_cosine = cosine(&tokenwise_hidden, &batched.hidden);
+        let logits_cosine = cosine(&tokenwise_logits, &batched.logits);
+        eprintln!(
+            "CPU batched verification: hidden_cosine={hidden_cosine:.8} logits_cosine={logits_cosine:.8}"
+        );
+        assert!(hidden_cosine >= 0.999, "CPU batched hidden-state drift");
+        assert!(
+            logits_cosine >= 0.999,
+            "CPU batched verification-logit drift"
+        );
+        for row in 0..verify_count {
+            let start = row * summarizer.inventory.vocab_size;
+            let end = start + summarizer.inventory.vocab_size;
+            assert_eq!(
+                greedy_argmax(&tokenwise_logits[start..end]),
+                greedy_argmax(&batched.logits[start..end]),
+                "CPU batched verification changed greedy token at row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_cpu_mtp_batched_forward_matches_tokenwise_when_env_set() {
+        let (Some(gguf), Some(tokenizer)) = (
+            std::env::var_os("QWEN35_NATIVE_MTP_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let summarizer = Qwen35Summarizer::load_gguf(
+            gguf,
+            tokenizer,
+            LoadOptions {
+                device: DevicePreference::Cpu,
+            },
+        )
+        .expect("load CPU Qwen3.5 MTP summarizer");
+        let model = match &summarizer.backend {
+            Backend::Cpu(model) => model,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => panic!("expected CPU backend"),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(_) => panic!("expected CPU backend"),
+        };
+        let ids = summarizer
+            .tokenizer
+            .encode(
+                crate::prompt::non_thinking_chat_prompt(
+                    "Summarize: What is this function for?\n\nfn wake(worker: &Worker) { worker.notify(); }",
+                ),
+                true,
+            )
+            .expect("tokenize CPU MTP prompt")
+            .get_ids()[..8]
+            .to_vec();
+        let rows = ids.len();
+        let hidden_size = summarizer.inventory.hidden_size;
+        let max_context = rows + 1;
+        let mut target_state = model.new_state(max_context);
+        let target_hidden = model
+            .prefill_tokens_hidden(&ids, &mut target_state)
+            .expect("CPU MTP target hidden rows");
+        let mut shifted_hidden = vec![0.0f32; target_hidden.len()];
+        shifted_hidden[hidden_size..]
+            .copy_from_slice(&target_hidden[..target_hidden.len() - hidden_size]);
+
+        let mut tokenwise_state = model
+            .new_mtp_state(max_context)
+            .expect("CPU tokenwise MTP state");
+        let mut tokenwise_hidden = Vec::new();
+        let mut tokenwise_logits = Vec::new();
+        for row in 0..rows {
+            let hidden = &shifted_hidden[row * hidden_size..(row + 1) * hidden_size];
+            let output = model
+                .mtp_forward_tokens_logits_hidden(&ids[row..row + 1], hidden, &mut tokenwise_state)
+                .expect("CPU tokenwise MTP row");
+            tokenwise_hidden.extend(output.hidden);
+            tokenwise_logits.extend(output.logits);
+        }
+
+        let mut batched_state = model
+            .new_mtp_state(max_context)
+            .expect("CPU batched MTP state");
+        let batched = model
+            .mtp_forward_tokens_logits_hidden(&ids, &shifted_hidden, &mut batched_state)
+            .expect("CPU batched MTP rows");
+        let hidden_cosine = cosine(&tokenwise_hidden, &batched.hidden);
+        let logits_cosine = cosine(&tokenwise_logits, &batched.logits);
+        eprintln!(
+            "CPU batched MTP: hidden_cosine={hidden_cosine:.8} logits_cosine={logits_cosine:.8}"
+        );
+        assert!(hidden_cosine >= 0.999, "CPU batched MTP hidden-state drift");
+        assert!(logits_cosine >= 0.999, "CPU batched MTP logit drift");
+        for row in 0..rows {
+            let start = row * summarizer.inventory.vocab_size;
+            let end = start + summarizer.inventory.vocab_size;
+            assert_eq!(
+                greedy_argmax(&tokenwise_logits[start..end]),
+                greedy_argmax(&batched.logits[start..end]),
+                "CPU batched MTP changed greedy token at row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_cpu_mtp_matches_target_sampling_when_env_set() {
+        let (Some(gguf), Some(tokenizer)) = (
+            std::env::var_os("QWEN35_NATIVE_MTP_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let summarizer = Qwen35Summarizer::load_gguf(
+            gguf,
+            tokenizer,
+            LoadOptions {
+                device: DevicePreference::Cpu,
+            },
+        )
+        .expect("load CPU Qwen3.5 MTP summarizer");
+        let model = match &summarizer.backend {
+            Backend::Cpu(model) => model,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => panic!("expected CPU backend"),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(_) => panic!("expected CPU backend"),
+        };
+        let prompt = crate::prompt::non_thinking_chat_prompt(
+            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        );
+        let prompt_ids = summarizer
+            .tokenizer
+            .encode(prompt.as_str(), true)
+            .expect("tokenize MTP golden prompt")
+            .get_ids()
+            .to_vec();
+        let hidden_size = summarizer.inventory.hidden_size;
+        let mut target_state = model.new_state(prompt_ids.len() + 3);
+        let mut prompt_hidden = model
+            .prefill_tokens_hidden(&prompt_ids[..prompt_ids.len() - 1], &mut target_state)
+            .expect("MTP golden target prefix");
+        let target = model
+            .forward_token_logits_hidden(
+                *prompt_ids.last().expect("non-empty MTP golden prompt"),
+                &mut target_state,
+            )
+            .expect("MTP golden target last token");
+        prompt_hidden.extend_from_slice(&target.hidden);
+        let first = greedy_argmax(&target.logits);
+        assert_eq!(first, 1919, "unexpected MTP golden target token");
+
+        let mut prompt_conditioning = vec![0.0f32; prompt_hidden.len()];
+        prompt_conditioning[hidden_size..]
+            .copy_from_slice(&prompt_hidden[..prompt_hidden.len() - hidden_size]);
+        let mut mtp_state = model
+            .new_mtp_state(prompt_ids.len() + 3)
+            .expect("MTP golden state");
+        model
+            .mtp_prefill_tokens(&prompt_ids, &prompt_conditioning, &mut mtp_state)
+            .expect("MTP golden prompt prefill");
+        let first_draft = model
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut mtp_state)
+            .expect("MTP first golden draft");
+        let first_draft_token = greedy_argmax(&first_draft.logits);
+        let second_draft = model
+            .mtp_forward_tokens_logits_hidden(
+                &[first_draft_token],
+                &first_draft.hidden,
+                &mut mtp_state,
+            )
+            .expect("MTP second golden draft");
+        assert_eq!(
+            [first_draft_token, greedy_argmax(&second_draft.logits)],
+            [709, 369],
+            "native MTP drafts differ from llama.cpp golden tokens"
+        );
+
+        for params in [
+            crate::GenerationParams {
+                max_tokens: 12,
+                ..crate::BRIEF_GENERATION_PARAMS
+            },
+            crate::GenerationParams {
+                max_tokens: 64,
+                ..crate::TRIAGE_GENERATION_PARAMS
+            },
+        ] {
+            let expected = model
+                .generate_target_only_for_test(&summarizer.tokenizer, &prompt, params)
+                .expect("CPU target-only generation");
+            let actual = model
+                .generate(&summarizer.tokenizer, &prompt, params)
+                .expect("CPU MTP generation");
+            assert_eq!(actual, expected, "MTP changed target sampling output");
+        }
+    }
+
+    #[test]
     #[ignore]
     fn qwen35_cpu_quality_prints_when_env_set() {
         let (Some(gguf), Some(tokenizer)) = (
@@ -918,6 +1176,19 @@ mod cpu_perf_tests {
         }
         best_idx as u32
     }
+
+    fn cosine(lhs: &[f32], rhs: &[f32]) -> f64 {
+        assert_eq!(lhs.len(), rhs.len());
+        let (mut dot, mut lhs_norm, mut rhs_norm) = (0.0f64, 0.0f64, 0.0f64);
+        for (&left, &right) in lhs.iter().zip(rhs) {
+            let left = f64::from(left);
+            let right = f64::from(right);
+            dot += left * right;
+            lhs_norm += left * left;
+            rhs_norm += right * right;
+        }
+        dot / (lhs_norm.sqrt() * rhs_norm.sqrt()).max(f64::EPSILON)
+    }
 }
 
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
@@ -1118,6 +1389,61 @@ mod tests {
             )
             .expect("CUDA summary generation");
         assert!(bullets.len() <= 2);
+    }
+
+    #[test]
+    fn qwen35_cuda_mixed_mtp_target_matches_golden_when_env_set() {
+        let (Some(gguf), Some(tokenizer)) = (
+            std::env::var_os("QWEN35_NATIVE_MTP_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let summarizer = Qwen35Summarizer::load_gguf(
+            gguf,
+            tokenizer,
+            LoadOptions {
+                device: DevicePreference::Cuda,
+            },
+        )
+        .expect("load mixed CUDA Qwen3.5 MTP summarizer");
+        let Backend::Cuda(model) = &summarizer.backend else {
+            panic!("expected CUDA backend");
+        };
+        let prompt = crate::prompt::non_thinking_chat_prompt(
+            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        );
+        let ids = summarizer
+            .tokenizer
+            .encode(prompt, true)
+            .expect("tokenize mixed CUDA golden prompt")
+            .get_ids()
+            .to_vec();
+        let mut state = model
+            .new_forward_state(ids.len() + 1)
+            .expect("mixed CUDA golden state");
+        for chunk in ids[..ids.len() - 1].chunks(512) {
+            model
+                .prefill_tokens(chunk, &mut state)
+                .expect("mixed CUDA golden prefill");
+        }
+        let mut workspace = model
+            .new_forward_workspace(ids.len() + 1)
+            .expect("mixed CUDA golden workspace");
+        let logits = model
+            .forward_token_logits(
+                *ids.last().expect("non-empty mixed CUDA golden prompt"),
+                &mut state,
+                &mut workspace,
+            )
+            .expect("mixed CUDA golden logits");
+        let token = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| u32::try_from(index).expect("vocabulary index fits u32"))
+            .expect("non-empty mixed CUDA golden logits");
+        assert_eq!(token, 1919, "mixed CUDA target differs from llama.cpp");
     }
 
     #[test]

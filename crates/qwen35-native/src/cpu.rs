@@ -26,12 +26,14 @@ const LINEAR_HEADS: usize = 16;
 const LINEAR_HEAD_DIM: usize = 128;
 const CONV_KERNEL: usize = 4;
 const CONV_CHANNEL_BLOCK: usize = 1024;
+const MTP_DRAFT_MAX: usize = 2;
 
 pub(crate) struct CpuQwen35Model {
     inventory: Qwen35Inventory,
     token_embd: QuantMatrix,
     output_norm: Vec<f32>,
     layers: Vec<LayerWeights>,
+    mtp: Option<MtpWeights>,
     eos_token_id: u32,
     performance_pool: PerformanceCorePool,
 }
@@ -71,25 +73,54 @@ struct FullAttentionWeights {
     attn_k_norm: Vec<f32>,
 }
 
+struct MtpWeights {
+    layer: LayerWeights,
+    eh_proj: QuantMatrix,
+    enorm: Vec<f32>,
+    hnorm: Vec<f32>,
+    shared_head_norm: Vec<f32>,
+}
+
+#[derive(Clone)]
 pub(crate) struct ForwardState {
     position: usize,
     layer_states: Vec<LayerState>,
     max_context: usize,
 }
 
+#[derive(Clone)]
 enum LayerState {
     Delta(DeltaState),
     Full(FullAttentionState),
 }
 
+#[derive(Clone)]
 struct DeltaState {
     recurrent: Vec<f32>,
     conv: Vec<f32>,
 }
 
+#[derive(Clone)]
 struct FullAttentionState {
     k_cache: Vec<f32>,
     v_cache: Vec<f32>,
+}
+
+pub(crate) struct TargetForwardOutput {
+    pub(crate) hidden: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MtpState {
+    position: usize,
+    attention: FullAttentionState,
+    max_context: usize,
+}
+
+pub(crate) struct MtpForwardOutput {
+    pub(crate) hidden: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
 }
 
 impl CpuQwen35Model {
@@ -137,11 +168,44 @@ impl CpuQwen35Model {
                 kind,
             });
         }
+        let mtp = if inventory.has_mtp() {
+            let prefix = format!("blk.{}", inventory.block_count);
+            Some(MtpWeights {
+                layer: LayerWeights {
+                    attn_norm: tensor_f32(model, &format!("{prefix}.attn_norm.weight"))?,
+                    post_attention_norm: tensor_f32(
+                        model,
+                        &format!("{prefix}.post_attention_norm.weight"),
+                    )?,
+                    ffn_gate: qwen_matrix(model, &format!("{prefix}.ffn_gate.weight"))?,
+                    ffn_up: qwen_matrix(model, &format!("{prefix}.ffn_up.weight"))?,
+                    ffn_down: qwen_matrix(model, &format!("{prefix}.ffn_down.weight"))?,
+                    kind: LayerKind::Full(FullAttentionWeights {
+                        attn_q: qwen_matrix(model, &format!("{prefix}.attn_q.weight"))?,
+                        attn_k: qwen_matrix(model, &format!("{prefix}.attn_k.weight"))?,
+                        attn_v: qwen_matrix(model, &format!("{prefix}.attn_v.weight"))?,
+                        attn_output: qwen_matrix(model, &format!("{prefix}.attn_output.weight"))?,
+                        attn_q_norm: tensor_f32(model, &format!("{prefix}.attn_q_norm.weight"))?,
+                        attn_k_norm: tensor_f32(model, &format!("{prefix}.attn_k_norm.weight"))?,
+                    }),
+                },
+                eh_proj: qwen_matrix(model, &format!("{prefix}.nextn.eh_proj.weight"))?,
+                enorm: tensor_f32(model, &format!("{prefix}.nextn.enorm.weight"))?,
+                hnorm: tensor_f32(model, &format!("{prefix}.nextn.hnorm.weight"))?,
+                shared_head_norm: tensor_f32(
+                    model,
+                    &format!("{prefix}.nextn.shared_head_norm.weight"),
+                )?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             inventory,
             token_embd,
             output_norm,
             layers,
+            mtp,
             eos_token_id,
             performance_pool: PerformanceCorePool::new("qwen35")
                 .map_err(|error| Error::GenerationUnavailable(error.to_string()))?,
@@ -158,6 +222,25 @@ impl CpuQwen35Model {
             .install(|| self.generate_on_performance_cores(tokenizer, prompt, params))
     }
 
+    #[cfg(test)]
+    pub(crate) fn generate_target_only_for_test(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        params: GenerationParams,
+    ) -> Result<String> {
+        self.performance_pool.install(|| {
+            let encoding = tokenizer
+                .encode(prompt, true)
+                .map_err(|error| Error::Tokenizer(error.to_string()))?;
+            let prompt_ids = encoding.get_ids();
+            if prompt_ids.is_empty() {
+                return Ok(String::new());
+            }
+            self.generate_without_mtp(tokenizer, prompt, prompt_ids, params)
+        })
+    }
+
     fn generate_on_performance_cores(
         &self,
         tokenizer: &Tokenizer,
@@ -171,6 +254,19 @@ impl CpuQwen35Model {
         if prompt_ids.is_empty() {
             return Ok(String::new());
         }
+        if self.mtp.is_some() {
+            return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
+        }
+        self.generate_without_mtp(tokenizer, prompt, prompt_ids, params)
+    }
+
+    fn generate_without_mtp(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<String> {
         let max_context = prompt_ids
             .len()
             .saturating_add(params.max_tokens)
@@ -194,6 +290,238 @@ impl CpuQwen35Model {
             }
             generated.push(token);
             next = token;
+        }
+        tokenizer
+            .decode(&generated, true)
+            .map_err(|e| Error::Tokenizer(e.to_string()))
+    }
+
+    fn generate_with_mtp(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<String> {
+        let max_context = prompt_ids
+            .len()
+            .saturating_add(params.max_tokens)
+            .saturating_add(1)
+            .min(self.inventory.context_length);
+        let hidden_size = self.inventory.hidden_size;
+        let vocab_size = self.inventory.vocab_size;
+        let mut target_state = self.new_state(max_context);
+        let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
+        for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(512) {
+            let hidden = self.prefill_tokens_hidden(tokens, &mut target_state)?;
+            prompt_hidden.extend(hidden);
+        }
+        let mut target = self.forward_token_logits_hidden(
+            *prompt_ids.last().expect("checked non-empty above"),
+            &mut target_state,
+        )?;
+        prompt_hidden.extend_from_slice(&target.hidden);
+
+        let zero_hidden = vec![0.0f32; hidden_size];
+        let prompt_conditioning =
+            mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
+        let mut mtp_state = self.new_mtp_state(max_context)?;
+        for start in (0..prompt_ids.len()).step_by(512) {
+            let end = (start + 512).min(prompt_ids.len());
+            self.mtp_prefill_tokens(
+                &prompt_ids[start..end],
+                &prompt_conditioning[start * hidden_size..end * hidden_size],
+                &mut mtp_state,
+            )?;
+        }
+
+        let mut generated = Vec::with_capacity(params.max_tokens);
+        let mut rng = SamplerRng::new(prompt_seed(prompt));
+        let Some(first) = sample_token(&mut target.logits, &generated, params, &mut rng) else {
+            return Ok(String::new());
+        };
+        if first == self.eos_token_id {
+            return Ok(String::new());
+        }
+        generated.push(first);
+        let mtp_debug = std::env::var_os("GREPPY_QWEN35_MTP_DEBUG").is_some();
+        if mtp_debug {
+            eprintln!("qwen35-mtp-debug first={first}");
+        }
+        let mut next = first;
+        let mut pending_target_hidden = target.hidden;
+        let mut drafted_total = 0usize;
+        let mut accepted_total = 0usize;
+        let mut cycles = 0usize;
+        let mut speculative_target_state = target_state.clone();
+        let mut draft_mtp_state = mtp_state.clone();
+
+        while generated.len() < params.max_tokens {
+            let remaining = params.max_tokens - generated.len();
+            if remaining == 1 {
+                let previous_hidden = pending_target_hidden;
+                let mut output = self.forward_token_logits_hidden(next, &mut target_state)?;
+                self.mtp_prefill_tokens(&[next], &previous_hidden, &mut mtp_state)?;
+                let Some(token) = sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                pending_target_hidden = output.hidden;
+                continue;
+            }
+
+            cycles += 1;
+            let previous_hidden = pending_target_hidden.clone();
+            let draft_limit = MTP_DRAFT_MAX.min(remaining - 1);
+            draft_mtp_state.clone_from(&mtp_state);
+            let mut draft_rng = rng.clone();
+            let mut draft_history = generated.clone();
+            let mut draft_tokens = Vec::with_capacity(draft_limit);
+            let mut draft_input = next;
+            let mut draft_hidden = previous_hidden.clone();
+            for _ in 0..draft_limit {
+                let mut draft = self.mtp_forward_tokens_logits_hidden(
+                    &[draft_input],
+                    &draft_hidden,
+                    &mut draft_mtp_state,
+                )?;
+                let Some(token) =
+                    sample_token(&mut draft.logits, &draft_history, params, &mut draft_rng)
+                else {
+                    break;
+                };
+                draft_tokens.push(token);
+                if token == self.eos_token_id {
+                    break;
+                }
+                draft_history.push(token);
+                draft_input = token;
+                draft_hidden = draft.hidden;
+            }
+
+            if draft_tokens.is_empty() {
+                let mut output = self.forward_token_logits_hidden(next, &mut target_state)?;
+                self.mtp_prefill_tokens(&[next], &previous_hidden, &mut mtp_state)?;
+                let Some(token) = sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                pending_target_hidden = output.hidden;
+                continue;
+            }
+            drafted_total += draft_tokens.len();
+            if mtp_debug {
+                eprintln!("qwen35-mtp-debug cycle={cycles} input={next} drafts={draft_tokens:?}");
+            }
+
+            let mut verification_tokens = Vec::with_capacity(1 + draft_tokens.len());
+            verification_tokens.push(next);
+            verification_tokens.extend_from_slice(&draft_tokens);
+            speculative_target_state.clone_from(&target_state);
+            let mut verification = self.forward_tokens_logits_hidden(
+                &verification_tokens,
+                &mut speculative_target_state,
+            )?;
+            let mut accepted = 0usize;
+            let mut mismatch = None;
+            let mut finished = false;
+            for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
+                let row_start = draft_index * vocab_size;
+                let row_end = row_start + vocab_size;
+                let Some(target_token) = sample_token(
+                    &mut verification.logits[row_start..row_end],
+                    &generated,
+                    params,
+                    &mut rng,
+                ) else {
+                    finished = true;
+                    break;
+                };
+                if target_token == self.eos_token_id {
+                    finished = true;
+                    break;
+                }
+                if mtp_debug {
+                    eprintln!(
+                        "qwen35-mtp-debug cycle={cycles} pos={draft_index} target={target_token} draft={draft_token}"
+                    );
+                }
+                generated.push(target_token);
+                if target_token != draft_token {
+                    mismatch = Some(target_token);
+                    break;
+                }
+                accepted += 1;
+                accepted_total += 1;
+                if generated.len() == params.max_tokens {
+                    finished = true;
+                    break;
+                }
+            }
+            if finished {
+                break;
+            }
+
+            if accepted == draft_tokens.len() {
+                let row_start = accepted * vocab_size;
+                let row_end = row_start + vocab_size;
+                let Some(target_token) = sample_token(
+                    &mut verification.logits[row_start..row_end],
+                    &generated,
+                    params,
+                    &mut rng,
+                ) else {
+                    break;
+                };
+                if target_token == self.eos_token_id {
+                    break;
+                }
+                generated.push(target_token);
+                next = target_token;
+                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                pending_target_hidden =
+                    last_hidden_row(&verification.hidden, verification_tokens.len(), hidden_size)?
+                        .to_vec();
+                let conditioning = mtp_conditioning_rows(
+                    &previous_hidden,
+                    &verification.hidden,
+                    verification_tokens.len(),
+                    hidden_size,
+                )?;
+                self.mtp_prefill_tokens(&verification_tokens, &conditioning, &mut mtp_state)?;
+            } else {
+                let target_token = mismatch.expect("non-accepted draft must have mismatch token");
+                let commit_count = accepted + 1;
+                let commit_tokens = &verification_tokens[..commit_count];
+                let committed_hidden =
+                    self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
+                let conditioning = mtp_conditioning_rows(
+                    &previous_hidden,
+                    &committed_hidden,
+                    commit_count,
+                    hidden_size,
+                )?;
+                self.mtp_prefill_tokens(commit_tokens, &conditioning, &mut mtp_state)?;
+                pending_target_hidden =
+                    last_hidden_row(&committed_hidden, commit_count, hidden_size)?.to_vec();
+                next = target_token;
+            }
+        }
+
+        if mtp_debug {
+            eprintln!(
+                "qwen35-mtp-debug cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
+            );
         }
         tokenizer
             .decode(&generated, true)
@@ -227,6 +555,25 @@ impl CpuQwen35Model {
         }
     }
 
+    pub(crate) fn new_mtp_state(&self, max_context: usize) -> Result<MtpState> {
+        if self.mtp.is_none() {
+            return Err(Error::GenerationUnavailable(
+                "Qwen3.5 model does not contain an MTP layer".into(),
+            ));
+        }
+        Ok(MtpState {
+            position: 0,
+            attention: FullAttentionState {
+                k_cache: vec![0.0; max_context * self.inventory.kv_heads * self.inventory.head_dim],
+                v_cache: vec![
+                    0.0;
+                    max_context * self.inventory.kv_heads * self.inventory.value_dim
+                ],
+            },
+            max_context,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn on_performance_cores<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
         self.performance_pool.install(operation)
@@ -239,8 +586,17 @@ impl CpuQwen35Model {
     }
 
     pub(crate) fn prefill_tokens(&self, tokens: &[u32], state: &mut ForwardState) -> Result<()> {
+        let _ = self.prefill_tokens_hidden(tokens, state)?;
+        Ok(())
+    }
+
+    pub(crate) fn prefill_tokens_hidden(
+        &self,
+        tokens: &[u32],
+        state: &mut ForwardState,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if state.position.saturating_add(tokens.len()) > state.max_context {
             return Err(Error::InvalidRequest(format!(
@@ -275,7 +631,7 @@ impl CpuQwen35Model {
             add_rows(&mut hidden, &residual, &ffn);
         }
         state.position += rows;
-        Ok(())
+        Ok(hidden)
     }
 
     #[cfg(test)]
@@ -369,6 +725,148 @@ impl CpuQwen35Model {
         let mut hidden = self.forward_token_hidden(token, state)?;
         rms_norm_qwen(&mut hidden, &self.output_norm);
         self.token_embd.matmul(&hidden, 1).map_err(Into::into)
+    }
+
+    pub(crate) fn forward_token_logits_hidden(
+        &self,
+        token: u32,
+        state: &mut ForwardState,
+    ) -> Result<TargetForwardOutput> {
+        let hidden = self.forward_token_hidden(token, state)?;
+        let mut output_hidden = hidden.clone();
+        rms_norm_qwen(&mut output_hidden, &self.output_norm);
+        let logits = self.token_embd.matmul(&output_hidden, 1)?;
+        Ok(TargetForwardOutput { hidden, logits })
+    }
+
+    pub(crate) fn forward_tokens_logits_hidden(
+        &self,
+        tokens: &[u32],
+        state: &mut ForwardState,
+    ) -> Result<TargetForwardOutput> {
+        let hidden = self.prefill_tokens_hidden(tokens, state)?;
+        if hidden.is_empty() {
+            return Ok(TargetForwardOutput {
+                hidden,
+                logits: Vec::new(),
+            });
+        }
+        let mut output_hidden = hidden.clone();
+        rms_norm_rows_qwen(
+            &mut output_hidden,
+            &self.output_norm,
+            self.inventory.hidden_size,
+        );
+        let logits = self.token_embd.matmul(&output_hidden, tokens.len())?;
+        Ok(TargetForwardOutput { hidden, logits })
+    }
+
+    pub(crate) fn mtp_prefill_tokens(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut MtpState,
+    ) -> Result<()> {
+        let _ = self.mtp_forward_tokens_hidden(tokens, target_hidden, state)?;
+        Ok(())
+    }
+
+    pub(crate) fn mtp_forward_tokens_logits_hidden(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut MtpState,
+    ) -> Result<MtpForwardOutput> {
+        let mut hidden = self.mtp_forward_tokens_hidden(tokens, target_hidden, state)?;
+        if hidden.is_empty() {
+            return Ok(MtpForwardOutput {
+                hidden,
+                logits: Vec::new(),
+            });
+        }
+        let mtp = self.mtp_weights()?;
+        rms_norm_rows_qwen(
+            &mut hidden,
+            &mtp.shared_head_norm,
+            self.inventory.hidden_size,
+        );
+        let logits = self.token_embd.matmul(&hidden, tokens.len())?;
+        Ok(MtpForwardOutput { hidden, logits })
+    }
+
+    fn mtp_forward_tokens_hidden(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut MtpState,
+    ) -> Result<Vec<f32>> {
+        let mtp = self.mtp_weights()?;
+        if tokens.is_empty() {
+            if target_hidden.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(Error::InvalidRequest(
+                "MTP target hidden rows were provided without tokens".into(),
+            ));
+        }
+        let rows = tokens.len();
+        let hidden_size = self.inventory.hidden_size;
+        if target_hidden.len() != rows * hidden_size {
+            return Err(Error::InvalidRequest(format!(
+                "MTP target hidden length {}, expected {}x{}",
+                target_hidden.len(),
+                rows,
+                hidden_size
+            )));
+        }
+        if state.position.saturating_add(rows) > state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 MTP prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+
+        let mut embeddings = self.token_embd.embedding_rows(tokens)?;
+        let mut target_hidden = target_hidden.to_vec();
+        rms_norm_rows_qwen(&mut embeddings, &mtp.enorm, hidden_size);
+        rms_norm_rows_qwen(&mut target_hidden, &mtp.hnorm, hidden_size);
+        let mut joined = vec![0.0f32; rows * hidden_size * 2];
+        joined
+            .par_chunks_mut(hidden_size * 2)
+            .zip(embeddings.par_chunks(hidden_size))
+            .zip(target_hidden.par_chunks(hidden_size))
+            .for_each(|((joined, embedding), hidden)| {
+                joined[..hidden_size].copy_from_slice(embedding);
+                joined[hidden_size..].copy_from_slice(hidden);
+            });
+
+        let mut hidden = mtp.eh_proj.matmul(&joined, rows)?;
+        let residual = hidden.clone();
+        rms_norm_rows_qwen(&mut hidden, &mtp.layer.attn_norm, hidden_size);
+        let LayerKind::Full(attention_weights) = &mtp.layer.kind else {
+            return Err(Error::Gguf("qwen35 MTP layer is not full attention".into()));
+        };
+        let attention = self.full_attention_block_rows(
+            attention_weights,
+            &mut state.attention,
+            state.position,
+            &hidden,
+            rows,
+        )?;
+        add_rows(&mut hidden, &residual, &attention);
+
+        let residual = hidden.clone();
+        rms_norm_rows_qwen(&mut hidden, &mtp.layer.post_attention_norm, hidden_size);
+        let ffn = self.ffn_rows(&mtp.layer, &hidden, rows)?;
+        add_rows(&mut hidden, &residual, &ffn);
+        state.position += rows;
+        Ok(hidden)
+    }
+
+    fn mtp_weights(&self) -> Result<&MtpWeights> {
+        self.mtp.as_ref().ok_or_else(|| {
+            Error::GenerationUnavailable("Qwen3.5 model does not contain an MTP layer".into())
+        })
     }
 
     #[cfg(test)]
@@ -958,6 +1456,50 @@ fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
 
 fn qwen_matrix(model: &GgufModel, name: &str) -> Result<QuantMatrix> {
     QuantMatrix::from_model_q4_x8(model, name).map_err(Into::into)
+}
+
+fn mtp_conditioning_rows(
+    previous_hidden: &[f32],
+    committed_hidden: &[f32],
+    rows: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    if previous_hidden.len() != hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "MTP previous hidden length {}, expected {}",
+            previous_hidden.len(),
+            hidden_size
+        )));
+    }
+    if committed_hidden.len() != rows * hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "MTP committed hidden length {}, expected {}x{}",
+            committed_hidden.len(),
+            rows,
+            hidden_size
+        )));
+    }
+    let mut conditioning = vec![0.0f32; committed_hidden.len()];
+    if rows == 0 {
+        return Ok(conditioning);
+    }
+    conditioning[..hidden_size].copy_from_slice(previous_hidden);
+    if rows > 1 {
+        conditioning[hidden_size..].copy_from_slice(&committed_hidden[..(rows - 1) * hidden_size]);
+    }
+    Ok(conditioning)
+}
+
+fn last_hidden_row(hidden: &[f32], rows: usize, hidden_size: usize) -> Result<&[f32]> {
+    if rows == 0 || hidden.len() != rows * hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "hidden row layout length {}, expected non-empty {}x{}",
+            hidden.len(),
+            rows,
+            hidden_size
+        )));
+    }
+    Ok(&hidden[(rows - 1) * hidden_size..rows * hidden_size])
 }
 
 fn prompt_seed(prompt: &str) -> u64 {
