@@ -1610,6 +1610,68 @@ kernel void embed_native_qwen_attention_values_gate_rows_simd32_f32(
     }
 }
 
+// Fused H8/KV2/D256 prefill attention with online softmax. One SIMDgroup owns
+// one query head; each lane retains eight value dimensions in registers.
+kernel void embed_native_qwen_attention_fused_rows_simd32_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k_cache [[buffer(2)]],
+        device const float * v_cache [[buffer(3)]],
+        device const float * gate    [[buffer(4)]],
+        device       float * out     [[buffer(5)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint2 tid_pos [[thread_position_in_threadgroup]]) {
+    const uint row = tg_pos.x;
+    const uint q_head = tg_pos.y;
+    const uint lane = tid_pos.x;
+    if (row >= (uint) args.rows || q_head >= (uint) args.q_heads) {
+        return;
+    }
+    const uint gqa = (uint) args.q_heads / (uint) args.kv_heads;
+    const uint kv_head = q_head / gqa;
+    const uint position = (uint) args.position + row;
+    const uint64_t q_base = (uint64_t) row * args.q_stride + q_head * args.dim;
+    const uint64_t gate_base = q_base;
+    const uint64_t out_base = ((uint64_t) row * args.q_heads + q_head) * args.dim;
+    float values[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float max_score = -INFINITY;
+    float sum = 0.0f;
+
+    for (uint pos = 0; pos <= position; ++pos) {
+        const uint64_t k_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+        float dot = 0.0f;
+        for (uint dim = lane; dim < (uint) args.dim; dim += 32u) {
+            dot += q[q_base + dim] * k_cache[k_base + dim];
+        }
+        const float score = simd_sum(dot) * args.scale;
+        float next_max = 0.0f;
+        float old_scale = 0.0f;
+        float new_scale = 0.0f;
+        if (lane == 0u) {
+            next_max = max(max_score, score);
+            old_scale = exp(max_score - next_max);
+            new_scale = exp(score - next_max);
+        }
+        next_max = simd_broadcast(next_max, 0u);
+        old_scale = simd_broadcast(old_scale, 0u);
+        new_scale = simd_broadcast(new_scale, 0u);
+        const uint64_t v_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+        for (uint item = 0; item < 8u; ++item) {
+            const uint dim = lane + item * 32u;
+            values[item] = values[item] * old_scale + v_cache[v_base + dim] * new_scale;
+        }
+        sum = sum * old_scale + new_scale;
+        max_score = next_max;
+    }
+
+    const float inv_sum = 1.0f / max(sum, 1.0e-20f);
+    for (uint item = 0; item < 8u; ++item) {
+        const uint dim = lane + item * 32u;
+        const float gate_value = gate[gate_base + dim];
+        out[out_base + dim] = values[item] * inv_sum / (1.0f + exp(-gate_value));
+    }
+}
+
 kernel void embed_native_qwen_apply_silu_gate_rows_f32(
         constant embed_native_kargs_qwen_gate_rows & args [[buffer(0)]],
         device       float * values [[buffer(1)]],

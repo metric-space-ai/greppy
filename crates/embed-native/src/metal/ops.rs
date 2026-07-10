@@ -1927,6 +1927,58 @@ pub fn op_qwen_attention_values_gate_rows_simd32_f32(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn op_qwen_attention_fused_rows_simd32_f32(
+    enc: &ComputeEncoder,
+    dev: &Device,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    gate: &Buffer,
+    gate_offset: usize,
+    out: &Buffer,
+    rows: i32,
+    position: i32,
+    q_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    max_context: i32,
+    q_stride: i32,
+    scale: f32,
+) -> bool {
+    let name = "embed_native_qwen_attention_fused_rows_simd32_f32";
+    let Some(pso) = dev.pipeline(name) else {
+        set_last_error(format!(
+            "op_qwen_attention_fused_rows_simd32_f32: pipeline `{name}` not found"
+        ));
+        return false;
+    };
+    let args = QwenAttentionRowsArgs {
+        rows,
+        position,
+        q_heads,
+        kv_heads,
+        dim: head_dim,
+        max_context,
+        q_stride,
+        score_stride: 0,
+        scale,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    };
+    enc.set_pipeline(&pso);
+    enc.set_bytes(0, &args);
+    enc.set_buffer(1, q, q_offset);
+    enc.set_buffer(2, k_cache, 0);
+    enc.set_buffer(3, v_cache, 0);
+    enc.set_buffer(4, gate, gate_offset);
+    enc.set_buffer(5, out, 0);
+    enc.dispatch_threadgroups((rows as usize, q_heads as usize, 1), (32, 1, 1));
+    true
+}
+
 pub fn op_qwen_apply_silu_gate_rows_f32(
     enc: &ComputeEncoder,
     dev: &Device,

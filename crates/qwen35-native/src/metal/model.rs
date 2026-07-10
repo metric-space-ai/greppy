@@ -2873,39 +2873,12 @@ impl MetalQwen35Model {
             && self.inventory.head_dim == 256
             && self.inventory.value_dim == 256;
         if simd32_attention {
-            ok(ops::op_qwen_attention_scores_rows_simd32_f32(
+            ok(ops::op_qwen_attention_fused_rows_simd32_f32(
                 enc,
                 self.dev,
                 &ws.qkv,
                 0,
                 k_cache,
-                &ws.scores,
-                checked_i32(rows, "attention rows")?,
-                checked_i32(position, "attention position")?,
-                checked_i32(self.inventory.attention_heads, "attention heads")?,
-                checked_i32(self.inventory.kv_heads, "kv heads")?,
-                checked_i32(self.inventory.head_dim, "attention head dim")?,
-                checked_i32(max_context, "attention context")?,
-                checked_i32(q_dim * 2, "attention q stride")?,
-                checked_i32(score_stride, "attention score stride")?,
-                scale,
-            ))?;
-            enc.memory_barrier_buffers();
-            ok(ops::op_qwen_softmax_rows_simd32_f32(
-                enc,
-                self.dev,
-                &ws.scores,
-                checked_i32(rows, "attention rows")?,
-                checked_i32(position, "attention position")?,
-                checked_i32(self.inventory.attention_heads, "attention heads")?,
-                checked_i32(max_context, "attention context")?,
-                checked_i32(score_stride, "attention score stride")?,
-            ))?;
-            enc.memory_barrier_buffers();
-            ok(ops::op_qwen_attention_values_gate_rows_simd32_f32(
-                enc,
-                self.dev,
-                &ws.scores,
                 v_cache,
                 &ws.qkv,
                 q_dim * std::mem::size_of::<f32>(),
@@ -2914,10 +2887,10 @@ impl MetalQwen35Model {
                 checked_i32(position, "attention position")?,
                 checked_i32(self.inventory.attention_heads, "attention heads")?,
                 checked_i32(self.inventory.kv_heads, "kv heads")?,
-                checked_i32(self.inventory.value_dim, "attention value dim")?,
+                checked_i32(self.inventory.head_dim, "attention head dim")?,
                 checked_i32(max_context, "attention context")?,
-                checked_i32(q_dim * 2, "attention gate stride")?,
-                checked_i32(score_stride, "attention score stride")?,
+                checked_i32(q_dim * 2, "attention q stride")?,
+                scale,
             ))?;
         } else {
             ok(ops::op_qwen_attention_scores_rows_f32(
