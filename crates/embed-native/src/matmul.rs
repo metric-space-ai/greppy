@@ -408,6 +408,12 @@ impl QuantMatrix {
     }
 
     pub fn matvec_prepared_q8k(&self, input: &PreparedQ8K) -> Result<Vec<f32>> {
+        let mut out = Vec::new();
+        self.matvec_prepared_q8k_into(input, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn matvec_prepared_q8k_into(&self, input: &PreparedQ8K, out: &mut Vec<f32>) -> Result<()> {
         if input.cols != self.cols {
             return Err(Error::InvalidGguf(format!(
                 "{} prepared matvec input width {}, expected {}",
@@ -415,7 +421,8 @@ impl QuantMatrix {
             )));
         }
         let row_blocks = self.cols / QK_K;
-        let mut out = vec![0.0f32; self.rows];
+        out.clear();
+        out.resize(self.rows, 0.0);
         match &self.storage {
             QuantStorage::Q4K {
                 blocks: rhs,
@@ -441,17 +448,18 @@ impl QuantMatrix {
                                 values.copy_from_slice(&tile);
                             }
                         });
-                    return Ok(out);
+                    return Ok(());
                 }
                 #[cfg(target_arch = "x86_64")]
                 if let Some(x8_vnni) = x8_vnni {
-                    return Ok(matvec_x8_prepared(
+                    matvec_x8_prepared_into(
                         x8_vnni,
                         &input.repeated_x4,
-                        self.rows,
                         self.cols,
                         dot8x1_q4k_q8k_avxvnni,
-                    ));
+                        out,
+                    );
+                    return Ok(());
                 }
                 out.par_chunks_mut(64)
                     .enumerate()
@@ -498,26 +506,28 @@ impl QuantMatrix {
                 if self.rows <= Q6K_X8_MATVEC_MAX_ROWS {
                     if let Some(x8) = x8 {
                         if std::arch::is_aarch64_feature_detected!("i8mm") {
-                            return Ok(matvec_x8_prepared(
+                            matvec_x8_prepared_into(
                                 x8,
                                 &input.repeated_x4,
-                                self.rows,
                                 self.cols,
                                 dot8x1_q6k_q8k_i8mm,
-                            ));
+                                out,
+                            );
+                            return Ok(());
                         }
                     }
                 }
                 #[cfg(target_arch = "x86_64")]
                 if self.rows <= Q6K_X8_MATVEC_MAX_ROWS {
                     if let Some(x8) = x8 {
-                        return Ok(matvec_x8_prepared(
+                        matvec_x8_prepared_into(
                             x8,
                             &input.repeated_x4,
-                            self.rows,
                             self.cols,
                             dot8x1_q6k_q8k_avxvnni,
-                        ));
+                            out,
+                        );
+                        return Ok(());
                     }
                 }
                 out.par_chunks_mut(64)
@@ -551,7 +561,7 @@ impl QuantMatrix {
                 )));
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn matvec_prepared_q8k_or_f32(&self, input: &PreparedQ8K, lhs: &[f32]) -> Result<Vec<f32>> {
@@ -1414,14 +1424,27 @@ fn matvec_x8_prepared<T: Sync>(
     kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [f32; 8],
 ) -> Vec<f32> {
     debug_assert_eq!(matrix_rows % 8, 0);
-    let row_blocks = matrix_cols / QK_K;
     let mut out = vec![0.0f32; matrix_rows];
-    if matrix_rows <= 64 {
+    matvec_x8_prepared_into(rhs, input, matrix_cols, kernel, &mut out);
+    out
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matvec_x8_prepared_into<T: Sync>(
+    rhs: &[T],
+    input: &[BlockQ8Kx4],
+    matrix_cols: usize,
+    kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [f32; 8],
+    out: &mut [f32],
+) {
+    debug_assert_eq!(out.len() % 8, 0);
+    let row_blocks = matrix_cols / QK_K;
+    if out.len() <= 64 {
         for (group, dst) in out.chunks_exact_mut(8).enumerate() {
             let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
             dst.copy_from_slice(&unsafe { kernel(weights, &input) });
         }
-        return out;
+        return;
     }
     out.par_chunks_mut(64)
         .enumerate()
@@ -1433,7 +1456,6 @@ fn matvec_x8_prepared<T: Sync>(
                 dst.copy_from_slice(&unsafe { kernel(weights, &input) });
             }
         });
-    out
 }
 
 #[cfg(target_arch = "aarch64")]

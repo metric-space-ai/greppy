@@ -85,7 +85,15 @@ struct MtpWeights {
 pub(crate) struct ForwardState {
     position: usize,
     layer_states: Vec<LayerState>,
+    decode_workspace: CpuDecodeWorkspace,
     max_context: usize,
+}
+
+#[derive(Clone, Default)]
+struct CpuDecodeWorkspace {
+    ffn_gate: Vec<f32>,
+    ffn_up: Vec<f32>,
+    ffn_out: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -641,6 +649,7 @@ impl CpuQwen35Model {
         ForwardState {
             position: 0,
             layer_states,
+            decode_workspace: CpuDecodeWorkspace::default(),
             max_context,
         }
     }
@@ -1070,24 +1079,34 @@ impl CpuQwen35Model {
             let mut residual = hidden;
             let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.post_attention_norm);
-            let ffn = self.ffn(layer, &x)?;
-            add_in_place(&mut residual, &ffn);
+            self.ffn_into(layer, &x, &mut state.decode_workspace)?;
+            add_in_place(&mut residual, &state.decode_workspace.ffn_out);
             hidden = residual;
         }
         state.position += 1;
         Ok(hidden)
     }
 
-    fn ffn(&self, layer: &LayerWeights, hidden: &[f32]) -> Result<Vec<f32>> {
+    fn ffn_into(
+        &self,
+        layer: &LayerWeights,
+        hidden: &[f32],
+        workspace: &mut CpuDecodeWorkspace,
+    ) -> Result<()> {
         let input = layer.ffn_gate.prepare_q8k_matvec(hidden)?;
-        let (gate, up) = rayon::join(
-            || layer.ffn_gate.matvec_prepared_q8k(&input),
-            || layer.ffn_up.matvec_prepared_q8k(&input),
+        let (gate, up) = (&mut workspace.ffn_gate, &mut workspace.ffn_up);
+        let (gate_result, up_result) = rayon::join(
+            || layer.ffn_gate.matvec_prepared_q8k_into(&input, gate),
+            || layer.ffn_up.matvec_prepared_q8k_into(&input, up),
         );
-        let mut gate = gate?;
-        let up = up?;
-        swiglu_in_place(&mut gate, &up);
-        layer.ffn_down.matmul(&gate, 1).map_err(Into::into)
+        gate_result?;
+        up_result?;
+        swiglu_in_place(gate, up);
+        let down_input = layer.ffn_down.prepare_q8k_matvec(gate)?;
+        layer
+            .ffn_down
+            .matvec_prepared_q8k_into(&down_input, &mut workspace.ffn_out)
+            .map_err(Into::into)
     }
 
     fn ffn_rows(&self, layer: &LayerWeights, hidden: &[f32], rows: usize) -> Result<Vec<f32>> {
