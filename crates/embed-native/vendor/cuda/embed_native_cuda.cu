@@ -2810,6 +2810,37 @@ GP_CUDA_EXPORT int gp_f32_matvec(
     return (int) cudaPeekAtLastError();
 }
 
+__global__ void gp_qwen_concat_rows_kernel(
+        const float * __restrict__ left,
+        const float * __restrict__ right,
+        float * __restrict__ dst,
+        int total,
+        int dim) {
+    const int idx = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total) return;
+    const int row = idx / dim;
+    const int col = idx - row * dim;
+    const int64_t dst_base = (int64_t) row * dim * 2;
+    dst[dst_base + col] = left[idx];
+    dst[dst_base + dim + col] = right[idx];
+}
+
+GP_CUDA_EXPORT int gp_qwen_concat_rows(
+        const float * left,
+        const float * right,
+        float * dst,
+        int rows,
+        int dim,
+        void * stream) {
+    if (left == nullptr || right == nullptr || dst == nullptr || rows <= 0 || dim <= 0) {
+        return (int) cudaErrorInvalidValue;
+    }
+    const int total = rows * dim;
+    gp_qwen_concat_rows_kernel<<<(total + 255) / 256, 256, 0, (cudaStream_t) stream>>>(
+        left, right, dst, total, dim);
+    return (int) cudaPeekAtLastError();
+}
+
 GP_CUDA_EXPORT int gp_mmvq_quantize(
         const float * src,
         void * q8_scratch,

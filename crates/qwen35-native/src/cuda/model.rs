@@ -14,12 +14,12 @@ use greppy_embed_native::cuda::ffi::{
     gp_qwen_attention_scores_decode, gp_qwen_attention_scores_decode_position,
     gp_qwen_attention_values_decode, gp_qwen_attention_values_decode_position, gp_qwen_cache_write,
     gp_qwen_cache_write_position, gp_qwen_cache_write_rows, gp_qwen_causal_conv1d_silu,
-    gp_qwen_causal_conv1d_silu_rows_parallel, gp_qwen_deinterleave_q_gate, gp_qwen_deltanet_decode,
-    gp_qwen_deltanet_decode_rows, gp_qwen_increment_position, gp_qwen_normalize_linear_qk,
-    gp_qwen_normalize_linear_qk_rows, gp_qwen_rms_norm, gp_qwen_rms_norm_q8, gp_qwen_rope_decode,
-    gp_qwen_rope_decode_position, gp_qwen_rope_rows, gp_qwen_softmax_decode,
-    gp_qwen_softmax_decode_position, gp_qwen_swiglu, gp_rms_norm, CudaDevice, CudaGraph,
-    DeviceBuffer,
+    gp_qwen_causal_conv1d_silu_rows_parallel, gp_qwen_concat_rows, gp_qwen_deinterleave_q_gate,
+    gp_qwen_deltanet_decode, gp_qwen_deltanet_decode_rows, gp_qwen_increment_position,
+    gp_qwen_normalize_linear_qk, gp_qwen_normalize_linear_qk_rows, gp_qwen_rms_norm,
+    gp_qwen_rms_norm_q8, gp_qwen_rope_decode, gp_qwen_rope_decode_position, gp_qwen_rope_rows,
+    gp_qwen_softmax_decode, gp_qwen_softmax_decode_position, gp_qwen_swiglu, gp_rms_norm,
+    CudaDevice, CudaGraph, DeviceBuffer,
 };
 use greppy_embed_native::cuda::weights::CudaWeights;
 use greppy_embed_native::{GgmlDType, GgufModel};
@@ -48,6 +48,13 @@ pub struct CudaForwardState {
     graph_token: Option<u32>,
     prefill_workspace: Option<CudaPrefillWorkspace>,
     layer_states: Vec<CudaLayerState>,
+}
+
+pub(crate) struct CudaMtpState {
+    position: usize,
+    max_context: usize,
+    k_cache: DeviceBuffer,
+    v_cache: DeviceBuffer,
 }
 
 enum CudaLayerState {
@@ -82,6 +89,11 @@ pub(crate) struct CudaForwardWorkspace {
     argmax_indices: DeviceBuffer,
     scores: DeviceBuffer,
     q8_scratch: DeviceBuffer,
+}
+
+pub(crate) struct CudaTargetForwardOutput {
+    pub(crate) hidden: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
 }
 
 struct CudaPrefillWorkspace {
@@ -154,6 +166,9 @@ impl CudaQwen35Model {
         if prompt_ids.is_empty() {
             return Ok(String::new());
         }
+        if self.inventory.has_mtp() {
+            return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
+        }
         let max_context = prompt_ids
             .len()
             .saturating_add(params.max_tokens)
@@ -194,6 +209,249 @@ impl CudaQwen35Model {
         tokenizer
             .decode(&generated, true)
             .map_err(|e| Error::Tokenizer(e.to_string()))
+    }
+
+    fn generate_with_mtp(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<String> {
+        let max_context = prompt_ids
+            .len()
+            .saturating_add(params.max_tokens)
+            .saturating_add(1)
+            .min(self.inventory.context_length);
+        let hidden_size = self.inventory.hidden_size;
+        let vocab_size = self.inventory.vocab_size;
+        let mut target_state = self.new_forward_state(max_context)?;
+        let mut target_workspace = self.new_forward_workspace(max_context)?;
+        let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
+        for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(CUDA_PREFILL_BATCH_ROWS) {
+            prompt_hidden.extend(self.prefill_tokens_hidden(tokens, &mut target_state)?);
+        }
+        let mut target = self.forward_token_logits_hidden(
+            *prompt_ids.last().expect("checked non-empty above"),
+            &mut target_state,
+            &mut target_workspace,
+        )?;
+        prompt_hidden.extend_from_slice(&target.hidden);
+
+        let zero_hidden = vec![0.0f32; hidden_size];
+        let prompt_conditioning =
+            mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
+        let mut mtp_state = self.new_mtp_state(max_context)?;
+        for start in (0..prompt_ids.len()).step_by(CUDA_PREFILL_BATCH_ROWS) {
+            let end = (start + CUDA_PREFILL_BATCH_ROWS).min(prompt_ids.len());
+            self.mtp_prefill_tokens(
+                &prompt_ids[start..end],
+                &prompt_conditioning[start * hidden_size..end * hidden_size],
+                &mut mtp_state,
+            )?;
+        }
+
+        let mut generated = Vec::with_capacity(params.max_tokens);
+        let mut rng = SamplerRng::new(prompt_seed(prompt));
+        let Some(first) = sample_token(&mut target.logits, &generated, params, &mut rng) else {
+            return Ok(String::new());
+        };
+        if first == self.eos_token_id {
+            return Ok(String::new());
+        }
+        generated.push(first);
+        let mtp_debug = std::env::var_os("GREPPY_QWEN35_MTP_DEBUG").is_some();
+        if mtp_debug {
+            eprintln!("qwen35-mtp-debug backend=cuda first={first}");
+        }
+        let mut next = first;
+        let mut pending_target_hidden = target.hidden;
+        let mut drafted_total = 0usize;
+        let mut accepted_total = 0usize;
+        let mut cycles = 0usize;
+        let mut speculative_target_state = self.new_forward_state(max_context)?;
+        let mut draft_mtp_state = self.new_mtp_state(max_context)?;
+
+        while generated.len() < params.max_tokens {
+            let remaining = params.max_tokens - generated.len();
+            if remaining == 1 {
+                let previous_hidden = pending_target_hidden;
+                let mut output = self.forward_token_logits_hidden(
+                    next,
+                    &mut target_state,
+                    &mut target_workspace,
+                )?;
+                self.mtp_prefill_tokens(&[next], &previous_hidden, &mut mtp_state)?;
+                let Some(token) = sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                pending_target_hidden = output.hidden;
+                continue;
+            }
+
+            cycles += 1;
+            let previous_hidden = pending_target_hidden.clone();
+            let draft_limit = MTP_DRAFT_MAX.min(remaining - 1);
+            self.copy_mtp_state(&mtp_state, &mut draft_mtp_state)?;
+            let mut draft_rng = rng.clone();
+            let mut draft_history = generated.clone();
+            let mut draft_tokens = Vec::with_capacity(draft_limit);
+            let mut draft_input = next;
+            let mut draft_hidden = previous_hidden.clone();
+            for _ in 0..draft_limit {
+                let mut draft = self.mtp_forward_tokens_logits_hidden(
+                    &[draft_input],
+                    &draft_hidden,
+                    &mut draft_mtp_state,
+                )?;
+                let Some(token) =
+                    sample_token(&mut draft.logits, &draft_history, params, &mut draft_rng)
+                else {
+                    break;
+                };
+                draft_tokens.push(token);
+                if token == self.eos_token_id {
+                    break;
+                }
+                draft_history.push(token);
+                draft_input = token;
+                draft_hidden = draft.hidden;
+            }
+
+            if draft_tokens.is_empty() {
+                let mut output = self.forward_token_logits_hidden(
+                    next,
+                    &mut target_state,
+                    &mut target_workspace,
+                )?;
+                self.mtp_prefill_tokens(&[next], &previous_hidden, &mut mtp_state)?;
+                let Some(token) = sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                pending_target_hidden = output.hidden;
+                continue;
+            }
+            drafted_total += draft_tokens.len();
+            if mtp_debug {
+                eprintln!(
+                    "qwen35-mtp-debug backend=cuda cycle={cycles} input={next} drafts={draft_tokens:?}"
+                );
+            }
+
+            let mut verification_tokens = Vec::with_capacity(1 + draft_tokens.len());
+            verification_tokens.push(next);
+            verification_tokens.extend_from_slice(&draft_tokens);
+            self.copy_forward_state(&target_state, &mut speculative_target_state)?;
+            let mut verification = self.forward_tokens_logits_hidden(
+                &verification_tokens,
+                &mut speculative_target_state,
+            )?;
+            let mut accepted = 0usize;
+            let mut mismatch = None;
+            let mut finished = false;
+            for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
+                let row_start = draft_index * vocab_size;
+                let row_end = row_start + vocab_size;
+                let Some(target_token) = sample_token(
+                    &mut verification.logits[row_start..row_end],
+                    &generated,
+                    params,
+                    &mut rng,
+                ) else {
+                    finished = true;
+                    break;
+                };
+                if target_token == self.eos_token_id {
+                    finished = true;
+                    break;
+                }
+                if mtp_debug {
+                    eprintln!(
+                        "qwen35-mtp-debug backend=cuda cycle={cycles} pos={draft_index} target={target_token} draft={draft_token}"
+                    );
+                }
+                generated.push(target_token);
+                if target_token != draft_token {
+                    mismatch = Some(target_token);
+                    break;
+                }
+                accepted += 1;
+                accepted_total += 1;
+                if generated.len() == params.max_tokens {
+                    finished = true;
+                    break;
+                }
+            }
+            if finished {
+                break;
+            }
+
+            if accepted == draft_tokens.len() {
+                let row_start = accepted * vocab_size;
+                let row_end = row_start + vocab_size;
+                let Some(target_token) = sample_token(
+                    &mut verification.logits[row_start..row_end],
+                    &generated,
+                    params,
+                    &mut rng,
+                ) else {
+                    break;
+                };
+                if target_token == self.eos_token_id {
+                    break;
+                }
+                generated.push(target_token);
+                next = target_token;
+                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                pending_target_hidden =
+                    last_hidden_row(&verification.hidden, verification_tokens.len(), hidden_size)?
+                        .to_vec();
+                let conditioning = mtp_conditioning_rows(
+                    &previous_hidden,
+                    &verification.hidden,
+                    verification_tokens.len(),
+                    hidden_size,
+                )?;
+                self.mtp_prefill_tokens(&verification_tokens, &conditioning, &mut mtp_state)?;
+            } else {
+                let target_token = mismatch.expect("non-accepted draft must have mismatch token");
+                let commit_count = accepted + 1;
+                let commit_tokens = &verification_tokens[..commit_count];
+                let committed_hidden =
+                    self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
+                let conditioning = mtp_conditioning_rows(
+                    &previous_hidden,
+                    &committed_hidden,
+                    commit_count,
+                    hidden_size,
+                )?;
+                self.mtp_prefill_tokens(commit_tokens, &conditioning, &mut mtp_state)?;
+                pending_target_hidden =
+                    last_hidden_row(&committed_hidden, commit_count, hidden_size)?.to_vec();
+                next = target_token;
+            }
+        }
+
+        if mtp_debug {
+            eprintln!(
+                "qwen35-mtp-debug backend=cuda cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
+            );
+        }
+        tokenizer
+            .decode(&generated, true)
+            .map_err(|error| Error::Tokenizer(error.to_string()))
     }
 
     pub fn new_forward_state(&self, max_context: usize) -> Result<CudaForwardState> {
@@ -268,6 +526,87 @@ impl CudaQwen35Model {
         })
     }
 
+    pub(crate) fn new_mtp_state(&self, max_context: usize) -> Result<CudaMtpState> {
+        if !self.inventory.has_mtp() {
+            return Err(Error::GenerationUnavailable(
+                "Qwen3.5 model does not contain an MTP layer".into(),
+            ));
+        }
+        Ok(CudaMtpState {
+            position: 0,
+            max_context,
+            k_cache: self
+                .new_f32(max_context * self.inventory.kv_heads * self.inventory.head_dim)?,
+            v_cache: self
+                .new_f32(max_context * self.inventory.kv_heads * self.inventory.value_dim)?,
+        })
+    }
+
+    fn copy_forward_state(&self, src: &CudaForwardState, dst: &mut CudaForwardState) -> Result<()> {
+        if src.max_context != dst.max_context || src.layer_states.len() != dst.layer_states.len() {
+            return Err(Error::InvalidRequest(
+                "CUDA target state layouts do not match".into(),
+            ));
+        }
+        for (src_layer, dst_layer) in src.layer_states.iter().zip(&dst.layer_states) {
+            match (src_layer, dst_layer) {
+                (
+                    CudaLayerState::Delta {
+                        recurrent: src_recurrent,
+                        conv: src_conv,
+                    },
+                    CudaLayerState::Delta {
+                        recurrent: dst_recurrent,
+                        conv: dst_conv,
+                    },
+                ) => {
+                    self.dev
+                        .copy_d2d(dst_recurrent, src_recurrent, src_recurrent.bytes())?;
+                    self.dev.copy_d2d(dst_conv, src_conv, src_conv.bytes())?;
+                }
+                (
+                    CudaLayerState::Full {
+                        k_cache: src_k,
+                        v_cache: src_v,
+                    },
+                    CudaLayerState::Full {
+                        k_cache: dst_k,
+                        v_cache: dst_v,
+                    },
+                ) => {
+                    self.dev.copy_d2d(dst_k, src_k, src_k.bytes())?;
+                    self.dev.copy_d2d(dst_v, src_v, src_v.bytes())?;
+                }
+                _ => {
+                    return Err(Error::InvalidRequest(
+                        "CUDA target state layer kinds do not match".into(),
+                    ));
+                }
+            }
+        }
+        self.dev.sync()?;
+        dst.position = src.position;
+        dst.decode_graph = None;
+        dst.graph_unavailable = false;
+        dst.graph_token = None;
+        Ok(())
+    }
+
+    fn copy_mtp_state(&self, src: &CudaMtpState, dst: &mut CudaMtpState) -> Result<()> {
+        if src.max_context != dst.max_context {
+            return Err(Error::InvalidRequest(
+                "CUDA MTP state layouts do not match".into(),
+            ));
+        }
+        self.dev
+            .copy_d2d(&dst.k_cache, &src.k_cache, src.k_cache.bytes())?;
+        self.dev
+            .copy_d2d(&dst.v_cache, &src.v_cache, src.v_cache.bytes())?;
+        self.dev.sync()?;
+        dst.position = src.position;
+        Ok(())
+    }
+
     fn new_prefill_workspace(&self, rows: usize) -> Result<CudaPrefillWorkspace> {
         let hidden = self.inventory.hidden_size;
         let inner = self.inventory.ssm_inner_size;
@@ -318,6 +657,22 @@ impl CudaQwen35Model {
         Ok(logits)
     }
 
+    pub(crate) fn forward_token_logits_hidden(
+        &self,
+        token: u32,
+        state: &mut CudaForwardState,
+        ws: &mut CudaForwardWorkspace,
+    ) -> Result<CudaTargetForwardOutput> {
+        state.decode_graph = None;
+        state.graph_token = None;
+        self.forward_token_logits_device(token, state, ws)?;
+        let mut hidden = vec![0.0f32; self.inventory.hidden_size];
+        let mut logits = vec![0.0f32; self.inventory.vocab_size];
+        self.dev.copy_d2h(&mut hidden, &ws.hidden)?;
+        self.dev.copy_d2h(&mut logits, &ws.logits)?;
+        Ok(CudaTargetForwardOutput { hidden, logits })
+    }
+
     #[cfg(test)]
     pub(crate) fn prefill_token(
         &self,
@@ -335,10 +690,270 @@ impl CudaQwen35Model {
         tokens: &[u32],
         state: &mut CudaForwardState,
     ) -> Result<()> {
+        let _ = self.prefill_tokens_impl(tokens, state, true)?;
+        Ok(())
+    }
+
+    pub(crate) fn prefill_tokens_hidden(
+        &self,
+        tokens: &[u32],
+        state: &mut CudaForwardState,
+    ) -> Result<Vec<f32>> {
+        self.prefill_tokens_impl(tokens, state, false)
+    }
+
+    pub(crate) fn forward_tokens_logits_hidden(
+        &self,
+        tokens: &[u32],
+        state: &mut CudaForwardState,
+    ) -> Result<CudaTargetForwardOutput> {
+        let hidden = self.prefill_tokens_impl(tokens, state, false)?;
+        if tokens.is_empty() {
+            return Ok(CudaTargetForwardOutput {
+                hidden,
+                logits: Vec::new(),
+            });
+        }
+        let rows = tokens.len();
+        let workspace = state.prefill_workspace.take().ok_or_else(|| {
+            Error::GenerationUnavailable("CUDA prefill workspace is already in use".into())
+        })?;
+        let result = (|| -> Result<Vec<f32>> {
+            self.rms_norm_device(
+                "output_norm.weight",
+                workspace.hidden.as_f32(),
+                workspace.normed.as_f32(),
+                rows,
+                self.inventory.hidden_size,
+                true,
+            )?;
+            let logits_device = self.new_f32(rows * self.inventory.vocab_size)?;
+            for row in 0..rows {
+                self.matvec_device_to(
+                    "token_embd.weight",
+                    unsafe {
+                        workspace
+                            .normed
+                            .as_f32()
+                            .add(row * self.inventory.hidden_size)
+                    },
+                    self.inventory.hidden_size,
+                    unsafe { logits_device.as_f32().add(row * self.inventory.vocab_size) },
+                    self.inventory.vocab_size,
+                    &workspace.q8_scratch,
+                )?;
+            }
+            self.dev.sync()?;
+            let mut logits = vec![0.0f32; rows * self.inventory.vocab_size];
+            self.dev.copy_d2h(&mut logits, &logits_device)?;
+            Ok(logits)
+        })();
+        state.prefill_workspace = Some(workspace);
+        Ok(CudaTargetForwardOutput {
+            hidden,
+            logits: result?,
+        })
+    }
+
+    pub(crate) fn mtp_prefill_tokens(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut CudaMtpState,
+    ) -> Result<()> {
+        let _ = self.mtp_forward_tokens(tokens, target_hidden, state, false)?;
+        Ok(())
+    }
+
+    pub(crate) fn mtp_forward_tokens_logits_hidden(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut CudaMtpState,
+    ) -> Result<CudaTargetForwardOutput> {
+        self.mtp_forward_tokens(tokens, target_hidden, state, true)
+    }
+
+    fn mtp_forward_tokens(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut CudaMtpState,
+        include_logits: bool,
+    ) -> Result<CudaTargetForwardOutput> {
+        if !self.inventory.has_mtp() {
+            return Err(Error::GenerationUnavailable(
+                "Qwen3.5 model does not contain an MTP layer".into(),
+            ));
+        }
+        if tokens.is_empty() {
+            if target_hidden.is_empty() {
+                return Ok(CudaTargetForwardOutput {
+                    hidden: Vec::new(),
+                    logits: Vec::new(),
+                });
+            }
+            return Err(Error::InvalidRequest(
+                "MTP target hidden rows were provided without tokens".into(),
+            ));
+        }
+        let rows = tokens.len();
+        let hidden_size = self.inventory.hidden_size;
+        if target_hidden.len() != rows * hidden_size {
+            return Err(Error::InvalidRequest(format!(
+                "MTP target hidden length {}, expected {}x{}",
+                target_hidden.len(),
+                rows,
+                hidden_size
+            )));
+        }
+        if state.position.saturating_add(rows) > state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 MTP prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+        let layer = self.inventory.block_count;
+        let prefix = format!("blk.{layer}");
+        let mmq_rows = rows.div_ceil(CUDA_MMQ_ROW_TILE) * CUDA_MMQ_ROW_TILE;
+        let mut workspace = self.new_prefill_workspace(mmq_rows)?;
+        let target_buffer = self.new_f32(mmq_rows * hidden_size)?;
+        let joined = self.new_f32(mmq_rows * hidden_size * 2)?;
+        self.dev.copy_h2d(&workspace.token_ids, tokens)?;
+        self.dev.copy_h2d(&target_buffer, target_hidden)?;
+        self.embed_tokens_device(
+            workspace.token_ids.as_u32(),
+            workspace.hidden.as_f32(),
+            rows,
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.nextn.enorm.weight"),
+            workspace.hidden.as_f32(),
+            workspace.normed.as_f32(),
+            rows,
+            hidden_size,
+            true,
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.nextn.hnorm.weight"),
+            target_buffer.as_f32(),
+            workspace.attn_out.as_f32(),
+            rows,
+            hidden_size,
+            true,
+        )?;
+        check(
+            unsafe {
+                gp_qwen_concat_rows(
+                    workspace.normed.as_f32(),
+                    workspace.attn_out.as_f32(),
+                    joined.as_f32(),
+                    checked_i32(rows, "MTP concat rows")?,
+                    checked_i32(hidden_size, "MTP concat hidden")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 CUDA MTP concat rows",
+        )?;
+        let mut q8_dtype = None;
+        self.projection_matmul_rows_device_to(
+            &format!("{prefix}.nextn.eh_proj.weight"),
+            joined.as_f32(),
+            workspace.mmq_rows,
+            hidden_size * 2,
+            workspace.hidden.as_f32(),
+            hidden_size,
+            &mut q8_dtype,
+            &workspace.q8_scratch,
+            &workspace.fixup_scratch,
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.attn_norm.weight"),
+            workspace.hidden.as_f32(),
+            workspace.normed.as_f32(),
+            rows,
+            hidden_size,
+            true,
+        )?;
+        self.full_attention_block_rows_device(
+            layer,
+            &state.k_cache,
+            &state.v_cache,
+            state.position,
+            rows,
+            state.max_context,
+            &mut workspace,
+        )?;
+        self.add_rms_norm_device(
+            &format!("{prefix}.post_attention_norm.weight"),
+            workspace.hidden.as_f32(),
+            workspace.attn_out.as_f32(),
+            workspace.hidden.as_f32(),
+            workspace.normed.as_f32(),
+            rows,
+            hidden_size,
+        )?;
+        self.ffn_block_rows_device(layer, rows, &mut workspace)?;
+        self.add_device(
+            workspace.hidden.as_f32(),
+            workspace.attn_out.as_f32(),
+            workspace.hidden.as_f32(),
+            rows * hidden_size,
+        )?;
+        let logits_device = if include_logits {
+            self.rms_norm_device(
+                &format!("{prefix}.nextn.shared_head_norm.weight"),
+                workspace.hidden.as_f32(),
+                workspace.normed.as_f32(),
+                rows,
+                hidden_size,
+                true,
+            )?;
+            let logits = self.new_f32(rows * self.inventory.vocab_size)?;
+            for row in 0..rows {
+                self.matvec_device_to(
+                    "token_embd.weight",
+                    unsafe { workspace.normed.as_f32().add(row * hidden_size) },
+                    hidden_size,
+                    unsafe { logits.as_f32().add(row * self.inventory.vocab_size) },
+                    self.inventory.vocab_size,
+                    &workspace.q8_scratch,
+                )?;
+            }
+            Some(logits)
+        } else {
+            None
+        };
+        self.dev.sync()?;
+        state.position += rows;
+        let hidden = if include_logits {
+            let mut hidden = vec![0.0f32; rows * hidden_size];
+            self.dev.copy_d2h(&mut hidden, &workspace.normed)?;
+            hidden
+        } else {
+            Vec::new()
+        };
+        let logits = match logits_device {
+            Some(logits) => {
+                let mut values = vec![0.0f32; rows * self.inventory.vocab_size];
+                self.dev.copy_d2h(&mut values, &logits)?;
+                values
+            }
+            None => Vec::new(),
+        };
+        Ok(CudaTargetForwardOutput { hidden, logits })
+    }
+
+    fn prefill_tokens_impl(
+        &self,
+        tokens: &[u32],
+        state: &mut CudaForwardState,
+        cache_only_final: bool,
+    ) -> Result<Vec<f32>> {
         state.decode_graph = None;
         state.graph_token = None;
         if tokens.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let rows = tokens.len();
         if state.position.saturating_add(rows) > state.max_context {
@@ -363,7 +978,7 @@ impl CudaQwen35Model {
         if mmq_rows > ws.mmq_rows {
             ws = self.new_prefill_workspace(mmq_rows)?;
         }
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Vec<f32>> {
             self.dev.copy_h2d(&ws.token_ids, tokens)?;
             self.embed_tokens_device(ws.token_ids.as_u32(), ws.hidden.as_f32(), rows)?;
 
@@ -377,7 +992,7 @@ impl CudaQwen35Model {
                     self.inventory.hidden_size,
                     true,
                 )?;
-                if layer == final_layer {
+                if layer == final_layer && cache_only_final {
                     match &mut state.layer_states[layer] {
                         CudaLayerState::Full { k_cache, v_cache } => {
                             self.full_attention_cache_only_rows_device(
@@ -398,7 +1013,7 @@ impl CudaQwen35Model {
                     }
                     self.dev.sync()?;
                     state.position += rows;
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
 
                 match &mut state.layer_states[layer] {
@@ -439,7 +1054,9 @@ impl CudaQwen35Model {
 
             self.dev.sync()?;
             state.position += rows;
-            Ok(())
+            let mut hidden = vec![0.0f32; rows * self.inventory.hidden_size];
+            self.dev.copy_d2h(&mut hidden, &ws.hidden)?;
+            Ok(hidden)
         })();
         state.prefill_workspace = Some(ws);
         result
@@ -2831,12 +3448,57 @@ impl CudaQwen35Model {
     }
 }
 
+fn mtp_conditioning_rows(
+    previous_hidden: &[f32],
+    committed_hidden: &[f32],
+    rows: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    if previous_hidden.len() != hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "MTP previous hidden length {}, expected {}",
+            previous_hidden.len(),
+            hidden_size
+        )));
+    }
+    if committed_hidden.len() != rows * hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "MTP committed hidden length {}, expected {}x{}",
+            committed_hidden.len(),
+            rows,
+            hidden_size
+        )));
+    }
+    let mut conditioning = vec![0.0f32; committed_hidden.len()];
+    if rows == 0 {
+        return Ok(conditioning);
+    }
+    conditioning[..hidden_size].copy_from_slice(previous_hidden);
+    if rows > 1 {
+        conditioning[hidden_size..].copy_from_slice(&committed_hidden[..(rows - 1) * hidden_size]);
+    }
+    Ok(conditioning)
+}
+
+fn last_hidden_row(hidden: &[f32], rows: usize, hidden_size: usize) -> Result<&[f32]> {
+    if rows == 0 || hidden.len() != rows * hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "hidden row layout length {}, expected non-empty {}x{}",
+            hidden.len(),
+            rows,
+            hidden_size
+        )));
+    }
+    Ok(&hidden[(rows - 1) * hidden_size..rows * hidden_size])
+}
+
 const RMS_EPS: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 10_000_000.0;
 const CONV_KERNEL: usize = 4;
 const MMQ_FIXUP_SCRATCH_BYTES: usize = 128 * 128 * 128 * std::mem::size_of::<f32>();
 const CUDA_PREFILL_BATCH_ROWS: usize = 512;
 const CUDA_MMQ_ROW_TILE: usize = 128;
+const MTP_DRAFT_MAX: usize = 2;
 
 fn mmq_activation_layout(dtype: GgmlDType) -> Result<u8> {
     match dtype {
@@ -3838,6 +4500,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qwen35_cuda_batched_hidden_matches_tokenwise_when_env_set() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_MTP_GGUF") else {
+            return;
+        };
+        let gguf = GgufModel::open(&path).expect("open Qwen3.5 MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 MTP inventory");
+        let cuda =
+            CudaQwen35Model::from_gguf(&gguf, inventory, 248_044).expect("CUDA Qwen MTP model");
+        let prefix = [42_u32, 314, 2718, 99];
+        let verify = [1234_u32, 5678, 9012];
+        let max_context = prefix.len() + verify.len() + 1;
+
+        let mut tokenwise_state = cuda
+            .new_forward_state(max_context)
+            .expect("CUDA tokenwise hidden state");
+        cuda.prefill_tokens(&prefix, &mut tokenwise_state)
+            .expect("CUDA tokenwise hidden prefix");
+        let mut tokenwise_workspace = cuda
+            .new_forward_workspace(max_context)
+            .expect("CUDA tokenwise hidden workspace");
+        let mut tokenwise_hidden = Vec::new();
+        let mut tokenwise_logits = Vec::new();
+        for token in verify {
+            let output = cuda
+                .forward_token_logits_hidden(token, &mut tokenwise_state, &mut tokenwise_workspace)
+                .expect("CUDA tokenwise hidden row");
+            tokenwise_hidden.extend(output.hidden);
+            tokenwise_logits.extend(output.logits);
+        }
+
+        let mut batched_state = cuda
+            .new_forward_state(max_context)
+            .expect("CUDA batched hidden state");
+        cuda.prefill_tokens(&prefix, &mut batched_state)
+            .expect("CUDA batched hidden prefix");
+        let batched = cuda
+            .forward_tokens_logits_hidden(&verify, &mut batched_state)
+            .expect("CUDA batched hidden rows");
+        let hidden_cosine = cosine(&tokenwise_hidden, &batched.hidden);
+        let logits_cosine = cosine(&tokenwise_logits, &batched.logits);
+        eprintln!(
+            "CUDA batched hidden: hidden_cos={hidden_cosine:.8} logits_cos={logits_cosine:.8}"
+        );
+        assert!(hidden_cosine >= 0.95, "CUDA batched hidden-state drift");
+        assert!(logits_cosine >= 0.95, "CUDA batched hidden-logit drift");
+    }
+
+    #[test]
+    fn qwen35_cuda_mtp_matches_golden_tokens_when_env_set() {
+        let (Some(gguf_path), Some(tokenizer_path)) = (
+            std::env::var_os("QWEN35_NATIVE_MTP_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let gguf = GgufModel::open(&gguf_path).expect("open Qwen3.5 MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 MTP inventory");
+        let cuda = CudaQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044)
+            .expect("CUDA Qwen MTP model");
+        let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
+        let prompt = crate::prompt::non_thinking_chat_prompt(
+            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        );
+        let ids = tokenizer
+            .encode(prompt, true)
+            .expect("tokenize CUDA MTP golden prompt")
+            .get_ids()
+            .to_vec();
+        let max_context = ids.len() + 3;
+        let mut target_state = cuda
+            .new_forward_state(max_context)
+            .expect("CUDA MTP target state");
+        let mut prompt_hidden = cuda
+            .prefill_tokens_hidden(&ids[..ids.len() - 1], &mut target_state)
+            .expect("CUDA MTP target prompt hidden");
+        let mut target_workspace = cuda
+            .new_forward_workspace(max_context)
+            .expect("CUDA MTP target workspace");
+        let target = cuda
+            .forward_token_logits_hidden(
+                *ids.last().expect("non-empty CUDA MTP prompt"),
+                &mut target_state,
+                &mut target_workspace,
+            )
+            .expect("CUDA MTP target final row");
+        prompt_hidden.extend_from_slice(&target.hidden);
+        let first = greedy_argmax(&target.logits);
+        assert_eq!(first, 1919, "unexpected CUDA MTP target token");
+
+        let hidden_size = inventory.hidden_size;
+        let mut conditioning = vec![0.0f32; prompt_hidden.len()];
+        conditioning[hidden_size..]
+            .copy_from_slice(&prompt_hidden[..prompt_hidden.len() - hidden_size]);
+        let mut mtp_state = cuda.new_mtp_state(max_context).expect("CUDA MTP state");
+        cuda.mtp_prefill_tokens(&ids, &conditioning, &mut mtp_state)
+            .expect("CUDA MTP prompt catch-up");
+        let first_draft = cuda
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut mtp_state)
+            .expect("CUDA MTP first draft");
+        let first_draft_token = greedy_argmax(&first_draft.logits);
+        let second_draft = cuda
+            .mtp_forward_tokens_logits_hidden(
+                &[first_draft_token],
+                &first_draft.hidden,
+                &mut mtp_state,
+            )
+            .expect("CUDA MTP second draft");
+        assert_eq!(
+            [first_draft_token, greedy_argmax(&second_draft.logits)],
+            [709, 369],
+            "CUDA MTP drafts differ from llama.cpp golden tokens"
+        );
+    }
+
     fn patterned_input(len: usize) -> Vec<f32> {
         (0..len)
             .map(|i| (((i * 17 + 11) % 101) as f32 - 50.0) / 23.0)
@@ -4125,6 +4902,15 @@ mod tests {
         } else {
             (dot / (ln * rn)) as f32
         }
+    }
+
+    fn greedy_argmax(values: &[f32]) -> u32 {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| u32::try_from(index).expect("vocabulary index fits u32"))
+            .expect("non-empty logits")
     }
 
     fn rms_diff(lhs: &[f32], rhs: &[f32]) -> f32 {

@@ -30,6 +30,13 @@ pub struct MetalForwardState {
     layer_states: Vec<MetalLayerState>,
 }
 
+pub(crate) struct MetalMtpState {
+    position: usize,
+    max_context: usize,
+    k_cache: Buffer,
+    v_cache: Buffer,
+}
+
 enum MetalLayerState {
     Delta { recurrent: Buffer, conv: Buffer },
     Full { k_cache: Buffer, v_cache: Buffer },
@@ -54,6 +61,11 @@ pub(crate) struct MetalForwardWorkspace {
     scores: Buffer,
 }
 
+pub(crate) struct MetalTargetForwardOutput {
+    pub(crate) hidden: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
+}
+
 struct MetalPrefillWorkspace {
     token_ids: Buffer,
     hidden: Buffer,
@@ -73,6 +85,7 @@ struct MetalPrefillWorkspace {
 }
 
 const METAL_PREFILL_BATCH_ROWS: usize = 512;
+const MTP_DRAFT_MAX: usize = 2;
 
 impl MetalQwen35Model {
     pub fn from_gguf(
@@ -112,6 +125,9 @@ impl MetalQwen35Model {
         let prompt_ids = encoding.get_ids();
         if prompt_ids.is_empty() {
             return Ok(String::new());
+        }
+        if self.inventory.has_mtp() {
+            return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
         }
         let max_context = prompt_ids
             .len()
@@ -153,6 +169,249 @@ impl MetalQwen35Model {
         tokenizer
             .decode(&generated, true)
             .map_err(|e| Error::Tokenizer(e.to_string()))
+    }
+
+    fn generate_with_mtp(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<String> {
+        let max_context = prompt_ids
+            .len()
+            .saturating_add(params.max_tokens)
+            .saturating_add(1)
+            .min(self.inventory.context_length);
+        let hidden_size = self.inventory.hidden_size;
+        let vocab_size = self.inventory.vocab_size;
+        let mut target_state = self.new_forward_state(max_context)?;
+        let mut target_workspace = self.new_forward_workspace(max_context)?;
+        let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
+        for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(METAL_PREFILL_BATCH_ROWS) {
+            prompt_hidden.extend(self.prefill_tokens_hidden(tokens, &mut target_state)?);
+        }
+        let mut target = self.forward_token_logits_hidden(
+            *prompt_ids.last().expect("checked non-empty above"),
+            &mut target_state,
+            &mut target_workspace,
+        )?;
+        prompt_hidden.extend_from_slice(&target.hidden);
+
+        let zero_hidden = vec![0.0f32; hidden_size];
+        let prompt_conditioning =
+            mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
+        let mut mtp_state = self.new_mtp_state(max_context)?;
+        for start in (0..prompt_ids.len()).step_by(METAL_PREFILL_BATCH_ROWS) {
+            let end = (start + METAL_PREFILL_BATCH_ROWS).min(prompt_ids.len());
+            self.mtp_prefill_tokens(
+                &prompt_ids[start..end],
+                &prompt_conditioning[start * hidden_size..end * hidden_size],
+                &mut mtp_state,
+            )?;
+        }
+
+        let mut generated = Vec::with_capacity(params.max_tokens);
+        let mut rng = SamplerRng::new(prompt_seed(prompt));
+        let Some(first) = sample_token(&mut target.logits, &generated, params, &mut rng) else {
+            return Ok(String::new());
+        };
+        if first == self.eos_token_id {
+            return Ok(String::new());
+        }
+        generated.push(first);
+        let mtp_debug = std::env::var_os("GREPPY_QWEN35_MTP_DEBUG").is_some();
+        if mtp_debug {
+            eprintln!("qwen35-mtp-debug backend=metal first={first}");
+        }
+        let mut next = first;
+        let mut pending_target_hidden = target.hidden;
+        let mut drafted_total = 0usize;
+        let mut accepted_total = 0usize;
+        let mut cycles = 0usize;
+        let mut speculative_target_state = self.new_forward_state(max_context)?;
+        let mut draft_mtp_state = self.new_mtp_state(max_context)?;
+
+        while generated.len() < params.max_tokens {
+            let remaining = params.max_tokens - generated.len();
+            if remaining == 1 {
+                let previous_hidden = pending_target_hidden;
+                let mut output = self.forward_token_logits_hidden(
+                    next,
+                    &mut target_state,
+                    &mut target_workspace,
+                )?;
+                self.mtp_prefill_tokens(&[next], &previous_hidden, &mut mtp_state)?;
+                let Some(token) = sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                pending_target_hidden = output.hidden;
+                continue;
+            }
+
+            cycles += 1;
+            let previous_hidden = pending_target_hidden.clone();
+            let draft_limit = MTP_DRAFT_MAX.min(remaining - 1);
+            self.copy_mtp_state(&mtp_state, &mut draft_mtp_state)?;
+            let mut draft_rng = rng.clone();
+            let mut draft_history = generated.clone();
+            let mut draft_tokens = Vec::with_capacity(draft_limit);
+            let mut draft_input = next;
+            let mut draft_hidden = previous_hidden.clone();
+            for _ in 0..draft_limit {
+                let mut draft = self.mtp_forward_tokens_logits_hidden(
+                    &[draft_input],
+                    &draft_hidden,
+                    &mut draft_mtp_state,
+                )?;
+                let Some(token) =
+                    sample_token(&mut draft.logits, &draft_history, params, &mut draft_rng)
+                else {
+                    break;
+                };
+                draft_tokens.push(token);
+                if token == self.eos_token_id {
+                    break;
+                }
+                draft_history.push(token);
+                draft_input = token;
+                draft_hidden = draft.hidden;
+            }
+
+            if draft_tokens.is_empty() {
+                let mut output = self.forward_token_logits_hidden(
+                    next,
+                    &mut target_state,
+                    &mut target_workspace,
+                )?;
+                self.mtp_prefill_tokens(&[next], &previous_hidden, &mut mtp_state)?;
+                let Some(token) = sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
+                    break;
+                };
+                if token == self.eos_token_id {
+                    break;
+                }
+                generated.push(token);
+                next = token;
+                pending_target_hidden = output.hidden;
+                continue;
+            }
+            drafted_total += draft_tokens.len();
+            if mtp_debug {
+                eprintln!(
+                    "qwen35-mtp-debug backend=metal cycle={cycles} input={next} drafts={draft_tokens:?}"
+                );
+            }
+
+            let mut verification_tokens = Vec::with_capacity(1 + draft_tokens.len());
+            verification_tokens.push(next);
+            verification_tokens.extend_from_slice(&draft_tokens);
+            self.copy_forward_state(&target_state, &mut speculative_target_state)?;
+            let mut verification = self.forward_tokens_logits_hidden(
+                &verification_tokens,
+                &mut speculative_target_state,
+            )?;
+            let mut accepted = 0usize;
+            let mut mismatch = None;
+            let mut finished = false;
+            for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
+                let row_start = draft_index * vocab_size;
+                let row_end = row_start + vocab_size;
+                let Some(target_token) = sample_token(
+                    &mut verification.logits[row_start..row_end],
+                    &generated,
+                    params,
+                    &mut rng,
+                ) else {
+                    finished = true;
+                    break;
+                };
+                if target_token == self.eos_token_id {
+                    finished = true;
+                    break;
+                }
+                if mtp_debug {
+                    eprintln!(
+                        "qwen35-mtp-debug backend=metal cycle={cycles} pos={draft_index} target={target_token} draft={draft_token}"
+                    );
+                }
+                generated.push(target_token);
+                if target_token != draft_token {
+                    mismatch = Some(target_token);
+                    break;
+                }
+                accepted += 1;
+                accepted_total += 1;
+                if generated.len() == params.max_tokens {
+                    finished = true;
+                    break;
+                }
+            }
+            if finished {
+                break;
+            }
+
+            if accepted == draft_tokens.len() {
+                let row_start = accepted * vocab_size;
+                let row_end = row_start + vocab_size;
+                let Some(target_token) = sample_token(
+                    &mut verification.logits[row_start..row_end],
+                    &generated,
+                    params,
+                    &mut rng,
+                ) else {
+                    break;
+                };
+                if target_token == self.eos_token_id {
+                    break;
+                }
+                generated.push(target_token);
+                next = target_token;
+                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                pending_target_hidden =
+                    last_hidden_row(&verification.hidden, verification_tokens.len(), hidden_size)?
+                        .to_vec();
+                let conditioning = mtp_conditioning_rows(
+                    &previous_hidden,
+                    &verification.hidden,
+                    verification_tokens.len(),
+                    hidden_size,
+                )?;
+                self.mtp_prefill_tokens(&verification_tokens, &conditioning, &mut mtp_state)?;
+            } else {
+                let target_token = mismatch.expect("non-accepted draft must have mismatch token");
+                let commit_count = accepted + 1;
+                let commit_tokens = &verification_tokens[..commit_count];
+                let committed_hidden =
+                    self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
+                let conditioning = mtp_conditioning_rows(
+                    &previous_hidden,
+                    &committed_hidden,
+                    commit_count,
+                    hidden_size,
+                )?;
+                self.mtp_prefill_tokens(commit_tokens, &conditioning, &mut mtp_state)?;
+                pending_target_hidden =
+                    last_hidden_row(&committed_hidden, commit_count, hidden_size)?.to_vec();
+                next = target_token;
+            }
+        }
+
+        if mtp_debug {
+            eprintln!(
+                "qwen35-mtp-debug backend=metal cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
+            );
+        }
+        tokenizer
+            .decode(&generated, true)
+            .map_err(|error| Error::Tokenizer(error.to_string()))
     }
 
     pub fn new_forward_state(&self, max_context: usize) -> Result<MetalForwardState> {
@@ -207,6 +466,99 @@ impl MetalQwen35Model {
             logits: self.new_f32(self.inventory.vocab_size)?,
             scores: self.new_f32(self.inventory.attention_heads * max_context)?,
         })
+    }
+
+    pub(crate) fn new_mtp_state(&self, max_context: usize) -> Result<MetalMtpState> {
+        if !self.inventory.has_mtp() {
+            return Err(Error::GenerationUnavailable(
+                "Qwen3.5 model does not contain an MTP layer".into(),
+            ));
+        }
+        Ok(MetalMtpState {
+            position: 0,
+            max_context,
+            k_cache: self
+                .new_f32(max_context * self.inventory.kv_heads * self.inventory.head_dim)?,
+            v_cache: self
+                .new_f32(max_context * self.inventory.kv_heads * self.inventory.value_dim)?,
+        })
+    }
+
+    fn copy_forward_state(
+        &self,
+        src: &MetalForwardState,
+        dst: &mut MetalForwardState,
+    ) -> Result<()> {
+        if src.max_context != dst.max_context || src.layer_states.len() != dst.layer_states.len() {
+            return Err(Error::InvalidRequest(
+                "Metal target state layouts do not match".into(),
+            ));
+        }
+        let cb = self.command_buffer()?;
+        let blit = cb.blit().ok_or_else(|| {
+            Error::GenerationUnavailable("failed to create Metal blit encoder".into())
+        })?;
+        for (src_layer, dst_layer) in src.layer_states.iter().zip(&dst.layer_states) {
+            match (src_layer, dst_layer) {
+                (
+                    MetalLayerState::Delta {
+                        recurrent: src_recurrent,
+                        conv: src_conv,
+                    },
+                    MetalLayerState::Delta {
+                        recurrent: dst_recurrent,
+                        conv: dst_conv,
+                    },
+                ) => {
+                    blit.copy_buffer(src_recurrent, 0, dst_recurrent, 0, src_recurrent.len());
+                    blit.copy_buffer(src_conv, 0, dst_conv, 0, src_conv.len());
+                }
+                (
+                    MetalLayerState::Full {
+                        k_cache: src_k,
+                        v_cache: src_v,
+                    },
+                    MetalLayerState::Full {
+                        k_cache: dst_k,
+                        v_cache: dst_v,
+                    },
+                ) => {
+                    blit.copy_buffer(src_k, 0, dst_k, 0, src_k.len());
+                    blit.copy_buffer(src_v, 0, dst_v, 0, src_v.len());
+                }
+                _ => {
+                    return Err(Error::InvalidRequest(
+                        "Metal target state layer kinds do not match".into(),
+                    ));
+                }
+            }
+        }
+        blit.end();
+        cb.commit_and_wait().map_err(|error| {
+            Error::GenerationUnavailable(format!("Metal target state copy failed: {error}"))
+        })?;
+        dst.position = src.position;
+        Ok(())
+    }
+
+    fn copy_mtp_state(&self, src: &MetalMtpState, dst: &mut MetalMtpState) -> Result<()> {
+        if src.max_context != dst.max_context {
+            return Err(Error::InvalidRequest(
+                "Metal MTP state layouts do not match".into(),
+            ));
+        }
+        let cb = self.command_buffer()?;
+        let blit = cb.blit().ok_or_else(|| {
+            Error::GenerationUnavailable("failed to create Metal blit encoder".into())
+        })?;
+        blit.copy_buffer(&src.k_cache, 0, &dst.k_cache, 0, src.k_cache.len());
+        blit.copy_buffer(&src.v_cache, 0, &dst.v_cache, 0, src.v_cache.len());
+        blit.end();
+        cb.commit_and_wait().map_err(|error| {
+            Error::GenerationUnavailable(format!("Metal MTP state copy failed: {error}"))
+        })?;
+        dst.position = src.position;
+        Ok(())
     }
 
     fn new_prefill_workspace(
@@ -271,6 +623,46 @@ impl MetalQwen35Model {
         })?;
         state.position += 1;
         self.read_f32(&ws.logits, self.inventory.vocab_size)
+    }
+
+    pub(crate) fn forward_token_logits_hidden(
+        &self,
+        token: u32,
+        state: &mut MetalForwardState,
+        ws: &mut MetalForwardWorkspace,
+    ) -> Result<MetalTargetForwardOutput> {
+        let cb = self.command_buffer()?;
+        let enc = cb
+            .compute()
+            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_token_hidden(&enc, token, state, ws, false)?;
+        self.encode_rms_norm(
+            &enc,
+            "output_norm.weight",
+            &ws.hidden,
+            &ws.normed,
+            1,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_matvec_to(
+            &enc,
+            "token_embd.weight",
+            &ws.normed,
+            self.inventory.hidden_size,
+            &ws.logits,
+            self.inventory.vocab_size,
+        )?;
+        enc.end();
+        cb.commit_and_wait().map_err(|e| {
+            Error::GenerationUnavailable(format!("Metal hidden/logits forward failed: {e}"))
+        })?;
+        state.position += 1;
+        Ok(MetalTargetForwardOutput {
+            hidden: self.read_f32(&ws.hidden, self.inventory.hidden_size)?,
+            logits: self.read_f32(&ws.logits, self.inventory.vocab_size)?,
+        })
     }
 
     pub(crate) fn forward_token_greedy(
@@ -342,8 +734,270 @@ impl MetalQwen35Model {
         tokens: &[u32],
         state: &mut MetalForwardState,
     ) -> Result<()> {
+        let _ = self.forward_tokens_hidden_device(tokens, state, true)?;
+        Ok(())
+    }
+
+    pub(crate) fn prefill_tokens_hidden(
+        &self,
+        tokens: &[u32],
+        state: &mut MetalForwardState,
+    ) -> Result<Vec<f32>> {
+        let workspace = self.forward_tokens_hidden_device(tokens, state, false)?;
+        self.read_f32(&workspace.hidden, tokens.len() * self.inventory.hidden_size)
+    }
+
+    pub(crate) fn forward_tokens_logits_hidden(
+        &self,
+        tokens: &[u32],
+        state: &mut MetalForwardState,
+    ) -> Result<MetalTargetForwardOutput> {
+        let workspace = self.forward_tokens_hidden_device(tokens, state, false)?;
         if tokens.is_empty() {
-            return Ok(());
+            return Ok(MetalTargetForwardOutput {
+                hidden: Vec::new(),
+                logits: Vec::new(),
+            });
+        }
+        let rows = tokens.len();
+        let logits = self.new_f32(rows * self.inventory.vocab_size)?;
+        let cb = self.command_buffer()?;
+        let enc = cb
+            .compute_concurrent()
+            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_rms_norm(
+            &enc,
+            "output_norm.weight",
+            &workspace.hidden,
+            &workspace.normed,
+            rows,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_matmul_rows_to(
+            &enc,
+            "token_embd.weight",
+            &workspace.normed,
+            rows,
+            self.inventory.hidden_size,
+            &logits,
+            self.inventory.vocab_size,
+        )?;
+        enc.end();
+        cb.commit_and_wait().map_err(|e| {
+            Error::GenerationUnavailable(format!("Metal batched hidden/logits forward failed: {e}"))
+        })?;
+        Ok(MetalTargetForwardOutput {
+            hidden: self.read_f32(&workspace.hidden, rows * self.inventory.hidden_size)?,
+            logits: self.read_f32(&logits, rows * self.inventory.vocab_size)?,
+        })
+    }
+
+    pub(crate) fn mtp_prefill_tokens(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut MetalMtpState,
+    ) -> Result<()> {
+        let _ = self.mtp_forward_tokens(tokens, target_hidden, state, false)?;
+        Ok(())
+    }
+
+    pub(crate) fn mtp_forward_tokens_logits_hidden(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut MetalMtpState,
+    ) -> Result<MetalTargetForwardOutput> {
+        self.mtp_forward_tokens(tokens, target_hidden, state, true)
+    }
+
+    fn mtp_forward_tokens(
+        &self,
+        tokens: &[u32],
+        target_hidden: &[f32],
+        state: &mut MetalMtpState,
+        include_logits: bool,
+    ) -> Result<MetalTargetForwardOutput> {
+        if !self.inventory.has_mtp() {
+            return Err(Error::GenerationUnavailable(
+                "Qwen3.5 model does not contain an MTP layer".into(),
+            ));
+        }
+        if tokens.is_empty() {
+            if target_hidden.is_empty() {
+                return Ok(MetalTargetForwardOutput {
+                    hidden: Vec::new(),
+                    logits: Vec::new(),
+                });
+            }
+            return Err(Error::InvalidRequest(
+                "MTP target hidden rows were provided without tokens".into(),
+            ));
+        }
+        let rows = tokens.len();
+        let hidden_size = self.inventory.hidden_size;
+        if target_hidden.len() != rows * hidden_size {
+            return Err(Error::InvalidRequest(format!(
+                "MTP target hidden length {}, expected {}x{}",
+                target_hidden.len(),
+                rows,
+                hidden_size
+            )));
+        }
+        if state.position.saturating_add(rows) > state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 MTP prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+        let layer = self.inventory.block_count;
+        let prefix = format!("blk.{layer}");
+        let workspace = self.new_prefill_workspace(rows, state.max_context)?;
+        let target_hidden = self.upload_pod(target_hidden)?;
+        let joined = self.new_f32(rows * hidden_size * 2)?;
+        let logits = if include_logits {
+            Some(self.new_f32(rows * self.inventory.vocab_size)?)
+        } else {
+            None
+        };
+        unsafe {
+            workspace.token_ids.write(0, tokens);
+        }
+        let cb = self.command_buffer()?;
+        let enc = cb
+            .compute_concurrent()
+            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_embed_tokens(&enc, &workspace.token_ids, &workspace.hidden, rows)?;
+        enc.memory_barrier_buffers();
+        self.encode_rms_norm(
+            &enc,
+            &format!("{prefix}.nextn.enorm.weight"),
+            &workspace.hidden,
+            &workspace.normed,
+            rows,
+            hidden_size,
+            true,
+        )?;
+        self.encode_rms_norm(
+            &enc,
+            &format!("{prefix}.nextn.hnorm.weight"),
+            &target_hidden,
+            &workspace.attn_out,
+            rows,
+            hidden_size,
+            true,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_concat_rows(
+            &enc,
+            &workspace.normed,
+            &workspace.attn_out,
+            &joined,
+            rows,
+            hidden_size,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_matmul_rows_to(
+            &enc,
+            &format!("{prefix}.nextn.eh_proj.weight"),
+            &joined,
+            rows,
+            hidden_size * 2,
+            &workspace.hidden,
+            hidden_size,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_rms_norm(
+            &enc,
+            &format!("{prefix}.attn_norm.weight"),
+            &workspace.hidden,
+            &workspace.normed,
+            rows,
+            hidden_size,
+            true,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_full_attention_block_rows(
+            &enc,
+            layer,
+            &state.k_cache,
+            &state.v_cache,
+            state.position,
+            rows,
+            state.max_context,
+            &workspace,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_add_rms_norm(
+            &enc,
+            &format!("{prefix}.post_attention_norm.weight"),
+            &workspace.hidden,
+            &workspace.attn_out,
+            &workspace.hidden,
+            &workspace.normed,
+            rows,
+            hidden_size,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_ffn_block_rows(&enc, layer, rows, &workspace)?;
+        enc.memory_barrier_buffers();
+        self.encode_add(
+            &enc,
+            &workspace.hidden,
+            &workspace.attn_out,
+            &workspace.hidden,
+            rows * hidden_size,
+        )?;
+        if let Some(logits) = &logits {
+            enc.memory_barrier_buffers();
+            self.encode_rms_norm(
+                &enc,
+                &format!("{prefix}.nextn.shared_head_norm.weight"),
+                &workspace.hidden,
+                &workspace.normed,
+                rows,
+                hidden_size,
+                true,
+            )?;
+            enc.memory_barrier_buffers();
+            self.encode_matmul_rows_to(
+                &enc,
+                "token_embd.weight",
+                &workspace.normed,
+                rows,
+                hidden_size,
+                logits,
+                self.inventory.vocab_size,
+            )?;
+        }
+        enc.end();
+        cb.commit_and_wait()
+            .map_err(|e| Error::GenerationUnavailable(format!("Metal MTP forward failed: {e}")))?;
+        state.position += rows;
+        let output_hidden = if include_logits {
+            &workspace.normed
+        } else {
+            &workspace.hidden
+        };
+        Ok(MetalTargetForwardOutput {
+            hidden: self.read_f32(output_hidden, rows * hidden_size)?,
+            logits: match logits {
+                Some(logits) => self.read_f32(&logits, rows * self.inventory.vocab_size)?,
+                None => Vec::new(),
+            },
+        })
+    }
+
+    fn forward_tokens_hidden_device(
+        &self,
+        tokens: &[u32],
+        state: &mut MetalForwardState,
+        cache_only_final: bool,
+    ) -> Result<MetalPrefillWorkspace> {
+        if tokens.is_empty() {
+            return self.new_prefill_workspace(1, state.max_context);
         }
         let rows = tokens.len();
         if state.position.saturating_add(rows) > state.max_context {
@@ -373,7 +1027,7 @@ impl MetalQwen35Model {
         enc.memory_barrier_buffers();
 
         for layer in 0..self.inventory.block_count {
-            if self.encode_prefill_layer(&enc, layer, state, rows, &ws)? {
+            if self.encode_prefill_layer(&enc, layer, state, rows, &ws, cache_only_final)? {
                 break;
             }
         }
@@ -382,7 +1036,7 @@ impl MetalQwen35Model {
             Error::GenerationUnavailable(format!("Metal batched prefill failed: {e}"))
         })?;
         state.position += rows;
-        Ok(())
+        Ok(ws)
     }
 
     fn encode_prefill_layer(
@@ -392,6 +1046,7 @@ impl MetalQwen35Model {
         state: &mut MetalForwardState,
         rows: usize,
         ws: &MetalPrefillWorkspace,
+        cache_only_final: bool,
     ) -> Result<bool> {
         self.encode_rms_norm(
             enc,
@@ -409,7 +1064,7 @@ impl MetalQwen35Model {
             MetalLayerState::Delta { recurrent, conv } => {
                 self.encode_delta_attention_block_rows(enc, layer, recurrent, conv, rows, ws)?;
             }
-            MetalLayerState::Full { k_cache, v_cache } if final_layer => {
+            MetalLayerState::Full { k_cache, v_cache } if final_layer && cache_only_final => {
                 self.encode_full_attention_cache_only_rows(
                     enc,
                     layer,
@@ -434,7 +1089,7 @@ impl MetalQwen35Model {
                 )?;
             }
         }
-        if final_layer {
+        if final_layer && cache_only_final {
             return Ok(true);
         }
 
@@ -1199,6 +1854,54 @@ impl MetalQwen35Model {
             (hidden * std::mem::size_of::<f32>()) as u64,
             (rows * hidden * std::mem::size_of::<f32>()) as u64,
             (rows * hidden * std::mem::size_of::<f32>()) as u64,
+        ))
+    }
+
+    fn encode_concat_rows(
+        &self,
+        enc: &greppy_embed_native::metal::ffi::ComputeEncoder,
+        left: &Buffer,
+        right: &Buffer,
+        dst: &Buffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        let elem = std::mem::size_of::<f32>();
+        let src_row = dim * elem;
+        let src_total = rows * src_row;
+        let dst_row = dim * 2 * elem;
+        let dst_total = rows * dst_row;
+        ok(ops::op_concat(
+            enc,
+            self.dev,
+            left,
+            right,
+            dst,
+            0,
+            checked_i32(dim, "concat left width")?,
+            checked_i32(rows, "concat left rows")?,
+            1,
+            1,
+            elem as u64,
+            src_row as u64,
+            src_total as u64,
+            src_total as u64,
+            checked_i32(dim, "concat right width")?,
+            checked_i32(rows, "concat right rows")?,
+            1,
+            1,
+            elem as u64,
+            src_row as u64,
+            src_total as u64,
+            src_total as u64,
+            checked_i32(dim * 2, "concat output width")?,
+            checked_i32(rows, "concat output rows")?,
+            1,
+            1,
+            elem as u64,
+            dst_row as u64,
+            dst_total as u64,
+            dst_total as u64,
         ))
     }
 
@@ -2476,6 +3179,50 @@ impl MetalQwen35Model {
     }
 }
 
+fn mtp_conditioning_rows(
+    previous_hidden: &[f32],
+    committed_hidden: &[f32],
+    rows: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    if previous_hidden.len() != hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "MTP previous hidden length {}, expected {}",
+            previous_hidden.len(),
+            hidden_size
+        )));
+    }
+    if committed_hidden.len() != rows * hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "MTP committed hidden length {}, expected {}x{}",
+            committed_hidden.len(),
+            rows,
+            hidden_size
+        )));
+    }
+    let mut conditioning = vec![0.0f32; committed_hidden.len()];
+    if rows == 0 {
+        return Ok(conditioning);
+    }
+    conditioning[..hidden_size].copy_from_slice(previous_hidden);
+    if rows > 1 {
+        conditioning[hidden_size..].copy_from_slice(&committed_hidden[..(rows - 1) * hidden_size]);
+    }
+    Ok(conditioning)
+}
+
+fn last_hidden_row(hidden: &[f32], rows: usize, hidden_size: usize) -> Result<&[f32]> {
+    if rows == 0 || hidden.len() != rows * hidden_size {
+        return Err(Error::InvalidRequest(format!(
+            "hidden row layout length {}, expected non-empty {}x{}",
+            hidden.len(),
+            rows,
+            hidden_size
+        )));
+    }
+    Ok(&hidden[(rows - 1) * hidden_size..rows * hidden_size])
+}
+
 const RMS_EPS: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 10_000_000.0;
 const CONV_KERNEL: usize = 4;
@@ -2764,6 +3511,287 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_metal_batched_hidden_matches_tokenwise_when_env_set() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_MTP_GGUF") else {
+            return;
+        };
+        let gguf = GgufModel::open(&path).expect("open Qwen3.5 MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 MTP inventory");
+        let metal = MetalQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044)
+            .expect("Metal Qwen MTP model");
+        let prefix = [42_u32, 314, 2718, 99];
+        let verify = [1234_u32, 5678, 9012];
+        let max_context = prefix.len() + verify.len() + 1;
+
+        let mut tokenwise_state = metal
+            .new_forward_state(max_context)
+            .expect("Metal tokenwise hidden state");
+        metal
+            .prefill_tokens(&prefix, &mut tokenwise_state)
+            .expect("Metal tokenwise hidden prefix");
+        let mut tokenwise_workspace = metal
+            .new_forward_workspace(max_context)
+            .expect("Metal tokenwise hidden workspace");
+        let mut tokenwise_hidden = Vec::new();
+        let mut tokenwise_logits = Vec::new();
+        for token in verify {
+            let output = metal
+                .forward_token_logits_hidden(token, &mut tokenwise_state, &mut tokenwise_workspace)
+                .expect("Metal tokenwise hidden row");
+            tokenwise_hidden.extend(output.hidden);
+            tokenwise_logits.extend(output.logits);
+        }
+
+        let mut batched_state = metal
+            .new_forward_state(max_context)
+            .expect("Metal batched hidden state");
+        metal
+            .prefill_tokens(&prefix, &mut batched_state)
+            .expect("Metal batched hidden prefix");
+        let batched = metal
+            .forward_tokens_logits_hidden(&verify, &mut batched_state)
+            .expect("Metal batched hidden rows");
+        let hidden_cosine = cosine(&tokenwise_hidden, &batched.hidden);
+        let logits_cosine = cosine(&tokenwise_logits, &batched.logits);
+        eprintln!(
+            "Metal batched hidden: hidden_cos={hidden_cosine:.8} logits_cos={logits_cosine:.8}"
+        );
+        assert!(hidden_cosine >= 0.98, "Metal batched hidden-state drift");
+        assert!(logits_cosine >= 0.98, "Metal batched hidden-logit drift");
+    }
+
+    #[test]
+    fn qwen35_metal_mtp_matches_golden_tokens_when_env_set() {
+        let (Some(gguf_path), Some(tokenizer_path)) = (
+            std::env::var_os("QWEN35_NATIVE_MTP_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            return;
+        };
+        let gguf = GgufModel::open(&gguf_path).expect("open Qwen3.5 MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 MTP inventory");
+        let metal = MetalQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044)
+            .expect("Metal Qwen MTP model");
+        let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
+        let prompt = crate::prompt::non_thinking_chat_prompt(
+            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        );
+        let ids = tokenizer
+            .encode(prompt, true)
+            .expect("tokenize Metal MTP golden prompt")
+            .get_ids()
+            .to_vec();
+        let max_context = ids.len() + 3;
+        let mut target_state = metal
+            .new_forward_state(max_context)
+            .expect("Metal MTP target state");
+        let mut prompt_hidden = metal
+            .prefill_tokens_hidden(&ids[..ids.len() - 1], &mut target_state)
+            .expect("Metal MTP target prompt hidden");
+        let mut target_workspace = metal
+            .new_forward_workspace(max_context)
+            .expect("Metal MTP target workspace");
+        let target = metal
+            .forward_token_logits_hidden(
+                *ids.last().expect("non-empty Metal MTP prompt"),
+                &mut target_state,
+                &mut target_workspace,
+            )
+            .expect("Metal MTP target final row");
+        prompt_hidden.extend_from_slice(&target.hidden);
+        let first = greedy_argmax(&target.logits);
+        assert_eq!(first, 1919, "unexpected Metal MTP target token");
+
+        let hidden_size = inventory.hidden_size;
+        let mut conditioning = vec![0.0f32; prompt_hidden.len()];
+        conditioning[hidden_size..]
+            .copy_from_slice(&prompt_hidden[..prompt_hidden.len() - hidden_size]);
+        let mut mtp_state = metal.new_mtp_state(max_context).expect("Metal MTP state");
+        metal
+            .mtp_prefill_tokens(&ids, &conditioning, &mut mtp_state)
+            .expect("Metal MTP prompt catch-up");
+        let first_draft = metal
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut mtp_state)
+            .expect("Metal MTP first draft");
+        let first_draft_token = greedy_argmax(&first_draft.logits);
+        let second_draft = metal
+            .mtp_forward_tokens_logits_hidden(
+                &[first_draft_token],
+                &first_draft.hidden,
+                &mut mtp_state,
+            )
+            .expect("Metal MTP second draft");
+        let cpu = crate::cpu::CpuQwen35Model::load(&gguf, inventory, 248_044)
+            .expect("CPU MTP comparison model");
+        let mut cpu_mtp_state = cpu
+            .new_mtp_state(max_context)
+            .expect("CPU MTP comparison state");
+        cpu.mtp_prefill_tokens(&ids, &conditioning, &mut cpu_mtp_state)
+            .expect("CPU MTP comparison catch-up");
+        let cpu_first = cpu
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut cpu_mtp_state)
+            .expect("CPU MTP first comparison draft");
+        let cpu_first_token = greedy_argmax(&cpu_first.logits);
+        let cpu_second = cpu
+            .mtp_forward_tokens_logits_hidden(
+                &[cpu_first_token],
+                &cpu_first.hidden,
+                &mut cpu_mtp_state,
+            )
+            .expect("CPU MTP second comparison draft");
+        let mut fresh_metal_state = metal
+            .new_mtp_state(max_context)
+            .expect("fresh Metal MTP comparison state");
+        let fresh_metal = metal
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut fresh_metal_state)
+            .expect("fresh Metal MTP comparison draft");
+        let mut fresh_cpu_state = cpu
+            .new_mtp_state(max_context)
+            .expect("fresh CPU MTP comparison state");
+        let fresh_cpu = cpu
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut fresh_cpu_state)
+            .expect("fresh CPU MTP comparison draft");
+        eprintln!(
+            "Metal/CPU MTP fresh hidden_cos={:.8} logits_cos={:.8}; first hidden_cos={:.8} logits_cos={:.8}; second logits_cos={:.8}",
+            cosine(&fresh_metal.hidden, &fresh_cpu.hidden),
+            cosine(&fresh_metal.logits, &fresh_cpu.logits),
+            cosine(&first_draft.hidden, &cpu_first.hidden),
+            cosine(&first_draft.logits, &cpu_first.logits),
+            cosine(&second_draft.logits, &cpu_second.logits),
+        );
+        assert_eq!(
+            [first_draft_token, greedy_argmax(&second_draft.logits)],
+            [709, 369],
+            "Metal MTP drafts differ from llama.cpp golden tokens"
+        );
+    }
+
+    #[test]
+    fn qwen35_metal_mtp_input_projection_matches_cpu_when_env_set() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_MTP_GGUF") else {
+            return;
+        };
+        let gguf = GgufModel::open(&path).expect("open Qwen3.5 MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 MTP inventory");
+        let metal = MetalQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044)
+            .expect("Metal Qwen MTP model");
+        let layer = inventory.block_count;
+        let prefix = format!("blk.{layer}.nextn");
+        let hidden_size = inventory.hidden_size;
+        let token = 1919_u32;
+        let target_hidden = patterned_input(hidden_size);
+        let embedding = QuantMatrix::from_model(&gguf, "token_embd.weight")
+            .expect("CPU MTP embedding")
+            .embedding_rows(&[token])
+            .expect("CPU MTP embedding row");
+        let enorm = gguf
+            .tensor(&format!("{prefix}.enorm.weight"))
+            .expect("CPU MTP enorm")
+            .to_f32()
+            .expect("CPU MTP enorm values");
+        let hnorm = gguf
+            .tensor(&format!("{prefix}.hnorm.weight"))
+            .expect("CPU MTP hnorm")
+            .to_f32()
+            .expect("CPU MTP hnorm values");
+        let embedding = cpu_rms_norm(&embedding, &enorm, hidden_size, true);
+        let target_hidden = cpu_rms_norm(&target_hidden, &hnorm, hidden_size, true);
+        let mut joined_expected = embedding;
+        joined_expected.extend_from_slice(&target_hidden);
+        let hidden_expected = QuantMatrix::from_model(&gguf, &format!("{prefix}.eh_proj.weight"))
+            .expect("CPU MTP eh_proj")
+            .matmul(&joined_expected, 1)
+            .expect("CPU MTP eh_proj row");
+
+        let workspace = metal
+            .new_prefill_workspace(1, 4)
+            .expect("Metal MTP projection workspace");
+        unsafe {
+            workspace.token_ids.write(0, &[token]);
+        }
+        let target_buffer = metal
+            .upload_pod(&patterned_input(hidden_size))
+            .expect("upload MTP target hidden");
+        let joined = metal
+            .new_f32(hidden_size * 2)
+            .expect("Metal MTP joined buffer");
+        let cb = metal
+            .command_buffer()
+            .expect("Metal MTP projection command");
+        let enc = cb.compute().expect("Metal MTP projection encoder");
+        metal
+            .encode_embed_tokens(&enc, &workspace.token_ids, &workspace.hidden, 1)
+            .expect("Metal MTP embed");
+        enc.memory_barrier_buffers();
+        metal
+            .encode_rms_norm(
+                &enc,
+                &format!("{prefix}.enorm.weight"),
+                &workspace.hidden,
+                &workspace.normed,
+                1,
+                hidden_size,
+                true,
+            )
+            .expect("Metal MTP enorm");
+        metal
+            .encode_rms_norm(
+                &enc,
+                &format!("{prefix}.hnorm.weight"),
+                &target_buffer,
+                &workspace.attn_out,
+                1,
+                hidden_size,
+                true,
+            )
+            .expect("Metal MTP hnorm");
+        enc.memory_barrier_buffers();
+        metal
+            .encode_concat_rows(
+                &enc,
+                &workspace.normed,
+                &workspace.attn_out,
+                &joined,
+                1,
+                hidden_size,
+            )
+            .expect("Metal MTP concat");
+        enc.memory_barrier_buffers();
+        metal
+            .encode_matmul_rows_to(
+                &enc,
+                &format!("{prefix}.eh_proj.weight"),
+                &joined,
+                1,
+                hidden_size * 2,
+                &workspace.hidden,
+                hidden_size,
+            )
+            .expect("Metal MTP eh_proj");
+        enc.end();
+        cb.commit_and_wait().expect("Metal MTP projection wait");
+        let joined_actual = metal
+            .read_f32(&joined, hidden_size * 2)
+            .expect("read Metal MTP joined row");
+        let hidden_actual = metal
+            .read_f32(&workspace.hidden, hidden_size)
+            .expect("read Metal MTP projected row");
+        eprintln!(
+            "Metal MTP input projection joined_cos={:.8} hidden_cos={:.8}",
+            cosine(&joined_actual, &joined_expected),
+            cosine(&hidden_actual, &hidden_expected),
+        );
+        assert!(
+            cosine(&joined_actual, &joined_expected) >= 0.999,
+            "Metal MTP joined input drift"
+        );
+        assert!(
+            cosine(&hidden_actual, &hidden_expected) >= 0.999,
+            "Metal MTP input projection drift"
+        );
+    }
+
+    #[test]
     #[ignore = "diagnostic Metal layer profile"]
     fn qwen35_metal_prefill_layer_profile_when_env_set() {
         let Some(path) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
@@ -2825,7 +3853,7 @@ mod tests {
             let cb = metal.command_buffer().expect("Metal profile layer command");
             let enc = cb.compute().expect("Metal profile layer encoder");
             let final_layer = metal
-                .encode_prefill_layer(&enc, layer, &mut state, rows, &ws)
+                .encode_prefill_layer(&enc, layer, &mut state, rows, &ws, true)
                 .expect("Metal profile layer encode");
             enc.end();
             let timing = cb
@@ -3891,6 +4919,15 @@ mod tests {
         let ln = rms_norm(lhs) * (lhs.len().max(1) as f32).sqrt();
         let rn = rms_norm(rhs) * (rhs.len().max(1) as f32).sqrt();
         dot / (ln * rn).max(1.0e-12)
+    }
+
+    fn greedy_argmax(values: &[f32]) -> u32 {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| u32::try_from(index).expect("vocabulary index fits u32"))
+            .expect("non-empty logits")
     }
 
     fn assert_close_vec(label: &str, lhs: &[f32], rhs: &[f32], tol: f32) {
