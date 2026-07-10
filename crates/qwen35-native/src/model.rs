@@ -789,6 +789,56 @@ mod cpu_perf_tests {
             .expect("CPU profile prefill");
     }
 
+    #[test]
+    #[ignore = "diagnostic CPU decode profile"]
+    fn qwen35_cpu_decode_profile_when_env_set() {
+        let (Some(gguf), Some(tokenizer)) = (
+            std::env::var_os("QWEN35_NATIVE_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            eprintln!("skipping CPU decode profile: QWEN35_NATIVE_GGUF/TOKENIZER unset");
+            return;
+        };
+        let position = perf_env_usize("QWEN35_NATIVE_CPU_DECODE_POSITION", 64).clamp(1, 511);
+        let inventory = greppy_embed_native::GgufModel::open(&gguf).expect("open CPU profile GGUF");
+        for name in [
+            "token_embd.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.ssm_out.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_down.weight",
+        ] {
+            let tensor = inventory.tensor(name).expect("CPU profile tensor");
+            eprintln!(
+                "cpu_decode_profile stage=inventory tensor={name} dtype={} shape={:?}",
+                tensor.dtype, tensor.shape,
+            );
+        }
+        let summarizer = Qwen35Summarizer::load_gguf(
+            gguf,
+            tokenizer,
+            LoadOptions {
+                device: DevicePreference::Cpu,
+            },
+        )
+        .expect("load CPU Qwen3.5 summarizer");
+        let model = match &summarizer.backend {
+            Backend::Cpu(model) => model,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => panic!("expected CPU backend"),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(_) => panic!("expected CPU backend"),
+        };
+        let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, position + 1);
+        let mut state = model.new_state(position + 2);
+        model
+            .prefill_tokens(&prompt_ids[..position], &mut state)
+            .expect("CPU decode profile prefill");
+        model
+            .profile_forward_token_logits(prompt_ids[position], &mut state)
+            .expect("CPU decode profile token");
+    }
+
     fn perf_env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()

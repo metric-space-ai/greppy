@@ -342,6 +342,88 @@ impl CpuQwen35Model {
         self.token_embd.matmul(&hidden, 1).map_err(Into::into)
     }
 
+    #[cfg(test)]
+    pub(crate) fn profile_forward_token_logits(
+        &self,
+        token: u32,
+        state: &mut ForwardState,
+    ) -> Result<Vec<f32>> {
+        if state.position >= state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+        let total_start = std::time::Instant::now();
+        let stage_start = std::time::Instant::now();
+        let mut hidden = self.token_embd.embedding_rows(&[token])?;
+        eprintln!(
+            "cpu_decode_profile stage=embed position={} ms={:.3}",
+            state.position,
+            stage_start.elapsed().as_secs_f64() * 1.0e3,
+        );
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let kind = match &layer.kind {
+                LayerKind::Delta(_) => "delta",
+                LayerKind::Full(_) => "full",
+            };
+            let layer_start = std::time::Instant::now();
+            let stage_start = std::time::Instant::now();
+            let residual = hidden.clone();
+            let mut x = hidden;
+            rms_norm_qwen(&mut x, &layer.attn_norm);
+            let norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            let attn = match (&layer.kind, &mut state.layer_states[idx]) {
+                (LayerKind::Delta(weights), LayerState::Delta(runtime)) => {
+                    self.delta_block(weights, runtime, &x)?
+                }
+                (LayerKind::Full(weights), LayerState::Full(runtime)) => {
+                    self.full_attention_block(weights, runtime, state.position, &x)?
+                }
+                _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
+            };
+            let attention_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            hidden = add(&residual, &attn);
+            let residual_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            let residual = hidden.clone();
+            let mut x = hidden;
+            rms_norm_qwen(&mut x, &layer.post_attention_norm);
+            let post_norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            let ffn = self.ffn(layer, &x)?;
+            let ffn_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            hidden = add(&residual, &ffn);
+            let ffn_add_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+            eprintln!(
+                "cpu_decode_profile stage=layer layer={idx} kind={kind} total_ms={:.3} norm_ms={norm_ms:.3} attention_ms={attention_ms:.3} residual_ms={residual_ms:.3} post_norm_ms={post_norm_ms:.3} ffn_ms={ffn_ms:.3} ffn_add_ms={ffn_add_ms:.3}",
+                layer_start.elapsed().as_secs_f64() * 1.0e3,
+            );
+        }
+        state.position += 1;
+
+        let stage_start = std::time::Instant::now();
+        rms_norm_qwen(&mut hidden, &self.output_norm);
+        let output_norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        let stage_start = std::time::Instant::now();
+        let logits = self.token_embd.matmul(&hidden, 1)?;
+        let lm_head_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        eprintln!(
+            "cpu_decode_profile stage=output position={} output_norm_ms={output_norm_ms:.3} lm_head_ms={lm_head_ms:.3} total_ms={:.3}",
+            state.position - 1,
+            total_start.elapsed().as_secs_f64() * 1.0e3,
+        );
+        Ok(logits)
+    }
+
     fn forward_token_hidden(&self, token: u32, state: &mut ForwardState) -> Result<Vec<f32>> {
         if state.position >= state.max_context {
             return Err(Error::InvalidRequest(format!(
@@ -675,33 +757,40 @@ impl CpuQwen35Model {
         let (q, rest) = qkv.split_at_mut(inner);
         let (k, v) = rest.split_at_mut(inner);
         normalize_linear_qk(q, k);
-
-        let mut out = vec![0.0f32; inner];
-        for head in 0..LINEAR_HEADS {
-            let base = head * LINEAR_HEAD_DIM;
-            let qh = &q[base..base + LINEAR_HEAD_DIM];
-            let kh = &k[base..base + LINEAR_HEAD_DIM];
-            let vh = &v[base..base + LINEAR_HEAD_DIM];
-            let oh = &mut out[base..base + LINEAR_HEAD_DIM];
-            let recurrent = &mut state.recurrent[head * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM
-                ..(head + 1) * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM];
+        let scan_params: [(f32, f32); LINEAR_HEADS] = std::array::from_fn(|head| {
             let beta_h = sigmoid(beta[head]);
             let decay = (-weights.ssm_a[head].exp()
                 * softplus(alpha[head] + weights.ssm_dt_bias[head]))
             .exp()
             .clamp(0.0, 1.0);
-            for value_idx in 0..LINEAR_HEAD_DIM {
-                let row =
-                    &mut recurrent[value_idx * LINEAR_HEAD_DIM..(value_idx + 1) * LINEAR_HEAD_DIM];
+            (beta_h, decay)
+        });
+
+        let mut out = vec![0.0f32; inner];
+        state
+            .recurrent
+            .par_chunks_mut(LINEAR_HEAD_DIM)
+            .zip(out.par_iter_mut())
+            .enumerate()
+            .for_each(|(state_row, (row, output))| {
+                let head = state_row / LINEAR_HEAD_DIM;
+                let value_idx = state_row % LINEAR_HEAD_DIM;
+                let base = head * LINEAR_HEAD_DIM;
+                let qh = &q[base..base + LINEAR_HEAD_DIM];
+                let kh = &k[base..base + LINEAR_HEAD_DIM];
+                let value = v[base + value_idx];
+                let (beta_h, decay) = scan_params[head];
                 let prior = dot(row, kh);
-                let delta = (vh[value_idx] - decay * prior) * beta_h;
+                let delta = (value - decay * prior) * beta_h;
                 let mut attn = 0.0f32;
                 for key_idx in 0..LINEAR_HEAD_DIM {
                     row[key_idx] = decay * row[key_idx] + kh[key_idx] * delta;
                     attn += row[key_idx] * qh[key_idx];
                 }
-                oh[value_idx] = attn;
-            }
+                *output = attn;
+            });
+        for head in 0..LINEAR_HEADS {
+            let base = head * LINEAR_HEAD_DIM;
             rms_norm_plain(&mut out[base..base + LINEAR_HEAD_DIM], &weights.ssm_norm);
             for i in 0..LINEAR_HEAD_DIM {
                 out[base + i] *= silu(z[base + i]);
