@@ -1,10 +1,19 @@
 /// Versioned prompt/output contract used by the daemon protocol.
-pub const PROMPT_VERSION: &str = "qwen35-brief-purpose-v3";
+pub const PROMPT_VERSION: &str = "qwen35-brief-tag-v4";
 pub const TRIAGE_PROMPT_VERSION: &str = "qwen35-triage-v3";
 
 /// Exact prompt used for every definition source span.
 pub fn brief_prompt(source: &str) -> String {
-    format!("Summarize: What is this function for?\n\n{source}")
+    format!("brief:\n{source}")
+}
+
+/// Chat wrapper for `brief` (tag-v4): the finetuned model is trained on this
+/// exact prefix and needs no empty think block to stay in non-thinking mode.
+pub fn brief_chat_prompt(source: &str) -> String {
+    format!(
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        brief_prompt(source).trim()
+    )
 }
 
 pub fn triage_prompt(query: &str, span_loc: &str, span_code: &str) -> String {
@@ -28,9 +37,10 @@ mod tests {
 
     #[test]
     fn prompt_is_exact_contract() {
+        assert_eq!(brief_prompt("fn f() {}\n"), "brief:\nfn f() {}\n");
         assert_eq!(
-            brief_prompt("fn f() {}\n"),
-            "Summarize: What is this function for?\n\nfn f() {}\n"
+            brief_chat_prompt("fn f() {}\n"),
+            "<|im_start|>user\nbrief:\nfn f() {}<|im_end|>\n<|im_start|>assistant\n"
         );
     }
 

@@ -876,8 +876,8 @@ mod cpu_perf_tests {
             #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
-        let prompt = crate::prompt::non_thinking_chat_prompt(
-            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        let prompt = crate::prompt::brief_chat_prompt(
+            "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
         );
         let prompt_ids = summarizer
             .tokenizer
@@ -898,7 +898,7 @@ mod cpu_perf_tests {
             .expect("MTP golden target last token");
         prompt_hidden.extend_from_slice(&target.hidden);
         let first = greedy_argmax(&target.logits);
-        assert_eq!(first, 1919, "unexpected MTP golden target token");
+        assert_eq!(first, 10296, "unexpected MTP golden target token");
 
         let mut prompt_conditioning = vec![0.0f32; prompt_hidden.len()];
         prompt_conditioning[hidden_size..]
@@ -922,8 +922,8 @@ mod cpu_perf_tests {
             .expect("MTP second golden draft");
         assert_eq!(
             [first_draft_token, greedy_argmax(&second_draft.logits)],
-            [709, 369],
-            "native MTP drafts differ from llama.cpp golden tokens"
+            [6976, 279],
+            "native MTP drafts differ from the finetuned-model golden tokens"
         );
 
         for params in [
@@ -1410,8 +1410,8 @@ mod tests {
         let Backend::Cuda(model) = &summarizer.backend else {
             panic!("expected CUDA backend");
         };
-        let prompt = crate::prompt::non_thinking_chat_prompt(
-            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        let prompt = crate::prompt::brief_chat_prompt(
+            "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
         );
         let ids = summarizer
             .tokenizer
