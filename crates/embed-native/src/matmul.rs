@@ -216,6 +216,18 @@ pub struct PreparedQ8K {
     repeated_x4: Vec<BlockQ8Kx4>,
 }
 
+/// Opaque Q8_K rows and SIMD tiles shared by several batched projections.
+#[derive(Debug, Clone)]
+pub struct PreparedQ8KRows {
+    rows: usize,
+    cols: usize,
+    activations: Vec<Vec<BlockQ8K>>,
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    tiles_x4: Vec<Vec<BlockQ8Kx4>>,
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    tail_repeated_x4: Vec<Vec<BlockQ8Kx4>>,
+}
+
 #[derive(Debug, Clone)]
 struct BlockQ8_0 {
     d: f16,
@@ -503,6 +515,184 @@ impl QuantMatrix {
                 )));
             }
         }
+        Ok(out)
+    }
+
+    pub fn prepare_q8k_rows(&self, lhs: &[f32], rows: usize) -> Result<PreparedQ8KRows> {
+        if lhs.len() != rows * self.cols {
+            return Err(Error::InvalidGguf(format!(
+                "{} prepared matmul lhs len {}, expected {}x{}",
+                self.name,
+                lhs.len(),
+                rows,
+                self.cols
+            )));
+        }
+        if !matches!(
+            &self.storage,
+            QuantStorage::Q4K { .. } | QuantStorage::Q5K { .. } | QuantStorage::Q6K { .. }
+        ) {
+            return Err(Error::InvalidGguf(format!(
+                "{} cannot use prepared Q8_K rows with this weight dtype",
+                self.name
+            )));
+        }
+        let activations = lhs
+            .par_chunks(self.cols)
+            .map(quantize_q8k)
+            .collect::<Vec<_>>();
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let tiles_x4 = activations[..rows & !3]
+            .par_chunks(4)
+            .map(|rows| pack_q8kx4_rows([&rows[0], &rows[1], &rows[2], &rows[3]]))
+            .collect::<Vec<_>>();
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let tail_repeated_x4 = activations[rows & !3..]
+            .iter()
+            .map(|row| pack_q8kx4_repeated(row))
+            .collect::<Vec<_>>();
+        Ok(PreparedQ8KRows {
+            rows,
+            cols: self.cols,
+            activations,
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            tiles_x4,
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            tail_repeated_x4,
+        })
+    }
+
+    pub fn matmul_prepared_q8k_rows(&self, input: &PreparedQ8KRows) -> Result<Vec<f32>> {
+        if input.cols != self.cols {
+            return Err(Error::InvalidGguf(format!(
+                "{} prepared matmul input width {}, expected {}",
+                self.name, input.cols, self.cols
+            )));
+        }
+        let out = match &self.storage {
+            QuantStorage::Q4K {
+                blocks,
+                #[cfg(target_arch = "aarch64")]
+                x8,
+                #[cfg(target_arch = "x86_64")]
+                x8_vnni,
+            } => {
+                #[cfg(target_arch = "aarch64")]
+                if let Some(x8) = x8 {
+                    matmul_q4kx8_batched_prepared(x8, input, self.rows)
+                } else {
+                    matmul_q4k_batched_prepared(
+                        blocks,
+                        &input.activations,
+                        input.rows,
+                        self.rows,
+                        self.cols / QK_K,
+                    )
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(x8_vnni) = x8_vnni {
+                    matmul_q4kx8_batched_avxvnni_prepared(x8_vnni, input, self.rows)
+                } else {
+                    matmul_q4k_batched_prepared(
+                        blocks,
+                        &input.activations,
+                        input.rows,
+                        self.rows,
+                        self.cols / QK_K,
+                    )
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                matmul_q4k_batched_prepared(
+                    blocks,
+                    &input.activations,
+                    input.rows,
+                    self.rows,
+                    self.cols / QK_K,
+                )
+            }
+            QuantStorage::Q5K {
+                blocks,
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+                x8,
+            } => {
+                #[cfg(target_arch = "aarch64")]
+                if let Some(x8) = x8 {
+                    matmul_x8_batched_i8mm_prepared(x8, input, self.rows, dot8x4_q5k_q8k_i8mm)
+                } else {
+                    matmul_q5k_batched_prepared(
+                        blocks,
+                        &input.activations,
+                        input.rows,
+                        self.rows,
+                        self.cols / QK_K,
+                    )
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(x8) = x8 {
+                    matmul_q5kx8_batched_avxvnni_prepared(x8, input, self.rows)
+                } else {
+                    matmul_q5k_batched_prepared(
+                        blocks,
+                        &input.activations,
+                        input.rows,
+                        self.rows,
+                        self.cols / QK_K,
+                    )
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                matmul_q5k_batched_prepared(
+                    blocks,
+                    &input.activations,
+                    input.rows,
+                    self.rows,
+                    self.cols / QK_K,
+                )
+            }
+            QuantStorage::Q6K {
+                blocks,
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+                x8,
+            } => {
+                #[cfg(target_arch = "aarch64")]
+                if let Some(x8) = x8 {
+                    matmul_x8_batched_i8mm_prepared(x8, input, self.rows, dot8x4_q6k_q8k_i8mm)
+                } else {
+                    matmul_q6k_batched_prepared(
+                        blocks,
+                        &input.activations,
+                        input.rows,
+                        self.rows,
+                        self.cols / QK_K,
+                    )
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(x8) = x8 {
+                    matmul_q6kx8_batched_avxvnni_prepared(x8, input, self.rows)
+                } else {
+                    matmul_q6k_batched_prepared(
+                        blocks,
+                        &input.activations,
+                        input.rows,
+                        self.rows,
+                        self.cols / QK_K,
+                    )
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                matmul_q6k_batched_prepared(
+                    blocks,
+                    &input.activations,
+                    input.rows,
+                    self.rows,
+                    self.cols / QK_K,
+                )
+            }
+            _ => {
+                return Err(Error::InvalidGguf(format!(
+                    "{} cannot use prepared Q8_K rows with this weight dtype",
+                    self.name
+                )));
+            }
+        };
         Ok(out)
     }
 
@@ -1007,6 +1197,16 @@ fn matmul_q4k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    matmul_q4k_batched_prepared(rhs, &activations, lhs_rows, matrix_rows, row_blocks)
+}
+
+fn matmul_q4k_batched_prepared(
+    rhs: &[BlockQ4K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
     #[cfg(target_arch = "x86_64")]
     if x86_kernel_kind() == X86KernelKind::AvxVnni {
         return matmul_q4k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
@@ -1217,6 +1417,63 @@ fn matmul_q4kx8_batched(
     transpose_batched_output(&transposed, lhs_rows, matrix_rows)
 }
 
+#[cfg(target_arch = "aarch64")]
+fn matmul_q4kx8_batched_prepared(
+    rhs: &[BlockQ4Kx8],
+    input: &PreparedQ8KRows,
+    matrix_rows: usize,
+) -> Vec<f32> {
+    let lhs_rows = input.rows;
+    let row_blocks = input.cols / QK_K;
+    let tiled_rows = lhs_rows & !3;
+    let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    transposed
+        .par_chunks_mut(64 * lhs_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first_group = chunk_idx * 8;
+            for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
+                let group = first_group + local_group;
+                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+                if use_i8mm {
+                    for (input_tile, xq) in input.tiles_x4.iter().enumerate() {
+                        let values = unsafe { dot8x4_q4k_q8k_neon(weights, xq) };
+                        for input_lane in 0..4 {
+                            let input_row = input_tile * 4 + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[input_lane][output_lane];
+                            }
+                        }
+                    }
+                } else {
+                    for input_row in 0..tiled_rows {
+                        let values =
+                            unsafe { dot8_q4k_q8k_neon(weights, &input.activations[input_row]) };
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                        }
+                    }
+                }
+                for tail_lane in 0..lhs_rows - tiled_rows {
+                    let input_row = tiled_rows + tail_lane;
+                    let values = if use_i8mm {
+                        unsafe {
+                            dot8x4_q4k_q8k_neon(weights, &input.tail_repeated_x4[tail_lane])[0]
+                        }
+                    } else {
+                        unsafe { dot8_q4k_q8k_neon(weights, &input.activations[input_row]) }
+                    };
+                    for output_lane in 0..8 {
+                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                    }
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
 #[cfg(target_arch = "x86_64")]
 fn matmul_q4kx8_batched_avxvnni(
     rhs: &[BlockQ4Kx8Vnni],
@@ -1292,6 +1549,86 @@ fn matmul_q4kx8_batched_avxvnni(
             }
         });
     transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn matmul_x8_batched_avxvnni_prepared<T: Sync>(
+    rhs: &[T],
+    input: &PreparedQ8KRows,
+    matrix_rows: usize,
+    kernel_x4: unsafe fn(&[T], &[BlockQ8Kx4]) -> [[f32; 8]; 4],
+    kernel_x16: unsafe fn(&[T], [&[BlockQ8Kx4]; 4]) -> [[[f32; 8]; 4]; 4],
+) -> Vec<f32> {
+    let lhs_rows = input.rows;
+    let row_blocks = input.cols / QK_K;
+    let tiled_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    transposed
+        .par_chunks_mut(64 * lhs_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first_group = chunk_idx * 8;
+            for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
+                let group = first_group + local_group;
+                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+                let tiled_groups = input.tiles_x4.len() & !3;
+                for input_tile in (0..tiled_groups).step_by(4) {
+                    let values = unsafe {
+                        kernel_x16(
+                            weights,
+                            [
+                                &input.tiles_x4[input_tile],
+                                &input.tiles_x4[input_tile + 1],
+                                &input.tiles_x4[input_tile + 2],
+                                &input.tiles_x4[input_tile + 3],
+                            ],
+                        )
+                    };
+                    for tile in 0..4 {
+                        for input_lane in 0..4 {
+                            let input_row = (input_tile + tile) * 4 + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[tile][input_lane][output_lane];
+                            }
+                        }
+                    }
+                }
+                for (tail_tile, xq) in input.tiles_x4[tiled_groups..].iter().enumerate() {
+                    let values = unsafe { kernel_x4(weights, xq) };
+                    for input_lane in 0..4 {
+                        let input_row = (tiled_groups + tail_tile) * 4 + input_lane;
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for (tail_lane, xq) in input.tail_repeated_x4.iter().enumerate() {
+                    let input_row = tiled_rows + tail_lane;
+                    let values = unsafe { kernel_x4(weights, xq) }[0];
+                    for output_lane in 0..8 {
+                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                    }
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn matmul_q4kx8_batched_avxvnni_prepared(
+    rhs: &[BlockQ4Kx8Vnni],
+    input: &PreparedQ8KRows,
+    matrix_rows: usize,
+) -> Vec<f32> {
+    matmul_x8_batched_avxvnni_prepared(
+        rhs,
+        input,
+        matrix_rows,
+        dot8x4_q4k_q8k_avxvnni,
+        dot8x16_q4k_q8k_avxvnni,
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1569,6 +1906,21 @@ fn matmul_q5kx8_batched_avxvnni(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn matmul_q5kx8_batched_avxvnni_prepared(
+    rhs: &[BlockQ5Kx8],
+    input: &PreparedQ8KRows,
+    matrix_rows: usize,
+) -> Vec<f32> {
+    matmul_x8_batched_avxvnni_prepared(
+        rhs,
+        input,
+        matrix_rows,
+        dot8x4_q5k_q8k_avxvnni,
+        dot8x16_q5k_q8k_avxvnni,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot8x4_q5k_q8k_avxvnni(weights: &[BlockQ5Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
     dot8x4n_q5k_q8k_avxvnni(weights, [inputs])[0]
@@ -1816,6 +2168,21 @@ fn matmul_q6kx8_batched_avxvnni(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn matmul_q6kx8_batched_avxvnni_prepared(
+    rhs: &[BlockQ6Kx8],
+    input: &PreparedQ8KRows,
+    matrix_rows: usize,
+) -> Vec<f32> {
+    matmul_x8_batched_avxvnni_prepared(
+        rhs,
+        input,
+        matrix_rows,
+        dot8x4_q6k_q8k_avxvnni,
+        dot8x16_q6k_q8k_avxvnni,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot8x4_q6k_q8k_avxvnni(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
     dot8x4n_q6k_q8k_avxvnni(weights, [inputs])[0]
@@ -2025,6 +2392,47 @@ fn matmul_x8_batched_i8mm<T: Sync>(
                     }
                 }
                 for (tail_lane, xq) in tail_tiles.iter().enumerate() {
+                    let input_row = tiled_rows + tail_lane;
+                    let values = unsafe { kernel(weights, xq) }[0];
+                    for output_lane in 0..8 {
+                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                    }
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn matmul_x8_batched_i8mm_prepared<T: Sync>(
+    rhs: &[T],
+    input: &PreparedQ8KRows,
+    matrix_rows: usize,
+    kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [[f32; 8]; 4],
+) -> Vec<f32> {
+    let lhs_rows = input.rows;
+    let row_blocks = input.cols / QK_K;
+    let tiled_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    transposed
+        .par_chunks_mut(64 * lhs_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first_group = chunk_idx * 8;
+            for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
+                let group = first_group + local_group;
+                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+                for (input_tile, xq) in input.tiles_x4.iter().enumerate() {
+                    let values = unsafe { kernel(weights, xq) };
+                    for input_lane in 0..4 {
+                        let input_row = input_tile * 4 + input_lane;
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for (tail_lane, xq) in input.tail_repeated_x4.iter().enumerate() {
                     let input_row = tiled_rows + tail_lane;
                     let values = unsafe { kernel(weights, xq) }[0];
                     for output_lane in 0..8 {
@@ -2322,13 +2730,23 @@ fn matmul_q6k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    matmul_q6k_batched_prepared(rhs, &activations, lhs_rows, matrix_rows, row_blocks)
+}
+
+fn matmul_q6k_batched_prepared(
+    rhs: &[BlockQ6K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     if std::arch::is_aarch64_feature_detected!("dotprod") {
-        return matmul_q6k_batched_neon(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+        return matmul_q6k_batched_neon(rhs, activations, lhs_rows, matrix_rows, row_blocks);
     }
     #[cfg(target_arch = "x86_64")]
     if x86_kernel_kind() == X86KernelKind::AvxVnni {
-        return matmul_q6k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+        return matmul_q6k_batched_avxvnni(rhs, activations, lhs_rows, matrix_rows, row_blocks);
     }
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
     let chunk_values = 64 * lhs_rows;
@@ -2508,13 +2926,23 @@ fn matmul_q5k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    matmul_q5k_batched_prepared(rhs, &activations, lhs_rows, matrix_rows, row_blocks)
+}
+
+fn matmul_q5k_batched_prepared(
+    rhs: &[BlockQ5K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     if std::arch::is_aarch64_feature_detected!("dotprod") {
-        return matmul_q5k_batched_neon(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+        return matmul_q5k_batched_neon(rhs, activations, lhs_rows, matrix_rows, row_blocks);
     }
     #[cfg(target_arch = "x86_64")]
     if x86_kernel_kind() == X86KernelKind::AvxVnni {
-        return matmul_q5k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+        return matmul_q5k_batched_avxvnni(rhs, activations, lhs_rows, matrix_rows, row_blocks);
     }
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
     let chunk_values = 64 * lhs_rows;
@@ -3088,7 +3516,13 @@ fn quantize_q8kx4(xs: &[f32], row_len: usize) -> Vec<BlockQ8Kx4> {
     debug_assert_eq!(xs.len(), row_len * 4);
     let rows: [Vec<BlockQ8K>; 4] =
         std::array::from_fn(|row| quantize_q8k(&xs[row * row_len..(row + 1) * row_len]));
-    let blocks = row_len / QK_K;
+    pack_q8kx4_rows([&rows[0], &rows[1], &rows[2], &rows[3]])
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn pack_q8kx4_rows(rows: [&[BlockQ8K]; 4]) -> Vec<BlockQ8Kx4> {
+    let blocks = rows[0].len();
+    debug_assert!(rows.iter().all(|row| row.len() == blocks));
     let mut out = Vec::with_capacity(blocks);
     for block in 0..blocks {
         let src = [

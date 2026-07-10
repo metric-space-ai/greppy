@@ -483,9 +483,10 @@ impl CpuQwen35Model {
         let profile = std::env::var_os("QWEN35_NATIVE_CPU_PROFILE_STAGES").is_some();
         #[cfg(test)]
         let stage_start = std::time::Instant::now();
+        let input = layer.ffn_gate.prepare_q8k_rows(hidden, rows)?;
         let (gate, up) = rayon::join(
-            || layer.ffn_gate.matmul(hidden, rows),
-            || layer.ffn_up.matmul(hidden, rows),
+            || layer.ffn_gate.matmul_prepared_q8k_rows(&input),
+            || layer.ffn_up.matmul_prepared_q8k_rows(&input),
         );
         let mut gate = gate?;
         #[cfg(test)]
@@ -521,10 +522,11 @@ impl CpuQwen35Model {
         #[cfg(test)]
         let stage_start = std::time::Instant::now();
         let inner = self.inventory.ssm_inner_size;
-        let mut qkv = weights.attn_qkv.matmul(hidden, rows)?;
-        let z = weights.attn_gate.matmul(hidden, rows)?;
-        let beta = weights.ssm_beta.matmul(hidden, rows)?;
-        let alpha = weights.ssm_alpha.matmul(hidden, rows)?;
+        let input = weights.attn_qkv.prepare_q8k_rows(hidden, rows)?;
+        let mut qkv = weights.attn_qkv.matmul_prepared_q8k_rows(&input)?;
+        let z = weights.attn_gate.matmul_prepared_q8k_rows(&input)?;
+        let beta = weights.ssm_beta.matmul_prepared_q8k_rows(&input)?;
+        let alpha = weights.ssm_alpha.matmul_prepared_q8k_rows(&input)?;
         let mut scan_params = vec![(0.0f32, 0.0f32); rows * LINEAR_HEADS];
         #[cfg(test)]
         let projection_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
@@ -624,9 +626,10 @@ impl CpuQwen35Model {
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
         let q_dim = self.inventory.attention_heads * self.inventory.head_dim;
-        let q_fused = weights.attn_q.matmul(hidden, rows)?;
-        let mut k = weights.attn_k.matmul(hidden, rows)?;
-        let v = weights.attn_v.matmul(hidden, rows)?;
+        let input = weights.attn_q.prepare_q8k_rows(hidden, rows)?;
+        let q_fused = weights.attn_q.matmul_prepared_q8k_rows(&input)?;
+        let mut k = weights.attn_k.matmul_prepared_q8k_rows(&input)?;
+        let v = weights.attn_v.matmul_prepared_q8k_rows(&input)?;
         #[cfg(test)]
         let projection_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
         #[cfg(test)]

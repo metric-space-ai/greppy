@@ -583,7 +583,43 @@ fn load_cuda_backend(
 #[cfg(test)]
 mod cpu_perf_tests {
     use super::*;
+    use greppy_embed_native::matmul::QuantMatrix;
     use tokenizers::Tokenizer;
+
+    #[test]
+    fn qwen35_prepared_q8k_rows_match_regular_matmul_when_env_set() {
+        let Some(gguf) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
+            return;
+        };
+        let model = greppy_embed_native::GgufModel::open(gguf).expect("open Qwen3.5 GGUF");
+        for name in [
+            "blk.0.ssm_out.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.ffn_down.weight",
+        ] {
+            let matrix = QuantMatrix::from_model_q4_x8(&model, name).expect("load quant matrix");
+            let rows = 5;
+            let input = (0..rows * matrix.cols())
+                .map(|idx| ((idx * 37 % 257) as f32 - 128.0) / 97.0)
+                .collect::<Vec<_>>();
+            let expected = matrix.matmul(&input, rows).expect("regular quant matmul");
+            let prepared = matrix
+                .prepare_q8k_rows(&input, rows)
+                .expect("prepare Q8_K rows");
+            let actual = matrix
+                .matmul_prepared_q8k_rows(&prepared)
+                .expect("prepared quant matmul");
+            let max_abs = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1.0e-5,
+                "prepared Q8_K rows drift for {name}: max_abs={max_abs:.6e}"
+            );
+        }
+    }
 
     #[test]
     fn qwen35_cpu_batched_prefill_matches_tokenwise_when_env_set() {
