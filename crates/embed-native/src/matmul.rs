@@ -4092,8 +4092,11 @@ fn dot4_q6k_q8k(
         return dot4_q6k_q8k_neon(xs0, xs1, xs2, xs3, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind().has_avx2() {
-        unsafe {
+    unsafe {
+        if x86_kernel_kind() == X86KernelKind::AvxVnni {
+            return dot4x1_q6k_q8k_avxvnni([xs0, xs1, xs2, xs3], ys);
+        }
+        if x86_kernel_kind().has_avx2() {
             return (
                 dot_q6k_q8k_avx2(xs0, ys),
                 dot_q6k_q8k_avx2(xs1, ys),
@@ -5821,6 +5824,87 @@ unsafe fn q6_scale_pair_shuffle_avx2(pair: usize) -> __m128i {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot4x1_q6k_q8k_avxvnni(
+    weights: [&[BlockQ6K]; 4],
+    input: &[BlockQ8K],
+) -> (f32, f32, f32, f32) {
+    let low_nibble = _mm256_set1_epi8(0x0f);
+    let high_mask = _mm256_set1_epi8(0x03);
+    let mut sums = [0.0f32; 4];
+    for block in 0..weights[0].len() {
+        let x: [&BlockQ6K; 4] = std::array::from_fn(|output| &weights[output][block]);
+        let y = &input[block];
+        let mut corrections = [0i32; 4];
+        for output in 0..4 {
+            for group in 0..QK_K / 16 {
+                corrections[output] += 32 * y.bsums[group] as i32 * x[output].scales[group] as i32;
+            }
+        }
+
+        let mut integer_sums = [_mm256_setzero_si256(); 4];
+        for half in 0..2 {
+            let q8: [__m256i; 4] = std::array::from_fn(|group| {
+                _mm256_loadu_si256(y.qs.as_ptr().add(half * 128 + group * 32) as *const __m256i)
+            });
+            for output in 0..4 {
+                let ql0 =
+                    _mm256_loadu_si256(x[output].ql.as_ptr().add(half * 64) as *const __m256i);
+                let ql1 =
+                    _mm256_loadu_si256(x[output].ql.as_ptr().add(half * 64 + 32) as *const __m256i);
+                let qh = _mm256_loadu_si256(x[output].qh.as_ptr().add(half * 32) as *const __m256i);
+                let quantized = [
+                    _mm256_or_si256(
+                        _mm256_and_si256(ql0, low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(qh, high_mask)),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(ql1, low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(
+                            _mm256_srli_epi16::<2>(qh),
+                            high_mask,
+                        )),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(
+                            _mm256_srli_epi16::<4>(qh),
+                            high_mask,
+                        )),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(ql1), low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(
+                            _mm256_srli_epi16::<6>(qh),
+                            high_mask,
+                        )),
+                    ),
+                ];
+                for group in 0..4 {
+                    let scale0 = x[output].scales[half * 8 + group * 2] as i32;
+                    let scale1 = x[output].scales[half * 8 + group * 2 + 1] as i32;
+                    let scale = _mm256_set_epi32(
+                        scale1, scale1, scale1, scale1, scale0, scale0, scale0, scale0,
+                    );
+                    let dot = _mm256_dpbusd_avx_epi32(
+                        _mm256_setzero_si256(),
+                        quantized[group],
+                        q8[group],
+                    );
+                    integer_sums[output] =
+                        _mm256_add_epi32(integer_sums[output], _mm256_mullo_epi32(dot, scale));
+                }
+            }
+        }
+        for output in 0..4 {
+            let integer_sum = hsum_i32x8_avx2(integer_sums[output]) - corrections[output];
+            sums[output] += x[output].d.to_f32() * y.d * integer_sum as f32;
+        }
+    }
+    (sums[0], sums[1], sums[2], sums[3])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot4x4_q6k_q8k_avxvnni(
     weights: [&[BlockQ6K]; 4],
     inputs: [&[BlockQ8K]; 4],
@@ -6684,6 +6768,23 @@ mod x86_tests {
             .chunks_exact(row_blocks * QK_K)
             .map(quantize_q8k)
             .collect::<Vec<_>>();
+        let compact = unsafe {
+            dot4x1_q6k_q8k_avxvnni(
+                [&weights[0], &weights[1], &weights[2], &weights[3]],
+                &requantized_rows[0],
+            )
+        };
+        for (output, actual) in [compact.0, compact.1, compact.2, compact.3]
+            .into_iter()
+            .enumerate()
+        {
+            let expected = unsafe { dot_q6k_q8k_avx2(&weights[output], &requantized_rows[0]) };
+            let tolerance = 2.0e-4 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "compact Q6_K 4x1 VNNI mismatch output={output}: actual={actual} expected={expected} tolerance={tolerance}",
+            );
+        }
         let actual = unsafe { dot8x4_q6k_q8k_avxvnni(&packed_weights, &packed_input) };
         let wide = unsafe {
             dot8x16_q6k_q8k_avxvnni(
