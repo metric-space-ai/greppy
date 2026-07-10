@@ -231,7 +231,7 @@ pub struct PreparedQ8KRows {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     tiles_x4: Vec<Vec<BlockQ8Kx4>>,
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    tail_repeated_x4: Vec<Vec<BlockQ8Kx4>>,
+    tail_x4: Option<(Vec<BlockQ8Kx4>, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -590,10 +590,14 @@ impl QuantMatrix {
             .map(|rows| pack_q8kx4_rows([&rows[0], &rows[1], &rows[2], &rows[3]]))
             .collect::<Vec<_>>();
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        let tail_repeated_x4 = activations[rows & !3..]
-            .iter()
-            .map(|row| pack_q8kx4_repeated(row))
-            .collect::<Vec<_>>();
+        let tail = &activations[rows & !3..];
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let tail_x4 = tail.last().map(|last| {
+            let packed = pack_q8kx4_rows(std::array::from_fn(|lane| {
+                tail.get(lane).unwrap_or(last).as_slice()
+            }));
+            (packed, tail.len())
+        });
         Ok(PreparedQ8KRows {
             rows,
             cols: self.cols,
@@ -601,7 +605,7 @@ impl QuantMatrix {
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             tiles_x4,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            tail_repeated_x4,
+            tail_x4,
         })
     }
 
@@ -1532,17 +1536,24 @@ fn matmul_q4kx8_batched_prepared(
                         }
                     }
                 }
-                for tail_lane in 0..lhs_rows - tiled_rows {
-                    let input_row = tiled_rows + tail_lane;
-                    let values = if use_i8mm {
-                        unsafe {
-                            dot8x4_q4k_q8k_neon(weights, &input.tail_repeated_x4[tail_lane])[0]
+                if use_i8mm {
+                    if let Some((tail, tail_rows)) = &input.tail_x4 {
+                        let values = unsafe { dot8x4_q4k_q8k_neon(weights, tail) };
+                        for input_lane in 0..*tail_rows {
+                            let input_row = tiled_rows + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[input_lane][output_lane];
+                            }
                         }
-                    } else {
-                        unsafe { dot8_q4k_q8k_neon(weights, &input.activations[input_row]) }
-                    };
-                    for output_lane in 0..8 {
-                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                    }
+                } else {
+                    for input_row in tiled_rows..lhs_rows {
+                        let values =
+                            unsafe { dot8_q4k_q8k_neon(weights, &input.activations[input_row]) };
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                        }
                     }
                 }
             }
@@ -1675,11 +1686,14 @@ fn matmul_x8_batched_avxvnni_prepared<T: Sync>(
                         }
                     }
                 }
-                for (tail_lane, xq) in input.tail_repeated_x4.iter().enumerate() {
-                    let input_row = tiled_rows + tail_lane;
-                    let values = unsafe { kernel_x4(weights, xq) }[0];
-                    for output_lane in 0..8 {
-                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                if let Some((tail, tail_rows)) = &input.tail_x4 {
+                    let values = unsafe { kernel_x4(weights, tail) };
+                    for input_lane in 0..*tail_rows {
+                        let input_row = tiled_rows + input_lane;
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] =
+                                values[input_lane][output_lane];
+                        }
                     }
                 }
             }
@@ -2528,11 +2542,14 @@ fn matmul_x8_batched_i8mm_prepared<T: Sync>(
                         }
                     }
                 }
-                for (tail_lane, xq) in input.tail_repeated_x4.iter().enumerate() {
-                    let input_row = tiled_rows + tail_lane;
-                    let values = unsafe { kernel(weights, xq) }[0];
-                    for output_lane in 0..8 {
-                        group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
+                if let Some((tail, tail_rows)) = &input.tail_x4 {
+                    let values = unsafe { kernel(weights, tail) };
+                    for input_lane in 0..*tail_rows {
+                        let input_row = tiled_rows + input_lane;
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] =
+                                values[input_lane][output_lane];
+                        }
                     }
                 }
             }
