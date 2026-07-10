@@ -62,6 +62,7 @@ pub(crate) struct CudaMtpState {
     max_context: usize,
     k_cache: DeviceBuffer,
     v_cache: DeviceBuffer,
+    workspace: Option<CudaMtpWorkspace>,
 }
 
 enum CudaLayerState {
@@ -123,6 +124,15 @@ struct CudaPrefillWorkspace {
     ffn_up: DeviceBuffer,
     q8_scratch: DeviceBuffer,
     fixup_scratch: DeviceBuffer,
+}
+
+struct CudaMtpWorkspace {
+    mmq_rows: usize,
+    logits_rows: usize,
+    prefill: CudaPrefillWorkspace,
+    target_hidden: DeviceBuffer,
+    joined: DeviceBuffer,
+    logits: DeviceBuffer,
 }
 
 impl CudaQwen35Model {
@@ -253,7 +263,6 @@ impl CudaQwen35Model {
             .saturating_add(1)
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
-        let vocab_size = self.inventory.vocab_size;
         let mut perf = crate::MtpPerfTimer::new();
         let mut target_state = self.new_forward_state(max_context)?;
         let mut target_workspace = self.new_forward_workspace(max_context)?;
@@ -412,32 +421,21 @@ impl CudaQwen35Model {
             self.copy_forward_state(&target_state, &mut speculative_target_state)?;
             perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
             let stage = perf.begin_stage();
-            let mut verification = CudaTargetForwardOutput {
-                hidden: Vec::with_capacity(verification_tokens.len() * hidden_size),
-                logits: Vec::with_capacity(verification_tokens.len() * vocab_size),
-            };
-            for &token in &verification_tokens {
-                let output = self.forward_token_logits_hidden_graph(
-                    token,
-                    &mut speculative_target_state,
-                    &mut speculative_target_workspace,
-                )?;
-                verification.hidden.extend(output.hidden);
-                verification.logits.extend(output.logits);
-            }
-            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+            let mut committed_hidden = Vec::with_capacity(verification_tokens.len() * hidden_size);
+            let mut verify_input = next;
             let mut accepted = 0usize;
             let mut mismatch = None;
             let mut finished = false;
             for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
-                let row_start = draft_index * vocab_size;
-                let row_end = row_start + vocab_size;
-                let Some(target_token) = sample_token(
-                    &mut verification.logits[row_start..row_end],
-                    &generated,
-                    params,
-                    &mut rng,
-                ) else {
+                let mut output = self.forward_token_logits_hidden_graph(
+                    verify_input,
+                    &mut speculative_target_state,
+                    &mut speculative_target_workspace,
+                )?;
+                committed_hidden.extend_from_slice(&output.hidden);
+                let Some(target_token) =
+                    sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
                     finished = true;
                     break;
                 };
@@ -461,21 +459,26 @@ impl CudaQwen35Model {
                     finished = true;
                     break;
                 }
+                verify_input = draft_token;
             }
+            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
             if finished {
                 break;
             }
             mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
 
             if accepted == draft_tokens.len() {
-                let row_start = accepted * vocab_size;
-                let row_end = row_start + vocab_size;
-                let Some(target_token) = sample_token(
-                    &mut verification.logits[row_start..row_end],
-                    &generated,
-                    params,
-                    &mut rng,
-                ) else {
+                let stage = perf.begin_stage();
+                let mut output = self.forward_token_logits_hidden_graph(
+                    verify_input,
+                    &mut speculative_target_state,
+                    &mut speculative_target_workspace,
+                )?;
+                perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                committed_hidden.extend_from_slice(&output.hidden);
+                let Some(target_token) =
+                    sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
                     break;
                 };
                 if target_token == self.eos_token_id {
@@ -489,11 +492,11 @@ impl CudaQwen35Model {
                 target_state.graph_unavailable = false;
                 target_state.graph_token = None;
                 pending_target_hidden =
-                    last_hidden_row(&verification.hidden, verification_tokens.len(), hidden_size)?
+                    last_hidden_row(&committed_hidden, verification_tokens.len(), hidden_size)?
                         .to_vec();
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
-                    &verification.hidden,
+                    &committed_hidden,
                     verification_tokens.len(),
                     hidden_size,
                 )?;
@@ -504,17 +507,11 @@ impl CudaQwen35Model {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
-                let stage = perf.begin_stage();
-                let mut committed_hidden = Vec::with_capacity(commit_count * hidden_size);
-                for &token in commit_tokens {
-                    let output = self.forward_token_logits_hidden_graph(
-                        token,
-                        &mut target_state,
-                        &mut target_workspace,
-                    )?;
-                    committed_hidden.extend(output.hidden);
-                }
-                perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
+                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                target_state.decode_graph = None;
+                target_state.decode_graph_mode = None;
+                target_state.graph_unavailable = false;
+                target_state.graph_token = None;
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,
@@ -634,6 +631,20 @@ impl CudaQwen35Model {
                 .new_f32(max_context * self.inventory.kv_heads * self.inventory.head_dim)?,
             v_cache: self
                 .new_f32(max_context * self.inventory.kv_heads * self.inventory.value_dim)?,
+            workspace: Some(self.new_mtp_workspace(CUDA_MMQ_ROW_TILE, 1)?),
+        })
+    }
+
+    fn new_mtp_workspace(&self, mmq_rows: usize, logits_rows: usize) -> Result<CudaMtpWorkspace> {
+        let hidden_size = self.inventory.hidden_size;
+        let logits_rows = logits_rows.max(1);
+        Ok(CudaMtpWorkspace {
+            mmq_rows,
+            logits_rows,
+            prefill: self.new_prefill_workspace(mmq_rows)?,
+            target_hidden: self.new_f32(mmq_rows * hidden_size)?,
+            joined: self.new_f32(mmq_rows * hidden_size * 2)?,
+            logits: self.new_f32(logits_rows * self.inventory.vocab_size)?,
         })
     }
 
@@ -944,132 +955,152 @@ impl CudaQwen35Model {
         let layer = self.inventory.block_count;
         let prefix = format!("blk.{layer}");
         let mmq_rows = rows.div_ceil(CUDA_MMQ_ROW_TILE) * CUDA_MMQ_ROW_TILE;
-        let mut workspace = self.new_prefill_workspace(mmq_rows)?;
-        let target_buffer = self.new_f32(mmq_rows * hidden_size)?;
-        let joined = self.new_f32(mmq_rows * hidden_size * 2)?;
-        self.dev.copy_h2d(&workspace.token_ids, tokens)?;
-        self.dev.copy_h2d(&target_buffer, target_hidden)?;
-        self.embed_tokens_device(
-            workspace.token_ids.as_u32(),
-            workspace.hidden.as_f32(),
-            rows,
-        )?;
-        self.rms_norm_device(
-            &format!("{prefix}.nextn.enorm.weight"),
-            workspace.hidden.as_f32(),
-            workspace.normed.as_f32(),
-            rows,
-            hidden_size,
-            true,
-        )?;
-        self.rms_norm_device(
-            &format!("{prefix}.nextn.hnorm.weight"),
-            target_buffer.as_f32(),
-            workspace.attn_out.as_f32(),
-            rows,
-            hidden_size,
-            true,
-        )?;
-        check(
-            unsafe {
-                gp_qwen_concat_rows(
-                    workspace.normed.as_f32(),
-                    workspace.attn_out.as_f32(),
-                    joined.as_f32(),
-                    checked_i32(rows, "MTP concat rows")?,
-                    checked_i32(hidden_size, "MTP concat hidden")?,
-                    self.dev.stream(),
-                )
-            },
-            "qwen35 CUDA MTP concat rows",
-        )?;
-        let mut q8_dtype = None;
-        self.projection_matmul_rows_device_to(
-            &format!("{prefix}.nextn.eh_proj.weight"),
-            joined.as_f32(),
-            workspace.mmq_rows,
-            hidden_size * 2,
-            workspace.hidden.as_f32(),
-            hidden_size,
-            &mut q8_dtype,
-            &workspace.q8_scratch,
-            &workspace.fixup_scratch,
-        )?;
-        self.rms_norm_device(
-            &format!("{prefix}.attn_norm.weight"),
-            workspace.hidden.as_f32(),
-            workspace.normed.as_f32(),
-            rows,
-            hidden_size,
-            true,
-        )?;
-        self.full_attention_block_rows_device(
-            layer,
-            &state.k_cache,
-            &state.v_cache,
-            state.position,
-            rows,
-            state.max_context,
-            &mut workspace,
-        )?;
-        self.add_rms_norm_device(
-            &format!("{prefix}.post_attention_norm.weight"),
-            workspace.hidden.as_f32(),
-            workspace.attn_out.as_f32(),
-            workspace.hidden.as_f32(),
-            workspace.normed.as_f32(),
-            rows,
-            hidden_size,
-        )?;
-        self.ffn_block_rows_device(layer, rows, &mut workspace)?;
-        self.add_device(
-            workspace.hidden.as_f32(),
-            workspace.attn_out.as_f32(),
-            workspace.hidden.as_f32(),
-            rows * hidden_size,
-        )?;
-        let logits_device = if include_logits {
+        let required_logits_rows = if include_logits { rows } else { 0 };
+        let mut mtp_workspace = state.workspace.take().ok_or_else(|| {
+            Error::GenerationUnavailable("CUDA MTP workspace is already in use".into())
+        })?;
+        if mmq_rows > mtp_workspace.mmq_rows || required_logits_rows > mtp_workspace.logits_rows {
+            let grown = self.new_mtp_workspace(
+                mmq_rows.max(mtp_workspace.mmq_rows),
+                required_logits_rows.max(mtp_workspace.logits_rows),
+            );
+            match grown {
+                Ok(workspace) => mtp_workspace = workspace,
+                Err(error) => {
+                    state.workspace = Some(mtp_workspace);
+                    return Err(error);
+                }
+            }
+        }
+        let result = (|| -> Result<CudaTargetForwardOutput> {
+            let CudaMtpWorkspace {
+                prefill: workspace,
+                target_hidden: target_buffer,
+                joined,
+                logits: logits_device,
+                ..
+            } = &mut mtp_workspace;
+            self.dev.copy_h2d(&workspace.token_ids, tokens)?;
+            self.dev.copy_h2d(target_buffer, target_hidden)?;
+            self.embed_tokens_device(
+                workspace.token_ids.as_u32(),
+                workspace.hidden.as_f32(),
+                rows,
+            )?;
             self.rms_norm_device(
-                &format!("{prefix}.nextn.shared_head_norm.weight"),
+                &format!("{prefix}.nextn.enorm.weight"),
                 workspace.hidden.as_f32(),
                 workspace.normed.as_f32(),
                 rows,
                 hidden_size,
                 true,
             )?;
-            let logits = self.new_f32(rows * self.inventory.vocab_size)?;
-            for row in 0..rows {
-                self.matvec_device_to(
-                    "token_embd.weight",
-                    unsafe { workspace.normed.as_f32().add(row * hidden_size) },
+            self.rms_norm_device(
+                &format!("{prefix}.nextn.hnorm.weight"),
+                target_buffer.as_f32(),
+                workspace.attn_out.as_f32(),
+                rows,
+                hidden_size,
+                true,
+            )?;
+            check(
+                unsafe {
+                    gp_qwen_concat_rows(
+                        workspace.normed.as_f32(),
+                        workspace.attn_out.as_f32(),
+                        joined.as_f32(),
+                        checked_i32(rows, "MTP concat rows")?,
+                        checked_i32(hidden_size, "MTP concat hidden")?,
+                        self.dev.stream(),
+                    )
+                },
+                "qwen35 CUDA MTP concat rows",
+            )?;
+            let mut q8_dtype = None;
+            self.projection_matmul_rows_device_to(
+                &format!("{prefix}.nextn.eh_proj.weight"),
+                joined.as_f32(),
+                workspace.mmq_rows,
+                hidden_size * 2,
+                workspace.hidden.as_f32(),
+                hidden_size,
+                &mut q8_dtype,
+                &workspace.q8_scratch,
+                &workspace.fixup_scratch,
+            )?;
+            self.rms_norm_device(
+                &format!("{prefix}.attn_norm.weight"),
+                workspace.hidden.as_f32(),
+                workspace.normed.as_f32(),
+                rows,
+                hidden_size,
+                true,
+            )?;
+            self.full_attention_block_rows_device(
+                layer,
+                &state.k_cache,
+                &state.v_cache,
+                state.position,
+                rows,
+                state.max_context,
+                workspace,
+            )?;
+            self.add_rms_norm_device(
+                &format!("{prefix}.post_attention_norm.weight"),
+                workspace.hidden.as_f32(),
+                workspace.attn_out.as_f32(),
+                workspace.hidden.as_f32(),
+                workspace.normed.as_f32(),
+                rows,
+                hidden_size,
+            )?;
+            self.ffn_block_rows_device(layer, rows, workspace)?;
+            self.add_device(
+                workspace.hidden.as_f32(),
+                workspace.attn_out.as_f32(),
+                workspace.hidden.as_f32(),
+                rows * hidden_size,
+            )?;
+            if include_logits {
+                self.rms_norm_device(
+                    &format!("{prefix}.nextn.shared_head_norm.weight"),
+                    workspace.hidden.as_f32(),
+                    workspace.normed.as_f32(),
+                    rows,
                     hidden_size,
-                    unsafe { logits.as_f32().add(row * self.inventory.vocab_size) },
-                    self.inventory.vocab_size,
-                    &workspace.q8_scratch,
+                    true,
                 )?;
+                for row in 0..rows {
+                    self.matvec_device_to(
+                        "token_embd.weight",
+                        unsafe { workspace.normed.as_f32().add(row * hidden_size) },
+                        hidden_size,
+                        unsafe { logits_device.as_f32().add(row * self.inventory.vocab_size) },
+                        self.inventory.vocab_size,
+                        &workspace.q8_scratch,
+                    )?;
+                }
             }
-            Some(logits)
-        } else {
-            None
-        };
-        self.dev.sync()?;
-        state.position += rows;
-        let hidden = if include_logits {
-            let mut hidden = vec![0.0f32; rows * hidden_size];
-            self.dev.copy_d2h(&mut hidden, &workspace.normed)?;
-            hidden
-        } else {
-            Vec::new()
-        };
-        let logits = match logits_device {
-            Some(logits) => {
+            self.dev.sync()?;
+            state.position += rows;
+            let hidden = if include_logits {
+                let mut hidden = vec![0.0f32; rows * hidden_size];
+                self.dev.copy_d2h(&mut hidden, &workspace.normed)?;
+                hidden
+            } else {
+                Vec::new()
+            };
+            let logits = if include_logits {
                 let mut values = vec![0.0f32; rows * self.inventory.vocab_size];
-                self.dev.copy_d2h(&mut values, &logits)?;
+                self.dev.copy_d2h(&mut values, logits_device)?;
                 values
-            }
-            None => Vec::new(),
-        };
-        Ok(CudaTargetForwardOutput { hidden, logits })
+            } else {
+                Vec::new()
+            };
+            Ok(CudaTargetForwardOutput { hidden, logits })
+        })();
+        state.workspace = Some(mtp_workspace);
+        result
     }
 
     fn prefill_tokens_impl(

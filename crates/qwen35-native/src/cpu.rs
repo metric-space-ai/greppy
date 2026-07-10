@@ -309,7 +309,6 @@ impl CpuQwen35Model {
             .saturating_add(1)
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
-        let vocab_size = self.inventory.vocab_size;
         let mut perf = crate::MtpPerfTimer::new();
         let mut target_state = self.new_state(max_context);
         let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
@@ -455,23 +454,18 @@ impl CpuQwen35Model {
             speculative_target_state.clone_from(&target_state);
             perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
             let stage = perf.begin_stage();
-            let mut verification = self.forward_tokens_logits_hidden(
-                &verification_tokens,
-                &mut speculative_target_state,
-            )?;
-            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+            let mut committed_hidden = Vec::with_capacity(verification_tokens.len() * hidden_size);
+            let mut verify_input = next;
             let mut accepted = 0usize;
             let mut mismatch = None;
             let mut finished = false;
             for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
-                let row_start = draft_index * vocab_size;
-                let row_end = row_start + vocab_size;
-                let Some(target_token) = sample_token(
-                    &mut verification.logits[row_start..row_end],
-                    &generated,
-                    params,
-                    &mut rng,
-                ) else {
+                let mut output =
+                    self.forward_token_logits_hidden(verify_input, &mut speculative_target_state)?;
+                committed_hidden.extend_from_slice(&output.hidden);
+                let Some(target_token) =
+                    sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
                     finished = true;
                     break;
                 };
@@ -495,21 +489,23 @@ impl CpuQwen35Model {
                     finished = true;
                     break;
                 }
+                verify_input = draft_token;
             }
+            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
             if finished {
                 break;
             }
             mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
 
             if accepted == draft_tokens.len() {
-                let row_start = accepted * vocab_size;
-                let row_end = row_start + vocab_size;
-                let Some(target_token) = sample_token(
-                    &mut verification.logits[row_start..row_end],
-                    &generated,
-                    params,
-                    &mut rng,
-                ) else {
+                let stage = perf.begin_stage();
+                let mut output =
+                    self.forward_token_logits_hidden(verify_input, &mut speculative_target_state)?;
+                perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                committed_hidden.extend_from_slice(&output.hidden);
+                let Some(target_token) =
+                    sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
                     break;
                 };
                 if target_token == self.eos_token_id {
@@ -519,11 +515,11 @@ impl CpuQwen35Model {
                 next = target_token;
                 std::mem::swap(&mut target_state, &mut speculative_target_state);
                 pending_target_hidden =
-                    last_hidden_row(&verification.hidden, verification_tokens.len(), hidden_size)?
+                    last_hidden_row(&committed_hidden, verification_tokens.len(), hidden_size)?
                         .to_vec();
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
-                    &verification.hidden,
+                    &committed_hidden,
                     verification_tokens.len(),
                     hidden_size,
                 )?;
@@ -534,10 +530,7 @@ impl CpuQwen35Model {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
-                let stage = perf.begin_stage();
-                let committed_hidden =
-                    self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
-                perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
+                std::mem::swap(&mut target_state, &mut speculative_target_state);
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,

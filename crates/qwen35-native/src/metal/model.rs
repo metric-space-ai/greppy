@@ -35,6 +35,7 @@ pub(crate) struct MetalMtpState {
     max_context: usize,
     k_cache: Buffer,
     v_cache: Buffer,
+    workspace: Option<MetalMtpWorkspace>,
 }
 
 enum MetalLayerState {
@@ -82,6 +83,15 @@ struct MetalPrefillWorkspace {
     ffn_gate: Buffer,
     ffn_up: Buffer,
     scores: Buffer,
+}
+
+struct MetalMtpWorkspace {
+    rows: usize,
+    logits_rows: usize,
+    prefill: MetalPrefillWorkspace,
+    target_hidden: Buffer,
+    joined: Buffer,
+    logits: Buffer,
 }
 
 const METAL_PREFILL_BATCH_ROWS: usize = 512;
@@ -207,7 +217,6 @@ impl MetalQwen35Model {
             .saturating_add(1)
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
-        let vocab_size = self.inventory.vocab_size;
         let mut perf = crate::MtpPerfTimer::new();
         let mut target_state = self.new_forward_state(max_context)?;
         let mut target_workspace = self.new_forward_workspace(max_context)?;
@@ -365,23 +374,21 @@ impl MetalQwen35Model {
             self.copy_forward_state(&target_state, &mut speculative_target_state)?;
             perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
             let stage = perf.begin_stage();
-            let mut verification = self.forward_tokens_logits_hidden(
-                &verification_tokens,
-                &mut speculative_target_state,
-            )?;
-            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+            let mut committed_hidden = Vec::with_capacity(verification_tokens.len() * hidden_size);
+            let mut verify_input = next;
             let mut accepted = 0usize;
             let mut mismatch = None;
             let mut finished = false;
             for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
-                let row_start = draft_index * vocab_size;
-                let row_end = row_start + vocab_size;
-                let Some(target_token) = sample_token(
-                    &mut verification.logits[row_start..row_end],
-                    &generated,
-                    params,
-                    &mut rng,
-                ) else {
+                let mut output = self.forward_token_logits_hidden(
+                    verify_input,
+                    &mut speculative_target_state,
+                    &mut target_workspace,
+                )?;
+                committed_hidden.extend_from_slice(&output.hidden);
+                let Some(target_token) =
+                    sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
                     finished = true;
                     break;
                 };
@@ -405,21 +412,26 @@ impl MetalQwen35Model {
                     finished = true;
                     break;
                 }
+                verify_input = draft_token;
             }
+            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
             if finished {
                 break;
             }
             mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
 
             if accepted == draft_tokens.len() {
-                let row_start = accepted * vocab_size;
-                let row_end = row_start + vocab_size;
-                let Some(target_token) = sample_token(
-                    &mut verification.logits[row_start..row_end],
-                    &generated,
-                    params,
-                    &mut rng,
-                ) else {
+                let stage = perf.begin_stage();
+                let mut output = self.forward_token_logits_hidden(
+                    verify_input,
+                    &mut speculative_target_state,
+                    &mut target_workspace,
+                )?;
+                perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                committed_hidden.extend_from_slice(&output.hidden);
+                let Some(target_token) =
+                    sample_token(&mut output.logits, &generated, params, &mut rng)
+                else {
                     break;
                 };
                 if target_token == self.eos_token_id {
@@ -429,11 +441,11 @@ impl MetalQwen35Model {
                 next = target_token;
                 std::mem::swap(&mut target_state, &mut speculative_target_state);
                 pending_target_hidden =
-                    last_hidden_row(&verification.hidden, verification_tokens.len(), hidden_size)?
+                    last_hidden_row(&committed_hidden, verification_tokens.len(), hidden_size)?
                         .to_vec();
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
-                    &verification.hidden,
+                    &committed_hidden,
                     verification_tokens.len(),
                     hidden_size,
                 )?;
@@ -444,10 +456,7 @@ impl MetalQwen35Model {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
-                let stage = perf.begin_stage();
-                let committed_hidden =
-                    self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
-                perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
+                std::mem::swap(&mut target_state, &mut speculative_target_state);
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,
@@ -549,6 +558,25 @@ impl MetalQwen35Model {
                 .new_f32(max_context * self.inventory.kv_heads * self.inventory.head_dim)?,
             v_cache: self
                 .new_f32(max_context * self.inventory.kv_heads * self.inventory.value_dim)?,
+            workspace: Some(self.new_mtp_workspace(1, 1, max_context)?),
+        })
+    }
+
+    fn new_mtp_workspace(
+        &self,
+        rows: usize,
+        logits_rows: usize,
+        max_context: usize,
+    ) -> Result<MetalMtpWorkspace> {
+        let hidden_size = self.inventory.hidden_size;
+        let logits_rows = logits_rows.max(1);
+        Ok(MetalMtpWorkspace {
+            rows,
+            logits_rows,
+            prefill: self.new_prefill_workspace(rows, max_context)?,
+            target_hidden: self.new_f32(rows * hidden_size)?,
+            joined: self.new_f32(rows * hidden_size * 2)?,
+            logits: self.new_f32(logits_rows * self.inventory.vocab_size)?,
         })
     }
 
@@ -922,107 +950,83 @@ impl MetalQwen35Model {
         }
         let layer = self.inventory.block_count;
         let prefix = format!("blk.{layer}");
-        let workspace = self.new_prefill_workspace(rows, state.max_context)?;
-        let target_hidden = self.upload_pod(target_hidden)?;
-        let joined = self.new_f32(rows * hidden_size * 2)?;
-        let logits = if include_logits {
-            Some(self.new_f32(rows * self.inventory.vocab_size)?)
-        } else {
-            None
-        };
-        unsafe {
-            workspace.token_ids.write(0, tokens);
+        let required_logits_rows = if include_logits { rows } else { 0 };
+        let mut mtp_workspace = state.workspace.take().ok_or_else(|| {
+            Error::GenerationUnavailable("Metal MTP workspace is already in use".into())
+        })?;
+        if rows > mtp_workspace.rows || required_logits_rows > mtp_workspace.logits_rows {
+            let grown = self.new_mtp_workspace(
+                rows.max(mtp_workspace.rows),
+                required_logits_rows.max(mtp_workspace.logits_rows),
+                state.max_context,
+            );
+            match grown {
+                Ok(workspace) => mtp_workspace = workspace,
+                Err(error) => {
+                    state.workspace = Some(mtp_workspace);
+                    return Err(error);
+                }
+            }
         }
-        let cb = self.command_buffer()?;
-        let enc = cb
-            .compute_concurrent()
-            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
-        self.encode_embed_tokens(&enc, &workspace.token_ids, &workspace.hidden, rows)?;
-        enc.memory_barrier_buffers();
-        self.encode_rms_norm(
-            &enc,
-            &format!("{prefix}.nextn.enorm.weight"),
-            &workspace.hidden,
-            &workspace.normed,
-            rows,
-            hidden_size,
-            true,
-        )?;
-        self.encode_rms_norm(
-            &enc,
-            &format!("{prefix}.nextn.hnorm.weight"),
-            &target_hidden,
-            &workspace.attn_out,
-            rows,
-            hidden_size,
-            true,
-        )?;
-        enc.memory_barrier_buffers();
-        self.encode_concat_rows(
-            &enc,
-            &workspace.normed,
-            &workspace.attn_out,
-            &joined,
-            rows,
-            hidden_size,
-        )?;
-        enc.memory_barrier_buffers();
-        self.encode_matmul_rows_to(
-            &enc,
-            &format!("{prefix}.nextn.eh_proj.weight"),
-            &joined,
-            rows,
-            hidden_size * 2,
-            &workspace.hidden,
-            hidden_size,
-        )?;
-        enc.memory_barrier_buffers();
-        self.encode_rms_norm(
-            &enc,
-            &format!("{prefix}.attn_norm.weight"),
-            &workspace.hidden,
-            &workspace.normed,
-            rows,
-            hidden_size,
-            true,
-        )?;
-        enc.memory_barrier_buffers();
-        self.encode_full_attention_block_rows(
-            &enc,
-            layer,
-            &state.k_cache,
-            &state.v_cache,
-            state.position,
-            rows,
-            state.max_context,
-            &workspace,
-        )?;
-        enc.memory_barrier_buffers();
-        self.encode_add_rms_norm(
-            &enc,
-            &format!("{prefix}.post_attention_norm.weight"),
-            &workspace.hidden,
-            &workspace.attn_out,
-            &workspace.hidden,
-            &workspace.normed,
-            rows,
-            hidden_size,
-        )?;
-        enc.memory_barrier_buffers();
-        self.encode_ffn_block_rows(&enc, layer, rows, &workspace)?;
-        enc.memory_barrier_buffers();
-        self.encode_add(
-            &enc,
-            &workspace.hidden,
-            &workspace.attn_out,
-            &workspace.hidden,
-            rows * hidden_size,
-        )?;
-        if let Some(logits) = &logits {
+        let result = (|| -> Result<MetalTargetForwardOutput> {
+            let MetalMtpWorkspace {
+                prefill: workspace,
+                target_hidden: target_buffer,
+                joined,
+                logits,
+                ..
+            } = &mut mtp_workspace;
+            unsafe {
+                workspace.token_ids.write(0, tokens);
+                target_buffer.write(0, target_hidden);
+            }
+            let cb = self.command_buffer()?;
+            let enc = cb.compute_concurrent().ok_or_else(|| {
+                Error::GenerationUnavailable("failed to create Metal encoder".into())
+            })?;
+            self.encode_embed_tokens(&enc, &workspace.token_ids, &workspace.hidden, rows)?;
             enc.memory_barrier_buffers();
             self.encode_rms_norm(
                 &enc,
-                &format!("{prefix}.nextn.shared_head_norm.weight"),
+                &format!("{prefix}.nextn.enorm.weight"),
+                &workspace.hidden,
+                &workspace.normed,
+                rows,
+                hidden_size,
+                true,
+            )?;
+            self.encode_rms_norm(
+                &enc,
+                &format!("{prefix}.nextn.hnorm.weight"),
+                target_buffer,
+                &workspace.attn_out,
+                rows,
+                hidden_size,
+                true,
+            )?;
+            enc.memory_barrier_buffers();
+            self.encode_concat_rows(
+                &enc,
+                &workspace.normed,
+                &workspace.attn_out,
+                joined,
+                rows,
+                hidden_size,
+            )?;
+            enc.memory_barrier_buffers();
+            self.encode_matmul_rows_to(
+                &enc,
+                &format!("{prefix}.nextn.eh_proj.weight"),
+                joined,
+                rows,
+                hidden_size * 2,
+                &workspace.hidden,
+                hidden_size,
+            )?;
+            enc.memory_barrier_buffers();
+            self.encode_rms_norm(
+                &enc,
+                &format!("{prefix}.attn_norm.weight"),
                 &workspace.hidden,
                 &workspace.normed,
                 rows,
@@ -1030,32 +1034,80 @@ impl MetalQwen35Model {
                 true,
             )?;
             enc.memory_barrier_buffers();
-            self.encode_matmul_rows_to(
+            self.encode_full_attention_block_rows(
                 &enc,
-                "token_embd.weight",
+                layer,
+                &state.k_cache,
+                &state.v_cache,
+                state.position,
+                rows,
+                state.max_context,
+                workspace,
+            )?;
+            enc.memory_barrier_buffers();
+            self.encode_add_rms_norm(
+                &enc,
+                &format!("{prefix}.post_attention_norm.weight"),
+                &workspace.hidden,
+                &workspace.attn_out,
+                &workspace.hidden,
                 &workspace.normed,
                 rows,
                 hidden_size,
-                logits,
-                self.inventory.vocab_size,
             )?;
-        }
-        enc.end();
-        cb.commit_and_wait()
-            .map_err(|e| Error::GenerationUnavailable(format!("Metal MTP forward failed: {e}")))?;
-        state.position += rows;
-        let output_hidden = if include_logits {
-            &workspace.normed
-        } else {
-            &workspace.hidden
-        };
-        Ok(MetalTargetForwardOutput {
-            hidden: self.read_f32(output_hidden, rows * hidden_size)?,
-            logits: match logits {
-                Some(logits) => self.read_f32(&logits, rows * self.inventory.vocab_size)?,
-                None => Vec::new(),
-            },
-        })
+            enc.memory_barrier_buffers();
+            self.encode_ffn_block_rows(&enc, layer, rows, workspace)?;
+            enc.memory_barrier_buffers();
+            self.encode_add(
+                &enc,
+                &workspace.hidden,
+                &workspace.attn_out,
+                &workspace.hidden,
+                rows * hidden_size,
+            )?;
+            if include_logits {
+                enc.memory_barrier_buffers();
+                self.encode_rms_norm(
+                    &enc,
+                    &format!("{prefix}.nextn.shared_head_norm.weight"),
+                    &workspace.hidden,
+                    &workspace.normed,
+                    rows,
+                    hidden_size,
+                    true,
+                )?;
+                enc.memory_barrier_buffers();
+                self.encode_matmul_rows_to(
+                    &enc,
+                    "token_embd.weight",
+                    &workspace.normed,
+                    rows,
+                    hidden_size,
+                    logits,
+                    self.inventory.vocab_size,
+                )?;
+            }
+            enc.end();
+            cb.commit_and_wait().map_err(|e| {
+                Error::GenerationUnavailable(format!("Metal MTP forward failed: {e}"))
+            })?;
+            state.position += rows;
+            let output_hidden = if include_logits {
+                &workspace.normed
+            } else {
+                &workspace.hidden
+            };
+            Ok(MetalTargetForwardOutput {
+                hidden: self.read_f32(output_hidden, rows * hidden_size)?,
+                logits: if include_logits {
+                    self.read_f32(logits, rows * self.inventory.vocab_size)?
+                } else {
+                    Vec::new()
+                },
+            })
+        })();
+        state.workspace = Some(mtp_workspace);
+        result
     }
 
     fn forward_tokens_hidden_device(
