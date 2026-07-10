@@ -3017,18 +3017,89 @@ unsafe fn dot4x4_q6k_q8k_neon(
     weights: [&[BlockQ6K]; 4],
     inputs: [&[BlockQ8K]; 4],
 ) -> [[f32; 4]; 4] {
+    let low_nibble = vdupq_n_u8(0x0f);
+    let high_mask = vdupq_n_u8(0x03);
     let mut sums = [[0.0f64; 4]; 4];
-    let mut decoded = [[0i8; QK_K]; 4];
     for block in 0..weights[0].len() {
-        for output in 0..4 {
-            decode_q6k_i8(&weights[output][block], &mut decoded[output]);
+        let x: [&BlockQ6K; 4] = std::array::from_fn(|output| &weights[output][block]);
+        let y: [&BlockQ8K; 4] = std::array::from_fn(|input| &inputs[input][block]);
+        let mut corrections = [[0i32; 4]; 4];
+        for input in 0..4 {
+            for output in 0..4 {
+                for group in 0..QK_K / 16 {
+                    corrections[input][output] +=
+                        32 * y[input].bsums[group] as i32 * x[output].scales[group] as i32;
+                }
+            }
+        }
+
+        let mut integer_sums = [[0i32; 4]; 4];
+        for half in 0..2 {
+            let q8_low: [int8x16x4_t; 4] =
+                std::array::from_fn(|input| vld1q_s8_x4(y[input].qs.as_ptr().add(half * 128)));
+            let q8_high: [int8x16x4_t; 4] =
+                std::array::from_fn(|input| vld1q_s8_x4(y[input].qs.as_ptr().add(half * 128 + 64)));
+            for output in 0..4 {
+                let ql = vld1q_u8_x4(x[output].ql.as_ptr().add(half * 64));
+                let qh = vld1q_u8_x2(x[output].qh.as_ptr().add(half * 32));
+                let quantized = [
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql.0, low_nibble),
+                        vshlq_n_u8(vandq_u8(qh.0, high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql.1, low_nibble),
+                        vshlq_n_u8(vandq_u8(qh.1, high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql.2, low_nibble),
+                        vshlq_n_u8(vandq_u8(vshrq_n_u8(qh.0, 2), high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql.3, low_nibble),
+                        vshlq_n_u8(vandq_u8(vshrq_n_u8(qh.1, 2), high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8(ql.0, 4),
+                        vshlq_n_u8(vandq_u8(vshrq_n_u8(qh.0, 4), high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8(ql.1, 4),
+                        vshlq_n_u8(vandq_u8(vshrq_n_u8(qh.1, 4), high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8(ql.2, 4),
+                        vshlq_n_u8(vandq_u8(vshrq_n_u8(qh.0, 6), high_mask), 4),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8(ql.3, 4),
+                        vshlq_n_u8(vandq_u8(vshrq_n_u8(qh.1, 6), high_mask), 4),
+                    )),
+                ];
+                for input in 0..4 {
+                    let input_vectors = [
+                        q8_low[input].0,
+                        q8_low[input].1,
+                        q8_low[input].2,
+                        q8_low[input].3,
+                        q8_high[input].0,
+                        q8_high[input].1,
+                        q8_high[input].2,
+                        q8_high[input].3,
+                    ];
+                    for group in 0..8 {
+                        integer_sums[input][output] +=
+                            vaddvq_s32(neon_vdotq_s32(quantized[group], input_vectors[group]))
+                                * x[output].scales[half * 8 + group] as i32;
+                    }
+                }
+            }
         }
         for input in 0..4 {
             for output in 0..4 {
-                let x = &weights[output][block];
-                let y = &inputs[input][block];
-                let integer_sum = dot_q6k_i8_q8k_neon(&decoded[output], &x.scales, y);
-                sums[input][output] += x.d.to_f32() as f64 * y.d as f64 * integer_sum as f64;
+                let integer_sum = integer_sums[input][output] - corrections[input][output];
+                sums[input][output] +=
+                    x[output].d.to_f32() as f64 * y[input].d as f64 * integer_sum as f64;
             }
         }
     }
@@ -3545,18 +3616,89 @@ unsafe fn dot4x4_q6k_q8k_avxvnni(
     weights: [&[BlockQ6K]; 4],
     inputs: [&[BlockQ8K]; 4],
 ) -> [[f32; 4]; 4] {
+    let low_nibble = _mm256_set1_epi8(0x0f);
+    let high_mask = _mm256_set1_epi8(0x03);
     let mut sums = [[0.0f32; 4]; 4];
-    let mut decoded_u8 = [[0u8; QK_K]; 4];
     for block in 0..weights[0].len() {
-        for output in 0..4 {
-            decode_q6k_u8(&weights[output][block], &mut decoded_u8[output]);
+        let x: [&BlockQ6K; 4] = std::array::from_fn(|output| &weights[output][block]);
+        let y: [&BlockQ8K; 4] = std::array::from_fn(|input| &inputs[input][block]);
+        let mut corrections = [[0i32; 4]; 4];
+        for input in 0..4 {
+            for output in 0..4 {
+                for group in 0..QK_K / 16 {
+                    corrections[input][output] +=
+                        32 * y[input].bsums[group] as i32 * x[output].scales[group] as i32;
+                }
+            }
+        }
+
+        let mut integer_sums = [[_mm256_setzero_si256(); 4]; 4];
+        for half in 0..2 {
+            let q8: [[__m256i; 4]; 4] = std::array::from_fn(|input| {
+                std::array::from_fn(|group| {
+                    _mm256_loadu_si256(
+                        y[input].qs.as_ptr().add(half * 128 + group * 32) as *const __m256i
+                    )
+                })
+            });
+            for output in 0..4 {
+                let ql0 =
+                    _mm256_loadu_si256(x[output].ql.as_ptr().add(half * 64) as *const __m256i);
+                let ql1 =
+                    _mm256_loadu_si256(x[output].ql.as_ptr().add(half * 64 + 32) as *const __m256i);
+                let qh = _mm256_loadu_si256(x[output].qh.as_ptr().add(half * 32) as *const __m256i);
+                let quantized = [
+                    _mm256_or_si256(
+                        _mm256_and_si256(ql0, low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(qh, high_mask)),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(ql1, low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(
+                            _mm256_srli_epi16::<2>(qh),
+                            high_mask,
+                        )),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(
+                            _mm256_srli_epi16::<4>(qh),
+                            high_mask,
+                        )),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(ql1), low_nibble),
+                        _mm256_slli_epi16::<4>(_mm256_and_si256(
+                            _mm256_srli_epi16::<6>(qh),
+                            high_mask,
+                        )),
+                    ),
+                ];
+                for group in 0..4 {
+                    let scale0 = x[output].scales[half * 8 + group * 2] as i32;
+                    let scale1 = x[output].scales[half * 8 + group * 2 + 1] as i32;
+                    let scale = _mm256_set_epi32(
+                        scale1, scale1, scale1, scale1, scale0, scale0, scale0, scale0,
+                    );
+                    for input in 0..4 {
+                        let dot = _mm256_dpbusd_avx_epi32(
+                            _mm256_setzero_si256(),
+                            quantized[group],
+                            q8[input][group],
+                        );
+                        integer_sums[input][output] = _mm256_add_epi32(
+                            integer_sums[input][output],
+                            _mm256_mullo_epi32(dot, scale),
+                        );
+                    }
+                }
+            }
         }
         for input in 0..4 {
             for output in 0..4 {
-                let x = &weights[output][block];
-                let y = &inputs[input][block];
-                let integer_sum = dot_q6k_u8_q8k_avxvnni(&decoded_u8[output], &x.scales, y);
-                sums[input][output] += x.d.to_f32() * y.d * integer_sum as f32;
+                let integer_sum =
+                    hsum_i32x8_avx2(integer_sums[input][output]) - corrections[input][output];
+                sums[input][output] += x[output].d.to_f32() * y[input].d * integer_sum as f32;
             }
         }
     }
@@ -3975,11 +4117,174 @@ mod arm_tests {
             }
         }
     }
+
+    #[test]
+    fn q6k_q8k_dotprod_tile_matches_decoded_reference() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let row_blocks = 3;
+        let weights = q6k_tile_weights(row_blocks);
+        let inputs = q8k_tile_inputs(row_blocks);
+        let actual = unsafe {
+            dot4x4_q6k_q8k_neon(
+                [&weights[0], &weights[1], &weights[2], &weights[3]],
+                [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+            )
+        };
+        for input in 0..4 {
+            for output in 0..4 {
+                let mut expected = 0.0f64;
+                let mut decoded = [0i8; QK_K];
+                for block in 0..row_blocks {
+                    decode_q6k_i8(&weights[output][block], &mut decoded);
+                    let integer_sum = unsafe {
+                        dot_q6k_i8_q8k_neon(
+                            &decoded,
+                            &weights[output][block].scales,
+                            &inputs[input][block],
+                        )
+                    };
+                    expected += weights[output][block].d.to_f32() as f64
+                        * inputs[input][block].d as f64
+                        * integer_sum as f64;
+                }
+                assert_eq!(
+                    actual[input][output].to_bits(),
+                    (expected as f32).to_bits(),
+                    "Q6_K packed/decoded dotprod mismatch input={input} output={output}: packed={} decoded={}",
+                    actual[input][output],
+                    expected as f32,
+                );
+            }
+        }
+    }
+
+    fn q6k_tile_weights(row_blocks: usize) -> Vec<Vec<BlockQ6K>> {
+        (0..4)
+            .map(|row| {
+                (0..row_blocks)
+                    .map(|block| {
+                        let mut ql = [0u8; QK_K / 2];
+                        let mut qh = [0u8; QK_K / 4];
+                        let mut scales = [0i8; QK_K / 16];
+                        for (idx, value) in ql.iter_mut().enumerate() {
+                            *value = ((row * 41 + block * 31 + idx * 19 + 5) & 0xff) as u8;
+                        }
+                        for (idx, value) in qh.iter_mut().enumerate() {
+                            *value = ((row * 19 + block * 29 + idx * 13 + 7) & 0xff) as u8;
+                        }
+                        for (idx, value) in scales.iter_mut().enumerate() {
+                            *value = ((row * 11 + block * 7 + idx * 5) % 31) as i8 - 15;
+                        }
+                        BlockQ6K {
+                            ql,
+                            qh,
+                            scales,
+                            d: f16::from_f32(0.0065 + row as f32 * 0.0003),
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn q8k_tile_inputs(row_blocks: usize) -> Vec<Vec<BlockQ8K>> {
+        (0..4)
+            .map(|row| {
+                let values = (0..row_blocks * QK_K)
+                    .map(|idx| ((row * 43 + idx * 37) % 211) as f32 / 53.0 - 2.0)
+                    .collect::<Vec<_>>();
+                quantize_q8k(&values)
+            })
+            .collect()
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod x86_tests {
     use super::*;
+
+    #[test]
+    fn q6k_q8k_avxvnni_tile_matches_decoded_reference() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("avxvnni") {
+            return;
+        }
+        let row_blocks = 3;
+        let weights = q6k_tile_weights(row_blocks);
+        let inputs = q8k_tile_inputs(row_blocks);
+        let actual = unsafe {
+            dot4x4_q6k_q8k_avxvnni(
+                [&weights[0], &weights[1], &weights[2], &weights[3]],
+                [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+            )
+        };
+        for input in 0..4 {
+            for output in 0..4 {
+                let mut expected = 0.0f32;
+                let mut decoded = [0u8; QK_K];
+                for block in 0..row_blocks {
+                    decode_q6k_u8(&weights[output][block], &mut decoded);
+                    let integer_sum = unsafe {
+                        dot_q6k_u8_q8k_avxvnni(
+                            &decoded,
+                            &weights[output][block].scales,
+                            &inputs[input][block],
+                        )
+                    };
+                    expected += weights[output][block].d.to_f32()
+                        * inputs[input][block].d
+                        * integer_sum as f32;
+                }
+                assert_eq!(
+                    actual[input][output].to_bits(),
+                    expected.to_bits(),
+                    "Q6_K packed/decoded VNNI mismatch input={input} output={output}: packed={} decoded={expected}",
+                    actual[input][output],
+                );
+            }
+        }
+    }
+
+    fn q6k_tile_weights(row_blocks: usize) -> Vec<Vec<BlockQ6K>> {
+        (0..4)
+            .map(|row| {
+                (0..row_blocks)
+                    .map(|block| {
+                        let mut ql = [0u8; QK_K / 2];
+                        let mut qh = [0u8; QK_K / 4];
+                        let mut scales = [0i8; QK_K / 16];
+                        for (idx, value) in ql.iter_mut().enumerate() {
+                            *value = ((row * 41 + block * 31 + idx * 19 + 5) & 0xff) as u8;
+                        }
+                        for (idx, value) in qh.iter_mut().enumerate() {
+                            *value = ((row * 19 + block * 29 + idx * 13 + 7) & 0xff) as u8;
+                        }
+                        for (idx, value) in scales.iter_mut().enumerate() {
+                            *value = ((row * 11 + block * 7 + idx * 5) % 31) as i8 - 15;
+                        }
+                        BlockQ6K {
+                            ql,
+                            qh,
+                            scales,
+                            d: f16::from_f32(0.0065 + row as f32 * 0.0003),
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn q8k_tile_inputs(row_blocks: usize) -> Vec<Vec<BlockQ8K>> {
+        (0..4)
+            .map(|row| {
+                let values = (0..row_blocks * QK_K)
+                    .map(|idx| ((row * 43 + idx * 37) % 211) as f32 / 53.0 - 2.0)
+                    .collect::<Vec<_>>();
+                quantize_q8k(&values)
+            })
+            .collect()
+    }
 
     #[test]
     fn q5k_q8k_avxvnni_tile_matches_rowwise_avx2() {
