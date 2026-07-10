@@ -1047,8 +1047,63 @@ fn rms_norm_plain(x: &mut [f32], w: &[f32]) {
 }
 
 fn rms_rstd(x: &[f32]) -> f32 {
-    let sum_sq = x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
-    (1.0 / ((sum_sq / x.len() as f64) + RMS_EPS as f64).sqrt()) as f32
+    let sum_sq = sum_squares_f32(x);
+    1.0 / ((sum_sq / x.len() as f32) + RMS_EPS).sqrt()
+}
+
+#[inline]
+fn sum_squares_f32(values: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            return sum_squares_f32_avx2(values);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        return sum_squares_f32_neon(values);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        values.iter().map(|value| value * value).sum()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_squares_f32_avx2(values: &[f32]) -> f32 {
+    let vector_len = values.len() & !7;
+    let mut sum = _mm256_setzero_ps();
+    for idx in (0..vector_len).step_by(8) {
+        let value = _mm256_loadu_ps(values.as_ptr().add(idx));
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(value, value));
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum::<f32>()
+        + values[vector_len..]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn sum_squares_f32_neon(values: &[f32]) -> f32 {
+    let vector_len = values.len() & !3;
+    let mut sum = vdupq_n_f32(0.0);
+    for idx in (0..vector_len).step_by(4) {
+        let value = vld1q_f32(values.as_ptr().add(idx));
+        sum = vaddq_f32(sum, vmulq_f32(value, value));
+    }
+    let mut lanes = [0.0f32; 4];
+    vst1q_f32(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum::<f32>()
+        + values[vector_len..]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
 }
 
 fn normalize_linear_qk(q: &mut [f32], k: &mut [f32]) {
@@ -1057,8 +1112,8 @@ fn normalize_linear_qk(q: &mut [f32], k: &mut [f32]) {
         let base = head * LINEAR_HEAD_DIM;
         let qh = &mut q[base..base + LINEAR_HEAD_DIM];
         let kh = &mut k[base..base + LINEAR_HEAD_DIM];
-        let q_norm = (qh.iter().map(|v| v * v).sum::<f32>() + RMS_EPS).sqrt();
-        let k_norm = (kh.iter().map(|v| v * v).sum::<f32>() + RMS_EPS).sqrt();
+        let q_norm = (sum_squares_f32(qh) + RMS_EPS).sqrt();
+        let k_norm = (sum_squares_f32(kh) + RMS_EPS).sqrt();
         for v in qh {
             *v = *v / q_norm * q_scale;
         }

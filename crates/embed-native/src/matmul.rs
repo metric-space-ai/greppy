@@ -1839,7 +1839,7 @@ fn matmul_q6kx8_batched_i8mm(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "i8mm")]
 unsafe fn dot8x4_q6k_q8k_i8mm(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
-    let mut output = [[0.0f64; 8]; 4];
+    let mut output = [[0.0f32; 8]; 4];
     for (q6, q8) in weights.iter().zip(inputs) {
         let mut integer_sums = [[0i32; 8]; 4];
         let mut corrections = [[0i32; 8]; 4];
@@ -1885,17 +1885,17 @@ unsafe fn dot8x4_q6k_q8k_i8mm(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> 
                 let integer_sum =
                     integer_sums[input_row][output_col] - corrections[input_row][output_col];
                 output[input_row][output_col] +=
-                    q6.d[output_col] as f64 * q8.d[input_row] as f64 * integer_sum as f64;
+                    q6.d[output_col] * q8.d[input_row] * integer_sum as f32;
             }
         }
     }
-    std::array::from_fn(|input| std::array::from_fn(|col| output[input][col] as f32))
+    output
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "i8mm")]
 unsafe fn dot8x1_q6k_q8k_i8mm(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> [f32; 8] {
-    let mut output = [0.0f64; 8];
+    let mut output = [0.0f32; 8];
     for (q6, q8) in weights.iter().zip(inputs) {
         let mut integer_sums = [0i32; 8];
         let mut corrections = [0i32; 8];
@@ -1929,10 +1929,10 @@ unsafe fn dot8x1_q6k_q8k_i8mm(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> 
         }
         for output_col in 0..8 {
             let integer_sum = integer_sums[output_col] - corrections[output_col];
-            output[output_col] += q6.d[output_col] as f64 * q8.d[0] as f64 * integer_sum as f64;
+            output[output_col] += q6.d[output_col] * q8.d[0] * integer_sum as f32;
         }
     }
-    std::array::from_fn(|col| output[col] as f32)
+    output
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3346,10 +3346,10 @@ unsafe fn dot4_q6k_q8k_neon(
     xs3: &[BlockQ6K],
     ys: &[BlockQ8K],
 ) -> (f32, f32, f32, f32) {
-    let mut sum0 = 0.0f64;
-    let mut sum1 = 0.0f64;
-    let mut sum2 = 0.0f64;
-    let mut sum3 = 0.0f64;
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
     let m4b = vdupq_n_u8(0x0f);
     let mone = vdupq_n_u8(3);
 
@@ -3463,13 +3463,13 @@ unsafe fn dot4_q6k_q8k_neon(
             process_col!(q6_3, qh_3, sc_3, isum3);
         }
 
-        sum0 += x0.d.to_f32() as f64 * yd as f64 * ((isum0 - 32 * isum_mins0) as f64);
-        sum1 += x1.d.to_f32() as f64 * yd as f64 * ((isum1 - 32 * isum_mins1) as f64);
-        sum2 += x2.d.to_f32() as f64 * yd as f64 * ((isum2 - 32 * isum_mins2) as f64);
-        sum3 += x3.d.to_f32() as f64 * yd as f64 * ((isum3 - 32 * isum_mins3) as f64);
+        sum0 += x0.d.to_f32() * yd * (isum0 - 32 * isum_mins0) as f32;
+        sum1 += x1.d.to_f32() * yd * (isum1 - 32 * isum_mins1) as f32;
+        sum2 += x2.d.to_f32() * yd * (isum2 - 32 * isum_mins2) as f32;
+        sum3 += x3.d.to_f32() * yd * (isum3 - 32 * isum_mins3) as f32;
     }
 
-    (sum0 as f32, sum1 as f32, sum2 as f32, sum3 as f32)
+    (sum0, sum1, sum2, sum3)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -4143,7 +4143,7 @@ unsafe fn dot_q5k_u8_q8k_neon(
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 unsafe fn dot_q6k_q8k_neon(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
-    let mut sum = 0.0f64;
+    let mut sum = 0.0f32;
     let m4b = vdupq_n_u8(0x0f);
     let mone = vdupq_n_u8(3);
 
@@ -4228,9 +4228,9 @@ unsafe fn dot_q6k_q8k_neon(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
             isum += vaddvq_s32(p2) * scale0 + vaddvq_s32(p3) * scale1;
             scale = scale.add(2);
         }
-        sum += d_all as f64 * y.d as f64 * ((isum - 32 * isum_mins) as f64);
+        sum += d_all * y.d * (isum - 32 * isum_mins) as f32;
     }
-    sum as f32
+    sum
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -4240,7 +4240,7 @@ unsafe fn dot4x4_q6k_q8k_neon(
 ) -> [[f32; 4]; 4] {
     let low_nibble = vdupq_n_u8(0x0f);
     let high_mask = vdupq_n_u8(0x03);
-    let mut sums = [[0.0f64; 4]; 4];
+    let mut sums = [[0.0f32; 4]; 4];
     for block in 0..weights[0].len() {
         let x: [&BlockQ6K; 4] = std::array::from_fn(|output| &weights[output][block]);
         let y: [&BlockQ8K; 4] = std::array::from_fn(|input| &inputs[input][block]);
@@ -4319,12 +4319,11 @@ unsafe fn dot4x4_q6k_q8k_neon(
         for input in 0..4 {
             for output in 0..4 {
                 let integer_sum = integer_sums[input][output] - corrections[input][output];
-                sums[input][output] +=
-                    x[output].d.to_f32() as f64 * y[input].d as f64 * integer_sum as f64;
+                sums[input][output] += x[output].d.to_f32() * y[input].d * integer_sum as f32;
             }
         }
     }
-    std::array::from_fn(|input| std::array::from_fn(|output| sums[input][output] as f32))
+    sums
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -5533,7 +5532,7 @@ mod arm_tests {
         };
         for input in 0..4 {
             for output in 0..4 {
-                let mut expected = 0.0f64;
+                let mut expected = 0.0f32;
                 let mut decoded = [0i8; QK_K];
                 for block in 0..row_blocks {
                     decode_q6k_i8(&weights[output][block], &mut decoded);
@@ -5544,16 +5543,16 @@ mod arm_tests {
                             &inputs[input][block],
                         )
                     };
-                    expected += weights[output][block].d.to_f32() as f64
-                        * inputs[input][block].d as f64
-                        * integer_sum as f64;
+                    expected += weights[output][block].d.to_f32()
+                        * inputs[input][block].d
+                        * integer_sum as f32;
                 }
                 assert_eq!(
                     actual[input][output].to_bits(),
-                    (expected as f32).to_bits(),
+                    expected.to_bits(),
                     "Q6_K packed/decoded dotprod mismatch input={input} output={output}: packed={} decoded={}",
                     actual[input][output],
-                    expected as f32,
+                    expected,
                 );
             }
         }
