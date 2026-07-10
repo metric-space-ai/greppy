@@ -1,6 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 use greppy_embed_native::matmul::QuantMatrix;
 use greppy_embed_native::GgufModel;
 use rayon::prelude::*;
@@ -560,15 +565,8 @@ impl CpuQwen35Model {
                         ..qkv_base + inner + head_base + LINEAR_HEAD_DIM];
                     let value = qkv[qkv_base + inner * 2 + head_base + value_idx];
                     let (beta_h, decay) = scan_params[row * LINEAR_HEADS + head];
-                    let prior = dot(recurrent_row, kh);
-                    let delta = (value - decay * prior) * beta_h;
-                    let mut attn = 0.0f32;
-                    for key_idx in 0..LINEAR_HEAD_DIM {
-                        recurrent_row[key_idx] =
-                            decay * recurrent_row[key_idx] + kh[key_idx] * delta;
-                        attn += recurrent_row[key_idx] * qh[key_idx];
-                    }
-                    out_values[row] = attn;
+                    out_values[row] =
+                        delta_recurrent_step(recurrent_row, qh, kh, value, beta_h, decay);
                 }
             });
         #[cfg(test)]
@@ -780,14 +778,7 @@ impl CpuQwen35Model {
                 let kh = &k[base..base + LINEAR_HEAD_DIM];
                 let value = v[base + value_idx];
                 let (beta_h, decay) = scan_params[head];
-                let prior = dot(row, kh);
-                let delta = (value - decay * prior) * beta_h;
-                let mut attn = 0.0f32;
-                for key_idx in 0..LINEAR_HEAD_DIM {
-                    row[key_idx] = decay * row[key_idx] + kh[key_idx] * delta;
-                    attn += row[key_idx] * qh[key_idx];
-                }
-                *output = attn;
+                *output = delta_recurrent_step(row, qh, kh, value, beta_h, decay);
             });
         for head in 0..LINEAR_HEADS {
             let base = head * LINEAR_HEAD_DIM;
@@ -912,6 +903,127 @@ fn add_rows(dst: &mut [f32], lhs: &[f32], rhs: &[f32]) {
 
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
     lhs.iter().zip(rhs).map(|(a, b)| a * b).sum()
+}
+
+#[inline]
+fn delta_recurrent_step(
+    state: &mut [f32],
+    query: &[f32],
+    key: &[f32],
+    value: f32,
+    beta: f32,
+    decay: f32,
+) -> f32 {
+    debug_assert_eq!(state.len(), LINEAR_HEAD_DIM);
+    debug_assert_eq!(query.len(), LINEAR_HEAD_DIM);
+    debug_assert_eq!(key.len(), LINEAR_HEAD_DIM);
+
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            return delta_recurrent_step_avx2(state, query, key, value, beta, decay);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        return delta_recurrent_step_neon(state, query, key, value, beta, decay);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        delta_recurrent_step_scalar(state, query, key, value, beta, decay)
+    }
+}
+
+fn delta_recurrent_step_scalar(
+    state: &mut [f32],
+    query: &[f32],
+    key: &[f32],
+    value: f32,
+    beta: f32,
+    decay: f32,
+) -> f32 {
+    let prior = dot(state, key);
+    let delta = (value - decay * prior) * beta;
+    let mut attention = 0.0f32;
+    for idx in 0..LINEAR_HEAD_DIM {
+        state[idx] = decay * state[idx] + key[idx] * delta;
+        attention += state[idx] * query[idx];
+    }
+    attention
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn delta_recurrent_step_avx2(
+    state: &mut [f32],
+    query: &[f32],
+    key: &[f32],
+    value: f32,
+    beta: f32,
+    decay: f32,
+) -> f32 {
+    let mut prior = _mm256_setzero_ps();
+    for idx in (0..LINEAR_HEAD_DIM).step_by(8) {
+        let state_values = _mm256_loadu_ps(state.as_ptr().add(idx));
+        let key_values = _mm256_loadu_ps(key.as_ptr().add(idx));
+        prior = _mm256_add_ps(prior, _mm256_mul_ps(state_values, key_values));
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), prior);
+    let prior = lanes.iter().copied().sum::<f32>();
+    let delta = (value - decay * prior) * beta;
+    let decay = _mm256_set1_ps(decay);
+    let delta = _mm256_set1_ps(delta);
+    let mut attention = _mm256_setzero_ps();
+    for idx in (0..LINEAR_HEAD_DIM).step_by(8) {
+        let state_values = _mm256_loadu_ps(state.as_ptr().add(idx));
+        let key_values = _mm256_loadu_ps(key.as_ptr().add(idx));
+        let updated = _mm256_add_ps(
+            _mm256_mul_ps(decay, state_values),
+            _mm256_mul_ps(key_values, delta),
+        );
+        _mm256_storeu_ps(state.as_mut_ptr().add(idx), updated);
+        let query_values = _mm256_loadu_ps(query.as_ptr().add(idx));
+        attention = _mm256_add_ps(attention, _mm256_mul_ps(updated, query_values));
+    }
+    _mm256_storeu_ps(lanes.as_mut_ptr(), attention);
+    lanes.iter().copied().sum()
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn delta_recurrent_step_neon(
+    state: &mut [f32],
+    query: &[f32],
+    key: &[f32],
+    value: f32,
+    beta: f32,
+    decay: f32,
+) -> f32 {
+    let mut prior = vdupq_n_f32(0.0);
+    for idx in (0..LINEAR_HEAD_DIM).step_by(4) {
+        let state_values = vld1q_f32(state.as_ptr().add(idx));
+        let key_values = vld1q_f32(key.as_ptr().add(idx));
+        prior = vaddq_f32(prior, vmulq_f32(state_values, key_values));
+    }
+    let mut lanes = [0.0f32; 4];
+    vst1q_f32(lanes.as_mut_ptr(), prior);
+    let prior = lanes.iter().copied().sum::<f32>();
+    let delta = (value - decay * prior) * beta;
+    let decay = vdupq_n_f32(decay);
+    let delta = vdupq_n_f32(delta);
+    let mut attention = vdupq_n_f32(0.0);
+    for idx in (0..LINEAR_HEAD_DIM).step_by(4) {
+        let state_values = vld1q_f32(state.as_ptr().add(idx));
+        let key_values = vld1q_f32(key.as_ptr().add(idx));
+        let updated = vaddq_f32(vmulq_f32(decay, state_values), vmulq_f32(key_values, delta));
+        vst1q_f32(state.as_mut_ptr().add(idx), updated);
+        let query_values = vld1q_f32(query.as_ptr().add(idx));
+        attention = vaddq_f32(attention, vmulq_f32(updated, query_values));
+    }
+    vst1q_f32(lanes.as_mut_ptr(), attention);
+    lanes.iter().copied().sum()
 }
 
 fn rms_norm_qwen(x: &mut [f32], w: &[f32]) {
@@ -1042,5 +1154,98 @@ fn softplus(x: f32) -> f32 {
         x
     } else {
         (1.0 + x.exp()).ln()
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_tests {
+    use super::*;
+
+    #[test]
+    fn avx2_recurrent_step_stays_close_to_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut scalar_state = (0..LINEAR_HEAD_DIM)
+            .map(|idx| ((idx * 29 % 97) as f32 - 48.0) / 257.0)
+            .collect::<Vec<_>>();
+        let mut simd_state = scalar_state.clone();
+        let query = (0..LINEAR_HEAD_DIM)
+            .map(|idx| ((idx * 17 % 89) as f32 - 44.0) / 193.0)
+            .collect::<Vec<_>>();
+        let key = (0..LINEAR_HEAD_DIM)
+            .map(|idx| ((idx * 37 % 101) as f32 - 50.0) / 211.0)
+            .collect::<Vec<_>>();
+
+        let mut max_attention_diff = 0.0f32;
+        for step in 0..64 {
+            let value = (step as f32 - 31.0) / 79.0;
+            let beta = 0.2 + step as f32 / 128.0;
+            let decay = 0.91 + (step % 7) as f32 / 100.0;
+            let scalar =
+                delta_recurrent_step_scalar(&mut scalar_state, &query, &key, value, beta, decay);
+            let simd = unsafe {
+                delta_recurrent_step_avx2(&mut simd_state, &query, &key, value, beta, decay)
+            };
+            max_attention_diff = max_attention_diff.max((scalar - simd).abs());
+        }
+        let max_state_diff = scalar_state
+            .iter()
+            .zip(&simd_state)
+            .map(|(scalar, simd)| (scalar - simd).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_state_diff <= 2.0e-5,
+            "AVX2 recurrent state drift: {max_state_diff:.6e}"
+        );
+        assert!(
+            max_attention_diff <= 2.0e-5,
+            "AVX2 recurrent attention drift: {max_attention_diff:.6e}"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "neon"))]
+mod arm_tests {
+    use super::*;
+
+    #[test]
+    fn neon_recurrent_step_stays_close_to_scalar() {
+        let mut scalar_state = (0..LINEAR_HEAD_DIM)
+            .map(|idx| ((idx * 29 % 97) as f32 - 48.0) / 257.0)
+            .collect::<Vec<_>>();
+        let mut simd_state = scalar_state.clone();
+        let query = (0..LINEAR_HEAD_DIM)
+            .map(|idx| ((idx * 17 % 89) as f32 - 44.0) / 193.0)
+            .collect::<Vec<_>>();
+        let key = (0..LINEAR_HEAD_DIM)
+            .map(|idx| ((idx * 37 % 101) as f32 - 50.0) / 211.0)
+            .collect::<Vec<_>>();
+
+        let mut max_attention_diff = 0.0f32;
+        for step in 0..64 {
+            let value = (step as f32 - 31.0) / 79.0;
+            let beta = 0.2 + step as f32 / 128.0;
+            let decay = 0.91 + (step % 7) as f32 / 100.0;
+            let scalar =
+                delta_recurrent_step_scalar(&mut scalar_state, &query, &key, value, beta, decay);
+            let simd = unsafe {
+                delta_recurrent_step_neon(&mut simd_state, &query, &key, value, beta, decay)
+            };
+            max_attention_diff = max_attention_diff.max((scalar - simd).abs());
+        }
+        let max_state_diff = scalar_state
+            .iter()
+            .zip(&simd_state)
+            .map(|(scalar, simd)| (scalar - simd).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_state_diff <= 2.0e-5,
+            "NEON recurrent state drift: {max_state_diff:.6e}"
+        );
+        assert!(
+            max_attention_diff <= 2.0e-5,
+            "NEON recurrent attention drift: {max_attention_diff:.6e}"
+        );
     }
 }
