@@ -608,19 +608,9 @@ impl QuantMatrix {
                     }
                 } else if lhs_rows == 1 {
                     #[cfg(target_arch = "x86_64")]
-                    let used_x8 = if let Some(x8) = x8 {
-                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x1_q6k_q8k_avxvnni);
-                        true
-                    } else {
-                        false
-                    };
+                    let used_x8 = false;
                     #[cfg(target_arch = "aarch64")]
-                    let used_x8 = if let Some(x8) = x8 {
-                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x1_q6k_q8k_i8mm);
-                        true
-                    } else {
-                        false
-                    };
+                    let used_x8 = false;
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let used_x8 = false;
                     if !used_x8 {
@@ -985,6 +975,13 @@ fn matvec_x8<T: Sync>(
     let quantized = quantize_q8k(lhs);
     let input = pack_q8kx4_repeated(&quantized);
     let mut out = vec![0.0f32; matrix_rows];
+    if matrix_rows <= 64 {
+        for (group, dst) in out.chunks_exact_mut(8).enumerate() {
+            let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+            dst.copy_from_slice(&unsafe { kernel(weights, &input) });
+        }
+        return out;
+    }
     out.par_chunks_mut(64)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
@@ -4829,19 +4826,64 @@ unsafe fn dot_q5k_u8_q8k_avxvnni(
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q6k_q8k_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
     let mut sum = 0.0f32;
-    let mut aux8 = [0i8; QK_K];
-
     for (x, y) in xs.iter().zip(ys) {
-        decode_q6k_i8(x, &mut aux8);
-        let mut isum = 0i32;
-        for j in 0..QK_K / 16 {
-            let dot = dot_i8_i8_16_avx2(aux8.as_ptr().add(j * 16), y.qs.as_ptr().add(j * 16));
-            isum += dot * x.scales[j] as i32;
-        }
-        sum += x.d.to_f32() * y.d * isum as f32;
-    }
+        let low_2_bits = _mm256_set1_epi8(0x03);
+        let low_nibble = _mm256_set1_epi8(0x0f);
+        let scales = _mm_loadu_si128(x.scales.as_ptr() as *const __m128i);
+        let scales_i16 = _mm256_cvtepi8_epi16(scales);
+        let bsums = _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i);
+        let correction = _mm256_slli_epi32::<5>(_mm256_madd_epi16(bsums, scales_i16));
+        let mut accumulator = _mm256_setzero_si256();
 
+        for half in 0..2 {
+            let ql0 = _mm256_loadu_si256(x.ql.as_ptr().add(half * 64) as *const __m256i);
+            let ql1 = _mm256_loadu_si256(x.ql.as_ptr().add(half * 64 + 32) as *const __m256i);
+            let qh = _mm256_loadu_si256(x.qh.as_ptr().add(half * 32) as *const __m256i);
+            let quantized = [
+                _mm256_or_si256(
+                    _mm256_and_si256(ql0, low_nibble),
+                    _mm256_slli_epi16::<4>(_mm256_and_si256(qh, low_2_bits)),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(ql1, low_nibble),
+                    _mm256_slli_epi16::<2>(_mm256_and_si256(qh, _mm256_set1_epi8(0x0c))),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), low_nibble),
+                    _mm256_and_si256(qh, _mm256_set1_epi8(0x30)),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(ql1), low_nibble),
+                    _mm256_srli_epi16::<2>(_mm256_and_si256(qh, _mm256_set1_epi8(0xc0_u8 as i8))),
+                ),
+            ];
+            for (group, values) in quantized.into_iter().enumerate() {
+                let input = _mm256_loadu_si256(
+                    y.qs.as_ptr().add(half * 128 + group * 32) as *const __m256i
+                );
+                let products = _mm256_maddubs_epi16(values, input);
+                let scale_pair = q6_scale_pair_shuffle_avx2(half * 4 + group);
+                let scaled = _mm256_madd_epi16(
+                    _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_pair)),
+                    products,
+                );
+                accumulator = _mm256_add_epi32(accumulator, scaled);
+            }
+        }
+        let integer_sum = hsum_i32x8_avx2(_mm256_sub_epi32(accumulator, correction));
+        sum += x.d.to_f32() * y.d * integer_sum as f32;
+    }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6_scale_pair_shuffle_avx2(pair: usize) -> __m128i {
+    let low = (pair * 2) as i8;
+    let high = low + 1;
+    _mm_set_epi8(
+        high, high, high, high, high, high, high, high, low, low, low, low, low, low, low, low,
+    )
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -377,10 +377,10 @@ impl CpuQwen35Model {
             let stage_start = std::time::Instant::now();
             let attn = match (&layer.kind, &mut state.layer_states[idx]) {
                 (LayerKind::Delta(weights), LayerState::Delta(runtime)) => {
-                    self.delta_block(weights, runtime, &x)?
+                    self.delta_block_rows(weights, runtime, &x, 1)?
                 }
                 (LayerKind::Full(weights), LayerState::Full(runtime)) => {
-                    self.full_attention_block(weights, runtime, state.position, &x)?
+                    self.full_attention_block_rows(weights, runtime, state.position, &x, 1)?
                 }
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
             };
@@ -397,7 +397,7 @@ impl CpuQwen35Model {
             let post_norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
             let stage_start = std::time::Instant::now();
-            let ffn = self.ffn(layer, &x)?;
+            let ffn = self.ffn_rows(layer, &x, 1)?;
             let ffn_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
             let stage_start = std::time::Instant::now();
