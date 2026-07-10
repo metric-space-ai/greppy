@@ -24,6 +24,7 @@ const ROPE_THETA: f32 = 10_000_000.0;
 const LINEAR_HEADS: usize = 16;
 const LINEAR_HEAD_DIM: usize = 128;
 const CONV_KERNEL: usize = 4;
+const CONV_CHANNEL_BLOCK: usize = 1024;
 
 pub(crate) struct CpuQwen35Model {
     inventory: Qwen35Inventory,
@@ -547,23 +548,24 @@ impl CpuQwen35Model {
         #[cfg(test)]
         let stage_start = std::time::Instant::now();
 
-        for row in 0..rows {
-            let qkv_row = &mut qkv[row * inner * 3..(row + 1) * inner * 3];
-            causal_conv1d_silu(qkv_row, &weights.ssm_conv1d, &mut state.conv);
-            let (q, rest) = qkv_row.split_at_mut(inner);
-            let (k, _) = rest.split_at_mut(inner);
-            normalize_linear_qk(q, k);
-            let beta_row = &beta[row * LINEAR_HEADS..(row + 1) * LINEAR_HEADS];
-            let alpha_row = &alpha[row * LINEAR_HEADS..(row + 1) * LINEAR_HEADS];
-            for head in 0..LINEAR_HEADS {
-                let beta_h = sigmoid(beta_row[head]);
-                let decay = (-weights.ssm_a[head].exp()
-                    * softplus(alpha_row[head] + weights.ssm_dt_bias[head]))
-                .exp()
-                .clamp(0.0, 1.0);
-                scan_params[row * LINEAR_HEADS + head] = (beta_h, decay);
-            }
-        }
+        causal_conv1d_silu_rows(&mut qkv, &weights.ssm_conv1d, &mut state.conv, rows);
+        qkv.par_chunks_mut(inner * 3)
+            .zip(beta.par_chunks(LINEAR_HEADS))
+            .zip(alpha.par_chunks(LINEAR_HEADS))
+            .zip(scan_params.par_chunks_mut(LINEAR_HEADS))
+            .for_each(|(((qkv_row, beta_row), alpha_row), params_row)| {
+                let (q, rest) = qkv_row.split_at_mut(inner);
+                let (k, _) = rest.split_at_mut(inner);
+                normalize_linear_qk(q, k);
+                for head in 0..LINEAR_HEADS {
+                    let beta_h = sigmoid(beta_row[head]);
+                    let decay = (-weights.ssm_a[head].exp()
+                        * softplus(alpha_row[head] + weights.ssm_dt_bias[head]))
+                    .exp()
+                    .clamp(0.0, 1.0);
+                    params_row[head] = (beta_h, decay);
+                }
+            });
         #[cfg(test)]
         let prepare_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
         #[cfg(test)]
@@ -1263,6 +1265,58 @@ fn causal_conv1d_silu(values: &mut [f32], weights: &[f32], state: &mut [f32]) {
     silu_in_place(values);
 }
 
+struct SharedMutF32(*mut f32);
+
+// Each worker receives a disjoint channel range for every row. The pointer is
+// shared only to express that strided partitioning, which slices cannot model.
+unsafe impl Send for SharedMutF32 {}
+unsafe impl Sync for SharedMutF32 {}
+
+impl SharedMutF32 {
+    unsafe fn slice<'a>(&self, offset: usize, len: usize) -> &'a mut [f32] {
+        std::slice::from_raw_parts_mut(self.0.add(offset), len)
+    }
+}
+
+fn causal_conv1d_silu_rows(values: &mut [f32], weights: &[f32], state: &mut [f32], rows: usize) {
+    debug_assert!(rows > 0);
+    debug_assert_eq!(values.len() % rows, 0);
+    let channels = values.len() / rows;
+    debug_assert_eq!(state.len(), channels * CONV_KERNEL);
+    debug_assert_eq!(weights.len(), channels * CONV_KERNEL);
+    if rows == 1 {
+        causal_conv1d_silu(values, weights, state);
+        return;
+    }
+
+    let shared_values = SharedMutF32(values.as_mut_ptr());
+    state
+        .par_chunks_mut(CONV_CHANNEL_BLOCK * CONV_KERNEL)
+        .enumerate()
+        .for_each(|(block, state_block)| {
+            let channel_start = block * CONV_CHANNEL_BLOCK;
+            let block_channels = state_block.len() / CONV_KERNEL;
+            for row in 0..rows {
+                let values_block =
+                    unsafe { shared_values.slice(row * channels + channel_start, block_channels) };
+                for (channel, value) in values_block.iter_mut().enumerate() {
+                    let state_base = channel * CONV_KERNEL;
+                    let weight_base = (channel_start + channel) * CONV_KERNEL;
+                    for tap in 0..CONV_KERNEL - 1 {
+                        state_block[state_base + tap] = state_block[state_base + tap + 1];
+                    }
+                    state_block[state_base + CONV_KERNEL - 1] = *value;
+                    let mut acc = 0.0f32;
+                    for tap in 0..CONV_KERNEL {
+                        acc += state_block[state_base + tap] * weights[weight_base + tap];
+                    }
+                    *value = acc;
+                }
+                silu_in_place(values_block);
+            }
+        });
+}
+
 fn apply_rope(values: &mut [f32], position: usize, head_dim: usize, rope_dim: usize) {
     if position == 0 {
         return;
@@ -1327,6 +1381,37 @@ mod math_tests {
             (actual - expected).abs() <= tolerance,
             "SIMD dot drift: actual={actual:.8e} expected={expected:.8e} tolerance={tolerance:.8e}",
         );
+    }
+
+    #[test]
+    fn parallel_causal_conv_rows_matches_tokenwise() {
+        let rows = 7;
+        let channels = CONV_CHANNEL_BLOCK * 2 + 13;
+        let input = (0..rows * channels)
+            .map(|idx| ((idx * 29 % 251) as f32 - 125.0) / 97.0)
+            .collect::<Vec<_>>();
+        let weights = (0..channels * CONV_KERNEL)
+            .map(|idx| ((idx * 17 % 127) as f32 - 63.0) / 113.0)
+            .collect::<Vec<_>>();
+        let initial_state = (0..channels * CONV_KERNEL)
+            .map(|idx| ((idx * 37 % 149) as f32 - 74.0) / 131.0)
+            .collect::<Vec<_>>();
+
+        let mut expected = input.clone();
+        let mut expected_state = initial_state.clone();
+        for row in 0..rows {
+            causal_conv1d_silu(
+                &mut expected[row * channels..(row + 1) * channels],
+                &weights,
+                &mut expected_state,
+            );
+        }
+
+        let mut actual = input;
+        let mut actual_state = initial_state;
+        causal_conv1d_silu_rows(&mut actual, &weights, &mut actual_state, rows);
+        assert_eq!(actual, expected);
+        assert_eq!(actual_state, expected_state);
     }
 }
 
