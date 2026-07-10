@@ -542,19 +542,9 @@ impl QuantMatrix {
                     }
                 } else if lhs_rows == 1 {
                     #[cfg(target_arch = "x86_64")]
-                    let used_x8 = if let Some(x8) = x8 {
-                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x1_q5k_q8k_avxvnni);
-                        true
-                    } else {
-                        false
-                    };
+                    let used_x8 = false;
                     #[cfg(target_arch = "aarch64")]
-                    let used_x8 = if let Some(x8) = x8 {
-                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x1_q5k_q8k_i8mm);
-                        true
-                    } else {
-                        false
-                    };
+                    let used_x8 = false;
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let used_x8 = false;
                     if !used_x8 {
