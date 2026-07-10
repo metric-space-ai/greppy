@@ -889,18 +889,10 @@ mod metal_perf_tests {
                     .expect("Metal perf workspace");
                 let prefill = &prompt_ids[..prompt_ids.len().saturating_sub(1)];
                 let t0 = std::time::Instant::now();
-                if crate::metal::model::metal_batch_prefill_enabled() {
-                    for chunk in prefill.chunks(512) {
-                        model
-                            .prefill_tokens(chunk, &mut state)
-                            .expect("Metal perf batched prefill forward");
-                    }
-                } else {
-                    for &token in prefill {
-                        model
-                            .prefill_token(token, &mut state, &mut workspace)
-                            .expect("Metal perf tokenwise prefill forward");
-                    }
+                for chunk in prefill.chunks(512) {
+                    model
+                        .prefill_tokens(chunk, &mut state)
+                        .expect("Metal perf batched prefill forward");
                 }
                 let input_s = t0.elapsed().as_secs_f64();
                 let mut next = *prompt_ids.last().expect("non-empty perf prompt");

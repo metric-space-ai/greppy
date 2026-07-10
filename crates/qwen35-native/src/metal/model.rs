@@ -121,18 +121,8 @@ impl MetalQwen35Model {
         let mut state = self.new_forward_state(max_context)?;
         let mut workspace = self.new_forward_workspace(max_context)?;
         let prefill_ids = &prompt_ids[..prompt_ids.len().saturating_sub(1)];
-        if metal_batch_prefill_enabled() {
-            for chunk in prefill_ids.chunks(METAL_PREFILL_BATCH_ROWS) {
-                if chunk.len() == 1 {
-                    self.prefill_token(chunk[0], &mut state, &mut workspace)?;
-                } else if !chunk.is_empty() {
-                    self.prefill_tokens(chunk, &mut state)?;
-                }
-            }
-        } else {
-            for &token in prefill_ids {
-                self.prefill_token(token, &mut state, &mut workspace)?;
-            }
+        for chunk in prefill_ids.chunks(METAL_PREFILL_BATCH_ROWS) {
+            self.prefill_tokens(chunk, &mut state)?;
         }
 
         let mut generated = Vec::new();
@@ -335,6 +325,7 @@ impl MetalQwen35Model {
         Ok(token[0])
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prefill_token(
         &self,
         token: u32,
@@ -379,88 +370,10 @@ impl MetalQwen35Model {
         self.encode_embed_tokens(&enc, &ws.token_ids, &ws.hidden, rows)?;
         enc.memory_barrier_buffers();
 
-        let final_layer = self.inventory.block_count.saturating_sub(1);
         for layer in 0..self.inventory.block_count {
-            self.encode_rms_norm(
-                &enc,
-                &format!("blk.{layer}.attn_norm.weight"),
-                &ws.hidden,
-                &ws.normed,
-                rows,
-                self.inventory.hidden_size,
-                true,
-            )?;
-            enc.memory_barrier_buffers();
-
-            if layer == final_layer {
-                match &mut state.layer_states[layer] {
-                    MetalLayerState::Full { k_cache, v_cache } => {
-                        self.encode_full_attention_cache_only_rows(
-                            &enc,
-                            layer,
-                            k_cache,
-                            v_cache,
-                            state.position,
-                            rows,
-                            state.max_context,
-                            &ws,
-                        )?;
-                    }
-                    MetalLayerState::Delta { recurrent, conv } => {
-                        self.encode_delta_attention_block_rows(
-                            &enc, layer, recurrent, conv, rows, &ws,
-                        )?;
-                    }
-                }
-                enc.end();
-                cb.commit_and_wait().map_err(|e| {
-                    Error::GenerationUnavailable(format!("Metal batched prefill failed: {e}"))
-                })?;
-                state.position += rows;
-                return Ok(());
+            if self.encode_prefill_layer(&enc, layer, state, rows, &ws)? {
+                break;
             }
-
-            match &mut state.layer_states[layer] {
-                MetalLayerState::Delta { recurrent, conv } => {
-                    self.encode_delta_attention_block_rows(
-                        &enc, layer, recurrent, conv, rows, &ws,
-                    )?;
-                }
-                MetalLayerState::Full { k_cache, v_cache } => {
-                    self.encode_full_attention_block_rows(
-                        &enc,
-                        layer,
-                        k_cache,
-                        v_cache,
-                        state.position,
-                        rows,
-                        state.max_context,
-                        &ws,
-                    )?;
-                }
-            }
-            enc.memory_barrier_buffers();
-            self.encode_add_rms_norm(
-                &enc,
-                &format!("blk.{layer}.post_attention_norm.weight"),
-                &ws.hidden,
-                &ws.attn_out,
-                &ws.hidden,
-                &ws.normed,
-                rows,
-                self.inventory.hidden_size,
-            )?;
-            enc.memory_barrier_buffers();
-            self.encode_ffn_block_rows(&enc, layer, rows, &ws)?;
-            enc.memory_barrier_buffers();
-            self.encode_add(
-                &enc,
-                &ws.hidden,
-                &ws.attn_out,
-                &ws.hidden,
-                rows * self.inventory.hidden_size,
-            )?;
-            enc.memory_barrier_buffers();
         }
         enc.end();
         cb.commit_and_wait().map_err(|e| {
@@ -468,6 +381,84 @@ impl MetalQwen35Model {
         })?;
         state.position += rows;
         Ok(())
+    }
+
+    fn encode_prefill_layer(
+        &self,
+        enc: &greppy_embed_native::metal::ffi::ComputeEncoder,
+        layer: usize,
+        state: &mut MetalForwardState,
+        rows: usize,
+        ws: &MetalPrefillWorkspace,
+    ) -> Result<bool> {
+        self.encode_rms_norm(
+            enc,
+            &format!("blk.{layer}.attn_norm.weight"),
+            &ws.hidden,
+            &ws.normed,
+            rows,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        enc.memory_barrier_buffers();
+
+        let final_layer = layer + 1 == self.inventory.block_count;
+        match &mut state.layer_states[layer] {
+            MetalLayerState::Delta { recurrent, conv } => {
+                self.encode_delta_attention_block_rows(enc, layer, recurrent, conv, rows, ws)?;
+            }
+            MetalLayerState::Full { k_cache, v_cache } if final_layer => {
+                self.encode_full_attention_cache_only_rows(
+                    enc,
+                    layer,
+                    k_cache,
+                    v_cache,
+                    state.position,
+                    rows,
+                    state.max_context,
+                    ws,
+                )?;
+            }
+            MetalLayerState::Full { k_cache, v_cache } => {
+                self.encode_full_attention_block_rows(
+                    enc,
+                    layer,
+                    k_cache,
+                    v_cache,
+                    state.position,
+                    rows,
+                    state.max_context,
+                    ws,
+                )?;
+            }
+        }
+        if final_layer {
+            return Ok(true);
+        }
+
+        enc.memory_barrier_buffers();
+        self.encode_add_rms_norm(
+            enc,
+            &format!("blk.{layer}.post_attention_norm.weight"),
+            &ws.hidden,
+            &ws.attn_out,
+            &ws.hidden,
+            &ws.normed,
+            rows,
+            self.inventory.hidden_size,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_ffn_block_rows(enc, layer, rows, ws)?;
+        enc.memory_barrier_buffers();
+        self.encode_add(
+            enc,
+            &ws.hidden,
+            &ws.attn_out,
+            &ws.hidden,
+            rows * self.inventory.hidden_size,
+        )?;
+        enc.memory_barrier_buffers();
+        Ok(false)
     }
 
     fn forward_token_hidden_device(
@@ -2500,12 +2491,6 @@ fn is_greedy_device_sampling(params: GenerationParams) -> bool {
         && params.repetition_penalty == 1.0
 }
 
-pub(crate) fn metal_batch_prefill_enabled() -> bool {
-    std::env::var_os("QWEN35_NATIVE_METAL_BATCH_PREFILL")
-        .as_deref()
-        .is_some_and(|value| value == "1")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2633,7 +2618,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "batched Metal prefill len>1 still drifts against tokenwise decode"]
     fn qwen35_metal_batched_prefill_matches_tokenwise_when_env_set() {
         let Some(path) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
             eprintln!("skipping qwen35 Metal batched prefill parity: QWEN35_NATIVE_GGUF unset");
