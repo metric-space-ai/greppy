@@ -94,6 +94,10 @@ struct CpuDecodeWorkspace {
     ffn_gate: Vec<f32>,
     ffn_up: Vec<f32>,
     ffn_out: Vec<f32>,
+    delta_qkv: Vec<f32>,
+    delta_gate: Vec<f32>,
+    delta_out: Vec<f32>,
+    attention_out: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -1064,16 +1068,18 @@ impl CpuQwen35Model {
             let mut residual = hidden;
             let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.attn_norm);
-            let attn = match (&layer.kind, &mut state.layer_states[idx]) {
+            let (layer_states, workspace) = (&mut state.layer_states, &mut state.decode_workspace);
+            match (&layer.kind, &mut layer_states[idx]) {
                 (LayerKind::Delta(weights), LayerState::Delta(runtime)) => {
-                    self.delta_block(weights, runtime, &x)?
+                    self.delta_block_into(weights, runtime, &x, workspace)?;
                 }
                 (LayerKind::Full(weights), LayerState::Full(runtime)) => {
-                    self.full_attention_block(weights, runtime, state.position, &x)?
+                    workspace.attention_out =
+                        self.full_attention_block(weights, runtime, state.position, &x)?;
                 }
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
-            };
-            add_in_place(&mut residual, &attn);
+            }
+            add_in_place(&mut residual, &workspace.attention_out);
             hidden = residual;
 
             let mut residual = hidden;
@@ -1406,18 +1412,20 @@ impl CpuQwen35Model {
         Ok(projected)
     }
 
-    fn delta_block(
+    fn delta_block_into(
         &self,
         weights: &DeltaWeights,
         state: &mut DeltaState,
         hidden: &[f32],
-    ) -> Result<Vec<f32>> {
+        workspace: &mut CpuDecodeWorkspace,
+    ) -> Result<()> {
         let input = weights.attn_qkv.prepare_q8k_matvec(hidden)?;
-        let ((qkv, z), (beta, alpha)) = rayon::join(
+        let (qkv, z) = (&mut workspace.delta_qkv, &mut workspace.delta_gate);
+        let ((qkv_result, z_result), (beta, alpha)) = rayon::join(
             || {
                 rayon::join(
-                    || weights.attn_qkv.matvec_prepared_q8k(&input),
-                    || weights.attn_gate.matvec_prepared_q8k(&input),
+                    || weights.attn_qkv.matvec_prepared_q8k_into(&input, qkv),
+                    || weights.attn_gate.matvec_prepared_q8k_into(&input, z),
                 )
             },
             || {
@@ -1427,9 +1435,9 @@ impl CpuQwen35Model {
                 )
             },
         );
-        let mut qkv = qkv?;
-        causal_conv1d_silu(&mut qkv, &weights.ssm_conv1d, &mut state.conv);
-        let z = z?;
+        qkv_result?;
+        z_result?;
+        causal_conv1d_silu(qkv, &weights.ssm_conv1d, &mut state.conv);
         let beta = beta?;
         let alpha = alpha?;
 
@@ -1446,11 +1454,12 @@ impl CpuQwen35Model {
             (beta_h, decay)
         });
 
-        let mut out = vec![0.0f32; inner];
+        workspace.delta_out.clear();
+        workspace.delta_out.resize(inner, 0.0);
         state
             .recurrent
             .par_chunks_mut(LINEAR_HEAD_DIM)
-            .zip(out.par_iter_mut())
+            .zip(workspace.delta_out.par_iter_mut())
             .enumerate()
             .for_each(|(state_row, (row, output))| {
                 let head = state_row / LINEAR_HEAD_DIM;
@@ -1464,10 +1473,17 @@ impl CpuQwen35Model {
             });
         for head in 0..LINEAR_HEADS {
             let base = head * LINEAR_HEAD_DIM;
-            rms_norm_plain(&mut out[base..base + LINEAR_HEAD_DIM], &weights.ssm_norm);
+            rms_norm_plain(
+                &mut workspace.delta_out[base..base + LINEAR_HEAD_DIM],
+                &weights.ssm_norm,
+            );
         }
-        mul_silu_in_place(&mut out, &z);
-        weights.ssm_out.matmul(&out, 1).map_err(Into::into)
+        mul_silu_in_place(&mut workspace.delta_out, z);
+        let output_input = weights.ssm_out.prepare_q8k_matvec(&workspace.delta_out)?;
+        weights
+            .ssm_out
+            .matvec_prepared_q8k_into(&output_input, &mut workspace.attention_out)
+            .map_err(Into::into)
     }
 
     fn full_attention_block(
