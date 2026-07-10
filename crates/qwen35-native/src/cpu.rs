@@ -380,7 +380,7 @@ impl CpuQwen35Model {
                     self.delta_block_rows(weights, runtime, &x, 1)?
                 }
                 (LayerKind::Full(weights), LayerState::Full(runtime)) => {
-                    self.full_attention_block_rows(weights, runtime, state.position, &x, 1)?
+                    self.full_attention_block(weights, runtime, state.position, &x)?
                 }
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
             };
@@ -854,31 +854,32 @@ impl CpuQwen35Model {
         let mut attn_out = vec![0.0f32; self.inventory.attention_heads * self.inventory.value_dim];
         let gqa = self.inventory.attention_heads / self.inventory.kv_heads;
         let score_scale = 1.0 / (self.inventory.head_dim as f32).sqrt();
-        for head in 0..self.inventory.attention_heads {
-            let kv_head = head / gqa;
-            let qh = &q[head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
-            let mut scores = Vec::with_capacity(position + 1);
-            for pos in 0..=position {
-                let key_base = pos * kv_k_dim + kv_head * self.inventory.head_dim;
-                let kh = &state.k_cache[key_base..key_base + self.inventory.head_dim];
-                scores.push(dot(qh, kh) * score_scale);
-            }
-            softmax_in_place(&mut scores);
-            let dst = &mut attn_out
-                [head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
-            for (pos, score) in scores.iter().copied().enumerate() {
-                let value_base = pos * kv_v_dim + kv_head * self.inventory.value_dim;
-                let vh = &state.v_cache[value_base..value_base + self.inventory.value_dim];
-                for i in 0..self.inventory.value_dim {
-                    dst[i] += score * vh[i];
+        attn_out
+            .par_chunks_mut(self.inventory.value_dim)
+            .enumerate()
+            .for_each(|(head, dst)| {
+                let kv_head = head / gqa;
+                let qh = &q[head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
+                let mut scores = Vec::with_capacity(position + 1);
+                for pos in 0..=position {
+                    let key_base = pos * kv_k_dim + kv_head * self.inventory.head_dim;
+                    let kh = &state.k_cache[key_base..key_base + self.inventory.head_dim];
+                    scores.push(dot(qh, kh) * score_scale);
                 }
-            }
-            let gate =
-                &q_gate[head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
-            for i in 0..self.inventory.value_dim {
-                dst[i] *= sigmoid(gate[i]);
-            }
-        }
+                softmax_in_place(&mut scores);
+                for (pos, score) in scores.iter().copied().enumerate() {
+                    let value_base = pos * kv_v_dim + kv_head * self.inventory.value_dim;
+                    let vh = &state.v_cache[value_base..value_base + self.inventory.value_dim];
+                    for i in 0..self.inventory.value_dim {
+                        dst[i] += score * vh[i];
+                    }
+                }
+                let gate =
+                    &q_gate[head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
+                for i in 0..self.inventory.value_dim {
+                    dst[i] *= sigmoid(gate[i]);
+                }
+            });
         weights.attn_output.matmul(&attn_out, 1).map_err(Into::into)
     }
 }
