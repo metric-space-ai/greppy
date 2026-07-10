@@ -242,11 +242,11 @@ impl MetalQwen35Model {
         state: &mut MetalForwardState,
         ws: &mut MetalForwardWorkspace,
     ) -> Result<Vec<f32>> {
-        self.forward_token_hidden_device(token, state, ws, false)?;
         let cb = self.command_buffer()?;
         let enc = cb
             .compute()
             .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_token_hidden(&enc, token, state, ws, false)?;
         self.encode_rms_norm(
             &enc,
             "output_norm.weight",
@@ -269,6 +269,7 @@ impl MetalQwen35Model {
         cb.commit_and_wait().map_err(|e| {
             Error::GenerationUnavailable(format!("Metal logits forward failed: {e}"))
         })?;
+        state.position += 1;
         self.read_f32(&ws.logits, self.inventory.vocab_size)
     }
 
@@ -278,11 +279,11 @@ impl MetalQwen35Model {
         state: &mut MetalForwardState,
         ws: &mut MetalForwardWorkspace,
     ) -> Result<u32> {
-        self.forward_token_hidden_device(token, state, ws, false)?;
         let cb = self.command_buffer()?;
         let enc = cb
             .compute()
             .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_token_hidden(&enc, token, state, ws, false)?;
         self.encode_rms_norm(
             &enc,
             "output_norm.weight",
@@ -318,6 +319,7 @@ impl MetalQwen35Model {
         cb.commit_and_wait().map_err(|e| {
             Error::GenerationUnavailable(format!("Metal greedy forward failed: {e}"))
         })?;
+        state.position += 1;
         let mut token = [0_u32; 1];
         unsafe {
             ws.token_id.read(0, &mut token);
@@ -468,6 +470,27 @@ impl MetalQwen35Model {
         ws: &mut MetalForwardWorkspace,
         prefill: bool,
     ) -> Result<()> {
+        let cb = self.command_buffer()?;
+        let enc = cb
+            .compute()
+            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_token_hidden(&enc, token, state, ws, prefill)?;
+        enc.end();
+        cb.commit_and_wait().map_err(|e| {
+            Error::GenerationUnavailable(format!("Metal hidden forward failed: {e}"))
+        })?;
+        state.position += 1;
+        Ok(())
+    }
+
+    fn encode_token_hidden(
+        &self,
+        enc: &greppy_embed_native::metal::ffi::ComputeEncoder,
+        token: u32,
+        state: &mut MetalForwardState,
+        ws: &MetalForwardWorkspace,
+        prefill: bool,
+    ) -> Result<()> {
         if state.position >= state.max_context {
             return Err(Error::InvalidRequest(format!(
                 "qwen35 prompt exceeds local context cap {}",
@@ -483,17 +506,13 @@ impl MetalQwen35Model {
         unsafe {
             ws.token_id.write(0, std::slice::from_ref(&token));
         }
-        let cb = self.command_buffer()?;
-        let enc = cb
-            .compute()
-            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
-        self.encode_embed_tokens(&enc, &ws.token_id, &ws.hidden, 1)?;
+        self.encode_embed_tokens(enc, &ws.token_id, &ws.hidden, 1)?;
         enc.memory_barrier_buffers();
 
         let final_layer = self.inventory.block_count.saturating_sub(1);
         for layer in 0..self.inventory.block_count {
             self.encode_rms_norm(
-                &enc,
+                enc,
                 &format!("blk.{layer}.attn_norm.weight"),
                 &ws.hidden,
                 &ws.normed,
@@ -507,7 +526,7 @@ impl MetalQwen35Model {
                 match &mut state.layer_states[layer] {
                     MetalLayerState::Full { k_cache, v_cache } => {
                         self.encode_full_attention_cache_only(
-                            &enc,
+                            enc,
                             layer,
                             k_cache,
                             v_cache,
@@ -517,24 +536,19 @@ impl MetalQwen35Model {
                         )?;
                     }
                     MetalLayerState::Delta { recurrent, conv } => {
-                        self.encode_delta_attention_block(&enc, layer, recurrent, conv, ws)?;
+                        self.encode_delta_attention_block(enc, layer, recurrent, conv, ws)?;
                     }
                 }
-                enc.end();
-                cb.commit_and_wait().map_err(|e| {
-                    Error::GenerationUnavailable(format!("Metal prefill forward failed: {e}"))
-                })?;
-                state.position += 1;
                 return Ok(());
             }
 
             match &mut state.layer_states[layer] {
                 MetalLayerState::Delta { recurrent, conv } => {
-                    self.encode_delta_attention_block(&enc, layer, recurrent, conv, ws)?;
+                    self.encode_delta_attention_block(enc, layer, recurrent, conv, ws)?;
                 }
                 MetalLayerState::Full { k_cache, v_cache } => {
                     self.encode_full_attention_block(
-                        &enc,
+                        enc,
                         layer,
                         k_cache,
                         v_cache,
@@ -546,7 +560,7 @@ impl MetalQwen35Model {
             }
             enc.memory_barrier_buffers();
             self.encode_add_rms_norm(
-                &enc,
+                enc,
                 &format!("blk.{layer}.post_attention_norm.weight"),
                 &ws.hidden,
                 &ws.attn_out,
@@ -556,10 +570,10 @@ impl MetalQwen35Model {
                 self.inventory.hidden_size,
             )?;
             enc.memory_barrier_buffers();
-            self.encode_ffn_block(&enc, layer, ws)?;
+            self.encode_ffn_block(enc, layer, ws)?;
             enc.memory_barrier_buffers();
             self.encode_add(
-                &enc,
+                enc,
                 &ws.hidden,
                 &ws.attn_out,
                 &ws.hidden,
@@ -567,12 +581,6 @@ impl MetalQwen35Model {
             )?;
             enc.memory_barrier_buffers();
         }
-
-        enc.end();
-        cb.commit_and_wait().map_err(|e| {
-            Error::GenerationUnavailable(format!("Metal hidden forward failed: {e}"))
-        })?;
-        state.position += 1;
         Ok(())
     }
 
