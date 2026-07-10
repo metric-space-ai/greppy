@@ -19,6 +19,7 @@ pub struct Qwen35Inventory {
     pub ssm_inner_size: usize,
     pub ssm_group_count: usize,
     pub ssm_time_step_rank: usize,
+    pub nextn_predict_layers: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,7 +60,16 @@ pub const QWEN35_08B_EXPECTED: Qwen35Expected = Qwen35Expected {
 impl Qwen35Inventory {
     pub fn from_gguf(model: &GgufModel) -> Result<Self> {
         let architecture = metadata_str(model, "general.architecture")?.to_string();
-        let block_count = metadata_usize(model, "qwen35.block_count")?;
+        let stored_block_count = metadata_usize(model, "qwen35.block_count")?;
+        let nextn_predict_layers =
+            metadata_usize(model, "qwen35.nextn_predict_layers").unwrap_or(0);
+        let block_count = stored_block_count
+            .checked_sub(nextn_predict_layers)
+            .ok_or_else(|| {
+                Error::Gguf(format!(
+                    "qwen35.block_count {stored_block_count} is smaller than nextn_predict_layers {nextn_predict_layers}"
+                ))
+            })?;
         let hidden_size = metadata_usize(model, "qwen35.embedding_length")?;
         let feed_forward_size = metadata_usize(model, "qwen35.feed_forward_length")?;
         let attention_heads = metadata_usize(model, "qwen35.attention.head_count")?;
@@ -96,6 +106,7 @@ impl Qwen35Inventory {
             ssm_inner_size,
             ssm_group_count,
             ssm_time_step_rank,
+            nextn_predict_layers,
         };
         inv.validate()?;
         Ok(inv)
@@ -145,6 +156,12 @@ impl Qwen35Inventory {
             self.ssm_time_step_rank,
             expected.ssm_time_step_rank,
         )?;
+        if self.nextn_predict_layers > 1 {
+            return Err(Error::Gguf(format!(
+                "nextn_predict_layers mismatch: got {}, expected 0 or 1",
+                self.nextn_predict_layers
+            )));
+        }
         Ok(())
     }
 
@@ -223,12 +240,12 @@ impl Qwen35Inventory {
                     &format!("blk.{layer}.attn_gate.weight"),
                     &[self.ssm_inner_size, self.hidden_size],
                 )?;
-                require_quant_tensor(
+                require_projection_tensor(
                     model,
                     &format!("blk.{layer}.ssm_beta.weight"),
                     &[self.ssm_group_count, self.hidden_size],
                 )?;
-                require_quant_tensor(
+                require_projection_tensor(
                     model,
                     &format!("blk.{layer}.ssm_alpha.weight"),
                     &[self.ssm_time_step_rank, self.hidden_size],
@@ -260,11 +277,109 @@ impl Qwen35Inventory {
                 )?;
             }
         }
+        if self.has_mtp() {
+            self.validate_mtp_tensors(model)?;
+        }
         Ok(())
     }
 
     pub fn is_full_attention_layer(&self, layer: usize) -> bool {
         (layer + 1) % self.full_attention_interval == 0
+    }
+
+    pub fn has_mtp(&self) -> bool {
+        self.nextn_predict_layers == 1
+    }
+
+    fn validate_mtp_tensors(&self, model: &GgufModel) -> Result<()> {
+        let prefix = format!("blk.{}", self.block_count);
+        require_f32_tensor(
+            model,
+            &format!("{prefix}.attn_norm.weight"),
+            &[self.hidden_size],
+        )?;
+        require_f32_tensor(
+            model,
+            &format!("{prefix}.post_attention_norm.weight"),
+            &[self.hidden_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.attn_q.weight"),
+            &[self.attention_heads * self.head_dim * 2, self.hidden_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.attn_k.weight"),
+            &[self.kv_heads * self.head_dim, self.hidden_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.attn_v.weight"),
+            &[self.kv_heads * self.value_dim, self.hidden_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.attn_output.weight"),
+            &[self.hidden_size, self.attention_heads * self.value_dim],
+        )?;
+        require_f32_tensor(
+            model,
+            &format!("{prefix}.attn_q_norm.weight"),
+            &[self.head_dim],
+        )?;
+        require_f32_tensor(
+            model,
+            &format!("{prefix}.attn_k_norm.weight"),
+            &[self.head_dim],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.ffn_gate.weight"),
+            &[self.feed_forward_size, self.hidden_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.ffn_up.weight"),
+            &[self.feed_forward_size, self.hidden_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.ffn_down.weight"),
+            &[self.hidden_size, self.feed_forward_size],
+        )?;
+        require_quant_tensor(
+            model,
+            &format!("{prefix}.nextn.eh_proj.weight"),
+            &[self.hidden_size, self.hidden_size * 2],
+        )?;
+        for suffix in ["enorm", "hnorm", "shared_head_norm"] {
+            require_f32_tensor(
+                model,
+                &format!("{prefix}.nextn.{suffix}.weight"),
+                &[self.hidden_size],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_real_mtp_inventory_when_available() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_MTP_GGUF") else {
+            return;
+        };
+        let model = GgufModel::open(path).expect("open MTP GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&model).expect("read MTP inventory");
+        assert_eq!(inventory.nextn_predict_layers, 1);
+        assert!(inventory.has_mtp());
+        inventory
+            .validate_core_tensors(&model)
+            .expect("validate MTP tensors");
     }
 }
 
@@ -313,10 +428,24 @@ fn require_quant_tensor(model: &GgufModel, name: &str, expected_shape: &[usize])
     require_tensor(model, name, expected_shape, TensorDType::Qwen35Q4KmSet)
 }
 
+fn require_projection_tensor(
+    model: &GgufModel,
+    name: &str,
+    expected_shape: &[usize],
+) -> Result<()> {
+    require_tensor(
+        model,
+        name,
+        expected_shape,
+        TensorDType::Qwen35ProjectionSet,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TensorDType {
     Exact(GgmlDType),
     Qwen35Q4KmSet,
+    Qwen35ProjectionSet,
 }
 
 fn require_tensor(
@@ -342,6 +471,14 @@ fn require_tensor(
         TensorDType::Qwen35Q4KmSet if !is_qwen35_q4km_dtype(info.dtype) => {
             return Err(Error::Gguf(format!(
                 "tensor `{name}` dtype {}, expected one of Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 for qwen35 q4_k_m inference",
+                info.dtype
+            )));
+        }
+        TensorDType::Qwen35ProjectionSet
+            if info.dtype != GgmlDType::F32 && !is_qwen35_q4km_dtype(info.dtype) =>
+        {
+            return Err(Error::Gguf(format!(
+                "tensor `{name}` dtype {}, expected F32 or a qwen35 q4_k_m quant type",
                 info.dtype
             )));
         }

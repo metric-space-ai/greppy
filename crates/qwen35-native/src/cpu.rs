@@ -552,8 +552,16 @@ impl CpuQwen35Model {
             },
             || {
                 rayon::join(
-                    || weights.ssm_beta.matmul_prepared_q8k_rows(&input),
-                    || weights.ssm_alpha.matmul_prepared_q8k_rows(&input),
+                    || {
+                        weights
+                            .ssm_beta
+                            .matmul_prepared_q8k_rows_or_f32(&input, hidden)
+                    },
+                    || {
+                        weights
+                            .ssm_alpha
+                            .matmul_prepared_q8k_rows_or_f32(&input, hidden)
+                    },
                 )
             },
         );
@@ -803,8 +811,8 @@ impl CpuQwen35Model {
             },
             || {
                 rayon::join(
-                    || weights.ssm_beta.matvec_prepared_q8k(&input),
-                    || weights.ssm_alpha.matvec_prepared_q8k(&input),
+                    || weights.ssm_beta.matvec_prepared_q8k_or_f32(&input, hidden),
+                    || weights.ssm_alpha.matvec_prepared_q8k_or_f32(&input, hidden),
                 )
             },
         );

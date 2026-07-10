@@ -521,6 +521,13 @@ impl QuantMatrix {
         Ok(out)
     }
 
+    pub fn matvec_prepared_q8k_or_f32(&self, input: &PreparedQ8K, lhs: &[f32]) -> Result<Vec<f32>> {
+        match &self.storage {
+            QuantStorage::F32(_) => self.matmul(lhs, 1),
+            _ => self.matvec_prepared_q8k(input),
+        }
+    }
+
     pub fn prepare_q8k_rows(&self, lhs: &[f32], rows: usize) -> Result<PreparedQ8KRows> {
         if lhs.len() != rows * self.cols {
             return Err(Error::InvalidGguf(format!(
@@ -697,6 +704,17 @@ impl QuantMatrix {
             }
         };
         Ok(out)
+    }
+
+    pub fn matmul_prepared_q8k_rows_or_f32(
+        &self,
+        input: &PreparedQ8KRows,
+        lhs: &[f32],
+    ) -> Result<Vec<f32>> {
+        match &self.storage {
+            QuantStorage::F32(_) => self.matmul(lhs, input.rows),
+            _ => self.matmul_prepared_q8k_rows(input),
+        }
     }
 
     pub fn matmul(&self, lhs: &[f32], lhs_rows: usize) -> Result<Vec<f32>> {
