@@ -749,35 +749,37 @@ mod cpu_perf_tests {
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, input_target);
-        let mut warm_state = model.new_state(8);
-        for &token in prompt_ids.iter().take(2) {
-            model
-                .prefill_token(token, &mut warm_state)
-                .expect("CPU warmup prefill");
-        }
-
-        let mut state = model.new_state(prompt_ids.len() + output_target + 1);
         let prefill_count = prompt_ids.len() - 1;
-        let t0 = std::time::Instant::now();
-        for tokens in prompt_ids[..prefill_count].chunks(512) {
-            model
-                .prefill_tokens(tokens, &mut state)
-                .expect("CPU perf prefill forward");
-        }
-        let input_elapsed = t0.elapsed();
+        let (input_elapsed, generated, output_elapsed) = model.on_performance_cores(|| {
+            let mut warm_state = model.new_state(8);
+            for &token in prompt_ids.iter().take(2) {
+                model
+                    .prefill_token(token, &mut warm_state)
+                    .expect("CPU warmup prefill");
+            }
 
-        let mut next = prompt_ids[prefill_count];
-        let mut generated = Vec::with_capacity(output_target);
-        let t1 = std::time::Instant::now();
-        for _ in 0..output_target {
-            let logits = model
-                .forward_token_logits(next, &mut state)
-                .expect("CPU perf decode forward");
-            let token = greedy_argmax(&logits);
-            generated.push(token);
-            next = token;
-        }
-        let output_elapsed = t1.elapsed();
+            let mut state = model.new_state(prompt_ids.len() + output_target + 1);
+            let t0 = std::time::Instant::now();
+            for tokens in prompt_ids[..prefill_count].chunks(512) {
+                model
+                    .prefill_tokens(tokens, &mut state)
+                    .expect("CPU perf prefill forward");
+            }
+            let input_elapsed = t0.elapsed();
+
+            let mut next = prompt_ids[prefill_count];
+            let mut generated = Vec::with_capacity(output_target);
+            let t1 = std::time::Instant::now();
+            for _ in 0..output_target {
+                let logits = model
+                    .forward_token_logits(next, &mut state)
+                    .expect("CPU perf decode forward");
+                let token = greedy_argmax(&logits);
+                generated.push(token);
+                next = token;
+            }
+            (input_elapsed, generated, t1.elapsed())
+        });
         let input_tps = prefill_count as f64 / input_elapsed.as_secs_f64();
         let output_tps = generated.len() as f64 / output_elapsed.as_secs_f64();
         println!(

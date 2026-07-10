@@ -6,6 +6,7 @@ use gemm::{gemm, Parallelism};
 
 use crate::gguf::{GgufModel, Value};
 use crate::matmul::QuantMatrix;
+use crate::performance::PerformanceCorePool;
 use crate::{Error, Result, TokenizedBatch};
 
 const GGUF_ARCHITECTURE: &str = "gemma-embedding";
@@ -28,6 +29,7 @@ pub struct CpuEmbeddingModel {
     head: SentenceTransformerHead,
     cfg: GgufConfig,
     rotary: RotaryEmbeddings,
+    performance_pool: PerformanceCorePool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +136,7 @@ impl CpuEmbeddingModel {
             head,
             cfg,
             rotary,
+            performance_pool: PerformanceCorePool::new("embeddinggemma")?,
         })
     }
 
@@ -142,6 +145,15 @@ impl CpuEmbeddingModel {
     }
 
     pub fn forward_tokens(
+        &self,
+        token_ids: &[Vec<u32>],
+        attention_mask: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.performance_pool
+            .install(|| self.forward_tokens_on_performance_cores(token_ids, attention_mask))
+    }
+
+    fn forward_tokens_on_performance_cores(
         &self,
         token_ids: &[Vec<u32>],
         attention_mask: &[Vec<u32>],
@@ -157,8 +169,10 @@ impl CpuEmbeddingModel {
     ) -> Result<Vec<StageOutput>> {
         let token_ids = vec![token_ids.to_vec()];
         let attention_mask = vec![attention_mask.to_vec()];
-        let (_, stages) = self.forward_inner(&token_ids, &attention_mask, true)?;
-        Ok(stages)
+        self.performance_pool.install(|| {
+            let (_, stages) = self.forward_inner(&token_ids, &attention_mask, true)?;
+            Ok(stages)
+        })
     }
 
     fn forward_inner(

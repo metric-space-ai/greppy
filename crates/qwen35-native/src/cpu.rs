@@ -7,6 +7,7 @@ use std::arch::aarch64::*;
 use std::arch::x86_64::*;
 
 use greppy_embed_native::matmul::QuantMatrix;
+use greppy_embed_native::performance::PerformanceCorePool;
 use greppy_embed_native::GgufModel;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
@@ -32,6 +33,7 @@ pub(crate) struct CpuQwen35Model {
     output_norm: Vec<f32>,
     layers: Vec<LayerWeights>,
     eos_token_id: u32,
+    performance_pool: PerformanceCorePool,
 }
 
 struct LayerWeights {
@@ -141,10 +143,22 @@ impl CpuQwen35Model {
             output_norm,
             layers,
             eos_token_id,
+            performance_pool: PerformanceCorePool::new("qwen35")
+                .map_err(|error| Error::GenerationUnavailable(error.to_string()))?,
         })
     }
 
     pub(crate) fn generate(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        params: GenerationParams,
+    ) -> Result<String> {
+        self.performance_pool
+            .install(|| self.generate_on_performance_cores(tokenizer, prompt, params))
+    }
+
+    fn generate_on_performance_cores(
         &self,
         tokenizer: &Tokenizer,
         prompt: &str,
@@ -211,6 +225,11 @@ impl CpuQwen35Model {
             layer_states,
             max_context,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_performance_cores<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        self.performance_pool.install(operation)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

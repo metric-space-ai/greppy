@@ -678,6 +678,7 @@ dependencies = [
  "bytemuck",
  "gemm",
  "half",
+ "libc",
  "libloading",
  "memmap2",
  "objc2",

@@ -20,6 +20,7 @@
 pub mod gguf;
 pub mod matmul;
 pub mod model;
+pub mod performance;
 pub mod quant;
 pub mod tokenizer;
 
@@ -301,6 +302,8 @@ pub enum Error {
     UnsupportedDType(GgmlDType),
     #[error("tokenizer: {0}")]
     Tokenizer(String),
+    #[error("CPU inference: {0}")]
+    Cpu(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
