@@ -523,10 +523,24 @@ impl CpuQwen35Model {
         let stage_start = std::time::Instant::now();
         let inner = self.inventory.ssm_inner_size;
         let input = weights.attn_qkv.prepare_q8k_rows(hidden, rows)?;
-        let mut qkv = weights.attn_qkv.matmul_prepared_q8k_rows(&input)?;
-        let z = weights.attn_gate.matmul_prepared_q8k_rows(&input)?;
-        let beta = weights.ssm_beta.matmul_prepared_q8k_rows(&input)?;
-        let alpha = weights.ssm_alpha.matmul_prepared_q8k_rows(&input)?;
+        let ((qkv, z), (beta, alpha)) = rayon::join(
+            || {
+                rayon::join(
+                    || weights.attn_qkv.matmul_prepared_q8k_rows(&input),
+                    || weights.attn_gate.matmul_prepared_q8k_rows(&input),
+                )
+            },
+            || {
+                rayon::join(
+                    || weights.ssm_beta.matmul_prepared_q8k_rows(&input),
+                    || weights.ssm_alpha.matmul_prepared_q8k_rows(&input),
+                )
+            },
+        );
+        let mut qkv = qkv?;
+        let z = z?;
+        let beta = beta?;
+        let alpha = alpha?;
         let mut scan_params = vec![(0.0f32, 0.0f32); rows * LINEAR_HEADS];
         #[cfg(test)]
         let projection_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
@@ -627,9 +641,18 @@ impl CpuQwen35Model {
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
         let q_dim = self.inventory.attention_heads * self.inventory.head_dim;
         let input = weights.attn_q.prepare_q8k_rows(hidden, rows)?;
-        let q_fused = weights.attn_q.matmul_prepared_q8k_rows(&input)?;
-        let mut k = weights.attn_k.matmul_prepared_q8k_rows(&input)?;
-        let v = weights.attn_v.matmul_prepared_q8k_rows(&input)?;
+        let (q_fused, (k, v)) = rayon::join(
+            || weights.attn_q.matmul_prepared_q8k_rows(&input),
+            || {
+                rayon::join(
+                    || weights.attn_k.matmul_prepared_q8k_rows(&input),
+                    || weights.attn_v.matmul_prepared_q8k_rows(&input),
+                )
+            },
+        );
+        let q_fused = q_fused?;
+        let mut k = k?;
+        let v = v?;
         #[cfg(test)]
         let projection_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
         #[cfg(test)]
@@ -750,11 +773,25 @@ impl CpuQwen35Model {
         hidden: &[f32],
     ) -> Result<Vec<f32>> {
         let input = weights.attn_qkv.prepare_q8k_matvec(hidden)?;
-        let mut qkv = weights.attn_qkv.matvec_prepared_q8k(&input)?;
+        let ((qkv, z), (beta, alpha)) = rayon::join(
+            || {
+                rayon::join(
+                    || weights.attn_qkv.matvec_prepared_q8k(&input),
+                    || weights.attn_gate.matvec_prepared_q8k(&input),
+                )
+            },
+            || {
+                rayon::join(
+                    || weights.ssm_beta.matvec_prepared_q8k(&input),
+                    || weights.ssm_alpha.matvec_prepared_q8k(&input),
+                )
+            },
+        );
+        let mut qkv = qkv?;
         causal_conv1d_silu(&mut qkv, &weights.ssm_conv1d, &mut state.conv);
-        let z = weights.attn_gate.matvec_prepared_q8k(&input)?;
-        let beta = weights.ssm_beta.matvec_prepared_q8k(&input)?;
-        let alpha = weights.ssm_alpha.matvec_prepared_q8k(&input)?;
+        let z = z?;
+        let beta = beta?;
+        let alpha = alpha?;
 
         let inner = self.inventory.ssm_inner_size;
         let (q, rest) = qkv.split_at_mut(inner);
@@ -803,14 +840,23 @@ impl CpuQwen35Model {
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
         let input = weights.attn_q.prepare_q8k_matvec(hidden)?;
-        let q_fused = weights.attn_q.matvec_prepared_q8k(&input)?;
+        let (q_fused, (k, v)) = rayon::join(
+            || weights.attn_q.matvec_prepared_q8k(&input),
+            || {
+                rayon::join(
+                    || weights.attn_k.matvec_prepared_q8k(&input),
+                    || weights.attn_v.matvec_prepared_q8k(&input),
+                )
+            },
+        );
+        let q_fused = q_fused?;
         let (mut q, q_gate) = split_full_attention_q_gate(
             &q_fused,
             self.inventory.attention_heads,
             self.inventory.head_dim,
         );
-        let mut k = weights.attn_k.matvec_prepared_q8k(&input)?;
-        let v = weights.attn_v.matvec_prepared_q8k(&input)?;
+        let mut k = k?;
+        let v = v?;
         debug_assert_eq!(k.len(), kv_k_dim);
         debug_assert_eq!(v.len(), kv_v_dim);
 
