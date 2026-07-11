@@ -1226,7 +1226,10 @@ mod tests {
         std::env::set_var("GREPPY_STORE_DIR", base.join("data"));
         let dir = ensure_workspace_store(&repo).unwrap();
         assert!(dir.ends_with(crate::workspace::workspace_hash(&repo)));
-        assert!(dir.to_string_lossy().contains("workspaces/v2"));
+        assert_eq!(
+            dir.parent(),
+            Some(base.join("data").join("workspaces").join("v2").as_path())
+        );
         let m = read_store_manifest(&dir).unwrap();
         assert_eq!(m.canonical_root, repo.canonicalize().unwrap());
         std::env::remove_var("GREPPY_STORE_DIR");
