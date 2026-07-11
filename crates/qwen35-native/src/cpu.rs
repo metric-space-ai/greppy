@@ -1855,11 +1855,9 @@ unsafe fn delta_recurrent_step_neon(
     for idx in (0..LINEAR_HEAD_DIM).step_by(4) {
         let state_values = vld1q_f32(state.as_ptr().add(idx));
         let key_values = vld1q_f32(key.as_ptr().add(idx));
-        prior = vaddq_f32(prior, vmulq_f32(state_values, key_values));
+        prior = vfmaq_f32(prior, state_values, key_values);
     }
-    let mut lanes = [0.0f32; 4];
-    vst1q_f32(lanes.as_mut_ptr(), prior);
-    let prior = lanes.iter().copied().sum::<f32>();
+    let prior = vaddvq_f32(prior);
     let delta = (value - decay * prior) * beta;
     let decay = vdupq_n_f32(decay);
     let delta = vdupq_n_f32(delta);
@@ -1867,13 +1865,12 @@ unsafe fn delta_recurrent_step_neon(
     for idx in (0..LINEAR_HEAD_DIM).step_by(4) {
         let state_values = vld1q_f32(state.as_ptr().add(idx));
         let key_values = vld1q_f32(key.as_ptr().add(idx));
-        let updated = vaddq_f32(vmulq_f32(decay, state_values), vmulq_f32(key_values, delta));
+        let updated = vfmaq_f32(vmulq_f32(decay, state_values), key_values, delta);
         vst1q_f32(state.as_mut_ptr().add(idx), updated);
         let query_values = vld1q_f32(query.as_ptr().add(idx));
-        attention = vaddq_f32(attention, vmulq_f32(updated, query_values));
+        attention = vfmaq_f32(attention, updated, query_values);
     }
-    vst1q_f32(lanes.as_mut_ptr(), attention);
-    lanes.iter().copied().sum()
+    vaddvq_f32(attention)
 }
 
 fn rms_norm_qwen(x: &mut [f32], w: &[f32]) {
