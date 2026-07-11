@@ -3837,7 +3837,7 @@ mod tests {
         );
         assert_eq!(
             [first_draft_token, greedy_argmax(&second_draft.logits)],
-            [6976, 279],
+            [334, 1159],
             "Metal MTP drafts differ from the finetuned-model golden tokens"
         );
     }

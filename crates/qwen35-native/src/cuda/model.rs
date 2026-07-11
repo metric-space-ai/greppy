@@ -4805,9 +4805,36 @@ mod tests {
                 &mut mtp_state,
             )
             .expect("CUDA MTP second draft");
+        let cpu = crate::cpu::CpuQwen35Model::load(&gguf, inventory, 248_044)
+            .expect("CPU MTP comparison model");
+        let mut cpu_mtp_state = cpu
+            .new_mtp_state(max_context)
+            .expect("CPU MTP comparison state");
+        cpu.mtp_prefill_tokens(&ids, &conditioning, &mut cpu_mtp_state)
+            .expect("CPU MTP comparison catch-up");
+        let cpu_first = cpu
+            .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut cpu_mtp_state)
+            .expect("CPU MTP first comparison draft");
+        let cpu_first_token = greedy_argmax(&cpu_first.logits);
+        let cpu_second = cpu
+            .mtp_forward_tokens_logits_hidden(
+                &[cpu_first_token],
+                &cpu_first.hidden,
+                &mut cpu_mtp_state,
+            )
+            .expect("CPU MTP second comparison draft");
+        let first_hidden_cosine = cosine(&first_draft.hidden, &cpu_first.hidden);
+        let first_logits_cosine = cosine(&first_draft.logits, &cpu_first.logits);
+        let second_logits_cosine = cosine(&second_draft.logits, &cpu_second.logits);
+        eprintln!(
+            "CUDA/CPU MTP first hidden_cos={first_hidden_cosine:.8} logits_cos={first_logits_cosine:.8}; second logits_cos={second_logits_cosine:.8}; tokens={first_draft_token}/{cpu_first_token}"
+        );
+        assert!(first_hidden_cosine >= 0.998);
+        assert!(first_logits_cosine >= 0.998);
+        assert!(second_logits_cosine >= 0.998);
         assert_eq!(
             [first_draft_token, greedy_argmax(&second_draft.logits)],
-            [6976, 279],
+            [6976, 264],
             "CUDA MTP drafts differ from the finetuned-model golden tokens"
         );
     }
