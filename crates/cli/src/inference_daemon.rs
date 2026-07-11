@@ -636,6 +636,13 @@ fn read_frame(
             ));
         }
         match stream.read(&mut buffer) {
+            #[cfg(windows)]
+            Ok(0) => {
+                // A byte-mode named pipe in PIPE_NOWAIT mode reports an
+                // empty read as zero bytes while the peer is still alive.
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            #[cfg(not(windows))]
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

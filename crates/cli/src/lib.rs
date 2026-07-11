@@ -14037,6 +14037,13 @@ fn sync_parent_dir(path: &std::path::Path) -> Result<()> {
 }
 
 fn sync_file(path: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::io(format!("open file {}", path.display()), e))?;
+    #[cfg(not(windows))]
     let file = std::fs::File::open(path)
         .map_err(|e| Error::io(format!("open file {}", path.display()), e))?;
     file.sync_all()
