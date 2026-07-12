@@ -3,7 +3,7 @@
   "version": 1,
   "release_ready": false,
   "release_blockers": [
-    "EmbeddingGemma conversion provenance is unresolved",
+    "EmbeddingGemma third-party conversion recipe is not published",
     "Qwen summary-quality and training reproducibility gates are unresolved",
     "final redistribution review is pending"
   ],
@@ -43,15 +43,15 @@
       "provenance": [
         {
           "path": "licenses/EMBEDDINGGEMMA-PROVENANCE.json",
-          "sha256": "10553e03d7864734e36800b895f1f0c562d8d1405a97f0330efb3d30fcf86ef3",
-          "size": 1028
+          "sha256": "234c290231715073c135f6817857ce38005ac73032cdb1d6d1df9f38b7bcc22f",
+          "size": 1896
         }
       ],
       "modifications": [
         {
           "path": "licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt",
-          "sha256": "08e3c0dbba598ba90bd73d4a0457ff554b5f4cd121b4d23e44ecd4074bf6a30c",
-          "size": 680
+          "sha256": "117e25db715a57abf675dea24b848b8ee39efa3ae2d97881d4b76a709448fb6c",
+          "size": 939
         }
       ]
     },

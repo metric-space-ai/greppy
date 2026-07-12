@@ -10,15 +10,17 @@ archives must include this file and the complete `licenses/` directory.
 
 - Purpose: code-query and source-span embeddings.
 - Upstream model: `google/embeddinggemma-300m`.
+- Bundled GGUF source: pinned
+  `cduk/embeddinggemma-300m-GGUF-with-dense-modules` snapshot, byte-identical.
 - Bundled files: `embeddinggemma-300M-Q4_K.gguf`, `tokenizer.json`.
 - Terms: Gemma Terms of Use plus the incorporated Gemma Prohibited Use Policy.
 - Notice: `licenses/EMBEDDINGGEMMA-NOTICE.txt`.
 
 The Gemma terms require a copy of the agreement and a specific Notice for
 redistribution. They are not replaced by Greppy's MIT license. Public release
-remains blocked until the bundled quantization's provenance and redistribution
-review are signed off and the current official terms are compared with the
-packaged copies.
+remains blocked until the third-party quantization recipe is replaced or
+recovered, the redistribution review is signed off, and the current official
+terms are compared with the packaged copies.
 
 See `licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt` and
 `licenses/EMBEDDINGGEMMA-PROVENANCE.json`. The release workflow verifies these

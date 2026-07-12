@@ -3,18 +3,38 @@
   "model_id": "embeddinggemma-300m-q4k-current",
   "release_ready": false,
   "release_blockers": [
-    "exact upstream revision has not been recovered",
-    "exact GGUF conversion and quantizer revisions have not been recovered",
+    "third-party GGUF conversion command and tool revisions are not published",
     "redistribution review has not been signed off"
   ],
   "base": {
     "repository": "google/embeddinggemma-300m",
-    "revision": null,
+    "revision": "57c266a740f537b4dc058e1b0cda161fd15afa75",
     "license": "Gemma Terms of Use"
+  },
+  "gguf_source": {
+    "repository": "cduk/embeddinggemma-300m-GGUF-with-dense-modules",
+    "revision": "16eaef07700282e488368e27b992b8fe5a40c423",
+    "file_commit": "1a81ab8cc0339fc926e64291fb207a17f1cbe804",
+    "filename": "embeddinggemma-300M-Q4_K.gguf",
+    "declared_base_model": "google/embeddinggemma-300m",
+    "declared_license": "gemma",
+    "downloaded_byte_identical": true,
+    "gguf_metadata_general_name": "57c266a740f537b4dc058e1b0cda161fd15afa75",
+    "gguf_version": 3,
+    "quantization_version": 2,
+    "file_type": "Q4_K_M"
+  },
+  "tokenizer_source": {
+    "repository": "google/embeddinggemma-300m-qat-q4_0-unquantized",
+    "revision": "7740c61c3ad98a9deb8423a20388ab6c3c5c45f2",
+    "filename": "tokenizer.json",
+    "declared_license": "gemma"
   },
   "conversion": {
     "format": "GGUF",
-    "quantization": "Q4_K",
+    "quantization": "Q4_K_M",
+    "performed_by_greppy": false,
+    "producer": "cduk/embeddinggemma-300m-GGUF-with-dense-modules",
     "tool": null,
     "revision": null,
     "command": null

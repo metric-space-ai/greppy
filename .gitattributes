@@ -2,7 +2,14 @@ crates/cli/assets/embeddinggemma-300m-q4k/*.gguf filter=lfs diff=lfs merge=lfs -
 crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json filter=lfs diff=lfs merge=lfs -text
 crates/cli/assets/qwen35-0.8b-mtp-q4km/*.gguf filter=lfs diff=lfs merge=lfs -text
 crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json filter=lfs diff=lfs merge=lfs -text
+crates/cli/assets/qwen35-0.8b-mtp-q4km/*.sha256 text eol=lf
 crates/cli/tests/assets/ci-test/** -text
+
+# Redistribution lock records are hashed byte-for-byte on every release
+# platform. Keep LF checkout bytes stable when Git runs on Windows.
+licenses/*.html text eol=lf
+licenses/*.json text eol=lf
+licenses/*.txt text eol=lf
 
 # Benchmark harness + drivers are tooling, not the shipped product (a single
 # native Rust binary). Exclude from GitHub's language stats so the repo language
