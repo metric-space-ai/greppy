@@ -2180,13 +2180,11 @@ impl GraphIndex {
         self.id_to_file.get(&id).map(|s| s.as_str())
     }
 
-    /// Resolve a CALLS edge: direct qname first, then callable name, then a
-    /// constructable class/type fallback for `ClassName(...)`-style
-    /// instantiation when no constructor/function node resolves.
+    /// Resolve a CALLS edge. Receiver dispatch is deliberately method-only:
+    /// resolving `value.as_bytes()` to an unrelated free `as_bytes` function
+    /// is worse than leaving the edge unresolved. Other calls retain the
+    /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
-        if let Some(tgt) = self.by_qname(&edge.target_qualified_name) {
-            return Some(tgt.id);
-        }
         let src = self.by_qname(&edge.source_qualified_name)?;
         let src_id = src.id;
         let name = edge
@@ -2196,6 +2194,21 @@ impl GraphIndex {
         if name.is_empty() {
             return None;
         }
+        if edge
+            .properties
+            .get("callee_form")
+            .and_then(|value| value.as_str())
+            == Some("receiver")
+        {
+            let owner = edge
+                .properties
+                .get("receiver_owner")
+                .and_then(|value| value.as_str())?;
+            return self.resolve_receiver_method(&edge.file_path, owner, name);
+        }
+        if let Some(tgt) = self.by_qname(&edge.target_qualified_name) {
+            return Some(tgt.id);
+        }
         match self.resolve_unique_status_with_imports(&CALLABLE_LABELS, name, src_id) {
             UniqueResolution::Unique(id) => Some(id),
             UniqueResolution::Unresolved => {
@@ -2203,6 +2216,29 @@ impl GraphIndex {
             }
             UniqueResolution::Ambiguous => None,
         }
+    }
+
+    /// Resolve a receiver call only when its statically observed owner and
+    /// method name identify one Method node. Prefer the exact same-file qname;
+    /// cross-file resolution requires a globally unique owner/name suffix.
+    fn resolve_receiver_method(&self, file_path: &str, owner: &str, name: &str) -> Option<i64> {
+        if owner.is_empty() || name.is_empty() {
+            return None;
+        }
+        let local_qname = format!("{file_path}::{owner}::{name}");
+        if let Some(target) = self.by_qname(&local_qname) {
+            return (target.label == "Method").then_some(target.id);
+        }
+
+        let suffix = format!("::{owner}::{name}");
+        note_edge_resolution_work(self.by_qname.len());
+        let mut matches = self
+            .by_qname
+            .iter()
+            .filter(|(qname, node)| node.label == "Method" && qname.ends_with(&suffix))
+            .map(|(_, node)| node.id);
+        let target = matches.next()?;
+        matches.next().is_none().then_some(target)
     }
 
     /// Resolve a reference edge: try the parser's direct same-file guess
@@ -2947,6 +2983,80 @@ mod tests {
             .filter(|e| e.target_id == b.id && e.edge_type == "CALLS")
             .collect();
         assert_eq!(outs.len(), 1, "expected one CALLS edge a→b, got {outs:?}");
+    }
+
+    #[test]
+    fn rust_receiver_call_does_not_resolve_to_same_named_free_function() {
+        const SOURCE: &str = r#"
+fn as_bytes<T>(_value: T) -> usize { 0 }
+
+struct Unrelated;
+
+impl Unrelated {
+    fn as_bytes(&self) -> &[u8] { &[] }
+}
+
+fn caller(value: &str) -> &[u8] {
+    value.as_bytes()
+}
+"#;
+        let repo = setup_repo("receiver-not-free", SOURCE);
+        let mut store = Store::open_memory().unwrap();
+        let _ = index(&mut store, &repo, "test").unwrap();
+
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::caller")
+            .unwrap()
+            .expect("caller must exist");
+        let free_function = store
+            .get_node_by_qname("test", "src/lib.rs::Function::as_bytes")
+            .unwrap()
+            .expect("free as_bytes must exist");
+        let unrelated_method = store
+            .get_node_by_qname("test", "src/lib.rs::Unrelated::as_bytes")
+            .unwrap()
+            .expect("Unrelated::as_bytes must exist");
+        let calls = store.outgoing_edges(caller.id, Some("CALLS"), 256).unwrap();
+
+        assert!(
+            calls.iter().all(|edge| {
+                edge.target_id != free_function.id && edge.target_id != unrelated_method.id
+            }),
+            "receiver call must remain unresolved instead of targeting a same-named free function or unrelated method: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn rust_receiver_call_resolves_to_unique_method() {
+        const SOURCE: &str = r#"
+struct Buffer;
+
+impl Buffer {
+    fn as_bytes(&self) -> &[u8] { &[] }
+}
+
+fn caller(value: Buffer) -> &'static [u8] {
+    value.as_bytes()
+}
+"#;
+        let repo = setup_repo("receiver-method", SOURCE);
+        let mut store = Store::open_memory().unwrap();
+        let _ = index(&mut store, &repo, "test").unwrap();
+
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::caller")
+            .unwrap()
+            .expect("caller must exist");
+        let method = store
+            .get_node_by_qname("test", "src/lib.rs::Buffer::as_bytes")
+            .unwrap()
+            .expect("Buffer::as_bytes must exist");
+        let calls = store.outgoing_edges(caller.id, Some("CALLS"), 256).unwrap();
+
+        assert!(
+            calls.iter().any(|edge| edge.target_id == method.id),
+            "receiver call must resolve to the unique Method node: {calls:?}"
+        );
     }
 
     #[test]

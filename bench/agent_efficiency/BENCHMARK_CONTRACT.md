@@ -31,6 +31,8 @@ Each task runs with the same question, model, timeout, and repository snapshot.
 Index/model setup occurs before measured agent work. Per-task rows retain:
 
 - accepted mechanical quality/correctness evidence;
+- explicit hard-negative graph terms are hard failures, so an answer cannot
+  pass by naming the expected symbols alongside a known false edge;
 - input and output tokens separately;
 - variable input tokens after the common first-turn prompt;
 - tool calls and source-open calls;

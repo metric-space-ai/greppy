@@ -13434,12 +13434,12 @@ mod tests {
     fn version_bump_same_scope_is_scope_stable() {
         // Pure version bump, default scope on both sides → self-heal.
         assert!(version_drift_is_scope_stable(&drift_json(
-            "indexer version/scope changed (was greppy-indexer-v1, expected greppy-indexer-v2)"
+            "indexer version/scope changed (was greppy-indexer-v1, expected greppy-indexer-v3)"
         )));
         // Same non-default scope, version bumped → self-heal.
         assert!(version_drift_is_scope_stable(&drift_json(
             "indexer version/scope changed (was greppy-indexer-v1;discover_scope=I8:src/*.rs, \
-             expected greppy-indexer-v2;discover_scope=I8:src/*.rs)"
+             expected greppy-indexer-v3;discover_scope=I8:src/*.rs)"
         )));
     }
 
@@ -13448,12 +13448,12 @@ mod tests {
         // Different discover scope → NOT stable → refuse (fail-closed).
         assert!(!version_drift_is_scope_stable(&drift_json(
             "indexer version/scope changed (was greppy-indexer-v2;discover_scope=I8:src/*.rs, \
-             expected greppy-indexer-v2)"
+             expected greppy-indexer-v3)"
         )));
         // Version bump AND scope change → scope change dominates → refuse.
         assert!(!version_drift_is_scope_stable(&drift_json(
             "indexer version/scope changed (was greppy-indexer-v1, \
-             expected greppy-indexer-v2;discover_scope=I8:src/*.rs)"
+             expected greppy-indexer-v3;discover_scope=I8:src/*.rs)"
         )));
     }
 

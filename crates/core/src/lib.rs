@@ -24,7 +24,9 @@
 /// upgrades — robustness lesson from the O3/O8/O9/P4 batch).
 ///   v1 -> v2 (2026-07-07): O9 discovery boundary, O8 resolver window,
 ///   O3 closure attribution, P4 edge call-site line now persisted.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v2";
+///   v2 -> v3 (2026-07-12): preserve Rust receiver-call shape and resolve
+///   receiver dispatch only to Method nodes, never same-named free functions.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v3";
 
 pub mod cache;
 pub mod diag;

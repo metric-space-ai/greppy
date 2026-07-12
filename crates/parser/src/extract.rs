@@ -329,6 +329,54 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
     None
 }
 
+/// Resolve the owner type of an unambiguous Rust receiver call when the AST
+/// carries enough local type evidence. `self.method()` inherits the enclosing
+/// impl owner; `value.method()` is accepted only when `value` is an explicitly
+/// typed function parameter. Inferred locals deliberately return `None` so the
+/// graph resolver cannot attach the call to an unrelated same-named method.
+fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str> {
+    let field = callee.parent()?;
+    if field.kind() != "field_expression" {
+        return None;
+    }
+    let receiver = field.child_by_field_name("value")?;
+    let receiver_text = node_text(source, receiver).trim();
+    if receiver_text == "self" {
+        return enclosing_impl_type(source, callee);
+    }
+    if receiver.kind() != "identifier" || receiver_text.is_empty() {
+        return None;
+    }
+
+    let mut ancestor = field.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "function_item" {
+            let parameters = node.child_by_field_name("parameters")?;
+            for index in 0..parameters.named_child_count() {
+                let Some(parameter) = parameters.named_child(index) else {
+                    continue;
+                };
+                if parameter.kind() != "parameter" {
+                    continue;
+                }
+                let Some(pattern) = parameter.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if node_text(source, pattern).trim() != receiver_text {
+                    continue;
+                }
+                let ty = parameter.child_by_field_name("type")?;
+                let mut names = Vec::new();
+                type_identifiers_in(source, ty, &mut names);
+                return names.into_iter().next();
+            }
+            return None;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
 /// Walk `node`'s ancestors and return the qname of the nearest enclosing
 /// *definition* (function/method, struct, enum, or trait) — whichever the
 /// reference sits inside. Used as the `source` endpoint for TYPE_REF and
@@ -2576,6 +2624,21 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 }
                 let node = cap.node;
                 let text = node_text(source, node);
+                // Rust's grammar makes receiver dispatch unambiguous here:
+                // `value.method()` captures the field_identifier below a
+                // field_expression, while bare/module/associated calls use
+                // identifier/scoped_identifier nodes. Preserve that shape so
+                // the resolver never guesses a same-named free function for a
+                // receiver call.
+                let callee_form = if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "field_expression")
+                {
+                    "receiver"
+                } else {
+                    "direct"
+                };
+                let receiver_owner = rust_receiver_owner(source, node);
                 // NOTE: no `Call` pseudo-node (forensics F2 + index perf). The
                 // CALLS edge below targets the real `file::Function::<text>`
                 // qname (resolved by name when cross-file); the Call node was
@@ -2599,10 +2662,22 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         // resolver matches against Function/Method node
                         // names project-wide. `callee_text` is kept for
                         // backwards-compatible diagnostics.
-                        properties: serde_json::json!({
+                        properties: {
+                            let mut properties = serde_json::json!({
                             "callee_text": text,
                             "callee_name": text,
-                        }),
+                            "callee_form": callee_form,
+                            });
+                            if let (Some(owner), Some(object)) =
+                                (receiver_owner, properties.as_object_mut())
+                            {
+                                object.insert(
+                                    "receiver_owner".into(),
+                                    serde_json::Value::String(owner.to_string()),
+                                );
+                            }
+                            properties
+                        },
                     });
                 }
             }
@@ -14122,6 +14197,40 @@ mod tests {
             !callee_names.contains("Foo"),
             "must NOT capture type path `Foo`, got {callee_names:?}"
         );
+    }
+
+    #[test]
+    fn rust_calls_preserve_receiver_dispatch_shape() {
+        const SOURCE: &str = r#"
+            fn caller(value: Buffer) {
+                value.method_call();
+                free_call(value);
+            }
+        "#;
+        let result = extract(Language::Rust, SOURCE.as_bytes(), "src/lib.rs").unwrap();
+        let form_for = |name: &str| {
+            result
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some(name)
+                })
+                .and_then(|edge| edge.properties.get("callee_form"))
+                .and_then(|value| value.as_str())
+        };
+
+        assert_eq!(form_for("method_call"), Some("receiver"));
+        assert_eq!(form_for("free_call"), Some("direct"));
+        let receiver_owner = result
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("method_call")
+            })
+            .and_then(|edge| edge.properties.get("receiver_owner"))
+            .and_then(|value| value.as_str());
+        assert_eq!(receiver_owner, Some("Buffer"));
     }
 
     #[test]

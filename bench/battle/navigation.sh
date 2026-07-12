@@ -144,7 +144,7 @@ else
 fi
 
 # ---- find-usages <Struct> : THE regression guard --------------------------
-# `Widget` names BOTH a Struct and an Impl. The incoming USES/TYPE_REF
+# `Widget` names BOTH a Struct and an Impl. The incoming USAGE
 # edges all land on the Struct; the Impl has none. If symbol resolution
 # picks the Impl, the command prints "(no usages)" for a symbol that is
 # very much used. This is the exact bug the DB-only harness missed.
@@ -155,17 +155,17 @@ if grep -q '(no usages)' <<<"$fu_out"; then
 else
     pass "find-usages Widget is NOT '(no usages)'"
 fi
-# Content assertions: the real referrers are `caller` (USES) and `make`
-# (TYPE_REF + USES). At least one must appear; ideally both.
+# Content assertions: the real referrers are `caller` and `make`, both through
+# the unified USAGE edge model. At least one must appear; ideally both.
 fu_hits=0
 grep -q 'caller' <<<"$fu_out" && fu_hits=$((fu_hits + 1))
 grep -q 'make'   <<<"$fu_out" && fu_hits=$((fu_hits + 1))
 assert_ge "$fu_hits" 1 "find-usages Widget names a real referrer (caller/make)"
 # The edge kind must be one the command claims to report.
-if grep -qE 'USES|TYPE_REF' <<<"$fu_out"; then
-    pass "find-usages Widget reports a USES/TYPE_REF edge kind"
+if grep -q 'USAGE' <<<"$fu_out"; then
+    pass "find-usages Widget reports a USAGE edge kind"
 else
-    fail "find-usages Widget reports a USES/TYPE_REF edge kind (got: $fu_out)"
+    fail "find-usages Widget reports a USAGE edge kind (got: $fu_out)"
 fi
 
 # Sanity counter-case: a symbol with genuinely no usages must still say so

@@ -131,6 +131,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      - name: agent benchmark precision grader
+        run: python3 -m unittest bench/agent_efficiency/test_grade_answers.py
+
       # Black-box battle suite against the freshly built debug binaries. The
       # release workflow separately builds and tests the exact packages that
       # ship, avoiding a second multi-hundred-MiB model link on every push.

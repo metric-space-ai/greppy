@@ -100,13 +100,20 @@ def grade_answer(
             found.append(term)
         else:
             missing.append(term)
+    forbidden_found = find_forbidden_terms(chk, answer_norm)
 
     count_status = count_check(chk, answer)
     required_total = len(required) + (1 if count_status == "missing" else 0)
     found_total = len(found) + (1 if count_status == "ok" else 0)
     score = 1.0 if required_total == 0 else found_total / required_total
-    verdict = "pass" if not missing and count_status != "missing" else "partial"
+    verdict = (
+        "pass"
+        if not missing and count_status != "missing" and not forbidden_found
+        else "partial"
+    )
     if found_total == 0 and required_total > 0:
+        verdict = "fail"
+    if forbidden_found:
         verdict = "fail"
 
     accepted = bool(accept_smoke and verdict == "pass")
@@ -117,6 +124,7 @@ def grade_answer(
         "verdict": verdict,
         "found": found,
         "missing": missing,
+        "forbidden_found": forbidden_found,
         "count_status": count_status,
         "note": (
             "Smoke grade only. It checks expected symbols/files/count hints in "
@@ -141,8 +149,11 @@ def grade_answer_mechanical(
         terms = [t for t in chk.get("terms", []) if t]
         min_hits = int(chk.get("min_hits", 1))
         found = [t for t in terms if canonical(t) in answer_norm]
+        forbidden_found = find_forbidden_terms(chk, answer_norm)
         hits = len(found)
-        if hits >= min_hits:
+        if forbidden_found:
+            verdict = "fail"
+        elif hits >= min_hits:
             verdict = "pass"
         elif hits > 0:
             verdict = "partial"
@@ -155,9 +166,12 @@ def grade_answer_mechanical(
             "verdict": verdict,
             "found": found,
             "missing": [t for t in terms if t not in found],
+            "forbidden_found": forbidden_found,
             "count_status": "not_applicable",
-            "extra_failures": [] if hits >= min_hits
-            else [f"hit {hits}/{min_hits} required floor terms"],
+            "extra_failures": (
+                [f"forbidden term present: {term}" for term in forbidden_found]
+                + ([] if hits >= min_hits else [f"hit {hits}/{min_hits} required floor terms"])
+            ),
             "note": (
                 "SWE-QA floor grade: answer must name at least min_hits of the "
                 "rg-verified gold identifiers/files."
@@ -174,6 +188,10 @@ def grade_answer_mechanical(
             missing.append(term)
 
     extra_failures: list[str] = []
+    forbidden_found = find_forbidden_terms(chk, answer_norm)
+    extra_failures.extend(
+        f"forbidden term present: {term}" for term in forbidden_found
+    )
     count_status = count_check_mechanical(chk, answer, found)
     count_required = chk.get("min_count") is not None
     count_passed = count_status in {"ok", "inferred_from_members", "not_applicable"}
@@ -197,7 +215,9 @@ def grade_answer_mechanical(
         found_total += 1
     score = 1.0 if required_total == 0 else found_total / required_total
 
-    if not missing and not extra_failures:
+    if forbidden_found:
+        verdict = "fail"
+    elif not missing and not extra_failures:
         verdict = "pass"
     elif found_total == 0:
         verdict = "fail"
@@ -212,6 +232,7 @@ def grade_answer_mechanical(
         "verdict": verdict,
         "found": found,
         "missing": missing,
+        "forbidden_found": forbidden_found,
         "count_status": count_status,
         "extra_failures": extra_failures,
         "note": (
@@ -235,6 +256,21 @@ def expected_terms(chk: dict[str, Any]) -> list[str]:
         terms.append(chk.get("query", ""))
         terms.append(chk.get("expect_file", ""))
     return [t for t in terms if t]
+
+
+def find_forbidden_terms(chk: dict[str, Any], answer_norm: str) -> list[str]:
+    """Return explicit hard negatives mentioned in the candidate answer.
+
+    Benchmark tasks use these only for symbols that would assert a wrong edge
+    direction or confuse direct and transitive scope. A hit is a hard quality
+    failure: false graph evidence is more harmful to an agent than an omitted
+    optional result.
+    """
+    return [
+        term
+        for term in chk.get("forbid_terms", [])
+        if term and canonical(term) in answer_norm
+    ]
 
 
 def count_check(chk: dict[str, Any], answer: str) -> str:

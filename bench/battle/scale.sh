@@ -4,7 +4,7 @@
 #   * index completes (rc=0), no panic
 #   * within a sane time budget (no runaway hang)
 #   * RSS stays bounded (no OOM / no unbounded memory growth)
-#   * the graph has real cross-file CALLS / IMPORTS / TYPE_REF edges
+#   * the graph has real cross-file CALLS / IMPORTS / USAGE edges
 #   * the DB passes integrity_check
 #
 # File count is overridable so an operator can push toward the 2000+
@@ -119,7 +119,7 @@ pass "graph.db exists"
 nodes=$(sqlite_q "$DB" "SELECT count(*) FROM nodes;" 2>/dev/null || echo 0)
 assert_ge "${nodes:-0}" 1 "graph has nodes"
 
-for et in CALLS IMPORTS TYPE_REF; do
+for et in CALLS IMPORTS USAGE; do
     c=$(sqlite_q "$DB" "SELECT count(*) FROM edges WHERE edge_type='$et';" 2>/dev/null || echo 0)
     assert_ge "${c:-0}" 1 "graph has cross-file $et edges"
 done
@@ -127,14 +127,14 @@ done
 # Cross-file proof: at least one edge whose endpoints live in different
 # files. This is the real invariant — intra-file edges are cheap;
 # cross-file resolution is the hard part. By construction every module
-# `use`s + returns the previous module's struct, so IMPORTS and TYPE_REF
+# `use`s + returns the previous module's struct, so IMPORTS and USAGE
 # MUST be cross-file.
 xfile=$(sqlite_q "$DB" "
   SELECT count(*) FROM edges e
   JOIN nodes s ON s.id = e.source_id
   JOIN nodes t ON t.id = e.target_id
-  WHERE e.edge_type IN ('IMPORTS','TYPE_REF') AND s.file_path <> t.file_path;" 2>/dev/null || echo 0)
-assert_ge "${xfile:-0}" 1 "at least one TRULY cross-file edge (IMPORTS/TYPE_REF)"
+  WHERE e.edge_type IN ('IMPORTS','USAGE') AND s.file_path <> t.file_path;" 2>/dev/null || echo 0)
+assert_ge "${xfile:-0}" 1 "at least one TRULY cross-file edge (IMPORTS/USAGE)"
 
 # Informational: how CALLS resolve. The corpus has build_N() call the
 # imported Widget(N-1)::new(); the resolver currently binds `new` to the
