@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-pub(super) const PROTOCOL_VERSION: u32 = 1;
+pub(super) const PROTOCOL_VERSION: u32 = 2;
 const ACCEPT_QUEUE_LENGTH: usize = 16;
 const INFERENCE_QUEUE_LENGTH: usize = 8;
 const READER_WORKERS: usize = 4;
@@ -46,7 +46,9 @@ impl LifecycleState {
 #[derive(Debug)]
 struct RuntimeStatus {
     state: LifecycleState,
+    state_started: Instant,
     active_request_id: Option<String>,
+    active_request_started: Option<Instant>,
     completed_requests: u64,
     rejected_requests: u64,
     last_error: Option<String>,
@@ -56,7 +58,9 @@ impl Default for RuntimeStatus {
     fn default() -> Self {
         Self {
             state: LifecycleState::Starting,
+            state_started: Instant::now(),
             active_request_id: None,
+            active_request_started: None,
             completed_requests: 0,
             rejected_requests: 0,
             last_error: None,
@@ -124,6 +128,7 @@ pub(super) struct ServerPolicy {
     pub model_ttl: Duration,
     pub exit_ttl: Duration,
     pub request_deadline: Duration,
+    pub hard_request_timeout: Option<Duration>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
 }
@@ -349,6 +354,12 @@ where
         Arc::clone(&stop),
         Arc::clone(&pending_requests),
         Arc::clone(&last_activity),
+    );
+    spawn_hung_worker_watchdog(
+        Arc::clone(&status),
+        Arc::clone(&stop),
+        policy.hard_request_timeout,
+        log_prefix,
     );
 
     let mut model = None;
@@ -644,8 +655,13 @@ fn status_response(
     serde_json::json!({
         "request_id": request_id,
         "protocol": PROTOCOL_VERSION,
+        "daemon_pid": std::process::id(),
         "state": status.state.as_str(),
+        "state_elapsed_ms": status.state_started.elapsed().as_millis(),
         "active_request_id": status.active_request_id,
+        "active_request_elapsed_ms": status
+            .active_request_started
+            .map(|started| started.elapsed().as_millis()),
         "completed_requests": status.completed_requests,
         "rejected_requests": status.rejected_requests,
         "last_error": status.last_error,
@@ -776,6 +792,9 @@ fn retryable_io(error: &std::io::Error) -> bool {
 
 fn set_state(status: &Arc<Mutex<RuntimeStatus>>, state: LifecycleState, error: Option<String>) {
     if let Ok(mut status) = status.lock() {
+        if status.state != state {
+            status.state_started = Instant::now();
+        }
         status.state = state;
         status.last_error = error;
     }
@@ -783,6 +802,7 @@ fn set_state(status: &Arc<Mutex<RuntimeStatus>>, state: LifecycleState, error: O
 
 fn set_active(status: &Arc<Mutex<RuntimeStatus>>, request_id: Option<String>) {
     if let Ok(mut status) = status.lock() {
+        status.active_request_started = request_id.as_ref().map(|_| Instant::now());
         status.active_request_id = request_id;
     }
 }
@@ -790,14 +810,53 @@ fn set_active(status: &Arc<Mutex<RuntimeStatus>>, request_id: Option<String>) {
 fn complete(status: &Arc<Mutex<RuntimeStatus>>, model_loaded: bool, error: Option<String>) {
     if let Ok(mut status) = status.lock() {
         status.active_request_id = None;
+        status.active_request_started = None;
         status.completed_requests = status.completed_requests.saturating_add(1);
         status.last_error = error;
-        status.state = if model_loaded {
+        let next_state = if model_loaded {
             LifecycleState::Ready
         } else {
             LifecycleState::Faulted
         };
+        if status.state != next_state {
+            status.state_started = Instant::now();
+        }
+        status.state = next_state;
     }
+}
+
+fn spawn_hung_worker_watchdog(
+    status: Arc<Mutex<RuntimeStatus>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    timeout: Option<Duration>,
+    log_prefix: &'static str,
+) {
+    let Some(timeout) = timeout else {
+        return;
+    };
+    std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(LOOP_INTERVAL);
+            let timed_out = status.lock().ok().is_some_and(|status| {
+                status
+                    .active_request_started
+                    .is_some_and(|started| started.elapsed() >= timeout)
+                    || (status.state == LifecycleState::Loading
+                        && status.state_started.elapsed() >= timeout)
+            });
+            if timed_out {
+                if log_enabled(log_prefix) {
+                    eprintln!(
+                        "{log_prefix}: inference worker exceeded hard timeout {timeout:?}; exiting"
+                    );
+                }
+                // Inference backends cannot be safely interrupted in-process.
+                // Exiting releases the owner lock; the next client repairs the
+                // stale endpoint and starts one clean model instance.
+                std::process::exit(70);
+            }
+        }
+    });
 }
 
 fn reject(status: &Arc<Mutex<RuntimeStatus>>) {
@@ -1341,6 +1400,7 @@ mod tests {
                     model_ttl: Duration::from_millis(150),
                     exit_ttl: Duration::from_millis(700),
                     request_deadline: Duration::from_secs(3),
+                    hard_request_timeout: None,
                     max_request_bytes: 4096,
                     max_response_bytes: 4096,
                 },
@@ -1457,6 +1517,7 @@ mod tests {
                     model_ttl: Duration::from_secs(2),
                     exit_ttl: Duration::from_millis(300),
                     request_deadline: Duration::from_secs(1),
+                    hard_request_timeout: None,
                     max_request_bytes: 4096,
                     max_response_bytes: 4096,
                 },
@@ -1515,6 +1576,7 @@ mod tests {
                     model_ttl: Duration::from_secs(2),
                     exit_ttl: Duration::from_millis(500),
                     request_deadline: Duration::from_millis(50),
+                    hard_request_timeout: None,
                     max_request_bytes: 4096,
                     max_response_bytes: 4096,
                 },
@@ -1573,6 +1635,8 @@ mod tests {
     }
 
     const CRASH_HELPER_IDENTITY: &str = "GREPPY_TEST_DAEMON_CRASH_IDENTITY";
+    const HANG_HELPER: &str = "GREPPY_TEST_DAEMON_HANG";
+    const HANG_LOAD_HELPER: &str = "GREPPY_TEST_DAEMON_HANG_LOAD";
 
     #[test]
     fn daemon_subprocess_helper() {
@@ -1581,6 +1645,8 @@ mod tests {
         };
         let endpoint = Endpoint::for_identity("crash-test", &identity).unwrap();
         let address = endpoint.address().to_string();
+        let hang = std::env::var_os(HANG_HELPER).is_some();
+        let hang_load = std::env::var_os(HANG_LOAD_HELPER).is_some();
         let code = run_server(
             endpoint,
             &address,
@@ -1588,16 +1654,102 @@ mod tests {
                 model_ttl: Duration::from_secs(5),
                 exit_ttl: Duration::from_secs(10),
                 request_deadline: Duration::from_secs(1),
+                hard_request_timeout: (hang || hang_load).then_some(Duration::from_millis(100)),
                 max_request_bytes: 4096,
                 max_response_bytes: 4096,
             },
-            false,
-            || Ok::<_, String>(()),
+            hang_load,
+            move || {
+                if hang_load {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Ok::<_, String>(())
+            },
             |_| Ok(()),
-            |_raw, model| serde_json::json!({"ok": model.is_some()}),
+            move |_raw, model| {
+                if hang {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                serde_json::json!({"ok": model.is_some()})
+            },
             "crash-test",
         );
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn hung_worker_exits_and_replacement_repairs_endpoint() {
+        let identity = format!("{}-{}", std::process::id(), request_id());
+        let endpoint = Endpoint::for_identity("crash-test", &identity).unwrap();
+        let mut hung = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("inference_daemon::tests::daemon_subprocess_helper")
+            .arg("--nocapture")
+            .env(CRASH_HELPER_IDENTITY, &identity)
+            .env(HANG_HELPER, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hung daemon test child");
+        wait_for_server(&endpoint);
+
+        assert!(matches!(
+            request(
+                &endpoint,
+                serde_json::json!({"op": "infer"}),
+                Duration::from_secs(1),
+                4096,
+            ),
+            RequestOutcome::Failed | RequestOutcome::NoDaemon
+        ));
+        assert_eq!(hung.wait().expect("reap watchdog daemon").code(), Some(70));
+
+        let mut replacement = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("inference_daemon::tests::daemon_subprocess_helper")
+            .arg("--nocapture")
+            .env(CRASH_HELPER_IDENTITY, &identity)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn replacement daemon test child");
+        wait_for_server(&endpoint);
+        assert!(matches!(
+            request(
+                &endpoint,
+                serde_json::json!({"op": "infer"}),
+                Duration::from_secs(1),
+                4096,
+            ),
+            RequestOutcome::Response(ref value) if value["ok"] == true
+        ));
+        replacement.kill().expect("kill replacement daemon child");
+        let _ = replacement.wait();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(endpoint.address());
+    }
+
+    #[test]
+    fn hung_prewarm_load_is_terminated() {
+        let identity = format!("{}-{}", std::process::id(), request_id());
+        let endpoint = Endpoint::for_identity("crash-test", &identity).unwrap();
+        let mut hung = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("inference_daemon::tests::daemon_subprocess_helper")
+            .arg("--nocapture")
+            .env(CRASH_HELPER_IDENTITY, &identity)
+            .env(HANG_LOAD_HELPER, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hung prewarm daemon test child");
+        wait_for_server(&endpoint);
+        assert_eq!(
+            hung.wait().expect("reap prewarm watchdog daemon").code(),
+            Some(70)
+        );
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(endpoint.address());
     }
 
     #[test]

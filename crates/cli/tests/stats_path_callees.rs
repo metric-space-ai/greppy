@@ -393,11 +393,10 @@ fn provider_policy_require_complete_blocks_path_json() {
     assert_eq!(v["steps"].as_array().unwrap().len(), 0);
 }
 
-/// D2 fail-open: with the inline auto-reindex disabled (kill switch),
-/// a stale index serves the OLD path steps, honestly labeled
-/// (`fresh: false` + stderr warning), instead of refusing with exit 1.
+/// Freshness is fail-closed even when automatic repair is disabled: old path
+/// steps must never be exposed as source evidence.
 #[test]
-fn path_json_serves_labeled_stale_steps_when_auto_reindex_disabled() {
+fn path_json_refuses_stale_steps_when_auto_reindex_disabled() {
     let (repo, store) = index_fixture("path-json-stale");
     std::fs::write(
         repo.join("src/leaf.rs"),
@@ -412,38 +411,32 @@ fn path_json_serves_labeled_stale_steps_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
-        "labeled-stale path must serve the indexed path; stderr={err}\nstdout={out}"
+        code, 75,
+        "stale path must be refused; stderr={err}\nstdout={out}"
     );
-    assert!(
-        err.contains("index may be stale") && err.contains("run 'grep index'"),
-        "labeled-stale path must warn on stderr; stderr={err:?}"
-    );
+    assert!(err.is_empty(), "JSON refusal must stay machine-readable");
     let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid labeled-stale path json: {e}; stdout={out:?}"));
+        .unwrap_or_else(|e| panic!("invalid stale refusal json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "path");
-    assert_eq!(
-        v["status"],
-        serde_json::Value::Null,
-        "labeled-stale path must not be skipped: {v:?}"
-    );
+    assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(v["from"], "entry");
     assert_eq!(v["to"], "leaf");
     assert_eq!(v["fresh"], false, "result must be labeled stale: {v:?}");
-    assert_eq!(v["freshness"]["state"], "stale");
+    assert_eq!(v["freshness"]["state"], "drift");
     assert_eq!(
         v["freshness"]["stale_file_count"], 1,
         "path must report the drift extent: {v:?}"
     );
-    assert_eq!(v["path_found"], true);
+    assert_eq!(v["path_found"], false);
     assert!(
-        !v["steps"].as_array().unwrap().is_empty(),
-        "labeled-stale path must serve the old steps: {v:?}"
+        v["steps"].as_array().unwrap().is_empty(),
+        "stale path must not expose old steps: {v:?}"
     );
 }
 
-/// D2: the same small drift WITH auto-reindex enabled (default) heals
-/// the index inline; the renamed-away endpoint is then honestly gone.
+/// The same small drift with automatic repair enabled is refused for the
+/// triggering request. A subsequent request observes the atomically published
+/// fresh generation and reports that the renamed-away endpoint is gone.
 #[test]
 fn path_json_auto_reindexes_small_stale_drift() {
     let (repo, store) = index_fixture("path-json-heal");
@@ -452,6 +445,22 @@ fn path_json_auto_reindexes_small_stale_drift() {
         "pub fn renamed_leaf() -> u32 { 8 }\n",
     )
     .unwrap();
+
+    let (first_code, first_out, first_err) = run(
+        &["path", "--from", "entry", "--to", "leaf", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        first_code, 75,
+        "triggering stale request must be refused; stderr={first_err}\nstdout={first_out}"
+    );
+    let first: serde_json::Value = serde_json::from_str(&first_out)
+        .unwrap_or_else(|e| panic!("invalid refresh json: {e}; stdout={first_out:?}"));
+    assert_eq!(first["status"], "skipped_stale_index");
+    assert_eq!(first["fresh"], false);
+    assert_eq!(first["freshness"]["state"], "refreshing");
+    assert!(first["steps"].as_array().unwrap().is_empty());
 
     let (code, out, err) = run(
         &["path", "--from", "entry", "--to", "leaf", "--json"],

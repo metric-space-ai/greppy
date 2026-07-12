@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use super::inference_daemon::{self, Endpoint, RequestOutcome, ServerPolicy, PROTOCOL_VERSION};
 
-const ENV_DISABLE: &str = "GREPPY_NO_EMBED_DAEMON";
 const ENV_MODEL_TTL: &str = "GREPPY_EMBED_DAEMON_MODEL_TTL_S";
 const ENV_EXIT_TTL: &str = "GREPPY_EMBED_DAEMON_EXIT_TTL_S";
 const DEFAULT_MODEL_TTL_S: u64 = 300;
@@ -42,9 +41,6 @@ pub(super) fn embed_query_via_daemon(
     model_key: &str,
     text: &str,
 ) -> Option<Vec<f32>> {
-    if std::env::var_os(ENV_DISABLE).is_some() {
-        return None;
-    }
     let endpoint = endpoint(cfg, model_key)?;
     match request_embedding(&endpoint, model_key, text) {
         RequestOutcome::Response(vector) => return Some(vector),
@@ -133,9 +129,6 @@ fn spawn_daemon(
 }
 
 pub(super) fn prewarm_from_env(cfg: &super::EmbeddingModelConfig, model_key: &str) {
-    if std::env::var_os(ENV_DISABLE).is_some() {
-        return;
-    }
     let Some(endpoint) = endpoint(cfg, model_key) else {
         return;
     };
@@ -158,6 +151,7 @@ pub(super) fn daemon_main(socket: String, cfg: super::EmbeddingModelConfig, prew
         model_ttl: Duration::from_secs(env_secs(ENV_MODEL_TTL, DEFAULT_MODEL_TTL_S)),
         exit_ttl: Duration::from_secs(env_secs(ENV_EXIT_TTL, DEFAULT_EXIT_TTL_S)),
         request_deadline: CLIENT_READ_TIMEOUT,
+        hard_request_timeout: Some(Duration::from_secs(75)),
         max_request_bytes: MAX_REQUEST_BYTES,
         max_response_bytes: MAX_RESPONSE_BYTES,
     };

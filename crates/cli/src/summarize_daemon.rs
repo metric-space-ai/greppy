@@ -10,6 +10,7 @@ const ENV_EXIT_TTL: &str = "GREPPY_SUMMARIZE_DAEMON_EXIT_TTL_S";
 const DEFAULT_MODEL_TTL_S: u64 = 300;
 const DEFAULT_EXIT_TTL_S: u64 = 1800;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const HARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 #[allow(dead_code)]
 const TRIAGE_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -279,6 +280,7 @@ pub(super) fn daemon_main(socket: String, cfg: super::QwenSummaryConfig, prewarm
         model_ttl: Duration::from_secs(env_secs(ENV_MODEL_TTL, DEFAULT_MODEL_TTL_S)),
         exit_ttl: Duration::from_secs(env_secs(ENV_EXIT_TTL, DEFAULT_EXIT_TTL_S)),
         request_deadline: CLIENT_READ_TIMEOUT,
+        hard_request_timeout: Some(HARD_REQUEST_TIMEOUT),
         max_request_bytes: MAX_REQUEST_BYTES,
         max_response_bytes: MAX_RESPONSE_BYTES,
     };

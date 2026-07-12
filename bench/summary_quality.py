@@ -479,8 +479,13 @@ def execute(args: argparse.Namespace) -> int:
     }
     write_json(args.output, document)
     failures = sum(1 for row in records if row["error"])
-    print(f"[run] wrote {len(records)} records; contract failures={failures}")
-    return 0 if failures == 0 else 2
+    visible = sum(bool(row["summary"]) for row in records)
+    coverage = visible / len(records) if records else 0.0
+    print(
+        f"[run] wrote {len(records)} records; contract failures={failures}; "
+        f"visible summaries={visible} ({coverage:.1%})"
+    )
+    return 0 if failures == 0 and coverage >= 0.85 else 2
 
 
 def load_minimax_key() -> str:
@@ -670,7 +675,14 @@ def gate(args: argparse.Namespace) -> int:
     checks = {
         "at_least_200_real_functions": total >= 200,
         "all_cases_have_results_and_judgments": complete,
+        "evidence_digests_match": results_doc.get("cases_sha256")
+        == sha256_file(args.cases)
+        and judgments_doc.get("cases_sha256") == sha256_file(args.cases)
+        and judgments_doc.get("results_sha256") == sha256_file(args.results),
         "brief_output_contract_has_no_failures": contract_errors == 0,
+        "visible_summary_coverage_at_least_85_percent": visible / total >= 0.85
+        if total
+        else False,
         "helpful_direction_at_least_85_percent": helpful_rate >= 0.85,
         "misleading_at_most_2_percent": misleading_rate <= 0.02,
         "no_invented_symbols": invented == 0,
