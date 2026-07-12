@@ -66,15 +66,10 @@ jobs:
           git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-mtp-q4km/*'
           ls -lh crates/cli/assets/embeddinggemma-300m-q4k
           ls -lh crates/cli/assets/qwen35-0.8b-mtp-q4km
-          test "$(shasum -a 256 crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf | awk '{print $1}')" = "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2"
-          test "$(shasum -a 256 crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json | awk '{print $1}')" = "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
-          qwen_dir=crates/cli/assets/qwen35-0.8b-mtp-q4km
-          test "$(shasum -a 256 "$qwen_dir/Qwen3.5-0.8B-MTP-Q4_K_M.gguf" | awk '{print $1}')" = "$(tr -d '\r\n' < "$qwen_dir/Qwen3.5-0.8B-MTP-Q4_K_M.gguf.sha256")"
-          test "$(shasum -a 256 "$qwen_dir/tokenizer.json" | awk '{print $1}')" = "$(tr -d '\r\n' < "$qwen_dir/tokenizer.json.sha256")"
-          test -s licenses/EMBEDDINGGEMMA-NOTICE.txt
-          test -s licenses/GEMMA-TERMS.html
-          test -s licenses/GEMMA-PROHIBITED-USE-POLICY.html
-          test -s licenses/QWEN3.5-APACHE-2.0.txt
+          python tools/verify_model_redistribution.py
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python tools/verify_model_redistribution.py --release
+          fi
 
       - name: Install Rust (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -213,7 +208,13 @@ jobs:
           test ! -e "$clean/bin/grep"
           test -s "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt"
           test -s "$clean/bin/licenses/GEMMA-TERMS.html"
+          test -s "$clean/bin/licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt"
+          test -s "$clean/bin/licenses/EMBEDDINGGEMMA-PROVENANCE.json"
           test -s "$clean/bin/licenses/QWEN3.5-APACHE-2.0.txt"
+          test -s "$clean/bin/licenses/QWEN3.5-MODIFICATIONS.txt"
+          test -s "$clean/bin/licenses/QWEN3.5-PROVENANCE.json"
+          test -s "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json"
+          test -s "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json"
           bash "$clean/bin/release_package_smoke.sh" "$clean/bin/greppy" "$clean/work"
 
       - name: Smoke-test packaged artifact (Windows)
@@ -225,7 +226,13 @@ jobs:
           Expand-Archive -Path "${{ matrix.asset }}" -DestinationPath "$clean/bin" -Force
           if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt")) { throw 'missing EmbeddingGemma notice' }
           if (-not (Test-Path "$clean/bin/licenses/GEMMA-TERMS.html")) { throw 'missing Gemma terms' }
+          if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt")) { throw 'missing EmbeddingGemma modification notice' }
+          if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-PROVENANCE.json")) { throw 'missing EmbeddingGemma provenance' }
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-APACHE-2.0.txt")) { throw 'missing Qwen license' }
+          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-MODIFICATIONS.txt")) { throw 'missing Qwen modification notice' }
+          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-PROVENANCE.json")) { throw 'missing Qwen provenance' }
+          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json")) { throw 'missing Qwen training-data manifest' }
+          if (-not (Test-Path "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json")) { throw 'missing model redistribution lock' }
           & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
 
       - name: Generate SPDX SBOM

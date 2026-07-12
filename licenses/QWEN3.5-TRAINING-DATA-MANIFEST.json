@@ -1,0 +1,30 @@
+{
+  "schema_version": "greppy.training-data-manifest.v1",
+  "model_id": "greppy-qwen35-function-purpose-2026-07-11",
+  "release_ready": false,
+  "source_dataset": {
+    "repository": "Fsoft-AIC/the-vault-function",
+    "revision": "505c679056e49a2a269b64777ee7c496d22e1440",
+    "declared_license": "MIT"
+  },
+  "selection": {
+    "description": "ordered function records transformed into prompt/completion SFT rows",
+    "row_count": 55274,
+    "ordered_rows_sha256": "3e0badd041cf93e5d8e2d0e0b7e983f941562dd68ca94c7592884eae69946ff3"
+  },
+  "labels": {
+    "generator": "MiniMax-M3",
+    "purpose": "short English function-purpose completions",
+    "student_prompt_version": "qwen35-brief-v3",
+    "student_prompt_template": "<|im_start|>user\nbrief:\n{source}<|im_end|>\n<|im_start|>assistant\n",
+    "raw_labels_published": false
+  },
+  "review": {
+    "status": "pending",
+    "blockers": [
+      "publish the exact training pipeline and environment lock",
+      "document source-license filtering for every selected record",
+      "complete generated-output redistribution review"
+    ]
+  }
+}

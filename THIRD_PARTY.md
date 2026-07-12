@@ -20,13 +20,24 @@ remains blocked until the bundled quantization's provenance and redistribution
 review are signed off and the current official terms are compared with the
 packaged copies.
 
+See `licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt` and
+`licenses/EMBEDDINGGEMMA-PROVENANCE.json`. The release workflow verifies these
+records and refuses to publish while their release lock remains unresolved.
+
 ### Qwen3.5-0.8B MTP Q4_K_M
 
 - Purpose: short function-purpose navigation hints.
-- Base model/tokenizer: `Qwen/Qwen3.5-0.8B`.
-- Quantized MTP source: `unsloth/Qwen3.5-0.8B-MTP-GGUF`.
+- Base model/tokenizer: pinned `Qwen/Qwen3.5-0.8B` revision.
+- Finetune: Greppy full-parameter function-purpose SFT with an MTP draft layer.
+- Quantization: merged BF16 checkpoint converted and quantized to Q4_K_M with
+  pinned llama.cpp; the bundled GGUF contains target and MTP weights.
 - Bundled files: `Qwen3.5-0.8B-MTP-Q4_K_M.gguf`, `tokenizer.json`.
 - License: Apache License 2.0; see `licenses/QWEN3.5-APACHE-2.0.txt`.
+
+This is a modified model, not an unchanged Unsloth artifact. See
+`licenses/QWEN3.5-MODIFICATIONS.txt`, `licenses/QWEN3.5-PROVENANCE.json`, and
+`licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json`. The current checkpoint remains
+blocked from release until the recorded quality and redistribution gates pass.
 
 Model outputs are non-authoritative navigation hints. Source spans, signatures,
 and graph evidence remain deterministic even when summary inference fails.

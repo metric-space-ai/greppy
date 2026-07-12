@@ -128,6 +128,9 @@ jobs:
       - name: agent benchmark precision grader
         run: python3 -m unittest bench/agent_efficiency/test_grade_answers.py
 
+      - name: model redistribution verifier tests
+        run: python3 -m unittest tools/test_verify_model_redistribution.py
+
       # Black-box battle suite against the freshly built debug binaries. The
       # real-assets-link and the release workflow separately build the actual
       # embedded payload, avoiding repeated 827 MB process images here.
@@ -153,6 +156,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: Verify model redistribution integrity
+        run: python tools/verify_model_redistribution.py
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable

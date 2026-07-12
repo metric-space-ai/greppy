@@ -1,0 +1,65 @@
+{
+  "schema_version": "greppy.model-provenance.v1",
+  "model_id": "greppy-qwen35-function-purpose-2026-07-11",
+  "release_ready": false,
+  "release_blockers": [
+    "independent summary-quality gate has not passed",
+    "training pipeline source and environment lock are not yet published",
+    "redistribution review has not been signed off"
+  ],
+  "base": {
+    "repository": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "model_sha256": "04b1c301e7789b32eddea47531cb8ddd3c690e6bc29e0911b14f7c7280544696",
+    "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "config_sha256": "b90b86eaf5e4810a99348c3d271b7516f93d1529ab23add6dcf189076a512204",
+    "license": "Apache-2.0"
+  },
+  "training": {
+    "method": "full-parameter supervised finetuning with FP32 master weights and jointly trained MTP draft layer",
+    "student_prompt_version": "qwen35-brief-v3",
+    "student_prompt_template": "<|im_start|>user\nbrief:\n{source}<|im_end|>\n<|im_start|>assistant\n",
+    "ordered_sft_rows": 55274,
+    "ordered_sft_rows_sha256": "3e0badd041cf93e5d8e2d0e0b7e983f941562dd68ca94c7592884eae69946ff3",
+    "stages": [
+      {
+        "rows": 4509,
+        "sha256": "4b378e6fe10cec79ae76176e5e2b5fce9637960928080f286fe20840cf24852d"
+      },
+      {
+        "rows": 30651,
+        "sha256": "ceac48839c769123a7ca8e40baffc282ac26816739e879a471921cc08d69192a"
+      },
+      {
+        "rows": 20114,
+        "sha256": "a2d75ee1e39065666657cd3baa86d09b7119921567916d9479387b94f7ff5aeb"
+      }
+    ],
+    "fixed_eval_rows": 987,
+    "fixed_eval_sha256": "02d42760f44c3d410c43f41675ddcd2c4ee2916c0f2cad2d25049466ea0f186e",
+    "pipeline_script_sha256": {
+      "train_smoke.py": "245825ec00d1920342448785c4e8613e20d8fbb2f8e75b78a7a2ec9626b80c31",
+      "mtp_module.py": "22cc4dcb5d0638464e2fb2e5dd492e1d089624ebafb4e9000206fd0e7ce53156",
+      "prod_gen.py": "f953178c43c94e123f4abe15b839177a16e841eaee532b9b7d10a2164f1c816e",
+      "pilot_run.py": "547d13e3bce8ab65f297bc83e34b3623fc90c19e29994c4adb7cd860592df2cb",
+      "rebuild_sft.py": "9ded9905e46e1f4861c9a3e053ccc631d01fa23635b9cb7f8e811d3447d18a67",
+      "daily_cycle.sh": "8417fc73ded9ae0d4f0dab5c06f934ec3fcfb52e2e5c1d9964ff45f638ac3343",
+      "strip_mtp.py": "696570b70c3694bce94c41b55a8e382d27c8de2dd9bb49e2fefb4ffc4bdf2510",
+      "promote_checkpoint.sh": "13eae284f2d618688f568d7e05d65be256d4ef3e82441f761765fe0eae658145"
+    }
+  },
+  "export": {
+    "merged_bf16_safetensors_sha256": "237cf0a76d57d4c4e6fdbbcc5af0020f9413060b8b1ccb145a95b4c75368f11e",
+    "llama_cpp_revision": "ef2d770117db45b05aa7ecd1b0acca36370c5470",
+    "quantization": "Q4_K_M",
+    "gguf_contains_mtp": true
+  },
+  "bundled": {
+    "gguf_path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
+    "gguf_size": 541903232,
+    "gguf_sha256": "d45e08ad7bb8787ae9b6f56b6915e8b44ac6e13c6b740fdc7bd591249209a72c",
+    "tokenizer_path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json",
+    "tokenizer_size": 12807982,
+    "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+  }
+}

@@ -1,0 +1,21 @@
+Greppy Qwen3.5 modification notice
+
+The bundled Qwen3.5 model is modified from Qwen/Qwen3.5-0.8B. It is not an
+unchanged copy of the upstream model or of unsloth/Qwen3.5-0.8B-MTP-GGUF.
+
+Greppy made the following material changes:
+
+1. Full-parameter supervised finetuning for short English function-purpose
+   summaries. The historical student prompt used the `qwen35-brief-v3` chat
+   template recorded in QWEN3.5-PROVENANCE.json.
+2. Joint training of a next-token-prediction (MTP) draft layer.
+3. Export of the merged checkpoint to BF16 GGUF.
+4. Q4_K_M quantization of target and MTP weights with llama.cpp.
+
+Current bundled GGUF SHA256:
+d45e08ad7bb8787ae9b6f56b6915e8b44ac6e13c6b740fdc7bd591249209a72c
+
+The exact recorded inputs and tool revisions are listed in
+QWEN3.5-PROVENANCE.json and QWEN3.5-TRAINING-DATA-MANIFEST.json. This notice
+documents modification; it does not assert that the current checkpoint has
+passed Greppy's release gates.

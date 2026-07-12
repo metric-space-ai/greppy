@@ -34,7 +34,7 @@ pub use sampler::{
     TRIAGE_GENERATION_PARAMS,
 };
 
-pub const MODEL_ID: &str = "unsloth/Qwen3.5-0.8B-MTP-GGUF/Qwen3.5-0.8B-MTP-Q4_K_M";
+pub const MODEL_ID: &str = "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

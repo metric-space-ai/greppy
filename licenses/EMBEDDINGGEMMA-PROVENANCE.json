@@ -1,0 +1,30 @@
+{
+  "schema_version": "greppy.model-provenance.v1",
+  "model_id": "embeddinggemma-300m-q4k-current",
+  "release_ready": false,
+  "release_blockers": [
+    "exact upstream revision has not been recovered",
+    "exact GGUF conversion and quantizer revisions have not been recovered",
+    "redistribution review has not been signed off"
+  ],
+  "base": {
+    "repository": "google/embeddinggemma-300m",
+    "revision": null,
+    "license": "Gemma Terms of Use"
+  },
+  "conversion": {
+    "format": "GGUF",
+    "quantization": "Q4_K",
+    "tool": null,
+    "revision": null,
+    "command": null
+  },
+  "bundled": {
+    "gguf_path": "crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf",
+    "gguf_size": 238991680,
+    "gguf_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+    "tokenizer_path": "crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json",
+    "tokenizer_size": 33385008,
+    "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+  }
+}

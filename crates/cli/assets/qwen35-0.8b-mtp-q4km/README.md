@@ -7,12 +7,23 @@ Every greppy build expects these Git-LFS assets in this directory:
 - `tokenizer.json`
 - `tokenizer.json.sha256`
 
-The GGUF is the Q4_K_M file from `unsloth/Qwen3.5-0.8B-MTP-GGUF` and contains
-the target model plus its MTP draft layer.
-The tokenizer JSON is from `Qwen/Qwen3.5-0.8B`.
+The GGUF is Greppy's 2026-07-11 function-purpose finetune of the pinned
+`Qwen/Qwen3.5-0.8B` base model. Greppy changed the model through full-parameter
+supervised finetuning and trained an MTP draft layer. The merged BF16 checkpoint
+was converted and quantized to Q4_K_M with llama.cpp; the checked-in GGUF
+contains both target and MTP weights.
+
+This checkpoint is an engineering candidate, not a released production model.
+Its independent navigation-quality evaluation does not yet meet Greppy's
+release threshold, so the release lock marks it `release_ready: false`.
+
+The tokenizer JSON is from the pinned `Qwen/Qwen3.5-0.8B` revision and is
+unchanged by Greppy.
 
 Both sources identify Qwen3.5 as Apache-2.0. The complete license shipped with
-Greppy is `licenses/QWEN3.5-APACHE-2.0.txt`.
+Greppy is `licenses/QWEN3.5-APACHE-2.0.txt`. Exact base, data, training, export,
+quantization, and modification records are in the repository-level
+`licenses/QWEN3.5-*.json` and `licenses/QWEN3.5-MODIFICATIONS.txt` files.
 
 Verified asset digests:
 
