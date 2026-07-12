@@ -90,13 +90,13 @@
       "provenance": [
         {
           "path": "licenses/QWEN3.5-PROVENANCE.json",
-          "sha256": "cb77a020beae31d4340235d002b952c92d9fbededdbbbf4ee22ab2608b375d81",
-          "size": 3150
+          "sha256": "18204ad4a24a6be6725558b6691c97fe50103b7491dd7ea7389b3851f563448c",
+          "size": 3363
         },
         {
           "path": "licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json",
-          "sha256": "80d02b2d34fa7e18d6628cd69397e78bb1e3501fb2bfe468d8a92c1baa5ef889",
-          "size": 1099
+          "sha256": "c2948b9edf13cb192f8295c21881960c9800af50f7caa11ac3fbf238deafaed4",
+          "size": 1442
         }
       ],
       "modifications": [

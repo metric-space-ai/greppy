@@ -1,0 +1,7 @@
+# Canonical upstream repositories used by the frozen summary-quality suite.
+serde-rs/serde
+pallets/flask
+google/gson
+colinhacks/zod
+tokio-rs/tokio
+gohugoio/hugo

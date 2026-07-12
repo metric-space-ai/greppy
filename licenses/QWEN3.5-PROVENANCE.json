@@ -4,7 +4,7 @@
   "release_ready": false,
   "release_blockers": [
     "independent summary-quality gate has not passed",
-    "training pipeline source and environment lock are not yet published",
+    "2026-07-13 continuation training, export, and acceptance are incomplete",
     "redistribution review has not been signed off"
   ],
   "base": {
@@ -17,6 +17,9 @@
   },
   "training": {
     "method": "full-parameter supervised finetuning with FP32 master weights and jointly trained MTP draft layer",
+    "published_reproducibility_package": "training/qwen35",
+    "published_package_schema": "greppy.qwen35-finetuning-package.v1",
+    "private_audit_summary": "training/qwen35/audit-summary-2026-07-13.json",
     "student_prompt_version": "qwen35-brief-v3",
     "student_prompt_template": "<|im_start|>user\nbrief:\n{source}<|im_end|>\n<|im_start|>assistant\n",
     "ordered_sft_rows": 55274,

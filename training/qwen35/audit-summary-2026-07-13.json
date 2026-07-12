@@ -1,0 +1,47 @@
+{
+  "schema_version": "greppy.qwen35-sft-audit-summary.v1",
+  "audit_date": "2026-07-13",
+  "prompt_version": "qwen35-brief-v3",
+  "input": {
+    "full_sft_rows": 269379,
+    "full_sft_sha256": "a79fef839541110a05ad0712565e2f05a883d96e4ac644e20d86e674e2bfca18"
+  },
+  "rows": {
+    "raw_total": 269625,
+    "accepted_raw": 269380,
+    "dropped_raw": 245,
+    "distinct_accepted_prompts": 269379,
+    "duplicate_raw_sources": 1,
+    "mapped_sft": 269379
+  },
+  "languages": {
+    "c": 28491,
+    "cpp": 28467,
+    "csharp": 28757,
+    "go": 28569,
+    "java": 28523,
+    "javascript": 26555,
+    "php": 28538,
+    "python": 28421,
+    "ruby": 20400,
+    "rust": 22658
+  },
+  "repository_count": 54324,
+  "license_combination_count": 325,
+  "summary_quality_holdout": {
+    "repositories": [
+      "colinhacks/zod",
+      "gohugoio/hugo",
+      "google/gson",
+      "pallets/flask",
+      "serde-rs/serde",
+      "tokio-rs/tokio"
+    ],
+    "raw_matches": 0,
+    "selected_matches": 0
+  },
+  "aggregate_row_sha256": "fa10bae3a37e19cda295394155199ae85a5d8240131060f49e5284a14eae384c",
+  "full_private_report_sha256": "ad93aaa5e2982c4d04da0d744c16bd7226845c682b6a3f03742da699d1de89cc",
+  "full_report_published": false,
+  "disclosure": "No source text, generated labels, or per-row hashes are included."
+}

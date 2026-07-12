@@ -1,0 +1,58 @@
+{
+  "schema_version": "greppy.qwen35-finetuning-package.v1",
+  "snapshot_date": "2026-07-13",
+  "base_model": {
+    "repository": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "model_sha256": "04b1c301e7789b32eddea47531cb8ddd3c690e6bc29e0911b14f7c7280544696",
+    "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "config_sha256": "b90b86eaf5e4810a99348c3d271b7516f93d1529ab23add6dcf189076a512204"
+  },
+  "source_dataset": {
+    "repository": "Fsoft-AIC/the-vault-function",
+    "revision": "505c679056e49a2a269b64777ee7c496d22e1440",
+    "dataset_card_declared_license": "MIT"
+  },
+  "prompt": {
+    "teacher_version": "minimax-m3-brief-K-v1",
+    "student_version": "qwen35-brief-v3",
+    "student_template": "<|im_start|>user\nbrief:\n{source}<|im_end|>\n<|im_start|>assistant\n"
+  },
+  "frozen_training_data": {
+    "ordered_rows": 55274,
+    "ordered_rows_sha256": "3e0badd041cf93e5d8e2d0e0b7e983f941562dd68ca94c7592884eae69946ff3",
+    "ordered_stages": [
+      {"kind": "initial", "rows": 4509, "sha256": "4b378e6fe10cec79ae76176e5e2b5fce9637960928080f286fe20840cf24852d"},
+      {"kind": "continuation", "rows": 30651, "sha256": "ceac48839c769123a7ca8e40baffc282ac26816739e879a471921cc08d69192a"},
+      {"kind": "continuation", "rows": 20114, "sha256": "a2d75ee1e39065666657cd3baa86d09b7119921567916d9479387b94f7ff5aeb"}
+    ],
+    "fixed_eval_rows": 987,
+    "fixed_eval_sha256": "02d42760f44c3d410c43f41675ddcd2c4ee2916c0f2cad2d25049466ea0f186e",
+    "continuation_2026_07_13": {
+      "full_snapshot_rows": 269379,
+      "full_snapshot_sha256": "a79fef839541110a05ad0712565e2f05a883d96e4ac644e20d86e674e2bfca18",
+      "new_rows": 214105,
+      "new_rows_sha256": "778c8c436cc81a0df78be1a9c44e9afea345c6a2c4080c95574e12d09d5f97f1",
+      "retained_new_rows_at_maxlen": 211726,
+      "retained_fixed_eval_rows_at_maxlen": 984,
+      "initial_checkpoint_merged_bf16_sha256": "237cf0a76d57d4c4e6fdbbcc5af0020f9413060b8b1ccb145a95b4c75368f11e",
+      "initial_checkpoint_gguf_sha256": "d45e08ad7bb8787ae9b6f56b6915e8b44ac6e13c6b740fdc7bd591249209a72c",
+      "training_status": "in_progress",
+      "output_hashes": null
+    }
+  },
+  "export": {
+    "merged_bf16_safetensors_sha256": "237cf0a76d57d4c4e6fdbbcc5af0020f9413060b8b1ccb145a95b4c75368f11e",
+    "llama_cpp_revision": "ef2d770117db45b05aa7ecd1b0acca36370c5470",
+    "quantization": "Q4_K_M",
+    "gguf_contains_mtp": true,
+    "gguf_sha256": "d45e08ad7bb8787ae9b6f56b6915e8b44ac6e13c6b740fdc7bd591249209a72c"
+  },
+  "publication": {
+    "raw_source_rows_published": false,
+    "generated_labels_published": false,
+    "audit_summary": "audit-summary-2026-07-13.json",
+    "audit_aggregate_sha256": "fa10bae3a37e19cda295394155199ae85a5d8240131060f49e5284a14eae384c",
+    "full_private_audit_report_sha256": "ad93aaa5e2982c4d04da0d744c16bd7226845c682b6a3f03742da699d1de89cc"
+  }
+}

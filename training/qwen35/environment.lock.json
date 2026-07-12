@@ -1,0 +1,27 @@
+{
+  "schema_version": "greppy.qwen35-training-environment.v1",
+  "captured_on": "2026-07-13",
+  "platform": {
+    "os": "Ubuntu 22.04.1 LTS",
+    "kernel": "6.8.0-111-generic",
+    "architecture": "x86_64",
+    "cpu": "13th Gen Intel(R) Core(TM) i5-13400F",
+    "launch_cpu_affinity": "0-11"
+  },
+  "accelerator": {
+    "visible_gpu_count": 3,
+    "captured_product_name": "NVIDIA RTX A4500",
+    "captured_framebuffer_mib": 20470,
+    "driver": "595.71.05",
+    "driver_reported_cuda": "13.2",
+    "nvcc": "12.6.85",
+    "torch": "2.8.0+cu128",
+    "torch_cuda": "12.8",
+    "cudnn": 91002
+  },
+  "python_packages": "requirements.lock",
+  "capture_notes": [
+    "Host name, GPU UUID, serial number, PCI address, live utilization, temperature, and clock data were intentionally omitted.",
+    "The source capture did not record the Python interpreter version."
+  ]
+}

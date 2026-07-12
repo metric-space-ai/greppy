@@ -20,10 +20,18 @@
     "raw_labels_published": false
   },
   "review": {
-    "status": "pending",
+    "status": "audited_pending_release",
+    "evidence": {
+      "package": "training/qwen35",
+      "audit_summary": "training/qwen35/audit-summary-2026-07-13.json",
+      "mapped_sft_rows": 269379,
+      "repository_count": 54324,
+      "license_combination_count": 325,
+      "summary_quality_holdout_matches": 0,
+      "aggregate_sha256": "fa10bae3a37e19cda295394155199ae85a5d8240131060f49e5284a14eae384c"
+    },
     "blockers": [
-      "publish the exact training pipeline and environment lock",
-      "document source-license filtering for every selected record",
+      "publish the full repository/license histogram as a release evidence artifact",
       "complete generated-output redistribution review"
     ]
   }

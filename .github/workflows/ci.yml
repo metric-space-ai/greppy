@@ -134,6 +134,11 @@ jobs:
       - name: model redistribution verifier tests
         run: python3 -m unittest tools/test_verify_model_redistribution.py
 
+      - name: Qwen training provenance package
+        run: |
+          python3 -m unittest discover -s training/qwen35/tests -v
+          python3 training/qwen35/verify_package.py
+
       # Black-box battle suite against the freshly built debug binaries. The
       # real-assets-link and the release workflow separately build the actual
       # embedded payload, avoiding repeated 827 MB process images here.
