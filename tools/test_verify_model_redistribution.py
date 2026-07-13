@@ -182,6 +182,55 @@ class VerifyModelRedistributionTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertFalse(report_path.exists())
 
+    def test_embeddinggemma_reproduction_is_cross_checked(self) -> None:
+        source_sha = "1" * 64
+        asset_record = self._record(self.asset)
+        provenance = {
+            "schema_version": "greppy.model-provenance.v1",
+            "model_id": verifier.EMBEDDINGGEMMA_MODEL_ID,
+            "release_ready": False,
+            "conversion": {
+                "source": {
+                    "repository": "example/source",
+                    "file_commit": "2" * 40,
+                    "filename": "embeddinggemma-300M-F32.gguf",
+                    "size": 123,
+                    "sha256": source_sha,
+                },
+                "reproduction": {
+                    "tool": "llama.cpp llama-quantize",
+                    "revision": "3" * 40,
+                    "architecture": "x86_64",
+                    "command": verifier.EMBEDDINGGEMMA_REPRO_COMMAND,
+                    "independent_runs": 2,
+                    "bit_stable": True,
+                    "byte_identical_to_bundled_asset": True,
+                    "output_size": asset_record["size"],
+                    "output_sha256": asset_record["sha256"],
+                },
+            },
+            "bundled": {
+                "gguf_size": asset_record["size"],
+                "gguf_sha256": asset_record["sha256"],
+            },
+        }
+        self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+        manifest = self._manifest(release_ready=False, model_ready=False)
+        manifest["models"][0]["id"] = verifier.EMBEDDINGGEMMA_MODEL_ID  # type: ignore[index]
+        self._write_manifest(manifest)
+
+        self.assertEqual(verifier.verify_lock(self.lock_path, self.root), [])
+
+        provenance["conversion"]["reproduction"]["output_sha256"] = "4" * 64
+        self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+        self._write_manifest(self._manifest(release_ready=False, model_ready=False))
+        manifest = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        manifest["models"][0]["id"] = verifier.EMBEDDINGGEMMA_MODEL_ID
+        self._write_manifest(manifest)
+
+        errors = verifier.verify_lock(self.lock_path, self.root)
+        self.assertTrue(any("reproduction output does not match" in error for error in errors), errors)
+
 
 if __name__ == "__main__":
     unittest.main()

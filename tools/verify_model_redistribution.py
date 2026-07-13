@@ -42,6 +42,11 @@ _PROVENANCE_SCHEMAS = {
     "greppy.training-data-manifest.v1",
 }
 REPORT_SCHEMA = "greppy.model-redistribution-report.v1"
+EMBEDDINGGEMMA_MODEL_ID = "embeddinggemma-300m-q4k-current"
+EMBEDDINGGEMMA_REPRO_COMMAND = (
+    "llama-quantize embeddinggemma-300M-F32.gguf "
+    "embeddinggemma-300M-Q4_K.gguf Q4_K_M 4"
+)
 
 
 def _is_int(value: object) -> bool:
@@ -167,6 +172,111 @@ def _verify_release_provenance(entry: object, label: str, root: Path, errors: li
         errors.append(f"release gate: provenance {relative_path} is not release_ready")
 
 
+def _load_model_provenance(
+    model: dict[str, Any], model_label: str, root: Path, errors: list[str]
+) -> dict[str, Any] | None:
+    entries = model.get("provenance")
+    if not isinstance(entries, list):
+        return None
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        relative_path = Path(*PurePosixPath(entry["path"]).parts)
+        if relative_path.suffix != ".json":
+            continue
+        try:
+            document = json.loads((root / relative_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors.append(
+                f"{model_label}.provenance[{index}]: cannot read model provenance: {exc}"
+            )
+            continue
+        if (
+            isinstance(document, dict)
+            and document.get("schema_version") == "greppy.model-provenance.v1"
+            and document.get("model_id") == model.get("id")
+        ):
+            return document
+    errors.append(f"{model_label}: no model provenance record matches its model id")
+    return None
+
+
+def _verify_embeddinggemma_reproduction(
+    model: dict[str, Any], model_label: str, root: Path, errors: list[str]
+) -> None:
+    if model.get("id") != EMBEDDINGGEMMA_MODEL_ID:
+        return
+    document = _load_model_provenance(model, model_label, root, errors)
+    if document is None:
+        return
+    conversion = document.get("conversion")
+    if not isinstance(conversion, dict):
+        errors.append(f"{model_label}: EmbeddingGemma conversion must be an object")
+        return
+    source = conversion.get("source")
+    reproduction = conversion.get("reproduction")
+    if not isinstance(source, dict):
+        errors.append(f"{model_label}: EmbeddingGemma conversion.source must be an object")
+        return
+    if not isinstance(reproduction, dict):
+        errors.append(f"{model_label}: EmbeddingGemma conversion.reproduction must be an object")
+        return
+
+    source_checks = {
+        "repository": lambda value: isinstance(value, str) and bool(value.strip()),
+        "file_commit": lambda value: isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None,
+        "filename": lambda value: value == "embeddinggemma-300M-F32.gguf",
+        "size": lambda value: _is_int(value) and value > 0,
+        "sha256": lambda value: isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None,
+    }
+    for field, valid in source_checks.items():
+        if not valid(source.get(field)):
+            errors.append(f"{model_label}: invalid EmbeddingGemma conversion.source.{field}")
+
+    reproduction_checks = {
+        "tool": reproduction.get("tool") == "llama.cpp llama-quantize",
+        "revision": isinstance(reproduction.get("revision"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", reproduction["revision"]) is not None,
+        "architecture": reproduction.get("architecture") == "x86_64",
+        "command": reproduction.get("command") == EMBEDDINGGEMMA_REPRO_COMMAND,
+        "independent_runs": _is_int(reproduction.get("independent_runs"))
+        and reproduction["independent_runs"] >= 2,
+        "bit_stable": reproduction.get("bit_stable") is True,
+        "byte_identical_to_bundled_asset": reproduction.get("byte_identical_to_bundled_asset") is True,
+        "output_size": _is_int(reproduction.get("output_size"))
+        and reproduction["output_size"] > 0,
+        "output_sha256": isinstance(reproduction.get("output_sha256"), str)
+        and _SHA256_RE.fullmatch(reproduction["output_sha256"]) is not None,
+    }
+    for field, valid in reproduction_checks.items():
+        if not valid:
+            errors.append(f"{model_label}: invalid EmbeddingGemma conversion.reproduction.{field}")
+
+    bundled = document.get("bundled")
+    assets = model.get("assets")
+    gguf_asset = next(
+        (
+            entry
+            for entry in assets
+            if isinstance(entry, dict)
+            and isinstance(entry.get("path"), str)
+            and entry["path"].endswith(".gguf")
+        ),
+        None,
+    ) if isinstance(assets, list) else None
+    if not isinstance(bundled, dict) or not isinstance(gguf_asset, dict):
+        errors.append(f"{model_label}: EmbeddingGemma bundled GGUF binding is missing")
+        return
+    expected = (
+        reproduction.get("output_sha256"),
+        reproduction.get("output_size"),
+    )
+    if expected != (bundled.get("gguf_sha256"), bundled.get("gguf_size")):
+        errors.append(f"{model_label}: EmbeddingGemma reproduction output does not match provenance bundle")
+    if expected != (gguf_asset.get("sha256"), gguf_asset.get("size")):
+        errors.append(f"{model_label}: EmbeddingGemma reproduction output does not match locked GGUF")
+
+
 def verify_lock(lock_path: Path, root: Path, *, release: bool = False) -> list[str]:
     """Return all validation errors for *lock_path*, or an empty list."""
     errors: list[str] = []
@@ -230,6 +340,7 @@ def verify_lock(lock_path: Path, root: Path, *, release: bool = False) -> list[s
 
         for section in _FILE_SECTIONS:
             _verify_file_section(model, section, model_label, root, errors)
+        _verify_embeddinggemma_reproduction(model, model_label, root, errors)
         if release and isinstance(model.get("provenance"), list):
             for provenance_index, entry in enumerate(model["provenance"]):
                 _verify_release_provenance(
