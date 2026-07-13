@@ -18,9 +18,11 @@ archives must include this file and the complete `licenses/` directory.
 
 The Gemma terms require a copy of the agreement and a specific Notice for
 redistribution. They are not replaced by Greppy's MIT license. Public release
-remains blocked until the third-party quantization recipe is replaced or
-recovered, the redistribution review is signed off, and the current official
-terms are compared with the packaged copies.
+remains blocked until the redistribution review is signed off and the current
+official terms are compared with the packaged copies. The bundled Q4_K_M bytes
+have been independently reproduced from the pinned public F32 GGUF; the exact
+source digest, llama.cpp revision, x86_64 command, and output digest are in the
+provenance record.
 
 See `licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt` and
 `licenses/EMBEDDINGGEMMA-PROVENANCE.json`. The release workflow verifies these

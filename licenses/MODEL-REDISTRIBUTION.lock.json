@@ -3,7 +3,6 @@
   "version": 1,
   "release_ready": false,
   "release_blockers": [
-    "EmbeddingGemma third-party conversion recipe is not published",
     "Qwen summary-quality and training reproducibility gates are unresolved",
     "final redistribution review is pending"
   ],
@@ -43,15 +42,15 @@
       "provenance": [
         {
           "path": "licenses/EMBEDDINGGEMMA-PROVENANCE.json",
-          "sha256": "234c290231715073c135f6817857ce38005ac73032cdb1d6d1df9f38b7bcc22f",
-          "size": 1896
+          "sha256": "42e96a544c8d942a23da1147266758d84c63971a2040137f76670a5d3d7946d0",
+          "size": 2600
         }
       ],
       "modifications": [
         {
           "path": "licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt",
-          "sha256": "117e25db715a57abf675dea24b848b8ee39efa3ae2d97881d4b76a709448fb6c",
-          "size": 939
+          "sha256": "fe97c5d9d919f7ef759eacb5d60a6c4aaa4a0b5a4cfb0d9ffa0defe1b6ef3edc",
+          "size": 1533
         }
       ]
     },

@@ -16,10 +16,16 @@ terms are under the repository-level `licenses/` directory.
 Source: https://huggingface.co/cduk/embeddinggemma-300m-GGUF-with-dense-modules/tree/16eaef07700282e488368e27b992b8fe5a40c423
 
 Greppy did not convert or alter the GGUF bytes. The pinned third-party snapshot
-does not publish its exact converter and quantizer revisions, so
-`licenses/EMBEDDINGGEMMA-PROVENANCE.json` keeps the current asset blocked from a
-production release. Greppy will replace it with a reproducibly converted asset
-unless that missing upstream record is supplied.
+also contains the F32 GGUF from which Greppy independently reproduced the
+bundled Q4_K_M bytes. Two x86_64 runs of `llama-quantize` at llama.cpp revision
+`56fc38b9655fbe1869d8bd6cfb269418196cea69` were bit-stable and byte-identical
+to the bundled file. The exact source digest, command, architecture, and output
+digest are recorded in `licenses/EMBEDDINGGEMMA-PROVENANCE.json`.
+
+This reconstruction proves the packaged quantized artifact is reproducible; it
+does not claim knowledge of the producer's unpublished build environment. The
+asset remains blocked from a production release until the separate
+redistribution review is signed off.
 
 Verified asset digests:
 

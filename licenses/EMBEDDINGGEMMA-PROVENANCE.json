@@ -3,7 +3,6 @@
   "model_id": "embeddinggemma-300m-q4k-current",
   "release_ready": false,
   "release_blockers": [
-    "third-party GGUF conversion command and tool revisions are not published",
     "redistribution review has not been signed off"
   ],
   "base": {
@@ -35,9 +34,25 @@
     "quantization": "Q4_K_M",
     "performed_by_greppy": false,
     "producer": "cduk/embeddinggemma-300m-GGUF-with-dense-modules",
-    "tool": null,
-    "revision": null,
-    "command": null
+    "source": {
+      "repository": "cduk/embeddinggemma-300m-GGUF-with-dense-modules",
+      "file_commit": "6c4b6b0b86f1917506d8047478e350e51ac65fe8",
+      "filename": "embeddinggemma-300M-F32.gguf",
+      "size": 621867328,
+      "sha256": "695c5960fa074ccdc7993d9a9d215a20bee20c03f8eba23111caa6de0d0c6991"
+    },
+    "reproduction": {
+      "tool": "llama.cpp llama-quantize",
+      "revision": "56fc38b9655fbe1869d8bd6cfb269418196cea69",
+      "architecture": "x86_64",
+      "command": "llama-quantize embeddinggemma-300M-F32.gguf embeddinggemma-300M-Q4_K.gguf Q4_K_M 4",
+      "independent_runs": 2,
+      "bit_stable": true,
+      "byte_identical_to_bundled_asset": true,
+      "output_size": 238991680,
+      "output_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+      "verified_at": "2026-07-13"
+    }
   },
   "bundled": {
     "gguf_path": "crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf",

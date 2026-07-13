@@ -9,11 +9,23 @@ the Q4_K_M mix distributed under the filename embeddinggemma-300M-Q4_K.gguf.
 Greppy downloaded that file from pinned Hugging Face revision
 16eaef07700282e488368e27b992b8fe5a40c423 and did not alter its bytes.
 
+Greppy independently reconstructed the bundled bytes from the producer's
+public embeddinggemma-300M-F32.gguf artifact (file commit
+6c4b6b0b86f1917506d8047478e350e51ac65fe8, SHA256
+695c5960fa074ccdc7993d9a9d215a20bee20c03f8eba23111caa6de0d0c6991) with
+llama.cpp revision 56fc38b9655fbe1869d8bd6cfb269418196cea69:
+
+llama-quantize embeddinggemma-300M-F32.gguf \
+  embeddinggemma-300M-Q4_K.gguf Q4_K_M 4
+
+Two independent x86_64 runs produced the bundled file byte for byte. The
+architecture is part of the recipe because the ARM64 quantizer produces a
+different, deterministic byte stream for the same source weights.
+
 Current bundled GGUF SHA256:
 53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2
 
-The third-party snapshot does not publish its exact conversion command or
-converter and quantizer revisions. This is recorded as a release blocker in
-EMBEDDINGGEMMA-PROVENANCE.json. Unless that record is supplied, Greppy will
-replace this file with a reproducibly converted and newly hashed derivative
-before a production release.
+The producer did not publish its original shell command. The reconstruction
+above is therefore an independently verified recipe, not a claim about the
+producer's private build environment. Redistribution remains blocked until the
+separate legal review recorded in EMBEDDINGGEMMA-PROVENANCE.json is signed off.
