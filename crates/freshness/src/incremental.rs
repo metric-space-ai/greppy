@@ -86,6 +86,7 @@ pub fn compute_file_diff(
     inventory: &[InventoryEntry],
 ) -> Result<Vec<FileDiff>> {
     let persisted = store.list_file_states(project)?;
+    let persisted_skips = store.list_index_skips(project)?;
     let identities = store.list_file_identities(project)?;
     let mut diffs = Vec::with_capacity(inventory.len());
     let max_size = max_file_size_bytes();
@@ -109,6 +110,13 @@ pub fn compute_file_diff(
             )
         })
         .collect();
+    let mut skipped_by_rel: std::collections::HashMap<_, _> = persisted_skips
+        .into_iter()
+        .map(|skip| (skip.rel_path.clone(), skip))
+        .collect();
+    // A successful indexed row is authoritative if a legacy or interrupted
+    // run left a skip row for the same path behind.
+    skipped_by_rel.retain(|rel_path, _| !by_rel.contains_key(rel_path));
 
     for entry in inventory {
         // Stat BEFORE read. The discover walk already captured
@@ -140,6 +148,21 @@ pub fn compute_file_diff(
                 }
             },
         };
+
+        if let Some(skip) = skipped_by_rel.remove(&entry.rel_path) {
+            // Skipped files intentionally have no file_state row. Their
+            // persisted stat metadata is therefore the only baseline that
+            // can prove the same skip was already considered by the active
+            // index generation. Any uncertainty falls through to Added and
+            // forces the indexer to disposition the path again.
+            if skip.mtime_ns != 0
+                && skip.size == current.size as i64
+                && Some(skip.mtime_ns) == current.mtime_ns
+            {
+                diffs.push(FileDiff::Unchanged);
+                continue;
+            }
+        }
 
         if current.size > max_size {
             // Oversized: diff by (size, mtime) against the persisted
@@ -191,6 +214,9 @@ pub fn compute_file_diff(
 
     // Anything left in by_rel is a deletion.
     for (rel, _) in by_rel {
+        diffs.push(FileDiff::Deleted(rel));
+    }
+    for (rel, _) in skipped_by_rel {
         diffs.push(FileDiff::Deleted(rel));
     }
 
@@ -404,7 +430,7 @@ pub fn indexer_version_hash() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greppy_store::Project;
+    use greppy_store::{workspace_state as ws, IndexSkip, Project};
     use std::fs;
     use std::path::PathBuf;
 
@@ -512,6 +538,60 @@ mod tests {
         assert!(summary.contains(&"modified"));
         assert!(summary.contains(&"deleted"));
         assert!(summary.contains(&"unchanged"));
+    }
+
+    #[test]
+    fn diff_respects_unchanged_and_changed_index_skips() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+
+        let dir = tempdir_via_env();
+        let keep = make_entry(&dir, "src/keep.ts", "invalid provider syntax");
+        let changed = make_entry(&dir, "src/changed.ts", "old invalid syntax");
+        let gone = make_entry(&dir, "src/gone.ts", "gone invalid syntax");
+
+        for entry in [&keep, &changed, &gone] {
+            let metadata = stable_metadata(&fs::metadata(&entry.abs_path).unwrap());
+            store
+                .upsert_index_skip(&IndexSkip {
+                    project: "p".into(),
+                    rel_path: entry.rel_path.clone(),
+                    language: "typescript".into(),
+                    reason: "provider_invalid".into(),
+                    detail: "fixture".into(),
+                    size: metadata.size as i64,
+                    mtime_ns: metadata.mtime_ns.unwrap(),
+                    last_indexed_generation: 1,
+                    updated_at: ws::now_iso8601(),
+                })
+                .unwrap();
+        }
+
+        fs::write(&changed.abs_path, "new and longer invalid provider syntax").unwrap();
+        fs::remove_file(&gone.abs_path).unwrap();
+        let inventory = vec![keep, changed];
+        let diffs = compute_file_diff(&store, "p", &inventory).unwrap();
+
+        assert_eq!(
+            diffs
+                .iter()
+                .filter(|diff| matches!(diff, FileDiff::Unchanged))
+                .count(),
+            1,
+            "the unchanged persisted skip must remain fresh: {diffs:?}"
+        );
+        assert!(diffs.iter().any(
+            |diff| matches!(diff, FileDiff::Added(entry) if entry.rel_path == "src/changed.ts")
+        ));
+        assert!(diffs
+            .iter()
+            .any(|diff| matches!(diff, FileDiff::Deleted(path) if path == "src/gone.ts")));
     }
 
     #[test]
