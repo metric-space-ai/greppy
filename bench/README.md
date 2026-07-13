@@ -53,6 +53,15 @@ repository path, endpoint, secret, or raw trace. Run
 `python3 -m unittest bench/test_runtime_footprint.py` for its redaction,
 cleanup, failure, timing-schema, and atomic-write tests.
 
+## Hardware evidence
+
+`hardware_evidence.sh` runs one inference-evidence pass of a built greppy
+binary on real hardware (backend selection, functional contracts, cold index
+and warm p50/p95 latencies, VRAM peak on CUDA) and emits a scrubbed JSON
+artifact conforming to `hardware-evidence.schema.json`. Committed artifacts
+live in `hardware-evidence/` — see `hardware-evidence/README.md` for what
+each platform leg proves and how to re-run it.
+
 The fixture-based scripts are non-destructive: they reindex
 `bench/fixtures/sample/` from scratch and clean up after themselves. The runtime
 footprint harness reads the explicitly supplied Git repository and keeps its

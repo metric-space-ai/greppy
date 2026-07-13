@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/metric-space-ai/greppy/blob/main/bench/hardware-evidence.schema.json",
+  "title": "greppy hardware evidence artifact",
+  "description": "One reproducible inference-evidence run of bench/hardware_evidence.sh on real hardware (beyond GitHub-hosted runners). Committed artifacts live under bench/hardware-evidence/ and MUST NOT contain anything host-identifying: no hostnames, no usernames, no serial numbers, no absolute paths. Hardware make/model, driver versions, and OS versions are deliberately recorded; they are the evidence. Model digests are recorded so evidence collected against a superseded model is mechanically detectable (compare against crates/cli/assets/MODEL_ASSETS.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "created_utc",
+    "platform",
+    "product",
+    "backend",
+    "models",
+    "measurements",
+    "checks",
+    "status"
+  ],
+  "properties": {
+    "schema_version": { "const": "greppy.hardware-evidence.v1" },
+    "created_utc": {
+      "type": "string",
+      "description": "UTC timestamp of the run, ISO-8601 (YYYY-MM-DDTHH:MM:SSZ)."
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "os_version", "arch", "cpu_model", "cpu_cores"],
+      "properties": {
+        "os": { "enum": ["linux", "macos", "windows"] },
+        "os_version": {
+          "type": "string",
+          "description": "Kernel release (Linux) or product version (macOS). Never the node name."
+        },
+        "arch": { "type": "string" },
+        "cpu_model": {
+          "type": "string",
+          "description": "CPU brand string (/proc/cpuinfo model name, sysctl machdep.cpu.brand_string)."
+        },
+        "cpu_cores": { "type": "integer", "minimum": 1 },
+        "ram_gb": { "type": "number", "minimum": 0 },
+        "apple_silicon_generation": {
+          "type": "string",
+          "description": "Apple Silicon generation parsed from the CPU brand string (e.g. \"M5\"). The Metal tensor-ops (Metal 4) inference path only lights up on generations/OS builds whose GPU exposes it; evidence collected on an older generation marks the tensor path as pending newer hardware in measurements.notes."
+        },
+        "gpu": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["name"],
+          "description": "Discrete/integrated GPU used by the run; null for pure-CPU platforms.",
+          "properties": {
+            "name": { "type": "string" },
+            "driver_version": { "type": "string" },
+            "vram_total_mib": { "type": "integer", "minimum": 0 },
+            "compute_capability": { "type": ["string", "null"] },
+            "metal_family": {
+              "type": ["string", "null"],
+              "description": "Metal feature family reported by the product's backend probe (e.g. metal4/tensor-ops vs metal3/simdgroup)."
+            }
+          }
+        }
+      }
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "source_sha", "binary_sha256", "backend_compiled"],
+      "properties": {
+        "version": { "type": "string", "description": "Output of `greppy --version`." },
+        "source_sha": {
+          "type": "string",
+          "description": "Git commit the measured binary was built from (passed via --source-sha; \"unknown\" if the build is untracked)."
+        },
+        "binary_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "backend_compiled": {
+          "type": "boolean",
+          "description": "Whether the requested backend is compiled into this binary (registry probe `compiled`)."
+        },
+        "backend_build_info": { "type": "string" }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "selected"],
+      "properties": {
+        "requested": { "enum": ["cpu", "metal", "cuda"] },
+        "selected": {
+          "enum": ["cpu", "metal", "cuda"],
+          "description": "Backend the product actually selected (doctor .inference.registry.selected_backend). Must equal `requested` for a passing artifact."
+        },
+        "selected_device": {
+          "type": ["string", "null"],
+          "description": "Product device id (e.g. cuda:0) — an enumeration index, not host-identifying."
+        },
+        "cpu_capabilities": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "SIMD capabilities the product's own CPU probe reports (avx2, avx-vnni, avx512f, neon, dotprod). Empty on x86 means the binary ran on its SIMD baseline fallbacks."
+        },
+        "baseline_x86_required": {
+          "type": "boolean",
+          "description": "True when the run was invoked with --require-baseline-x86: the harness additionally asserts the CPU lacks AVX-VNNI/AVX-512 so the passing checks prove the SIMD fallback paths."
+        },
+        "cuda_toolkit_visible": {
+          "type": ["boolean", "null"],
+          "description": "CUDA runs only: whether a CUDA toolkit (nvcc) was reachable in the harness environment. Must be false for a valid runtime-only artifact — the shipped binary bundles its CUDA backend (nvcc-built with --cudart=static) and needs only the NVIDIA driver's libcuda.so.1 at runtime."
+        },
+        "cuda_backend_needed_libs": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "CUDA runs only: DT_NEEDED entries of the materialized bundled backend library. Must not contain cudart/cublas/nvrtc."
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["embedding", "summary"],
+      "description": "Digests of the models embedded in the measured binary, as reported by `greppy doctor --json` (.inference.models). Compare against crates/cli/assets/MODEL_ASSETS.json to detect evidence that predates a model promotion.",
+      "properties": {
+        "embedding": { "$ref": "#/$defs/model" },
+        "summary": { "$ref": "#/$defs/model" }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture", "index_cold_ms", "semantic_search_ms", "brief_ms"],
+      "properties": {
+        "fixture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["files", "tree_sha256"],
+          "properties": {
+            "files": { "type": "integer", "minimum": 1 },
+            "tree_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "Canonical content digest of the generated fixture tree; identical across platforms for the same harness revision."
+            }
+          }
+        },
+        "index_cold_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock `greppy index` on the fixture from an empty store: parsing, graph build, embedding AND summary inference."
+        },
+        "semantic_search_ms": { "$ref": "#/$defs/latency" },
+        "brief_ms": { "$ref": "#/$defs/latency" },
+        "vram": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["baseline_mib", "peak_mib", "poll_interval_s"],
+          "description": "CUDA runs only: nvidia-smi memory.used polling on the measured GPU for the whole harness run. peak-baseline bounds the product's VRAM footprint (other tenants may inflate both equally).",
+          "properties": {
+            "baseline_mib": { "type": "integer", "minimum": 0 },
+            "peak_mib": { "type": "integer", "minimum": 0 },
+            "poll_interval_s": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Free-form caveats, e.g. shared GPU tenancy, or hardware paths this platform cannot prove yet (Metal tensor-ops needs an M5-class GPU; baseline-x86 needs a pre-AVX-VNNI machine)."
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "pass"],
+        "properties": {
+          "name": { "type": "string" },
+          "pass": { "type": "boolean" },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "status": {
+      "enum": ["pass", "fail"],
+      "description": "pass iff every entry in `checks` passed. Only passing artifacts belong in bench/hardware-evidence/."
+    }
+  },
+  "$defs": {
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "model_sha256", "tokenizer_sha256"],
+      "properties": {
+        "model_id": { "type": "string" },
+        "model_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "tokenizer_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calls", "p50_ms", "p95_ms", "min_ms", "max_ms"],
+      "description": "Warm-daemon latency over `calls` sequential invocations (one unmeasured warm-up call precedes the series).",
+      "properties": {
+        "calls": { "type": "integer", "minimum": 1 },
+        "p50_ms": { "type": "integer", "minimum": 0 },
+        "p95_ms": { "type": "integer", "minimum": 0 },
+        "min_ms": { "type": "integer", "minimum": 0 },
+        "max_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
