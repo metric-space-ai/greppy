@@ -1,10 +1,13 @@
 //! Build-time embedding of the EmbeddingGemma-300M and Qwen3.5-0.8B Q4_K models.
 //!
 //! Owner rule: greppy works OUT OF THE BOX — semantic search must ALWAYS
-//! work, so the model ships INSIDE the binary and the model files live IN THIS
-//! REPO (`crates/cli/assets/embeddinggemma-300m-q4k/` and
-//! `crates/cli/assets/qwen35-0.8b-mtp-q4km/`, tracked via Git LFS). No download,
-//! external path, feature switch, or environment variable is required. The
+//! work, so the model ships INSIDE the binary. The asset BYTES are hosted as
+//! GitHub release assets (free and unlimited for public repos; Git LFS storage
+//! and bandwidth were the org's dominant cost). WHAT ships stays pinned in
+//! this repo: `crates/cli/assets/MODEL_ASSETS.json` plus `*.sha256` sidecars,
+//! materialized and digest-verified by `tools/fetch_model_assets.sh` before
+//! any build. The shipped binary is unchanged: no download, external path,
+//! feature switch, or environment variable is required at runtime. The
 //! sole exception is the compile-guarded `ci-test-assets` debug feature used by
 //! non-inference tests; release builds cannot enable it.
 //!
@@ -104,12 +107,12 @@ fn verify(repo_asset: &Path, name: &str, want_sha: &str) {
     assert!(
         src.exists(),
         "embedded model asset `{name}` not found at {}.\n\
-         The model must live in the repo (Git LFS): run `git lfs install && git lfs pull`.\n\
+         Fetch the release-hosted model assets first: run `./tools/fetch_model_assets.sh`.\n\
          Refusing to build a binary without its repo-owned model.",
         src.display(),
     );
     // A Git-LFS pointer file (a few hundred bytes) is not the real asset —
-    // catch the common "forgot to lfs pull" case with a clear message.
+    // catch the common "asset not fetched" case with a clear message.
     let got = sha256_file(&src);
     assert_eq!(
         got,

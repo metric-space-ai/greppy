@@ -64,3 +64,11 @@ bench/agent_efficiency/realcorpus/*/
 # --- candle golden minters (dev-only; candle removed from the product, goldens are committed static fixtures in crates/embed-native/testdata) ---
 /crates/embeddinggemma/
 *.log
+
+# Model assets are fetched from the pinned GitHub release (see
+# crates/cli/assets/MODEL_ASSETS.json + tools/fetch_model_assets.sh);
+# only the manifest and *.sha256 sidecars are tracked.
+crates/cli/assets/qwen35-0.8b-mtp-q4km/*.gguf
+crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
+crates/cli/assets/embeddinggemma-300m-q4k/*.gguf
+crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json

@@ -182,10 +182,21 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout with Git LFS models
+      - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Restore model assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          lfs: true
+          path: |
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
+            crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+            crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
+          key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
+
+      - name: Fetch model assets (release-hosted, sha-pinned)
+        shell: bash
+        run: ./tools/fetch_model_assets.sh
 
       - name: Verify model redistribution integrity
         run: python tools/verify_model_redistribution.py
@@ -281,8 +292,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Restore model assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          lfs: true
+          path: |
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
+            crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+            crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
+          key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
+
+      - name: Fetch model assets (release-hosted, sha-pinned)
+        shell: bash
+        run: ./tools/fetch_model_assets.sh
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88

@@ -1,0 +1,26 @@
+{
+  "comment": "Embedded model assets are hosted as GitHub release assets (free, unlimited for public repos) instead of Git LFS. tools/fetch_model_assets.sh downloads them into crates/cli/assets/ and verifies every file against the sha256 below before build.rs bakes it into the binary. Each asset may carry its own release_tag (falls back to the top-level release_tag), so promoting a new model = upload ONE asset to a new tag and bump that entry + its .sha256 sidecar in the same commit.",
+  "release_tag": "model-assets-v2",
+  "assets": [
+    {
+      "asset_name": "Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
+      "dest": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
+      "sha256": "d09d5028e28ea9df501d83a9a60b80ed73f878b4b98424b09a39505364a1053f"
+    },
+    {
+      "asset_name": "qwen-tokenizer.json",
+      "dest": "crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json",
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    },
+    {
+      "asset_name": "embeddinggemma-300M-Q4_K.gguf",
+      "dest": "crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf",
+      "sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2"
+    },
+    {
+      "asset_name": "embeddinggemma-tokenizer.json",
+      "dest": "crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json",
+      "sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+    }
+  ]
+}
