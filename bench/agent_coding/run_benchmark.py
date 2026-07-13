@@ -32,7 +32,7 @@ PROVIDER_EXTENSION = REPO_ROOT / "bench" / "agent_efficiency" / "minimax-provide
 TASK_SCHEMA_VERSION = "greppy.agent-coding-tasks.v1"
 RESULT_SCHEMA_VERSION = "greppy.agent-coding-results.v1"
 MANIFEST_SCHEMA_VERSION = "greppy.agent-coding-manifest.v1"
-GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v1"
+GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v2"
 HARNESS_VERSION = "2"
 DEFAULT_MODEL = "MiniMax-M3"
 DEFAULT_PROVIDER = "minimax"
@@ -877,6 +877,7 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         and input_ratio <= 0.8
     )
     no_significant_regression = p_value >= 0.05
+    observed_not_lower = candidate_only >= baseline_only
     credited_wall_wins = sum(cand["agent"]["wall_seconds"] < base["agent"]["wall_seconds"] for base, cand in solved)
     wall_ratio = ratio(
         sum(cand["agent"]["wall_seconds"] for base, cand in solved),
@@ -886,7 +887,11 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     sample_size_pass = len(complete_pairs) >= MIN_COMPLETE_PAIRS and len(solved) >= MIN_SOLVED_PAIRS
     return {
         "schema_version": GATE_SCHEMA_VERSION,
-        "passed": complete and sample_size_pass and no_significant_regression and efficiency_pass,
+        "passed": complete
+        and sample_size_pass
+        and observed_not_lower
+        and no_significant_regression
+        and efficiency_pass,
         "complete": complete,
         "sample_size": {
             "minimum_complete_pairs": MIN_COMPLETE_PAIRS,
@@ -901,6 +906,7 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
             "greppy_only_passes": candidate_only,
             "one_sided_exact_mcnemar_p": round(p_value, 8),
             "alpha": 0.05,
+            "greppy_observed_correctness_not_lower": observed_not_lower,
             "no_significant_regression": no_significant_regression,
         },
         "efficiency_on_solved_pairs": {
@@ -1053,7 +1059,10 @@ def build_base_manifest(
         },
         "warm_greppy_outside_measurement": warm_greppy,
         "gate_preregistration": {
-            "correctness": "one-sided exact McNemar; reject regression at p < 0.05",
+            "correctness": (
+                "Greppy paired correctness wins >= losses, plus one-sided exact "
+                "McNemar regression alarm at p < 0.05"
+            ),
             "efficiency_population": "pairs where both arms pass the independent test",
             "minimum_sample": "at least 30 complete pairs and at least 20 both-solved pairs",
             "efficiency": "sum ratio <= 0.80 for tool calls AND source opens AND input tokens",

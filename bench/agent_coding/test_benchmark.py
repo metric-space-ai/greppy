@@ -348,6 +348,30 @@ class GradingTests(unittest.TestCase):
         self.assertEqual(grade["correctness"]["one_sided_exact_mcnemar_p"], 0.03125)
         self.assertFalse(grade["passed"])
 
+    def test_observed_loss_fails_when_exact_alarm_is_not_significant(self) -> None:
+        task_ids = [f"t{i}" for i in range(30)]
+        rows: list[dict[str, object]] = []
+        for index, task_id in enumerate(task_ids):
+            rows.extend(
+                [
+                    result_row(task_id, "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10),
+                    result_row(
+                        task_id,
+                        "greppy",
+                        passed=index != 0,
+                        tools=8,
+                        source_opens=4,
+                        inputs=800,
+                        wall=8,
+                    ),
+                ]
+            )
+        grade = bench.grade_results(rows, task_ids)
+        self.assertEqual(grade["correctness"]["one_sided_exact_mcnemar_p"], 0.5)
+        self.assertTrue(grade["correctness"]["no_significant_regression"])
+        self.assertFalse(grade["correctness"]["greppy_observed_correctness_not_lower"])
+        self.assertFalse(grade["passed"])
+
     def test_failed_pair_never_receives_wall_time_credit(self) -> None:
         rows = [
             result_row("solved", "explorer", passed=True, tools=10, inputs=100, wall=1),

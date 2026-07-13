@@ -135,5 +135,48 @@ class SummaryQualityGateTests(unittest.TestCase):
         self.assertFalse(report["checks"]["no_signature_echoes"])
 
 
+class SummaryQualityJudgeTests(unittest.TestCase):
+    def valid_response(self) -> dict:
+        return {
+            "prompt_version": SUMMARY_QUALITY.JUDGE_PROMPT_VERSION,
+            "verdicts": [
+                {
+                    "id": "sq030",
+                    "helpful": True,
+                    "misleading": False,
+                    "invented_symbols": [],
+                    "signature_echo": False,
+                    "reason": "correct purpose",
+                },
+                {
+                    "id": "sq031",
+                    "helpful": False,
+                    "misleading": False,
+                    "invented_symbols": [],
+                    "signature_echo": True,
+                    "reason": "only echoes signature",
+                },
+            ],
+        }
+
+    def test_response_requires_exact_ids_in_exact_order(self):
+        items = [{"id": "sq030"}, {"id": "sq031"}]
+        rows = SUMMARY_QUALITY.validate_judge_response(self.valid_response(), items)
+        self.assertEqual([row["id"] for row in rows], ["sq030", "sq031"])
+
+        wrong = self.valid_response()
+        wrong["verdicts"][0]["id"] = "sq001"
+        with self.assertRaisesRegex(RuntimeError, "wrong IDs"):
+            SUMMARY_QUALITY.validate_judge_response(wrong, items)
+
+    def test_response_rejects_missing_typed_fields(self):
+        response = self.valid_response()
+        response["verdicts"][0]["helpful"] = "yes"
+        with self.assertRaisesRegex(RuntimeError, "non-boolean helpful"):
+            SUMMARY_QUALITY.validate_judge_response(
+                response, [{"id": "sq030"}, {"id": "sq031"}]
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,11 @@ ID. A result without that `RUN_MANIFEST.json` is not release evidence.
 Each task runs with the same question, model, timeout, and repository snapshot.
 Index/model setup occurs before measured agent work. Per-task rows retain:
 
+Arm order is deterministically balanced per task by hashing the benchmark
+order version, task ID, and arm name. This prevents one treatment from always
+running earlier in a provider session while keeping the complete order
+reproducible from the manifest.
+
 - accepted mechanical quality/correctness evidence;
 - explicit hard-negative graph terms are hard failures, so an answer cannot
   pass by naming the expected symbols alongside a known false edge;
@@ -46,14 +51,16 @@ mismatches, or incomplete pairs make a run non-decision-capable.
 
 `v0.2.0` requires all gates against `explorer`:
 
-1. No statistically significant paired correctness regression (one-sided exact
-   discordant-pair test, alpha 0.05).
-2. Candidate total tool calls on structural `locate` tasks are at most 80% of
+1. Greppy must have at least as many observed paired correctness wins as losses.
+2. A one-sided exact discordant-pair test must not detect a correctness
+   regression at alpha 0.05. This is a regression alarm, not a claim of
+   population equivalence or non-inferiority.
+3. Candidate total tool calls on structural `locate` tasks are at most 80% of
    baseline.
-3. Candidate source-open calls on structural tasks are at most 80% of baseline.
-4. Candidate variable input tokens on structural tasks are at most 80% of
+4. Candidate source-open calls on structural tasks are at most 80% of baseline.
+5. Candidate variable input tokens on structural tasks are at most 80% of
    baseline.
-5. Every comparable row has accepted machine-readable quality evidence.
+6. Every comparable row has accepted machine-readable quality evidence.
 
 `release_gate.py` implements these thresholds. They are fixed before the run
 and may not be relaxed after observing results.

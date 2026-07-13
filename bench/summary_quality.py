@@ -28,7 +28,7 @@ RESULTS_SCHEMA = "greppy.summary-quality-results.v1"
 JUDGMENTS_SCHEMA = "greppy.summary-quality-judgments.v1"
 GATE_SCHEMA = "greppy.summary-quality-gate.v1"
 SELECTION_VERSION = "greppy-summary-quality-selection-v1"
-JUDGE_PROMPT_VERSION = "greppy-summary-quality-judge-v1"
+JUDGE_PROMPT_VERSION = "greppy-summary-quality-judge-v2"
 SUMMARY_PROMPT_VERSION = "qwen35-brief-tag-v4"
 DEFAULT_REPOS = ("serde", "flask", "gson", "zod", "tokio", "hugo")
 EXCLUDED_PATH = re.compile(
@@ -511,6 +511,7 @@ def parse_json_response(text: str) -> dict[str, Any]:
 
 
 def judge_request(key: str, items: list[dict[str, Any]], timeout: float) -> dict[str, Any]:
+    required_ids = [item["id"] for item in items]
     instructions = f"""
 You validate tiny function-purpose hints used only for code navigation.
 For each item, compare the generated summary with the exact source.
@@ -523,8 +524,15 @@ Definitions:
 - An empty summary is helpful=false and misleading=false.
 
 Do not reward eloquence or detail. Do not answer what the code does beyond the verdict reason.
-Return exactly one JSON object:
-{{"prompt_version":"{JUDGE_PROMPT_VERSION}","verdicts":[{{"id":"sq001","helpful":true,"misleading":false,"invented_symbols":[],"signature_echo":false,"reason":"short reason"}}]}}
+Return exactly one JSON object with prompt_version and a verdicts array. Each
+verdict must contain id, helpful, misleading, invented_symbols,
+signature_echo, and a short reason. Copy each item ID exactly once, in the same
+order. Do not invent, omit, or rename IDs.
+
+The only allowed IDs for this request are:
+{json.dumps(required_ids)}
+
+Required top-level prompt_version: {JUDGE_PROMPT_VERSION}
 
 ITEMS:
 {json.dumps(items, ensure_ascii=False)}
@@ -555,6 +563,37 @@ ITEMS:
         if block.get("type") == "text"
     )
     return parse_json_response(text)
+
+
+def validate_judge_response(
+    response: dict[str, Any], items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if response.get("prompt_version") != JUDGE_PROMPT_VERSION:
+        raise RuntimeError("judge prompt-version mismatch")
+    rows = response.get("verdicts")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError("judge verdicts must be an array of objects")
+    expected_ids = [item["id"] for item in items]
+    returned_ids = [row.get("id") for row in rows]
+    if returned_ids != expected_ids:
+        raise RuntimeError(
+            f"judge returned wrong IDs: expected {expected_ids}, got {returned_ids}"
+        )
+    for row in rows:
+        if not isinstance(row.get("helpful"), bool):
+            raise RuntimeError(f"judge returned non-boolean helpful for {row['id']}")
+        if not isinstance(row.get("misleading"), bool):
+            raise RuntimeError(f"judge returned non-boolean misleading for {row['id']}")
+        invented = row.get("invented_symbols")
+        if not isinstance(invented, list) or not all(
+            isinstance(symbol, str) for symbol in invented
+        ):
+            raise RuntimeError(f"judge returned invalid invented_symbols for {row['id']}")
+        if not isinstance(row.get("signature_echo"), bool):
+            raise RuntimeError(f"judge returned non-boolean signature_echo for {row['id']}")
+        if not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            raise RuntimeError(f"judge returned an empty reason for {row['id']}")
+    return rows
 
 
 def judge(args: argparse.Namespace) -> int:
@@ -593,10 +632,13 @@ def judge(args: argparse.Namespace) -> int:
             for record in batch
         ]
         response: dict[str, Any] | None = None
+        rows: list[dict[str, Any]] | None = None
         error: Exception | None = None
         for attempt in range(6):
             try:
-                response = judge_request(key, items, args.timeout)
+                candidate = judge_request(key, items, args.timeout)
+                rows = validate_judge_response(candidate, items)
+                response = candidate
                 break
             except urllib.error.HTTPError as exc:
                 error = exc
@@ -612,15 +654,8 @@ def judge(args: argparse.Namespace) -> int:
             except (RuntimeError, json.JSONDecodeError, urllib.error.URLError) as exc:
                 error = exc
                 time.sleep(min(60.0, 2.0**attempt))
-        if response is None:
+        if response is None or rows is None:
             raise RuntimeError(f"judge failed after retries: {error}")
-        if response.get("prompt_version") != JUDGE_PROMPT_VERSION:
-            raise RuntimeError("judge prompt-version mismatch")
-        rows = response.get("verdicts")
-        if not isinstance(rows, list) or {row.get("id") for row in rows} != {
-            item["id"] for item in items
-        }:
-            raise RuntimeError(f"judge returned wrong IDs for batch at {offset}")
         for row in rows:
             source_lower = source_for(cases[row["id"]]).lower()
             row["invented_symbols"] = [

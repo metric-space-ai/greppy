@@ -150,17 +150,18 @@ removed normally.
 
 The gate is fixed in code and copied into every manifest:
 
-1. A one-sided exact paired McNemar test must not show a correctness regression
-   at `p < 0.05`.
-2. A decision requires at least 30 complete pairs and at least 20 pairs where
+1. Greppy must have at least as many observed paired correctness wins as losses.
+2. A one-sided exact paired McNemar regression alarm must not fire at `p <
+   0.05`. This alarm is not presented as proof of population equivalence.
+3. A decision requires at least 30 complete pairs and at least 20 pairs where
    both independent tests pass; smaller runs cannot pass.
-3. Only pairs where **both** independent tests pass enter efficiency grading.
-4. Across those solved pairs, Greppy must use at most `0.80x` the explorer's
+4. Only pairs where **both** independent tests pass enter efficiency grading.
+5. Across those solved pairs, Greppy must use at most `0.80x` the explorer's
    summed tool calls, at most `0.80x` its summed source opens, **and** at most
    `0.80x` its summed input tokens. All three conditions are required.
-5. Wall time is descriptive only and is computed only for solved pairs. A
+6. Wall time is descriptive only and is computed only for solved pairs. A
    failed test can never receive or contribute a speed win.
-6. Missing or invalid arms fail the gate. Pi timeouts, nonzero exits, reported
+7. Missing or invalid arms fail the gate. Pi timeouts, nonzero exits, reported
    model errors, and zero-turn sessions make an arm invalid even if a partial
    edit happens to pass the test.
 

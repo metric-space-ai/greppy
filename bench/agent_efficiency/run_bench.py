@@ -64,7 +64,8 @@ TASKS = HERE / "tasks_v2.json"
 RESULTS = HERE / "results.json"
 RAW_ROOT = HERE / "raw_runs"
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
-BENCHMARK_PROMPT_VERSION = "greppy-agent-nav-v3"
+BENCHMARK_PROMPT_VERSION = "greppy-agent-nav-v4"
+ARM_ORDER_VERSION = "sha256-task-agent-v1"
 
 
 def ensure_provider_key(provider: str = "minimax") -> None:
@@ -209,11 +210,22 @@ def prompt_contract() -> dict:
     }
     return {
         "version": BENCHMARK_PROMPT_VERSION,
+        "arm_order": ARM_ORDER_VERSION,
         "sha256": {
             name: hashlib.sha256(text.encode("utf-8")).hexdigest()
             for name, text in prompts.items()
         },
     }
+
+
+def deterministic_agent_order(task_id: str, agents: list[str]) -> list[str]:
+    """Balance provider-time effects without introducing unrecorded randomness."""
+    return sorted(
+        agents,
+        key=lambda agent: hashlib.sha256(
+            f"{ARM_ORDER_VERSION}\0{task_id}\0{agent}".encode("utf-8")
+        ).digest(),
+    )
 
 
 def plus_sys(root: str) -> str:
@@ -831,7 +843,6 @@ def main() -> None:
         "plus": plus_sys,
         "explorer": lambda root: EXPLORER_SYS,
     }
-    run_order = ("grep", "greppy", "plus", "explorer")
     for t in tasks:
         repo = t["repo"]
         lang, size = repo_meta(repo)
@@ -875,9 +886,7 @@ def main() -> None:
             by[t["id"]] = row
             save_rows(by, results_path)
 
-        for agent in run_order:
-            if agent not in agents:
-                continue
+        for agent in deterministic_agent_order(t["id"], agents):
             label = f"{agent}:"
             if not rerun and has_agent_result(agent):
                 res = row[agent]

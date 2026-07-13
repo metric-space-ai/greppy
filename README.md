@@ -213,12 +213,15 @@ Two complementary, pre-registered suites are checked in:
 Both suites record per-task correctness, tool calls, source opens, input/output
 tokens, context or prompt volume, and wall time for the same agent and model.
 Task banks, prompts, binaries, runtime versions, setup commands, and repository
-commits are hashed into their manifests.
+commits are hashed into their manifests. Arm order is deterministically
+balanced per task and its ordering scheme is versioned in the manifest.
 
 `v0.2.0` may claim an efficiency win only when both published, mechanically
 graded runs for the exact release commit prove all of the following:
 
-- no statistically significant correctness regression;
+- at least as many observed paired correctness wins as losses, plus no exact
+  paired regression alarm at `p < 0.05` (the alarm is not presented as proof
+  of population equivalence);
 - at least 20% fewer tool calls and source-open calls on structural tasks;
 - at least 20% fewer variable input tokens on structural tasks;
 - exact repository commits, task-bank hash, prompt hash, model ID, Greppy

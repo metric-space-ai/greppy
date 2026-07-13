@@ -94,8 +94,10 @@ def main() -> int:
         structural, args.baseline, args.candidate, "variable_input"
     )
     loss_p = one_sided_loss_probability(losses, wins)
+    observed_not_lower = wins >= losses
     checks = {
         "all_rows_have_accepted_quality": missing_quality == 0 and bool(comparable),
+        "candidate_observed_correctness_not_lower": observed_not_lower,
         "no_significant_correctness_regression": loss_p >= 0.05,
         "tool_calls_at_least_20_percent_lower": tool_ratio is not None and tool_ratio <= 0.80,
         "source_opens_at_least_20_percent_lower": open_ratio is not None and open_ratio <= 0.80,
@@ -103,7 +105,7 @@ def main() -> int:
         and input_ratio <= 0.80,
     }
     report = {
-        "schema_version": "greppy.agent-release-gate.v1",
+        "schema_version": "greppy.agent-release-gate.v2",
         "baseline": args.baseline,
         "candidate": args.candidate,
         "comparable_rows": len(comparable),
@@ -113,6 +115,7 @@ def main() -> int:
             "candidate_wins": wins,
             "candidate_losses": losses,
             "ties": ties,
+            "candidate_observed_correctness_not_lower": observed_not_lower,
             "one_sided_regression_p": loss_p,
         },
         "ratios_candidate_over_baseline": {

@@ -53,6 +53,10 @@ ground truth, and a machine-checkable descriptor. Example:
 TypeScript, and Go. Real repository commits are pinned for Serde, Tokio, Flask,
 Django, Gson, and Zod.
 
+The runner deterministically balances arm order from the task ID and recorded
+benchmark version, so Greppy is not systematically run before or after the
+baseline while every ordering remains reproducible.
+
 ## Reproduce
 
 ```bash
@@ -103,11 +107,12 @@ no raw traces.
 ## Release gates
 
 The result is accepted only when every comparable row has quality evidence,
-there is no statistically significant paired correctness regression, and on
-structural tasks Greppy uses at most 80% of the baseline's tool calls,
-source-open calls, and variable input tokens. `release_gate.py` enforces those
-thresholds; `forensics.py --enforce` additionally rejects missing evidence and
-router violations.
+Greppy has at least as many observed paired correctness wins as losses, the
+exact paired regression alarm does not fire, and on structural tasks Greppy
+uses at most 80% of the baseline's tool calls, source-open calls, and variable
+input tokens. The exact test is not presented as proof of population
+equivalence. `release_gate.py` enforces those thresholds; `forensics.py
+--enforce` additionally rejects missing evidence and router violations.
 
 ## Large-repository stress
 
