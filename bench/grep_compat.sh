@@ -30,9 +30,16 @@ rm -rf "$WORK/repo/.greppy"
 mkdir -p "$WORK/store"
 export GREPPY_STORE_DIR="$WORK/store"
 
-REAL_GREP=$(command -v grep)
+# Resolve system grep from fixed paths, mirroring the product's discover_grep.
+# `command -v grep` is unsafe here: a greppy shim installed as `grep` on PATH
+# (e.g. ~/.local/bin/grep) would recurse the comparison into a fork bomb.
+REAL_GREP=""
+for candidate in /usr/bin/grep /bin/grep; do
+    [[ -x "$candidate" ]] && { REAL_GREP="$candidate"; break; }
+done
 if [[ -z "$REAL_GREP" ]]; then
-    REAL_GREP=/usr/bin/grep
+    echo "no system grep at /usr/bin/grep or /bin/grep" >&2
+    exit 1
 fi
 
 # Run real grep + wrapper from $WORK so any relative paths in the
