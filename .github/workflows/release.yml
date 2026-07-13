@@ -655,6 +655,16 @@ jobs:
             --target "${{ matrix.rust_host }}"
           if ($LASTEXITCODE -ne 0) { throw 'SPDX verification failed' }
           & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
+          # TODO(windows daemon stress): port bench/release_daemon_stress.sh
+          # to PowerShell for this leg. Portable as-is: concurrency/queue
+          # limits/oversize/slow-client/protocol scenarios (the raw client
+          # needs System.IO.Pipes.NamedPipeClientStream against the
+          # \\.\pipe\greppy-* endpoints instead of unix sockets), kill -9
+          # (Stop-Process -Force) + respawn, and TTL-based eviction/exit.
+          # Genuinely NOT portable: the two stale-endpoint-file scenarios
+          # (leftover socket file after SIGKILL; junk regular file at the
+          # endpoint path) - named pipes vanish with their owning process,
+          # so no stale filesystem endpoint can exist on Windows.
 
   publish:
     name: publish gated release
