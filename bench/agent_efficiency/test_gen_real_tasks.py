@@ -59,5 +59,26 @@ class EnsureMirrorsTests(unittest.TestCase):
                     gen.ensure_mirrors(self.manifest())
 
 
+class ControlPayloadTests(unittest.TestCase):
+    def test_literal_control_remains_verbatim(self) -> None:
+        source = {"id": "t1", "q": "find literal", "check": {"kind": "literal"}}
+        self.assertEqual(
+            gen.control_payload(source, "literal_control"),
+            {"q": "find literal", "check": {"kind": "literal"}},
+        )
+
+    def test_graph_control_question_is_deterministically_reframed(self) -> None:
+        source = {
+            "id": "t1",
+            "q": "Who calls target?",
+            "check": {"kind": "who_calls", "symbol": "target"},
+        }
+        first = gen.control_payload(source, "graph_control_synth")
+        second = gen.control_payload(source, "graph_control_synth")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first["q"], source["q"])
+        self.assertEqual(source["q"], "Who calls target?")
+
+
 if __name__ == "__main__":
     unittest.main()

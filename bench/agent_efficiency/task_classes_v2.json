@@ -1,12 +1,11 @@
 {
   "schema_version": 1,
-  "purpose": "Machine-readable corpus-v2 router/regression classes for the real-repo agent benchmark (serde/flask/gson/zod) plus reused synthetic v1 controls.",
+  "purpose": "Machine-readable corpus-v2 router/regression classes for the six-repository real-code agent benchmark plus deterministic synthetic v1 controls.",
   "source_evidence": [
     "bench/agent_efficiency/realcorpus/candidates.json",
     "bench/agent_efficiency/realcorpus/MANIFEST.json",
     "bench/agent_efficiency/tasks.json",
-    "bench/agent_efficiency/task_classes.json",
-    "greppy-10x/bench/agent_efficiency/REALCORPUS_TASKGEN_SPEC.md"
+    "bench/agent_efficiency/task_classes.json"
   ],
   "generator": "bench/agent_efficiency/gen_real_tasks.py -- deterministic function of the inputs; no randomness, no timestamps.",
   "input_candidates_sha256": "1ca14f6883b6d1e0fa2a00a5468a55d7ad6151ca9a58333ccf2501eb74e3dd92",
@@ -163,7 +162,7 @@
     },
     "graph_control_synth": {
       "role": "avoid_embedding",
-      "description": "Exact graph tasks reused verbatim from the synthetic v1 graph_control class (regression control for the shared resolver; must not regress on rust/python).",
+      "description": "Exact graph tasks derived from the synthetic v1 graph_control class with deterministic natural-language question frames (regression control for the shared resolver; must not regress on rust/python).",
       "ids": [
         "r106",
         "r107",

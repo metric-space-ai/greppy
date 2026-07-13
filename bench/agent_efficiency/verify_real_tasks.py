@@ -238,9 +238,9 @@ def main() -> int:
                   f"{V1_SOURCE_CLASS[cls]}")
             reused = {k: v for k, v in t.items()
                       if k not in ("id", "class", "source_id")}
-            want = {k: v for k, v in src.items() if k != "id"}
+            want = gen.control_payload(src, cls)
             check(reused == want,
-                  f"{tid}: payload not verbatim v1 task {sid}")
+                  f"{tid}: payload does not reproduce from v1 task {sid}")
         else:
             fail(f"{tid}: unknown class {cls!r}")
 

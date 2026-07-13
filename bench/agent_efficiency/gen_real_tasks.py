@@ -30,8 +30,9 @@ Task mix (denominators stay open until user sign-off):
   research_multihop    ~15  impact / chain questions on gate-passing targets
   literal_control      <=15 reused verbatim from v1 tasks.json (class
                             literal_control has only 9 ids -> all 9)
-  graph_control_synth  ~10  reused verbatim from v1 graph_control, evenly
-                            spaced over sorted ids
+  graph_control_synth  ~10  reused from v1 graph_control with a deterministic
+                            natural-language question frame, evenly spaced
+                            over sorted ids
 
 Usage:
     python3 bench/agent_efficiency/gen_real_tasks.py
@@ -681,6 +682,23 @@ def _frame_pick(frames: list[str], repo: str, symbol: str) -> str:
     return frames[h % len(frames)]
 
 
+def control_payload(source: dict, task_class: str) -> dict:
+    """Derive a control payload exactly as emitted by ``build``."""
+    reused = {key: value for key, value in source.items() if key != "id"}
+    if task_class != "graph_control_synth":
+        return reused
+    check = reused.get("check", {})
+    if check.get("kind") == "who_calls" and check.get("symbol"):
+        reused["q"] = _frame_pick(
+            GRAPH_FRAMES, "synth", check["symbol"]
+        ).format(name=check["symbol"])
+    elif check.get("kind") == "path" and check.get("frm") and check.get("to"):
+        reused["q"] = _frame_pick(
+            CHAIN_FRAMES, "synth", f"{check['frm']}->{check['to']}"
+        ).format(frm=check["frm"], to=check["to"])
+    return reused
+
+
 def _graph_question(repo: str, t: dict) -> str:
     owner = t.get("filters", {}).get("owner_class")
     name = (
@@ -935,23 +953,13 @@ def build() -> dict:
         for sid in src_ids:
             tid = next_id()
             src = v1_by_id[sid]
-            reused = {k: v for k, v in src.items() if k != "id"}
             # v3 natural phrasing also applies to the synthetic graph
             # controls ("Who calls X? List the calling functions." is the
             # same command-shaped voice the real classes dropped). Ground
             # truth / checks stay verbatim; literal_control keeps its v1
             # wording (already how a user types a literal lookup, and it is
             # the grep-favoring control).
-            if cls == "graph_control_synth":
-                chk = reused.get("check", {})
-                if chk.get("kind") == "who_calls" and chk.get("symbol"):
-                    reused["q"] = _frame_pick(
-                        GRAPH_FRAMES, "synth", chk["symbol"]
-                    ).format(name=chk["symbol"])
-                elif chk.get("kind") == "path" and chk.get("frm") and chk.get("to"):
-                    reused["q"] = _frame_pick(
-                        CHAIN_FRAMES, "synth", f"{chk['frm']}->{chk['to']}"
-                    ).format(frm=chk["frm"], to=chk["to"])
+            reused = control_payload(src, cls)
             tasks.append({"id": tid, "class": cls, "source_id": sid, **reused})
             class_ids[cls].append(tid)
 
@@ -959,7 +967,7 @@ def build() -> dict:
         "schema_version": 1,
         "purpose": (
             "Machine-readable corpus-v2 router/regression classes for the "
-            "real-repo agent benchmark (serde/flask/gson/zod) plus reused "
+            "six-repository real-code agent benchmark plus deterministic "
             "synthetic v1 controls."
         ),
         "source_evidence": [
@@ -967,7 +975,6 @@ def build() -> dict:
             "bench/agent_efficiency/realcorpus/MANIFEST.json",
             "bench/agent_efficiency/tasks.json",
             "bench/agent_efficiency/task_classes.json",
-            "greppy-10x/bench/agent_efficiency/REALCORPUS_TASKGEN_SPEC.md",
         ],
         "generator": (
             "bench/agent_efficiency/gen_real_tasks.py -- deterministic "
@@ -1043,8 +1050,9 @@ def build() -> dict:
             "graph_control_synth": {
                 "role": "avoid_embedding",
                 "description": (
-                    "Exact graph tasks reused verbatim from the synthetic v1 "
-                    "graph_control class (regression control for the shared "
+                    "Exact graph tasks derived from the synthetic v1 "
+                    "graph_control class with deterministic natural-language "
+                    "question frames (regression control for the shared "
                     "resolver; must not regress on rust/python)."
                 ),
                 "ids": class_ids["graph_control_synth"],

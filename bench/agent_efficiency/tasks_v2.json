@@ -2482,7 +2482,7 @@
     "repo": "rust_medium",
     "lang": "rust",
     "type": "locate",
-    "q": "Who calls the function compute_checksum? List the calling functions.",
+    "q": "I'm reviewing a PR that touches `compute_checksum`. Which callers could be affected?",
     "ground_truth": "compute_checksum is called by merge_checksums, by normalize_record, and by every process_svcNN service function (74 call sites total).",
     "check": {
       "kind": "who_calls",
@@ -2502,7 +2502,7 @@
     "repo": "rust_medium",
     "lang": "rust",
     "type": "research",
-    "q": "Trace from run_pipeline to clamp_value. Give the path of functions.",
+    "q": "does `run_pipeline` ever end up reaching `clamp_value`? How?",
     "ground_truth": "run_pipeline -> process_svcNN -> normalize_record -> clamp_value.",
     "check": {
       "kind": "path",
@@ -2517,7 +2517,7 @@
     "repo": "python_large",
     "lang": "python",
     "type": "research",
-    "q": "Trace from run_pipeline to validate_amount.",
+    "q": "somehow `run_pipeline` influences what `validate_amount` does. Can you explain the connection through the code?",
     "ground_truth": "run_pipeline -> process_svcNNN -> post_entry -> to_minor_units -> validate_amount.",
     "check": {
       "kind": "path",
@@ -2532,7 +2532,7 @@
     "repo": "java_medium",
     "lang": "java",
     "type": "locate",
-    "q": "Who calls computeChecksum? List the calling methods.",
+    "q": "is `computeChecksum` dead code, or is it still used somewhere?",
     "ground_truth": "computeChecksum is called by normalizeRecord and by every processSvcNN.",
     "check": {
       "kind": "who_calls",
@@ -2551,7 +2551,7 @@
     "repo": "java_medium",
     "lang": "java",
     "type": "research",
-    "q": "Trace from runPipeline to clampValue.",
+    "q": "I'm debugging something odd: a change in `runPipeline` ends up affecting `clampValue`. How does it get there?",
     "ground_truth": "runPipeline -> processSvcNN -> normalizeRecord -> clampValue.",
     "check": {
       "kind": "path",
@@ -2566,7 +2566,7 @@
     "repo": "js_small",
     "lang": "javascript",
     "type": "research",
-    "q": "What would break inside the pipeline if collect changed? Identify its caller.",
+    "q": "before I refactor `collect`: what depends on it?",
     "ground_truth": "runPipeline depends on collect; it is the only in-file caller.",
     "check": {
       "kind": "who_calls",
@@ -2584,7 +2584,7 @@
     "repo": "rust_medium",
     "lang": "rust",
     "type": "locate",
-    "q": "Who calls process_svc09? Name the caller and its file.",
+    "q": "I want to change the signature of `process_svc09` — what do I need to touch?",
     "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc09.",
     "check": {
       "kind": "who_calls",
@@ -2602,7 +2602,7 @@
     "repo": "python_large",
     "lang": "python",
     "type": "locate",
-    "q": "Who calls process_svc005? Name the caller.",
+    "q": "is `process_svc005` dead code, or is it still used somewhere?",
     "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc005.",
     "check": {
       "kind": "who_calls",
@@ -2620,7 +2620,7 @@
     "repo": "java_medium",
     "lang": "java",
     "type": "locate",
-    "q": "Who calls processSvc19? Name the calling method.",
+    "q": "I need to deprecate `processSvc19`. What still calls it?",
     "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc19.",
     "check": {
       "kind": "who_calls",
@@ -2638,7 +2638,7 @@
     "repo": "go_small",
     "lang": "go",
     "type": "locate",
-    "q": "Who calls ProcessSvc07?",
+    "q": "before I refactor `ProcessSvc07`: what depends on it?",
     "ground_truth": "RunPipeline (app/pipeline.go) calls ProcessSvc07.",
     "check": {
       "kind": "who_calls",
