@@ -27,8 +27,11 @@ const DEFAULT_EMBED_BATCH: usize = 16;
 const EMBED_BATCH_ENV: &str = "GREPPY_EMBED_BATCH";
 
 fn embed_batch_size() -> usize {
-    std::env::var(EMBED_BATCH_ENV)
-        .ok()
+    parse_embed_batch_size(std::env::var(EMBED_BATCH_ENV).ok().as_deref())
+}
+
+fn parse_embed_batch_size(value: Option<&str>) -> usize {
+    value
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_EMBED_BATCH)
@@ -251,6 +254,7 @@ pub fn index_code_embeddings_for_project(
                 pending.push(PendingDoc {
                     node: node.clone(),
                     title: title.clone(),
+                    prompt_token_len: provider.document_token_len(Some(&title), &chunk.text)?,
                     chunk,
                 });
                 if pending.len() >= batch_size {
@@ -292,6 +296,7 @@ pub fn index_code_embeddings_for_project(
 struct PendingDoc {
     node: greppy_store::Node,
     title: String,
+    prompt_token_len: usize,
     chunk: EmbeddingChunk,
 }
 
@@ -309,12 +314,14 @@ struct FlushEmbeddingBatchReport {
     failed: bool,
 }
 
-/// Embed every buffered document in `pending` in one batched inference call and
-/// upsert the resulting vectors, then empty the buffer.
+/// Embed every buffered document in `pending` in length-bucketed inference calls
+/// and upsert the resulting vectors, then empty the buffer.
 ///
 /// This preserves the exact per-node upsert fields of the old serial path — the
-/// only change is that the `vector` for each node comes from a single batched
-/// forward pass instead of `pending.len()` separate ones.
+/// only change is that each `vector` comes from a batch whose prompt lengths are
+/// in the same power-of-two range. The pending window remains capped by the
+/// configured batch size, so bucketing does not allow memory to grow with the
+/// number of token-length ranges.
 fn flush_embedding_batch(
     store: &mut Store,
     provider: &mut dyn CodeEmbeddingProvider,
@@ -324,6 +331,37 @@ fn flush_embedding_batch(
     if pending.is_empty() {
         return Ok(FlushEmbeddingBatchReport::default());
     }
+
+    pending.sort_by_key(|doc| prompt_token_length_bucket(doc.prompt_token_len));
+    let mut report = FlushEmbeddingBatchReport::default();
+    while !pending.is_empty() {
+        let bucket = prompt_token_length_bucket(pending[0].prompt_token_len);
+        let bucket_len = pending
+            .iter()
+            .take_while(|doc| prompt_token_length_bucket(doc.prompt_token_len) == bucket)
+            .count();
+        let mut bucket_docs = pending.drain(..bucket_len).collect::<Vec<_>>();
+        let bucket_report =
+            flush_same_length_bucket(store, provider, graph_generation, &mut bucket_docs)?;
+        report.written += bucket_report.written;
+        report.failed |= bucket_report.failed;
+    }
+    Ok(report)
+}
+
+fn prompt_token_length_bucket(token_len: usize) -> usize {
+    token_len
+        .max(1)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+}
+
+fn flush_same_length_bucket(
+    store: &mut Store,
+    provider: &mut dyn CodeEmbeddingProvider,
+    graph_generation: u64,
+    pending: &mut Vec<PendingDoc>,
+) -> Result<FlushEmbeddingBatchReport> {
     let docs = pending
         .iter()
         .map(|doc| (Some(doc.title.as_str()), doc.chunk.text.as_str()))
@@ -1666,11 +1704,12 @@ pub fn next_definition() {
     }
 
     /// Provider whose per-document vector is a pure, unique function of the
-    /// span content, and that records the size of every batch call. Lets a
-    /// test prove (a) batching is actually happening and (b) each node still
-    /// receives the vector for its own content regardless of batch boundaries.
+    /// span content, and that records the size and prompt lengths of every
+    /// batch call. Lets tests prove batching behavior while checking that each
+    /// node still receives the vector for its own content.
     struct RecordingProvider {
         batch_sizes: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+        batch_prompt_lengths: std::rc::Rc<std::cell::RefCell<Vec<Vec<usize>>>>,
     }
 
     fn content_vector(content: &str) -> Vec<f32> {
@@ -1683,6 +1722,13 @@ pub fn next_definition() {
         vec![(h & 0xffff) as f32, (h >> 16) as f32, content.len() as f32]
     }
 
+    fn test_prompt_token_len(title: Option<&str>, content: &str) -> usize {
+        EmbedTask::document_with_title(title, content)
+            .split_whitespace()
+            .count()
+            .max(1)
+    }
+
     impl CodeEmbeddingProvider for RecordingProvider {
         fn model_id(&self) -> &str {
             "test-code-embedder"
@@ -1693,15 +1739,27 @@ pub fn next_definition() {
         fn task_profile(&self) -> &str {
             "embeddinggemma_code_retrieval"
         }
-        fn embed_code_document(&mut self, _title: Option<&str>, content: &str) -> Result<Vec<f32>> {
+        fn embed_code_document(&mut self, title: Option<&str>, content: &str) -> Result<Vec<f32>> {
             self.batch_sizes.borrow_mut().push(1);
+            self.batch_prompt_lengths
+                .borrow_mut()
+                .push(vec![test_prompt_token_len(title, content)]);
             Ok(content_vector(content))
         }
         // Override so the indexer's batched path is exercised, recording the
         // real batch size and returning a per-document vector in input order.
         fn embed_code_documents(&mut self, docs: &[(Option<&str>, &str)]) -> Result<Vec<Vec<f32>>> {
             self.batch_sizes.borrow_mut().push(docs.len());
+            self.batch_prompt_lengths.borrow_mut().push(
+                docs.iter()
+                    .map(|(title, content)| test_prompt_token_len(*title, content))
+                    .collect(),
+            );
             Ok(docs.iter().map(|(_, c)| content_vector(c)).collect())
+        }
+
+        fn document_token_len(&self, title: Option<&str>, content: &str) -> Result<usize> {
+            Ok(test_prompt_token_len(title, content))
         }
     }
 
@@ -1736,6 +1794,7 @@ pub fn next_definition() {
         let batch_sizes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut provider = RecordingProvider {
             batch_sizes: batch_sizes.clone(),
+            batch_prompt_lengths: Default::default(),
         };
         let report = index_code_embeddings_for_project(
             &mut store,
@@ -1783,22 +1842,118 @@ pub fn next_definition() {
         }
     }
 
+    #[test]
+    fn dissimilar_prompt_lengths_use_separate_batches_and_keep_node_vectors() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut src = String::new();
+        let mut spans = Vec::new();
+        for i in 0..DEFAULT_EMBED_BATCH {
+            let start_line = src.lines().count() as i64 + 1;
+            src.push_str(&format!("pub fn varied_{i}() {{\n"));
+            let body_lines = if i % 2 == 0 { 1 } else { 32 };
+            for line in 0..body_lines {
+                src.push_str(&format!("    let value_{i}_{line} = token_{i}_{line};\n"));
+            }
+            src.push_str("}\n\n");
+            let end_line = src.lines().count() as i64 - 1;
+            spans.push((i, start_line, end_line));
+        }
+        std::fs::write(root.join("src/lib.rs"), &src).unwrap();
+
+        let mut store = store_with_project(&root);
+        for &(i, start_line, end_line) in &spans {
+            insert_node(
+                &mut store,
+                &format!("p.varied_{i}"),
+                &format!("varied_{i}"),
+                "Function",
+                "src/lib.rs",
+                start_line,
+                end_line,
+            );
+        }
+
+        let batch_sizes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let batch_prompt_lengths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut provider = RecordingProvider {
+            batch_sizes: batch_sizes.clone(),
+            batch_prompt_lengths: batch_prompt_lengths.clone(),
+        };
+        let report = index_code_embeddings_for_project(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            EmbeddingIndexOptions::for_generation(8),
+        )
+        .unwrap();
+        assert_eq!(report.nodes_embedded, DEFAULT_EMBED_BATCH);
+
+        let batches = batch_prompt_lengths.borrow();
+        assert_eq!(
+            batches.iter().map(Vec::len).sum::<usize>(),
+            DEFAULT_EMBED_BATCH
+        );
+        assert!(
+            batches.len() >= 2,
+            "expected separate length buckets: {batches:?}"
+        );
+        for lengths in batches.iter() {
+            let bucket = prompt_token_length_bucket(lengths[0]);
+            assert!(
+                lengths
+                    .iter()
+                    .all(|&length| prompt_token_length_bucket(length) == bucket),
+                "one forward mixed prompt-length buckets: {lengths:?}"
+            );
+        }
+        let distinct_buckets = batches
+            .iter()
+            .flat_map(|lengths| lengths.iter().copied())
+            .map(prompt_token_length_bucket)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            distinct_buckets.len() >= 2,
+            "test inputs were not sufficiently dissimilar: {batches:?}"
+        );
+
+        for &(i, start_line, end_line) in &spans {
+            let span = source_span(&src, start_line, end_line).unwrap();
+            let hits = store
+                .vector_search_exact(
+                    &content_vector(&span),
+                    &VectorSearchQuery {
+                        project: "p",
+                        model_id: "test-code-embedder",
+                        prompt_version: "test-prompt-v1",
+                        task: "embeddinggemma_code_retrieval",
+                        graph_generation: Some(8),
+                        file_path: None,
+                        limit: 1,
+                        min_score: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(hits[0].embedding.qualified_name, format!("p.varied_{i}"));
+        }
+    }
+
     /// The `GREPPY_EMBED_BATCH` override is honored and clamps to >= 1.
     #[test]
     fn embed_batch_env_override_is_parsed_and_clamped() {
-        let key = super::EMBED_BATCH_ENV;
-        let prev = std::env::var_os(key);
-        std::env::set_var(key, "4");
-        assert_eq!(super::embed_batch_size(), 4);
-        std::env::set_var(key, "0");
-        assert_eq!(super::embed_batch_size(), super::DEFAULT_EMBED_BATCH);
-        std::env::set_var(key, "garbage");
-        assert_eq!(super::embed_batch_size(), super::DEFAULT_EMBED_BATCH);
-        std::env::remove_var(key);
-        assert_eq!(super::embed_batch_size(), super::DEFAULT_EMBED_BATCH);
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
+        assert_eq!(super::parse_embed_batch_size(Some("4")), 4);
+        assert_eq!(
+            super::parse_embed_batch_size(Some("0")),
+            super::DEFAULT_EMBED_BATCH
+        );
+        assert_eq!(
+            super::parse_embed_batch_size(Some("garbage")),
+            super::DEFAULT_EMBED_BATCH
+        );
+        assert_eq!(
+            super::parse_embed_batch_size(None),
+            super::DEFAULT_EMBED_BATCH
+        );
     }
 }
