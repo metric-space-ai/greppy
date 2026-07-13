@@ -506,7 +506,7 @@ impl CudaQwen35Model {
             if finished {
                 break;
             }
-            mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
+            mtp_fallback = crate::mtp_should_fallback(cycles, accepted_total);
 
             if accepted == draft_tokens.len() {
                 let stage = perf.begin_stage();
@@ -3721,7 +3721,7 @@ const CONV_KERNEL: usize = 4;
 const MMQ_FIXUP_SCRATCH_BYTES: usize = 128 * 128 * 128 * std::mem::size_of::<f32>();
 const CUDA_PREFILL_BATCH_ROWS: usize = 512;
 const CUDA_MMQ_ROW_TILE: usize = 128;
-const MTP_DRAFT_MAX: usize = 2;
+const MTP_DRAFT_MAX: usize = 6;
 
 fn mmq_activation_layout(dtype: GgmlDType) -> Result<u8> {
     match dtype {

@@ -131,10 +131,13 @@ pub(crate) enum MtpPerfStage {
     MtpCommit,
 }
 
-const MTP_FALLBACK_MIN_DRAFTS: usize = 2;
+const MTP_FALLBACK_MIN_CYCLES: usize = 2;
 
-pub(crate) fn mtp_should_fallback(drafted: usize, accepted: usize) -> bool {
-    drafted >= MTP_FALLBACK_MIN_DRAFTS && accepted.saturating_mul(4) <= drafted.saturating_mul(3)
+pub(crate) fn mtp_should_fallback(cycles: usize, accepted: usize) -> bool {
+    // Speculation pays while it yields > 1.5 accepted draft tokens per verify
+    // cycle (equivalent to the previous 75%-of-2-drafts rule, but independent
+    // of the draft window so 6-token chains are judged by net win, not ratio).
+    cycles >= MTP_FALLBACK_MIN_CYCLES && accepted.saturating_mul(2) <= cycles.saturating_mul(3)
 }
 
 impl MtpPerfTimer {
@@ -269,11 +272,16 @@ impl From<greppy_embed_native::Error> for Error {
 mod mtp_tests {
     #[test]
     fn weak_draft_falls_back_only_after_evidence() {
+        // below the evidence floor: never fall back after a single cycle
         assert!(!super::mtp_should_fallback(1, 0));
-        assert!(super::mtp_should_fallback(2, 1));
-        assert!(super::mtp_should_fallback(4, 2));
-        assert!(super::mtp_should_fallback(4, 3));
-        assert!(!super::mtp_should_fallback(4, 4));
+        // <= 1.5 accepted per cycle -> fall back
+        assert!(super::mtp_should_fallback(2, 3));
+        assert!(super::mtp_should_fallback(4, 6));
+        // > 1.5 accepted per cycle -> keep speculating
+        assert!(!super::mtp_should_fallback(2, 4));
+        assert!(!super::mtp_should_fallback(4, 7));
+        // 6-token chains with modest per-token acceptance still pay off
+        assert!(!super::mtp_should_fallback(10, 25));
     }
 
     #[test]

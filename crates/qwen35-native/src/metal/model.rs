@@ -98,7 +98,7 @@ struct MetalMtpWorkspace {
 }
 
 const METAL_PREFILL_BATCH_ROWS: usize = 512;
-const MTP_DRAFT_MAX: usize = 2;
+const MTP_DRAFT_MAX: usize = 6;
 
 impl MetalQwen35Model {
     pub fn from_gguf(
@@ -450,7 +450,7 @@ impl MetalQwen35Model {
             if finished {
                 break;
             }
-            mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
+            mtp_fallback = crate::mtp_should_fallback(cycles, accepted_total);
 
             if accepted == draft_tokens.len() {
                 let stage = perf.begin_stage();

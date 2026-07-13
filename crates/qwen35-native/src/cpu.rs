@@ -26,7 +26,7 @@ const LINEAR_HEADS: usize = 16;
 const LINEAR_HEAD_DIM: usize = 128;
 const CONV_KERNEL: usize = 4;
 const CONV_CHANNEL_BLOCK: usize = 1024;
-const MTP_DRAFT_MAX: usize = 2;
+const MTP_DRAFT_MAX: usize = 6;
 
 pub(crate) struct CpuQwen35Model {
     inventory: Qwen35Inventory,
@@ -612,7 +612,7 @@ impl CpuQwen35Model {
             if finished {
                 break;
             }
-            mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
+            mtp_fallback = crate::mtp_should_fallback(cycles, accepted_total);
 
             if accepted == draft_tokens.len() {
                 std::mem::swap(&mut target_state, &mut speculative_target_state);
