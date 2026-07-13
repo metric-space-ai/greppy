@@ -1113,6 +1113,15 @@ fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn no_daemon_error(error: &std::io::Error) -> bool {
+    // ENOTSOCK: a stale REGULAR file occupies the endpoint path. macOS/BSD
+    // report ENOTSOCK from connect(2) in that case (Linux reports
+    // ECONNREFUSED, already classified below). Treating it as anything but
+    // "no daemon" would permanently brick the endpoint: only the no-daemon
+    // classification triggers a spawn, and only the spawned owner repairs
+    // the stale path (TransportListener::bind removes dead endpoint files).
+    if error.raw_os_error() == Some(libc::ENOTSOCK) {
+        return true;
+    }
     matches!(
         error.kind(),
         std::io::ErrorKind::NotFound
@@ -1733,6 +1742,30 @@ mod tests {
         assert!(!retryable_capacity_response(
             &serde_json::json!({"error": "model load failed"})
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_non_socket_endpoint_classifies_as_no_daemon() {
+        // A regular file at the endpoint path must classify as "no daemon"
+        // so the client attempts a spawn and the new owner repairs the path
+        // (macOS connect(2) reports ENOTSOCK there; Linux ECONNREFUSED).
+        // Anything else deadlocks the endpoint forever: no spawn, no repair.
+        let endpoint = Endpoint::for_identity(
+            "stale-file-client-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        std::fs::write(endpoint.address(), b"stale").unwrap();
+        let outcome = request(
+            &endpoint,
+            serde_json::json!({"op": "status"}),
+            Duration::from_millis(200),
+            4096,
+            4096,
+        );
+        std::fs::remove_file(endpoint.address()).unwrap();
+        assert_eq!(outcome, RequestOutcome::NoDaemon);
     }
 
     #[cfg(unix)]
