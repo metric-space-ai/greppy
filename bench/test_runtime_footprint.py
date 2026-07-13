@@ -142,7 +142,7 @@ if command == "doctor":
         },
     }
     print(json.dumps(value))
-    raise SystemExit(0 if healthy else 1)
+    raise SystemExit(0 if healthy else (73 if indexed else 1))
 
 if command == "index":
     marker.write_text("ok", encoding="ascii")

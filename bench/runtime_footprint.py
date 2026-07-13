@@ -831,7 +831,7 @@ def measure(config: Config) -> dict[str, Any]:
             phase="doctor_after_index",
             env=env,
             timeout_seconds=config.timeout_seconds,
-            accepted_exit_codes=(0, 1),
+            accepted_exit_codes=(0, 1, 73),
             publication_replacements=publication_replacements,
         )
         command_records.append(after_index_run.record)
@@ -861,7 +861,7 @@ def measure(config: Config) -> dict[str, Any]:
                 phase="embedding_wait",
                 env=env,
                 timeout_seconds=min(config.timeout_seconds, max(remaining, 0.001)),
-                accepted_exit_codes=(0, 1),
+                accepted_exit_codes=(0, 1, 73),
                 iteration=embedding_wait_polls,
                 publication_replacements=publication_replacements,
             )
@@ -1055,7 +1055,7 @@ def measure(config: Config) -> dict[str, Any]:
                     phase="cleanup_doctor",
                     env=env,
                     timeout_seconds=min(config.timeout_seconds, 5.0),
-                    accepted_exit_codes=(0, 1),
+                    accepted_exit_codes=(0, 1, 73),
                     publication_replacements=publication_replacements,
                 )
                 cleanup_json = _json_object(cleanup_run.stdout, "cleanup_doctor")
