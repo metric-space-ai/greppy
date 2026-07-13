@@ -126,7 +126,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: agent benchmark precision grader
-        run: python3 -m unittest bench/agent_efficiency/test_grade_answers.py
+        run: python3 -m unittest discover -s bench/agent_efficiency -p 'test_*.py' -v
 
       - name: paired coding benchmark harness
         run: |

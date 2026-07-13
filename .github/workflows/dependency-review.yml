@@ -1,0 +1,22 @@
+name: Dependency review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Reject vulnerable dependency changes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v4.3.1, pinned to immutable source.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # actions/dependency-review-action v4, pinned to immutable source.
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48
+        with:
+          fail-on-severity: high

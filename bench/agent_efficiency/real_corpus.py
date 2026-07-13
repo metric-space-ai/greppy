@@ -146,7 +146,6 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -176,7 +175,7 @@ REPOS = {
     },
     "gson": {
         "url": "https://github.com/google/gson",
-        "commit": "c9f3fd55",  # short pin; resolved to full sha at setup
+        "commit": "c9f3fd55854a743b66f857ace3c7b268ea3e2ef7",
         "lang": "java",
         "license": "Apache-2.0",
         "local_seed": None,
@@ -184,7 +183,7 @@ REPOS = {
     },
     "zod": {
         "url": "https://github.com/colinhacks/zod",
-        "commit": "912f0f51",  # short pin; resolved to full sha at setup
+        "commit": "912f0f51b0ced654d0069741e7160834dca742ee",
         "lang": "ts",
         "license": "MIT",
         "local_seed": None,
@@ -193,7 +192,7 @@ REPOS = {
     # ---- larger-repo expansion: optional local seed via GREPPY_BENCH_SEED_DIR ----
     "tokio": {
         "url": "https://github.com/tokio-rs/tokio",
-        "commit": "c637f6e",
+        "commit": "c637f6e73d06f36d933cc3edaf45111c06b79c18",
         "lang": "rust",
         "license": "MIT",
         "local_seed": (Path(_SEED_DIR) / "tokio") if _SEED_DIR else None,
@@ -201,7 +200,7 @@ REPOS = {
     },
     "django": {
         "url": "https://github.com/django/django",
-        "commit": "318a316",
+        "commit": "318a316a4c86a65bede68144f9546a6056d91379",
         "lang": "python",
         "license": "BSD-3-Clause",
         "local_seed": (Path(_SEED_DIR) / "django") if _SEED_DIR else None,
@@ -209,7 +208,7 @@ REPOS = {
     },
     "hugo": {
         "url": "https://github.com/gohugoio/hugo",
-        "commit": "dfb35dc",
+        "commit": "dfb35dcd7a9ab9a6d8b6c0829c312f2e4d5f8b0d",
         "lang": "go",
         "license": "Apache-2.0",
         "local_seed": (Path(_SEED_DIR) / "hugo") if _SEED_DIR else None,
@@ -217,7 +216,7 @@ REPOS = {
     },
     "elasticsearch": {
         "url": "https://github.com/elastic/elasticsearch",
-        "commit": "fc85b9c0",
+        "commit": "fc85b9c0492265a20e90e18db4f496c5e2e4bf4a",
         "lang": "java",
         "license": "Elastic-2.0 / SSPL-1.0",
         "local_seed": (Path(_SEED_DIR) / "elasticsearch") if _SEED_DIR else None,
@@ -846,18 +845,6 @@ def save_manifest(m: dict):
     MANIFEST.write_text(json.dumps(m, indent=2, sort_keys=True) + "\n")
 
 
-def resolve_full_sha(url: str, short: str) -> str:
-    """Resolve a short sha via the GitHub API (fetch-by-sha needs 40 chars)."""
-    if len(short) == 40:
-        return short
-    owner_repo = url.rstrip("/").split("github.com/")[-1]
-    api = f"https://api.github.com/repos/{owner_repo}/commits/{short}"
-    req = urllib.request.Request(api, headers={"User-Agent": "greppy-bench",
-                                               "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())["sha"]
-
-
 # ------------------------------------------------------------------- setup
 
 def cmd_setup(repos):
@@ -908,7 +895,9 @@ def _clone(name, spec, dest: Path) -> str:
             return head
         print(f"[setup] {name}: local seed at {head[:12]} != pin "
               f"{spec['commit']} — falling back to network")
-    full = resolve_full_sha(spec["url"], spec["commit"])
+    full = spec["commit"]
+    if not re.fullmatch(r"[0-9a-f]{40}", full):
+        raise RuntimeError(f"{name}: benchmark commit must be a full SHA-1")
     print(f"[setup] {name}: shallow-fetching {full[:12]} from {spec['url']}")
     dest.mkdir(parents=True)
     sh(["git", "init", "-q", str(dest)])
