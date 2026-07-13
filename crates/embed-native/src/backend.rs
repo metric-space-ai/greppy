@@ -411,7 +411,7 @@ fn system_memory() -> (Option<u64>, Option<u64>) {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn probe_metal() -> BackendProbe {
-    match crate::metal::ffi::Device::default_system() {
+    match crate::metal::ffi::global_device() {
         Some(device) if device.runtime_ready() => BackendProbe {
             backend: BackendKind::Metal,
             backend_id: "greppy-metal-q4k-v1".into(),

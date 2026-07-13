@@ -1,9 +1,9 @@
 //! Feature-gated Metal backend plumbing.
 //!
-//! This module vendors the generic ggml Metal host dispatch surface from CTOX
-//! and adapts it to `greppy-embed-native`. The full Gemma graph is not wired
-//! here yet; these pieces are the runtime, kargs, tensor descriptors, and op
-//! dispatchers M4 needs.
+//! This module adapts the vendored ggml Metal kernels to
+//! `greppy-embed-native`. It contains the runtime, argument layouts, tensor
+//! descriptors, operation dispatch, weights, and complete Gemma graph used on
+//! supported Apple-Silicon devices.
 
 pub mod errors;
 pub mod ffi;

@@ -24,12 +24,15 @@
 //!
 //! `build.rs` sets the env var `GREPPY_EMBED_NATIVE_METALLIB` to the absolute
 //! path of the compiled metallib in `$OUT_DIR`. We pull it into the
-//! binary at compile time via `include_bytes!` so the installed CTOX
+//! binary at compile time via `include_bytes!` so the installed Greppy
 //! doesn't need a companion file on disk — the shaders ship with the
 //! executable.
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -192,8 +195,13 @@ impl Device {
 
     pub fn build_info(&self) -> String {
         format!(
-            "embedded-metallib;metal4={}",
-            if self.supports_metal4 { "yes" } else { "no" }
+            "embedded-metallib;metal4={};mul_mm={}",
+            if self.supports_metal4 { "yes" } else { "no" },
+            if self.uses_tensor_mul_mm() {
+                "tensor"
+            } else {
+                "simdgroup"
+            }
         )
     }
 
@@ -229,9 +237,13 @@ impl Device {
             capabilities: vec![
                 "unified-memory".into(),
                 "simdgroup".into(),
-                self.supports_metal4
-                    .then_some("tensor-ops".into())
-                    .unwrap_or_else(|| "classic-pipelines".into()),
+                if self.uses_tensor_mul_mm() {
+                    "tensor-ops".into()
+                } else if self.supports_metal4 {
+                    "simdgroup-fallback".into()
+                } else {
+                    "classic-pipelines".into()
+                },
             ],
             rejection_reason: None,
         }
@@ -407,30 +419,50 @@ fn load_library_from_blob(
     // to a temp file and use `newLibraryWithURL:error:`. The cost is
     // a few ms at startup — irrelevant next to model load.
     let seq = METALLIB_LOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let tmp = std::env::temp_dir().join(format!(
-        "greppy_embed_native_{}_{}_{}.metallib",
-        flavor,
+        "greppy_embed_native_{flavor}_{}_{}_{}.metallib",
         std::process::id(),
         seq,
+        nonce,
     ));
-    if let Err(e) = std::fs::write(&tmp, blob) {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = match options.open(&tmp) {
+        Ok(file) => file,
+        Err(e) => {
+            set_last_error(format!(
+                "failed to create private temp metallib {}: {e}",
+                tmp.display()
+            ));
+            return None;
+        }
+    };
+    if let Err(e) = file.write_all(blob).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
         set_last_error(format!(
-            "failed to write temp metallib to {}: {e}",
+            "failed to write private temp metallib {}: {e}",
             tmp.display()
         ));
         return None;
     }
+    drop(file);
     let url = unsafe {
         objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(
             tmp.to_string_lossy().as_ref(),
         ))
     };
-    let lib = unsafe { mtl.newLibraryWithURL_error(&url) }
-        .map_err(|e| set_last_error(format!("newLibraryWithURL_error: {e:?}")))
-        .ok()?;
-    // Best-effort cleanup; not fatal if it fails.
+    let result = unsafe { mtl.newLibraryWithURL_error(&url) };
+    // Cleanup runs on both success and failure. The file is mode 0600 and was
+    // created with O_EXCL, so another local user cannot replace the payload.
     let _ = std::fs::remove_file(&tmp);
-    Some(lib)
+    result
+        .map_err(|e| set_last_error(format!("newLibraryWithURL_error: {e:?}")))
+        .ok()
 }
 
 #[cfg(embed_native_has_tensor_metallib)]
@@ -797,6 +829,29 @@ static GLOBAL_DEVICE: OnceLock<Option<Device>> = OnceLock::new();
 /// Returns `None` if the Metal stack is unavailable.
 pub fn global_device() -> Option<&'static Device> {
     GLOBAL_DEVICE.get_or_init(Device::default_system).as_ref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_info_reports_the_loaded_mul_mm_path() {
+        let Some(device) = global_device() else {
+            return;
+        };
+        let info = device.device_info();
+        assert_eq!(
+            info.capabilities.iter().any(|item| item == "tensor-ops"),
+            device.uses_tensor_mul_mm()
+        );
+        let expected = if device.uses_tensor_mul_mm() {
+            "mul_mm=tensor"
+        } else {
+            "mul_mm=simdgroup"
+        };
+        assert!(device.build_info().contains(expected));
+    }
 }
 
 // ─── Tiny dead-code link to silence unused-warning ──────────────────

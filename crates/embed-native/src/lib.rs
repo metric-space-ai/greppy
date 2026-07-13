@@ -1,19 +1,19 @@
 //! Candle-free native inference of EmbeddingGemma-300M (Gemma3, Q4_K GGUF).
 //!
 //! Goal: replace the `candle-core`/`candle-nn` dependency entirely (0 candle
-//! crates in Cargo.lock) with a lean, single-model native engine. Source-reuse
-//! from candle (Apache/MIT) and ctox is allowed; a candle *dependency* is not.
+//! crates in Cargo.lock) with a lean, single-model native engine. Compatible
+//! Apache/MIT kernel source may be ported with provenance; a Candle *runtime
+//! dependency* is not part of the product.
 //!
-//! Backends: CPU (M1-M3), then Metal (M4), then CUDA (M5). Every stage is
-//! verified byte-for-byte against candle golden vectors in `testdata/golden/`
-//! (minted by `crates/embeddinggemma/examples/mint_golden.rs` before candle is
-//! removed): `golden_single.json` (token_ids + final embeddings),
+//! Backends: portable/runtime-dispatched CPU, Apple-Silicon Metal, and
+//! Linux/x86_64 CUDA. Every stage is verified against golden vectors in
+//! `testdata/golden/`: `golden_single.json` (token_ids + final embeddings),
 //! `golden_batch.json` (padded batch → mean-pool-over-mask), `golden_stages.json`
 //! (per-stage hidden states: embed_scaled → layer_0..23 → output_norm →
 //! mean_pool → dense2 → dense3 → l2norm).
 //!
-//! See `PORT_PLAN.md` for the ctox reuse inventory (which verified kernels /
-//! harness pieces to import) and the Gemma3 correctness landmines.
+//! Kernel origins, revisions, local changes, and licenses are recorded under
+//! `vendor/` and in the repository's `THIRD_PARTY.md`.
 
 #![deny(rust_2018_idioms)]
 
