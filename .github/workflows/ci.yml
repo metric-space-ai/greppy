@@ -165,6 +165,9 @@ jobs:
   real-assets-link:
     name: real embedded assets (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+      EMBED_NATIVE_TOKENIZER: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
     strategy:
       fail-fast: false
       matrix:
@@ -184,10 +187,15 @@ jobs:
       - name: Build default product binary with real assets
         run: cargo build -p greppy --bin greppy
 
+      - name: Real CPU embedding inference gates
+        run: |
+          cargo test --release -p greppy-embed-native --test dequant_parity -- --nocapture
+          cargo test --release -p greppy-embed-native --test forward_parity -- --nocapture
+          cargo test --release -p greppy-embed-native --test api_contract -- --nocapture
+          cargo test --release -p greppy-embed-native --test tokenizer_parity -- --nocapture
+
       - name: Apple Silicon Metal inference gates
         if: runner.os == 'macOS'
-        env:
-          EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
         run: |
           cargo test -p greppy-embed-native --features metal --lib -- --test-threads=1
           cargo test -p greppy-embed-native --features metal --test metal_kernel_parity
