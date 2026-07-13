@@ -1,0 +1,8 @@
+{
+  "$comment": "Package Identity for the Microsoft Store MSIX submission. The three TODO fields MUST be copied verbatim from Partner Center -> Apps and games -> greppy -> Product management -> Product identity. tools/build_msix.ps1 refuses to build while any TODO remains, unless -AllowPlaceholderIdentity (CI input allow_placeholder_identity) is set for pipeline smoke-tests.",
+  "store_product_id": "9NNRV0BJ550L",
+  "store_listing_url": "https://apps.microsoft.com/detail/9NNRV0BJ550L",
+  "identity_name": "TODO: Partner Center 'Package/Identity/Name' (looks like 12345PublisherName.greppy)",
+  "publisher": "TODO: Partner Center 'Package/Identity/Publisher' (looks like CN=A1B2C3D4-E5F6-...)",
+  "publisher_display_name": "TODO: Partner Center 'Package/Identity/PublisherDisplayName'"
+}

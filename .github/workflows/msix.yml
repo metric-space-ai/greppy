@@ -1,0 +1,98 @@
+name: msix
+
+# Build the UNSIGNED Microsoft Store MSIX package for greppy (Store product
+# 9NNRV0BJ550L). The Store signs the submission itself, so no signing secrets
+# are involved (owner decision WINDOWS_SIGNING_MODE=MICROSOFT_STORE_MSIX, see
+# release.yml). The resulting artifact is uploaded manually to Partner Center;
+# the runbook lives in packaging/msix/README.md.
+#
+# The build FAILS if packaging/msix/identity.json still carries TODO
+# placeholder identity values, unless the allow_placeholder_identity input is
+# set for a pipeline smoke-test (that output can never be submitted).
+#
+# arm64 builds natively on the windows-11-arm GitHub-hosted runner, generally
+# available for public repositories since 2025-08-07:
+# https://github.blog/changelog/2025-08-07-arm64-hosted-runners-for-public-repositories-are-now-generally-available/
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_placeholder_identity:
+        description: >-
+          Smoke-test ONLY: build with fake placeholder Package Identity values
+          while packaging/msix/identity.json still has TODOs. The resulting
+          .msix cannot be submitted to the Microsoft Store.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-msix:
+    name: msix (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows ships CPU-only inference (see release.yml): no CUDA here.
+          - arch: x64
+            os: windows-latest
+            rust_host: x86_64-pc-windows-msvc
+          - arch: arm64
+            os: windows-11-arm
+            rust_host: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Restore model assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
+            crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+            crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
+          key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
+
+      - name: Fetch model assets (release-hosted, sha-pinned)
+        shell: bash
+        run: ./tools/fetch_model_assets.sh
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        # dtolnay/rust-toolchain v1, pinned to an immutable source revision.
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Assert native build host
+        shell: pwsh
+        run: |
+          $rustHost = ((rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value)
+          Write-Host "rustc host: $rustHost"
+          if ($rustHost -ne '${{ matrix.rust_host }}') {
+            throw "expected native host ${{ matrix.rust_host }}, got $rustHost"
+          }
+
+      - name: Build release binary (CPU inference)
+        run: cargo build --locked --release --bin greppy
+
+      - name: Build unsigned MSIX
+        shell: pwsh
+        env:
+          ALLOW_PLACEHOLDER_IDENTITY: ${{ inputs.allow_placeholder_identity && '1' || '' }}
+        run: |
+          $extra = @()
+          if ($env:ALLOW_PLACEHOLDER_IDENTITY) { $extra += '-AllowPlaceholderIdentity' }
+          & ./tools/build_msix.ps1 -Arch '${{ matrix.arch }}' -OutputDir msix-out @extra
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-msix-${{ matrix.arch }}-${{ github.sha }}
+          path: msix-out/*.msix
+          if-no-files-found: error

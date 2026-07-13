@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX AppxManifest TEMPLATE for greppy (Microsoft Store distribution).
+  Rendered by tools/build_msix.ps1 - do not ship this file as-is.
+
+  Placeholders (substituted at build time):
+    @IDENTITY_NAME@     Identity/Name from Partner Center -> Product identity
+                        (packaging/msix/identity.json: identity_name)
+    @PUBLISHER@         Identity/Publisher, always of the form "CN=..."
+                        (packaging/msix/identity.json: publisher)
+    @PUBLISHER_DISPLAY@ PublisherDisplayName from Partner Center
+                        (packaging/msix/identity.json: publisher_display_name)
+    @VERSION@           4-part x.y.z.0 derived from the Cargo workspace version.
+                        The Microsoft Store requires the 4th (revision) part to
+                        be 0 - the Store reserves it for its own use:
+                        https://learn.microsoft.com/en-us/windows/msix/package/app-package-requirements
+    @ARCH@              "x64" or "arm64" (lowercase), must match the packaged
+                        greppy.exe:
+                        https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-identity
+
+  Schema notes for a Store-distributed packaged win32 CONSOLE app (verified
+  against Microsoft Learn, 2026):
+    * Root namespaces: the foundation windows10 namespace plus uap (visual
+      elements), uap5 (windows.appExecutionAlias extension), uap10
+      (Subsystem="console", available since 10.0.19041) and rescap
+      (runFullTrust). Packaged desktop/win32 apps require runFullTrust:
+      https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-manifest
+    * AppExecutionAlias puts "greppy.exe" on PATH for every user after Store
+      install (per-user alias under %LOCALAPPDATA%\Microsoft\WindowsApps):
+      https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/desktop-to-uwp-extensions#start-your-app-by-using-an-alias
+      https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-uap5-executionalias
+    * TargetDeviceFamily is Windows.Desktop only (CLI needs a desktop shell).
+      MinVersion 10.0.19041.0 is the floor for uap10:Subsystem; uap5
+      (AppExecutionAlias) only needs 10.0.17134, so 19041 dominates:
+      https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-application
+    * runFullTrust is a RESTRICTED capability: Partner Center asks for a
+      justification during submission (see packaging/msix/README.md):
+      https://learn.microsoft.com/en-us/windows/uwp/packaging/app-capability-declarations#restricted-capabilities
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+    xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap uap5 uap10 rescap">
+
+  <!-- Identity must byte-match Partner Center -> Product management ->
+       Product identity for Store product 9NNRV0BJ550L, or Store validation
+       rejects the upload. -->
+  <Identity
+      Name="@IDENTITY_NAME@"
+      Publisher="@PUBLISHER@"
+      Version="@VERSION@"
+      ProcessorArchitecture="@ARCH@" />
+
+  <Properties>
+    <DisplayName>greppy</DisplayName>
+    <PublisherDisplayName>@PUBLISHER_DISPLAY@</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Local code navigation for coding agents: deterministic code graph, native semantic search, and byte-exact grep passthrough.</Description>
+  </Properties>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Capabilities>
+    <!-- Required for any packaged win32/desktop process. Store submission
+         must justify it (CLI process, full file-system access to the repos
+         it indexes, spawns child processes for daemon mode). -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <!-- uap10:Subsystem="console" marks the app as a console app so launches
+         attach to the console correctly (10.0.19041+). -->
+    <Application Id="Greppy"
+        Executable="greppy.exe"
+        EntryPoint="Windows.FullTrustApplication"
+        uap10:Subsystem="console">
+      <!-- AppListEntry="none": greppy is a pure CLI - hide the Start-menu
+           tile; users invoke the AppExecutionAlias from a terminal. This is
+           permitted for Store apps; the Store listing must make the CLI
+           usage obvious (see README certification notes). -->
+      <uap:VisualElements
+          DisplayName="greppy"
+          Description="Local code navigation for coding agents: deterministic code graph, native semantic search, and byte-exact grep passthrough."
+          BackgroundColor="transparent"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png"
+          AppListEntry="none" />
+      <Extensions>
+        <!-- Puts greppy.exe on PATH after Store install. -->
+        <uap5:Extension
+            Category="windows.appExecutionAlias"
+            Executable="greppy.exe"
+            EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="greppy.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
