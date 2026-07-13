@@ -376,13 +376,20 @@ jobs:
           test -n "$APPLE_ID" && test -n "$APPLE_TEAM_ID" && test -n "$APPLE_APP_PASSWORD"
           notary_zip="$RUNNER_TEMP/greppy-notary.zip"
           ditto -c -k --keepParent target/release/greppy "$notary_zip"
+          submit_log="$RUNNER_TEMP/notarytool-submit.log"
           xcrun notarytool submit "$notary_zip" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" \
-            --wait
-          xcrun stapler staple target/release/greppy
-          xcrun stapler validate target/release/greppy
+            --wait | tee "$submit_log"
+          grep -q 'status: Accepted' "$submit_log" || {
+            echo '::error::notarization was not Accepted'
+            exit 1
+          }
+          # A bare Mach-O binary cannot carry a stapled ticket (stapler exits 73
+          # on standalone executables - only bundles/dmg/pkg can be stapled;
+          # proven by the first signing dry-run). CLI standard practice applies:
+          # the notarization ticket is served online, which Gatekeeper checks.
           spctl --assess --type execute --verbose=4 target/release/greppy
 
       - name: Measure runtime footprint (Unix)
