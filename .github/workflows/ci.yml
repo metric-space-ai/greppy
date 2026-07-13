@@ -135,6 +135,9 @@ jobs:
             --tasks bench/agent_coding/tasks_v1.json \
             --validate-only
 
+      - name: runtime footprint evidence harness
+        run: python3 -m unittest bench.test_runtime_footprint -v
+
       - name: model redistribution verifier tests
         run: python3 -m unittest tools/test_verify_model_redistribution.py
 

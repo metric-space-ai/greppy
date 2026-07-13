@@ -26,8 +26,37 @@ bash bench/agent_utility.sh
 bash bench/freshness_bench.sh
 ```
 
-All scripts are non-destructive: they reindex the fixture at
-`bench/fixtures/sample/` from scratch and clean up after themselves.
+## Runtime footprint evidence
+
+`runtime_footprint.py` measures an exact Greppy binary against a real Git
+repository without retaining repository content:
+
+```bash
+python3 bench/runtime_footprint.py \
+  --greppy /absolute/path/to/greppy \
+  --repo /absolute/path/to/repository \
+  --semantic-query "find the retry scheduler" \
+  --brief-symbol "run_retry_loop" \
+  --device metal \
+  --warm-repeats 5 \
+  --output runtime-footprint.json
+```
+
+The harness uses and removes a private `GREPPY_STORE_DIR` outside the target
+repository. It stops resident daemons between index, semantic-search, and brief
+so each first measurement includes a real cold model load; subsequent samples
+measure the warm path. Its atomic JSON artifact contains binary and redacted
+command-template hashes, platform facts, timings, cache byte counts, sanitized
+doctor/backend/model/daemon states, and daemon RSS when a reported PID is
+readable. It never stores the query, symbol, source, command output, absolute
+repository path, endpoint, secret, or raw trace. Run
+`python3 -m unittest bench/test_runtime_footprint.py` for its redaction,
+cleanup, failure, timing-schema, and atomic-write tests.
+
+The fixture-based scripts are non-destructive: they reindex
+`bench/fixtures/sample/` from scratch and clean up after themselves. The runtime
+footprint harness reads the explicitly supplied Git repository and keeps its
+temporary index outside that repository.
 The fixture's git state is committed at the start of the run; each
 mutation scenario resets the working tree via `git clean -fdx` +
 `git checkout -- .` so successive runs are reproducible.
