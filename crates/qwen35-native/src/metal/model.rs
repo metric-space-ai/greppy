@@ -270,7 +270,6 @@ impl MetalQwen35Model {
         let mut accepted_total = 0usize;
         let mut cycles = 0usize;
         let mut mtp_fallback = false;
-        let mut speculative_target_state = self.new_forward_state(max_context)?;
         let mut draft_mtp_state = self.new_mtp_state(max_context)?;
 
         while generated.len() < params.max_tokens {
@@ -374,9 +373,6 @@ impl MetalQwen35Model {
             verification_tokens.push(next);
             verification_tokens.extend_from_slice(&draft_tokens);
             let stage = perf.begin_stage();
-            self.copy_forward_state(&target_state, &mut speculative_target_state)?;
-            perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
-            let stage = perf.begin_stage();
             let mut committed_hidden = Vec::with_capacity(verification_tokens.len() * hidden_size);
             let mut verify_input = next;
             let mut accepted = 0usize;
@@ -385,7 +381,7 @@ impl MetalQwen35Model {
             for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
                 let mut output = self.forward_token_logits_hidden(
                     verify_input,
-                    &mut speculative_target_state,
+                    &mut target_state,
                     &mut target_workspace,
                 )?;
                 committed_hidden.extend_from_slice(&output.hidden);
@@ -427,7 +423,7 @@ impl MetalQwen35Model {
                 let stage = perf.begin_stage();
                 let mut output = self.forward_token_logits_hidden(
                     verify_input,
-                    &mut speculative_target_state,
+                    &mut target_state,
                     &mut target_workspace,
                 )?;
                 perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
@@ -442,7 +438,12 @@ impl MetalQwen35Model {
                 }
                 generated.push(target_token);
                 next = target_token;
-                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                // Every verification forward commits its input. The sampled target token is the
+                // next, still-unprocessed input, so target-state rollback is never required.
+                debug_assert_eq!(
+                    committed_hidden.len(),
+                    verification_tokens.len() * hidden_size
+                );
                 pending_target_hidden =
                     last_hidden_row(&committed_hidden, verification_tokens.len(), hidden_size)?
                         .to_vec();
@@ -459,7 +460,8 @@ impl MetalQwen35Model {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
-                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                // The mismatch output is pending; only the input that produced it was committed.
+                debug_assert_eq!(committed_hidden.len(), commit_count * hidden_size);
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,
@@ -594,63 +596,6 @@ impl MetalQwen35Model {
             joined: self.new_f32(rows * hidden_size * 2)?,
             logits: self.new_f32(logits_rows * self.inventory.vocab_size)?,
         })
-    }
-
-    fn copy_forward_state(
-        &self,
-        src: &MetalForwardState,
-        dst: &mut MetalForwardState,
-    ) -> Result<()> {
-        if src.max_context != dst.max_context || src.layer_states.len() != dst.layer_states.len() {
-            return Err(Error::InvalidRequest(
-                "Metal target state layouts do not match".into(),
-            ));
-        }
-        let cb = self.command_buffer()?;
-        let blit = cb.blit().ok_or_else(|| {
-            Error::GenerationUnavailable("failed to create Metal blit encoder".into())
-        })?;
-        for (src_layer, dst_layer) in src.layer_states.iter().zip(&dst.layer_states) {
-            match (src_layer, dst_layer) {
-                (
-                    MetalLayerState::Delta {
-                        recurrent: src_recurrent,
-                        conv: src_conv,
-                    },
-                    MetalLayerState::Delta {
-                        recurrent: dst_recurrent,
-                        conv: dst_conv,
-                    },
-                ) => {
-                    blit.copy_buffer(src_recurrent, 0, dst_recurrent, 0, src_recurrent.len());
-                    blit.copy_buffer(src_conv, 0, dst_conv, 0, src_conv.len());
-                }
-                (
-                    MetalLayerState::Full {
-                        k_cache: src_k,
-                        v_cache: src_v,
-                    },
-                    MetalLayerState::Full {
-                        k_cache: dst_k,
-                        v_cache: dst_v,
-                    },
-                ) => {
-                    blit.copy_buffer(src_k, 0, dst_k, 0, src_k.len());
-                    blit.copy_buffer(src_v, 0, dst_v, 0, src_v.len());
-                }
-                _ => {
-                    return Err(Error::InvalidRequest(
-                        "Metal target state layer kinds do not match".into(),
-                    ));
-                }
-            }
-        }
-        blit.end();
-        cb.commit_and_wait().map_err(|error| {
-            Error::GenerationUnavailable(format!("Metal target state copy failed: {error}"))
-        })?;
-        dst.position = src.position;
-        Ok(())
     }
 
     fn copy_mtp_state(&self, src: &MetalMtpState, dst: &mut MetalMtpState) -> Result<()> {

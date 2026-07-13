@@ -326,8 +326,6 @@ impl CudaQwen35Model {
         let mut accepted_total = 0usize;
         let mut cycles = 0usize;
         let mut mtp_fallback = false;
-        let mut speculative_target_state = self.new_forward_state(max_context)?;
-        let mut speculative_target_workspace = self.new_forward_workspace(max_context)?;
         let mut draft_mtp_state = self.new_mtp_state(max_context)?;
 
         while generated.len() < params.max_tokens {
@@ -431,9 +429,6 @@ impl CudaQwen35Model {
             verification_tokens.push(next);
             verification_tokens.extend_from_slice(&draft_tokens);
             let stage = perf.begin_stage();
-            self.copy_forward_state(&target_state, &mut speculative_target_state)?;
-            perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
-            let stage = perf.begin_stage();
             let mut committed_hidden = Vec::with_capacity(verification_tokens.len() * hidden_size);
             let mut verify_input = next;
             let mut accepted = 0usize;
@@ -442,8 +437,8 @@ impl CudaQwen35Model {
             for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
                 let mut output = self.forward_token_logits_hidden_graph(
                     verify_input,
-                    &mut speculative_target_state,
-                    &mut speculative_target_workspace,
+                    &mut target_state,
+                    &mut target_workspace,
                 )?;
                 committed_hidden.extend_from_slice(&output.hidden);
                 let Some(target_token) =
@@ -484,8 +479,8 @@ impl CudaQwen35Model {
                 let stage = perf.begin_stage();
                 let mut output = self.forward_token_logits_hidden_graph(
                     verify_input,
-                    &mut speculative_target_state,
-                    &mut speculative_target_workspace,
+                    &mut target_state,
+                    &mut target_workspace,
                 )?;
                 perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
                 committed_hidden.extend_from_slice(&output.hidden);
@@ -499,11 +494,12 @@ impl CudaQwen35Model {
                 }
                 generated.push(target_token);
                 next = target_token;
-                std::mem::swap(&mut target_state, &mut speculative_target_state);
-                target_state.decode_graph = None;
-                target_state.decode_graph_mode = None;
-                target_state.graph_unavailable = false;
-                target_state.graph_token = None;
+                // Every verification forward commits its input. The sampled target token is the
+                // next, still-unprocessed input, so target-state rollback is never required.
+                debug_assert_eq!(
+                    committed_hidden.len(),
+                    verification_tokens.len() * hidden_size
+                );
                 pending_target_hidden =
                     last_hidden_row(&committed_hidden, verification_tokens.len(), hidden_size)?
                         .to_vec();
@@ -520,11 +516,8 @@ impl CudaQwen35Model {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
-                std::mem::swap(&mut target_state, &mut speculative_target_state);
-                target_state.decode_graph = None;
-                target_state.decode_graph_mode = None;
-                target_state.graph_unavailable = false;
-                target_state.graph_token = None;
+                // The mismatch output is pending; only the input that produced it was committed.
+                debug_assert_eq!(committed_hidden.len(), commit_count * hidden_size);
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,
@@ -659,57 +652,6 @@ impl CudaQwen35Model {
             joined: self.new_f32(mmq_rows * hidden_size * 2)?,
             logits: self.new_f32(logits_rows * self.inventory.vocab_size)?,
         })
-    }
-
-    fn copy_forward_state(&self, src: &CudaForwardState, dst: &mut CudaForwardState) -> Result<()> {
-        if src.max_context != dst.max_context || src.layer_states.len() != dst.layer_states.len() {
-            return Err(Error::InvalidRequest(
-                "CUDA target state layouts do not match".into(),
-            ));
-        }
-        for (src_layer, dst_layer) in src.layer_states.iter().zip(&dst.layer_states) {
-            match (src_layer, dst_layer) {
-                (
-                    CudaLayerState::Delta {
-                        recurrent: src_recurrent,
-                        conv: src_conv,
-                    },
-                    CudaLayerState::Delta {
-                        recurrent: dst_recurrent,
-                        conv: dst_conv,
-                    },
-                ) => {
-                    self.dev
-                        .copy_d2d(dst_recurrent, src_recurrent, src_recurrent.bytes())?;
-                    self.dev.copy_d2d(dst_conv, src_conv, src_conv.bytes())?;
-                }
-                (
-                    CudaLayerState::Full {
-                        k_cache: src_k,
-                        v_cache: src_v,
-                    },
-                    CudaLayerState::Full {
-                        k_cache: dst_k,
-                        v_cache: dst_v,
-                    },
-                ) => {
-                    self.dev.copy_d2d(dst_k, src_k, src_k.bytes())?;
-                    self.dev.copy_d2d(dst_v, src_v, src_v.bytes())?;
-                }
-                _ => {
-                    return Err(Error::InvalidRequest(
-                        "CUDA target state layer kinds do not match".into(),
-                    ));
-                }
-            }
-        }
-        self.dev.sync()?;
-        dst.position = src.position;
-        dst.decode_graph = None;
-        dst.decode_graph_mode = None;
-        dst.graph_unavailable = false;
-        dst.graph_token = None;
-        Ok(())
     }
 
     fn copy_mtp_state(&self, src: &CudaMtpState, dst: &mut CudaMtpState) -> Result<()> {
