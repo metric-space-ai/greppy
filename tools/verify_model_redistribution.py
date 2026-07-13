@@ -41,6 +41,7 @@ _PROVENANCE_SCHEMAS = {
     "greppy.model-provenance.v1",
     "greppy.training-data-manifest.v1",
 }
+REPORT_SCHEMA = "greppy.model-redistribution-report.v1"
 
 
 def _is_int(value: object) -> bool:
@@ -241,6 +242,67 @@ def verify_lock(lock_path: Path, root: Path, *, release: bool = False) -> list[s
     return errors
 
 
+def _report_path(lock_path: Path, root: Path) -> str:
+    try:
+        return lock_path.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return lock_path.name
+
+
+def verification_report(
+    lock_path: Path,
+    root: Path,
+    errors: Sequence[str],
+    *,
+    release: bool,
+    git_commit: str | None,
+) -> dict[str, object]:
+    """Build a deterministic, digest-bound report suitable for release evidence."""
+    lock_sha256: str | None = None
+    models: list[dict[str, object]] = []
+    try:
+        lock_sha256 = _sha256(lock_path)
+        manifest = json.loads(lock_path.read_text(encoding="utf-8"))
+        raw_models = manifest.get("models", []) if isinstance(manifest, dict) else []
+        if isinstance(raw_models, list):
+            for model in raw_models:
+                if not isinstance(model, dict):
+                    continue
+                assets = model.get("assets", [])
+                asset_digests = [
+                    entry["sha256"]
+                    for entry in assets
+                    if isinstance(entry, dict) and isinstance(entry.get("sha256"), str)
+                ] if isinstance(assets, list) else []
+                models.append(
+                    {
+                        "id": model.get("id"),
+                        "release_ready": model.get("release_ready"),
+                        "asset_sha256s": asset_digests,
+                    }
+                )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        pass
+
+    return {
+        "schema_version": REPORT_SCHEMA,
+        "mode": "release" if release else "integrity",
+        "passed": not errors,
+        "git_commit": git_commit,
+        "lock_path": _report_path(lock_path, root),
+        "lock_sha256": lock_sha256,
+        "models": models,
+        "errors": list(errors),
+    }
+
+
+def _write_report(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Verify model redistribution metadata and file integrity.")
     parser.add_argument(
@@ -260,14 +322,37 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also require global and per-model release_ready flags",
     )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="write a deterministic JSON verification report, including on failure",
+    )
+    parser.add_argument(
+        "--git-commit",
+        help="bind the report to the exact 40-character lowercase Git commit",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.git_commit is not None and re.fullmatch(r"[0-9a-f]{40}", args.git_commit) is None:
+        print("ERROR: --git-commit must be a 40-character lowercase hexadecimal commit", file=sys.stderr)
+        return 2
     lock_path = args.lock_file.resolve()
     root = args.root.resolve() if args.root is not None else lock_path.parent.parent
     errors = verify_lock(lock_path, root, release=args.release)
+    if args.report is not None:
+        _write_report(
+            args.report.resolve(),
+            verification_report(
+                lock_path,
+                root,
+                errors,
+                release=args.release,
+                git_commit=args.git_commit,
+            ),
+        )
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

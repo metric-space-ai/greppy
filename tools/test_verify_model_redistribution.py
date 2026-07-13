@@ -120,6 +120,68 @@ class VerifyModelRedistributionTests(unittest.TestCase):
 
         self.assertTrue(any("provenance" in error and "not release_ready" in error for error in release_errors))
 
+    def test_report_is_bound_to_lock_digest_commit_and_release_mode(self) -> None:
+        self._write_manifest(self._manifest())
+        report_path = self.root / "report.json"
+        commit = "a" * 40
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = verifier.main(
+                [
+                    str(self.lock_path),
+                    "--root",
+                    str(self.root),
+                    "--release",
+                    "--git-commit",
+                    commit,
+                    "--report",
+                    str(report_path),
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], verifier.REPORT_SCHEMA)
+        self.assertEqual(report["mode"], "release")
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["git_commit"], commit)
+        self.assertEqual(report["lock_path"], "licenses/MODEL-REDISTRIBUTION.lock.json")
+        self.assertEqual(report["lock_sha256"], hashlib.sha256(self.lock_path.read_bytes()).hexdigest())
+        self.assertEqual(report["models"][0]["asset_sha256s"], [self._record(self.asset)["sha256"]])
+
+    def test_failed_release_still_writes_failure_report(self) -> None:
+        self._write_manifest(self._manifest(release_ready=False, model_ready=False))
+        report_path = self.root / "report.json"
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = verifier.main(
+                [
+                    str(self.lock_path),
+                    "--root",
+                    str(self.root),
+                    "--release",
+                    "--report",
+                    str(report_path),
+                ]
+            )
+
+        self.assertEqual(result, 1)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("release_ready is false" in error for error in report["errors"]))
+
+    def test_invalid_git_commit_is_rejected_before_report(self) -> None:
+        self._write_manifest(self._manifest())
+        report_path = self.root / "report.json"
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = verifier.main(
+                [str(self.lock_path), "--git-commit", "main", "--report", str(report_path)]
+            )
+
+        self.assertEqual(result, 2)
+        self.assertFalse(report_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

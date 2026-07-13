@@ -25,8 +25,45 @@ permissions:
   attestations: write
 
 jobs:
+  model-redistribution:
+    name: model redistribution provenance
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Fetch pinned model assets
+        run: git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-mtp-q4km/*'
+
+      - name: Verify model provenance and release readiness
+        shell: bash
+        run: |
+          mode=()
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            mode+=(--release)
+          fi
+          python3 tools/verify_model_redistribution.py \
+            "${mode[@]}" \
+            --git-commit "$GITHUB_SHA" \
+            --report model-redistribution-report.json
+
+      - name: Upload digest-bound provenance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-redistribution-${{ github.sha }}
+          path: model-redistribution-report.json
+          if-no-files-found: error
+
+      - name: Attest model provenance report
+        uses: actions/attest@v4
+        with:
+          subject-path: model-redistribution-report.json
+
   build:
     name: build (${{ matrix.name }})
+    needs: model-redistribution
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     strategy:
@@ -71,9 +108,6 @@ jobs:
           ls -lh crates/cli/assets/embeddinggemma-300m-q4k
           ls -lh crates/cli/assets/qwen35-0.8b-mtp-q4km
           python tools/verify_model_redistribution.py
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            python tools/verify_model_redistribution.py --release
-          fi
 
       - name: Install Rust (pinned by rust-toolchain.toml)
         # dtolnay/rust-toolchain v1, pinned to an immutable source revision.
@@ -397,13 +431,26 @@ jobs:
 
   publish:
     name: publish gated release
-    needs: [build, verify-packages]
-    if: startsWith(github.ref, 'refs/tags/') && vars.GREPPY_INFERENCE_RELEASE_READY == 'true'
+    needs: [model-redistribution, build, verify-packages]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
+    environment: production-release
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
+      - name: Verify release provenance approval subject
+        shell: bash
+        run: |
+          report="release-assets/model-redistribution-$GITHUB_SHA/model-redistribution-report.json"
+          test -s "$report"
+          test "$(jq -r .schema_version "$report")" = greppy.model-redistribution-report.v1
+          test "$(jq -r .mode "$report")" = release
+          test "$(jq -r .passed "$report")" = true
+          test "$(jq -r .git_commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .lock_sha256 "$report")" = \
+            "$(sha256sum licenses/MODEL-REDISTRIBUTION.lock.json | cut -d' ' -f1)"
       - name: Download passing benchmark for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -459,11 +506,11 @@ jobs:
       - name: Generate aggregate release checksums
         shell: bash
         run: |
-          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' -o -name 'runtime-footprint-*.json' \) -print0 \
+          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' -o -name 'runtime-footprint-*.json' -o -name 'model-redistribution-report.json' \) -print0 \
             | sort -z \
             | xargs -0 shasum -a 256 \
             | sed 's#  release-assets/[^/]*/#  #' > release-assets/SHA256SUMS
-          test "$(wc -l < release-assets/SHA256SUMS)" -eq 12
+          test "$(wc -l < release-assets/SHA256SUMS)" -eq 13
           cat release-assets/SHA256SUMS
       - name: Attest aggregate checksums
         uses: actions/attest@v4
@@ -482,5 +529,6 @@ jobs:
             release-assets/**/*.sha256
             release-assets/**/*.spdx.json
             release-assets/**/runtime-footprint-*.json
+            release-assets/**/model-redistribution-report.json
             release-assets/SHA256SUMS
           fail_on_unmatched_files: true
