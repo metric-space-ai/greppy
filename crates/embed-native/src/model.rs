@@ -542,9 +542,19 @@ impl Attention {
         attention_mask: Option<&[f32]>,
     ) -> Result<Vec<f32>> {
         let rows = batch * seq_len;
-        let query_states = self.q_proj.matmul(xs, rows)?;
-        let key_states = self.k_proj.matmul(xs, rows)?;
-        let value_states = self.v_proj.matmul(xs, rows)?;
+        let input = self.q_proj.prepare_q8k_rows(xs, rows)?;
+        let (query_states, (key_states, value_states)) = rayon::join(
+            || self.q_proj.matmul_prepared_q8k_rows(&input),
+            || {
+                rayon::join(
+                    || self.k_proj.matmul_prepared_q8k_rows_or_f32(&input, xs),
+                    || self.v_proj.matmul_prepared_q8k_rows_or_f32(&input, xs),
+                )
+            },
+        );
+        let query_states = query_states?;
+        let key_states = key_states?;
+        let value_states = value_states?;
 
         let mut query_states =
             reshape_heads(&query_states, batch, seq_len, self.num_heads, self.head_dim);
@@ -621,12 +631,20 @@ impl Mlp {
     }
 
     fn forward(&self, xs: &[f32], rows: usize) -> Result<Vec<f32>> {
-        let mut gate = self.gate_proj.matmul(xs, rows)?;
-        let up = self.up_proj.matmul(xs, rows)?;
+        let (mut gate, up) = self.project_gate_up(xs, rows)?;
         gate.par_iter_mut()
             .zip(up.par_iter())
             .for_each(|(g, u)| *g = gelu_tanh(*g) * *u);
         self.down_proj.matmul(&gate, rows)
+    }
+
+    fn project_gate_up(&self, xs: &[f32], rows: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let input = self.gate_proj.prepare_q8k_rows(xs, rows)?;
+        let (gate, up) = rayon::join(
+            || self.gate_proj.matmul_prepared_q8k_rows(&input),
+            || self.up_proj.matmul_prepared_q8k_rows_or_f32(&input, xs),
+        );
+        Ok((gate?, up?))
     }
 
     fn forward_debug(
@@ -635,7 +653,7 @@ impl Mlp {
         xs: &[f32],
         rows: usize,
     ) -> Result<(Vec<f32>, Vec<StageOutput>)> {
-        let gate = self.gate_proj.matmul(xs, rows)?;
+        let (gate, up) = self.project_gate_up(xs, rows)?;
         let mut stages = vec![StageOutput {
             name: format!("layer_{layer_idx}_mlp_gate"),
             values: gate.clone(),
@@ -646,7 +664,6 @@ impl Mlp {
             name: format!("layer_{layer_idx}_mlp_gate_gelu"),
             values: gate_act.clone(),
         });
-        let up = self.up_proj.matmul(xs, rows)?;
         stages.push(StageOutput {
             name: format!("layer_{layer_idx}_mlp_up"),
             values: up.clone(),
