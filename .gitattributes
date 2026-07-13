@@ -13,3 +13,6 @@ training/qwen35/*.sha256 text eol=lf
 # breakdown reflects the product, not the eval scripts.
 bench/** linguist-vendored
 *.sh linguist-vendored
+# Model-asset pins must be byte-identical on every OS (the redistribution
+# lock hashes the sidecar/manifest files themselves) - no EOL normalization.
+crates/cli/assets/** -text
