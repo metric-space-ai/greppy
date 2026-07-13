@@ -193,15 +193,21 @@ those six repositories. It covered 269,625 raw rows, 269,380 accepted rows,
 byte-identical source duplicate that the selected SFT row disambiguates by its
 repo/language provenance. The deterministic aggregate row digest is
 `fa10bae3a37e19cda295394155199ae85a5d8240131060f49e5284a14eae384c`.
-See `audit-summary-2026-07-13.json` for the machine-readable result.
+See `audit-summary-2026-07-13.json` for the compact machine-readable result.
+The complete 54,324-entry repository histogram and 325-entry license
+histogram are published as deterministic gzip in
+`audit-report-2026-07-13.json.gz`. Its compressed SHA-256 is
+`aed01649bbf9d671c7a225d6ce684c85f3ac8a6b20a678920591094cbd3b1286`;
+the uncompressed JSON is the report already anchored by SHA-256
+`ad93aaa5e2982c4d04da0d744c16bd7226845c682b6a3f03742da699d1de89cc`.
 
 This is a recorded result of that frozen private audit, not a claim about
 future data. The auditor independently fails on an unmapped SFT prompt, any
 distinct accepted prompt absent from SFT, ambiguous raw/SFT duplicates,
 SHA-256 or prompt-normalization collisions, missing/invalid licenses,
 provenance or label mismatches, unexpected schemas, and selected denylist
-matches. The full private report is hash-anchored by the summary and is intended
-to ship as a release evidence artifact after the checkpoint passes quality.
+matches. The full aggregate report is now public; raw rows and labels remain
+withheld.
 
 ## Verification
 

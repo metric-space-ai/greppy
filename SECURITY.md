@@ -7,6 +7,93 @@ unreleased `main` branch is tested continuously but is not a supported release
 channel. Pin production installations to an immutable tag and verify the
 published checksum and build provenance.
 
+## Verifying a release
+
+The expected provenance identity is the repository
+`metric-space-ai/greppy`, the signer workflow
+`.github/workflows/release.yml`, and the release tag being installed. Download
+all assets into an empty directory so the exact release manifest can reject
+missing or unexpected files:
+
+```bash
+version=v0.2.0
+mkdir "greppy-$version" && cd "greppy-$version"
+gh release download "$version" --repo metric-space-ai/greppy
+python3 - <<'PY'
+import json
+from pathlib import Path
+manifest = json.loads(Path("RELEASE-ASSETS.json").read_text())
+expected = {asset["name"] for asset in manifest["assets"]}
+actual = {path.name for path in Path(".").iterdir() if path.is_file()}
+if actual != expected:
+    raise SystemExit(f"release asset mismatch: missing={expected-actual}, extra={actual-expected}")
+PY
+sha256sum --check SHA256SUMS
+gh attestation verify SHA256SUMS \
+  --repo metric-space-ai/greppy \
+  --signer-workflow metric-space-ai/greppy/.github/workflows/release.yml \
+  --source-ref "refs/tags/$version" \
+  --deny-self-hosted-runners
+```
+
+On macOS, use `shasum -a 256 -c SHA256SUMS` when GNU `sha256sum` is not
+installed. Also verify the selected package itself; this binds its digest to
+the same repository, workflow, and tag identity:
+
+```bash
+asset=greppy-macos-arm64.tar.gz  # select the package for the current platform
+gh attestation verify "$asset" \
+  --repo metric-space-ai/greppy \
+  --signer-workflow metric-space-ai/greppy/.github/workflows/release.yml \
+  --source-ref "refs/tags/$version" \
+  --deny-self-hosted-runners
+```
+
+The macOS binary must have a valid hardened-runtime signature, a stapled Apple
+notarization ticket, and a successful Gatekeeper assessment:
+
+```bash
+mkdir unpack && tar -C unpack -xzf greppy-macos-arm64.tar.gz
+codesign --verify --strict --verbose=2 unpack/greppy
+xcrun stapler validate unpack/greppy
+spctl --assess --type execute --verbose=4 unpack/greppy
+codesign --display --verbose=4 unpack/greppy 2>&1 | grep -E '^(Authority|TeamIdentifier)='
+```
+
+For Windows, verify both the aggregate checksum and the Authenticode chain and
+timestamp before running the binary:
+
+```powershell
+$version = 'v0.2.0'
+gh release download $version --repo metric-space-ai/greppy
+$line = (Select-String 'greppy-windows-x86_64.zip$' SHA256SUMS).Line
+$want = ($line -split '\s+')[0]
+$got = (Get-FileHash greppy-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($got -ne $want) { throw 'release checksum mismatch' }
+Expand-Archive greppy-windows-x86_64.zip -DestinationPath unpack
+$signature = Get-AuthenticodeSignature unpack/greppy.exe
+if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate) {
+    throw "invalid or untimestamped Authenticode signature: $($signature.Status)"
+}
+$signature.SignerCertificate | Format-List Subject,Thumbprint,NotAfter
+gh attestation verify greppy-windows-x86_64.zip `
+  --repo metric-space-ai/greppy `
+  --signer-workflow metric-space-ai/greppy/.github/workflows/release.yml `
+  --source-ref "refs/tags/$version" `
+  --deny-self-hosted-runners
+```
+
+The GitHub attestation establishes the expected repository and workflow
+identity. The Apple and Microsoft checks independently establish platform
+trust and timestamp validity; the displayed certificate subject is diagnostic
+and is not a substitute for the repository-pinned attestation.
+
+`RELEASE-ASSETS.json` is the machine-readable, exact filename contract.
+`SHA256SUMS` covers every listed asset except itself, including the manifest,
+SBOMs, build-environment records, benchmarks, and Qwen training evidence. Do
+not install a release if any contract, checksum, signature, or attestation
+check fails.
+
 ## Reporting a vulnerability
 
 Report vulnerabilities privately through GitHub's **Security > Report a

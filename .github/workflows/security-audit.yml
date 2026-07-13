@@ -26,7 +26,7 @@ jobs:
     name: RustSec advisory database
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       # rustsec/audit-check v2.0.0, pinned to immutable source.
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:

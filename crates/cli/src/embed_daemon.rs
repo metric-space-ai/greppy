@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-use super::inference_daemon::{self, Endpoint, RequestOutcome, ServerPolicy, PROTOCOL_VERSION};
+use super::inference_daemon::{
+    self, Endpoint, RequestOutcome, ServerPolicy, SpawnOutcome, PROTOCOL_VERSION,
+};
 
 const ENV_MODEL_TTL: &str = "GREPPY_EMBED_DAEMON_MODEL_TTL_S";
 const ENV_EXIT_TTL: &str = "GREPPY_EMBED_DAEMON_EXIT_TTL_S";
@@ -12,6 +14,14 @@ const DEFAULT_EXIT_TTL_S: u64 = 1800;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BYTES: usize = 1 << 20;
 const MAX_RESPONSE_BYTES: usize = 4 << 20;
+
+#[derive(Debug, PartialEq)]
+pub(super) enum EmbedDaemonResult {
+    Embedded(Vec<f32>),
+    DaemonBusy,
+    NoDaemon,
+    Failed,
+}
 
 fn env_secs(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -36,29 +46,38 @@ pub(super) fn status(cfg: &super::EmbeddingModelConfig, model_key: &str) -> serd
         .unwrap_or_else(|| serde_json::json!({"state": "unsupported"}))
 }
 
-pub(super) fn embed_query_via_daemon(
+pub(super) fn embed_query_via_daemon_result(
     cfg: &super::EmbeddingModelConfig,
     model_key: &str,
     text: &str,
-) -> Option<Vec<f32>> {
-    let endpoint = endpoint(cfg, model_key)?;
+) -> EmbedDaemonResult {
+    let Some(endpoint) = endpoint(cfg, model_key) else {
+        return EmbedDaemonResult::NoDaemon;
+    };
     match request_embedding(&endpoint, model_key, text) {
-        RequestOutcome::Response(vector) => return Some(vector),
-        RequestOutcome::Failed => return None,
+        RequestOutcome::Response(vector) => return EmbedDaemonResult::Embedded(vector),
+        RequestOutcome::DaemonBusy => return EmbedDaemonResult::DaemonBusy,
+        RequestOutcome::Failed => return EmbedDaemonResult::Failed,
         RequestOutcome::NoDaemon => {}
     }
 
-    inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
+    let spawn_outcome =
+        inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
     for delay in inference_daemon::retry_delays() {
         std::thread::sleep(delay);
         match request_embedding(&endpoint, model_key, text) {
-            RequestOutcome::Response(vector) => return Some(vector),
-            RequestOutcome::Failed => return None,
+            RequestOutcome::Response(vector) => return EmbedDaemonResult::Embedded(vector),
+            RequestOutcome::DaemonBusy => return EmbedDaemonResult::DaemonBusy,
+            RequestOutcome::Failed => return EmbedDaemonResult::Failed,
             RequestOutcome::NoDaemon => {}
         }
     }
-    inference_daemon::record_spawn_failure(&endpoint);
-    None
+    inference_daemon::record_spawn_failure(&endpoint, spawn_outcome.attempted());
+    match spawn_outcome {
+        SpawnOutcome::SpawnFailed => EmbedDaemonResult::NoDaemon,
+        SpawnOutcome::Contended => EmbedDaemonResult::DaemonBusy,
+        SpawnOutcome::Spawned | SpawnOutcome::Cooldown => EmbedDaemonResult::Failed,
+    }
 }
 
 fn request_embedding(endpoint: &Endpoint, model_key: &str, text: &str) -> RequestOutcome<Vec<f32>> {
@@ -67,7 +86,13 @@ fn request_embedding(endpoint: &Endpoint, model_key: &str, text: &str) -> Reques
         "mk": model_key,
         "text": text,
     });
-    match inference_daemon::request(endpoint, request, CLIENT_READ_TIMEOUT, MAX_RESPONSE_BYTES) {
+    match inference_daemon::request(
+        endpoint,
+        request,
+        CLIENT_READ_TIMEOUT,
+        MAX_REQUEST_BYTES,
+        MAX_RESPONSE_BYTES,
+    ) {
         RequestOutcome::Response(response) => {
             if response.get("error").is_some() {
                 return RequestOutcome::Failed;
@@ -90,6 +115,7 @@ fn request_embedding(endpoint: &Endpoint, model_key: &str, text: &str) -> Reques
             }
         }
         RequestOutcome::NoDaemon => RequestOutcome::NoDaemon,
+        RequestOutcome::DaemonBusy => RequestOutcome::DaemonBusy,
         RequestOutcome::Failed => RequestOutcome::Failed,
     }
 }
@@ -134,7 +160,7 @@ pub(super) fn prewarm_from_env(cfg: &super::EmbeddingModelConfig, model_key: &st
     };
     let ping = serde_json::json!({"op": "ping"});
     if matches!(
-        inference_daemon::request(&endpoint, ping, Duration::from_secs(1), 4096),
+        inference_daemon::request(&endpoint, ping, Duration::from_secs(1), 4096, 4096),
         RequestOutcome::Response(_)
     ) {
         return;

@@ -19,17 +19,73 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: read
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
+  release-eligibility:
+    name: immutable release subject
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - name: Test release artifact contract and verifiers
+        run: python3 -m unittest tools.test_release_artifacts -v
+      - name: Reject reused or replaced release subjects
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          EVENT_CREATED: ${{ github.event.created }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$EVENT_CREATED" = true || {
+            echo '::error::release workflow requires a newly created tag event'
+            exit 1
+          }
+          test "$EVENT_DELETED" != true && test "$EVENT_FORCED" != true || {
+            echo '::error::deleted or force-updated release tags are not eligible'
+            exit 1
+          }
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          test "$tag_commit" = "$GITHUB_SHA" || {
+            echo "::error::tag resolves to $tag_commit instead of $GITHUB_SHA"
+            exit 1
+          }
+          response="$RUNNER_TEMP/existing-release.json"
+          status="$(curl --silent --show-error --location \
+            --output "$response" --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          case "$status" in
+            404) ;;
+            200)
+              echo "::error::a release already exists for $GITHUB_REF_NAME; releases are immutable"
+              cat "$response"
+              exit 1
+              ;;
+            *)
+              echo "::error::cannot establish release immutability (GitHub API HTTP $status)"
+              cat "$response"
+              exit 1
+              ;;
+          esac
+
   model-redistribution:
     name: model redistribution provenance
+    needs: release-eligibility
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           lfs: true
 
@@ -48,24 +104,46 @@ jobs:
             --git-commit "$GITHUB_SHA" \
             --report model-redistribution-report.json
 
+      - name: Create deterministic Qwen training-evidence archive
+        shell: bash
+        run: |
+          python3 tools/release_artifacts.py create-training-archive \
+            --root . \
+            --manifest training/qwen35/MANIFEST.sha256 \
+            --output greppy-qwen35-training-evidence.tar.gz
+          shasum -a 256 greppy-qwen35-training-evidence.tar.gz \
+            > greppy-qwen35-training-evidence.tar.gz.sha256
+
       - name: Upload digest-bound provenance report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: model-redistribution-${{ github.sha }}
-          path: model-redistribution-report.json
+          path: |
+            model-redistribution-report.json
+            greppy-qwen35-training-evidence.tar.gz
+            greppy-qwen35-training-evidence.tar.gz.sha256
           if-no-files-found: error
 
       - name: Attest model provenance report
-        uses: actions/attest@v4
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: model-redistribution-report.json
+
+      - name: Attest Qwen training evidence
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: greppy-qwen35-training-evidence.tar.gz
 
   build:
     name: build (${{ matrix.name }})
     needs: model-redistribution
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +156,9 @@ jobs:
             asset: greppy-macos-arm64.tar.gz
             features: metal
             footprint_devices: 'cpu metal'
+            runner_os: macOS
+            runner_arch: ARM64
+            rust_host: aarch64-apple-darwin
           # Pinned to 22.04: ubuntu-latest (24.04) links glibc 2.39, which
           # excludes every 22.04-LTS host (v0.1.0/v0.1.1 assets shipped with
           # that requirement — a real-world "GLIBC_2.39 not found" failure).
@@ -87,6 +168,9 @@ jobs:
             asset: greppy-linux-x86_64.tar.gz
             features: cuda
             footprint_devices: 'cpu'
+            runner_os: Linux
+            runner_arch: X64
+            rust_host: x86_64-unknown-linux-gnu
             cuda_sub_packages: '["nvcc", "cudart"]'
             cuda_non_cuda_sub_packages: '["libcublas", "libcublas-dev"]'
           # v0.2.0 certifies Windows CPU inference and named-pipe daemons.
@@ -96,8 +180,11 @@ jobs:
             asset: greppy-windows-x86_64.zip
             features: cpu
             footprint_devices: 'cpu'
+            runner_os: Windows
+            runner_arch: X64
+            rust_host: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           lfs: true
 
@@ -115,12 +202,25 @@ jobs:
         with:
           toolchain: '1.95.0'
 
+      - name: Assert and record native build host
+        shell: bash
+        run: |
+          python tools/release_artifacts.py record-build-environment \
+            --output "build-environment-${{ matrix.name }}.json" \
+            --expected-os "${{ matrix.runner_os }}" \
+            --expected-arch "${{ matrix.runner_arch }}" \
+            --expected-host "${{ matrix.rust_host }}" \
+            --matrix-name "${{ matrix.name }}" \
+            --features "${{ matrix.features }}" \
+            --git-commit "$GITHUB_SHA" \
+            --cargo-lock Cargo.lock
+
       # CUDA toolkit (nvcc + cuBLAS headers/import libs) so build.rs can
       # compile the vendored ggml-cuda kernels into the shared backend. No GPU
       # is needed at build time.
       - name: Install CUDA toolkit
         if: matrix.features == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d
         with:
           cuda: '12.5.0'
           method: network
@@ -129,10 +229,10 @@ jobs:
 
       - name: Add MSVC developer tools to PATH
         if: runner.os == 'Windows' && matrix.features == 'cuda'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
       - name: Build release binary
-        run: cargo build --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
+        run: cargo build --locked --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
 
       - name: Sign macOS binary with Developer ID
         if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
@@ -233,12 +333,17 @@ jobs:
           git clone --quiet --filter=blob:none https://github.com/serde-rs/serde.git "$repo"
           git -C "$repo" checkout --quiet --detach 1023d077510b4aef36a41ef56fdb7798568a2654
           for device in ${{ matrix.footprint_devices }}; do
+            timeout_args=()
+            if [ "$device" = cpu ]; then
+              timeout_args=(--timeout-seconds 3600)
+            fi
             python3 bench/runtime_footprint.py \
               --greppy "$PWD/target/release/greppy" \
               --repo "$repo" \
               --semantic-query 'apply a rename case rule to a struct field' \
               --brief-symbol apply_to_field \
               --device "$device" \
+              "${timeout_args[@]}" \
               --warm-repeats 3 \
               --output "runtime-footprint-${{ matrix.name }}-$device.json"
           done
@@ -257,6 +362,7 @@ jobs:
               --semantic-query 'apply a rename case rule to a struct field' `
               --brief-symbol apply_to_field `
               --device $device `
+              --timeout-seconds 3600 `
               --warm-repeats 3 `
               --output "runtime-footprint-${{ matrix.name }}-$device.json"
             if ($LASTEXITCODE -ne 0) { throw "runtime footprint failed for $device" }
@@ -268,7 +374,8 @@ jobs:
           mkdir -p dist
           cp target/release/greppy dist/greppy
           cp bench/release_package_smoke.sh dist/
-          cp README.md LICENSE THIRD_PARTY.md SECURITY.md SUPPORT.md CHANGELOG.md dist/
+          cp tools/release_artifacts.py dist/
+          cp README.md LICENSE THIRD_PARTY.md SECURITY.md SUPPORT.md CHANGELOG.md Cargo.lock dist/
           cp -R licenses dist/licenses
           tar -C dist -czf "${{ matrix.asset }}" .
 
@@ -279,7 +386,8 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
-          Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md dist/
+          Copy-Item tools/release_artifacts.py dist/release_artifacts.py
+          Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
           Copy-Item licenses dist/licenses -Recurse
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
 
@@ -321,12 +429,26 @@ jobs:
           & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
 
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
           path: dist
           format: spdx-json
           output-file: ${{ matrix.asset }}.spdx.json
           upload-artifact: false
+
+      - name: Bind and verify release contents in SPDX SBOM
+        shell: bash
+        run: |
+          python tools/release_artifacts.py augment-spdx \
+            --sbom "${{ matrix.asset }}.spdx.json" \
+            --dist dist \
+            --cargo-lock Cargo.lock \
+            --target "${{ matrix.rust_host }}"
+          python tools/release_artifacts.py verify-spdx \
+            --sbom "${{ matrix.asset }}.spdx.json" \
+            --dist dist \
+            --cargo-lock Cargo.lock \
+            --target "${{ matrix.rust_host }}"
 
       - name: Generate SHA256 checksum (Unix)
         if: runner.os != 'Windows'
@@ -341,22 +463,27 @@ jobs:
           "$hash  ${{ matrix.asset }}" | Set-Content -Encoding ascii "${{ matrix.asset }}.sha256"
 
       - name: Attest release package provenance
-        uses: actions/attest@v4
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: ${{ matrix.asset }}
 
       - name: Attest SBOM provenance
-        uses: actions/attest@v4
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: ${{ matrix.asset }}.spdx.json
 
       - name: Attest runtime footprint evidence
-        uses: actions/attest@v4
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: runtime-footprint-*.json
 
+      - name: Attest native build environment
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: build-environment-${{ matrix.name }}.json
+
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -364,11 +491,14 @@ jobs:
             ${{ matrix.asset }}.sha256
             ${{ matrix.asset }}.spdx.json
             runtime-footprint-*.json
+            build-environment-${{ matrix.name }}.json
 
   verify-packages:
     name: clean package (${{ matrix.name }})
     needs: build
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -376,14 +506,17 @@ jobs:
           - name: macos-arm64
             os: macos-latest
             asset: greppy-macos-arm64.tar.gz
+            rust_host: aarch64-apple-darwin
           - name: linux-x86_64-no-toolkit
             os: ubuntu-22.04
             asset: greppy-linux-x86_64.tar.gz
+            rust_host: x86_64-unknown-linux-gnu
           - name: windows-x86_64
             os: windows-latest
             asset: greppy-windows-x86_64.zip
+            rust_host: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: ${{ matrix.asset }}
           path: package
@@ -409,7 +542,11 @@ jobs:
             test -s package/runtime-footprint-macos-arm64-cpu.json
             test -s package/runtime-footprint-macos-arm64-metal.json
           fi
-          test -s "package/${{ matrix.asset }}.spdx.json"
+          python3 unpack/release_artifacts.py verify-spdx \
+            --sbom "package/${{ matrix.asset }}.spdx.json" \
+            --dist unpack \
+            --cargo-lock unpack/Cargo.lock \
+            --target "${{ matrix.rust_host }}"
 
       - name: Verify clean Windows host
         if: runner.os == 'Windows'
@@ -427,6 +564,12 @@ jobs:
             if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
           }
           if (-not (Test-Path 'package/runtime-footprint-windows-x86_64-cpu.json')) { throw 'missing runtime footprint evidence' }
+          python unpack/release_artifacts.py verify-spdx `
+            --sbom "package/${{ matrix.asset }}.spdx.json" `
+            --dist unpack `
+            --cargo-lock unpack/Cargo.lock `
+            --target "${{ matrix.rust_host }}"
+          if ($LASTEXITCODE -ne 0) { throw 'SPDX verification failed' }
           & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
 
   publish:
@@ -435,9 +578,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     environment: production-release
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: release-assets
       - name: Verify release provenance approval subject
@@ -451,6 +599,15 @@ jobs:
           test "$(jq -r .git_commit "$report")" = "$GITHUB_SHA"
           test "$(jq -r .lock_sha256 "$report")" = \
             "$(sha256sum licenses/MODEL-REDISTRIBUTION.lock.json | cut -d' ' -f1)"
+          evidence_dir="release-assets/model-redistribution-$GITHUB_SHA"
+          (cd "$evidence_dir" && \
+            shasum -a 256 -c greppy-qwen35-training-evidence.tar.gz.sha256)
+          python3 tools/release_artifacts.py create-training-archive \
+            --root . \
+            --manifest training/qwen35/MANIFEST.sha256 \
+            --output "$RUNNER_TEMP/qwen-evidence-reproduction.tar.gz"
+          test "$(sha256sum "$evidence_dir/greppy-qwen35-training-evidence.tar.gz" | cut -d' ' -f1)" = \
+            "$(sha256sum "$RUNNER_TEMP/qwen-evidence-reproduction.tar.gz" | cut -d' ' -f1)"
       - name: Download passing benchmark for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -503,32 +660,82 @@ jobs:
           test "$(jq -r .gate.passed release-assets/coding-benchmark/verified/MANIFEST.json)" = true
           test "$(jq -r .greppy_source.git_commit release-assets/coding-benchmark/verified/MANIFEST.json)" = "$GITHUB_SHA"
           test "$(jq -r .greppy_source.tracked_worktree_dirty release-assets/coding-benchmark/verified/MANIFEST.json)" = false
-      - name: Generate aggregate release checksums
+      - name: Download passing summary-quality gate for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id="$(gh run list \
+            --workflow summary-quality.yml \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')"
+          test -n "$run_id" || {
+            echo '::error::no successful summary-quality gate exists for this release commit'
+            exit 1
+          }
+          mkdir -p release-assets/summary-quality
+          gh run download "$run_id" \
+            --name "greppy-summary-quality-$GITHUB_SHA" \
+            --dir release-assets/summary-quality
+          (cd release-assets/summary-quality && shasum -a 256 -c greppy-summary-quality.tar.gz.sha256)
+          mkdir -p release-assets/summary-quality/verified
+          tar -C release-assets/summary-quality/verified \
+            -xzf release-assets/summary-quality/greppy-summary-quality.tar.gz
+          manifest=release-assets/summary-quality/verified/MANIFEST.json
+          results=release-assets/summary-quality/verified/results.json
+          judgments=release-assets/summary-quality/verified/judgments.json
+          gate=release-assets/summary-quality/verified/gate.json
+          test "$(jq -r .schema_version "$manifest")" = greppy.summary-quality-evidence.v1
+          test "$(jq -r .git_commit "$manifest")" = "$GITHUB_SHA"
+          test "$(jq -r .raw_traces_published "$manifest")" = false
+          test "$(jq -r .gate.passed "$manifest")" = true
+          test "$(jq -r .passed "$gate")" = true
+          test "$(jq -r .cases_sha256 "$manifest")" = \
+            "$(sha256sum bench/summary_quality/cases_v1.json | cut -d' ' -f1)"
+          test "$(jq -r .results_sha256 "$manifest")" = \
+            "$(sha256sum "$results" | cut -d' ' -f1)"
+          test "$(jq -r .judgments_sha256 "$manifest")" = \
+            "$(sha256sum "$judgments" | cut -d' ' -f1)"
+          test "$(jq -r .gate_sha256 "$manifest")" = \
+            "$(sha256sum "$gate" | cut -d' ' -f1)"
+      - name: Stage and verify exact release asset contract
         shell: bash
         run: |
-          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' -o -name 'runtime-footprint-*.json' -o -name 'model-redistribution-report.json' \) -print0 \
-            | sort -z \
-            | xargs -0 shasum -a 256 \
-            | sed 's#  release-assets/[^/]*/#  #' > release-assets/SHA256SUMS
-          test "$(wc -l < release-assets/SHA256SUMS)" -eq 13
-          cat release-assets/SHA256SUMS
+          python3 tools/release_artifacts.py stage-release \
+            --source release-assets \
+            --output release-publish \
+            --contract tools/release_asset_contract.v1.json \
+            --git-commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --cargo-lock Cargo.lock
+          python3 tools/release_artifacts.py verify-staged-release \
+            --output release-publish \
+            --contract tools/release_asset_contract.v1.json \
+            --git-commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --cargo-lock Cargo.lock
+          cat release-publish/SHA256SUMS
       - name: Attest aggregate checksums
-        uses: actions/attest@v4
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
-          subject-path: release-assets/SHA256SUMS
-      - name: Attach verified packages to release
-        # Manual tag dispatches exercise every preceding release gate but can
-        # never publish. Only the repository's tag-push event may create or
-        # replace release assets.
+          subject-path: release-publish/SHA256SUMS
+      - name: Attest exact release asset manifest
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: release-publish/RELEASE-ASSETS.json
+      - name: Create immutable release
+        # gh release create fails atomically if this tag already has a release.
+        # The eligibility job also rejects force-updated tag events before any
+        # model or build work begins.
         if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release-assets/**/*.tar.gz
-            release-assets/**/*.zip
-            release-assets/**/*.sha256
-            release-assets/**/*.spdx.json
-            release-assets/**/runtime-footprint-*.json
-            release-assets/**/model-redistribution-report.json
-            release-assets/SHA256SUMS
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            release-publish/*

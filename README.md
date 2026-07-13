@@ -44,16 +44,19 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 ```bash
 # Portable CPU build (both models are always embedded)
+git lfs install
+git lfs pull
 cargo build --release --bin greppy
 sudo install -m 0755 target/release/greppy /usr/local/bin/greppy
 ```
 
 Every build embeds EmbeddingGemma and Qwen3.5 plus their tokenizers. No model is
-downloaded at runtime and neither model can be disabled. CPU inference is always
-available; build with `--features metal` on Apple Silicon or `--features cuda`
-on Linux/NVIDIA to include the accelerated backend. Runtime selection is
-automatic and can be made explicit with `--device cpu|metal|cuda[:INDEX]` or
-`GREPPY_DEVICE`.
+downloaded at runtime and neither model can be disabled. Git LFS must materialize
+the tracked model objects before Cargo runs; the build rejects missing or
+incorrect assets. CPU inference is always available; build with `--features
+metal` on Apple Silicon or `--features cuda` on Linux/NVIDIA to include the
+accelerated backend. Runtime selection is automatic and can be made explicit
+with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`.
 
 The first structured query builds its local workspace index. There is no
 current prebuilt production package while `v0.2.0` is completing the release
@@ -117,27 +120,64 @@ Qwen navigation hint. Read the source and verify changes with builds and tests.
 
 ### Try it without committing to it
 
-Greppy does not modify a repository during evaluation. Install the single
-binary under its own `greppy` name, point an agent at the command guide above,
-and compare one representative task with and without the structured commands.
-The strongest tests are questions that normally require several searches and
-file opens, such as finding all callers or locating behavior whose symbol name
-is unknown.
+`greppy trial` runs one mechanically graded, own-project A/B observation. The
+v1 protocol supports a `who-calls` check through Pi:
 
-Record correctness, tool calls, opened source spans, input tokens, and elapsed
-time for both runs. Keep Greppy only if the result is better for the actual
-project and agent. Removing the binary and its local cache completely removes
-the trial:
+```bash
+greppy trial \
+  --root . \
+  --question "Who calls parse_config, and from where?" \
+  --check who-calls \
+  --symbol parse_config \
+  --expect load_application \
+  --forbid legacy_loader \
+  --runner pi \
+  --provider minimax \
+  --model MiniMax-M3
+```
+
+`--expect` and `--forbid` are repeatable, case-sensitive final-answer literal
+checks. The command requires `--root` to be the exact top level of a clean Git
+repository with a committed `HEAD`. Commit or remove staged, unstaged, and
+untracked files first.
+
+The harness creates two private detached worktrees outside the target
+repository, at the same commit and tree. Each arm gets its own
+`GREPPY_STORE_DIR`, Pi config directory, and session directory. Pi context
+files, skills, prompt templates, extensions, themes, and session persistence
+are disabled. Complete versioned system prompts are supplied with
+`--system-prompt`; the Greppy prompt contains the exact requested symbol.
+Only the Greppy worktree is indexed, before either measured arm. Arms then run
+in deterministic `baseline`, `greppy` order and both worktrees must remain
+clean at the pinned commit. Disposable worktrees and stores are removed after
+the run.
+
+Stdout is one `greppy.project-trial.v1` JSON object identified by
+`schema_version`. It records commit and tree IDs; Pi and Greppy executable
+paths, versions, and SHA-256 digests; exact normalized tool and source-open
+calls; tool-result character counts; first-turn, later-turn, and aggregate Pi
+token counters when reported; turns; wall time; answers; mechanical grades;
+and trace SHA-256 digests. Raw Pi traces remain private and are deleted with
+the disposable trial directory.
+
+The only statuses are:
+
+- `valid_observation` (exit 0): both valid arms passed the mechanical check.
+- `quality_regression` (exit 1): the valid baseline passed and the valid Greppy arm failed.
+- `inconclusive` (exit 2): setup, execution, contamination, cleanliness, or baseline-quality failure prevented that comparison.
+
+A baseline trace that invokes Greppy is rejected. The `comparison` object gives
+the observed quality relationship and Greppy-minus-baseline deltas and ratios
+for this single pair. These are descriptive measurements, never a generalized
+efficiency result or release claim.
+
+The trial's disposable stores are removed automatically. To remove any Greppy
+cache created during normal use and uninstall the binary:
 
 ```bash
 greppy cache clear --root . --yes
 sudo rm /usr/local/bin/greppy
 ```
-
-Ordinary grep-compatible invocations are covered by byte-for-byte passthrough
-tests and do not build an index or start either inference daemon. Structured
-commands are additive and can therefore be introduced to an agent one command
-at a time.
 
 ---
 

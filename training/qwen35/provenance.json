@@ -53,6 +53,8 @@
     "generated_labels_published": false,
     "audit_summary": "audit-summary-2026-07-13.json",
     "audit_aggregate_sha256": "fa10bae3a37e19cda295394155199ae85a5d8240131060f49e5284a14eae384c",
-    "full_private_audit_report_sha256": "ad93aaa5e2982c4d04da0d744c16bd7226845c682b6a3f03742da699d1de89cc"
+    "full_audit_report": "audit-report-2026-07-13.json.gz",
+    "full_audit_report_compressed_sha256": "aed01649bbf9d671c7a225d6ce684c85f3ac8a6b20a678920591094cbd3b1286",
+    "full_audit_report_uncompressed_sha256": "ad93aaa5e2982c4d04da0d744c16bd7226845c682b6a3f03742da699d1de89cc"
   }
 }

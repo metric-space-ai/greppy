@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       # This job intentionally does not fetch Git LFS. Its debug-only,
       # compile-guarded sentinel assets keep black-box CLI process startup
@@ -57,12 +57,12 @@ jobs:
       # reads it and installs exactly that toolchain. No `toolchain:`
       # override so the pin is the single source of truth.
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry, git, and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry/index/
@@ -141,6 +141,14 @@ jobs:
       - name: runtime footprint evidence harness
         run: python3 -m unittest bench.test_runtime_footprint -v
 
+      - name: function summary quality gate logic
+        run: python3 -m unittest bench.test_summary_quality -v
+
+      - name: immutable GitHub Action pins
+        run: |
+          python3 -m unittest tools/test_verify_workflow_action_pins.py -v
+          python3 tools/verify_workflow_action_pins.py
+
       - name: model redistribution verifier tests
         run: python3 -m unittest tools/test_verify_model_redistribution.py
 
@@ -174,7 +182,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout with Git LFS models
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           lfs: true
 
@@ -182,7 +190,7 @@ jobs:
         run: python tools/verify_model_redistribution.py
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
 
       - name: Build default product binary with real assets
         run: cargo build -p greppy --bin greppy
@@ -208,15 +216,15 @@ jobs:
       GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           components: rustfmt
 
       - name: Cache cargo registry, git, and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry/index/
@@ -268,17 +276,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           lfs: true
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry, git, and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry/index/

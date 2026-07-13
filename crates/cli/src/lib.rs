@@ -7,6 +7,7 @@
 //! - `who-calls` / `callees` / `find-usages` / `impact` / `brief` — graph navigation.
 //! - `semantic-search` (`semantic`) — meaning-based code search.
 //! - `search-code` / `search-symbols` — current-source and indexed symbol search.
+//! - `trial`        — isolated own-project baseline/Greppy observation.
 //! - `install`      — agent installer      (out of scope)
 //! - `uninstall`    — agent uninstaller    (out of scope)
 //! - `update`       — explains the signed-release installation policy
@@ -28,6 +29,7 @@ mod embed_daemon;
 mod inference_daemon;
 #[cfg(any(unix, windows))]
 mod summarize_daemon;
+mod trial;
 
 /// Exit code for subcommands that are recognised but not yet implemented
 /// in the current phase. EX_UNAVAILABLE (69) is the standard BSD sysexits
@@ -213,6 +215,11 @@ pub enum Command {
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
+    },
+    /// Run one isolated own-project baseline/Greppy observation with Pi.
+    Trial {
+        #[command(flatten)]
+        args: trial::TrialArgs,
     },
     /// Structured graph search.
     SearchGraph {
@@ -647,6 +654,7 @@ const SUBCOMMANDS: &[&str] = &[
     "grep",
     "index",
     "cache",
+    "trial",
     "stats",
     "diagnostics",
     "doctor",
@@ -708,7 +716,9 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     // Structured Greppy commands perform throttled cache maintenance. This
     // intentionally runs after passthrough detection so an ordinary grep
     // invocation cannot touch Greppy state.
-    maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+    if !is_trial_invocation(&argv) {
+        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+    }
     // Structured subcommand (or help/version): clap can parse it. Any
     // non-UTF-8 here is a genuine usage error for a structured command.
     // P3: a failed agent call must TEACH the correct retry in the same
@@ -730,7 +740,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 eprintln!("usage: {usage}");
             } else {
                 eprintln!(
-                    "usage: greppy <command> --help  (commands: index, who-calls, callees, \
+                    "usage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
                      find-usages, impact, brief, semantic-search, search-code, search-symbols, \
                      path, index status)"
                 );
@@ -764,6 +774,10 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
+        "trial" => {
+            "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
+             --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
+        }
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
         _ => return None,
     })
@@ -1083,6 +1097,30 @@ fn peek_root_arg(argv: &[std::ffi::OsString]) -> Option<String> {
     None
 }
 
+/// Trial arms own their complete cache/config namespace. Skip the normal
+/// structured-command cache maintenance pass so the parent process cannot
+/// touch an ambient Greppy store before those namespaces are installed.
+fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let mut i = 1;
+    while i < argv.len() {
+        let token = &argv[i];
+        if token == "--root" || token == "--device" {
+            i += 2;
+            continue;
+        }
+        let token_lossy = token.to_string_lossy();
+        if token_lossy.starts_with("--root=")
+            || token_lossy.starts_with("--device=")
+            || token == "--no-gpu"
+        {
+            i += 1;
+            continue;
+        }
+        return token == "trial";
+    }
+    false
+}
+
 /// Decide whether `argv` (including argv[0]) is a bare `grep`
 /// passthrough rather than a recognised structured subcommand.
 ///
@@ -1164,6 +1202,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     println!("usage: greppy PATTERN [FILES..]        (real-grep passthrough)");
     println!("   or: greppy <command> [--root DIR]   commands:");
     println!("       index PATH  who-calls S   callees S   find-usages S");
+    println!("       trial --root DIR --question Q --check who-calls --symbol S ...");
     println!("       references S (who depends on S)   impact S [--direction incoming|outgoing]");
     println!("       brief S   semantic-search \"QUERY\"");
     println!("       search-code Q   search-symbols NAME [--kind function|method|struct|class]");
@@ -1255,6 +1294,7 @@ fn dispatch_subcommand(
             }
         }
         Command::Cache { command } => dispatch_cache(command, root),
+        Command::Trial { args } => trial::run(args, root),
         Command::SearchGraph { name, json } => {
             let mut q = greppy_search::GraphQuery::any().with_limit(50);
             let name_filter = name.as_deref();
@@ -12002,19 +12042,28 @@ fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -
         }
     }
     // Prefer the warm daemon (model stays resident across CLI calls; VRAM
-    // freed after its idle TTL); ANY daemon problem falls back to the
-    // in-process load below. Embed the NORMALIZED text either way so the
-    // cached vector is exactly the vector any query normalizing to the
-    // same key would compute.
+    // freed after its idle TTL). Only a daemon proven absent may use the
+    // in-process fallback. Busy or faulted live daemons retain model ownership,
+    // so falling back there could allocate a second model instance.
     #[cfg(any(unix, windows))]
-    let daemon_vector = embed_daemon::embed_query_via_daemon(cfg, &model_key, &normalized);
+    let daemon_result = embed_daemon::embed_query_via_daemon_result(cfg, &model_key, &normalized);
     #[cfg(not(any(unix, windows)))]
-    let daemon_vector: Option<Vec<f32>> = None;
-    let vector = match daemon_vector {
-        Some(v) => v,
-        None => {
+    let daemon_result = embed_daemon::EmbedDaemonResult::NoDaemon;
+    let vector = match daemon_result {
+        embed_daemon::EmbedDaemonResult::Embedded(vector) => vector,
+        embed_daemon::EmbedDaemonResult::NoDaemon => {
             let model = load_embedding_model(cfg, store_dir)?;
             greppy_search::embed_code_query(&model, &normalized)?
+        }
+        embed_daemon::EmbedDaemonResult::DaemonBusy => {
+            return Err(Error::Store(
+                "EmbeddingGemma daemon remained busy until the request deadline".into(),
+            ));
+        }
+        embed_daemon::EmbedDaemonResult::Failed => {
+            return Err(Error::Store(
+                "EmbeddingGemma daemon failed while retaining model ownership".into(),
+            ));
         }
     };
     if let Some(cache) = &cache {

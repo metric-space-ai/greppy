@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Checkout exact candidate commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           lfs: true
 
@@ -31,7 +31,7 @@ jobs:
           toolchain: '1.95.0'
 
       - name: Install pinned Pi Code runner
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '25.9.0'
 
@@ -97,12 +97,12 @@ jobs:
           shasum -a 256 greppy-agent-benchmark.tar.gz > greppy-agent-benchmark.tar.gz.sha256
 
       - name: Attest benchmark evidence
-        uses: actions/attest@v4
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: greppy-agent-benchmark.tar.gz
 
       - name: Upload benchmark evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: greppy-agent-benchmark-${{ github.sha }}
           retention-days: 90

@@ -1,0 +1,33 @@
+{
+  "schema_version": "greppy.release-asset-contract.v1",
+  "repository": "metric-space-ai/greppy",
+  "assets": [
+    {"name": "greppy-macos-arm64.tar.gz", "role": "package"},
+    {"name": "greppy-macos-arm64.tar.gz.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-macos-arm64.tar.gz.spdx.json", "role": "sbom"},
+    {"name": "runtime-footprint-macos-arm64-cpu.json", "role": "runtime-evidence"},
+    {"name": "runtime-footprint-macos-arm64-metal.json", "role": "runtime-evidence"},
+    {"name": "build-environment-macos-arm64.json", "role": "build-environment"},
+    {"name": "greppy-linux-x86_64.tar.gz", "role": "package"},
+    {"name": "greppy-linux-x86_64.tar.gz.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-linux-x86_64.tar.gz.spdx.json", "role": "sbom"},
+    {"name": "runtime-footprint-linux-x86_64-cpu.json", "role": "runtime-evidence"},
+    {"name": "build-environment-linux-x86_64.json", "role": "build-environment"},
+    {"name": "greppy-windows-x86_64.zip", "role": "package"},
+    {"name": "greppy-windows-x86_64.zip.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-windows-x86_64.zip.spdx.json", "role": "sbom"},
+    {"name": "runtime-footprint-windows-x86_64-cpu.json", "role": "runtime-evidence"},
+    {"name": "build-environment-windows-x86_64.json", "role": "build-environment"},
+    {"name": "model-redistribution-report.json", "role": "model-provenance"},
+    {"name": "greppy-agent-benchmark.tar.gz", "role": "benchmark-evidence"},
+    {"name": "greppy-agent-benchmark.tar.gz.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-coding-benchmark.tar.gz", "role": "benchmark-evidence"},
+    {"name": "greppy-coding-benchmark.tar.gz.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-summary-quality.tar.gz", "role": "summary-quality-evidence"},
+    {"name": "greppy-summary-quality.tar.gz.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-qwen35-training-evidence.tar.gz", "role": "training-evidence"},
+    {"name": "greppy-qwen35-training-evidence.tar.gz.sha256", "role": "checksum-sidecar"},
+    {"name": "RELEASE-ASSETS.json", "role": "release-manifest", "generated": true},
+    {"name": "SHA256SUMS", "role": "aggregate-checksums", "generated": true}
+  ]
+}

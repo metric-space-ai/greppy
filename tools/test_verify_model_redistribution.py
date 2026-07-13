@@ -32,10 +32,12 @@ class VerifyModelRedistributionTests(unittest.TestCase):
                 {
                     "schema_version": "greppy.model-provenance.v1",
                     "release_ready": True,
+                    "release_blockers": [],
                 }
             ).encode("utf-8"),
         )
         self.modifications = self._write("docs/model-modifications.md", b"quantized to Q4_K_M\n")
+        self.evidence = self._write("docs/model-evidence.json.gz", b"compressed evidence\n")
         self.lock_path = self.root / "licenses" / "MODEL-REDISTRIBUTION.lock.json"
 
     def _write(self, relative_path: str, content: bytes) -> Path:
@@ -56,6 +58,7 @@ class VerifyModelRedistributionTests(unittest.TestCase):
             "schema": verifier.SCHEMA,
             "version": verifier.VERSION,
             "release_ready": release_ready,
+            "release_blockers": [] if release_ready else ["review pending"],
             "models": [
                 {
                     "id": "example/model-q4",
@@ -64,6 +67,7 @@ class VerifyModelRedistributionTests(unittest.TestCase):
                     "license": [self._record(self.license)],
                     "provenance": [self._record(self.provenance)],
                     "modifications": [self._record(self.modifications)],
+                    "evidence": [self._record(self.evidence)],
                 }
             ],
         }
@@ -86,6 +90,17 @@ class VerifyModelRedistributionTests(unittest.TestCase):
         errors = verifier.verify_lock(self.lock_path, self.root)
 
         self.assertTrue(any("SHA256 mismatch" in error for error in errors), errors)
+
+    def test_tampered_optional_evidence_reports_digest_mismatch(self) -> None:
+        self._write_manifest(self._manifest())
+        self.evidence.write_bytes(b"tampered evidence\n")
+
+        errors = verifier.verify_lock(self.lock_path, self.root)
+
+        self.assertTrue(
+            any("evidence" in error and "SHA256 mismatch" in error for error in errors),
+            errors,
+        )
 
     def test_traversal_path_is_rejected(self) -> None:
         manifest = self._manifest()
@@ -119,6 +134,28 @@ class VerifyModelRedistributionTests(unittest.TestCase):
         release_errors = verifier.verify_lock(self.lock_path, self.root, release=True)
 
         self.assertTrue(any("provenance" in error and "not release_ready" in error for error in release_errors))
+
+    def test_ready_state_cannot_retain_release_blockers(self) -> None:
+        manifest = self._manifest()
+        manifest["release_blockers"] = ["review pending"]
+        self._write_manifest(manifest)
+
+        errors = verifier.verify_lock(self.lock_path, self.root)
+
+        self.assertTrue(
+            any("release_ready is true" in error and "release_blockers" in error for error in errors),
+            errors,
+        )
+
+        provenance = json.loads(self.provenance.read_text(encoding="utf-8"))
+        provenance["release_blockers"] = ["quality gate pending"]
+        self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+        self._write_manifest(self._manifest())
+        release_errors = verifier.verify_lock(self.lock_path, self.root, release=True)
+        self.assertTrue(
+            any("provenance" in error and "still has blockers" in error for error in release_errors),
+            release_errors,
+        )
 
     def test_report_is_bound_to_lock_digest_commit_and_release_mode(self) -> None:
         self._write_manifest(self._manifest())

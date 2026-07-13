@@ -14,12 +14,29 @@ const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOP_INTERVAL: Duration = Duration::from_millis(100);
 const CRASH_COOLDOWN: Duration = Duration::from_secs(2);
+const CAPACITY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const CAPACITY_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestOutcome<T> {
     Response(T),
+    DaemonBusy,
     NoDaemon,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpawnOutcome {
+    Spawned,
+    SpawnFailed,
+    Contended,
+    Cooldown,
+}
+
+impl SpawnOutcome {
+    pub(super) fn attempted(self) -> bool {
+        matches!(self, Self::Spawned | Self::SpawnFailed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +161,7 @@ pub(super) fn request(
     endpoint: &Endpoint,
     mut value: serde_json::Value,
     timeout: Duration,
+    max_request_bytes: usize,
     max_response_bytes: usize,
 ) -> RequestOutcome<serde_json::Value> {
     let Some(object) = value.as_object_mut() else {
@@ -154,34 +172,112 @@ pub(super) fn request(
         .entry("request_id")
         .or_insert_with(|| request_id().into());
 
-    let mut stream = match TransportStream::connect(endpoint, timeout) {
-        Ok(stream) => stream,
-        Err(error) if no_daemon_error(&error) => return RequestOutcome::NoDaemon,
+    let encoded = match serialize_json_frame(&value, max_request_bytes) {
+        Ok(encoded) => encoded,
         Err(_) => return RequestOutcome::Failed,
     };
+    let deadline = Instant::now() + timeout;
+    let mut retry_delay = CAPACITY_RETRY_INITIAL_DELAY;
+    let mut capacity_seen = false;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return if capacity_seen {
+                RequestOutcome::DaemonBusy
+            } else {
+                RequestOutcome::Failed
+            };
+        };
+        if remaining.is_zero() {
+            return if capacity_seen {
+                RequestOutcome::DaemonBusy
+            } else {
+                RequestOutcome::Failed
+            };
+        }
+        match request_once(endpoint, &encoded, remaining, max_response_bytes) {
+            RequestAttempt::Response(response) => return RequestOutcome::Response(response),
+            RequestAttempt::NoDaemon => return RequestOutcome::NoDaemon,
+            RequestAttempt::Failed if capacity_seen => return RequestOutcome::DaemonBusy,
+            RequestAttempt::Failed => return RequestOutcome::Failed,
+            RequestAttempt::RetryableCapacity => {
+                capacity_seen = true;
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return RequestOutcome::DaemonBusy;
+                };
+                std::thread::sleep(retry_delay.min(remaining));
+                retry_delay = retry_delay
+                    .checked_mul(2)
+                    .unwrap_or(CAPACITY_RETRY_MAX_DELAY)
+                    .min(CAPACITY_RETRY_MAX_DELAY);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestAttempt<T> {
+    Response(T),
+    RetryableCapacity,
+    NoDaemon,
+    Failed,
+}
+
+fn request_once(
+    endpoint: &Endpoint,
+    encoded: &[u8],
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> RequestAttempt<serde_json::Value> {
+    let mut stream = match TransportStream::connect(endpoint, timeout) {
+        Ok(stream) => stream,
+        Err(error) if no_daemon_error(&error) => return RequestAttempt::NoDaemon,
+        Err(_) => return RequestAttempt::Failed,
+    };
     if stream
-        .set_timeouts(CONNECTION_WRITE_TIMEOUT, timeout)
+        .set_timeouts(CONNECTION_WRITE_TIMEOUT.min(timeout), timeout)
         .is_err()
     {
-        return RequestOutcome::Failed;
+        return RequestAttempt::Failed;
     }
-    let mut encoded = value.to_string().into_bytes();
-    encoded.push(b'\n');
-    if write_frame(&mut stream, &encoded, CONNECTION_WRITE_TIMEOUT).is_err() {
-        return RequestOutcome::Failed;
+    if write_frame(&mut stream, encoded, CONNECTION_WRITE_TIMEOUT.min(timeout)).is_err() {
+        return RequestAttempt::Failed;
     }
     let response = match read_frame(&mut stream, max_response_bytes, timeout) {
         Ok(response) => response,
-        Err(_) => return RequestOutcome::Failed,
+        Err(_) => return RequestAttempt::Failed,
     };
-    serde_json::from_str(response.trim())
-        .map(RequestOutcome::Response)
-        .unwrap_or(RequestOutcome::Failed)
+    match serde_json::from_str(&response) {
+        Ok(response) if retryable_capacity_response(&response) => RequestAttempt::RetryableCapacity,
+        Ok(response) => RequestAttempt::Response(response),
+        Err(_) => RequestAttempt::Failed,
+    }
+}
+
+fn retryable_capacity_response(response: &serde_json::Value) -> bool {
+    let classified = response
+        .get("error_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("capacity")
+        && response
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    classified
+        || matches!(
+            response.get("error").and_then(serde_json::Value::as_str),
+            Some("inference queue full" | "daemon busy")
+        )
 }
 
 pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
     let request = serde_json::json!({"op": "status"});
-    match self::request(endpoint, request, Duration::from_millis(500), 16 * 1024) {
+    match self::request(
+        endpoint,
+        request,
+        Duration::from_millis(500),
+        16 * 1024,
+        16 * 1024,
+    ) {
         RequestOutcome::Response(mut status) => {
             if let Some(object) = status.as_object_mut() {
                 object.insert("endpoint".into(), endpoint.address().into());
@@ -193,6 +289,11 @@ pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
             "protocol": PROTOCOL_VERSION,
             "state": "stopped",
         }),
+        RequestOutcome::DaemonBusy => serde_json::json!({
+            "endpoint": endpoint.address(),
+            "protocol": PROTOCOL_VERSION,
+            "state": "busy",
+        }),
         RequestOutcome::Failed => serde_json::json!({
             "endpoint": endpoint.address(),
             "protocol": PROTOCOL_VERSION,
@@ -202,22 +303,32 @@ pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
     }
 }
 
-pub(super) fn spawn_once(endpoint: &Endpoint, spawn: impl FnOnce() -> Option<()>) -> Option<()> {
+pub(super) fn spawn_once(endpoint: &Endpoint, spawn: impl FnOnce() -> Option<()>) -> SpawnOutcome {
     if cooldown_active(endpoint) {
-        return None;
+        return SpawnOutcome::Cooldown;
     }
-    let lock = greppy_core::cache::acquire_named_lock(
+    let Some(lock) = greppy_core::cache::acquire_named_lock(
         &endpoint.spawn_lock_name(),
         greppy_core::cache::LockMode::Exclusive,
         true,
     )
-    .ok()??;
-    let result = spawn();
+    .ok()
+    .flatten() else {
+        return SpawnOutcome::Contended;
+    };
+    let outcome = if spawn().is_some() {
+        SpawnOutcome::Spawned
+    } else {
+        SpawnOutcome::SpawnFailed
+    };
     drop(lock);
-    result
+    outcome
 }
 
-pub(super) fn record_spawn_failure(endpoint: &Endpoint) {
+pub(super) fn record_spawn_failure(endpoint: &Endpoint, spawn_attempted: bool) {
+    if !spawn_attempted || cooldown_active(endpoint) {
+        return;
+    }
     let path = endpoint.cooldown_path();
     let Some(parent) = path.parent() else {
         return;
@@ -225,8 +336,13 @@ pub(super) fn record_spawn_failure(endpoint: &Endpoint) {
     if ensure_private_dir(parent).is_err() {
         return;
     }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -358,6 +474,7 @@ where
         Arc::clone(&last_activity),
     );
     spawn_hung_worker_watchdog(
+        endpoint.clone(),
         Arc::clone(&status),
         Arc::clone(&stop),
         policy.hard_request_timeout,
@@ -482,7 +599,7 @@ fn spawn_accept_loop(
                             reject(&status);
                             write_response(
                                 &mut stream,
-                                serde_json::json!({"error": "daemon busy"}),
+                                capacity_response(None, "daemon busy"),
                                 4096,
                             );
                             finish_request(&pending_requests, &last_activity);
@@ -635,7 +752,7 @@ fn read_and_queue(
             reject(status);
             write_response(
                 &mut job.stream,
-                serde_json::json!({"request_id": id, "error": "inference queue full"}),
+                capacity_response(Some(&id), "inference queue full"),
                 policy.max_response_bytes,
             );
             finish_request(pending_requests, last_activity);
@@ -672,6 +789,18 @@ fn status_response(
     })
 }
 
+fn capacity_response(request_id: Option<&str>, error: &'static str) -> serde_json::Value {
+    let mut response = serde_json::json!({
+        "error": error,
+        "error_kind": "capacity",
+        "retryable": true,
+    });
+    if let (Some(request_id), Some(object)) = (request_id, response.as_object_mut()) {
+        object.insert("request_id".into(), request_id.into());
+    }
+    response
+}
+
 fn finish_request(
     pending_requests: &std::sync::atomic::AtomicUsize,
     last_activity: &Mutex<Instant>,
@@ -695,14 +824,64 @@ fn write_response(
     value: serde_json::Value,
     max_response_bytes: usize,
 ) {
-    let mut bytes = value.to_string().into_bytes();
-    if bytes.len() > max_response_bytes {
-        bytes = serde_json::json!({"error": "response too large"})
-            .to_string()
-            .into_bytes();
+    let bytes = serialize_json_frame(&value, max_response_bytes).or_else(|_| {
+        serialize_json_frame(
+            &serde_json::json!({"error": "response too large"}),
+            max_response_bytes,
+        )
+    });
+    if let Ok(bytes) = bytes {
+        let _ = write_frame(stream, &bytes, CONNECTION_WRITE_TIMEOUT);
     }
-    bytes.push(b'\n');
-    let _ = write_frame(stream, &bytes, CONNECTION_WRITE_TIMEOUT);
+}
+
+fn serialize_json_frame(value: &serde_json::Value, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut frame = LimitedFrame::new(max_bytes);
+    serde_json::to_writer(&mut frame, value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    frame.write_all(b"\n")?;
+    Ok(frame.into_inner())
+}
+
+struct LimitedFrame {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl LimitedFrame {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(4096)),
+            max_bytes,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for LimitedFrame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(bytes.len()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "daemon frame exceeds limit",
+            ));
+        };
+        if next_len > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "daemon frame exceeds limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn write_frame(
@@ -828,6 +1007,7 @@ fn complete(status: &Arc<Mutex<RuntimeStatus>>, model_loaded: bool, error: Optio
 }
 
 fn spawn_hung_worker_watchdog(
+    endpoint: Endpoint,
     status: Arc<Mutex<RuntimeStatus>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     timeout: Option<Duration>,
@@ -855,6 +1035,7 @@ fn spawn_hung_worker_watchdog(
                 // Inference backends cannot be safely interrupted in-process.
                 // Exiting releases the owner lock; the next client repairs the
                 // stale endpoint and starts one clean model instance.
+                record_spawn_failure(&endpoint, true);
                 std::process::exit(70);
             }
         }
@@ -972,13 +1153,181 @@ struct TransportStream(std::os::unix::net::UnixStream);
 
 #[cfg(unix)]
 impl TransportStream {
-    fn connect(endpoint: &Endpoint, _timeout: Duration) -> std::io::Result<Self> {
-        std::os::unix::net::UnixStream::connect(&endpoint.address).map(Self)
+    fn connect(endpoint: &Endpoint, timeout: Duration) -> std::io::Result<Self> {
+        unix_connect_with_timeout(std::path::Path::new(&endpoint.address), timeout).map(Self)
     }
 
     fn set_timeouts(&self, write: Duration, read: Duration) -> std::io::Result<()> {
         self.0.set_write_timeout(Some(write))?;
         self.0.set_read_timeout(Some(read))
+    }
+}
+
+#[cfg(unix)]
+fn unix_connect_with_timeout(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = path.as_os_str().as_bytes();
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+    // SAFETY: A zeroed sockaddr_un is valid to initialize field by field before use.
+    let address = unsafe { address.assume_init_mut() };
+    if path.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon endpoint path is too long",
+        ));
+    }
+    address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AF_UNIX does not fit sa_family_t",
+        )
+    })?;
+    #[cfg(any(
+        target_os = "aix",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    {
+        address.sun_len =
+            u8::try_from(std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1)
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "daemon endpoint address is too long",
+                    )
+                })?;
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(path.iter().copied()) {
+        *target = libc::c_char::from_ne_bytes([source]);
+    }
+    let address_len = libc::socklen_t::try_from(
+        std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1,
+    )
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon endpoint address is too long",
+        )
+    })?;
+
+    // SAFETY: socket returns a new owned descriptor or -1 without aliasing Rust values.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: raw was just returned by socket and ownership is transferred exactly once.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let original_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+    if original_flags < 0
+        || unsafe {
+            libc::fcntl(
+                socket.as_raw_fd(),
+                libc::F_SETFL,
+                original_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let descriptor_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe {
+            libc::fcntl(
+                socket.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let connected = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(address).cast::<libc::sockaddr>(),
+            address_len,
+        )
+    };
+    if connected < 0 {
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINPROGRESS | libc::EALREADY | libc::EAGAIN)
+        ) {
+            return Err(error);
+        }
+        poll_connected(socket.as_raw_fd(), timeout)?;
+    }
+    if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, original_flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(std::os::unix::net::UnixStream::from(socket))
+}
+
+#[cfg(unix)]
+fn poll_connected(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = i32::try_from(remaining.as_millis().saturating_add(u128::from(
+            !remaining.subsec_nanos().is_multiple_of(1_000_000),
+        )))
+        .unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon connect timed out",
+            ));
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted && Instant::now() < deadline {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let mut socket_error: libc::c_int = 0;
+        let mut error_len = libc::socklen_t::try_from(std::mem::size_of_val(&socket_error))
+            .expect("socket error length fits socklen_t");
+        // SAFETY: socket_error and error_len are valid writable values of the declared sizes.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                std::ptr::from_mut(&mut socket_error).cast(),
+                &mut error_len,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        return if socket_error == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(socket_error))
+        };
     }
 }
 
@@ -1011,7 +1360,7 @@ impl TransportListener {
             ensure_private_dir(parent)?;
         }
         if path.exists() {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            if TransportStream::connect(endpoint, Duration::from_millis(100)).is_ok() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     "daemon endpoint is live",
@@ -1264,16 +1613,126 @@ mod tests {
     }
 
     #[test]
-    fn crash_cooldown_is_endpoint_scoped() {
+    fn crash_cooldown_is_endpoint_scoped_and_not_refreshed() {
         let endpoint = Endpoint::for_identity(
             "cooldown-test",
             &format!("{}-{}", std::process::id(), request_id()),
         )
         .unwrap();
         assert!(!cooldown_active(&endpoint));
-        record_spawn_failure(&endpoint);
+        record_spawn_failure(&endpoint, false);
+        assert!(!cooldown_active(&endpoint));
+
+        record_spawn_failure(&endpoint, true);
         assert!(cooldown_active(&endpoint));
+        let first_modified = endpoint
+            .cooldown_path()
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        record_spawn_failure(&endpoint, true);
+        let second_modified = endpoint
+            .cooldown_path()
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap();
+        assert_eq!(first_modified, second_modified);
+        assert_eq!(
+            spawn_once(&endpoint, || panic!("cooldown must suppress spawn")),
+            SpawnOutcome::Cooldown
+        );
         let _ = std::fs::remove_file(endpoint.cooldown_path());
+    }
+
+    #[test]
+    fn spawn_lock_contention_is_distinct_from_an_absent_daemon() {
+        let endpoint = Endpoint::for_identity(
+            "spawn-contention-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let lock = greppy_core::cache::acquire_named_lock(
+            &endpoint.spawn_lock_name(),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spawn_once(&endpoint, || panic!("contender must not spawn")),
+            SpawnOutcome::Contended
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn json_frame_limit_counts_the_newline_at_the_exact_boundary() {
+        let value = serde_json::json!({"result": "ok"});
+        let mut expected = serde_json::to_vec(&value).unwrap();
+        expected.push(b'\n');
+
+        assert_eq!(
+            serialize_json_frame(&value, expected.len()).unwrap(),
+            expected
+        );
+        let error = serialize_json_frame(&value, expected.len() - 1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn client_request_limit_is_enforced_before_connect() {
+        let endpoint = Endpoint::for_identity(
+            "request-limit-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let request_value = serde_json::json!({
+            "op": "infer",
+            "request_id": "fixed-request-id",
+            "payload": "bounded",
+        });
+        let mut framed_value = request_value.clone();
+        framed_value
+            .as_object_mut()
+            .unwrap()
+            .insert("protocol".into(), PROTOCOL_VERSION.into());
+        let exact_limit = serialize_json_frame(&framed_value, 4096).unwrap().len();
+
+        assert_eq!(
+            request(
+                &endpoint,
+                request_value.clone(),
+                Duration::from_millis(50),
+                exact_limit - 1,
+                4096,
+            ),
+            RequestOutcome::Failed
+        );
+        assert_eq!(
+            request(
+                &endpoint,
+                request_value,
+                Duration::from_millis(50),
+                exact_limit,
+                4096,
+            ),
+            RequestOutcome::NoDaemon
+        );
+    }
+
+    #[test]
+    fn retryable_capacity_responses_are_explicitly_classified() {
+        let response = capacity_response(Some("request-1"), "inference queue full");
+        assert_eq!(response["error_kind"], "capacity");
+        assert_eq!(response["retryable"], true);
+        assert!(retryable_capacity_response(&response));
+        assert!(retryable_capacity_response(
+            &serde_json::json!({"error": "daemon busy"})
+        ));
+        assert!(!retryable_capacity_response(
+            &serde_json::json!({"error": "model load failed"})
+        ));
     }
 
     #[cfg(unix)]
@@ -1332,12 +1791,58 @@ mod tests {
             serde_json::json!({"op": "status"}),
             Duration::from_secs(2),
             4096,
+            4096,
         );
         assert!(matches!(
             response,
             RequestOutcome::Response(ref value) if value["state"] == "ready"
         ));
         server.join().unwrap();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(endpoint.address());
+    }
+
+    #[test]
+    fn capacity_retry_deadline_preserves_daemon_busy_outcome() {
+        let endpoint = Endpoint::for_identity(
+            "capacity-deadline-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let listener = TransportListener::bind(&endpoint).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok(mut stream) => {
+                        read_frame(&mut stream, 4096, Duration::from_millis(100)).unwrap();
+                        write_response(
+                            &mut stream,
+                            capacity_response(None, "inference queue full"),
+                            4096,
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("capacity server accept failed: {error}"),
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = request(
+            &endpoint,
+            serde_json::json!({"op": "infer"}),
+            Duration::from_millis(75),
+            4096,
+            4096,
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(outcome, RequestOutcome::DaemonBusy);
+        assert!(started.elapsed() < Duration::from_secs(1));
         #[cfg(unix)]
         let _ = std::fs::remove_file(endpoint.address());
     }
@@ -1408,8 +1913,8 @@ mod tests {
                 },
                 false,
                 move || {
-                    server_loads.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, String>(())
+                    let owner = server_loads.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok::<_, String>(owner)
                 },
                 |raw| {
                     let value: serde_json::Value = serde_json::from_str(raw)
@@ -1422,8 +1927,11 @@ mod tests {
                 },
                 move |_raw, model| {
                     server_handled.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(5));
-                    serde_json::json!({"ok": model.is_some()})
+                    std::thread::sleep(Duration::from_millis(15));
+                    serde_json::json!({
+                        "ok": model.is_some(),
+                        "model_owner": model.as_ref().copied(),
+                    })
                 },
                 "lifecycle-test",
             )
@@ -1436,6 +1944,7 @@ mod tests {
                     &endpoint,
                     serde_json::json!({"op": "status"}),
                     Duration::from_millis(250),
+                    4096,
                     4096,
                 ),
                 RequestOutcome::Response(_)
@@ -1459,22 +1968,39 @@ mod tests {
                     serde_json::json!({"op": "infer"}),
                     Duration::from_secs(5),
                     4096,
+                    4096,
                 )
             }));
         }
         barrier.wait();
-        let mut responses = 0usize;
-        let mut unavailable = 0usize;
+        let mut model_owners = std::collections::BTreeSet::new();
         for client in clients {
             match client.join().expect("client thread") {
-                RequestOutcome::Response(_) => responses += 1,
-                RequestOutcome::NoDaemon | RequestOutcome::Failed => unavailable += 1,
+                RequestOutcome::Response(value) if value["ok"] == true => {
+                    model_owners.insert(
+                        value["model_owner"]
+                            .as_u64()
+                            .expect("successful response identifies its model owner"),
+                    );
+                }
+                RequestOutcome::Response(value) => {
+                    panic!("client received error response: {value}")
+                }
+                RequestOutcome::DaemonBusy | RequestOutcome::NoDaemon | RequestOutcome::Failed => {
+                    panic!("live daemon lost a client request")
+                }
             }
         }
-        assert_eq!(unavailable, 0, "live daemon lost client connections");
-        assert_eq!(responses, 32);
+        assert_eq!(model_owners, std::collections::BTreeSet::from([1]));
         assert_eq!(loads.load(Ordering::SeqCst), 1);
-        assert!(handled.load(Ordering::SeqCst) > 0);
+        assert_eq!(handled.load(Ordering::SeqCst), 32);
+        assert!(
+            diagnostic(&endpoint)["rejected_requests"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "test did not exercise retryable capacity responses"
+        );
 
         let evict_deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -1493,6 +2019,7 @@ mod tests {
                 &endpoint,
                 serde_json::json!({"op": "infer"}),
                 Duration::from_secs(3),
+                4096,
                 4096,
             ),
             RequestOutcome::Response(ref value) if value["ok"] == true
@@ -1544,6 +2071,7 @@ mod tests {
                 &endpoint,
                 serde_json::json!({"op": "infer"}),
                 Duration::from_secs(1),
+                4096,
                 4096,
             ),
             RequestOutcome::Response(ref value) if value["ok"] == true
@@ -1609,6 +2137,7 @@ mod tests {
                     serde_json::json!({"op": "infer"}),
                     Duration::from_secs(3),
                     4096,
+                    4096,
                 )
             }));
         }
@@ -1616,14 +2145,12 @@ mod tests {
 
         let mut completed = 0usize;
         let mut deadline_rejections = 0usize;
-        let mut capacity_rejections = 0usize;
         for client in clients {
             let RequestOutcome::Response(value) = client.join().expect("queue client") else {
                 panic!("live queue server lost a client");
             };
             match value.get("error").and_then(serde_json::Value::as_str) {
                 Some("deadline exceeded") => deadline_rejections += 1,
-                Some("inference queue full" | "daemon busy") => capacity_rejections += 1,
                 Some(other) => panic!("unexpected queue response: {other}"),
                 None if value["ok"] == true => completed += 1,
                 None => panic!("unexpected queue response: {value}"),
@@ -1631,7 +2158,13 @@ mod tests {
         }
         assert!(completed >= 1);
         assert!(deadline_rejections >= 1);
-        assert!(capacity_rejections >= 1);
+        assert_eq!(completed + deadline_rejections, 20);
+        assert!(
+            diagnostic(&endpoint)["rejected_requests"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         assert_eq!(server.join().expect("queue server"), 0);
     }
@@ -1701,10 +2234,12 @@ mod tests {
                 serde_json::json!({"op": "infer"}),
                 Duration::from_secs(1),
                 4096,
+                4096,
             ),
             RequestOutcome::Failed | RequestOutcome::NoDaemon
         ));
         assert_eq!(hung.wait().expect("reap watchdog daemon").code(), Some(70));
+        assert!(cooldown_active(&endpoint));
 
         let mut replacement = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
@@ -1721,6 +2256,7 @@ mod tests {
                 &endpoint,
                 serde_json::json!({"op": "infer"}),
                 Duration::from_secs(1),
+                4096,
                 4096,
             ),
             RequestOutcome::Response(ref value) if value["ok"] == true
@@ -1758,8 +2294,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(status.code(), Some(70));
+        assert!(cooldown_active(&endpoint));
         #[cfg(unix)]
         let _ = std::fs::remove_file(endpoint.address());
+        let _ = std::fs::remove_file(endpoint.cooldown_path());
     }
 
     #[test]
@@ -1792,6 +2330,7 @@ mod tests {
                 serde_json::json!({"op": "infer"}),
                 Duration::from_secs(1),
                 4096,
+                4096,
             ),
             RequestOutcome::Response(ref value) if value["ok"] == true
         ));
@@ -1810,6 +2349,7 @@ mod tests {
                     serde_json::json!({"op": "status"}),
                     Duration::from_millis(250),
                     4096,
+                    4096,
                 ),
                 RequestOutcome::Response(_)
             ) {
@@ -1824,7 +2364,14 @@ mod tests {
     #[test]
     fn frame_reader_rejects_oversize_and_slow_clients() {
         let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        writer.write_all(b"12345\n").unwrap();
+        writer.write_all(b"1234\n").unwrap();
+        assert_eq!(
+            read_frame(&mut TransportStream(reader), 5, Duration::from_millis(100)).unwrap(),
+            "1234"
+        );
+
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(b"1234\n").unwrap();
         let error =
             read_frame(&mut TransportStream(reader), 4, Duration::from_millis(100)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

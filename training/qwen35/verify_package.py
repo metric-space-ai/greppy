@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import re
@@ -11,6 +12,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+AUDIT_SUMMARY = ROOT / "audit-summary-2026-07-13.json"
+AUDIT_REPORT = ROOT / "audit-report-2026-07-13.json.gz"
 
 
 def sha256(path: Path) -> str:
@@ -65,6 +68,85 @@ def scan_secrets(files: list[Path]) -> None:
                 raise ValueError(f"possible {label} in {path.relative_to(ROOT)}")
 
 
+def verify_published_audit() -> None:
+    summary = json.loads(AUDIT_SUMMARY.read_text(encoding="utf-8"))
+    publication = summary.get("published_full_report")
+    if summary.get("full_report_published") is not True or not isinstance(publication, dict):
+        raise ValueError("published full audit declaration is missing")
+    if publication.get("path") != "training/qwen35/audit-report-2026-07-13.json.gz":
+        raise ValueError("published full audit path is not canonical")
+
+    compressed = AUDIT_REPORT.read_bytes()
+    if len(compressed) != publication.get("compressed_size"):
+        raise ValueError("published full audit compressed size mismatch")
+    if hashlib.sha256(compressed).hexdigest() != publication.get("compressed_sha256"):
+        raise ValueError("published full audit compressed digest mismatch")
+    try:
+        raw = gzip.decompress(compressed)
+    except OSError as exc:
+        raise ValueError(f"published full audit is not valid gzip: {exc}") from exc
+    if len(raw) != publication.get("uncompressed_size"):
+        raise ValueError("published full audit uncompressed size mismatch")
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    if raw_digest != publication.get("uncompressed_sha256"):
+        raise ValueError("published full audit uncompressed digest mismatch")
+    if raw_digest != summary.get("full_private_report_sha256"):
+        raise ValueError("published full audit does not match the private audit anchor")
+
+    try:
+        report = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"published full audit JSON is invalid: {exc}") from exc
+    expected_keys = {
+        "aggregate_sha256",
+        "disclosure",
+        "holdout_denylist",
+        "language_histogram",
+        "license_histogram",
+        "prompt_version",
+        "repository_histogram",
+        "row_histogram",
+        "schema_version",
+    }
+    if set(report) != expected_keys:
+        raise ValueError("published full audit contains unexpected fields")
+    if report.get("schema_version") != "greppy.qwen35-sft-audit.v1":
+        raise ValueError("published full audit schema mismatch")
+    if report.get("disclosure") != "No source text or generated labels are included in this report.":
+        raise ValueError("published full audit disclosure mismatch")
+    if report.get("aggregate_sha256") != summary.get("aggregate_row_sha256"):
+        raise ValueError("published full audit aggregate digest mismatch")
+    if report.get("prompt_version") != summary.get("prompt_version"):
+        raise ValueError("published full audit prompt version mismatch")
+    if report.get("holdout_denylist") != summary.get("summary_quality_holdout"):
+        raise ValueError("published full audit holdout result mismatch")
+    if report.get("language_histogram") != summary.get("languages"):
+        raise ValueError("published full audit language histogram mismatch")
+
+    repositories = report.get("repository_histogram")
+    licenses = report.get("license_histogram")
+    rows = report.get("row_histogram")
+    if not isinstance(repositories, dict) or len(repositories) != summary.get("repository_count"):
+        raise ValueError("published full audit repository histogram mismatch")
+    if not isinstance(licenses, dict) or len(licenses) != summary.get("license_combination_count"):
+        raise ValueError("published full audit license histogram mismatch")
+    if not isinstance(rows, dict):
+        raise ValueError("published full audit row histogram is missing")
+    for field, expected in summary.get("rows", {}).items():
+        if rows.get(field) != expected:
+            raise ValueError(f"published full audit row count mismatch: {field}")
+    for label, histogram in (("repository", repositories), ("license", licenses)):
+        if any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count <= 0
+            for key, count in histogram.items()
+        ):
+            raise ValueError(f"published full audit {label} histogram is invalid")
+
+
 def main() -> int:
     try:
         source_scripts = verify_manifest("SOURCE_SCRIPTS.sha256")
@@ -87,6 +169,7 @@ def main() -> int:
 
         for name in ("environment.lock.json", "provenance.json"):
             json.loads((ROOT / name).read_text(encoding="utf-8"))
+        verify_published_audit()
         scan_secrets(sorted(actual_files | {(ROOT / "MANIFEST.sha256").resolve()}))
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         print(f"package verification failed: {exc}", file=sys.stderr)

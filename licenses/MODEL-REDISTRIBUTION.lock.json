@@ -89,13 +89,13 @@
       "provenance": [
         {
           "path": "licenses/QWEN3.5-PROVENANCE.json",
-          "sha256": "18204ad4a24a6be6725558b6691c97fe50103b7491dd7ea7389b3851f563448c",
-          "size": 3363
+          "sha256": "51765fea5f302dfb620155bf1e5252a88bb59efdc29e126b88ffc5b68d1a4637",
+          "size": 3695
         },
         {
           "path": "licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json",
-          "sha256": "c2948b9edf13cb192f8295c21881960c9800af50f7caa11ac3fbf238deafaed4",
-          "size": 1442
+          "sha256": "8d97e2e8a7cea19d88d80aec63d0a54da5ade48eb4dba193490787fe5f95dbf6",
+          "size": 1662
         }
       ],
       "modifications": [
@@ -103,6 +103,28 @@
           "path": "licenses/QWEN3.5-MODIFICATIONS.txt",
           "sha256": "48188574d0b292a1191f16c00c8a9d8e671999b56f9930cc96f9d758fef24018",
           "size": 947
+        }
+      ],
+      "evidence": [
+        {
+          "path": "training/qwen35/audit-summary-2026-07-13.json",
+          "sha256": "56167e023963bc41050b2903a5078cd2851c0d17c4c639bb45924411377e1162",
+          "size": 1685
+        },
+        {
+          "path": "training/qwen35/audit-report-2026-07-13.json.gz",
+          "sha256": "aed01649bbf9d671c7a225d6ce684c85f3ac8a6b20a678920591094cbd3b1286",
+          "size": 762668
+        },
+        {
+          "path": "training/qwen35/provenance.json",
+          "sha256": "bf3dd2764dfba924dcf82078be9e76543949386164d1ea5b4f71e0b63bf87b91",
+          "size": 3104
+        },
+        {
+          "path": "training/qwen35/MANIFEST.sha256",
+          "sha256": "f9a2cf8cc8a0a7603ff16fb3b113838df0ed80505167551a043ada328653fff7",
+          "size": 1676
         }
       ]
     }

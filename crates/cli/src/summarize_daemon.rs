@@ -59,26 +59,27 @@ pub(super) fn summarize_source_via_daemon(
     let endpoint = endpoint(model_key)?;
     match request_brief(&endpoint, model_key, source) {
         RequestOutcome::Response(summary) => return Some(summary),
-        RequestOutcome::Failed => {
+        RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
             report_explicit_backend_failure(cfg, "daemon request failed");
             return None;
         }
         RequestOutcome::NoDaemon => {}
     }
 
-    let _ = inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
+    let spawn_outcome =
+        inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
     for delay in inference_daemon::retry_delays() {
         std::thread::sleep(delay);
         match request_brief(&endpoint, model_key, source) {
             RequestOutcome::Response(summary) => return Some(summary),
-            RequestOutcome::Failed => {
+            RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
                 report_explicit_backend_failure(cfg, "daemon request failed after restart");
                 return None;
             }
             RequestOutcome::NoDaemon => {}
         }
     }
-    inference_daemon::record_spawn_failure(&endpoint);
+    inference_daemon::record_spawn_failure(&endpoint, spawn_outcome.attempted());
     report_explicit_backend_failure(cfg, "daemon did not become ready");
     None
 }
@@ -96,26 +97,27 @@ pub(super) fn triage_spans_via_daemon(
     let endpoint = endpoint(model_key)?;
     match request_triage(&endpoint, model_key, query, spans) {
         RequestOutcome::Response(verdicts) => return Some(verdicts),
-        RequestOutcome::Failed => {
+        RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
             report_explicit_backend_failure(cfg, "triage daemon request failed");
             return None;
         }
         RequestOutcome::NoDaemon => {}
     }
 
-    let _ = inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
+    let spawn_outcome =
+        inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
     for delay in inference_daemon::retry_delays() {
         std::thread::sleep(delay);
         match request_triage(&endpoint, model_key, query, spans) {
             RequestOutcome::Response(verdicts) => return Some(verdicts),
-            RequestOutcome::Failed => {
+            RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
                 report_explicit_backend_failure(cfg, "triage daemon request failed after restart");
                 return None;
             }
             RequestOutcome::NoDaemon => {}
         }
     }
-    inference_daemon::record_spawn_failure(&endpoint);
+    inference_daemon::record_spawn_failure(&endpoint, spawn_outcome.attempted());
     report_explicit_backend_failure(cfg, "triage daemon did not become ready");
     None
 }
@@ -149,7 +151,13 @@ fn request_brief(
         "mode": "brief",
         "source": source,
     });
-    match inference_daemon::request(endpoint, request, CLIENT_READ_TIMEOUT, MAX_RESPONSE_BYTES) {
+    match inference_daemon::request(
+        endpoint,
+        request,
+        CLIENT_READ_TIMEOUT,
+        MAX_REQUEST_BYTES,
+        MAX_RESPONSE_BYTES,
+    ) {
         RequestOutcome::Response(response) => {
             if response.get("error").is_some() {
                 return RequestOutcome::Failed;
@@ -171,6 +179,7 @@ fn request_brief(
             }
         }
         RequestOutcome::NoDaemon => RequestOutcome::NoDaemon,
+        RequestOutcome::DaemonBusy => RequestOutcome::DaemonBusy,
         RequestOutcome::Failed => RequestOutcome::Failed,
     }
 }
@@ -198,6 +207,7 @@ fn request_triage(
         endpoint,
         request,
         TRIAGE_CLIENT_READ_TIMEOUT,
+        MAX_REQUEST_BYTES,
         MAX_RESPONSE_BYTES,
     ) {
         RequestOutcome::Response(response) => {
@@ -241,6 +251,7 @@ fn request_triage(
             RequestOutcome::Response(verdicts)
         }
         RequestOutcome::NoDaemon => RequestOutcome::NoDaemon,
+        RequestOutcome::DaemonBusy => RequestOutcome::DaemonBusy,
         RequestOutcome::Failed => RequestOutcome::Failed,
     }
 }

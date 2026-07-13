@@ -1,0 +1,131 @@
+name: function summary quality release gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  quality:
+    name: 204 pinned real functions
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          lfs: true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Verify bundled inference assets
+        run: |
+          git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-mtp-q4km/*'
+          python3 tools/verify_model_redistribution.py
+
+      - name: Build candidate binary with Metal
+        run: cargo build --release --bin greppy --features metal
+
+      - name: Materialize pinned quality repositories
+        run: |
+          python3 bench/agent_efficiency/real_corpus.py setup \
+            --repos serde flask gson zod tokio hugo
+
+      - name: Run real product summaries
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-summary-quality
+        run: |
+          mkdir -p "$RUN_DIR/store"
+          python3 bench/summary_quality.py run \
+            --binary "$GITHUB_WORKSPACE/target/release/greppy" \
+            --device metal \
+            --store-dir "$RUN_DIR/store" \
+            --cases bench/summary_quality/cases_v1.json \
+            --output "$RUN_DIR/results.json"
+
+      - name: Judge and enforce the registered gate
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          RUN_DIR: ${{ runner.temp }}/greppy-summary-quality
+        run: |
+          test -n "$MINIMAX_API_KEY"
+          python3 bench/summary_quality.py judge \
+            --cases bench/summary_quality/cases_v1.json \
+            --results "$RUN_DIR/results.json" \
+            --output "$RUN_DIR/judgments.json"
+          python3 bench/summary_quality.py gate \
+            --cases bench/summary_quality/cases_v1.json \
+            --results "$RUN_DIR/results.json" \
+            --judgments "$RUN_DIR/judgments.json" \
+            --output "$RUN_DIR/gate.json"
+
+      - name: Package digest-bound public evidence
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-summary-quality
+        run: |
+          binary_sha="$(shasum -a 256 target/release/greppy | awk '{print $1}')"
+          cases_sha="$(shasum -a 256 bench/summary_quality/cases_v1.json | awk '{print $1}')"
+          results_sha="$(shasum -a 256 "$RUN_DIR/results.json" | awk '{print $1}')"
+          judgments_sha="$(shasum -a 256 "$RUN_DIR/judgments.json" | awk '{print $1}')"
+          gate_sha="$(shasum -a 256 "$RUN_DIR/gate.json" | awk '{print $1}')"
+
+          test "$(jq -r .schema_version "$RUN_DIR/gate.json")" = greppy.summary-quality-gate.v1
+          test "$(jq -r .passed "$RUN_DIR/gate.json")" = true
+          test "$(jq -r .binary_sha256 "$RUN_DIR/results.json")" = "$binary_sha"
+          test "$(jq -r .cases_sha256 "$RUN_DIR/results.json")" = "$cases_sha"
+          test "$(jq -r .cases_sha256 "$RUN_DIR/judgments.json")" = "$cases_sha"
+          test "$(jq -r .results_sha256 "$RUN_DIR/judgments.json")" = "$results_sha"
+
+          jq -n \
+            --arg git_commit "$GITHUB_SHA" \
+            --arg binary_sha256 "$binary_sha" \
+            --arg cases_sha256 "$cases_sha" \
+            --arg results_sha256 "$results_sha" \
+            --arg judgments_sha256 "$judgments_sha" \
+            --arg gate_sha256 "$gate_sha" \
+            --arg summary_prompt_version "$(jq -r '.records[0].summary_prompt_version' "$RUN_DIR/results.json")" \
+            --arg judge_prompt_version "$(jq -r .judge_prompt_version "$RUN_DIR/judgments.json")" \
+            --argjson gate "$(cat "$RUN_DIR/gate.json")" \
+            '{
+              schema_version: "greppy.summary-quality-evidence.v1",
+              git_commit: $git_commit,
+              binary_sha256: $binary_sha256,
+              cases_sha256: $cases_sha256,
+              results_sha256: $results_sha256,
+              judgments_sha256: $judgments_sha256,
+              gate_sha256: $gate_sha256,
+              summary_prompt_version: $summary_prompt_version,
+              judge_prompt_version: $judge_prompt_version,
+              raw_traces_published: false,
+              gate: $gate
+            }' > "$RUN_DIR/MANIFEST.json"
+
+          mkdir -p publish
+          cp "$RUN_DIR/MANIFEST.json" \
+             "$RUN_DIR/results.json" \
+             "$RUN_DIR/judgments.json" \
+             "$RUN_DIR/gate.json" \
+             publish/
+          tar -C publish -czf greppy-summary-quality.tar.gz .
+          shasum -a 256 greppy-summary-quality.tar.gz > greppy-summary-quality.tar.gz.sha256
+
+      - name: Attest summary-quality evidence
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: greppy-summary-quality.tar.gz
+
+      - name: Upload summary-quality evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-summary-quality-${{ github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            greppy-summary-quality.tar.gz
+            greppy-summary-quality.tar.gz.sha256

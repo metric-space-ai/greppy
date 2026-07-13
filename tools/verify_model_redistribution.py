@@ -13,7 +13,8 @@ Version 1 has this shape::
         "assets": [{"path": "...", "sha256": "...", "size": 123}],
         "license": [{"path": "...", "sha256": "...", "size": 123}],
         "provenance": [{"path": "...", "sha256": "...", "size": 123}],
-        "modifications": [{"path": "...", "sha256": "...", "size": 123}]
+        "modifications": [{"path": "...", "sha256": "...", "size": 123}],
+        "evidence": [{"path": "...", "sha256": "...", "size": 123}]
       }]
     }
 
@@ -37,6 +38,7 @@ VERSION = 1
 DEFAULT_LOCK = Path(__file__).resolve().parents[1] / "licenses" / "MODEL-REDISTRIBUTION.lock.json"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _FILE_SECTIONS = ("assets", "license", "provenance", "modifications")
+_OPTIONAL_FILE_SECTIONS = ("evidence",)
 _PROVENANCE_SCHEMAS = {
     "greppy.model-provenance.v1",
     "greppy.training-data-manifest.v1",
@@ -170,6 +172,17 @@ def _verify_release_provenance(entry: object, label: str, root: Path, errors: li
         errors.append(f"release gate: provenance {relative_path} has an unsupported schema_version")
     if document.get("release_ready") is not True:
         errors.append(f"release gate: provenance {relative_path} is not release_ready")
+    blockers = document.get("release_blockers", [])
+    if not isinstance(blockers, list) or any(
+        not isinstance(blocker, str) or not blocker.strip() for blocker in blockers
+    ):
+        errors.append(
+            f"release gate: provenance {relative_path} has invalid release_blockers"
+        )
+    elif blockers:
+        errors.append(
+            f"release gate: provenance {relative_path} is release_ready but still has blockers"
+        )
 
 
 def _load_model_provenance(
@@ -311,6 +324,13 @@ def verify_lock(lock_path: Path, root: Path, *, release: bool = False) -> list[s
         errors.append("release_ready must be a boolean")
     elif release and not global_ready:
         errors.append("release gate: global release_ready is false")
+    release_blockers = manifest.get("release_blockers", [])
+    if not isinstance(release_blockers, list) or any(
+        not isinstance(blocker, str) or not blocker.strip() for blocker in release_blockers
+    ):
+        errors.append("release_blockers must be an array of non-empty strings")
+    elif global_ready is True and release_blockers:
+        errors.append("release_ready is true but release_blockers is not empty")
 
     models = manifest.get("models")
     if not isinstance(models, list) or not models:
@@ -340,6 +360,9 @@ def verify_lock(lock_path: Path, root: Path, *, release: bool = False) -> list[s
 
         for section in _FILE_SECTIONS:
             _verify_file_section(model, section, model_label, root, errors)
+        for section in _OPTIONAL_FILE_SECTIONS:
+            if section in model:
+                _verify_file_section(model, section, model_label, root, errors)
         _verify_embeddinggemma_reproduction(model, model_label, root, errors)
         if release and isinstance(model.get("provenance"), list):
             for provenance_index, entry in enumerate(model["provenance"]):
