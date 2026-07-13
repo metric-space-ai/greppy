@@ -25,6 +25,7 @@ const MAX_DERIVED_DEF_LINES: usize = 400;
 /// serial path exactly.
 const DEFAULT_EMBED_BATCH: usize = 16;
 const EMBED_BATCH_ENV: &str = "GREPPY_EMBED_BATCH";
+const EMBED_SCHEDULE_BATCHES: usize = 16;
 
 fn embed_batch_size() -> usize {
     parse_embed_batch_size(std::env::var(EMBED_BATCH_ENV).ok().as_deref())
@@ -35,6 +36,12 @@ fn parse_embed_batch_size(value: Option<&str>) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_EMBED_BATCH)
+}
+
+fn embed_schedule_window(batch_size: usize) -> usize {
+    batch_size
+        .saturating_mul(EMBED_SCHEDULE_BATCHES)
+        .max(batch_size)
 }
 
 /// Provider interface used by the indexer to embed real code spans.
@@ -163,10 +170,11 @@ pub fn index_code_embeddings_for_project(
     let mut offset = 0usize;
 
     let batch_size = embed_batch_size();
+    let schedule_window = embed_schedule_window(batch_size);
     // Candidate documents accumulated until a full batch is ready. Owned
     // `title`/`chunk` (already owned by construction) plus the whole `Node`
     // so the exact upsert fields are preserved on flush.
-    let mut pending: Vec<PendingDoc> = Vec::with_capacity(batch_size);
+    let mut pending: Vec<PendingDoc> = Vec::with_capacity(schedule_window);
     let mut embedding_batch_failed = false;
 
     loop {
@@ -257,11 +265,12 @@ pub fn index_code_embeddings_for_project(
                     prompt_token_len: provider.document_token_len(Some(&title), &chunk.text)?,
                     chunk,
                 });
-                if pending.len() >= batch_size {
+                if pending.len() >= schedule_window {
                     let flush = flush_embedding_batch(
                         store,
                         provider,
                         options.graph_generation,
+                        batch_size,
                         &mut pending,
                     )?;
                     report.nodes_embedded += flush.written;
@@ -272,7 +281,13 @@ pub fn index_code_embeddings_for_project(
     }
 
     if !pending.is_empty() {
-        let flush = flush_embedding_batch(store, provider, options.graph_generation, &mut pending)?;
+        let flush = flush_embedding_batch(
+            store,
+            provider,
+            options.graph_generation,
+            batch_size,
+            &mut pending,
+        )?;
         report.nodes_embedded += flush.written;
         embedding_batch_failed |= flush.failed;
     }
@@ -314,49 +329,38 @@ struct FlushEmbeddingBatchReport {
     failed: bool,
 }
 
-/// Embed every buffered document in `pending` in length-bucketed inference calls
+/// Embed every buffered document in `pending` in length-sorted inference calls
 /// and upsert the resulting vectors, then empty the buffer.
 ///
 /// This preserves the exact per-node upsert fields of the old serial path — the
-/// only change is that each `vector` comes from a batch whose prompt lengths are
-/// in the same power-of-two range. The pending window remains capped by the
-/// configured batch size, so bucketing does not allow memory to grow with the
-/// number of token-length ranges.
+/// only change is that each `vector` comes from a full batch of nearby prompt
+/// lengths. The scheduling window is bounded independently of repository size,
+/// avoiding both pathological padding and unbounded source retention.
 fn flush_embedding_batch(
     store: &mut Store,
     provider: &mut dyn CodeEmbeddingProvider,
     graph_generation: u64,
+    batch_size: usize,
     pending: &mut Vec<PendingDoc>,
 ) -> Result<FlushEmbeddingBatchReport> {
     if pending.is_empty() {
         return Ok(FlushEmbeddingBatchReport::default());
     }
 
-    pending.sort_by_key(|doc| prompt_token_length_bucket(doc.prompt_token_len));
+    pending.sort_by_key(|doc| doc.prompt_token_len);
     let mut report = FlushEmbeddingBatchReport::default();
     while !pending.is_empty() {
-        let bucket = prompt_token_length_bucket(pending[0].prompt_token_len);
-        let bucket_len = pending
-            .iter()
-            .take_while(|doc| prompt_token_length_bucket(doc.prompt_token_len) == bucket)
-            .count();
-        let mut bucket_docs = pending.drain(..bucket_len).collect::<Vec<_>>();
+        let batch_len = pending.len().min(batch_size);
+        let mut batch_docs = pending.drain(..batch_len).collect::<Vec<_>>();
         let bucket_report =
-            flush_same_length_bucket(store, provider, graph_generation, &mut bucket_docs)?;
+            flush_length_sorted_batch(store, provider, graph_generation, &mut batch_docs)?;
         report.written += bucket_report.written;
         report.failed |= bucket_report.failed;
     }
     Ok(report)
 }
 
-fn prompt_token_length_bucket(token_len: usize) -> usize {
-    token_len
-        .max(1)
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX)
-}
-
-fn flush_same_length_bucket(
+fn flush_length_sorted_batch(
     store: &mut Store,
     provider: &mut dyn CodeEmbeddingProvider,
     graph_generation: u64,
@@ -1843,12 +1847,12 @@ pub fn next_definition() {
     }
 
     #[test]
-    fn dissimilar_prompt_lengths_use_separate_batches_and_keep_node_vectors() {
+    fn dissimilar_prompt_lengths_are_sorted_into_nearby_batches() {
         let root = tempdir_via_env();
         std::fs::create_dir_all(root.join("src")).unwrap();
         let mut src = String::new();
         let mut spans = Vec::new();
-        for i in 0..DEFAULT_EMBED_BATCH {
+        for i in 0..(DEFAULT_EMBED_BATCH * 2) {
             let start_line = src.lines().count() as i64 + 1;
             src.push_str(&format!("pub fn varied_{i}() {{\n"));
             let body_lines = if i % 2 == 0 { 1 } else { 32 };
@@ -1888,34 +1892,23 @@ pub fn next_definition() {
             EmbeddingIndexOptions::for_generation(8),
         )
         .unwrap();
-        assert_eq!(report.nodes_embedded, DEFAULT_EMBED_BATCH);
+        assert_eq!(report.nodes_embedded, DEFAULT_EMBED_BATCH * 2);
 
         let batches = batch_prompt_lengths.borrow();
         assert_eq!(
             batches.iter().map(Vec::len).sum::<usize>(),
-            DEFAULT_EMBED_BATCH
+            DEFAULT_EMBED_BATCH * 2
         );
-        assert!(
-            batches.len() >= 2,
-            "expected separate length buckets: {batches:?}"
-        );
+        assert_eq!(batches.len(), 2, "expected two full batches: {batches:?}");
         for lengths in batches.iter() {
-            let bucket = prompt_token_length_bucket(lengths[0]);
             assert!(
-                lengths
-                    .iter()
-                    .all(|&length| prompt_token_length_bucket(length) == bucket),
-                "one forward mixed prompt-length buckets: {lengths:?}"
+                lengths.windows(2).all(|pair| pair[0] <= pair[1]),
+                "one forward was not sorted by prompt length: {lengths:?}"
             );
         }
-        let distinct_buckets = batches
-            .iter()
-            .flat_map(|lengths| lengths.iter().copied())
-            .map(prompt_token_length_bucket)
-            .collect::<std::collections::HashSet<_>>();
         assert!(
-            distinct_buckets.len() >= 2,
-            "test inputs were not sufficiently dissimilar: {batches:?}"
+            batches[0].last().unwrap() < batches[1].first().unwrap(),
+            "short and long prompts were mixed across forwards: {batches:?}"
         );
 
         for &(i, start_line, end_line) in &spans {
