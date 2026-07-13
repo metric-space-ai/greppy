@@ -70,6 +70,11 @@ const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY"
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
 #[cfg(all(debug_assertions, not(feature = "ci-test-assets")))]
 const ENV_TEST_SKIP_INFERENCE: &str = "GREPPY_TEST_SKIP_INFERENCE";
+/// Test-only failpoint: simulate an unavailable embedding backend so tests
+/// can pin the degraded-index contract (graph publishes, embeddings retry
+/// in the background) without a real inference failure.
+#[cfg(debug_assertions)]
+const ENV_TEST_EMBED_UNAVAILABLE: &str = "GREPPY_TEST_EMBED_UNAVAILABLE";
 
 #[cfg(feature = "ci-test-assets")]
 fn test_inference_skipped() -> bool {
@@ -4320,6 +4325,15 @@ impl BackgroundJobGuard {
 
     fn fail(&mut self, error: &Error) {
         self.write_state("failed", Some(&error.to_string()));
+        self.complete = true;
+    }
+
+    /// The snapshot published but the embedding pass is incomplete
+    /// (inference failure). The background record keeps the `failed`
+    /// state with the degradation reason so the next semantic query
+    /// retries the remaining vectors; the published graph stays live.
+    fn degraded(&mut self, reason: &str) {
+        self.write_state("failed", Some(reason));
         self.complete = true;
     }
 }
@@ -13032,7 +13046,7 @@ fn dispatch_index(
     }
     if let Some(embedding_report) = &snapshot.embeddings {
         println!(
-            "embedded {} code spans ({} reused, {} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} stale pruned)",
+            "embedded {} code spans ({} reused, {} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} failed, {} stale pruned)",
             embedding_report.nodes_embedded,
             embedding_report.nodes_reused,
             embedding_report.nodes_considered,
@@ -13040,6 +13054,7 @@ fn dispatch_index(
             embedding_report.nodes_skipped_missing_file,
             embedding_report.nodes_skipped_invalid_span,
             embedding_report.nodes_skipped_oversize,
+            embedding_report.nodes_failed,
             embedding_report.stale_rows_pruned
         );
     }
@@ -13051,10 +13066,24 @@ fn dispatch_index(
         );
     }
     retire_verified_legacy_store(&effective_root);
-    background_job.complete();
+    match snapshot.embedding_degraded.as_deref() {
+        // Degraded embeddings never cost the caller the published graph
+        // snapshot: record the reason (background job record / stderr) and
+        // let the background embed path finish the remaining vectors.
+        Some(reason) => background_job.degraded(reason),
+        None => background_job.complete(),
+    }
     let embedding_deferred = snapshot.embedding_deferred;
     drop(_lock);
     drop(_lifecycle);
+    if let Some(reason) = snapshot.embedding_degraded.as_deref() {
+        // No immediate respawn: a broken backend would fail the same way
+        // again. The next semantic query re-attempts through the existing
+        // background-embed path and reuses every vector that DID embed.
+        eprintln!(
+            "greppy index: embedding generation degraded ({reason}); the graph index is published and complete; the next semantic query retries the remaining embeddings."
+        );
+    }
     if embedding_deferred {
         if let Some(cfg) = embedding_config.as_ref() {
             let effective_root_string = effective_root.to_string_lossy().into_owned();
@@ -13355,6 +13384,26 @@ struct IndexSnapshotReport {
     index: greppy_indexer::IndexReport,
     embeddings: Option<greppy_indexer::EmbeddingIndexReport>,
     embedding_deferred: bool,
+    /// Set when embedding inference failed (model load or at least one
+    /// batch): the graph snapshot is still published, the completeness
+    /// stamp is withheld, and the background embed path finishes the
+    /// remaining vectors. Vectors are enrichment — their failure must
+    /// never cost the caller the graph index (nor the vectors that DID
+    /// embed).
+    embedding_degraded: Option<String>,
+}
+
+/// Outcome of the inline embedding pass over the freshly built temp store.
+///
+/// `Degraded` covers inference-side failures (embedding model unavailable,
+/// failed batches). Store/IO errors keep propagating as `Err`: a store that
+/// cannot be written cannot be published either.
+enum EmbeddingBuildOutcome {
+    Complete(greppy_indexer::EmbeddingIndexReport),
+    Degraded {
+        report: Option<greppy_indexer::EmbeddingIndexReport>,
+        reason: String,
+    },
 }
 
 fn index_atomic_snapshot(
@@ -13429,6 +13478,7 @@ fn index_atomic_snapshot_attempt(
             index: report,
             embeddings: None,
             embedding_deferred: false,
+            embedding_degraded: None,
         }));
     }
 
@@ -13437,26 +13487,28 @@ fn index_atomic_snapshot_attempt(
             && greppy_indexer::count_embedding_candidate_nodes(&temp_store, project)
                 .is_ok_and(|count| should_defer_embedding(cfg, count))
     });
-    let embedding_report = if let Some(cfg) = embedding_config.filter(|_| !embedding_deferred) {
-        match index_embeddings_into_temp_store(
-            &mut temp_store,
-            target,
-            project,
-            cfg,
-            &report,
-            active_path.parent().map(std::path::Path::to_path_buf),
-            background_job,
-        ) {
-            Ok(report) => Some(report),
-            Err(e) => {
-                drop(temp_store);
-                let _ = cleanup_sqlite_family(&temp_path);
-                return Err(e);
+    let (embedding_report, embedding_degraded) =
+        if let Some(cfg) = embedding_config.filter(|_| !embedding_deferred) {
+            match index_embeddings_into_temp_store(
+                &mut temp_store,
+                target,
+                project,
+                cfg,
+                &report,
+                active_path.parent().map(std::path::Path::to_path_buf),
+                background_job,
+            ) {
+                Ok(EmbeddingBuildOutcome::Complete(report)) => (Some(report), None),
+                Ok(EmbeddingBuildOutcome::Degraded { report, reason }) => (report, Some(reason)),
+                Err(e) => {
+                    drop(temp_store);
+                    let _ = cleanup_sqlite_family(&temp_path);
+                    return Err(e);
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            (None, None)
+        };
 
     checkpoint_store(&temp_store, &temp_path)?;
     temp_store.integrity_check().map_err(|e| {
@@ -13496,6 +13548,7 @@ fn index_atomic_snapshot_attempt(
         index: report,
         embeddings: embedding_report,
         embedding_deferred,
+        embedding_degraded,
     }))
 }
 
@@ -13523,7 +13576,14 @@ fn index_embeddings_into_temp_store(
     report: &greppy_indexer::IndexReport,
     tokenizer_cache_dir: Option<std::path::PathBuf>,
     mut background_job: Option<&mut BackgroundJobGuard>,
-) -> Result<greppy_indexer::EmbeddingIndexReport> {
+) -> Result<EmbeddingBuildOutcome> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(ENV_TEST_EMBED_UNAVAILABLE).is_some() {
+        return Ok(EmbeddingBuildOutcome::Degraded {
+            report: None,
+            reason: "test failpoint: embedding backend unavailable".into(),
+        });
+    }
     if let Some(job) = background_job.as_deref_mut() {
         job.embedding_loading();
     }
@@ -13531,9 +13591,10 @@ fn index_embeddings_into_temp_store(
         Ok(model) => model,
         Err(e) => {
             log_embedding_skip_once("index --embeddings", &e);
-            return Err(Error::Store(format!(
-                "embedding model load failed; snapshot is incomplete: {e}"
-            )));
+            return Ok(EmbeddingBuildOutcome::Degraded {
+                report: None,
+                reason: format!("embedding model load failed: {e}"),
+            });
         }
     };
     let mut provider = greppy_indexer::EmbeddingGemmaCodeProvider::new(&cfg.model_id, &model);
@@ -13562,6 +13623,23 @@ fn index_embeddings_into_temp_store(
             options,
         )?
     };
+    if !embedding_report.is_complete() {
+        // The completeness stamp is deliberately withheld: the next
+        // semantic query (or the spawned background job) re-runs the
+        // embedding pass, reusing every vector that DID embed by content
+        // hash and retrying only the failed documents.
+        let reason = format!(
+            "{} of {} embedding documents failed inference",
+            embedding_report.nodes_failed,
+            embedding_report
+                .nodes_failed
+                .saturating_add(embedding_report.nodes_embedded)
+        );
+        return Ok(EmbeddingBuildOutcome::Degraded {
+            report: Some(embedding_report),
+            reason,
+        });
+    }
     let key = embedding_complete_key(project);
     store
         .conn()
@@ -13571,7 +13649,7 @@ fn index_embeddings_into_temp_store(
             rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
         )
         .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
-    Ok(embedding_report)
+    Ok(EmbeddingBuildOutcome::Complete(embedding_report))
 }
 
 fn embedding_complete_key(project: &str) -> String {

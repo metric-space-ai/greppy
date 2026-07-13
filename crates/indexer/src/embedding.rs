@@ -156,6 +156,19 @@ pub struct EmbeddingIndexReport {
     pub nodes_skipped_invalid_span: usize,
     pub nodes_skipped_oversize: usize,
     pub stale_rows_pruned: usize,
+    /// Documents whose embedding inference batch failed. Vectors are
+    /// enrichment on top of the graph: inference failures degrade the
+    /// vector index (retried by the background/lazy embed path) instead
+    /// of failing the build. `> 0` means the vector index is incomplete
+    /// for this generation.
+    pub nodes_failed: usize,
+}
+
+impl EmbeddingIndexReport {
+    /// True when every candidate document got a vector in this pass.
+    pub fn is_complete(&self) -> bool {
+        self.nodes_failed == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -281,7 +294,6 @@ pub fn index_code_embeddings_for_project_with_progress(
     // `title`/`chunk` (already owned by construction) plus the whole `Node`
     // so the exact upsert fields are preserved on flush.
     let mut pending: Vec<PendingDoc> = Vec::with_capacity(schedule_window);
-    let mut embedding_batch_failed = false;
     progress(EmbeddingIndexProgress {
         completed_documents: 0,
         total_documents,
@@ -388,7 +400,7 @@ pub fn index_code_embeddings_for_project_with_progress(
                         &mut pending,
                     )?;
                     report.nodes_embedded += flush.written;
-                    embedding_batch_failed |= flush.failed;
+                    report.nodes_failed += flush.failed_documents;
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
@@ -407,20 +419,20 @@ pub fn index_code_embeddings_for_project_with_progress(
             &mut pending,
         )?;
         report.nodes_embedded += flush.written;
-        embedding_batch_failed |= flush.failed;
+        report.nodes_failed += flush.failed_documents;
         progress(EmbeddingIndexProgress {
             completed_documents: report.nodes_embedded,
             total_documents,
         });
     }
 
-    if embedding_batch_failed {
-        return Err(Error::Store(
-            "embedding generation incomplete: at least one batch failed".into(),
-        ));
-    }
-
-    if options.prune_before_generation {
+    // Inference failures degrade the vector index instead of failing the
+    // whole build: the graph snapshot and every vector that DID embed stay
+    // usable, and the background/lazy embed path re-attempts only the
+    // missing documents (successful vectors are reused by content hash).
+    // Pruning is skipped in that case so prior-generation vectors remain
+    // available both for queries and for reuse on the retry.
+    if options.prune_before_generation && report.is_complete() {
         report.stale_rows_pruned =
             store.prune_vector_embeddings_before_generation(project, options.graph_generation)?;
     }
@@ -448,7 +460,8 @@ struct EmbeddingChunk {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FlushEmbeddingBatchReport {
     written: usize,
-    failed: bool,
+    /// Documents dropped because their inference batch failed.
+    failed_documents: usize,
 }
 
 /// Embed every buffered document in `pending` in length-sorted inference calls
@@ -481,7 +494,7 @@ fn flush_embedding_batch(
         let bucket_report =
             flush_length_sorted_batch(store, provider, graph_generation, &mut batch_docs)?;
         report.written += bucket_report.written;
-        report.failed |= bucket_report.failed;
+        report.failed_documents += bucket_report.failed_documents;
     }
     Ok(report)
 }
@@ -539,10 +552,11 @@ fn flush_length_sorted_batch(
         Ok(vectors) => vectors,
         Err(e) => {
             log_embedding_skip_once(&e);
+            let failed_documents = pending.len();
             pending.clear();
             return Ok(FlushEmbeddingBatchReport {
                 written: 0,
-                failed: true,
+                failed_documents,
             });
         }
     };
@@ -552,10 +566,11 @@ fn flush_length_sorted_batch(
             vectors.len(),
             pending.len()
         )));
+        let failed_documents = pending.len();
         pending.clear();
         return Ok(FlushEmbeddingBatchReport {
             written: 0,
-            failed: true,
+            failed_documents,
         });
     }
     let model_id = provider.model_id().to_string();
@@ -583,7 +598,7 @@ fn flush_length_sorted_batch(
     }
     Ok(FlushEmbeddingBatchReport {
         written,
-        failed: false,
+        failed_documents: 0,
     })
 }
 
@@ -1704,7 +1719,7 @@ pub fn next_definition() {
     }
 
     #[test]
-    fn embedding_batch_failure_fails_build_and_keeps_prior_generation() {
+    fn embedding_batch_failure_degrades_build_and_keeps_prior_generation() {
         let root = tempdir_via_env();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn current() {}\n").unwrap();
@@ -1738,18 +1753,24 @@ pub fn next_definition() {
             .unwrap();
 
         let mut provider = FailingBatchProvider { failed: false };
-        let error = index_code_embeddings_for_project(
+        let report = index_code_embeddings_for_project(
             &mut store,
             &root,
             "p",
             &mut provider,
             EmbeddingIndexOptions::for_generation(5),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("embedding generation incomplete"));
+        // The build DEGRADES instead of failing: the graph snapshot stays
+        // publishable and the failed documents are reported for the
+        // background retry.
+        assert_eq!(report.nodes_embedded, 0);
+        assert_eq!(report.nodes_failed, 1);
+        assert!(!report.is_complete());
+        // Prior-generation vectors are NOT pruned on a degraded pass: they
+        // stay queryable and reusable for the retry.
+        assert_eq!(report.stale_rows_pruned, 0);
         assert_eq!(
             store
                 .count_vector_embeddings(

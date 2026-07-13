@@ -26,6 +26,13 @@ after the `v0.2.0` production gate.
   binary; only the inference backend/device is selectable.
 - Model idle TTL is 300 seconds and daemon process idle TTL is 1800 seconds.
 
+### Fixed
+
+- `greppy index` publishes the complete graph snapshot when embedding
+  inference degrades (model load failure or failed batches) instead of
+  discarding all indexing work with `EXIT_IO`; the vectors that did embed are
+  kept and the next semantic query resumes the remainder in the background.
+
 ### Removed
 
 - Synthetic grep-output augmentation, sidecars, and

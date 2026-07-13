@@ -2060,6 +2060,54 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     );
 }
 
+/// Embeddings are enrichment on top of the graph: an unavailable or failing
+/// embedding backend must degrade the vector index, NOT abort the whole
+/// `greppy index` run with EXIT_IO after minutes of work (the 2026-07-13
+/// agent-benchmark release gate lost the complete django graph snapshot to
+/// exactly this). The graph snapshot must publish, the command must exit 0,
+/// and the degradation must be visible on stderr.
+#[cfg(not(feature = "ci-test-assets"))]
+#[test]
+fn index_publishes_graph_when_embedding_backend_is_unavailable() {
+    let (repo, store) = make_repo("embed-degraded", "embed_degraded_marker");
+    let (code, out, err) = run_with_env_and_inference(
+        &["index", "."],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_EMBED_UNAVAILABLE", "1")],
+        true,
+    );
+    assert_eq!(
+        code, 0,
+        "index must complete when the embedding backend is unavailable; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("indexed "),
+        "index report line must be printed on the degraded path; stdout={out:?}"
+    );
+    assert!(
+        err.contains("embedding generation degraded"),
+        "degraded embedding state must be reported on stderr; stderr={err:?}"
+    );
+
+    let db = find_graph_db(&store).expect("degraded index must still publish graph.db");
+    assert!(
+        next_snapshot_paths_for_db(&db).is_empty(),
+        "degraded publish must not leave temp graph.db.next.* snapshots"
+    );
+
+    // The published graph is complete and queryable without embeddings.
+    let (code, out, err) = run(&["search-symbols", "embed_degraded_marker"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "graph queries must work against the degraded-published snapshot; stderr={err}"
+    );
+    assert!(
+        out.contains("embed_degraded_marker"),
+        "indexed symbol must be visible after a degraded publish; got {out:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
