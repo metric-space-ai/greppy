@@ -578,6 +578,15 @@ def run_logged(
         tee_path.write_text(proc.stdout, encoding="utf-8")
     if proc.returncode not in allowed:
         print(f"command failed: {rendered} -> {proc.returncode}", file=sys.stderr)
+        # CI keeps only the step transcript, not the run directory: without
+        # the captured tail a failure here is undiagnosable (the 2026-07-13
+        # exit-73 index failure burned a full runner-hour with zero output).
+        tail = proc.stdout.splitlines()[-40:]
+        if tail:
+            print(f"--- last {len(tail)} log lines ({log_path.name}) ---", file=sys.stderr)
+            for line in tail:
+                print(f"| {line}", file=sys.stderr)
+            print("--- end log tail ---", file=sys.stderr)
     return proc.returncode
 
 

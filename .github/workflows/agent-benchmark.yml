@@ -76,6 +76,25 @@ jobs:
           python3 -m unittest discover -s bench/agent_efficiency -p 'test_*.py' -v
           python3 bench/agent_efficiency/verify_real_tasks.py
 
+      - name: Reclaim build scratch disk before the gate
+        # The macOS runner has ~14 GB of free disk. Two cargo target trees
+        # (several GB each; the release binary alone embeds ~800 MB of model
+        # weights) plus the benchmark corpora left too little headroom for
+        # the per-repo greppy stores (django alone needs ~700 MB including
+        # the extracted model): the 2026-07-13 gate run filled the disk
+        # ~35 minutes into `greppy index django` and died with EXIT_IO (73),
+        # `sqlite: database or disk is full`. Only the release binary is
+        # read after this point — drop everything else and record the
+        # headroom for future forensics.
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          rm -rf "${{ runner.temp }}/greppy-task-bank-target"
+          mv target/release/greppy "${{ runner.temp }}/greppy-gate-bin"
+          rm -rf target
+          mkdir -p target/release
+          mv "${{ runner.temp }}/greppy-gate-bin" target/release/greppy
+          df -h "$GITHUB_WORKSPACE"
+
       - name: Run pre-registered acceptance gate
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
