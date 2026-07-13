@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the inference performance release-gate verifier."""
+"""Unit tests for the inference performance calibration verifier."""
 
 from __future__ import annotations
 

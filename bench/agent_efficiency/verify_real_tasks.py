@@ -14,13 +14,16 @@ mechanical gate:
      rule (re-derived here, not trusted).
   C. gates re-run:
        - vocabulary firewall on every fuzzy_discovery question (same gate
-         function as the generator: stemmed lexical collision + rg -i top-3),
+         function as the generator: stemmed lexical collision + deterministic
+         case-insensitive top-3 file scan),
        - multi-hop gate on every research_multihop target with FRESH
          ``greppy impact`` measurements in the isolated store; stored gate
          numbers must reproduce exactly.
-  D. reproduction: gen_real_tasks.build() is executed again and its
-     serialization compared byte-for-byte with the files on disk (proves the
-     outputs are a pure deterministic function of the inputs).
+  D. optional full reproduction: with ``--full-regenerate``,
+     gen_real_tasks.build() is executed again and its serialization compared
+     byte-for-byte with the files on disk. This expensive corpus-construction
+     audit measures every eligible CALLS target and is not needed for each
+     release benchmark run.
 
 Prints naked denominators (tasks per class / repo / language), the gate
 protocols, and the sha256 of both output files. Exits non-zero on ANY
@@ -28,14 +31,15 @@ violation.
 
 Usage:
     python3 bench/agent_efficiency/verify_real_tasks.py
+    python3 bench/agent_efficiency/verify_real_tasks.py --full-regenerate
     REALTASKS_WORK_DIR=/path/to/scratch python3 .../verify_real_tasks.py
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
-import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -68,7 +72,18 @@ def check(cond: bool, msg: str) -> bool:
     return cond
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--full-regenerate",
+        action="store_true",
+        help="remeasure every candidate and require byte-identical generation",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     for path in (TASKS_V2, CLASSES_V2, gen.CANDIDATES, gen.MANIFEST,
                  gen.TASKS_V1, gen.CLASSES_V1):
         if not path.exists():
@@ -294,16 +309,26 @@ def main() -> int:
           f"targets re-measured with greppy impact")
 
     # -------------------------------------------------------- D. reproduction
-    print("[verify] re-running gen_real_tasks.build() for byte reproduction "
-          "check ...")
-    built = gen.build()
-    re_tasks = gen.serialize(built["tasks"]).encode("utf-8")
-    re_classes = gen.serialize(built["classes"]).encode("utf-8")
-    check(re_tasks == TASKS_V2.read_bytes(),
-          "tasks_v2.json is NOT byte-identical to a fresh regeneration")
-    check(re_classes == CLASSES_V2.read_bytes(),
-          "task_classes_v2.json is NOT byte-identical to a fresh regeneration")
-    rep = built["report"]
+    rep = None
+    if args.full_regenerate:
+        print("[verify] re-running gen_real_tasks.build() for byte "
+              "reproduction check ...")
+        built = gen.build(preindexed_mirrors=mirrors)
+        re_tasks = gen.serialize(built["tasks"]).encode("utf-8")
+        re_classes = gen.serialize(built["classes"]).encode("utf-8")
+        generated_dir = gen.WORK_DIR / "generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        (generated_dir / TASKS_V2.name).write_bytes(re_tasks)
+        (generated_dir / CLASSES_V2.name).write_bytes(re_classes)
+        print(f"[verify] generated candidates: {generated_dir}")
+        check(re_tasks == TASKS_V2.read_bytes(),
+              "tasks_v2.json is NOT byte-identical to a fresh regeneration")
+        check(re_classes == CLASSES_V2.read_bytes(),
+              "task_classes_v2.json is NOT byte-identical to a fresh regeneration")
+        rep = built["report"]
+    else:
+        print("[verify] full candidate-pool regeneration skipped; use "
+              "--full-regenerate for the corpus-construction audit")
 
     # ----------------------------------------------------------- denominators
     def tally(key) -> dict[str, int]:
@@ -322,25 +347,32 @@ def main() -> int:
     for r, n in sorted(tally(lambda t: t["repo"]).items()):
         print(f"[verify]   repo  {r:20s} {n:3d}")
     print("[verify] per language:")
-    for l, n in sorted(tally(lambda t: t["lang"]).items()):
-        print(f"[verify]   lang  {l:20s} {n:3d}")
+    for language, n in sorted(tally(lambda t: t["lang"]).items()):
+        print(f"[verify]   lang  {language:20s} {n:3d}")
     print("[verify] per class x repo:")
     for k, n in sorted(tally(lambda t: (t["class"], t["repo"])).items()):
         print(f"[verify]   {k[0]:20s} {k[1]:16s} {n:3d}")
 
     print("\n[verify] ===== gate protocols =====")
-    print(f"[verify] fuzzy firewall: {rep['fuzzy_authored']} authored, "
-          f"{rep['fuzzy_survivors']} survived, "
-          f"{len(rep['fuzzy_rejections'])} rejected; "
-          f"{rep['fuzzy_selected']} selected "
-          f"{json.dumps(rep['fuzzy_quotas'])}")
-    for rj in rep["fuzzy_rejections"]:
-        why = rj.get("violations", [rj["reason"]])
-        print(f"[verify]   REJECT {rj['repo']}/{rj['symbol']}: {why[0]}")
-    print(f"[verify] multi-hop gate stats (all CALLS targets): "
-          f"{json.dumps(rep['multihop_gate_stats'])}")
-    print(f"[verify] research pools (gate-passing, unused, named): "
-          f"{json.dumps(rep['research_pool_sizes'])}")
+    if rep is not None:
+        print(f"[verify] fuzzy firewall: {rep['fuzzy_authored']} authored, "
+              f"{rep['fuzzy_survivors']} survived, "
+              f"{len(rep['fuzzy_rejections'])} rejected; "
+              f"{rep['fuzzy_selected']} selected "
+              f"{json.dumps(rep['fuzzy_quotas'])}")
+        for rejection in rep["fuzzy_rejections"]:
+            why = rejection.get("violations", [rejection["reason"]])
+            print(
+                f"[verify]   REJECT {rejection['repo']}/"
+                f"{rejection['symbol']}: {why[0]}"
+            )
+        print(f"[verify] multi-hop gate stats (all CALLS targets): "
+              f"{json.dumps(rep['multihop_gate_stats'])}")
+        print(f"[verify] research pools (gate-passing, unused, named): "
+              f"{json.dumps(rep['research_pool_sizes'])}")
+    else:
+        print(f"[verify] selected fuzzy firewalls rechecked: {len(fuzzy_tasks)}")
+        print(f"[verify] selected multi-hop gates rechecked: {len(research_tasks)}")
 
     print("\n[verify] ===== hashes =====")
     print(f"[verify] sha256 tasks_v2.json        = {gen._sha256(TASKS_V2)}")

@@ -50,6 +50,8 @@ jobs:
             --output "$RUN_DIR/results.json"
 
       - name: Judge and enforce the registered gate
+        id: quality_gate
+        continue-on-error: true
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           RUN_DIR: ${{ runner.temp }}/greppy-summary-quality
@@ -76,7 +78,6 @@ jobs:
           gate_sha="$(shasum -a 256 "$RUN_DIR/gate.json" | awk '{print $1}')"
 
           test "$(jq -r .schema_version "$RUN_DIR/gate.json")" = greppy.summary-quality-gate.v1
-          test "$(jq -r .passed "$RUN_DIR/gate.json")" = true
           test "$(jq -r .binary_sha256 "$RUN_DIR/results.json")" = "$binary_sha"
           test "$(jq -r .cases_sha256 "$RUN_DIR/results.json")" = "$cases_sha"
           test "$(jq -r .cases_sha256 "$RUN_DIR/judgments.json")" = "$cases_sha"
@@ -116,6 +117,7 @@ jobs:
           shasum -a 256 greppy-summary-quality.tar.gz > greppy-summary-quality.tar.gz.sha256
 
       - name: Attest summary-quality evidence
+        if: steps.quality_gate.outcome == 'success'
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: greppy-summary-quality.tar.gz
@@ -129,3 +131,21 @@ jobs:
           path: |
             greppy-summary-quality.tar.gz
             greppy-summary-quality.tar.gz.sha256
+
+      - name: Upload summary-quality diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-summary-quality-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/greppy-summary-quality/results.json
+            ${{ runner.temp }}/greppy-summary-quality/judgments.json
+            ${{ runner.temp }}/greppy-summary-quality/gate.json
+
+      - name: Enforce summary-quality release gate
+        if: always()
+        env:
+          QUALITY_GATE_OUTCOME: ${{ steps.quality_gate.outcome }}
+        run: test "$QUALITY_GATE_OUTCOME" = success

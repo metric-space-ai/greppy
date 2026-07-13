@@ -46,7 +46,6 @@ class EnsureMirrorsTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], gen.INDEX_TIMEOUT_SECONDS)
         self.assertEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
         self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
-
     def test_index_timeout_identifies_repository(self) -> None:
         timeout = subprocess.TimeoutExpired(cmd=["greppy", "index"], timeout=1)
         with tempfile.TemporaryDirectory() as directory:
@@ -78,6 +77,35 @@ class ControlPayloadTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first["q"], source["q"])
         self.assertEqual(source["q"], "Who calls target?")
+
+
+class FileCountTests(unittest.TestCase):
+    def setUp(self) -> None:
+        gen._RG_CACHE.clear()
+        gen._SEARCHABLE_FILES_CACHE.clear()
+        gen._SEARCHABLE_CONTENT_CACHE.clear()
+
+    def tearDown(self) -> None:
+        gen._RG_CACHE.clear()
+        gen._SEARCHABLE_FILES_CACHE.clear()
+        gen._SEARCHABLE_CONTENT_CACHE.clear()
+
+    def test_counts_clean_mirror_text_without_external_ripgrep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "a.txt").write_text("Needle needle\n", encoding="utf-8")
+            (root / "b.txt").write_text("needle\n", encoding="utf-8")
+            (root / "ignored.txt").write_text("needle needle needle\n", encoding="utf-8")
+            (root / "binary.bin").write_bytes(b"needle\0needle")
+            with mock.patch.object(
+                gen,
+                "searchable_files",
+                return_value=("a.txt", "b.txt", "binary.bin"),
+            ):
+                self.assertEqual(
+                    gen.rg_file_counts(root, "needle"),
+                    [("a.txt", 2), ("b.txt", 1)],
+                )
 
 
 if __name__ == "__main__":

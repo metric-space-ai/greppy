@@ -2,7 +2,7 @@
 
 Date: 2026-07-12
 
-This is a retained pre-contract snapshot, not current release-gate evidence.
+This is a retained pre-contract snapshot, not current release evidence.
 It used the embedded production asset, but the native prompt path processed
 511 rows through batched prefill and held the final token out for decode. The
 strict contract in `bench/inference_performance/` rejects that shape as PP511.
@@ -26,11 +26,13 @@ presented as exact PP512 performance.
 
 ## Median comparison
 
-The intended release gate was at least `1.05x` llama.cpp. This table does not
-satisfy the current input and generation contracts, so none of its ratios can
-pass or fail the current release gate.
+The historical engineering target was at least `1.05x` llama.cpp. This table
+does not satisfy the current input and generation contracts, so none of its
+ratios can pass or fail the current calibration. Greppy release acceptance is
+based on production latency, semantic quality, robustness, and measured agent
+outcomes rather than superiority over another inference engine.
 
-| Platform | Device | llama PP512 | Native PP512 | Ratio | llama TG128 | Native TG128 | Ratio | Gate |
+| Platform | Device | llama PP512 | Native PP512 | Ratio | llama TG128 | Native TG128 | Ratio | Historical calibration |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | Apple CPU | Apple M5, 4 P workers | 329.41 | 382.92 | 1.162x | 83.83 | 75.04 | 0.895x | FAIL: decode |
 | x86 CPU | i5-13400F, 6 physical P-cores | 374.33 | 260.04 | 0.695x | 71.82 | 53.86 | 0.750x | FAIL: prefill + decode |

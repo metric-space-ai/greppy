@@ -131,6 +131,10 @@ def main() -> int:
     store_dir = run_dir / "store"
     store_dir.mkdir(parents=True, exist_ok=True)
     os.environ["GREPPY_STORE_DIR"] = str(store_dir)
+    # The acceptance run deliberately excludes one-time precomputation from
+    # both agent arms. Finish embeddings before the first measured task instead
+    # of allowing the interactive lazy-index policy to race agent workers.
+    os.environ["GREPPY_LAZY_EMBED_MIN_SPANS"] = str(sys.maxsize)
     print("== embedded EmbeddingGemma + Qwen summaries active", file=sys.stderr)
     results = run_dir / "results.json"
     graded_results = run_dir / "results.mechanical.json"

@@ -9,7 +9,7 @@ DESIGN CONTRACT
   * Pure deterministic function of the input files: no randomness, no
     timestamps, no environment-dependent values in the outputs. Re-running
     after a candidates.json audit round reproduces byte-identical files
-    (given the same pinned repos + greppy binary + rg).
+    (given the same pinned repos + greppy binary).
   * Grading semantics are the candidates.json floor semantics verbatim:
     expect_members = real caller-name subset floor, file_evidence = path-only
     match, min_count = floor (the reference oracle undercounts; an agent that finds
@@ -65,7 +65,10 @@ TASKS_V1 = HERE / "tasks.json"
 CLASSES_V1 = HERE / "task_classes.json"
 OUT_TASKS = HERE / "tasks_v2.json"
 OUT_CLASSES = HERE / "task_classes_v2.json"
-BIN = HERE.parents[1] / "target" / "release" / "greppy"
+BIN = pathlib.Path(
+    os.environ.get("REALTASKS_GREPPY_BIN")
+    or HERE.parents[1] / "target" / "release" / "greppy"
+).resolve()
 
 REPO_ORDER = ["serde", "flask", "gson", "zod", "tokio", "django"]
 LANG_FALLBACK = {
@@ -215,23 +218,63 @@ def _stems_collide(a: str, b: str) -> bool:
 
 
 _RG_CACHE: dict[tuple[str, str], list[tuple[str, int]]] = {}
+_SEARCHABLE_FILES_CACHE: dict[str, tuple[str, ...]] = {}
+_SEARCHABLE_CONTENT_CACHE: dict[str, tuple[tuple[str, bytes], ...]] = {}
+
+
+def searchable_files(mirror: pathlib.Path) -> tuple[str, ...]:
+    """Return clean-mirror non-hidden files in stable relative path order."""
+    key = str(mirror.resolve())
+    if key in _SEARCHABLE_FILES_CACHE:
+        return _SEARCHABLE_FILES_CACHE[key]
+    paths: list[str] = []
+    for directory, dirnames, filenames in os.walk(mirror, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+        base = pathlib.Path(directory)
+        for filename in sorted(name for name in filenames if not name.startswith(".")):
+            path = base / filename
+            if path.is_file() and not path.is_symlink():
+                paths.append(path.relative_to(mirror).as_posix())
+    result = tuple(paths)
+    _SEARCHABLE_FILES_CACHE[key] = result
+    return result
+
+
+def searchable_contents(mirror: pathlib.Path) -> tuple[tuple[str, bytes], ...]:
+    """Read and normalize the clean text corpus once per pinned mirror."""
+    key = str(mirror.resolve())
+    if key in _SEARCHABLE_CONTENT_CACHE:
+        return _SEARCHABLE_CONTENT_CACHE[key]
+    rows: list[tuple[str, bytes]] = []
+    for relative in searchable_files(mirror):
+        path = mirror / relative
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" not in content:
+            rows.append((relative, content.lower()))
+    result = tuple(rows)
+    _SEARCHABLE_CONTENT_CACHE[key] = result
+    return result
 
 
 def rg_file_counts(mirror: pathlib.Path, word: str) -> list[tuple[str, int]]:
-    """``rg -i --count-matches`` per file, sorted by (-count, path)."""
+    """Case-insensitive literal match counts, sorted by (-count, path).
+
+    The benchmark used to shell out to an unpinned ripgrep installation here.
+    Scanning the clean pinned mirror directly keeps task verification identical
+    on clean macOS, Linux, and Windows runners.
+    """
     key = (str(mirror), word)
     if key in _RG_CACHE:
         return _RG_CACHE[key]
-    p = subprocess.run(
-        ["rg", "-i", "--count-matches", "--no-messages", "--", word],
-        cwd=mirror, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,  # never let rg fall back to reading stdin
-    )
     rows: list[tuple[str, int]] = []
-    for line in p.stdout.decode("utf-8", "replace").splitlines():
-        path, _, cnt = line.rpartition(":")
-        if path and cnt.isdigit():
-            rows.append((path, int(cnt)))
+    needle = word.encode("utf-8").lower()
+    for relative, content in searchable_contents(mirror):
+        count = content.count(needle)
+        if count:
+            rows.append((relative, count))
     rows.sort(key=lambda r: (-r[1], r[0]))
     _RG_CACHE[key] = rows
     return rows
@@ -245,9 +288,9 @@ def firewall_check(
     REJECT when any stemmed content word of the question
       (a) collides with the target symbol name / its camel-snake parts /
           the target filename stem, or
-      (b) rg -i of that word (its stem when the stem is >= 4 chars, so
-          morphological variants are covered as substrings) puts the target
-          file among the top-3 files by hit count.
+      (b) a case-insensitive scan for that word (using its stem when the stem
+          is >= 4 chars, so morphological variants are covered as substrings)
+          puts the target file among the top-3 files by hit count.
     """
     violations: list[str] = []
     forb = forbidden_stems(symbol, target_file)
@@ -294,6 +337,10 @@ def ensure_mirrors(manifest: dict) -> dict[str, pathlib.Path]:
                 shutil.rmtree(dst)
             shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
             marker.write_text(commit)
+        # The mirror intentionally has no Git metadata. This empty marker is
+        # only a workspace boundary, preventing an enclosing developer
+        # worktree from becoming the effective --root during local audits.
+        (dst / ".git").mkdir(exist_ok=True)
         mirrors[name] = dst
     env = dict(os.environ, GREPPY_STORE_DIR=str(STORE_DIR))
     for name, dst in mirrors.items():
@@ -719,18 +766,15 @@ def _graph_ground_truth(t: dict) -> str:
     return " ".join(parts)
 
 
-def build() -> dict:
+def build(preindexed_mirrors: dict[str, pathlib.Path] | None = None) -> dict:
     """Returns {"tasks": [...], "classes": {...}, "report": {...}}."""
     for path in (CANDIDATES, MANIFEST, TASKS_V1, CLASSES_V1):
         if not path.exists():
             sys.exit(f"[gen] missing input: {path}")
     if not BIN.exists():
         sys.exit(f"[gen] greppy release binary missing: {BIN}")
-    if not shutil.which("rg"):
-        sys.exit("[gen] rg (ripgrep) not on PATH -- required by the firewall")
-
     cands, manifest, tasks_v1, classes_v1 = _load_inputs()
-    mirrors = ensure_mirrors(manifest)
+    mirrors = preindexed_mirrors or ensure_mirrors(manifest)
 
     fuzzy_symbols = {r: {e["symbol"] for e in FUZZY_BANK if e["repo"] == r}
                      for r in REPO_ORDER}
@@ -983,8 +1027,8 @@ def build() -> dict:
         "input_candidates_sha256": _sha256(CANDIDATES),
         "grading_semantics": (
             "floor: expect_members = real caller-name subset floor, "
-            "file_evidence = path-only match, min_count = floor; the C "
-            "oracle undercounts, so an agent finding MORE true callers "
+            "file_evidence = path-only match, min_count = floor; the "
+            "reference oracle undercounts, so an agent finding MORE true callers "
             "must pass."
         ),
         "classes": {
@@ -1008,8 +1052,8 @@ def build() -> dict:
                     "Synonym-vocabulary (lexicon B) behaviour descriptions "
                     "with a mechanical firewall guaranteeing the question "
                     "shares no stemmed content word with the target symbol/"
-                    "filename and is not rg-solvable to the target file "
-                    "(top-3 rule)."
+                    "filename and does not rank the target file in the top "
+                    "three under the deterministic literal scan."
                 ),
                 "ids": class_ids["fuzzy_discovery"],
                 "acceptance": {

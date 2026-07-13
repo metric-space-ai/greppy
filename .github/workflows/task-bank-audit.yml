@@ -1,0 +1,65 @@
+name: agent task-bank reproducibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/task-bank-audit.yml'
+      - 'bench/agent_efficiency/gen_real_tasks.py'
+      - 'bench/agent_efficiency/verify_real_tasks.py'
+      - 'bench/agent_efficiency/tasks_v2.json'
+      - 'bench/agent_efficiency/task_classes_v2.json'
+      - 'bench/agent_efficiency/tasks.json'
+      - 'bench/agent_efficiency/task_classes.json'
+      - 'bench/agent_efficiency/real_corpus.py'
+      - 'bench/agent_efficiency/realcorpus/candidates.json'
+  pull_request:
+    paths:
+      - '.github/workflows/task-bank-audit.yml'
+      - 'bench/agent_efficiency/gen_real_tasks.py'
+      - 'bench/agent_efficiency/verify_real_tasks.py'
+      - 'bench/agent_efficiency/tasks_v2.json'
+      - 'bench/agent_efficiency/task_classes_v2.json'
+      - 'bench/agent_efficiency/tasks.json'
+      - 'bench/agent_efficiency/task_classes.json'
+      - 'bench/agent_efficiency/real_corpus.py'
+      - 'bench/agent_efficiency/realcorpus/candidates.json'
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: 115 tasks from pinned inputs
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5a
+        with:
+          lfs: true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Build graph-only task-bank audit helper
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/greppy-task-bank-target
+        run: cargo build --bin greppy --features ci-test-assets
+
+      - name: Materialize pinned repositories
+        run: |
+          python3 bench/agent_efficiency/real_corpus.py setup \
+            --repos serde flask gson zod tokio django
+
+      - name: Reproduce the complete task bank
+        env:
+          REALTASKS_GREPPY_BIN: ${{ runner.temp }}/greppy-task-bank-target/debug/greppy
+        run: |
+          python3 -m unittest discover \
+            -s bench/agent_efficiency -p 'test_*.py' -v
+          python3 bench/agent_efficiency/verify_real_tasks.py \
+            --full-regenerate

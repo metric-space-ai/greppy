@@ -2275,15 +2275,15 @@
     "type": "research",
     "class": "research_multihop",
     "q": "how risky is it to touch `async_trace_leaf` in tokio/src/lib.rs? What depends on it, directly or not?",
-    "ground_truth": "Oracle floor: at least 6 caller(s). Known callers include: changed_impl. Caller file evidence: tokio/src/sync/barrier.rs, tokio/src/sync/mpsc/bounded.rs, tokio/src/sync/mutex.rs, tokio/src/sync/once_cell.rs, tokio/src/sync/watch.rs. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.0843 < 0.3).",
+    "ground_truth": "Oracle floor: at least 6 caller(s). Known callers include: changed_impl. Caller file evidence: tokio/src/sync/barrier.rs, tokio/src/sync/mpsc/bounded.rs, tokio/src/sync/mutex.rs, tokio/src/sync/once_cell.rs, tokio/src/sync/watch.rs. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.2258 < 0.3).",
     "target": {
       "file": "tokio/src/lib.rs",
       "line": 598
     },
     "multihop_gate": {
       "reach1": 7,
-      "reach_total": 83,
-      "ratio": 0.0843,
+      "reach_total": 31,
+      "ratio": 0.2258,
       "max_ratio": 0.3,
       "measured_by": "greppy impact --depth 1 vs --depth 12 (isolated store)"
     },
@@ -2311,29 +2311,28 @@
     "lang": "python",
     "type": "research",
     "class": "research_multihop",
-    "q": "a bug was just found in `WithData` (django/core/serializers/base.py). What could be affected by it, including indirectly?",
-    "ground_truth": "Oracle floor: at least 2 caller(s). Known callers include: _handle_object, save_deferred_fields. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.2222 < 0.3).",
+    "q": "a bug was just found in `SpatialRefSys` (tests/gis_tests/test_spatialrefsys.py). What could be affected by it, including indirectly?",
+    "ground_truth": "Oracle floor: at least 1 caller(s). Known callers include: test_get_units. An agent finding MORE true callers than the floor must pass. Transitive reach is strictly larger than the direct floor (multi-hop gate: reach@1/reach@total = 0.1379 < 0.3).",
     "target": {
-      "file": "django/core/serializers/base.py",
-      "line": 29
+      "file": "tests/gis_tests/test_spatialrefsys.py",
+      "line": 73
     },
     "multihop_gate": {
-      "reach1": 2,
-      "reach_total": 9,
-      "ratio": 0.2222,
+      "reach1": 4,
+      "reach_total": 29,
+      "ratio": 0.1379,
       "max_ratio": 0.3,
       "measured_by": "greppy impact --depth 1 vs --depth 12 (isolated store)"
     },
     "check": {
       "kind": "impact",
-      "symbol": "WithData",
+      "symbol": "SpatialRefSys",
       "direction": "incoming",
       "expect_members": [
-        "_handle_object",
-        "save_deferred_fields"
+        "test_get_units"
       ],
       "file_evidence": [],
-      "min_count": 2,
+      "min_count": 1,
       "semantics": "floor"
     }
   },

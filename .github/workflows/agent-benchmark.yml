@@ -47,6 +47,11 @@ jobs:
       - name: Build candidate binary with Metal
         run: cargo build --release --bin greppy --features metal
 
+      - name: Build graph-only task-bank audit helper
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/greppy-task-bank-target
+        run: cargo build --bin greppy --features ci-test-assets
+
       - name: Materialize benchmark repositories
         run: |
           bash bench/agent_efficiency/gen_corpus.sh
@@ -54,6 +59,8 @@ jobs:
             --repos serde flask gson zod tokio django
 
       - name: Verify pinned task and repository contract
+        env:
+          REALTASKS_GREPPY_BIN: ${{ runner.temp }}/greppy-task-bank-target/debug/greppy
         run: |
           python3 -m unittest discover -s bench/agent_efficiency -p 'test_*.py' -v
           python3 bench/agent_efficiency/verify_real_tasks.py

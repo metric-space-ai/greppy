@@ -84,7 +84,7 @@
     },
     "fuzzy_discovery": {
       "role": "embedding_candidate",
-      "description": "Synonym-vocabulary (lexicon B) behaviour descriptions with a mechanical firewall guaranteeing the question shares no stemmed content word with the target symbol/filename and is not rg-solvable to the target file (top-3 rule).",
+      "description": "Synonym-vocabulary (lexicon B) behaviour descriptions with a mechanical firewall guaranteeing the question shares no stemmed content word with the target symbol/filename and does not rank the target file in the top three under the deterministic literal scan.",
       "ids": [
         "r061",
         "r062",

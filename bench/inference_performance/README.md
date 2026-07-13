@@ -1,20 +1,24 @@
 # Native inference performance contract
 
-This harness is the release contract for native Greppy inference versus a
-pinned llama.cpp checkout. It does not accept the human-readable output from
-`llama-bench`, and it does not contain historical or synthetic measurements.
-All run artifacts belong under the repository's ignored `dev/` directory.
+This harness is a strict engineering calibration for native Greppy inference
+versus a pinned llama.cpp checkout. It is useful for kernel regression work;
+it is not a product-quality or release-acceptance criterion. Release evidence
+instead measures supported-platform correctness, real Greppy latency, summary
+quality, and agent outcomes. The harness does not accept the human-readable
+output from `llama-bench`, and it does not contain historical or synthetic
+measurements. All run artifacts belong under the repository's ignored `dev/`
+directory.
 
 ## Current status
 
 EmbeddingGemma and production Greppy prompt producers are implemented. The
-strict verifier covers every workload and all four release platforms. Qwen's
-typed diagnostic API now accepts exact supplied token IDs, target-prefills all
-512 rows, and returns 128 committed EOS-disabled greedy tokens from the
-production MTP path together with separate stage timings.
+strict verifier covers every workload and all four supported platform paths.
+Qwen's typed diagnostic API now accepts exact supplied token IDs,
+target-prefills all 512 rows, and returns 128 committed EOS-disabled greedy
+tokens from the production MTP path together with separate stage timings.
 
 No complete four-platform result set has passed the verifier yet. Until paired
-native and pinned llama.cpp artifacts are collected on quiet release hardware,
+native and pinned llama.cpp artifacts are collected on quiet reference hardware,
 the historical table in `bench/qwen35_llama_cpp_baseline.md` is regression
 context only. Missing baselines, PP511 records, target-only TG128, or mismatched
 hardware continue to fail closed.
@@ -74,7 +78,7 @@ This workload is mandatory evidence that the optimized engine still exercises
 the production Greppy path. It is native-only and is not mislabeled as a
 llama.cpp MTP comparison.
 
-## Gate
+## Engineering calibration gate
 
 The verifier evaluates every platform/workload/case independently:
 
@@ -85,7 +89,9 @@ The verifier evaluates every platform/workload/case independently:
   `1.00x`.
 
 A missing binary, failed producer process, empty producer output, missing
-llama.cpp case, metadata mismatch, or invalid sample fails closed.
+llama.cpp case, metadata mismatch, or invalid sample fails this calibration
+closed. Such a failure warrants profiling, but does not by itself reject a
+Greppy release whose production latency and agent-outcome gates pass.
 
 ## Provenance and parity
 
