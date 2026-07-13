@@ -40,24 +40,34 @@ if os.environ.get("FAKE_FAIL_PHASE") == command:
     raise SystemExit(7)
 
 marker = store / "indexed"
+embedding_pending = store / "embedding-pending"
 if command == "doctor":
     indexed = marker.exists()
+    embedding_complete = indexed
+    if indexed and embedding_pending.exists():
+        polls = int(embedding_pending.read_text(encoding="ascii")) + 1
+        if polls >= 2:
+            embedding_pending.unlink()
+        else:
+            embedding_pending.write_text(str(polls), encoding="ascii")
+            embedding_complete = False
+    healthy = indexed and embedding_complete
     daemon = {
         "endpoint": str(store / "TOP-SECRET.sock"),
         "protocol": "greppy-inference-v1",
-        "state": "ready" if indexed else "stopped",
+        "state": "ready" if healthy else "stopped",
         "last_error": "TOP SECRET DAEMON ERROR",
     }
     value = {
         "command": "doctor",
-        "status": "ok" if indexed else "no_index",
-        "healthy": indexed,
+        "status": "ok" if healthy else ("unhealthy" if indexed else "no_index"),
+        "healthy": healthy,
         "store_exists": indexed,
         "root_path": "TOP SECRET ABSOLUTE REPO",
         "store_path": str(store),
         "store_bytes": 4096 if indexed else 0,
-        "embedding_complete": indexed,
-        "current_embedding_rows": 9 if indexed else 0,
+        "embedding_complete": embedding_complete,
+        "current_embedding_rows": 9 if embedding_complete else 0,
         "fresh": indexed,
         "schema_version": 12 if indexed else None,
         "expected_schema_version": 12,
@@ -70,6 +80,10 @@ if command == "doctor":
         "provider_failure_count": 0 if indexed else None,
         "git_tracked_files": 3,
         "vectors_missing_with_model": False,
+        "background_job": ({
+            "pid": 99999999,
+            "state": "embedding",
+        } if indexed and not embedding_complete else None),
         "inference": {
             "registry": {
                 "version": 1,
@@ -128,10 +142,12 @@ if command == "doctor":
         },
     }
     print(json.dumps(value))
-    raise SystemExit(0 if indexed else 1)
+    raise SystemExit(0 if healthy else 1)
 
 if command == "index":
     marker.write_text("ok", encoding="ascii")
+    if os.environ.get("FAKE_DEFER_EMBEDDING"):
+        embedding_pending.write_text("0", encoding="ascii")
     print("TOP SECRET INDEX STDOUT")
     raise SystemExit(0)
 
@@ -311,6 +327,21 @@ class RuntimeFootprintTests(unittest.TestCase):
         self.assertTrue(self.output.exists())
         self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
         self.assertEqual(list(self.output.parent.glob(".runtime.json.*.tmp")), [])
+
+    def test_deferred_embedding_is_waited_for_before_semantic_measurement(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"FAKE_DEFER_EMBEDDING": "1"},
+            clear=False,
+        ):
+            self.assertEqual(runtime_footprint.main(self._argv()), 0)
+        value = json.loads(self.output.read_text(encoding="utf-8"))
+        build = value["measurements"]["embedding_build"]
+        self.assertTrue(build["deferred"])
+        self.assertEqual(build["poll_count"], 1)
+        self.assertGreaterEqual(build["wait_wall_time_ms"], 0)
+        self.assertFalse(value["doctor"]["after_index"]["embedding_complete"])
+        self.assertTrue(value["doctor"]["after_embedding"]["embedding_complete"])
 
     def test_timeout_kills_command_group_and_cleans_store(self) -> None:
         argv = self._argv()

@@ -365,6 +365,16 @@ def _doctor_daemon_pids(value: dict[str, Any]) -> set[int]:
     return pids
 
 
+def _doctor_background_pids(value: dict[str, Any]) -> set[int]:
+    job = value.get("background_job")
+    if not isinstance(job, dict):
+        return set()
+    pid = job.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1:
+        return {pid}
+    return set()
+
+
 def _sanitize_doctor(
     value: dict[str, Any], phase: str
 ) -> tuple[dict[str, Any], set[int]]:
@@ -821,6 +831,7 @@ def measure(config: Config) -> dict[str, Any]:
             phase="doctor_after_index",
             env=env,
             timeout_seconds=config.timeout_seconds,
+            accepted_exit_codes=(0, 1),
             publication_replacements=publication_replacements,
         )
         command_records.append(after_index_run.record)
@@ -829,6 +840,43 @@ def measure(config: Config) -> dict[str, Any]:
             after_index_json, "doctor_after_index"
         )
         daemon_pids.update(index_pids)
+        daemon_pids.update(_doctor_background_pids(after_index_json))
+
+        embedding_wait_started = time.perf_counter_ns()
+        embedding_wait_polls = 0
+        after_embedding_json = after_index_json
+        doctor_after_embedding = doctor_after_index
+        embedding_deadline = time.monotonic() + config.timeout_seconds
+        while doctor_after_embedding.get("embedding_complete") is not True:
+            background_job = after_embedding_json.get("background_job")
+            if isinstance(background_job, dict) and background_job.get("state") == "failed":
+                raise MeasurementError("embedding build reported a background failure")
+            remaining = embedding_deadline - time.monotonic()
+            if remaining <= 0:
+                raise MeasurementError("embedding build timed out")
+            time.sleep(min(1.0, remaining))
+            embedding_wait_polls += 1
+            poll_run = _run_command(
+                [binary, "doctor", "--json", "--root", repo],
+                phase="embedding_wait",
+                env=env,
+                timeout_seconds=min(config.timeout_seconds, max(remaining, 0.001)),
+                accepted_exit_codes=(0, 1),
+                iteration=embedding_wait_polls,
+                publication_replacements=publication_replacements,
+            )
+            after_embedding_json = _json_object(
+                poll_run.stdout, "embedding_wait"
+            )
+            doctor_after_embedding, poll_pids = _sanitize_doctor(
+                after_embedding_json, "embedding_wait"
+            )
+            daemon_pids.update(poll_pids)
+            daemon_pids.update(_doctor_background_pids(after_embedding_json))
+        embedding_wait_ms = round(
+            (time.perf_counter_ns() - embedding_wait_started) / 1_000_000,
+            3,
+        )
         _terminate_daemons(index_pids, config.greppy, strict=True)
         daemon_pids.difference_update(index_pids)
 
@@ -972,6 +1020,11 @@ def measure(config: Config) -> dict[str, Any]:
             "commands": command_records,
             "measurements": {
                 "index": {"wall_time_ms": index_run.elapsed_ms},
+                "embedding_build": {
+                    "wait_wall_time_ms": embedding_wait_ms,
+                    "poll_count": embedding_wait_polls,
+                    "deferred": embedding_wait_polls > 0,
+                },
                 "semantic_search": {
                     "first_wall_time_ms": semantic_first_run.elapsed_ms,
                     "warm": _series(semantic_warm),
@@ -989,6 +1042,7 @@ def measure(config: Config) -> dict[str, Any]:
             "doctor": {
                 "before": doctor_before,
                 "after_index": doctor_after_index,
+                "after_embedding": doctor_after_embedding,
                 "after_semantic": doctor_after_semantic,
                 "after": doctor_after,
             },
@@ -1007,6 +1061,7 @@ def measure(config: Config) -> dict[str, Any]:
                 cleanup_json = _json_object(cleanup_run.stdout, "cleanup_doctor")
                 if cleanup_json.get("command") == "doctor":
                     daemon_pids.update(_doctor_daemon_pids(cleanup_json))
+                    daemon_pids.update(_doctor_background_pids(cleanup_json))
             except (MeasurementError, OSError):
                 pass
         for pid in daemon_pids:
