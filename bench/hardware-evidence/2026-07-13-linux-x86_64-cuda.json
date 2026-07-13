@@ -1,0 +1,147 @@
+{
+  "schema_version": "greppy.hardware-evidence.v1",
+  "created_utc": "2026-07-13T20:09:43Z",
+  "platform": {
+    "os": "linux",
+    "os_version": "6.8.0-124-generic",
+    "arch": "x86_64",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i5-13400F",
+    "cpu_cores": 16,
+    "ram_gb": 125,
+    "gpu": {
+      "name": "NVIDIA RTX A4500",
+      "driver_version": "595.71.05",
+      "vram_total_mib": 20470,
+      "compute_capability": "8.6",
+      "metal_family": null
+    }
+  },
+  "product": {
+    "version": "greppy 0.1.3",
+    "source_sha": "0e4a3648",
+    "binary_sha256": "a42d4e390900b3e977c53bd923708ff1e6fa39784fe28a4a6b2e4e3c3df03a97",
+    "backend_compiled": true,
+    "backend_build_info": "greppy-cuda-q4k;abi=1;min-cc=7.5"
+  },
+  "backend": {
+    "requested": "cuda",
+    "selected": "cuda",
+    "selected_device": "cuda:0",
+    "cpu_capabilities": [
+      "avx-vnni",
+      "avx2",
+      "fma",
+      "sse4.2"
+    ],
+    "baseline_x86_required": false,
+    "cuda_toolkit_visible": false,
+    "cuda_backend_needed_libs": [
+      "libc.so.6",
+      "libcuda.so.1",
+      "libdl.so.2",
+      "libgcc_s.so.1",
+      "libm.so.6",
+      "libpthread.so.0",
+      "librt.so.1",
+      "libstdc++.so.6",
+      "linux-vdso.so.1"
+    ]
+  },
+  "models": {
+    "embedding": {
+      "model_id": "google/embeddinggemma-300m@sha256:b469d441220e6327d89ed6109d31ed45f6d5e97ae76d35f159ae22a43cb4e4bf",
+      "model_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+      "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+    },
+    "summary": {
+      "model_id": "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11",
+      "model_sha256": "d09d5028e28ea9df501d83a9a60b80ed73f878b4b98424b09a39505364a1053f",
+      "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    }
+  },
+  "measurements": {
+    "fixture": {
+      "files": 2,
+      "tree_sha256": "6530ced82d9d2cce225c7ec128a14505437fa1b2a66a1d537c487577e2f7e6e2"
+    },
+    "index_cold_ms": 1432,
+    "semantic_search_ms": {
+      "calls": 20,
+      "p50_ms": 395,
+      "p95_ms": 397,
+      "min_ms": 390,
+      "max_ms": 400
+    },
+    "brief_ms": {
+      "calls": 20,
+      "p50_ms": 100,
+      "p95_ms": 194,
+      "min_ms": 95,
+      "max_ms": 195
+    },
+    "vram": {
+      "baseline_mib": 91,
+      "peak_mib": 1444,
+      "poll_interval_s": 0.5
+    },
+    "notes": [
+      "GPU may be shared with other tenants; VRAM peak-baseline bounds the product footprint."
+    ]
+  },
+  "checks": [
+    {
+      "name": "doctor selects requested backend (cuda)",
+      "pass": true,
+      "detail": "selected=cuda device=cuda:0"
+    },
+    {
+      "name": "requested backend compiled into binary",
+      "pass": true,
+      "detail": "greppy-cuda-q4k;abi=1;min-cc=7.5"
+    },
+    {
+      "name": "doctor reports embedded model digests",
+      "pass": true
+    },
+    {
+      "name": "index completes on fixture",
+      "pass": true,
+      "detail": "1432ms"
+    },
+    {
+      "name": "brief returns definition with summary",
+      "pass": true
+    },
+    {
+      "name": "semantic-search returns ranked hits",
+      "pass": true
+    },
+    {
+      "name": "expand resolves search evidence",
+      "pass": true
+    },
+    {
+      "name": "semantic-search ordering is deterministic across reruns",
+      "pass": true
+    },
+    {
+      "name": "grep passthrough byte-exact vs system grep",
+      "pass": true
+    },
+    {
+      "name": "no CUDA toolkit visible to the product (runtime-only environment)",
+      "pass": true,
+      "detail": "nvcc stripped from PATH, LD_LIBRARY_PATH unset"
+    },
+    {
+      "name": "bundled CUDA backend materialized from the binary",
+      "pass": true
+    },
+    {
+      "name": "CUDA backend needs no toolkit libraries (driver's libcuda.so.1 only)",
+      "pass": true,
+      "detail": "needed: libc.so.6 libcuda.so.1 libdl.so.2 libgcc_s.so.1 libm.so.6 libpthread.so.0 librt.so.1 libstdc++.so.6 linux-vdso.so.1"
+    }
+  ],
+  "status": "pass"
+}
