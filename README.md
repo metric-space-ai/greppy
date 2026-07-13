@@ -65,13 +65,16 @@ legacy previews and are not the current production distribution. Build the
 current `main` revision from source for evaluation. Do not rename or install the
 binary as `grep`.
 
-The deterministic graph is published first. On a large repository, code-span
-embeddings continue in a generation-bound background job so graph navigation
-does not wait for several minutes of inference. `semantic-search` never exposes
-partial vectors: until that generation is complete it returns `status:
-"indexing"` in JSON (exit 75), the selected CPU/Metal/CUDA backend, exact span
-progress, and an estimated completion time. Automatic selection prefers a
-compatible Metal or CUDA device with sufficient memory and otherwise uses CPU.
+The deterministic graph is published first. Code-span embeddings are a one-time
+local computation for each source generation and are reused by later agent
+sessions. On a large repository they continue in a generation-bound background
+job, so graph navigation remains available while Greppy trades local compute
+once for lower repeated cloud-model search and context cost. `semantic-search`
+never exposes partial vectors: until that generation is complete it returns
+`status: "indexing"` in JSON (exit 75), the selected CPU/Metal/CUDA backend,
+exact span progress, and an estimated completion time. Automatic selection
+prefers a compatible Metal or CUDA device with sufficient memory and otherwise
+uses the CPU fallback.
 
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
@@ -230,6 +233,9 @@ graded runs for the exact release commit prove all of the following:
 
 Historical charts and illustrative recordings are not treated as `v0.2.0`
 evidence until current navigation and coding-outcome runs pass those gates.
+Index construction is outside measured agent sessions because it is reusable;
+release evidence reports its CPU/GPU wall time and resource cost separately and
+includes the amortized break-even instead of presenting precomputation as free.
 
 ---
 

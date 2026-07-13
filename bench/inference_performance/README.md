@@ -220,8 +220,10 @@ python3 bench/inference_performance/collect.py \
 ```
 
 The exact-token llama.cpp driver supports `qwen_pp512` and `qwen_tg128`. Feed
-the native raw JSONL into `--cases`, exactly as in the embedding example. Never
-use `llama-bench` output for this contract.
+the collector-enriched native JSONL into `--cases`, exactly as in the embedding
+example. The driver selects the requested workload from the combined native
+Qwen rows and fails if that workload is absent. Never use `llama-bench` output
+for this contract.
 
 ## Verify
 

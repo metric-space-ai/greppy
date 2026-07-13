@@ -191,9 +191,11 @@ std::vector<token_case> read_cases(const options & opts) {
         if (value.contains("model_family") && value["model_family"] != opts.model_family) {
             throw std::runtime_error("token case model_family differs from --model-family");
         }
-        if (value.contains("workload") && value["workload"] != opts.workload &&
-            !(opts.workload == "embedding_encoder" && value["workload"] == "embedding_encoder")) {
-            throw std::runtime_error("token case workload differs from --workload");
+        // The native Qwen producer emits PP512, TG128, and production-prompt
+        // rows together. Select the requested workload from that provenance-
+        // bound file so both llama.cpp runs consume the exact native tokens.
+        if (value.contains("workload") && value["workload"] != opts.workload) {
+            continue;
         }
         const std::string id = value["case_id"].get<std::string>();
         if (id.empty()) {
@@ -226,7 +228,8 @@ std::vector<token_case> read_cases(const options & opts) {
         }
     }
     if (order.empty()) {
-        throw std::runtime_error("token case JSONL is empty");
+        throw std::runtime_error(
+            "token case JSONL contains no rows for requested workload " + opts.workload);
     }
     std::vector<token_case> result;
     result.reserve(order.size());
