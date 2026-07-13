@@ -4869,16 +4869,11 @@ unsafe fn dot8_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8K]) -> [f32; 8] {
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline(always)]
 unsafe fn neon_vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    // The asm lives in dotprod-gated sdot_acc so non-dotprod aarch64 targets
+    // (e.g. aarch64-pc-windows-msvc baseline) can still assemble this crate;
+    // the runtime check keeps the fast path on every dotprod CPU.
     if std::arch::is_aarch64_feature_detected!("dotprod") {
-        let mut acc: int32x4_t = vdupq_n_s32(0);
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) acc,
-            a = in(vreg) a,
-            b = in(vreg) b,
-            options(nostack, nomem),
-        );
-        return acc;
+        return sdot_acc(vdupq_n_s32(0), a, b);
     }
     let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
@@ -4894,18 +4889,7 @@ unsafe fn neon_vdotq_s32_pair(
     b1: int8x16_t,
 ) -> int32x4_t {
     if std::arch::is_aarch64_feature_detected!("dotprod") {
-        let mut acc: int32x4_t = vdupq_n_s32(0);
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
-            "sdot {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
-            acc = inout(vreg) acc,
-            a0 = in(vreg) a0,
-            b0 = in(vreg) b0,
-            a1 = in(vreg) a1,
-            b1 = in(vreg) b1,
-            options(nostack, nomem),
-        );
-        return acc;
+        return sdot_acc(sdot_acc(vdupq_n_s32(0), a0, b0), a1, b1);
     }
     let p0 = vmull_s8(vget_low_s8(a0), vget_low_s8(b0));
     let p1 = vmull_s8(vget_high_s8(a0), vget_high_s8(b0));
