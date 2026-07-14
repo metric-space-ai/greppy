@@ -196,6 +196,32 @@ jobs:
             --parallel '${{ inputs.parallel || '10' }}' \
             --output-dir "$RUN_DIR"
 
+      - name: Show gate verdict and aggregates (also on failure)
+        if: always()
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-agent-benchmark
+        run: |
+          for file in release-gate.json aggregate.txt SUMMARY.md; do
+            if [ -s "$RUN_DIR/$file" ]; then
+              echo "===== $file ====="
+              cat "$RUN_DIR/$file"
+            fi
+          done
+
+      - name: Upload gate diagnostics (also on failure, no raw traces)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-agent-benchmark-diagnostics-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/greppy-agent-benchmark/release-gate.json
+            ${{ runner.temp }}/greppy-agent-benchmark/aggregate.txt
+            ${{ runner.temp }}/greppy-agent-benchmark/SUMMARY.md
+            ${{ runner.temp }}/greppy-agent-benchmark/FORENSICS_explorer_VS_greppy.md
+            ${{ runner.temp }}/greppy-agent-benchmark/results.mechanical.json
+
       - name: Package publishable evidence without raw traces
         env:
           RUN_DIR: ${{ runner.temp }}/greppy-agent-benchmark
