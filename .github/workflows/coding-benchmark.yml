@@ -97,6 +97,42 @@ jobs:
             --output-dir "$RUN_DIR" \
             --run-id "github-$GITHUB_SHA"
 
+      - name: Show gate verdict and failure kinds (also on failure)
+        if: always()
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
+        run: |
+          if [ -s "$RUN_DIR/gate.json" ]; then
+            echo "===== gate.json ====="
+            cat "$RUN_DIR/gate.json"
+          fi
+          if [ -s "$RUN_DIR/results.json" ]; then
+            echo "===== failure kinds ====="
+            python3 - "$RUN_DIR/results.json" << 'PYEOF'
+          import collections, json, sys
+          rows = json.load(open(sys.argv[1]))
+          rows = rows if isinstance(rows, list) else rows.get("rows", [])
+          kinds = collections.Counter(
+              (row.get("arm"), row.get("failure_kind") or ("ok" if row.get("valid") else "invalid-unknown"))
+              for row in rows
+          )
+          for key, count in kinds.most_common():
+              print(count, key)
+          PYEOF
+          fi
+
+      - name: Upload gate diagnostics (also on failure, no raw traces)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-coding-benchmark-diagnostics-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/greppy-coding-benchmark/gate.json
+            ${{ runner.temp }}/greppy-coding-benchmark/results.json
+            ${{ runner.temp }}/greppy-coding-benchmark/MANIFEST.json
+
       - name: Package publishable evidence without raw traces
         env:
           RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
