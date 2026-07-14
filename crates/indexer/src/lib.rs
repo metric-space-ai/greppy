@@ -737,29 +737,24 @@ fn run_incremental(
         }
     }
 
-    // Every file_state row that survived this run reflects the run
-    // that confirmed it, even the unchanged files we did NOT rewrite. We
-    // skip re-hashing them, but stamp the current generation onto every
-    // remaining row in ONE bulk UPDATE so `last_indexed_generation`
+    // Every persisted file or skip row that survived this run reflects the
+    // run that confirmed it, even when we did not rewrite its content. We
+    // skip re-hashing unchanged files, but stamp the current generation onto
+    // all remaining rows in one transaction so `last_indexed_generation`
     // advances exactly as it does on a full reindex (the
     // `file_state_records_real_generation_stamp` contract). Deleted files'
     // rows are already gone; changed files were just written with this
     // generation, so this is idempotent for them.
-    bump_all_file_state_generation(store, project_name, generation)?;
+    bump_all_persisted_generations(store, project_name, generation)?;
     Ok(changed_files)
 }
 
-/// Bulk-stamp `generation` onto every `file_state` row for `project`. One
-/// statement, so it stays O(1) round-trips regardless of file count.
-fn bump_all_file_state_generation(store: &Store, project: &str, generation: u64) -> Result<()> {
-    store
-        .conn()
-        .execute(
-            "UPDATE file_state SET last_indexed_generation = ?2 WHERE project = ?1",
-            rusqlite::params![project, generation as i64],
-        )
-        .map(|_| ())
-        .map_err(sqlite_err)
+/// Bulk-stamp `generation` onto every `file_state` and `index_skips` row for
+/// `project`. Two statements share one transaction, so the update remains
+/// atomic and uses O(1) round-trips regardless of file count.
+fn bump_all_persisted_generations(store: &mut Store, project: &str, generation: u64) -> Result<()> {
+    store.bump_file_and_skip_generations(project, generation)?;
+    Ok(())
 }
 
 /// Result of extracting one file in the parallel phase. The bytes are
@@ -2415,13 +2410,6 @@ fn content_rows_from_bytes(bytes: &[u8]) -> Vec<ContentRow> {
         .collect()
 }
 
-fn mtime_ns(path: &Path) -> Option<i64> {
-    let md = std::fs::metadata(path).ok()?;
-    let mtime = md.modified().ok()?;
-    let dur = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(dur.as_nanos() as i64)
-}
-
 fn tree_sitter_version() -> &'static str {
     "0.25"
 }
@@ -2580,17 +2568,24 @@ fn record_index_skip(
     detail: &str,
     generation: u64,
 ) -> Result<()> {
-    let (size, mtime) = std::fs::metadata(&entry.abs_path)
-        .map(|md| (md.len() as i64, mtime_ns(&entry.abs_path).unwrap_or(0)))
-        .unwrap_or((0, 0));
+    let metadata = std::fs::metadata(&entry.abs_path)
+        .map(|md| stable_metadata(&md))
+        .unwrap_or(StableFileMetadata {
+            size: 0,
+            mtime_ns: None,
+            ctime_ns: None,
+            file_id: None,
+        });
     store.upsert_index_skip(&IndexSkip {
         project: project.to_string(),
         rel_path: entry.rel_path.clone(),
         language: language.to_string(),
         reason: reason.to_string(),
         detail: detail.to_string(),
-        size,
-        mtime_ns: mtime,
+        size: metadata.size as i64,
+        mtime_ns: metadata.mtime_ns.unwrap_or(0),
+        ctime_ns: metadata.ctime_ns,
+        file_id: metadata.file_id,
         last_indexed_generation: generation,
         updated_at: ws::now_iso8601(),
     })?;

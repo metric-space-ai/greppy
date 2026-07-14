@@ -18,6 +18,10 @@ pub struct IndexSkip {
     pub detail: String,
     pub size: i64,
     pub mtime_ns: i64,
+    #[serde(default)]
+    pub ctime_ns: Option<i64>,
+    #[serde(default)]
+    pub file_id: Option<u64>,
     pub last_indexed_generation: u64,
     pub updated_at: String,
 }
@@ -29,19 +33,37 @@ pub struct IndexSkipReasonCount {
 }
 
 impl Store {
+    /// Advance all surviving file and skip rows together after an incremental
+    /// run confirms the project at `generation`.
+    pub fn bump_file_and_skip_generations(&mut self, project: &str, generation: u64) -> Result<()> {
+        let tx = self.transaction()?;
+        tx.raw().execute(
+            "UPDATE file_state SET last_indexed_generation = ?2 WHERE project = ?1",
+            params![project, generation as i64],
+        )?;
+        tx.raw().execute(
+            "UPDATE index_skips SET last_indexed_generation = ?2 WHERE project = ?1",
+            params![project, generation as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_index_skip(&mut self, skip: &IndexSkip) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
             "INSERT INTO index_skips
                   (project, rel_path, language, reason, detail, size, mtime_ns,
-                   last_indexed_generation, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                   ctime_ns, file_id, last_indexed_generation, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(project, rel_path) DO UPDATE SET
                    language = excluded.language,
                    reason = excluded.reason,
                    detail = excluded.detail,
                    size = excluded.size,
                    mtime_ns = excluded.mtime_ns,
+                   ctime_ns = excluded.ctime_ns,
+                   file_id = excluded.file_id,
                    last_indexed_generation = excluded.last_indexed_generation,
                    updated_at = excluded.updated_at",
             params![
@@ -52,6 +74,8 @@ impl Store {
                 skip.detail,
                 skip.size,
                 skip.mtime_ns,
+                skip.ctime_ns,
+                skip.file_id.map(|value| value as i64),
                 skip.last_indexed_generation as i64,
                 skip.updated_at,
             ],
@@ -68,7 +92,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT project, rel_path, language, reason, detail, size, mtime_ns,
-                        last_indexed_generation, updated_at
+                        ctime_ns, file_id, last_indexed_generation, updated_at
                  FROM index_skips WHERE project = ?1 AND rel_path = ?2",
                 params![project, rel_path],
                 row_to_index_skip,
@@ -96,7 +120,7 @@ impl Store {
         }
         let mut stmt = self.conn().prepare(
             "SELECT project, rel_path, language, reason, detail, size, mtime_ns,
-                    last_indexed_generation, updated_at
+                    ctime_ns, file_id, last_indexed_generation, updated_at
              FROM index_skips
              WHERE project = ?1
              ORDER BY rel_path",
@@ -141,6 +165,7 @@ impl Store {
 }
 
 fn row_to_index_skip(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexSkip> {
+    let raw_file_id: Option<i64> = row.get(8)?;
     Ok(IndexSkip {
         project: row.get(0)?,
         rel_path: row.get(1)?,
@@ -149,8 +174,10 @@ fn row_to_index_skip(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexSkip> {
         detail: row.get(4)?,
         size: row.get(5)?,
         mtime_ns: row.get(6)?,
-        last_indexed_generation: row.get::<_, i64>(7).unwrap_or(0) as u64,
-        updated_at: row.get(8)?,
+        ctime_ns: row.get(7)?,
+        file_id: raw_file_id.map(|value| value as u64),
+        last_indexed_generation: row.get::<_, i64>(9).unwrap_or(0) as u64,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -179,6 +206,8 @@ mod tests {
             detail: "test detail".into(),
             size: 123,
             mtime_ns: 456,
+            ctime_ns: Some(789),
+            file_id: Some(42),
             last_indexed_generation: 7,
             updated_at: ws::now_iso8601(),
         }
@@ -222,5 +251,41 @@ mod tests {
         s.upsert_index_skip(&skip("a.rs", "oversize")).unwrap();
         s.delete_index_skip("p", "a.rs").unwrap();
         assert!(s.get_index_skip("p", "a.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn generation_bump_updates_file_and_skip_rows_atomically() {
+        let mut s = store_with_project();
+        s.upsert_file_state(&crate::FileState {
+            project: "p".into(),
+            rel_path: "indexed.rs".into(),
+            language: "rust".into(),
+            sha256: "hash".into(),
+            mtime_ns: 1,
+            size: 1,
+            parser_version: "parser".into(),
+            extractor_version: "extractor".into(),
+            last_indexed_generation: 1,
+        })
+        .unwrap();
+        s.upsert_index_skip(&skip("skipped.rs", "parse_failed"))
+            .unwrap();
+
+        s.bump_file_and_skip_generations("p", 9).unwrap();
+
+        assert_eq!(
+            s.get_file_state("p", "indexed.rs")
+                .unwrap()
+                .unwrap()
+                .last_indexed_generation,
+            9
+        );
+        assert_eq!(
+            s.get_index_skip("p", "skipped.rs")
+                .unwrap()
+                .unwrap()
+                .last_indexed_generation,
+            9
+        );
     }
 }

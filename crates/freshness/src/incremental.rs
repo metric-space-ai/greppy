@@ -150,15 +150,10 @@ pub fn compute_file_diff(
         };
 
         if let Some(skip) = skipped_by_rel.remove(&entry.rel_path) {
-            // Skipped files intentionally have no file_state row. Their
-            // persisted stat metadata is therefore the only baseline that
-            // can prove the same skip was already considered by the active
-            // index generation. Any uncertainty falls through to Added and
-            // forces the indexer to disposition the path again.
-            if skip.mtime_ns != 0
-                && skip.size == current.size as i64
-                && Some(skip.mtime_ns) == current.mtime_ns
-            {
+            // Skipped files intentionally have no file_state row. Accept only
+            // a complete, policy-compatible identity; any uncertainty forces
+            // the indexer to disposition the path again.
+            if skip_identity_matches(&skip, &current, max_size) {
                 diffs.push(FileDiff::Unchanged);
                 continue;
             }
@@ -250,6 +245,33 @@ fn stat_identity_matches(persisted: &PersistedStat, current: &CurrentStat) -> bo
         && persisted.file_id.is_some()
         && current.file_id.is_some()
         && persisted.file_id == current.file_id
+}
+
+fn skip_identity_matches(
+    skip: &greppy_store::IndexSkip,
+    current: &CurrentStat,
+    max_size: u64,
+) -> bool {
+    let basic_match = skip.mtime_ns != 0
+        && skip.size == current.size as i64
+        && Some(skip.mtime_ns) == current.mtime_ns;
+    if !basic_match || matches!(skip.reason.as_str(), "file_limit" | "time_budget") {
+        return false;
+    }
+
+    if skip.reason == "oversize" {
+        return current.size > max_size;
+    }
+    if current.size > max_size {
+        return false;
+    }
+
+    skip.ctime_ns.is_some()
+        && current.ctime_ns.is_some()
+        && skip.ctime_ns == current.ctime_ns
+        && skip.file_id.is_some()
+        && current.file_id.is_some()
+        && skip.file_id == current.file_id
 }
 
 fn rel_of(d: &FileDiff) -> String {
@@ -567,6 +589,8 @@ mod tests {
                     detail: "fixture".into(),
                     size: metadata.size as i64,
                     mtime_ns: metadata.mtime_ns.unwrap(),
+                    ctime_ns: metadata.ctime_ns,
+                    file_id: metadata.file_id,
                     last_indexed_generation: 1,
                     updated_at: ws::now_iso8601(),
                 })
@@ -592,6 +616,160 @@ mod tests {
         assert!(diffs
             .iter()
             .any(|diff| matches!(diff, FileDiff::Deleted(path) if path == "src/gone.ts")));
+    }
+
+    #[test]
+    fn same_size_skip_change_with_restored_mtime_is_rechecked() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let dir = tempdir_via_env();
+        let entry = make_entry(&dir, "src/swap.ts", "old-body");
+        let original = fs::metadata(&entry.abs_path).unwrap();
+        let original_modified = original.modified().unwrap();
+        let identity = stable_metadata(&original);
+        store
+            .upsert_index_skip(&IndexSkip {
+                project: "p".into(),
+                rel_path: entry.rel_path.clone(),
+                language: "typescript".into(),
+                reason: "parse_failed".into(),
+                detail: "fixture".into(),
+                size: identity.size as i64,
+                mtime_ns: identity.mtime_ns.unwrap(),
+                ctime_ns: identity.ctime_ns,
+                file_id: identity.file_id,
+                last_indexed_generation: 1,
+                updated_at: ws::now_iso8601(),
+            })
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&entry.abs_path, "new-body").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&entry.abs_path)
+            .unwrap()
+            .set_modified(original_modified)
+            .unwrap();
+
+        let diffs = compute_file_diff(&store, "p", std::slice::from_ref(&entry)).unwrap();
+        assert!(matches!(
+            diffs.as_slice(),
+            [FileDiff::Added(changed)] if changed.rel_path == entry.rel_path
+        ));
+    }
+
+    #[test]
+    fn incomplete_or_transient_skips_never_prove_freshness() {
+        let current = CurrentStat {
+            size: 10,
+            mtime_ns: Some(20),
+            ctime_ns: Some(30),
+            file_id: Some(40),
+        };
+        let mut skip = IndexSkip {
+            project: "p".into(),
+            rel_path: "src/a.rs".into(),
+            language: "rust".into(),
+            reason: "parse_failed".into(),
+            detail: "fixture".into(),
+            size: 10,
+            mtime_ns: 0,
+            ctime_ns: Some(30),
+            file_id: Some(40),
+            last_indexed_generation: 1,
+            updated_at: ws::now_iso8601(),
+        };
+        assert!(!skip_identity_matches(&skip, &current, 100));
+
+        skip.mtime_ns = 20;
+        skip.ctime_ns = None;
+        assert!(!skip_identity_matches(&skip, &current, 100));
+
+        skip.ctime_ns = Some(30);
+        skip.reason = "file_limit".into();
+        assert!(!skip_identity_matches(&skip, &current, 100));
+        skip.reason = "time_budget".into();
+        assert!(!skip_identity_matches(&skip, &current, 100));
+    }
+
+    #[test]
+    fn oversize_skip_tracks_the_active_size_policy() {
+        let current = CurrentStat {
+            size: 200,
+            mtime_ns: Some(20),
+            ctime_ns: None,
+            file_id: None,
+        };
+        let skip = IndexSkip {
+            project: "p".into(),
+            rel_path: "large.rs".into(),
+            language: "rust".into(),
+            reason: "oversize".into(),
+            detail: "fixture".into(),
+            size: 200,
+            mtime_ns: 20,
+            ctime_ns: None,
+            file_id: None,
+            last_indexed_generation: 1,
+            updated_at: ws::now_iso8601(),
+        };
+        assert!(skip_identity_matches(&skip, &current, 100));
+        assert!(!skip_identity_matches(&skip, &current, 300));
+    }
+
+    #[test]
+    fn file_state_wins_over_a_legacy_skip_for_the_same_path() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let dir = tempdir_via_env();
+        let entry = make_entry(&dir, "src/keep.rs", "pub fn keep() {}\n");
+        let metadata = stable_metadata(&fs::metadata(&entry.abs_path).unwrap());
+        store
+            .upsert_file_state(&FileState {
+                project: "p".into(),
+                rel_path: entry.rel_path.clone(),
+                language: "rust".into(),
+                sha256: sha256_hex(b"pub fn keep() {}\n"),
+                mtime_ns: metadata.mtime_ns.unwrap(),
+                size: metadata.size as i64,
+                parser_version: "x".into(),
+                extractor_version: "x".into(),
+                last_indexed_generation: 1,
+            })
+            .unwrap();
+        store
+            .upsert_index_skip(&IndexSkip {
+                project: "p".into(),
+                rel_path: entry.rel_path.clone(),
+                language: "rust".into(),
+                reason: "file_limit".into(),
+                detail: "legacy fixture".into(),
+                size: metadata.size as i64,
+                mtime_ns: metadata.mtime_ns.unwrap(),
+                ctime_ns: metadata.ctime_ns,
+                file_id: metadata.file_id,
+                last_indexed_generation: 1,
+                updated_at: ws::now_iso8601(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            compute_file_diff(&store, "p", &[entry]).unwrap(),
+            vec![FileDiff::Unchanged]
+        );
     }
 
     #[test]
