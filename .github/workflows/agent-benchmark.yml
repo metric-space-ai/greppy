@@ -21,8 +21,78 @@ permissions:
   attestations: write
 
 jobs:
+  # Indexing the 12 pinned task repos is a multi-hour CPU embedding build.
+  # Combined with the agent phase it blew the 6-hour hosted-runner hard cap
+  # twice (runs 29269091343, 29292161251 - both cancelled at exactly 6h00).
+  # The stores are deterministic in (model digests, task pins, corpus
+  # generators), so prime them in their own job and cache the result; the
+  # gate job restores the warm store and only pays a freshness validation.
+  prime-store:
+    name: prime task-repo stores
+    runs-on: macos-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Restore model assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
+            crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+            crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
+          key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
+      - name: Fetch model assets (release-hosted, sha-pinned)
+        shell: bash
+        run: ./tools/fetch_model_assets.sh
+      - name: Restore benchmark stores
+        id: bench-store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/greppy-bench-store
+          key: bench-store-v1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+      - name: Install pinned Rust toolchain
+        if: steps.bench-store.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+      - name: Build candidate binary with Metal
+        if: steps.bench-store.outputs.cache-hit != 'true'
+        run: cargo build --release --bin greppy --features metal
+      - name: Materialize benchmark repositories
+        if: steps.bench-store.outputs.cache-hit != 'true'
+        run: |
+          bash bench/agent_efficiency/gen_corpus.sh
+          python3 bench/agent_efficiency/real_corpus.py setup \
+            --repos serde flask gson zod tokio django
+      - name: Reclaim build scratch disk before indexing
+        if: steps.bench-store.outputs.cache-hit != 'true'
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          mv target/release/greppy "${{ runner.temp }}/greppy-gate-bin"
+          rm -rf target
+          mkdir -p target/release
+          mv "${{ runner.temp }}/greppy-gate-bin" target/release/greppy
+          df -h "$GITHUB_WORKSPACE"
+      - name: Build stores for every task repo
+        if: steps.bench-store.outputs.cache-hit != 'true'
+        env:
+          GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
+          GREPPY_STORE_DIR: ${{ runner.temp }}/greppy-bench-store
+          RUN_DIR: ${{ runner.temp }}/greppy-store-prime
+        run: |
+          python3 bench/agent_efficiency/parallel_acceptance_run.py \
+            --skip-build \
+            --skip-verify \
+            --index-only \
+            --tasks tasks_v2.json \
+            --agents grep,greppy,explorer \
+            --output-dir "$RUN_DIR"
+
   benchmark:
     name: pinned Greppy vs explorer
+    needs: prime-store
     runs-on: macos-latest
     timeout-minutes: 360
     steps:
@@ -41,6 +111,12 @@ jobs:
       - name: Fetch model assets (release-hosted, sha-pinned)
         shell: bash
         run: ./tools/fetch_model_assets.sh
+
+      - name: Restore benchmark stores (primed)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/greppy-bench-store
+          key: bench-store-v1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
 
       - name: Install pinned Rust toolchain
         # dtolnay/rust-toolchain v1, pinned to an immutable source revision.
@@ -106,6 +182,9 @@ jobs:
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
+          # Warm store from prime-store; the index step degrades to a fast
+          # freshness validation instead of a multi-hour embedding build.
+          GREPPY_STORE_DIR: ${{ runner.temp }}/greppy-bench-store
           RUN_DIR: ${{ runner.temp }}/greppy-agent-benchmark
         run: |
           test -n "$MINIMAX_API_KEY"

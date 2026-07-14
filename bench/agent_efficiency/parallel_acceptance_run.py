@@ -83,6 +83,12 @@ def main() -> int:
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-verify", action="store_true")
     ap.add_argument("--skip-bench", action="store_true")
+    ap.add_argument("--index-only", action="store_true",
+                    help="materialize the greppy stores for every selected "
+                         "task repo, then exit without running agents. Used "
+                         "by CI to prime the store cache in its own job so "
+                         "the 6h hosted-runner cap never hits the agent "
+                         "phase (indexing alone takes hours on CPU).")
     ap.add_argument("--rerun", action="store_true")
     ap.add_argument("--allow-unaccepted", action="store_true")
     args = ap.parse_args()
@@ -114,7 +120,7 @@ def main() -> int:
 
     key_env = PROVIDER_KEYS[args.llm_provider]
     ensure_api_key(key_env)
-    if not args.skip_bench and not os.environ.get(key_env):
+    if not args.skip_bench and not args.index_only and not os.environ.get(key_env):
         raise SystemExit(
             f"{key_env} is missing. Export it or set it with launchctl; "
             "do not pass it on argv."
@@ -128,7 +134,10 @@ def main() -> int:
     # cache (~/Library/Caches/greppy), which other sessions have wiped
     # mid-run before. Inherited by verify/index steps and every worker's pi
     # agent via the environment (PLAN_10X §8 Risiko 7).
-    store_dir = run_dir / "store"
+    # A pre-set GREPPY_STORE_DIR wins: CI primes the store in a separate job
+    # (--index-only) and restores it from cache, so both jobs must agree on
+    # one fixed path outside the per-run directory.
+    store_dir = pathlib.Path(os.environ.get("GREPPY_STORE_DIR") or (run_dir / "store"))
     store_dir.mkdir(parents=True, exist_ok=True)
     os.environ["GREPPY_STORE_DIR"] = str(store_dir)
     # The acceptance run deliberately excludes one-time precomputation from
@@ -210,6 +219,13 @@ def main() -> int:
             write_summary(summary, run_dir, steps, results, graded_results,
                           aggregate, forensics, tasks_path)
             return index_rc
+
+    if args.index_only:
+        print("== index-only: stores materialized, skipping agent phase",
+              file=sys.stderr)
+        write_summary(summary, run_dir, steps, results, graded_results,
+                      aggregate, forensics, tasks_path)
+        return 0
 
     bench_rc = 0
     if not args.skip_bench:
