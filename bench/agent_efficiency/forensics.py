@@ -446,10 +446,12 @@ def ratio(base: Any, cand: Any) -> float | None:
 
 
 def quality_score(row: dict[str, Any], agent: str) -> float | None:
+    # A graded partial/fail verdict is a score, not missing evidence
+    # (BENCHMARK_CONTRACT.md: only absent grades void a run; same owner-decided
+    # reading as release_gate.quality()). accepted_for_speed_claim keeps its
+    # role for speed claims elsewhere in this module.
     q = row.get(agent, {}).get("quality")
     if isinstance(q, dict) and q.get("score") is not None:
-        if q.get("accepted_for_speed_claim") is not True:
-            return None
         return float(q["score"])
     if row.get(agent, {}).get("correct") is not None:
         return 1.0 if row[agent]["correct"] else 0.0
@@ -474,7 +476,15 @@ def has_blocking_evidence_gap(
     if not comparable:
         return True
     for row in comparable:
-        if quality_not_worse(row, baseline, candidate) is not True:
+        # Blocking means EVIDENCE is missing (a row without a grade on either
+        # arm) or a router violation - matching this flag's documented purpose
+        # ("exit non-zero when mandatory acceptance evidence is missing").
+        # A graded row where the candidate scored worse is NOT an evidence
+        # gap: per-row losses are adjudicated by the pre-registered paired
+        # correctness gates in release_gate.py, which tolerate losses up to a
+        # one-sided exact test at alpha 0.05. A zero-loss rule here would
+        # contradict those registered gates.
+        if quality_not_worse(row, baseline, candidate) is None:
             return True
         cls = class_for_task(row, task_classes)
         if class_role(cls, task_classes) == "avoid_embedding" and candidate_uses_vector(
