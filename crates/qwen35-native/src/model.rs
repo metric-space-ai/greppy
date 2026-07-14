@@ -1226,14 +1226,16 @@ mod cpu_perf_tests {
         let first = greedy_argmax(&target.logits);
         assert_eq!(first, 10296, "unexpected MTP golden target token");
 
-        let mut prompt_conditioning = vec![0.0f32; prompt_hidden.len()];
-        prompt_conditioning[hidden_size..]
-            .copy_from_slice(&prompt_hidden[..prompt_hidden.len() - hidden_size]);
+        // MTP conditioning contract: row i pairs embed(token_{i+1}) with the
+        // POST-final-norm trunk hidden of token_i, so the prompt prefill skips
+        // token 0 (mirrors `generate_with_mtp`).
+        let prompt_conditioning =
+            model.output_normed_rows_for_test(&prompt_hidden[..prompt_hidden.len() - hidden_size]);
         let mut mtp_state = model
             .new_mtp_state(prompt_ids.len() + 3)
             .expect("MTP golden state");
         model
-            .mtp_prefill_tokens(&prompt_ids, &prompt_conditioning, &mut mtp_state)
+            .mtp_prefill_tokens(&prompt_ids[1..], &prompt_conditioning, &mut mtp_state)
             .expect("MTP golden prompt prefill");
         let first_draft = model
             .mtp_forward_tokens_logits_hidden(&[first], &target.hidden, &mut mtp_state)
@@ -1246,9 +1248,14 @@ mod cpu_perf_tests {
                 &mut mtp_state,
             )
             .expect("MTP second golden draft");
+        // Golden drafts for ckpt-2026-07-13-Q4_K_M. Cross-checked against the
+        // HF bf16 reference chain (mtp_module.Qwen35MTP, vLLM semantics): the
+        // trunk token (10296) and draft step 1 (6976) match HF exactly; step 2
+        // is Q4_K_M-trunk-consistent (the engine's own greedy target also picks
+        // 264 there, while the fp32 trunk diverges at that position).
         assert_eq!(
             [first_draft_token, greedy_argmax(&second_draft.logits)],
-            [334, 1159],
+            [6976, 264],
             "native MTP drafts differ from the finetuned-model golden tokens"
         );
 

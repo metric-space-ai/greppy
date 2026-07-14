@@ -261,15 +261,18 @@ impl MetalQwen35Model {
         let mut target = self.target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())?;
         perf.finish_target_prefill();
 
-        let zero_hidden = vec![0.0f32; hidden_size];
-        let prompt_conditioning =
-            mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
+        // MTP conditioning contract (vLLM Qwen3-Next MTP / training): row i pairs
+        // embed(token_{i+1}) with the POST-final-norm trunk hidden of token_i at
+        // rotary position i. Token 0 has no predecessor hidden, so the MTP prompt
+        // prefill covers tokens 1.. and the head's stream stays one behind the trunk.
+        let prompt_conditioning = self.output_normed_rows(&prompt_hidden, prompt_ids.len())?;
         let mut mtp_state = self.new_mtp_state(max_context)?;
         perf.begin_mtp_prefill();
-        for start in (0..prompt_ids.len()).step_by(METAL_PREFILL_BATCH_ROWS) {
-            let end = (start + METAL_PREFILL_BATCH_ROWS).min(prompt_ids.len());
+        let mtp_prompt_rows = prompt_ids.len() - 1;
+        for start in (0..mtp_prompt_rows).step_by(METAL_PREFILL_BATCH_ROWS) {
+            let end = (start + METAL_PREFILL_BATCH_ROWS).min(mtp_prompt_rows);
             self.mtp_prefill_tokens(
-                &prompt_ids[start..end],
+                &prompt_ids[start + 1..end + 1],
                 &prompt_conditioning[start * hidden_size..end * hidden_size],
                 &mut mtp_state,
             )?;
@@ -750,8 +753,10 @@ impl MetalQwen35Model {
             Error::GenerationUnavailable(format!("Metal hidden/logits forward failed: {e}"))
         })?;
         state.position += 1;
+        // MTP conditioning consumes the POST-final-norm trunk hidden (the
+        // representation the NextN head was trained on), so return `normed`.
         Ok(MetalTargetForwardOutput {
-            hidden: self.read_f32(&ws.hidden, self.inventory.hidden_size)?,
+            hidden: self.read_f32(&ws.normed, self.inventory.hidden_size)?,
             logits: self.read_f32(&ws.logits, self.inventory.vocab_size)?,
         })
     }
@@ -761,8 +766,8 @@ impl MetalQwen35Model {
         hidden_rows: &[f32],
         rows: usize,
     ) -> Result<MetalTargetForwardOutput> {
-        let hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
-        let src = self.upload_pod(&hidden)?;
+        let raw = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
+        let src = self.upload_pod(&raw)?;
         let normed = self.new_f32(self.inventory.hidden_size)?;
         let logits = self.new_f32(self.inventory.vocab_size)?;
         let cb = self.command_buffer()?;
@@ -793,10 +798,40 @@ impl MetalQwen35Model {
                 "Metal prefetched target projection failed: {error}"
             ))
         })?;
+        // MTP conditioning consumes the POST-final-norm trunk hidden.
         Ok(MetalTargetForwardOutput {
-            hidden,
+            hidden: self.read_f32(&normed, self.inventory.hidden_size)?,
             logits: self.read_f32(&logits, self.inventory.vocab_size)?,
         })
+    }
+
+    /// Apply the trunk's final `output_norm` to host-side hidden rows. MTP
+    /// conditioning consumes POST-final-norm hiddens (the representation the
+    /// NextN head was trained on), while batched prefill returns raw rows.
+    fn output_normed_rows(&self, hidden_rows: &[f32], rows: usize) -> Result<Vec<f32>> {
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let src = self.upload_pod(hidden_rows)?;
+        let dst = self.new_f32(rows * self.inventory.hidden_size)?;
+        let cb = self.command_buffer()?;
+        let enc = cb
+            .compute()
+            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_rms_norm(
+            &enc,
+            "output_norm.weight",
+            &src,
+            &dst,
+            rows,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        enc.end();
+        cb.commit_and_wait().map_err(|error| {
+            Error::GenerationUnavailable(format!("Metal output-norm rows failed: {error}"))
+        })?;
+        self.read_f32(&dst, rows * self.inventory.hidden_size)
     }
 
     pub(crate) fn forward_token_greedy(
@@ -923,8 +958,9 @@ impl MetalQwen35Model {
         cb.commit_and_wait().map_err(|e| {
             Error::GenerationUnavailable(format!("Metal batched hidden/logits forward failed: {e}"))
         })?;
+        // MTP conditioning consumes POST-final-norm trunk hiddens.
         Ok(MetalTargetForwardOutput {
-            hidden: self.read_f32(&workspace.hidden, rows * self.inventory.hidden_size)?,
+            hidden: self.read_f32(&workspace.normed, rows * self.inventory.hidden_size)?,
             logits: self.read_f32(&logits, rows * self.inventory.vocab_size)?,
         })
     }

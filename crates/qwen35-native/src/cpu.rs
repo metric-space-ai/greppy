@@ -373,16 +373,19 @@ impl CpuQwen35Model {
         let mut target = self.target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())?;
         perf.finish_target_prefill();
 
-        let zero_hidden = vec![0.0f32; hidden_size];
-        let prompt_conditioning =
-            mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
+        // MTP conditioning contract (vLLM Qwen3-Next MTP / training): row i pairs
+        // embed(token_{i+1}) with the POST-final-norm trunk hidden of token_i at
+        // rotary position i. Token 0 has no predecessor hidden, so the MTP prompt
+        // prefill covers tokens 1.. and the head's stream stays one behind the trunk.
+        rms_norm_rows_qwen(&mut prompt_hidden, &self.output_norm, hidden_size);
         let mut mtp_state = self.new_mtp_state(max_context)?;
         perf.begin_mtp_prefill();
-        for start in (0..prompt_ids.len()).step_by(512) {
-            let end = (start + 512).min(prompt_ids.len());
+        let mtp_prompt_rows = prompt_ids.len() - 1;
+        for start in (0..mtp_prompt_rows).step_by(512) {
+            let end = (start + 512).min(mtp_prompt_rows);
             self.mtp_prefill_tokens(
-                &prompt_ids[start..end],
-                &prompt_conditioning[start * hidden_size..end * hidden_size],
+                &prompt_ids[start + 1..end + 1],
+                &prompt_hidden[start * hidden_size..end * hidden_size],
                 &mut mtp_state,
             )?;
         }
@@ -559,51 +562,63 @@ impl CpuQwen35Model {
                         next = target_token;
                     }
                 } else {
+                    // One batched forward covers every remaining draft: logits row
+                    // j-1 decides draft_tokens[j], and the final row supplies the
+                    // bonus token once the whole chain is accepted.
                     let mut tail = self.forward_tokens_logits_hidden(
                         &draft_tokens,
                         &mut speculative_target_state,
                     )?;
-                    let Some(second_target) =
-                        sample_token(&mut tail.logits[..vocab_size], &generated, params, &mut rng)
-                    else {
-                        perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
-                        break;
-                    };
-                    if options.stop_on_eos && second_target == self.eos_token_id {
-                        finished = true;
-                    } else {
+                    for (position, &draft_token) in draft_tokens.iter().enumerate().skip(1) {
+                        let row = position - 1;
+                        let Some(target_token) = sample_token(
+                            &mut tail.logits[row * vocab_size..position * vocab_size],
+                            &generated,
+                            params,
+                            &mut rng,
+                        ) else {
+                            finished = true;
+                            break;
+                        };
+                        if options.stop_on_eos && target_token == self.eos_token_id {
+                            finished = true;
+                            break;
+                        }
                         if mtp_debug {
                             eprintln!(
-                                "qwen35-mtp-debug cycle={cycles} pos=1 target={second_target} draft={}",
-                                draft_tokens[1]
+                                "qwen35-mtp-debug cycle={cycles} pos={position} target={target_token} draft={draft_token}"
                             );
                         }
-                        generated.push(second_target);
-                        if second_target != draft_tokens[1] {
-                            mismatch = Some(second_target);
+                        generated.push(target_token);
+                        if target_token != draft_token {
+                            mismatch = Some(target_token);
+                            break;
+                        }
+                        accepted += 1;
+                        accepted_total += 1;
+                        if generated.len() == params.max_tokens {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    if !finished && mismatch.is_none() {
+                        debug_assert_eq!(accepted, draft_tokens.len());
+                        committed_hidden.extend_from_slice(&tail.hidden);
+                        let bonus_row = draft_tokens.len() - 1;
+                        let Some(target_token) = sample_token(
+                            &mut tail.logits[bonus_row * vocab_size..(bonus_row + 1) * vocab_size],
+                            &generated,
+                            params,
+                            &mut rng,
+                        ) else {
+                            perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                            break;
+                        };
+                        if options.stop_on_eos && target_token == self.eos_token_id {
+                            finished = true;
                         } else {
-                            accepted = 2;
-                            accepted_total += 1;
-                            if generated.len() == params.max_tokens {
-                                finished = true;
-                            } else {
-                                committed_hidden.extend_from_slice(&tail.hidden);
-                                let Some(target_token) = sample_token(
-                                    &mut tail.logits[vocab_size..vocab_size * 2],
-                                    &generated,
-                                    params,
-                                    &mut rng,
-                                ) else {
-                                    perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
-                                    break;
-                                };
-                                if options.stop_on_eos && target_token == self.eos_token_id {
-                                    finished = true;
-                                } else {
-                                    generated.push(target_token);
-                                    next = target_token;
-                                }
-                            }
+                            generated.push(target_token);
+                            next = target_token;
                         }
                     }
                 }
@@ -638,6 +653,7 @@ impl CpuQwen35Model {
                     let stage = perf.begin_stage();
                     committed_hidden =
                         self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
+                    rms_norm_rows_qwen(&mut committed_hidden, &self.output_norm, hidden_size);
                     perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
                 }
                 let conditioning = mtp_conditioning_rows(
@@ -728,6 +744,15 @@ impl CpuQwen35Model {
     #[cfg(test)]
     pub(crate) fn on_performance_cores<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
         self.performance_pool.install(operation)
+    }
+
+    /// POST-final-norm view of raw prefill hidden rows: the MTP conditioning
+    /// representation (see `generate_with_mtp`).
+    #[cfg(test)]
+    pub(crate) fn output_normed_rows_for_test(&self, hidden_rows: &[f32]) -> Vec<f32> {
+        let mut rows = hidden_rows.to_vec();
+        rms_norm_rows_qwen(&mut rows, &self.output_norm, self.inventory.hidden_size);
+        rows
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -878,15 +903,18 @@ impl CpuQwen35Model {
         self.token_embd.matmul(&hidden, 1).map_err(Into::into)
     }
 
+    /// The returned `hidden` rows are POST-final-norm (`output_norm`) trunk
+    /// hiddens: that is the representation the NextN/MTP head was trained on
+    /// (vLLM's EagleProposer feeds `last_hidden_state`, i.e. post-final-norm),
+    /// and the only consumer of these rows is the MTP conditioning input.
     pub(crate) fn forward_token_logits_hidden(
         &self,
         token: u32,
         state: &mut ForwardState,
     ) -> Result<TargetForwardOutput> {
-        let hidden = self.forward_token_hidden(token, state)?;
-        let mut output_hidden = hidden.clone();
-        rms_norm_qwen(&mut output_hidden, &self.output_norm);
-        let logits = self.token_embd.matmul(&output_hidden, 1)?;
+        let mut hidden = self.forward_token_hidden(token, state)?;
+        rms_norm_qwen(&mut hidden, &self.output_norm);
+        let logits = self.token_embd.matmul(&hidden, 1)?;
         Ok(TargetForwardOutput { hidden, logits })
     }
 
@@ -895,10 +923,9 @@ impl CpuQwen35Model {
         hidden_rows: &[f32],
         rows: usize,
     ) -> Result<TargetForwardOutput> {
-        let hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
-        let mut output_hidden = hidden.clone();
-        rms_norm_qwen(&mut output_hidden, &self.output_norm);
-        let logits = self.token_embd.matmul(&output_hidden, 1)?;
+        let mut hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
+        rms_norm_qwen(&mut hidden, &self.output_norm);
+        let logits = self.token_embd.matmul(&hidden, 1)?;
         Ok(TargetForwardOutput { hidden, logits })
     }
 
@@ -907,20 +934,15 @@ impl CpuQwen35Model {
         tokens: &[u32],
         state: &mut ForwardState,
     ) -> Result<TargetForwardOutput> {
-        let hidden = self.prefill_tokens_hidden(tokens, state)?;
+        let mut hidden = self.prefill_tokens_hidden(tokens, state)?;
         if hidden.is_empty() {
             return Ok(TargetForwardOutput {
                 hidden,
                 logits: Vec::new(),
             });
         }
-        let mut output_hidden = hidden.clone();
-        rms_norm_rows_qwen(
-            &mut output_hidden,
-            &self.output_norm,
-            self.inventory.hidden_size,
-        );
-        let logits = self.token_embd.matmul(&output_hidden, tokens.len())?;
+        rms_norm_rows_qwen(&mut hidden, &self.output_norm, self.inventory.hidden_size);
+        let logits = self.token_embd.matmul(&hidden, tokens.len())?;
         Ok(TargetForwardOutput { hidden, logits })
     }
 

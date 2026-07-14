@@ -317,15 +317,18 @@ impl CudaQwen35Model {
         let mut target = self.target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())?;
         perf.finish_target_prefill();
 
-        let zero_hidden = vec![0.0f32; hidden_size];
-        let prompt_conditioning =
-            mtp_conditioning_rows(&zero_hidden, &prompt_hidden, prompt_ids.len(), hidden_size)?;
+        // MTP conditioning contract (vLLM Qwen3-Next MTP / training): row i pairs
+        // embed(token_{i+1}) with the POST-final-norm trunk hidden of token_i at
+        // rotary position i. Token 0 has no predecessor hidden, so the MTP prompt
+        // prefill covers tokens 1.. and the head's stream stays one behind the trunk.
+        let prompt_conditioning = self.output_normed_rows(&prompt_hidden, prompt_ids.len())?;
         let mut mtp_state = self.new_mtp_state(max_context)?;
         perf.begin_mtp_prefill();
-        for start in (0..prompt_ids.len()).step_by(CUDA_PREFILL_BATCH_ROWS) {
-            let end = (start + CUDA_PREFILL_BATCH_ROWS).min(prompt_ids.len());
+        let mtp_prompt_rows = prompt_ids.len() - 1;
+        for start in (0..mtp_prompt_rows).step_by(CUDA_PREFILL_BATCH_ROWS) {
+            let end = (start + CUDA_PREFILL_BATCH_ROWS).min(mtp_prompt_rows);
             self.mtp_prefill_tokens(
-                &prompt_ids[start..end],
+                &prompt_ids[start + 1..end + 1],
                 &prompt_conditioning[start * hidden_size..end * hidden_size],
                 &mut mtp_state,
             )?;
@@ -772,6 +775,10 @@ impl CudaQwen35Model {
         Ok(logits)
     }
 
+    /// The returned `hidden` is the POST-final-norm (`output_norm`) trunk
+    /// hidden: that is the representation the NextN/MTP head was trained on
+    /// (vLLM's EagleProposer feeds `last_hidden_state`), and the only consumer
+    /// of this row is the MTP conditioning input.
     #[allow(dead_code)]
     pub(crate) fn forward_token_logits_hidden(
         &self,
@@ -783,13 +790,24 @@ impl CudaQwen35Model {
         state.decode_graph_mode = None;
         state.graph_token = None;
         self.forward_token_logits_device(token, state, ws)?;
+        self.rms_norm_device(
+            "output_norm.weight",
+            ws.hidden.as_f32(),
+            ws.normed.as_f32(),
+            1,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        self.dev.sync()?;
         let mut hidden = vec![0.0f32; self.inventory.hidden_size];
         let mut logits = vec![0.0f32; self.inventory.vocab_size];
-        self.dev.copy_d2h(&mut hidden, &ws.hidden)?;
+        self.dev.copy_d2h(&mut hidden, &ws.normed)?;
         self.dev.copy_d2h(&mut logits, &ws.logits)?;
         Ok(CudaTargetForwardOutput { hidden, logits })
     }
 
+    /// Graph-decode variant of [`Self::forward_token_logits_hidden`]; the
+    /// returned `hidden` is likewise the POST-final-norm trunk hidden.
     fn forward_token_logits_hidden_graph(
         &self,
         token: u32,
@@ -797,8 +815,17 @@ impl CudaQwen35Model {
         ws: &mut CudaForwardWorkspace,
     ) -> Result<CudaTargetForwardOutput> {
         let logits = self.forward_token_logits(token, state, ws)?;
+        self.rms_norm_device(
+            "output_norm.weight",
+            ws.hidden.as_f32(),
+            ws.normed.as_f32(),
+            1,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        self.dev.sync()?;
         let mut hidden = vec![0.0f32; self.inventory.hidden_size];
-        self.dev.copy_d2h(&mut hidden, &ws.hidden)?;
+        self.dev.copy_d2h(&mut hidden, &ws.normed)?;
         Ok(CudaTargetForwardOutput { hidden, logits })
     }
 
@@ -807,8 +834,8 @@ impl CudaQwen35Model {
         hidden_rows: &[f32],
         rows: usize,
     ) -> Result<CudaTargetForwardOutput> {
-        let hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
-        let src = self.upload_pod(&hidden)?;
+        let raw = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
+        let src = self.upload_pod(&raw)?;
         let normed = self.new_f32(self.inventory.hidden_size)?;
         let logits_device = self.new_f32(self.inventory.vocab_size)?;
         let q8_scratch = self.new_bytes(q8_1_scratch_bytes(self.inventory.hidden_size, 1))?;
@@ -829,9 +856,35 @@ impl CudaQwen35Model {
             &q8_scratch,
         )?;
         self.dev.sync()?;
+        // MTP conditioning consumes the POST-final-norm trunk hidden.
+        let mut hidden = vec![0.0f32; self.inventory.hidden_size];
+        self.dev.copy_d2h(&mut hidden, &normed)?;
         let mut logits = vec![0.0f32; self.inventory.vocab_size];
         self.dev.copy_d2h(&mut logits, &logits_device)?;
         Ok(CudaTargetForwardOutput { hidden, logits })
+    }
+
+    /// Apply the trunk's final `output_norm` to host-side hidden rows. MTP
+    /// conditioning consumes POST-final-norm hiddens (the representation the
+    /// NextN head was trained on), while batched prefill returns raw rows.
+    fn output_normed_rows(&self, hidden_rows: &[f32], rows: usize) -> Result<Vec<f32>> {
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let src = self.upload_pod(hidden_rows)?;
+        let dst = self.new_f32(rows * self.inventory.hidden_size)?;
+        self.rms_norm_device(
+            "output_norm.weight",
+            src.as_f32(),
+            dst.as_f32(),
+            rows,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        self.dev.sync()?;
+        let mut normed = vec![0.0f32; rows * self.inventory.hidden_size];
+        self.dev.copy_d2h(&mut normed, &dst)?;
+        Ok(normed)
     }
 
     #[cfg(test)]
@@ -864,16 +917,18 @@ impl CudaQwen35Model {
         self.prefill_tokens_impl(tokens, state, false)
     }
 
+    /// Batched target forward; the returned `hidden` rows are POST-final-norm
+    /// trunk hiddens (the MTP conditioning representation).
     #[allow(dead_code)]
     pub(crate) fn forward_tokens_logits_hidden(
         &self,
         tokens: &[u32],
         state: &mut CudaForwardState,
     ) -> Result<CudaTargetForwardOutput> {
-        let hidden = self.prefill_tokens_impl(tokens, state, false)?;
+        let _ = self.prefill_tokens_impl(tokens, state, false)?;
         if tokens.is_empty() {
             return Ok(CudaTargetForwardOutput {
-                hidden,
+                hidden: Vec::new(),
                 logits: Vec::new(),
             });
         }
@@ -881,7 +936,7 @@ impl CudaQwen35Model {
         let workspace = state.prefill_workspace.take().ok_or_else(|| {
             Error::GenerationUnavailable("CUDA prefill workspace is already in use".into())
         })?;
-        let result = (|| -> Result<Vec<f32>> {
+        let result = (|| -> Result<(Vec<f32>, Vec<f32>)> {
             self.rms_norm_device(
                 "output_norm.weight",
                 workspace.hidden.as_f32(),
@@ -907,15 +962,15 @@ impl CudaQwen35Model {
                 )?;
             }
             self.dev.sync()?;
+            let mut hidden = vec![0.0f32; rows * self.inventory.hidden_size];
+            self.dev.copy_d2h(&mut hidden, &workspace.normed)?;
             let mut logits = vec![0.0f32; rows * self.inventory.vocab_size];
             self.dev.copy_d2h(&mut logits, &logits_device)?;
-            Ok(logits)
+            Ok((hidden, logits))
         })();
         state.prefill_workspace = Some(workspace);
-        Ok(CudaTargetForwardOutput {
-            hidden,
-            logits: result?,
-        })
+        let (hidden, logits) = result?;
+        Ok(CudaTargetForwardOutput { hidden, logits })
     }
 
     pub(crate) fn mtp_prefill_tokens(
