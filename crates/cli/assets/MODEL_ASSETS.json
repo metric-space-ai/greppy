@@ -5,7 +5,8 @@
     {
       "asset_name": "Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
       "dest": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
-      "sha256": "d09d5028e28ea9df501d83a9a60b80ed73f878b4b98424b09a39505364a1053f"
+      "sha256": "1fd75d3d33ec508633054de2ecca341e7f8c4f4b49d2db654a4db78286c1827a",
+      "release_tag": "model-qwen35-nano-20260714-2023"
     },
     {
       "asset_name": "qwen-tokenizer.json",
