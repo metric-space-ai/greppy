@@ -93,10 +93,15 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "file_identity",
         sql: include_str!("migrations/0014_file_identity.sql"),
     },
+    Migration {
+        version: 15,
+        name: "index_skip_identity",
+        sql: include_str!("migrations/0015_index_skip_identity.sql"),
+    },
 ];
 
 /// Current schema version this crate knows about.
-pub const CURRENT_VERSION: u32 = 14;
+pub const CURRENT_VERSION: u32 = 15;
 
 /// Apply pending migrations. Returns the number of migrations applied.
 pub fn migrate(conn: &Connection) -> Result<usize, Error> {
@@ -478,6 +483,52 @@ mod tests {
             .unwrap();
         assert_eq!(v.parse::<u32>().unwrap(), CURRENT_VERSION);
         assert_eq!(migrate(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn index_skip_identity_migration_preserves_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        for migration in super::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 14)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', '14');
+             INSERT INTO projects(name, indexed_at, root_path) VALUES('p', 'x', '/p');
+             INSERT INTO index_skips(
+                 project, rel_path, language, reason, detail, size, mtime_ns,
+                 last_indexed_generation, updated_at
+             ) VALUES('p', 'bad.rs', 'rust', 'parse_failed', 'fixture', 4, 5, 6, 'x');",
+        )
+        .unwrap();
+
+        assert_eq!(migrate(&conn).unwrap(), 1);
+        let identity: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT ctime_ns, file_id FROM index_skips
+                 WHERE project = 'p' AND rel_path = 'bad.rs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity, (None, None));
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "15");
     }
 
     /// a migration that fails part-way must not advance

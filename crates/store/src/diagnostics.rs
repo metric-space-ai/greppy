@@ -136,6 +136,8 @@ mod tests {
                 detail: "size exceeds cap".into(),
                 size: 99,
                 mtime_ns: 1,
+                ctime_ns: Some(2),
+                file_id: Some(3),
                 last_indexed_generation: 1,
                 updated_at: ws::now_iso8601(),
             })
