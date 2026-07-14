@@ -235,7 +235,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('gh release create "$GITHUB_REF_NAME"', workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
-        self.assertGreaterEqual(workflow.count("--timeout-seconds 3600"), 2)
+        self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 2)
         self.assertIn('if [ "$device" = cpu ]', workflow)
 
 

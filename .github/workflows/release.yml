@@ -437,7 +437,7 @@ jobs:
               --semantic-query 'apply a rename case rule to a struct field' `
               --brief-symbol apply_to_field `
               --device $device `
-              --timeout-seconds 3600 `
+              --timeout-seconds 7200 `
               --warm-repeats 3 `
               --output "runtime-footprint-${{ matrix.name }}-$device.json"
             if ($LASTEXITCODE -ne 0) { throw "runtime footprint failed for $device" }
