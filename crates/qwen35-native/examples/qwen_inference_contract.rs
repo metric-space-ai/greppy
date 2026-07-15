@@ -14,6 +14,9 @@ const BRIEF_SEMANTICS: &str = "greppy_brief_production_mtp_v1";
 #[derive(Deserialize)]
 struct PromptCase {
     id: String,
+    /// Repo-relative file path of the source span; part of the trained
+    /// brief prompt contract and therefore mandatory.
+    path: String,
     source: String,
     max_output_tokens: usize,
 }
@@ -43,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if case.max_output_tokens == 0 || case.max_output_tokens > 64 {
                 return Err(format!("{}: max_output_tokens must be in 1..=64", case.id));
             }
-            let prompt = production_chat_prompt(&case.source);
+            let prompt = production_chat_prompt(&case.path, &case.source);
             let encoding = tokenizer
                 .encode(prompt, true)
                 .map_err(|error| format!("{}: cannot tokenize prompt: {error}", case.id))?;
@@ -142,11 +145,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (case, token_ids) in prepared {
         for _ in 0..warmups {
-            std::hint::black_box(summarizer.summarize_source(&case.source)?);
+            std::hint::black_box(summarizer.summarize_source(&case.path, &case.source)?);
         }
         for sample_index in 0..samples {
             let started = Instant::now();
-            let summary = summarizer.summarize_source(&case.source)?;
+            let summary = summarizer.summarize_source(&case.path, &case.source)?;
             let elapsed_ns = u64::try_from(started.elapsed().as_nanos())
                 .map_err(|_| "sample duration does not fit u64 nanoseconds")?;
             std::hint::black_box(&summary);
@@ -203,8 +206,11 @@ fn read_cases(path: &str) -> Result<Vec<PromptCase>, Box<dyn std::error::Error>>
         }
         let case: PromptCase = serde_json::from_str(&line)
             .map_err(|error| format!("{}:{}: {error}", path, index + 1))?;
-        if case.id.trim().is_empty() || case.source.trim().is_empty() {
-            return Err(format!("{}:{}: id and source must be non-empty", path, index + 1).into());
+        if case.id.trim().is_empty() || case.path.trim().is_empty() || case.source.trim().is_empty()
+        {
+            return Err(
+                format!("{}:{}: id, path, and source must be non-empty", path, index + 1).into(),
+            );
         }
         cases.push(case);
     }
@@ -214,10 +220,10 @@ fn read_cases(path: &str) -> Result<Vec<PromptCase>, Box<dyn std::error::Error>>
     Ok(cases)
 }
 
-fn production_chat_prompt(source: &str) -> String {
+fn production_chat_prompt(path: &str, source: &str) -> String {
     format!(
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        greppy_qwen35_native::brief_prompt(source).trim()
+        greppy_qwen35_native::brief_prompt(path, source).trim()
     )
 }
 

@@ -5473,17 +5473,19 @@ fn dispatch_impact_diff_scope(
 /// NAV_LIMIT because a briefing is a summary, not an exhaustive listing.
 const BRIEF_LIMIT: usize = 15;
 
-fn summarize_definition_span(source_span: &str) -> Option<Vec<String>> {
+/// `file_path` is the repo-relative path of the definition's file; the brief
+/// prompt contract feeds it to the model alongside the source span.
+fn summarize_definition_span(file_path: &str, source_span: &str) -> Option<Vec<String>> {
     #[cfg(any(unix, windows))]
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
-        summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, source_span)
+        summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, file_path, source_span)
             .filter(|bullets| !bullets.is_empty())
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = source_span;
+        let _ = (file_path, source_span);
         None
     }
 }
@@ -5581,7 +5583,7 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
                     header_end_line
                 );
                 if let Some(span) = span {
-                    if let Some(summary) = summarize_definition_span(&span.text) {
+                    if let Some(summary) = summarize_definition_span(&n.file_path, &span.text) {
                         for bullet in summary {
                             println!("  - {bullet}");
                         }
@@ -5712,7 +5714,7 @@ fn dispatch_brief_json(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .or_else(|| semantic_signature_from_span(source));
-        let summary = summarize_definition_span(source).unwrap_or_default();
+        let summary = summarize_definition_span(&node.file_path, source).unwrap_or_default();
         let summary_prompt_version = if summary.is_empty() {
             serde_json::Value::Null
         } else {
@@ -10441,8 +10443,10 @@ fn semantic_vector_purposes(
         {
             if let Some((cfg, model_key)) = summary_runtime.as_ref() {
                 let code = cap_semantic_purpose_span(&span.text);
-                bullets = summarize_daemon::summarize_source_via_daemon(cfg, model_key, &code)
-                    .unwrap_or_default();
+                bullets = summarize_daemon::summarize_source_via_daemon(
+                    cfg, model_key, file_path, &code,
+                )
+                .unwrap_or_default();
             }
         }
         purposes.push(SemanticVectorPurpose {

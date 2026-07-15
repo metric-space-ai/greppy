@@ -1,8 +1,10 @@
 //! Evaluate external Qwen GGUF candidates through the production summarizer.
 //!
-//! Input is JSONL with `id` and `source` fields. Output is one JSON object per
-//! line so model checkpoints can be compared without rebuilding the embedded
-//! CLI binary.
+//! Input is JSONL with `id`, `path` (repo-relative file path), and `source`
+//! fields. `path` is mandatory: the prompt contract bakes it into training,
+//! so eval rows without it must fail loudly instead of silently diverging.
+//! Output is one JSON object per line so model checkpoints can be compared
+//! without rebuilding the embedded CLI binary.
 
 use std::io::BufRead;
 use std::time::Instant;
@@ -40,8 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get("source")
             .and_then(serde_json::Value::as_str)
             .ok_or("brief_eval row is missing string field `source`")?;
+        let path = item
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .ok_or("brief_eval row is missing mandatory string field `path` (repo-relative file path; required so eval never silently diverges from the trained prompt)")?;
         let started = Instant::now();
-        let summary = summarizer.summarize_source(source)?;
+        let summary = summarizer.summarize_source(path, source)?;
         println!(
             "{}",
             serde_json::json!({

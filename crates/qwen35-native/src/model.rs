@@ -89,16 +89,19 @@ impl Qwen35Summarizer {
         })
     }
 
-    pub fn summarize_source(&self, source: &str) -> Result<Vec<String>> {
+    /// Summarize one definition source span. `path` is the repo-relative
+    /// file path of the span; it is part of the trained prompt contract and
+    /// grounds path-derived symbols in the quality filter.
+    pub fn summarize_source(&self, path: &str, source: &str) -> Result<Vec<String>> {
         if source.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let prompt = brief_prompt(source);
-        let model_prompt = crate::prompt::brief_chat_prompt(source);
+        let prompt = brief_prompt(path, source);
+        let model_prompt = crate::prompt::brief_chat_prompt(path, source);
         let raw = self.generate_raw(&model_prompt, BRIEF_GENERATION_PARAMS)?;
         let bullets = postprocess_brief_output(&raw, &prompt);
         log_summary_debug("primary", &raw, &bullets);
-        let bullets = filter_brief_bullets_by_quality(bullets, source);
+        let bullets = filter_brief_bullets_by_quality(bullets, path, source);
         log_filtered_summary_debug("primary", &bullets);
         if !bullets.is_empty() {
             return Ok(bullets);
@@ -106,7 +109,7 @@ impl Qwen35Summarizer {
         let fallback_raw = self.generate_raw(&model_prompt, BRIEF_FALLBACK_GENERATION_PARAMS)?;
         let fallback = postprocess_brief_output(&fallback_raw, &prompt);
         log_summary_debug("fallback", &fallback_raw, &fallback);
-        let fallback = filter_brief_bullets_by_quality(fallback, source);
+        let fallback = filter_brief_bullets_by_quality(fallback, path, source);
         log_filtered_summary_debug("fallback", &fallback);
         Ok(fallback)
     }
@@ -384,29 +387,39 @@ fn conservative_triage_guard(
 }
 
 #[cfg(test)]
-fn brief_bullets_pass_quality(bullets: &[String], source: &str) -> bool {
+fn brief_bullets_pass_quality(bullets: &[String], path: &str, source: &str) -> bool {
     if bullets.is_empty() {
         return false;
     }
+    let path_lower = path.to_ascii_lowercase();
     let source_terms = lexical_terms(source).collect::<std::collections::BTreeSet<_>>();
     let source_identifiers = code_identifiers(source).collect::<std::collections::BTreeSet<_>>();
-    bullets
-        .iter()
-        .all(|bullet| brief_bullet_passes_quality(bullet, &source_terms, &source_identifiers))
+    bullets.iter().all(|bullet| {
+        brief_bullet_passes_quality(bullet, &path_lower, &source_terms, &source_identifiers)
+    })
 }
 
-fn filter_brief_bullets_by_quality(bullets: Vec<String>, source: &str) -> Vec<String> {
+fn filter_brief_bullets_by_quality(bullets: Vec<String>, path: &str, source: &str) -> Vec<String> {
+    let path_lower = path.to_ascii_lowercase();
     let source_terms = lexical_terms(source).collect::<std::collections::BTreeSet<_>>();
     let source_identifiers = code_identifiers(source).collect::<std::collections::BTreeSet<_>>();
     bullets
         .into_iter()
-        .filter(|bullet| brief_bullet_passes_quality(bullet, &source_terms, &source_identifiers))
+        .filter(|bullet| {
+            brief_bullet_passes_quality(bullet, &path_lower, &source_terms, &source_identifiers)
+        })
         .take(2)
         .collect()
 }
 
+/// One bullet passes when nothing in it is ungrounded. Grounding is
+/// asymmetric, mirroring the benchmark judge: the prompt shows the model the
+/// repo-relative path AND the source, so a symbol that occurs in either one
+/// (case-insensitive substring for the path, like the existing source check)
+/// counts as grounded, never as a hallucination.
 fn brief_bullet_passes_quality(
     bullet: &str,
+    path_lower: &str,
     source_terms: &std::collections::BTreeSet<String>,
     source_identifiers: &std::collections::BTreeSet<String>,
 ) -> bool {
@@ -466,7 +479,10 @@ fn brief_bullet_passes_quality(
         let source_mentions_language = source_terms.contains(language)
             || source_identifiers
                 .iter()
-                .any(|identifier| identifier == language);
+                .any(|identifier| identifier == language)
+            || path_lower
+                .split(|c: char| !(c == '#' || c == '+' || c.is_ascii_alphanumeric()))
+                .any(|word| word == language);
         if mentions_language && !source_mentions_language {
             return false;
         }
@@ -487,34 +503,39 @@ fn brief_bullet_passes_quality(
     let source_mentions_atomic = source_terms.contains("atomic")
         || source_identifiers
             .iter()
-            .any(|ident| ident.to_ascii_lowercase().contains("atomic"));
+            .any(|ident| ident.to_ascii_lowercase().contains("atomic"))
+        || path_lower.contains("atomic");
     if lower.contains("atomic") && !source_mentions_atomic {
         return false;
     }
     if code_identifiers(bullet)
         .filter(|ident| ident.contains('_'))
-        .any(|ident| !source_identifiers.contains(&ident))
+        .any(|ident| !source_identifiers.contains(&ident) && !path_lower.contains(ident.as_str()))
     {
         return false;
     }
-    if bullet_symbol_identifiers(bullet)
-        .into_iter()
-        .any(|ident| !source_supports_term(&ident, source_terms, source_identifiers))
-    {
+    if bullet_symbol_identifiers(bullet).into_iter().any(|ident| {
+        !source_supports_term(&ident, source_terms, source_identifiers)
+            && !path_lower.contains(ident.as_str())
+    }) {
         return false;
     }
     if bullet
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(risky_claim_root)
-        .any(|term| !source_supports_term(term, source_terms, source_identifiers))
+        .any(|term| {
+            !source_supports_term(term, source_terms, source_identifiers)
+                && !path_lower.contains(term)
+        })
     {
         return false;
     }
     // Relatedness check, relaxed for the finetuned model: it paraphrases, so
     // exact >=4-char term overlap rejects good briefs on short functions.
-    // Accept when any >=3-char bullet term matches a source term or occurs as
+    // Accept when any >=3-char bullet term matches a source term, occurs as
     // a substring of a source identifier (finds "quiz" in QuizScreen,
-    // "con" in connection). Topic-unrelated sentences still fail.
+    // "con" in connection), or occurs in the prompt's file path — the model
+    // saw the path, so path-derived wording is grounded, not off-topic.
     if source_terms.is_empty() {
         return true;
     }
@@ -530,6 +551,7 @@ fn brief_bullet_passes_quality(
             source_terms.contains(&t)
                 || source_terms.iter().any(|s| s.contains(&t))
                 || idents_lower.iter().any(|i| i.contains(&t))
+                || path_lower.contains(&t)
         })
 }
 
@@ -645,6 +667,7 @@ mod triage_guard_tests {
         ];
         assert!(!brief_bullets_pass_quality(
             &bullets,
+            "src/users.rs",
             "fn add_user(users: &mut Vec<String>, name: String) { users.push(name); }"
         ));
     }
@@ -656,6 +679,7 @@ mod triage_guard_tests {
         ];
         assert!(!brief_bullets_pass_quality(
             &bullets,
+            "src/users.rs",
             "fn add_user(users: &mut Vec<String>, name: String) { users.push(name); }"
         ));
     }
@@ -669,6 +693,7 @@ mod triage_guard_tests {
         ] {
             assert!(!brief_bullets_pass_quality(
                 &[bullet.to_string()],
+                "src/spline.rs",
                 "fn bcspline(x: f32) -> f32 { ZodMiniISODateTime::new(x) }"
             ));
         }
@@ -678,7 +703,40 @@ mod triage_guard_tests {
     fn brief_quality_keeps_symbols_that_exist_in_source() {
         assert!(brief_bullets_pass_quality(
             &["Creates a ZodMiniISODateTime from ISO params.".to_string()],
+            "src/datetime.rs",
             "fn datetime(params: ISOParams) -> ZodMiniISODateTime { ZodMiniISODateTime::new(params) }"
+        ));
+    }
+
+    #[test]
+    fn brief_quality_keeps_camelcase_symbol_grounded_in_path() {
+        // The model sees the repo-relative path in its prompt, so a symbol
+        // that only occurs in the path (case-insensitive substring) is
+        // grounded, not a hallucination.
+        assert!(brief_bullets_pass_quality(
+            &["Creates a ZodMiniISODateTime from the given params.".to_string()],
+            "packages/zod/src/ZodMiniISODateTime.ts",
+            "export function datetime(params) { return build(params); }"
+        ));
+    }
+
+    #[test]
+    fn brief_quality_rejects_symbol_missing_from_source_and_path() {
+        // Same bullet, but neither the source nor the path mentions the
+        // symbol: still a hallucination.
+        assert!(!brief_bullets_pass_quality(
+            &["Creates a ZodMiniISODateTime from the given params.".to_string()],
+            "src/utils.rs",
+            "export function datetime(params) { return build(params); }"
+        ));
+    }
+
+    #[test]
+    fn brief_quality_keeps_snake_case_identifier_grounded_in_path() {
+        assert!(brief_bullets_pass_quality(
+            &["Registers the summarize_daemon request handler.".to_string()],
+            "crates/cli/src/summarize_daemon.rs",
+            "fn register(handler: Handler) { HANDLERS.push(handler); }"
         ));
     }
 
@@ -691,6 +749,7 @@ mod triage_guard_tests {
         ] {
             assert!(!brief_bullets_pass_quality(
                 &[bullet.to_string()],
+                "src/hint.rs",
                 "fn value() -> usize { iterator.size_hint().0 }"
             ));
         }
@@ -701,6 +760,7 @@ mod triage_guard_tests {
         let bullets = vec!["Adds a user name to the user list.".to_string()];
         assert!(brief_bullets_pass_quality(
             &bullets,
+            "src/users.rs",
             "fn add_user(users: &mut Vec<String>, name: String) { users.push(name); }"
         ));
     }
@@ -713,6 +773,7 @@ mod triage_guard_tests {
         ];
         let filtered = filter_brief_bullets_by_quality(
             bullets,
+            "src/users.rs",
             "fn add_user(users: &mut Vec<String>, name: String) { users.push(name); }",
         );
         assert_eq!(
@@ -727,6 +788,7 @@ mod triage_guard_tests {
             vec!["Retrieves a specific value from a database or JSON object.".to_string()];
         assert!(!brief_bullets_pass_quality(
             &bullets,
+            "src/cli.rs",
             "fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32, String> { println!(\"{} {:?}\", symbol.unwrap_or(\"\"), root); Ok(0) }"
         ));
     }
@@ -736,6 +798,7 @@ mod triage_guard_tests {
         let bullets = vec!["Tracks stale time with an atomic usize variable.".to_string()];
         assert!(!brief_bullets_pass_quality(
             &bullets,
+            "src/stats.rs",
             "pub struct Stats { stolen: usize }"
         ));
     }
@@ -745,6 +808,7 @@ mod triage_guard_tests {
         let bullets = vec!["Updates an atomic counter for worker wakeups.".to_string()];
         assert!(brief_bullets_pass_quality(
             &bullets,
+            "src/worker.rs",
             "fn wake(counter: &AtomicUsize) { counter.fetch_add(1, Ordering::Relaxed); }"
         ));
     }
@@ -754,10 +818,12 @@ mod triage_guard_tests {
         let source = "pub fn normalize_and_store_user(users: &mut Vec<String>, name: &str) -> usize { users.push(name.trim().to_ascii_lowercase()); users.len() }";
         assert!(!brief_bullets_pass_quality(
             &["The function normalize_and_store_user in Swift".to_string()],
+            "src/store_users.rs",
             source,
         ));
         assert!(!brief_bullets_pass_quality(
             &["This snippet defines normalize_and_store_user, which is used".to_string()],
+            "src/store_users.rs",
             source,
         ));
     }
@@ -1207,6 +1273,7 @@ mod cpu_perf_tests {
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt = crate::prompt::brief_chat_prompt(
+            "src/rename_rules.rs",
             "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
         );
         let prompt_ids = summarizer
@@ -1298,8 +1365,9 @@ mod cpu_perf_tests {
         )
         .expect("load CPU Qwen3.5 summarizer");
         let source = "pub fn add_user(users: &mut Vec<String>, name: &str) -> usize {\n    users.push(name.trim().to_string());\n    users.len()\n}\n";
-        let prompt = crate::brief_prompt(source);
-        let model_prompt = crate::prompt::brief_chat_prompt(source);
+        let path = "src/users.rs";
+        let prompt = crate::brief_prompt(path, source);
+        let model_prompt = crate::prompt::brief_chat_prompt(path, source);
         let params = crate::GenerationParams {
             max_tokens: 12,
             ..crate::BRIEF_GENERATION_PARAMS
@@ -1548,8 +1616,9 @@ mod metal_perf_tests {
         .expect("load Metal Qwen3.5 summarizer");
         let source =
             "fn add_user(users: &mut Vec<String>, name: String) {\n    users.push(name);\n}\n";
-        let prompt = crate::brief_prompt(source);
-        let model_prompt = crate::prompt::brief_chat_prompt(source);
+        let path = "src/users.rs";
+        let prompt = crate::brief_prompt(path, source);
+        let model_prompt = crate::prompt::brief_chat_prompt(path, source);
         let raw = summarizer
             .generate_raw(&model_prompt, crate::BRIEF_GENERATION_PARAMS)
             .expect("generate raw Metal summary");
@@ -1567,7 +1636,7 @@ mod metal_perf_tests {
             .expect("generate greedy raw Metal summary");
         let bullets = crate::postprocess_brief_output(&raw, &prompt);
         let summary = summarizer
-            .summarize_source(source)
+            .summarize_source(path, source)
             .expect("summarize exact Metal source");
         println!("qwen35_metal_quality raw={raw:?}");
         println!("qwen35_metal_quality greedy_raw={greedy_raw:?}");
@@ -1718,6 +1787,7 @@ mod tests {
         assert!(summarizer.backend_name().starts_with("cuda-"));
         let bullets = summarizer
             .summarize_source(
+                "src/users.rs",
                 "fn add_user(users: &mut Vec<String>, name: String) {\n    users.push(name);\n}\n",
             )
             .expect("CUDA summary generation");
@@ -1744,6 +1814,7 @@ mod tests {
             panic!("expected CUDA backend");
         };
         let prompt = crate::prompt::brief_chat_prompt(
+            "src/rename_rules.rs",
             "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
         );
         let ids = summarizer
