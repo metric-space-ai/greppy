@@ -712,10 +712,11 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         // argv[0] is the binary name; the rest are grep args. Build a
         // synthetic argv for the shared runner whose argv[0] is a
         // placeholder and argv[1..] are the user's (possibly non-UTF-8)
-        // arguments, forwarded verbatim.
+        // arguments. Greppy-owned global options are consumed before the
+        // remaining arguments are forwarded verbatim.
         let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
         full.push(std::ffi::OsString::from("greppy"));
-        full.extend(argv.into_iter().skip(1));
+        full.extend_from_slice(grep_passthrough_args(&argv));
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
             Err(Error::Invalid(_)) => EXIT_USAGE,
@@ -758,6 +759,28 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         }
     };
     dispatch_to_code(cli)
+}
+
+fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
+    let mut index = 1;
+    while index < argv.len() {
+        let token = &argv[index];
+        if token == "--root" || token == "--device" {
+            index = (index + 2).min(argv.len());
+            continue;
+        }
+        let token_lossy = token.to_string_lossy();
+        if token_lossy.starts_with("--root=")
+            || token_lossy.starts_with("--device=")
+            || token == "--no-gpu"
+            || token == "--no-summaries"
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    &argv[index..]
 }
 
 /// One-line usage per agent-facing subcommand, printed after a short arg
@@ -15845,6 +15868,12 @@ where
         assert!(is_grep_passthrough(&mk(&[
             "greppy", "--root", "/repo", "-R", "foo", "."
         ])));
+        assert_eq!(
+            grep_passthrough_args(&mk(&[
+                "greppy", "--root", "/repo", "--no-gpu", "-R", "foo", "."
+            ])),
+            mk(&["-R", "foo", "."])
+        );
     }
 
     // a non-UTF-8 first token can never be a subcommand
