@@ -23,18 +23,41 @@ permissions:
 jobs:
   # Indexing the 12 pinned task repos is a multi-hour CPU embedding build.
   # Combined with the agent phase it blew the 6-hour hosted-runner hard cap
-  # twice (runs 29269091343, 29292161251 - both cancelled at exactly 6h00).
-  # The stores are deterministic in (model digests, task pins, corpus
-  # generators), so prime them in their own job and cache the result; the
-  # gate job restores the warm store and only pays a freshness validation.
+  # twice (runs 29269091343, 29292161251), and even a dedicated single prime
+  # job exceeded 6h for a fresh model (29378503463) - and a cancelled job
+  # saves NO cache, so every attempt started from zero. Split priming into
+  # three balanced repo groups: each group finishes in ~2h, caches
+  # independently (a cancellation only loses one group), and the gate job
+  # merges the three stores (per-repo store subdirs are disjoint workspace
+  # hashes under workspaces/).
   prime-store:
-    name: prime task-repo stores
+    name: prime stores (${{ matrix.group }})
     runs-on: macos-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: g1
+            real_repos: django zod
+            index_repos: django zod go_small js_small
+          - group: g2
+            real_repos: flask gson
+            index_repos: flask gson python_large
+          - group: g3
+            real_repos: serde tokio
+            index_repos: serde tokio ts_large java_medium rust_medium
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Restore group store cache
+        id: bench-store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/greppy-bench-store-${{ matrix.group }}
+          key: bench-store-v2-${{ matrix.group }}-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
       - name: Restore model assets
+        if: steps.bench-store.outputs.cache-hit != 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
@@ -44,14 +67,9 @@ jobs:
             crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
           key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
       - name: Fetch model assets (release-hosted, sha-pinned)
+        if: steps.bench-store.outputs.cache-hit != 'true'
         shell: bash
         run: ./tools/fetch_model_assets.sh
-      - name: Restore benchmark stores
-        id: bench-store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: ${{ runner.temp }}/greppy-bench-store
-          key: bench-store-v1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
       - name: Install pinned Rust toolchain
         if: steps.bench-store.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
@@ -60,12 +78,12 @@ jobs:
       - name: Build candidate binary with Metal
         if: steps.bench-store.outputs.cache-hit != 'true'
         run: cargo build --release --bin greppy --features metal
-      - name: Materialize benchmark repositories
+      - name: Materialize benchmark repositories (group subset)
         if: steps.bench-store.outputs.cache-hit != 'true'
         run: |
           bash bench/agent_efficiency/gen_corpus.sh
           python3 bench/agent_efficiency/real_corpus.py setup \
-            --repos serde flask gson zod tokio django
+            --repos ${{ matrix.real_repos }}
       - name: Reclaim build scratch disk before indexing
         if: steps.bench-store.outputs.cache-hit != 'true'
         run: |
@@ -75,20 +93,23 @@ jobs:
           mkdir -p target/release
           mv "${{ runner.temp }}/greppy-gate-bin" target/release/greppy
           df -h "$GITHUB_WORKSPACE"
-      - name: Build stores for every task repo
+      - name: Build stores for the group repos
         if: steps.bench-store.outputs.cache-hit != 'true'
         env:
           GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
-          GREPPY_STORE_DIR: ${{ runner.temp }}/greppy-bench-store
+          GREPPY_STORE_DIR: ${{ runner.temp }}/greppy-bench-store-${{ matrix.group }}
           RUN_DIR: ${{ runner.temp }}/greppy-store-prime
         run: |
-          python3 bench/agent_efficiency/parallel_acceptance_run.py \
-            --skip-build \
-            --skip-verify \
-            --index-only \
-            --tasks tasks_v2.json \
-            --agents grep,greppy,explorer \
-            --output-dir "$RUN_DIR"
+          for repo in ${{ matrix.index_repos }}; do
+            python3 bench/agent_efficiency/parallel_acceptance_run.py \
+              --skip-build \
+              --skip-verify \
+              --index-only \
+              --repo "$repo" \
+              --tasks tasks_v2.json \
+              --agents grep,greppy,explorer \
+              --output-dir "$RUN_DIR-$repo"
+          done
 
   benchmark:
     name: pinned Greppy vs explorer
@@ -112,11 +133,38 @@ jobs:
         shell: bash
         run: ./tools/fetch_model_assets.sh
 
-      - name: Restore benchmark stores (primed)
+      - name: Restore group store cache g1
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: ${{ runner.temp }}/greppy-bench-store
-          key: bench-store-v1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+          path: ${{ runner.temp }}/greppy-bench-store-g1
+          key: bench-store-v2-g1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+      - name: Restore group store cache g2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/greppy-bench-store-g2
+          key: bench-store-v2-g2-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+      - name: Restore group store cache g3
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/greppy-bench-store-g3
+          key: bench-store-v2-g3-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+      - name: Merge group stores (disjoint workspace hashes)
+        shell: bash
+        run: |
+          store="${{ runner.temp }}/greppy-bench-store"
+          mkdir -p "$store"
+          for group in g1 g2 g3; do
+            src="${{ runner.temp }}/greppy-bench-store-$group"
+            if [ -d "$src/workspaces" ]; then
+              mkdir -p "$store/workspaces"
+              cp -R "$src/workspaces/." "$store/workspaces/"
+            fi
+            if [ -d "$src/models" ] && [ ! -d "$store/models" ]; then
+              cp -R "$src/models" "$store/models"
+            fi
+            rm -rf "$src"
+          done
+          du -sh "$store" || true
 
       - name: Install pinned Rust toolchain
         # dtolnay/rust-toolchain v1, pinned to an immutable source revision.
