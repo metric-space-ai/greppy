@@ -1005,6 +1005,9 @@ def sanitized_failure_row(task_id: str, arm: str, error: Exception) -> dict[str,
         "valid": False,
         "correctness": None,
         "failure_kind": error.__class__.__name__,
+        # HarnessError messages are harness-authored strings (operation names),
+        # never provider output - safe to expose for diagnosability
+        "failure_detail": str(error)[:200] if isinstance(error, HarnessError) else None,
         "worktree_cleaned": True,
         "completed_at": utc_now(),
     }
@@ -1259,18 +1262,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                             # reusing the previous attempt's task_tmp fails on
                             # the existing worktree path
                             attempt_tmp = task_tmp if attempt == 1 else task_tmp / f"retry{attempt}"
-                            row = run_arm(
-                                arm=arm,
-                                task=task,
-                                backing=backing,
-                                task_tmp=attempt_tmp,
-                                raw_dir=raw_run_dir / task["id"] / arm,
-                                pi_bin=pi_bin,
-                                greppy_bin=greppy_bin,
-                                warm_greppy=args.warm_greppy,
-                                expected_mutation_hash=preflight["mutation_diff_sha256"],
-                                secrets=secrets,
-                            )
+                            try:
+                                row = run_arm(
+                                    arm=arm,
+                                    task=task,
+                                    backing=backing,
+                                    task_tmp=attempt_tmp,
+                                    raw_dir=raw_run_dir / task["id"] / arm,
+                                    pi_bin=pi_bin,
+                                    greppy_bin=greppy_bin,
+                                    warm_greppy=args.warm_greppy,
+                                    expected_mutation_hash=preflight["mutation_diff_sha256"],
+                                    secrets=secrets,
+                                )
+                            except HarnessError as harness_error:
+                                # warmup/worktree failures are runner-environment
+                                # noise, not measurements - retry them like
+                                # provider errors instead of consuming the task
+                                if attempt >= 3:
+                                    raise
+                                print(f"[{task['id']}] {arm}: {harness_error}, retry {attempt}/2", flush=True)
+                                time.sleep(30 * attempt)
+                                continue
                             row["agent"]["provider_attempts"] = attempt
                             provider_flake = (
                                 not row["valid"]
@@ -1280,6 +1293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             if not provider_flake:
                                 break
                             print(f"[{task['id']}] {arm}: provider error, retry {attempt}/2", flush=True)
+                            time.sleep(30 * attempt)
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source
                         row = sanitized_failure_row(task["id"], arm, error)
                     rows.append(row)
