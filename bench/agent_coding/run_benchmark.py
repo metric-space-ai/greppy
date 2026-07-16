@@ -1255,11 +1255,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # does not consume task validity. Timeouts and harness
                         # failures are not retried.
                         for attempt in range(1, 4):
+                            # each attempt needs untouched worktree/store dirs;
+                            # reusing the previous attempt's task_tmp fails on
+                            # the existing worktree path
+                            attempt_tmp = task_tmp if attempt == 1 else task_tmp / f"retry{attempt}"
                             row = run_arm(
                                 arm=arm,
                                 task=task,
                                 backing=backing,
-                                task_tmp=task_tmp,
+                                task_tmp=attempt_tmp,
                                 raw_dir=raw_run_dir / task["id"] / arm,
                                 pi_bin=pi_bin,
                                 greppy_bin=greppy_bin,
