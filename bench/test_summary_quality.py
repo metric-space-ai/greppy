@@ -22,7 +22,7 @@ def sha256(path: pathlib.Path) -> str:
 
 
 class SummaryQualityGateTests(unittest.TestCase):
-    def documents(self, root: pathlib.Path, *, helpful: int, misleading: int):
+    def documents(self, root: pathlib.Path, *, helpful: int, anti: int):
         case_ids = [f"sq{index:03d}" for index in range(200)]
         cases = root / "cases.json"
         results = root / "results.json"
@@ -73,8 +73,11 @@ class SummaryQualityGateTests(unittest.TestCase):
                     "verdicts": [
                         {
                             "id": case_id,
-                            "helpful": index < helpful,
-                            "misleading": index < misleading,
+                            "utility": (
+                                "anti_helpful" if index < anti
+                                else "helpful" if index < anti + helpful
+                                else "barely_helpful"
+                            ),
                             "invented_symbols": [],
                             "signature_echo": False,
                         }
@@ -102,27 +105,27 @@ class SummaryQualityGateTests(unittest.TestCase):
 
     def test_registered_threshold_boundaries_pass(self):
         with tempfile.TemporaryDirectory() as raw:
-            args = self.documents(pathlib.Path(raw), helpful=170, misleading=10)
+            args = self.documents(pathlib.Path(raw), helpful=170, anti=10)
             return_code, report = self.run_gate(args)
 
         self.assertEqual(return_code, 0)
         self.assertTrue(report["passed"])
-        self.assertEqual(report["helpful_rate"], 0.85)
-        self.assertEqual(report["misleading_rate"], 0.05)
+        self.assertEqual(report["helpful_or_better_rate"], 0.85)
+        self.assertEqual(report["anti_helpful_rate"], 0.05)
         self.assertTrue(all(report["checks"].values()))
 
-    def test_one_misleading_result_over_the_limit_fails(self):
+    def test_one_anti_helpful_result_over_the_limit_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            args = self.documents(pathlib.Path(raw), helpful=200, misleading=11)
+            args = self.documents(pathlib.Path(raw), helpful=189, anti=11)
             return_code, report = self.run_gate(args)
 
         self.assertEqual(return_code, 2)
         self.assertFalse(report["passed"])
-        self.assertFalse(report["checks"]["misleading_at_most_5_percent"])
+        self.assertFalse(report["checks"]["anti_helpful_at_most_5_percent"])
 
     def test_digest_mismatch_and_signature_echo_fail(self):
         with tempfile.TemporaryDirectory() as raw:
-            args = self.documents(pathlib.Path(raw), helpful=200, misleading=0)
+            args = self.documents(pathlib.Path(raw), helpful=200, anti=0)
             judgments = json.loads(args.judgments.read_text(encoding="utf-8"))
             judgments["results_sha256"] = "0" * 64
             judgments["verdicts"][0]["signature_echo"] = True
@@ -142,16 +145,14 @@ class SummaryQualityJudgeTests(unittest.TestCase):
             "verdicts": [
                 {
                     "id": "sq030",
-                    "helpful": True,
-                    "misleading": False,
+                    "utility": "helpful",
                     "invented_symbols": [],
                     "signature_echo": False,
                     "reason": "correct purpose",
                 },
                 {
                     "id": "sq031",
-                    "helpful": False,
-                    "misleading": False,
+                    "utility": "barely_helpful",
                     "invented_symbols": [],
                     "signature_echo": True,
                     "reason": "only echoes signature",
@@ -171,8 +172,8 @@ class SummaryQualityJudgeTests(unittest.TestCase):
 
     def test_response_rejects_missing_typed_fields(self):
         response = self.valid_response()
-        response["verdicts"][0]["helpful"] = "yes"
-        with self.assertRaisesRegex(RuntimeError, "non-boolean helpful"):
+        response["verdicts"][0]["utility"] = "yes"
+        with self.assertRaisesRegex(RuntimeError, "invalid utility"):
             SUMMARY_QUALITY.validate_judge_response(
                 response, [{"id": "sq030"}, {"id": "sq031"}]
             )

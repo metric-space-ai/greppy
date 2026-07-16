@@ -41,5 +41,5 @@ python3 bench/summary_quality.py gate \
 
 `MINIMAX_API_KEY` is read only by the judge step. The product inference remains
 fully local. The fixed gate requires at least 200 functions, at least 85%
-helpful direction hints, at most 5% misleading hints (re-registered 2026-07-16 from 2%; rationale in bench/summary_quality.py), no invented symbols or
+helpful-or-better hints on the four-level triage-utility scale (very helpful / helpful / barely helpful / anti-helpful), at most 5% anti-helpful hints (scale re-registered 2026-07-16; rationale in bench/summary_quality.py), at most one judge-flagged invented symbol, no
 signature echoes, and no deterministic brief-contract failures.

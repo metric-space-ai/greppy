@@ -403,13 +403,68 @@ fn filter_brief_bullets_by_quality(bullets: Vec<String>, path: &str, source: &st
     let path_lower = path.to_ascii_lowercase();
     let source_terms = lexical_terms(source).collect::<std::collections::BTreeSet<_>>();
     let source_identifiers = code_identifiers(source).collect::<std::collections::BTreeSet<_>>();
+    let signature = normalized_signature_line(source);
     bullets
         .into_iter()
         .filter(|bullet| {
-            brief_bullet_passes_quality(bullet, &path_lower, &source_terms, &source_identifiers)
+            !bullet_echoes_signature(bullet, &signature)
+                && brief_bullet_passes_quality(
+                    bullet,
+                    &path_lower,
+                    &source_terms,
+                    &source_identifiers,
+                )
         })
         .take(2)
         .collect()
+}
+
+/// The definition's first non-empty line, lowercased with punctuation
+/// stripped - the same normalization the summary-quality judge applies.
+fn normalized_signature_line(source: &str) -> String {
+    let line = source
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    normalize_echo_text(line)
+}
+
+fn normalize_echo_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A hint that mainly restates the declaration is useless for triage: the
+/// agent already sees the signature. Reject a bullet when it is contained in
+/// the normalized signature line or shares >= 80% of its words with it.
+fn bullet_echoes_signature(bullet: &str, signature: &str) -> bool {
+    if signature.is_empty() {
+        return false;
+    }
+    let normalized = normalize_echo_text(bullet);
+    if normalized.is_empty() {
+        return false;
+    }
+    if signature.contains(&normalized) {
+        return true;
+    }
+    let bullet_words = normalized.split(' ').collect::<Vec<_>>();
+    let signature_words = signature.split(' ').collect::<std::collections::BTreeSet<_>>();
+    let shared = bullet_words
+        .iter()
+        .filter(|word| signature_words.contains(**word))
+        .count();
+    shared * 5 >= bullet_words.len() * 4
 }
 
 /// One bullet passes when nothing in it is ungrounded. Grounding is
@@ -1764,6 +1819,7 @@ mod metal_perf_tests {
     any(target_os = "linux", target_os = "windows")
 ))]
 mod tests {
+
     use super::*;
     use tokenizers::Tokenizer;
 
@@ -1949,5 +2005,21 @@ mod tests {
         }
         ids.truncate(target);
         ids
+    }
+}
+
+#[cfg(test)]
+mod echo_filter_tests {
+    #[test]
+    fn echo_filter_rejects_signature_restatement() {
+        let source = "fn parse_config(path: &str) -> Config {\n    load(path)\n}\n";
+        let sig = super::normalized_signature_line(source);
+        assert!(super::bullet_echoes_signature("Parse config path str config.", &sig));
+        assert!(!super::bullet_echoes_signature(
+            "Loads the configuration file from disk.",
+            &sig
+        ));
+        // Empty or unrelated bullets never count as echoes.
+        assert!(!super::bullet_echoes_signature("", &sig));
     }
 }
