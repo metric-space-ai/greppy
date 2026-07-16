@@ -51,13 +51,16 @@ pub(super) fn status(model_key: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({"state": "unsupported"}))
 }
 
+/// `path` is the repo-relative file path of the source span; it is part of
+/// the trained prompt contract and a mandatory protocol field.
 pub(super) fn summarize_source_via_daemon(
     cfg: &super::QwenSummaryConfig,
     model_key: &str,
+    path: &str,
     source: &str,
 ) -> Option<Vec<String>> {
     let endpoint = endpoint(model_key)?;
-    match request_brief(&endpoint, model_key, source) {
+    match request_brief(&endpoint, model_key, path, source) {
         RequestOutcome::Response(summary) => return Some(summary),
         RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
             report_explicit_backend_failure(cfg, "daemon request failed");
@@ -70,7 +73,7 @@ pub(super) fn summarize_source_via_daemon(
         inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
     for delay in inference_daemon::retry_delays() {
         std::thread::sleep(delay);
-        match request_brief(&endpoint, model_key, source) {
+        match request_brief(&endpoint, model_key, path, source) {
             RequestOutcome::Response(summary) => return Some(summary),
             RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
                 report_explicit_backend_failure(cfg, "daemon request failed after restart");
@@ -142,6 +145,7 @@ fn report_explicit_backend_failure(cfg: &super::QwenSummaryConfig, detail: &str)
 fn request_brief(
     endpoint: &Endpoint,
     model_key: &str,
+    path: &str,
     source: &str,
 ) -> RequestOutcome<Vec<String>> {
     let request = serde_json::json!({
@@ -149,6 +153,7 @@ fn request_brief(
         "fv": greppy_qwen35_native::BRIEF_FILTER_VERSION,
         "mk": model_key,
         "mode": "brief",
+        "path": path,
         "source": source,
     });
     match inference_daemon::request(
@@ -339,6 +344,18 @@ fn validate(raw: &str, model_key: &str) -> Result<(), serde_json::Value> {
             {
                 return Err(serde_json::json!({"error": "missing source"}));
             }
+            // The repo-relative file path is mandatory: it is baked into the
+            // trained prompt contract (PROMPT_VERSION qwen35-brief-path-v5),
+            // so a missing path must fail loudly instead of silently
+            // diverging from training.
+            if request
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .is_none()
+            {
+                return Err(serde_json::json!({"error": "missing path"}));
+            }
         }
         "triage" => validate_triage(&request)?,
         _ => unreachable!(),
@@ -397,7 +414,11 @@ fn respond(raw: &str, model: &mut Option<super::LoadedQwen35Summarizer>) -> serd
                 .get("source")
                 .and_then(serde_json::Value::as_str)
                 .expect("validated brief source");
-            match loaded.summarize_source(source) {
+            let path = request
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .expect("validated brief path");
+            match loaded.summarize_source(path, source) {
                 Ok(summary) => serde_json::json!({"s": summary}),
                 Err(error) => {
                     *model = None;
@@ -466,6 +487,7 @@ mod tests {
             "pv": "old-prompt",
             "mk": "model-key",
             "mode": "brief",
+            "path": "src/lib.rs",
             "source": "fn f() {}",
         });
         assert_eq!(
@@ -478,12 +500,53 @@ mod tests {
             "fv": "old-filter",
             "mk": "model-key",
             "mode": "brief",
+            "path": "src/lib.rs",
             "source": "fn f() {}",
         });
         assert_eq!(
             validate(&stale_filter.to_string(), "model-key").unwrap_err()["error"],
             "filter-version mismatch"
         );
+    }
+
+    #[test]
+    fn brief_protocol_requires_repo_relative_path() {
+        // Requests without a path (the pre-path-prompt protocol shape) must
+        // fail loudly: the prompt contract bakes the path into training.
+        let missing = serde_json::json!({
+            "pv": greppy_qwen35_native::PROMPT_VERSION,
+            "fv": greppy_qwen35_native::BRIEF_FILTER_VERSION,
+            "mk": "model-key",
+            "mode": "brief",
+            "source": "fn f() {}",
+        });
+        assert_eq!(
+            validate(&missing.to_string(), "model-key").unwrap_err()["error"],
+            "missing path"
+        );
+
+        let empty = serde_json::json!({
+            "pv": greppy_qwen35_native::PROMPT_VERSION,
+            "fv": greppy_qwen35_native::BRIEF_FILTER_VERSION,
+            "mk": "model-key",
+            "mode": "brief",
+            "path": "  ",
+            "source": "fn f() {}",
+        });
+        assert_eq!(
+            validate(&empty.to_string(), "model-key").unwrap_err()["error"],
+            "missing path"
+        );
+
+        let complete = serde_json::json!({
+            "pv": greppy_qwen35_native::PROMPT_VERSION,
+            "fv": greppy_qwen35_native::BRIEF_FILTER_VERSION,
+            "mk": "model-key",
+            "mode": "brief",
+            "path": "src/lib.rs",
+            "source": "fn f() {}",
+        });
+        assert!(validate(&complete.to_string(), "model-key").is_ok());
     }
 
     #[test]

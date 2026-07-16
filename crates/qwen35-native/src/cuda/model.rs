@@ -4840,6 +4840,7 @@ mod tests {
             .expect("CUDA Qwen MTP model");
         let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
         let prompt = crate::prompt::brief_chat_prompt(
+            "src/rename_rules.rs",
             "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
         );
         let ids = tokenizer
@@ -4926,6 +4927,7 @@ mod tests {
             CudaQwen35Model::from_gguf(&gguf, inventory, 248_044).expect("CUDA Qwen MTP model");
         let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
         let prompt = crate::prompt::brief_chat_prompt(
+            "src/users.rs",
             "pub fn add_user(users: &mut Vec<String>, name: &str) -> usize {\n    users.push(name.trim().to_string());\n    users.len()\n}",
         );
         let params = GenerationParams {

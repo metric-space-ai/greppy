@@ -1,6 +1,8 @@
 pub const MAX_BRIEF_BULLET_CHARS: usize = 140;
 pub const MAX_TRIAGE_REASON_CHARS: usize = 48;
-pub const BRIEF_FILTER_VERSION: &str = "qwen35-brief-filter-v2";
+// v3: symbols grounded in the prompt's repo-relative file path pass the
+// quality filter (path format prompt, "qwen35-brief-path-v5").
+pub const BRIEF_FILTER_VERSION: &str = "qwen35-brief-filter-v3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriageVerdict {
@@ -435,7 +437,7 @@ mod tests {
 
     #[test]
     fn cleans_prefixes_and_limits_to_two_lines() {
-        let prompt = brief_prompt("fn dispatch_brief() {}\n");
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
         let out = postprocess_brief_output(
             "Summary: Builds the compact symbol briefing.\n\n- Falls back to content search.\n- Extra detail.\n",
             &prompt,
@@ -451,7 +453,7 @@ mod tests {
 
     #[test]
     fn drops_code_fences_and_code_echo() {
-        let prompt = brief_prompt("fn dispatch_brief() {}\n");
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
         let out = postprocess_brief_output(
             "```rust\nfn dispatch_brief() {}\n```\nPurpose: Resolves a symbol briefing.\n",
             &prompt,
@@ -461,7 +463,7 @@ mod tests {
 
     #[test]
     fn trims_long_parenthetical_without_ellipsis() {
-        let prompt = brief_prompt("fn add_user() {}\n");
+        let prompt = brief_prompt("src/users.rs", "fn add_user() {}\n");
         let out = postprocess_brief_output(
             "This function is a helper utility designed to add a user's name to a list of strings (likely representing a database record, a JSON object, or a list of items).\n\nHere is a breakdown of what it does:",
             &prompt,
@@ -474,7 +476,7 @@ mod tests {
 
     #[test]
     fn drops_method_call_fragments() {
-        let prompt = brief_prompt("fn add_user() {}\n");
+        let prompt = brief_prompt("src/users.rs", "fn add_user() {}\n");
         assert!(
             postprocess_brief_output("users.push(name.trim().to_string();:", &prompt).is_empty()
         );
@@ -482,7 +484,7 @@ mod tests {
 
     #[test]
     fn removes_generic_leadin_and_discourse_tail() {
-        let prompt = brief_prompt("fn steal_into() {}\n");
+        let prompt = brief_prompt("src/queue.rs", "fn steal_into() {}\n");
         let out = postprocess_brief_output(
             "This code snippet describes a logic that processes tasks from multiple queues into a single queue. Specifically, the rest repeats.",
             &prompt,
@@ -495,7 +497,7 @@ mod tests {
 
     #[test]
     fn drops_known_as_hallucination_shape() {
-        let prompt = brief_prompt("fn run_task() {}\n");
+        let prompt = brief_prompt("src/task.rs", "fn run_task() {}\n");
         assert!(postprocess_brief_output(
             "This function, known as steal_into, is a standard helper.",
             &prompt
@@ -505,7 +507,7 @@ mod tests {
 
     #[test]
     fn drops_prompt_echo() {
-        let prompt = brief_prompt("fn dispatch_brief() {}\n");
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
         assert!(postprocess_brief_output(
             "Summarize: What is this function for?\n\nfn dispatch_brief() {}",
             &prompt
@@ -515,7 +517,7 @@ mod tests {
 
     #[test]
     fn drops_malformed_multiscript_gibberish() {
-        let prompt = brief_prompt("fn dispatch_brief() {}\n");
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
         let raw = "bli sport JB ảoillon bankrupt induceonconomykids包istent ro物的یکی旗和平快快ность是一项staولوج-errorsificar万岁жно上新tractorложеныcribedttikenorauingpr";
 
         assert!(postprocess_brief_output(raw, &prompt).is_empty());
@@ -523,7 +525,7 @@ mod tests {
 
     #[test]
     fn drops_thinking_output() {
-        let prompt = brief_prompt("fn dispatch_brief() {}\n");
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
         let raw =
             "[Start thinking]\nHere's a thinking process that leads to the suggested summary.";
 
@@ -532,7 +534,7 @@ mod tests {
 
     #[test]
     fn keeps_latin_extended_summary_text() {
-        let prompt = brief_prompt("fn dispatch_brief() {}\n");
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
 
         assert_eq!(
             postprocess_brief_output("Löst den Symbolkontext für brief auf.", &prompt),

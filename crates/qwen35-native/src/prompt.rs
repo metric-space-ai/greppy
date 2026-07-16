@@ -1,18 +1,24 @@
 /// Versioned prompt/output contract used by the daemon protocol.
-pub const PROMPT_VERSION: &str = "qwen35-brief-tag-v4";
+pub const PROMPT_VERSION: &str = "qwen35-brief-path-v5";
 pub const TRIAGE_PROMPT_VERSION: &str = "qwen35-triage-v3";
 
-/// Exact prompt used for every definition source span.
-pub fn brief_prompt(source: &str) -> String {
-    format!("brief:\n{source}")
+/// Exact prompt used for every definition source span (path format).
+///
+/// The finetuned model is trained on this exact byte layout: the task tag,
+/// one space, the repo-relative file path, a newline, then the unmodified
+/// source span. The student sees the same path context the teacher had when
+/// the training data was generated.
+pub fn brief_prompt(path: &str, source: &str) -> String {
+    format!("brief: {path}\n{source}")
 }
 
-/// Chat wrapper for `brief` (tag-v4): the finetuned model is trained on this
-/// exact prefix and needs no empty think block to stay in non-thinking mode.
-pub fn brief_chat_prompt(source: &str) -> String {
+/// Chat wrapper for `brief` (path format): the finetuned model is trained on
+/// this exact prefix and needs no empty think block to stay in non-thinking
+/// mode.
+pub fn brief_chat_prompt(path: &str, source: &str) -> String {
     format!(
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        brief_prompt(source).trim()
+        brief_prompt(path, source).trim()
     )
 }
 
@@ -37,10 +43,24 @@ mod tests {
 
     #[test]
     fn prompt_is_exact_contract() {
-        assert_eq!(brief_prompt("fn f() {}\n"), "brief:\nfn f() {}\n");
         assert_eq!(
-            brief_chat_prompt("fn f() {}\n"),
-            "<|im_start|>user\nbrief:\nfn f() {}<|im_end|>\n<|im_start|>assistant\n"
+            brief_prompt("src/lib.rs", "fn f() {}\n"),
+            "brief: src/lib.rs\nfn f() {}\n"
+        );
+        assert_eq!(
+            brief_chat_prompt("src/lib.rs", "fn f() {}\n"),
+            "<|im_start|>user\nbrief: src/lib.rs\nfn f() {}<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn prompt_keeps_path_and_source_verbatim() {
+        // One space after the colon, one newline before the source, and the
+        // source itself byte-identical — training and inference must agree.
+        let prompt = brief_prompt("crates/core/src/graph store.rs", "  fn g() {}\n\n");
+        assert_eq!(
+            prompt,
+            "brief: crates/core/src/graph store.rs\n  fn g() {}\n\n"
         );
     }
 
