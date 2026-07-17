@@ -6247,8 +6247,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                             }
                         }
                     }
-                    call_sites
-                        .sort_by(|a, b| (a.path.clone(), a.line).cmp(&(b.path.clone(), b.line)));
+                    call_sites.sort_by_key(|c| (c.path.clone(), c.line));
                     call_sites.dedup_by(|a, b| a.path == b.path && a.line == b.line);
                     let abs = root_path.join(&rel_path);
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
