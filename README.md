@@ -114,6 +114,28 @@ EXPAND — get the full source in one call instead of opening files by hand:
       pack — the full source of the top matches, bundled — in a single call,
       instead of reading each file:line yourself.
 
+READ — the definition's exact source span plus an edit handle:
+  greppy read SYMBOL --handle
+      Returns byte-exact definition source from the live file and a HANDLE
+      pinning file hash, byte range and content hashes. Pass the handle to
+      edit commands. Prefer this over opening whole files.
+
+EDIT — transactional, hash-guarded, all-or-nothing (v0.3.0):
+  greppy edit replace-body  --symbol SYM --source-file F    replace a definition's body
+  greppy edit insert-after  --symbol SYM --source-file F    add code after a definition
+  greppy edit delete        --symbol SYM                    remove a definition
+  greppy edit rename-call   --in SYM --from A --to B        retarget calls inside one definition
+  greppy edit rename-symbol --symbol SYM --new-name B       cross-file rename, one journal transaction
+  greppy edit ensure-import --file P --module M --name N    idempotent import (re-runs are free)
+  greppy edit text-cas      --file P --old-file F --new-file F   exact-once text change
+  greppy edit data set      --file c.json --path '$.a.b' --value-json V   structured configs
+  greppy edit apply --plan plan.json                        multi-file transactions
+      Every edit re-verifies its hashes immediately before writing and emits
+      a certificate: matched exactly once, hashes before/after, unified diff,
+      "no bytes changed outside the declared range", syntax verification.
+      On failure nothing is written and the error names the next step.
+      Contract: docs/contracts/EDIT_CONTRACT.md.
+
 FLAGS (append to any command above):
   --code            include each result's source lines (so no separate read is needed)
   --all             return every result (turn off the default truncation)
