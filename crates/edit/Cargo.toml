@@ -16,6 +16,8 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+regex = { workspace = true }

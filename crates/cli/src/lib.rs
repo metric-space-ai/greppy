@@ -779,6 +779,36 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Apply a unified diff to exactly the span of a previous read
+    /// (fuzz 0: every hunk must match byte-for-byte, else refusal).
+    #[command(name = "patch-span")]
+    PatchSpan {
+        #[arg(long)]
+        target: String,
+        #[arg(long = "patch-file")]
+        patch_file: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Regex replacement with exact expected match count (the weakest
+    /// selector class - prefer symbol or text-cas addressing).
+    #[command(name = "regex-cas")]
+    RegexCas {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        pattern: String,
+        #[arg(long)]
+        replacement: String,
+        #[arg(long, default_value_t = 1)]
+        expect: usize,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Idempotent import: absent -> inserted at the canonical position;
     /// present -> already-satisfied (exit 0, nothing written); the same
     /// name bound from a different module -> refusal, nothing written.
@@ -6055,6 +6085,58 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::PatchSpan {
+            target,
+            patch_file,
+            dry_run,
+            report,
+        } => {
+            let handle = greppy_edit::EditHandle::decode(&target)?;
+            let patch = std::fs::read(&patch_file).map_err(|source| Error::Io {
+                context: format!("read {patch_file}"),
+                source,
+            })?;
+            let language = greppy_edit::language_for_path(std::path::Path::new(&handle.path));
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::verbs::patch_span(
+                    &root_path,
+                    &handle,
+                    &patch,
+                    Some(language),
+                    &options,
+                )?,
+                report,
+            )
+        }
+        EditCommand::RegexCas {
+            file,
+            pattern,
+            replacement,
+            expect,
+            dry_run,
+            report,
+        } => {
+            let target = resolve_edit_file(&root_path, &file);
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::verbs::regex_cas(
+                    &root_path,
+                    &target,
+                    &pattern,
+                    &replacement,
+                    expect,
+                    &options,
+                )?,
+                report,
+            )
+        }
         EditCommand::EnsureImport {
             file,
             module,

@@ -180,6 +180,197 @@ pub fn replace_span(
     )
 }
 
+/// `greppy edit patch-span --target HANDLE --patch-file F`: apply a unified
+/// diff to exactly the span the agent previously read. fuzz 0: every hunk's
+/// context must match byte-for-byte inside the target; anything else refuses
+/// without writing.
+pub fn patch_span(
+    workspace_root: &Path,
+    handle: &crate::handle::EditHandle,
+    patch_text: &[u8],
+    language: Option<Language>,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let file = if Path::new(&handle.path).is_absolute() {
+        Path::new(&handle.path).to_path_buf()
+    } else {
+        workspace_root.join(&handle.path)
+    };
+    let snapshot = Snapshot::read(&file)?;
+    let (start, end) = match handle.verify(&snapshot.content) {
+        Ok(range) => range,
+        Err(_) => {
+            return Ok(single_refusal_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::Symbol,
+                SelectorClass::Resolved,
+                Status::Stale,
+                options,
+            ));
+        }
+    };
+    let target = &snapshot.content[start..end];
+    let Some(new_target) = apply_unified_patch_exact(target, patch_text) else {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::InvalidResult,
+            options,
+        ));
+    };
+    if new_target == target {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::AlreadySatisfied,
+            options,
+        ));
+    }
+    let ops = vec![PlannedOp {
+        id: "patch-span".into(),
+        range: (start, end),
+        replacement: new_target,
+    }];
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        language,
+        options,
+    )
+}
+
+/// Apply a unified diff to `base` with fuzz 0. Line-based; every hunk's
+/// context and removals must match exactly at the stated positions. Returns
+/// None on any mismatch (including malformed hunks).
+fn apply_unified_patch_exact(base: &[u8], patch: &[u8]) -> Option<Vec<u8>> {
+    let base_str = std::str::from_utf8(base).ok()?;
+    let patch_str = std::str::from_utf8(patch).ok()?;
+    let base_lines: Vec<&str> = base_str.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = 0usize; // next unconsumed base line
+    let mut lines = patch_str.lines().peekable();
+    let mut saw_hunk = false;
+    while let Some(line) = lines.next() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix("@@") {
+            saw_hunk = true;
+            // "@@ -l,c +l,c @@"
+            let minus = header.split_whitespace().find(|t| t.starts_with('-'))?;
+            let old_start: usize = minus[1..].split(',').next()?.parse().ok()?;
+            let old_start = old_start.saturating_sub(1); // 0-based
+            if old_start < cursor || old_start > base_lines.len() {
+                return None;
+            }
+            out.extend(base_lines[cursor..old_start].iter().map(|l| l.to_string()));
+            cursor = old_start;
+            while let Some(&next) = lines.peek() {
+                if next.starts_with("@@") || next.starts_with("--- ") {
+                    break;
+                }
+                let next = lines.next()?;
+                match next.chars().next() {
+                    Some(' ') => {
+                        if base_lines.get(cursor) != Some(&&next[1..]) {
+                            return None;
+                        }
+                        out.push(next[1..].to_string());
+                        cursor += 1;
+                    }
+                    Some('-') => {
+                        if base_lines.get(cursor) != Some(&&next[1..]) {
+                            return None;
+                        }
+                        cursor += 1;
+                    }
+                    Some('+') => out.push(next[1..].to_string()),
+                    Some('\\') => {} // "\ No newline at end of file"
+                    _ => return None,
+                }
+            }
+        }
+    }
+    if !saw_hunk {
+        return None;
+    }
+    out.extend(base_lines[cursor..].iter().map(|l| l.to_string()));
+    let mut bytes = out.join("\n").into_bytes();
+    if base.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    Some(bytes)
+}
+
+/// `greppy edit regex-cas`: regex replacement with exact expected match
+/// count. Accepted, but reported as the weakest selector class.
+pub fn regex_cas(
+    workspace_root: &Path,
+    file: &Path,
+    pattern: &str,
+    replacement: &str,
+    expect: usize,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| greppy_core::Error::Invalid(format!("invalid regex: {e}")))?;
+    let text = String::from_utf8_lossy(&snapshot.content).into_owned();
+    let matches: Vec<(usize, usize)> = re.find_iter(&text).map(|m| (m.start(), m.end())).collect();
+    if matches.is_empty() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Regex,
+            SelectorClass::RegexWeak,
+            Status::NotFound,
+            options,
+        ));
+    }
+    if matches.len() != expect {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Regex,
+            SelectorClass::RegexWeak,
+            Status::Ambiguous,
+            options,
+        ));
+    }
+    let ops: Vec<PlannedOp> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, end))| {
+            let expanded = re
+                .replace(&text[start..end], replacement)
+                .into_owned()
+                .into_bytes();
+            PlannedOp {
+                id: format!("regex-cas-{i}"),
+                range: (start, end),
+                replacement: expanded,
+            }
+        })
+        .collect();
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Regex,
+        SelectorClass::RegexWeak,
+        None,
+        options,
+    )
+}
+
 /// Where to place inserted text relative to a definition span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertPosition {
@@ -980,6 +1171,73 @@ mod tests {
         assert_eq!(cert.status, Status::Stale);
         assert_eq!(cert.exit_code(), 12);
         assert_eq!(std::fs::read(&f).unwrap(), b"fn a() { changed(); }\n");
+    }
+
+    #[test]
+    fn patch_span_exact_apply_and_refusal() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        let content = b"def f():\n    a = 1\n    b = 2\n    return a + b\n";
+        std::fs::write(&f, content).unwrap();
+        let h = EditHandle::for_range(dir.path(), Path::new("m.py"), content, 0, content.len())
+            .unwrap();
+        let patch = b"@@ -2,2 +2,2 @@\n     a = 1\n-    b = 2\n+    b = 3\n";
+        let cert = patch_span(
+            dir.path(),
+            &h,
+            patch,
+            Some(Language::Python),
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        assert!(std::fs::read_to_string(&f).unwrap().contains("b = 3"));
+        // ein Patch mit falschem Kontext: Refusal ohne Schreiben
+        std::fs::write(&f, content).unwrap();
+        let h2 = EditHandle::for_range(dir.path(), Path::new("m.py"), content, 0, content.len())
+            .unwrap();
+        let bad = b"@@ -2,2 +2,2 @@\n     a = 999\n-    b = 2\n+    b = 3\n";
+        let cert = patch_span(
+            dir.path(),
+            &h2,
+            bad,
+            Some(Language::Python),
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::InvalidResult);
+        assert!(std::fs::read_to_string(&f).unwrap().contains("b = 2"));
+    }
+
+    #[test]
+    fn regex_cas_expect_gates_count() {
+        let dir = ws();
+        let f = dir.path().join("conf.ini");
+        std::fs::write(
+            &f,
+            b"port = 9000
+timeout = 30
+",
+        )
+        .unwrap();
+        let cert = regex_cas(
+            dir.path(),
+            &f,
+            r"^port\s*=\s*\d+",
+            "port = 8080",
+            1,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        // ^ ohne multiline matcht nur zeile 1 -> genau 1 treffer
+        assert_eq!(cert.status, Status::Applied);
+        assert!(std::fs::read_to_string(&f)
+            .unwrap()
+            .starts_with("port = 8080"));
+        assert_eq!(
+            cert.operations[0].selector_class,
+            crate::certificate::SelectorClass::RegexWeak
+        );
     }
 
     #[test]

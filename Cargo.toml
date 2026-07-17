@@ -42,6 +42,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite"] }
 sha2 = "0.10"
 tempfile = "3"
+regex = "1"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"

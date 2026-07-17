@@ -686,6 +686,7 @@ version = "0.2.0"
 dependencies = [
  "greppy-core",
  "greppy-parser",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
