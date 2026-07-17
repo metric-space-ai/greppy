@@ -840,6 +840,23 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Within one definition, append an argument to every call of NAME
+    /// that does not already carry it (idempotent).
+    #[command(name = "ensure-argument")]
+    EnsureArgument {
+        #[arg(long)]
+        symbol: String,
+        /// The callee whose calls get the argument.
+        #[arg(long)]
+        call: String,
+        /// Argument text, e.g. "timeout=30".
+        #[arg(long)]
+        arg: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Append a method to a class body when absent; present reports
     /// already-satisfied.
     #[command(name = "ensure-method")]
@@ -889,6 +906,9 @@ pub enum EditCommand {
         symbol: String,
         #[arg(long = "new-name")]
         new_name: String,
+        /// graph (default) uses the resolved store; lsp is a later phase.
+        #[arg(long, default_value = "graph", value_parser = ["graph", "lsp"])]
+        backend: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -6252,6 +6272,29 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 }
             }
         }
+        EditCommand::EnsureArgument {
+            symbol,
+            call,
+            arg,
+            dry_run,
+            report,
+        } => match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
+            EditTarget::Refusal(cert) => (*cert, report),
+            EditTarget::Resolved { rel_path, range } => {
+                let abs = root_path.join(&rel_path);
+                let options = greppy_edit::verbs::VerbOptions {
+                    dry_run,
+                    with_diff: true,
+                    ..Default::default()
+                };
+                (
+                    greppy_edit::ensure::ensure_argument(
+                        &root_path, &abs, range, &call, &arg, &options,
+                    )?,
+                    report,
+                )
+            }
+        },
         EditCommand::EnsureMethod {
             symbol,
             name,
@@ -6332,9 +6375,16 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
         EditCommand::RenameSymbol {
             symbol,
             new_name,
+            backend,
             dry_run,
             report,
         } => {
+            if backend == "lsp" {
+                return Err(Error::NotImplemented {
+                    feature: "rename-symbol --backend lsp".into(),
+                    reason: "the LSP engine lands in a later 0.3.x phase; the graph backend is the default".into(),
+                });
+            }
             let store = open_default_store_query_writer(root)?;
             let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
             let mut def_nodes = Vec::new();

@@ -333,12 +333,168 @@ pub fn ensure_method(
     )
 }
 
+/// `greppy edit ensure-argument --symbol SYM --call NAME --arg TEXT`:
+/// within one resolved definition, append `arg_text` to every call of
+/// `callee` that does not already contain it (token-level check).
+/// All calls already carrying the argument -> already-satisfied.
+pub fn ensure_argument(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    callee: &str,
+    arg_text: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let language = greppy_parser::language_for_path(file);
+    let Some(call_args) = call_argument_spans(language, &snapshot.content, def_range, callee)
+    else {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::NotFound,
+            options,
+        ));
+    };
+    if call_args.is_empty() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::NotFound,
+            options,
+        ));
+    }
+    let mut ops = Vec::new();
+    for (i, (args_start, args_end)) in call_args.iter().enumerate() {
+        let args_text = String::from_utf8_lossy(&snapshot.content[*args_start..*args_end]);
+        let inner = args_text.trim_start_matches('(').trim_end_matches(')');
+        let already = inner.split(',').any(|a| a.trim() == arg_text.trim());
+        if already {
+            continue;
+        }
+        // vor der schliessenden klammer einfuegen
+        let insert_at = args_end - 1;
+        let sep = if inner.trim().is_empty() { "" } else { ", " };
+        ops.push(PlannedOp {
+            id: format!("ensure-argument-{i}"),
+            range: (insert_at, insert_at),
+            replacement: format!("{sep}{arg_text}").into_bytes(),
+        });
+    }
+    if ops.is_empty() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::AlreadySatisfied,
+            options,
+        ));
+    }
+    run_pipeline_public(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::TreeSitter,
+        SelectorClass::Structural,
+        Some(language),
+        options,
+    )
+}
+
+/// Argument-list spans `(...)` of every call to `callee` within `def_range`.
+fn call_argument_spans(
+    language: Language,
+    content: &[u8],
+    def_range: (usize, usize),
+    callee: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        if node.start_byte() >= def_range.0
+            && node.end_byte() <= def_range.1
+            && node.kind().contains("call")
+        {
+            let fn_node = node
+                .child_by_field_name("function")
+                .or_else(|| node.child(0));
+            let args_node = node.child_by_field_name("arguments");
+            if let (Some(f), Some(a)) = (fn_node, args_node) {
+                let name = &content[f.start_byte()..f.end_byte()];
+                // qualifizierte callees: letztes segment vergleichen
+                let short = name
+                    .rsplit(|&b| b == b'.' || b == b':')
+                    .next()
+                    .unwrap_or(name);
+                if short == callee.as_bytes() {
+                    out.push((a.start_byte(), a.end_byte()));
+                }
+            }
+        }
+        if node.end_byte() >= def_range.0 && node.start_byte() <= def_range.1 {
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ws() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn ensure_argument_appends_once() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        let content = b"def run():\n    fetch(url)\n    fetch(url, timeout=30)\n";
+        std::fs::write(&f, content).unwrap();
+        let cert = ensure_argument(
+            dir.path(),
+            &f,
+            (0, content.len()),
+            "fetch",
+            "timeout=30",
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(out.matches("timeout=30").count(), 2, "{out}");
+        // zweiter lauf: alles versorgt
+        let content2 = std::fs::read(&f).unwrap();
+        let cert = ensure_argument(
+            dir.path(),
+            &f,
+            (0, content2.len()),
+            "fetch",
+            "timeout=30",
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::AlreadySatisfied);
     }
 
     #[test]
