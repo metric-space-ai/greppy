@@ -2231,6 +2231,51 @@ fn symbol_candidate_rows(
 /// node id. If no primary-labelled node matches, we fall back to the
 /// single best node from [`resolve_symbol_id`] so the old behaviour is
 /// preserved for pseudo-node-only names.
+/// Candidate needles for similar-name suggestions, from an agent's raw
+/// query. Agents guess signature-shaped names ("impl Serialize for Range",
+/// "Serialize for Range") — the useful identifier is usually the LAST
+/// type-like token, so tokens are tried back to front with declaration
+/// keywords dropped.
+fn suggestion_needles(query: &str) -> Vec<String> {
+    let mut needles: Vec<String> = Vec::new();
+    if let Some((_, member)) = split_qualified(query) {
+        needles.push(member.to_string());
+    }
+    let mut tokens: Vec<&str> = query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| t.len() >= 3)
+        .filter(|t| {
+            !matches!(
+                t.to_ascii_lowercase().as_str(),
+                "impl"
+                    | "for"
+                    | "pub"
+                    | "struct"
+                    | "trait"
+                    | "class"
+                    | "def"
+                    | "function"
+                    | "static"
+                    | "const"
+                    | "async"
+                    | "extends"
+                    | "implements"
+                    | "interface"
+            )
+        })
+        .collect();
+    tokens.reverse();
+    for t in tokens {
+        if !needles.iter().any(|n| n == t) {
+            needles.push(t.to_string());
+        }
+    }
+    if needles.is_empty() {
+        needles.push(query.to_string());
+    }
+    needles
+}
+
 fn resolve_symbol_nodes(store: &greppy_store::Store, symbol: Option<&str>) -> Result<Vec<i64>> {
     let Some(s) = symbol else {
         // No symbol: mirror resolve_symbol_id's "first node" behaviour.
@@ -5954,6 +5999,20 @@ fn dispatch_read(
         }
     }
     if nodes.is_empty() {
+        // Dead ends must carry the next step (P3): both MiniMax and Kimi
+        // agents guess signature-shaped names ("impl Serialize for Range")
+        // and burned 4-5 turns each rediscovering the qualified form until
+        // the miss listed similar indexed names (trace forensics 2026-07-17).
+        let query = symbol.unwrap_or("");
+        let mut similar = Vec::new();
+        for needle in suggestion_needles(query) {
+            similar = store
+                .similar_node_names(&project, &needle, 5)
+                .unwrap_or_default();
+            if !similar.is_empty() {
+                break;
+            }
+        }
         if json {
             println!(
                 "{}",
@@ -5961,12 +6020,18 @@ fn dispatch_read(
                     "schema_version": READ_JSON_SCHEMA_VERSION,
                     "command": "read",
                     "status": "not-found",
-                    "query": symbol.unwrap_or(""),
+                    "query": query,
+                    "similar": similar,
                 }))
                 .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
             );
+        } else if similar.is_empty() {
+            println!("read: no definition found for `{query}`");
         } else {
-            println!("read: no definition found for `{}`", symbol.unwrap_or(""));
+            println!(
+                "read: no definition found for `{query}`; similar indexed names: {} — retry with one of these",
+                similar.join(", ")
+            );
         }
         return Ok(10);
     }
@@ -6865,11 +6930,39 @@ fn resolve_edit_target(
         }
     }
     if nodes.is_empty() {
+        // Same P3 rule as read: a not-found edit target lists the closest
+        // indexed names as candidates, so the certificate itself carries
+        // the retry instead of sending the agent back into name guessing.
+        let project = project_for(root)?;
+        let mut similar = Vec::new();
+        for needle in suggestion_needles(symbol) {
+            similar = store
+                .similar_node_names(&project, &needle, 5)
+                .unwrap_or_default();
+            if !similar.is_empty() {
+                break;
+            }
+        }
+        let mut candidates = Vec::new();
+        for name in similar {
+            if let Ok(ids) = resolve_symbol_nodes(&store, Some(&name)) {
+                if let Some(node) = ids
+                    .first()
+                    .and_then(|id| store.get_node(*id).ok().flatten())
+                {
+                    candidates.push(cert::Candidate {
+                        qualified_name: node.qualified_name.clone(),
+                        path: node.file_path.clone(),
+                        line: node.start_line as usize,
+                    });
+                }
+            }
+        }
         return Ok(EditTarget::Refusal(Box::new(refusal(
             root_path,
             "",
             greppy_edit::Status::NotFound,
-            vec![],
+            candidates,
         ))));
     }
     let mut sites: Vec<(String, i64)> = nodes
