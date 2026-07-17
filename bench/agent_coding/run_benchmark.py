@@ -1257,7 +1257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # retry those up to two times so infrastructure noise
                         # does not consume task validity. Timeouts and harness
                         # failures are not retried.
-                        for attempt in range(1, 4):
+                        for attempt in range(1, 6):
                             # each attempt needs untouched worktree/store dirs;
                             # reusing the previous attempt's task_tmp fails on
                             # the existing worktree path
@@ -1279,9 +1279,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 # warmup/worktree failures are runner-environment
                                 # noise, not measurements - retry them like
                                 # provider errors instead of consuming the task
-                                if attempt >= 3:
+                                if attempt >= 5:
                                     raise
-                                print(f"[{task['id']}] {arm}: {harness_error}, retry {attempt}/2", flush=True)
+                                print(f"[{task['id']}] {arm}: {harness_error}, retry {attempt}/4", flush=True)
                                 time.sleep(30 * attempt)
                                 continue
                             row["agent"]["provider_attempts"] = attempt
@@ -1292,7 +1292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             if not provider_flake:
                                 break
-                            print(f"[{task['id']}] {arm}: provider error, retry {attempt}/2", flush=True)
+                            print(f"[{task['id']}] {arm}: provider error, retry {attempt}/4", flush=True)
                             time.sleep(30 * attempt)
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source
                         row = sanitized_failure_row(task["id"], arm, error)

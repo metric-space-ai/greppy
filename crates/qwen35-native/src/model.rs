@@ -459,7 +459,9 @@ fn bullet_echoes_signature(bullet: &str, signature: &str) -> bool {
         return true;
     }
     let bullet_words = normalized.split(' ').collect::<Vec<_>>();
-    let signature_words = signature.split(' ').collect::<std::collections::BTreeSet<_>>();
+    let signature_words = signature
+        .split(' ')
+        .collect::<std::collections::BTreeSet<_>>();
     let shared = bullet_words
         .iter()
         .filter(|word| signature_words.contains(**word))
@@ -2014,7 +2016,10 @@ mod echo_filter_tests {
     fn echo_filter_rejects_signature_restatement() {
         let source = "fn parse_config(path: &str) -> Config {\n    load(path)\n}\n";
         let sig = super::normalized_signature_line(source);
-        assert!(super::bullet_echoes_signature("Parse config path str config.", &sig));
+        assert!(super::bullet_echoes_signature(
+            "Parse config path str config.",
+            &sig
+        ));
         assert!(!super::bullet_echoes_signature(
             "Loads the configuration file from disk.",
             &sig
