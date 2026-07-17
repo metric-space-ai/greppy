@@ -28,7 +28,15 @@ from urllib.parse import urlsplit
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
-PROVIDER_EXTENSION = REPO_ROOT / "bench" / "agent_efficiency" / "minimax-provider.js"
+# Exploratory model override (forensics runs, e.g. Kimi K3 whose responses
+# carry visible reasoning). Gate evidence stays on the registered MiniMax
+# defaults; the manifest records whatever was actually used.
+_EXT_OVERRIDE = os.environ.get("GREPPY_BENCH_EXTENSION")
+PROVIDER_EXTENSION = (
+    pathlib.Path(_EXT_OVERRIDE)
+    if _EXT_OVERRIDE
+    else REPO_ROOT / "bench" / "agent_efficiency" / "minimax-provider.js"
+)
 TASK_SCHEMA_VERSION = "greppy.agent-coding-tasks.v1"
 RESULT_SCHEMA_VERSION = "greppy.agent-coding-results.v1"
 MANIFEST_SCHEMA_VERSION = "greppy.agent-coding-manifest.v1"
@@ -59,8 +67,8 @@ def provider_cost_usd(agent: dict) -> float:
         for field, rate in PROVIDER_PRICE_USD_PER_MILLION.items()
     )
 HARNESS_VERSION = "2"
-DEFAULT_MODEL = "MiniMax-M3"
-DEFAULT_PROVIDER = "minimax"
+DEFAULT_MODEL = os.environ.get("GREPPY_BENCH_MODEL", "MiniMax-M3")
+DEFAULT_PROVIDER = os.environ.get("GREPPY_BENCH_PROVIDER", "minimax")
 RAW_ROOT = HERE / "raw_traces"
 ARMS = ("explorer", "greppy", "greppy-edit")
 MIN_COMPLETE_PAIRS = 30
@@ -389,22 +397,36 @@ def greppy_source_identity() -> dict[str, Any]:
 
 
 def verify_provider_registration(pi_bin: pathlib.Path) -> None:
-    result = run_process(
-        [
-            str(pi_bin),
-            "--extension",
-            str(PROVIDER_EXTENSION),
-            "--no-extensions",
-            "--list-models",
-            DEFAULT_MODEL,
-        ],
-        cwd=REPO_ROOT,
-        timeout_seconds=15,
-        env=os.environ.copy(),
-    )
-    output = (result.stdout + result.stderr).decode("utf-8", "replace")
-    if result.timed_out or result.returncode != 0 or not re.search(r"(?m)^minimax\s+MiniMax-M3\s", output):
-        raise HarnessError("explicit MiniMax provider registration probe failed")
+    # The probe is purely local (no API call), but a shared ~/.pi config
+    # dir is lock-contended and node startup is IO-starved when other pi
+    # fleets run on the same host (2026-07-17: 73s wall at 3s CPU next to
+    # five panel runners; one probe exceeded even 120s at peak load).
+    # Probe in a private config dir, tolerate load with retries.
+    last = "no attempt"
+    for attempt in range(3):
+        with tempfile.TemporaryDirectory(prefix="greppy-probe-pi-") as probe_dir:
+            env = os.environ.copy()
+            env["PI_CODING_AGENT_DIR"] = probe_dir
+            result = run_process(
+                [
+                    str(pi_bin),
+                    "--extension",
+                    str(PROVIDER_EXTENSION),
+                    "--no-extensions",
+                    "--list-models",
+                    DEFAULT_MODEL,
+                ],
+                cwd=REPO_ROOT,
+                timeout_seconds=120,
+                env=env,
+            )
+        output = (result.stdout + result.stderr).decode("utf-8", "replace")
+        pattern = rf"(?m)^{re.escape(DEFAULT_PROVIDER)}\s+{re.escape(DEFAULT_MODEL)}\s"
+        if not result.timed_out and result.returncode == 0 and re.search(pattern, output):
+            return
+        last = f"timed_out={result.timed_out} rc={result.returncode} tail={output[-200:]!r}"
+        time.sleep(10 * (attempt + 1))
+    raise HarnessError(f"explicit MiniMax provider registration probe failed: {last}")
 
 
 def clone_pinned_repository(task: dict[str, Any], parent: pathlib.Path) -> pathlib.Path:
@@ -569,6 +591,23 @@ def shared_user_prompt(task: dict[str, Any]) -> str:
     return f"Task:\n{task['user_task'].strip()}\n\nVerification command:\n{command}\n"
 
 
+# Per-arm pi tool surface. The greppy-edit arm's displacement prompt states
+# "there is no apply_patch and no manual patching"; with pi's builtin
+# edit/write/read in the tool palette that statement is visibly false and
+# gets ignored (trace forensics 2026-07-17: the arm's agent used builtin
+# edit and never called greppy). Displacement only works when the
+# environment matches the claim - the MSCC panel proves prompt-driven
+# adoption (78-87% greppy usage) exactly where the prompt's claim is true.
+# The edit arm therefore ships bash only: greppy read/edit is the paved
+# road, bash remains the honest escape hatch (and bash-side manual edits
+# stay measurable as fallback_edits in trace forensics).
+ARM_TOOLS = {
+    "explorer": "bash,read,edit,write",
+    "greppy": "bash,read,edit,write",
+    "greppy-edit": "bash",
+}
+
+
 def system_prompt(arm: str, greppy_bin: pathlib.Path) -> str:
     if arm == "explorer":
         policy = EXPLORER_POLICY
@@ -611,7 +650,7 @@ def run_pi_agent(
         "--thinking",
         "off",
         "--tools",
-        "bash,read,edit,write",
+        ARM_TOOLS[arm],
         "--no-context-files",
         "--no-skills",
         "--no-prompt-templates",
@@ -1121,7 +1160,7 @@ def build_base_manifest(
         "publishable": True,
         "contains_raw_traces": False,
         "model": {"provider": DEFAULT_PROVIDER, "id": DEFAULT_MODEL, "thinking": "off"},
-        "tools": ["bash", "read", "edit", "write"],
+        "tools_per_arm": {arm: ARM_TOOLS[arm].split(",") for arm in ARMS},
         "provider_extension": {
             "repository_path": "bench/agent_efficiency/minimax-provider.js",
             "sha256": sha256_bytes(PROVIDER_EXTENSION.read_bytes()),
@@ -1192,7 +1231,7 @@ RESUME_IDENTITY_FIELDS = (
     "schema_version",
     "harness_version",
     "model",
-    "tools",
+    "tools_per_arm",
     "provider_extension",
     "executables",
     "greppy_source",
