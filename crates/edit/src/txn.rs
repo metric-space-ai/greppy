@@ -131,6 +131,54 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
+/// The kinds of the ancestor chain (parent -> root, leaf excluded) of the
+/// smallest node covering `range`. This is the structural CONTEXT the edited
+/// bytes live in.
+///
+/// Counting ERROR/MISSING nodes alone is not a sufficient syntax gate:
+/// tree-sitter's error recovery silently reinterprets many malformations
+/// without emitting ERROR nodes (proven 2026-07-17: replacing a Go method
+/// body with a whole file's text — copyright header, package decl, imports —
+/// yielded new_errors=0 while gofmt rejected the file, so the certificate
+/// falsely reported `syntax: proved`). A structural edit must not change the
+/// context its target sits in: a body stays inside its function, a function
+/// stays a top-level declaration. When the surrounding context's kind chain
+/// changes, the edit broke the grammar in a way tree-sitter recovered past.
+fn context_kinds(language: Language, content: &[u8], range: (usize, usize)) -> Option<Vec<String>> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let leaf = tree
+        .root_node()
+        .descendant_for_byte_range(range.0, range.1.saturating_sub(1).max(range.0))?;
+    let mut kinds = Vec::new();
+    let mut node = leaf.parent();
+    while let Some(cur) = node {
+        kinds.push(cur.kind().to_string());
+        node = cur.parent();
+    }
+    Some(kinds)
+}
+
+/// Does the edited region still sit in the same structural context after the
+/// edit? `before_range` is the target in the pre-edit content; `after_range`
+/// is the changed span in the post-edit content. Returns true (permissive)
+/// when either side cannot be parsed — that path is covered by the
+/// ERROR/MISSING count, which reports not-applicable.
+pub fn structural_context_preserved(
+    language: Language,
+    before: &[u8],
+    before_range: (usize, usize),
+    after: &[u8],
+    after_range: (usize, usize),
+) -> bool {
+    match (
+        context_kinds(language, before, before_range),
+        context_kinds(language, after, after_range),
+    ) {
+        (Some(b), Some(a)) => a == b,
+        _ => true,
+    }
+}
+
 /// Parse `content` and count ERROR and MISSING nodes. `None` when the
 /// language is not tree-sitter-supported (postcondition then reports
 /// not-applicable rather than silently passing).

@@ -180,6 +180,7 @@ pub fn text_cas(
         SelectorClass::ExactText,
         None,
         options,
+        false,
     )
 }
 
@@ -246,6 +247,7 @@ pub fn replace_span(
         SelectorClass::Resolved,
         language,
         options,
+        true,
     )
 }
 
@@ -313,6 +315,7 @@ pub fn patch_span(
         SelectorClass::Resolved,
         language,
         options,
+        true,
     )
 }
 
@@ -437,6 +440,7 @@ pub fn regex_cas(
         SelectorClass::RegexWeak,
         None,
         options,
+        false,
     )
 }
 
@@ -503,6 +507,7 @@ pub fn replace_body(
         SelectorClass::Resolved,
         Some(language),
         options,
+        true,
     )
 }
 
@@ -562,6 +567,7 @@ pub fn insert_adjacent(
         SelectorClass::Resolved,
         language,
         options,
+        false,
     )
 }
 
@@ -601,6 +607,7 @@ pub fn delete_span(
         SelectorClass::Resolved,
         language,
         options,
+        false,
     )
 }
 
@@ -710,6 +717,7 @@ pub fn rename_in_span(
         SelectorClass::Structural,
         Some(language),
         options,
+        false,
     )
 }
 
@@ -812,6 +820,7 @@ pub fn change_signature(
         SelectorClass::Resolved,
         Some(language),
         options,
+        true,
     )?;
     // the call-site checklist rides in candidates: every entry is a place
     // the agent must review, because the graph backend does not rewrite them
@@ -1142,6 +1151,7 @@ pub(crate) fn run_pipeline_public(
         class,
         language,
         options,
+        false,
     )
 }
 
@@ -1171,6 +1181,7 @@ pub(crate) fn single_refusal_certificate(
 }
 
 /// The shared transaction pipeline for single-file verbs.
+#[allow(clippy::too_many_arguments)]
 fn run_pipeline(
     workspace_root: &Path,
     snapshot: Snapshot,
@@ -1179,6 +1190,7 @@ fn run_pipeline(
     class: SelectorClass,
     language: Option<Language>,
     options: &VerbOptions,
+    enforce_structure: bool,
 ) -> Result<Certificate> {
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
@@ -1239,7 +1251,30 @@ fn run_pipeline(
         },
     };
     let syntax_applicable = syntax_before.is_some() && syntax_after.is_some();
-    let syntax_ok = !syntax_applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
+    // Structural context preservation: tree-sitter recovers past many
+    // malformations without ERROR nodes, so the count-based check alone is
+    // unsound (a body replaced with a whole file parsed clean — see
+    // structural_context_preserved). Require the edited region to still sit
+    // in the same ancestor-kind chain it did before. Applied only to the
+    // single-op verbs (replace-body/-span, change-signature, …) where the
+    // post-edit span is exactly [op.range.0, op.range.0 + replacement.len());
+    // multi-op edits fall back to the count/isolation checks.
+    let structure_ok = match (enforce_structure, language, ops.as_slice()) {
+        (true, Some(l), [op]) => {
+            let after_range = (op.range.0, op.range.0 + op.replacement.len());
+            crate::txn::structural_context_preserved(
+                l,
+                &snapshot.content,
+                op.range,
+                &applied.content,
+                after_range,
+            )
+        }
+        _ => true,
+    };
+    let syntax_ok = (!syntax_applicable
+        || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0))
+        && structure_ok;
     let isolation_ok =
         formatter_expanded || outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
 
@@ -1842,6 +1877,35 @@ timeout = 30
         let out = std::fs::read_to_string(&f).unwrap();
         assert!(out.contains("start={}"), "{out}");
         assert!(out.contains("pub fn serialize(&self) -> String"), "{out}");
+    }
+
+    #[test]
+    fn replace_body_rejects_whole_file_as_replacement() {
+        // The --source-file footgun (agent points it at the real file, not a
+        // snippet): replacing a method body with the whole file's text
+        // parses ERROR-node-free under tree-sitter-go's recovery, so the
+        // count-based syntax check passed it as `applied`/`proved` while
+        // gofmt rejects the result (forensics 2026-07-17). The structural
+        // context check must catch it.
+        let dir = ws();
+        let f = dir.path().join("strings.go");
+        let content: &[u8] = b"package hstrings\n\nimport \"strings\"\n\nfunc Fold(a, b string) bool {\n\treturn strings.EqualFold(a, b)\n}\n";
+        std::fs::write(&f, content).unwrap();
+        let text = std::str::from_utf8(content).unwrap();
+        let fs = text.find("func Fold").unwrap();
+        let fe = text.rfind('}').unwrap() + 1;
+        let cert = replace_body(
+            dir.path(),
+            &f,
+            (fs, fe),
+            content, // the whole file as the "new body" — the footgun
+            Language::Go,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::InvalidResult, "{cert:?}");
+        assert_eq!(cert.operations[0].guarantees.syntax, Guarantee::Failed);
+        assert!(!cert.published);
     }
 
     #[test]
