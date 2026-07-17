@@ -21,7 +21,6 @@ READ — get exact definition source instead of opening files by hand:
       pins the file, byte range, and content hashes; pass it to edit
       commands. Prefer this over opening whole files: it returns exactly
       the code that matters and nothing else.
-  greppy expand ID --handle      same, for a hit from a previous search
 
 EDIT — transactional, hash-guarded, all-or-nothing. Never patch files by
 hand when an edit verb fits; the verbs verify their own result:

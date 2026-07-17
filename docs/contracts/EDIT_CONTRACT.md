@@ -25,9 +25,13 @@ thresholds: documented rationale, version bump, owner sign-off.
 ### Read
 
 ```
-greppy read SYMBOL [--context callers|callees|none] [--handle]
-greppy expand ID --handle
+greppy read SYMBOL [--handle]
 ```
+
+(Contract revision 2026-07-17: `expand ID --handle` was dropped before
+implementation — expand packs bundle several nodes, and a handle binds
+exactly one span. `greppy read` is the single handle issuer; reading a hit
+from a previous search is `read` on its qualified name.)
 
 `--handle` returns an opaque versioned token binding
 `{workspace_root, path, file_sha256, byte_range, target_sha256,
