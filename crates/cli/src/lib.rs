@@ -5856,6 +5856,35 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             )
         }
     };
+    let mut certificate = certificate;
+    if certificate.published {
+        // close the read->edit->read loop: refresh the store so the next
+        // read/graph query addresses the edited file without a manual
+        // reindex. index() is incremental from the second run, so this
+        // touches only the changed file. A refresh failure downgrades the
+        // flag, never the edit (the workspace write already happened).
+        // run the refresh as a self-subprocess: the full index path prints
+        // its report to stdout, which must stay reserved for the
+        // certificate; semantics are identical to `greppy index .`
+        let refreshed = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                std::process::Command::new(exe)
+                    .arg("--root")
+                    .arg(&root_path)
+                    .arg("index")
+                    .arg(&root_path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .ok()
+            })
+            .map(|status| status.success())
+            .unwrap_or(false);
+        for op in &mut certificate.operations {
+            op.store_refreshed = refreshed;
+        }
+    }
     let rendered = serde_json::to_string_pretty(&certificate)
         .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?;
     println!("{rendered}");

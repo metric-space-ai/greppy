@@ -468,6 +468,7 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
     error: str | None = None
+    last_error_text: str | None = None
     for line in raw.decode("utf-8", "replace").splitlines():
         try:
             event = json.loads(line)
@@ -497,6 +498,7 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
                     source_opens += 1
         if message.get("errorMessage"):
             error = str(message["errorMessage"])
+            last_error_text = error[:300]
     return {
         "input_tokens": input_tokens,
         "uncached_input_tokens": uncached_input_tokens,
@@ -507,6 +509,10 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         "source_opens": source_opens,
         "turns": turns,
         "reported_error": bool(error),
+        # provider error text, redacted upstream with the rest of stdout;
+        # 10 consecutive identical failures on one task are invisible
+        # without it (2026-07-17: serde-range-start-field, both arms)
+        "last_error_text": last_error_text,
     }
 
 
