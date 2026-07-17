@@ -1615,7 +1615,7 @@ mod tests {
             },
         };
         let err = text_cas(dir.path(), &f, b"a = 1", b"a = 9", 1, &opts);
-        // sed normalisiert auch zeile b -> scope-expansion ohne permit: Fehler,
+        // der normalizer aendert auch zeile b -> scope-expansion ohne permit: Fehler,
         // Datei unveraendert
         assert!(err.is_err());
         assert_eq!(std::fs::read(&f).unwrap(), b"a = 1\nb =    2\n");
@@ -1624,7 +1624,7 @@ mod tests {
             dry_run: false,
             with_diff: false,
             format: FormatPolicy::File {
-                argv: vec!["sed".into(), "-i".into(), "".into(), "s/ *= */ = /".into()],
+                argv: portable_normalizer_argv(),
                 permit_outside: true,
             },
         };
