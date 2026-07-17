@@ -329,6 +329,7 @@ fn run_pipeline(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // report assembly: splitting into a builder hides which fields a status requires
 fn single_op_certificate(
     workspace_root: &Path,
     snapshot: &Snapshot,
