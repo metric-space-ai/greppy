@@ -703,6 +703,63 @@ pub enum EditCommand {
     /// Replace exactly the span a previous `greppy read --handle` returned.
     /// The handle's hashes are re-verified immediately before writing; a
     /// changed file fails stale (exit 12) and writes nothing.
+    /// Replace only the BODY of a definition; the signature stays
+    /// byte-identical. Address by --symbol (resolved like `read`) or by
+    /// --target HANDLE from a previous read.
+    #[command(name = "replace-body")]
+    ReplaceBody {
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "source-file")]
+        source_file: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Insert a new top-level block after a definition.
+    #[command(name = "insert-after")]
+    InsertAfter {
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "source-file")]
+        source_file: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Insert a new top-level block before a definition.
+    #[command(name = "insert-before")]
+    InsertBefore {
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "source-file")]
+        source_file: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Delete a definition (including its trailing newline; a doubled blank
+    /// line is collapsed).
+    #[command(name = "delete")]
+    Delete {
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     #[command(name = "replace-span")]
     ReplaceSpan {
         /// Edit handle from `greppy read SYMBOL --handle`.
@@ -5801,6 +5858,15 @@ fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (u
 /// certificate; map its status to the registered exit code.
 fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
     let root_path = resolve_root(root)?;
+    #[derive(PartialEq)]
+    enum EditCommandKind {
+        InsertBefore,
+        Other,
+    }
+    let command_kind = match &command {
+        EditCommand::InsertBefore { .. } => EditCommandKind::InsertBefore,
+        _ => EditCommandKind::Other,
+    };
     let (certificate, report_path) = match command {
         EditCommand::TextCas {
             file,
@@ -5828,6 +5894,108 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 report,
             )
         }
+        EditCommand::ReplaceBody {
+            symbol,
+            target,
+            source_file,
+            dry_run,
+            report,
+        } => {
+            let new_body = std::fs::read(&source_file).map_err(|source| Error::Io {
+                context: format!("read {source_file}"),
+                source,
+            })?;
+            match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
+                EditTarget::Refusal(cert) => (*cert, report),
+                EditTarget::Resolved { rel_path, range } => {
+                    let abs = root_path.join(&rel_path);
+                    let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
+                    let options = greppy_edit::verbs::VerbOptions {
+                        dry_run,
+                        with_diff: true,
+                    };
+                    (
+                        greppy_edit::verbs::replace_body(
+                            &root_path, &abs, range, &new_body, language, &options,
+                        )?,
+                        report,
+                    )
+                }
+            }
+        }
+        EditCommand::InsertAfter {
+            symbol,
+            target,
+            source_file,
+            dry_run,
+            report,
+        }
+        | EditCommand::InsertBefore {
+            symbol,
+            target,
+            source_file,
+            dry_run,
+            report,
+        } => {
+            let position = if matches!(command_kind, EditCommandKind::InsertBefore) {
+                greppy_edit::verbs::InsertPosition::Before
+            } else {
+                greppy_edit::verbs::InsertPosition::After
+            };
+            let text = std::fs::read(&source_file).map_err(|source| Error::Io {
+                context: format!("read {source_file}"),
+                source,
+            })?;
+            match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
+                EditTarget::Refusal(cert) => (*cert, report),
+                EditTarget::Resolved { rel_path, range } => {
+                    let abs = root_path.join(&rel_path);
+                    let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
+                    let options = greppy_edit::verbs::VerbOptions {
+                        dry_run,
+                        with_diff: true,
+                    };
+                    (
+                        greppy_edit::verbs::insert_adjacent(
+                            &root_path,
+                            &abs,
+                            range,
+                            &text,
+                            position,
+                            Some(language),
+                            &options,
+                        )?,
+                        report,
+                    )
+                }
+            }
+        }
+        EditCommand::Delete {
+            symbol,
+            target,
+            dry_run,
+            report,
+        } => match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
+            EditTarget::Refusal(cert) => (*cert, report),
+            EditTarget::Resolved { rel_path, range } => {
+                let abs = root_path.join(&rel_path);
+                let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
+                let options = greppy_edit::verbs::VerbOptions {
+                    dry_run,
+                    with_diff: true,
+                };
+                (
+                    greppy_edit::verbs::delete_span(
+                        &root_path,
+                        &abs,
+                        range,
+                        Some(language),
+                        &options,
+                    )?,
+                    report,
+                )
+            }
+        },
         EditCommand::ReplaceSpan {
             target,
             source_file,
@@ -5895,6 +6063,179 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
         })?;
     }
     Ok(certificate.exit_code())
+}
+
+/// Resolve an edit target: either a `--target HANDLE` (verified against the
+/// live file) or a `--symbol` (resolved like `read`, against the live file).
+/// Returns the file path (workspace-relative), live content, and byte range —
+/// or a ready-made refusal certificate (not-found / ambiguous / stale).
+enum EditTarget {
+    Resolved {
+        rel_path: String,
+        range: (usize, usize),
+    },
+    Refusal(Box<greppy_edit::Certificate>),
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_edit_target(
+    symbol: Option<&str>,
+    target: Option<&str>,
+    root: Option<&str>,
+    root_path: &std::path::Path,
+) -> Result<EditTarget> {
+    use greppy_edit::certificate as cert;
+    fn refusal(
+        root_path: &std::path::Path,
+        path: &str,
+        status: greppy_edit::Status,
+        candidates: Vec<cert::Candidate>,
+    ) -> greppy_edit::Certificate {
+        greppy_edit::Certificate {
+            schema_version: cert::CERTIFICATE_SCHEMA.into(),
+            status,
+            transaction_id: "ge-refused".into(),
+            workspace: cert::WorkspaceReport {
+                root: root_path.to_string_lossy().into_owned(),
+                git_head_before: None,
+                git_head_after: None,
+            },
+            operations: vec![cert::OperationReport {
+                id: "resolve".into(),
+                file: path.to_string(),
+                selector_engine: cert::SelectorEngine::Symbol,
+                selector_class: cert::SelectorClass::Resolved,
+                scope_matches: 0,
+                target_matches: candidates.len(),
+                file_sha256_before: String::new(),
+                file_sha256_after: None,
+                target_sha256_before: String::new(),
+                target_sha256_after: None,
+                outside_declared_ranges_unchanged: true,
+                changed_byte_ranges: vec![],
+                node_before: None,
+                node_after: None,
+                unified_diff: None,
+                syntax: cert::SyntaxDelta {
+                    errors_before: 0,
+                    errors_after: 0,
+                    new_errors: 0,
+                    new_missing_nodes: 0,
+                },
+                postconditions_passed: false,
+                postconditions: vec![],
+                guarantees: cert::Guarantees {
+                    addressed_range: cert::Guarantee::Failed,
+                    no_clobber: cert::Guarantee::Proved,
+                    byte_isolation: cert::Guarantee::Proved,
+                    syntax: cert::Guarantee::NotApplicable,
+                    validators: cert::Guarantee::NotApplicable,
+                },
+                formatter_expanded_change_scope: false,
+                store_refreshed: false,
+                candidates,
+            }],
+            validators: vec![],
+            published: false,
+            publish_mode: greppy_edit::PublishMode::Atomic,
+        }
+    }
+
+    if let Some(token) = target {
+        let handle = greppy_edit::EditHandle::decode(token)?;
+        let abs = if std::path::Path::new(&handle.path).is_absolute() {
+            std::path::PathBuf::from(&handle.path)
+        } else {
+            root_path.join(&handle.path)
+        };
+        let content = std::fs::read(&abs).map_err(|source| Error::Io {
+            context: format!("read {}", abs.display()),
+            source,
+        })?;
+        return match handle.verify(&content) {
+            Ok(range) => Ok(EditTarget::Resolved {
+                rel_path: handle.path.clone(),
+                range,
+            }),
+            Err(_) => Ok(EditTarget::Refusal(Box::new(refusal(
+                root_path,
+                &handle.path,
+                greppy_edit::Status::Stale,
+                vec![],
+            )))),
+        };
+    }
+    let Some(symbol) = symbol else {
+        return Err(Error::Invalid(
+            "edit needs --symbol SYMBOL or --target HANDLE".into(),
+        ));
+    };
+    let store = open_default_store_query_writer(root)?;
+    let ids = resolve_symbol_nodes(&store, Some(symbol))?;
+    let mut nodes = Vec::new();
+    for id in &ids {
+        if let Some(node) = store.get_node(*id)? {
+            if !node.file_path.is_empty() && node.start_line >= 1 {
+                nodes.push(node);
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return Ok(EditTarget::Refusal(Box::new(refusal(
+            root_path,
+            "",
+            greppy_edit::Status::NotFound,
+            vec![],
+        ))));
+    }
+    let mut sites: Vec<(String, i64)> = nodes
+        .iter()
+        .map(|n| (n.file_path.clone(), n.start_line))
+        .collect();
+    sites.sort();
+    sites.dedup();
+    if sites.len() > 1 {
+        let candidates = nodes
+            .iter()
+            .map(|n| cert::Candidate {
+                qualified_name: n.qualified_name.clone(),
+                path: n.file_path.clone(),
+                line: n.start_line as usize,
+            })
+            .collect();
+        return Ok(EditTarget::Refusal(Box::new(refusal(
+            root_path,
+            "",
+            greppy_edit::Status::Ambiguous,
+            candidates,
+        ))));
+    }
+    let node = &nodes[0];
+    let abs = root_path.join(&node.file_path);
+    let content = std::fs::read(&abs).map_err(|source| Error::Io {
+        context: format!("read {}", abs.display()),
+        source,
+    })?;
+    let Some(span) = read_span_with_meta(
+        root_path,
+        &node.file_path,
+        node.start_line,
+        node.end_line,
+        usize::MAX,
+        false,
+    ) else {
+        return Ok(EditTarget::Refusal(Box::new(refusal(
+            root_path,
+            &node.file_path,
+            greppy_edit::Status::Stale,
+            vec![],
+        ))));
+    };
+    let range = line_range_to_bytes(&content, node.start_line as usize, span.end_line as usize);
+    Ok(EditTarget::Resolved {
+        rel_path: node.file_path.clone(),
+        range,
+    })
 }
 
 /// Edit targets may be workspace-relative or absolute.

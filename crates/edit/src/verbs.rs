@@ -180,6 +180,210 @@ pub fn replace_span(
     )
 }
 
+/// Where to place inserted text relative to a definition span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertPosition {
+    Before,
+    After,
+}
+
+/// `greppy edit replace-body --symbol SYM`: replace only the BODY of the
+/// definition at `def_range`, located via tree-sitter (`body` field of the
+/// smallest definition node covering the span). The signature stays
+/// byte-identical.
+pub fn replace_body(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    new_body: &[u8],
+    language: Language,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let Some(body_range) = body_range_within(language, &snapshot.content, def_range) else {
+        return Ok(single_op_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::NotFound,
+            0,
+            &[],
+            None,
+            None,
+            options,
+            PublishMode::Atomic,
+        ));
+    };
+    if &snapshot.content[body_range.0..body_range.1] == new_body {
+        return Ok(single_op_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::AlreadySatisfied,
+            1,
+            &[],
+            None,
+            None,
+            options,
+            PublishMode::Atomic,
+        ));
+    }
+    let ops = vec![PlannedOp {
+        id: "replace-body".into(),
+        range: body_range,
+        replacement: new_body.to_vec(),
+    }];
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        Some(language),
+        options,
+    )
+}
+
+/// `greppy edit insert-after/-before --symbol SYM`: insert a new top-level
+/// block adjacent to the definition span, separated by a blank line.
+pub fn insert_adjacent(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    text: &[u8],
+    position: InsertPosition,
+    language: Option<Language>,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let mut block = Vec::new();
+    let at = match position {
+        InsertPosition::Before => {
+            block.extend_from_slice(text);
+            if !text.ends_with(b"\n") {
+                block.push(b'\n');
+            }
+            block.push(b'\n');
+            def_range.0
+        }
+        InsertPosition::After => {
+            // insert after the trailing newline of the definition when present
+            let mut at = def_range.1;
+            if snapshot.content.get(at) == Some(&b'\n') {
+                at += 1;
+            }
+            block.push(b'\n');
+            block.extend_from_slice(text);
+            if !text.ends_with(b"\n") {
+                block.push(b'\n');
+            }
+            at
+        }
+    };
+    let ops = vec![PlannedOp {
+        id: format!(
+            "insert-{}",
+            if position == InsertPosition::Before {
+                "before"
+            } else {
+                "after"
+            }
+        ),
+        range: (at, at),
+        replacement: block,
+    }];
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        language,
+        options,
+    )
+}
+
+/// `greppy edit delete --symbol SYM`: remove the definition span including
+/// one trailing newline.
+pub fn delete_span(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    language: Option<Language>,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let mut end = def_range.1;
+    if snapshot.content.get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    // also swallow ONE preceding blank line so deletions do not accumulate
+    // double blank lines between the neighbours
+    let mut start = def_range.0;
+    if start >= 1 && snapshot.content.get(start - 1) == Some(&b'\n') {
+        if start >= 2 && snapshot.content.get(start - 2) == Some(&b'\n') {
+            start -= 1;
+        }
+    }
+    let ops = vec![PlannedOp {
+        id: "delete".into(),
+        range: (start, end),
+        replacement: Vec::new(),
+    }];
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        language,
+        options,
+    )
+}
+
+/// Locate the byte range of the `body` field of the smallest named node
+/// covering `def_range`. None when the language has no tree-sitter grammar
+/// or the node has no body field (e.g. a struct without one).
+fn body_range_within(
+    language: Language,
+    content: &[u8],
+    def_range: (usize, usize),
+) -> Option<(usize, usize)> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(def_range.0, def_range.1.saturating_sub(1))?;
+    loop {
+        if let Some(body) = node.child_by_field_name("body") {
+            // only accept a body that lies inside the addressed definition
+            if body.start_byte() >= def_range.0 && body.end_byte() <= def_range.1 {
+                // extend back to the start of the line when only indentation
+                // precedes the body: agents supply fully indented bodies, and
+                // replacing from mid-line would double the first line's indent
+                let mut start = body.start_byte();
+                let line_start = content[..start]
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                if content[line_start..start]
+                    .iter()
+                    .all(|b| b.is_ascii_whitespace())
+                {
+                    start = line_start;
+                }
+                return Some((start, body.end_byte()));
+            }
+        }
+        node = node.parent()?;
+        if node.start_byte() < def_range.0.saturating_sub(1) {
+            return None;
+        }
+    }
+}
+
 /// The shared transaction pipeline for single-file verbs.
 fn run_pipeline(
     workspace_root: &Path,
@@ -581,6 +785,68 @@ mod tests {
         assert_eq!(cert.status, Status::Stale);
         assert_eq!(cert.exit_code(), 12);
         assert_eq!(std::fs::read(&f).unwrap(), b"fn a() { changed(); }\n");
+    }
+
+    #[test]
+    fn replace_body_keeps_signature() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        let content = b"def add(a, b):\n    return a + b\n";
+        std::fs::write(&f, content).unwrap();
+        let cert = replace_body(
+            dir.path(),
+            &f,
+            (0, content.len() - 1),
+            b"    return b + a",
+            Language::Python,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert!(out.starts_with("def add(a, b):"), "{out}");
+        assert!(out.contains("return b + a"), "{out}");
+    }
+
+    #[test]
+    fn insert_after_appends_block() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        std::fs::write(&f, b"def a():\n    return 1\n").unwrap();
+        let cert = insert_adjacent(
+            dir.path(),
+            &f,
+            (0, 21),
+            b"def b():\n    return 2",
+            InsertPosition::After,
+            Some(Language::Python),
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert!(out.contains("def a():"), "{out}");
+        assert!(out.contains("\n\ndef b():"), "{out}");
+        assert_eq!(cert.operations[0].syntax.new_errors, 0);
+    }
+
+    #[test]
+    fn delete_removes_definition_and_blank_line() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        std::fs::write(&f, b"def a():\n    return 1\n\ndef b():\n    return 2\n").unwrap();
+        let cert = delete_span(
+            dir.path(),
+            &f,
+            (23, 45),
+            Some(Language::Python),
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert!(!out.contains("def b"), "{out}");
+        assert!(!out.contains("\n\n\n"), "{out}");
     }
 
     #[test]
