@@ -43,7 +43,7 @@ hash-guarded, all-or-nothing; every edit verifies its own result:
   greppy edit rename-call   --in SYM --from A --to B        retarget calls inside one definition
   greppy edit rename-symbol --symbol SYM --new-name B       rename with all references and imports
   greppy edit ensure-import --file PATH --module M --name N idempotent import (re-runs are safe)
-  greppy edit text-cas      --file PATH --old-file F --new-file F   exact-once text change (configs, docs)
+  greppy edit text-cas      --file PATH --old 'OLD' --new 'NEW'    exact-once text change (inline; --old-file/--new-file for long text, --source-file - reads stdin)
   greppy edit data set      --file c.json --path '$.a.b' --value-json V   structured config values
 
 Every edit returns a certificate: matched exactly once, hashes before/after,

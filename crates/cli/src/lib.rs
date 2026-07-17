@@ -685,11 +685,18 @@ pub enum EditCommand {
         #[arg(long)]
         file: String,
         /// File containing the exact old text.
-        #[arg(long = "old-file")]
-        old_file: String,
+        #[arg(long = "old-file", conflicts_with = "old")]
+        old_file: Option<String>,
         /// File containing the replacement text.
-        #[arg(long = "new-file")]
-        new_file: String,
+        #[arg(long = "new-file", conflicts_with = "new")]
+        new_file: Option<String>,
+        /// Exact old text inline (for short replacements; K3/M3 agents
+        /// reach for this form first and only then create temp files).
+        #[arg(long)]
+        old: Option<String>,
+        /// Replacement text inline.
+        #[arg(long)]
+        new: Option<String>,
         /// Exact number of occurrences OLD must have.
         #[arg(long, default_value_t = 1)]
         expect: usize,
@@ -6183,6 +6190,27 @@ fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (u
 
 /// `greppy edit`: dispatch to the transactional verbs; print the
 /// certificate; map its status to the registered exit code.
+/// Read an edit source argument: a file path, or `-` for stdin (agents
+/// naturally try heredocs; K3 reasoning trace 2026-07-17: "Need pass new
+/// source via stdin?").
+fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
+    if source_file == "-" {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|source| Error::Io {
+                context: "read edit source from stdin".into(),
+                source,
+            })?;
+        return Ok(buf);
+    }
+    std::fs::read(source_file).map_err(|source| Error::Io {
+        context: format!("read {source_file}"),
+        source,
+    })
+}
+
 fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
     let root_path = resolve_root(root)?;
     #[derive(PartialEq)]
@@ -6199,18 +6227,30 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             file,
             old_file,
             new_file,
+            old: old_inline,
+            new: new_inline,
             expect,
             dry_run,
             report,
         } => {
-            let old = std::fs::read(&old_file).map_err(|source| Error::Io {
-                context: format!("read {old_file}"),
-                source,
-            })?;
-            let new = std::fs::read(&new_file).map_err(|source| Error::Io {
-                context: format!("read {new_file}"),
-                source,
-            })?;
+            fn text_arg(
+                inline: Option<String>,
+                path: Option<String>,
+                which: &str,
+            ) -> Result<Vec<u8>> {
+                match (inline, path) {
+                    (Some(s), None) => Ok(s.into_bytes()),
+                    (None, Some(p)) => std::fs::read(&p).map_err(|source| Error::Io {
+                        context: format!("read {p}"),
+                        source,
+                    }),
+                    _ => Err(Error::Invalid(format!(
+                        "text-cas needs exactly one of --{which} STR or --{which}-file FILE"
+                    ))),
+                }
+            }
+            let old = text_arg(old_inline, old_file, "old")?;
+            let new = text_arg(new_inline, new_file, "new")?;
             let target = resolve_edit_file(&root_path, &file);
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
@@ -6229,10 +6269,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             dry_run,
             report,
         } => {
-            let new_body = std::fs::read(&source_file).map_err(|source| Error::Io {
-                context: format!("read {source_file}"),
-                source,
-            })?;
+            let new_body = read_source_arg(&source_file)?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved { rel_path, range } => {
@@ -6271,10 +6308,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             } else {
                 greppy_edit::verbs::InsertPosition::After
             };
-            let text = std::fs::read(&source_file).map_err(|source| Error::Io {
-                context: format!("read {source_file}"),
-                source,
-            })?;
+            let text = read_source_arg(&source_file)?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved { rel_path, range } => {
@@ -6739,10 +6773,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             report,
         } => {
             let handle = greppy_edit::EditHandle::decode(&target)?;
-            let new = std::fs::read(&source_file).map_err(|source| Error::Io {
-                context: format!("read {source_file}"),
-                source,
-            })?;
+            let new = read_source_arg(&source_file)?;
             let language = greppy_edit::language_for_path(std::path::Path::new(&handle.path));
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,

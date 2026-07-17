@@ -55,7 +55,7 @@ greppy edit ensure-method   --symbol CLASS --spec method.json
 greppy edit ensure-argument --symbol Q.SYM --call NAME --arg SPEC
 greppy edit ensure-annotation --symbol Q.SYM --annotation A
 greppy edit remove-if-present --symbol Q.SYM | --target HANDLE
-greppy edit text-cas        --file PATH --old-file F --new-file F [--expect 1]
+greppy edit text-cas        --file PATH (--old S --new S | --old-file F --new-file F) [--expect 1]
 greppy edit regex-cas       --file PATH --pattern RE --replacement S --expect N
 greppy edit data set|ensure --file PATH --path JSONPATH --value-json V
 greppy edit apply           --plan plan.json [--publish atomic|journal|patch|shadow-worktree]
@@ -65,6 +65,12 @@ greppy edit recover         [--workspace ROOT]      (journal crash recovery)
 Common flags: `--json` (default when stdout is not a tty), `--report FILE`,
 `--diff FILE`, `--dry-run`, `--at PATH:LINE` (symbol disambiguation),
 `--expect N|exactly-one|zero`.
+
+(Revision 2026-07-17, from K3 reasoning traces: `text-cas` accepts inline
+`--old`/`--new` strings — agents reach for that form first and only then
+create temp files — and every `--source-file` accepts `-` for stdin so
+heredocs work. Pure surface addition; semantics, hashes, and exit codes
+unchanged.)
 
 ## Exit codes (binding)
 
@@ -112,3 +118,16 @@ Measured by `bench/agent_coding` on the paired task set, third arm
 Prompt set v3 (`bench/agent_coding/prompts/greppy_system_v3.md`,
 `mscc_skill_v3.md`) is pinned by hash in every run manifest; v2 remains
 pinned for all v0.2.x evidence.
+
+Arm tool surface (revision 2026-07-17, before any measured gate-v4 run):
+the `greppy-edit` arm runs pi with `--tools bash` — no builtin
+read/edit/write. Rationale from trace forensics: the displacement prompt
+("there is no apply_patch") is visibly false while a builtin `edit` tool
+sits in the palette, and the agent then ignores greppy entirely (0 greppy
+calls in the greppy-arm serde trace); the MSCC panel shows 78-87% greppy
+adoption exactly where the displacement claim is true. Tool surfaces are
+part of the arm definition, recorded per arm in the manifest
+(`tools_per_arm`), and identical across both arms' *capabilities*: bash
+can still read and write files, so the arm loses no ability, only the
+contradiction. Explorer and greppy arms keep `bash,read,edit,write`.
+Thresholds are unchanged.
