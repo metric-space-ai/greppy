@@ -4263,6 +4263,46 @@ fn freshness_serve_decision(
     freshness_serve_decision_with_policy(store, root, project, true, true)
 }
 
+/// Heal a reindexable-stale store in-band: rebuild the graph AND (when the
+/// store carried them) the embeddings + summaries at a fresh generation, then
+/// re-open so the caller serves the current codebase. The edit loop mutates
+/// files constantly — through greppy's own edits AND external means (git apply,
+/// bash, another tool) — and every query command must reflect those changes or
+/// the agent gets stale/empty answers and abandons greppy (forensics
+/// 2026-07-18). Genuinely un-reindexable states (cold/failed) are left for the
+/// stale gate to refuse. Best-effort: a failed reindex leaves the old store,
+/// and the gate then decides.
+fn maybe_reindex_stale(store: &mut greppy_store::Store, root: Option<&str>) -> Result<()> {
+    let project = project_for(root)?;
+    if freshness_is_reindexable_stale(store, root, &project) {
+        try_auto_reindex_inline(root);
+        if let Ok(fresh) = open_default_store_query_writer(root) {
+            *store = fresh;
+        }
+    }
+    Ok(())
+}
+
+/// The index is stale AND the drift is one an inline reindex can heal
+/// (workspace/content drift or a scope-stable version bump), not a cold or
+/// broken store. Used by `read` to reindex in-band before serving rather than
+/// refuse and leave the edit-loop agent empty-handed.
+fn freshness_is_reindexable_stale(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+) -> bool {
+    let freshness = nav_freshness_json(store, root, project);
+    if freshness_json_is_fresh(&freshness) {
+        return false;
+    }
+    let state = freshness
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    freshness_state_can_trigger_reindex(state)
+}
+
 /// `allow_auto_reindex = false` for a surface that cannot guarantee its
 /// generation-scoped embeddings can be rebuilt in the same snapshot.
 /// True when the indexer-version drift is a pure VERSION bump (same
@@ -5621,7 +5661,8 @@ fn dispatch_impact(
             root,
         );
     }
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let query_symbol = symbol.unwrap_or("");
     let mut graph_gate_extra = serde_json::json!({
@@ -6052,8 +6093,19 @@ fn dispatch_read(
     root: Option<&str>,
 ) -> Result<i32> {
     const READ_JSON_SCHEMA_VERSION: &str = "greppy.read.v1";
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
+    // Read is the workhorse of the edit loop, and the loop mutates files
+    // constantly (test setup, the agent's own edits). Refusing on a stale
+    // index — returning empty until a background reindex catches up — left
+    // the agent with nothing and it degraded to bash (forensics 2026-07-18:
+    // a real flask task took 123 turns, greppy all but unused). Instead,
+    // heal in-band: a reindexable stale index is rebuilt BLOCKING and served
+    // fresh on this same call. `read` verifies every span against the live
+    // file anyway, so a brief blocking reindex is strictly better than an
+    // empty answer. Only genuinely un-reindexable states (cold/failed) still
+    // refuse.
+    maybe_reindex_stale(&mut store, root)?;
     if let Some(code) = graph_stale_gate(
         &store,
         root,
@@ -7163,7 +7215,8 @@ fn resolve_edit_file(root_path: &std::path::Path, file: &str) -> std::path::Path
 }
 
 fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let query_symbol = symbol.unwrap_or("");
     if let Some(code) = graph_stale_gate(
@@ -7506,7 +7559,8 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     if id.is_empty() {
         return Err(Error::Invalid("expand requires an id".into()));
     }
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let Some(pack) = store.get_expand_pack(id)? else {
         println!("expand: id not found or expired: {id}");
         return Ok(1);
@@ -8416,7 +8470,8 @@ fn dispatch_who_calls(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -8726,7 +8781,8 @@ fn dispatch_callees(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -8896,7 +8952,8 @@ fn dispatch_find_usages(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -9123,7 +9180,8 @@ fn dispatch_references(
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
@@ -11818,7 +11876,8 @@ fn dispatch_semantic(
         return Err(Error::Invalid("semantic-search requires a query".into()));
     }
 
-    let store = open_default_store_query_writer(root)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     // Stale/unknown snapshots are never served. Semantic search is always
     // vector-backed on current main, so auto-refresh is allowed only when the
