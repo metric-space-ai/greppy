@@ -466,7 +466,14 @@ def run_tests(repo: str, toolchain: str, test_files: list[str]) -> dict[str, boo
         for tf in data.get("testResults", []):
             test_name = tf.get("name", "")
             if test_name and os.path.isabs(test_name):
-                test_name = os.path.relpath(test_name, repo)
+                # realpath BOTH sides first: on macOS the checkout lives under
+                # /var/... (a symlink to /private/var/...) while vitest reports a
+                # resolved /private/var/... path, so a naive relpath emits a
+                # ../../.. cascade and no id ever matches the stored repo-relative
+                # ones (every ts task then scored 0/N).
+                test_name = os.path.relpath(
+                    os.path.realpath(test_name), os.path.realpath(repo)
+                )
             for a in tf.get("assertionResults", []):
                 key = f"{test_name}::{a.get('fullName') or a.get('title')}"
                 out[key] = a.get("status") == "passed"
