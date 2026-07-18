@@ -34,7 +34,19 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
 
-<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. This recording illustrates the workflow only; the pre-registered, publishable release evidence is described below.</sub>
+<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. This recording illustrates the workflow only; the measured release evidence is below.</sub>
+
+---
+
+## Measured result: no trade-off, across four models
+
+Across four coding models spanning three providers — **MiniMax-M3, GLM-5.2, Qwen3.6-27B, and Kimi-K3** — pairing a coding agent with greppy strictly dominates the lexical (`grep` + file-read) baseline on the cost–correctness frontier: **more tasks answered correctly at every tool-call budget (+6 to +50 percentage points)**, and the lexical agent's best answer quality reached at **37–80 % lower billed API cost**.
+
+<img src="docs/assets/cost-success-frontier.png" width="100%" alt="Cost–success frontier across four models: pi+greppy dominates the lexical baseline in every panel."/>
+
+<sub>Success rate over mean billed API cost per attempted task (log scale), four completed model panels. In every panel the greppy surface (orange square / green diamond) sits above and to the left of the lexical baseline (grey circle / blue triangle) — more correct at lower cost. The 2×2 factorial isolates the source: an explicit *minimum-sufficient-context* **instruction** adds nothing measurable — it tracks the no-instruction arm and only adds cost (up to +\$21 per 1,000 tasks on Kimi-K3). **The structured tool surface, not prompt engineering, carries the advantage.**</sub>
+
+> 📄 **Full paper:** [*The Minimum Sufficient Code Context Problem — Complexity, Discovery Overhead, and Approximation in Coding Agents*](docs/paper/mscc-greppy-paper.pdf) — the graph formulation of MSCC, its NP-completeness, the lexical-navigation lower bounds, the no-trade-off theorem, and the full four-model empirical evidence.
 
 ---
 
@@ -60,7 +72,7 @@ accelerated backend. Runtime selection is automatic and can be made explicit
 with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`.
 
 The first structured query builds its local workspace index. There is no
-current prebuilt production package while `v0.2.0` is completing the release
+current prebuilt production package while `v0.2.1` is completing the release
 gates listed below. Older archives remain available only as explicitly marked
 legacy previews and are not the current production distribution. Build the
 current `main` revision from source for evaluation. Do not rename or install the
@@ -220,7 +232,7 @@ Task banks, prompts, binaries, runtime versions, setup commands, and repository
 commits are hashed into their manifests. Arm order is deterministically
 balanced per task and its ordering scheme is versioned in the manifest.
 
-`v0.2.0` may claim an efficiency win only when both published, mechanically
+`v0.2.1` may claim an efficiency win only when both published, mechanically
 graded runs for the exact release commit prove all of the following:
 
 - at least as many observed paired correctness wins as losses, plus no exact
@@ -232,7 +244,7 @@ graded runs for the exact release commit prove all of the following:
   binary hash, per-task rows, grading, aggregate, and forensics are published;
 - raw agent traces remain private and are not release artifacts.
 
-Historical charts and illustrative recordings are not treated as `v0.2.0`
+Historical charts and illustrative recordings are not treated as `v0.2.1`
 evidence until current navigation and coding-outcome runs pass those gates.
 Index construction is outside measured agent sessions because it is reusable;
 release evidence reports its CPU/GPU wall time and resource cost separately and
@@ -295,7 +307,7 @@ age eviction but not the independent size quota.
 
 ## Status
 
-The current `main` branch is qualifying for the gated `v0.2.0` release. No
+The current `main` branch is qualifying for the gated `v0.2.1` release. No
 official release is cut until the packaged artifacts, native inference,
 daemon-fault tests, summary-quality corpus, agent benchmark, hardware matrix,
 signing, and notarization gates pass.
