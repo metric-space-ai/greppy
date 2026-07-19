@@ -52,42 +52,48 @@ Across four coding models spanning three providers — **MiniMax-M3, GLM-5.2, Qw
 
 ## Setup — two steps
 
-**1. Install the binary.**
+**1. Install greppy — the models ship inside the binary, either way.**
+
+There are two supported ways to install, and *both* give you a binary with both
+models compiled in. There is no third option that produces a model-less greppy.
+
+*Prebuilt binary.* Download the archive for your platform from the
+[releases page](https://github.com/metric-space-ai/greppy/releases)
+(`greppy-macos-arm64.tar.gz`, `greppy-linux-x86_64.tar.gz`,
+`greppy-windows-x86_64.zip`), unpack it, and put `greppy` on your `PATH`. The
+models are already baked in — nothing else to fetch.
+
+*Build from source.* One command fetches the SHA-256-pinned model assets and
+compiles them into the binary:
 
 ```bash
-# Portable CPU build (both models are always embedded)
-./tools/fetch_model_assets.sh   # sha256-pinned model weights from this repo's model releases
-cargo build --release --bin greppy
+./tools/fetch_model_assets.sh && cargo build --release --bin greppy
 sudo install -m 0755 target/release/greppy /usr/local/bin/greppy
 ```
 
-Every build embeds EmbeddingGemma and Qwen3.5 plus their tokenizers. No model is
-downloaded at runtime and neither model can be disabled. The model weights are
-hosted as GitHub release assets and pinned by SHA-256 in
-[`crates/cli/assets/MODEL_ASSETS.json`](crates/cli/assets/MODEL_ASSETS.json);
-`tools/fetch_model_assets.sh` materializes and verifies them before Cargo runs,
-and the build rejects missing or incorrect assets. CPU inference is always available; build with `--features
-metal` on Apple Silicon or `--features cuda` on Linux/NVIDIA to include the
-accelerated backend. Runtime selection is automatic and can be made explicit
-with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`.
+The build **refuses to produce a model-less binary**: if either model asset is
+missing or its SHA-256 does not match, `cargo build` fails with a precise error
+([`crates/cli/build.rs`](crates/cli/build.rs)) instead of shipping a greppy
+without its models — a `cargo build` that succeeds has the models embedded. The
+fetch step is idempotent (it verifies files already present and re-downloads
+only on mismatch), so the command is safe to re-run. Add `--features metal`
+(Apple Silicon) or `--features cuda` (Linux/NVIDIA) for the accelerated backend;
+CPU inference always works, and the device is selected automatically (override
+with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`).
 
-The first structured query builds its local workspace index. There is no
-current prebuilt production package while `v0.2.1` is completing the release
-gates listed below. Older archives remain available only as explicitly marked
-legacy previews and are not the current production distribution. Build the
-current `main` revision from source for evaluation. Do not rename or install the
-binary as `grep`.
+Every greppy binary embeds EmbeddingGemma (300M) and Qwen3.5 (0.8B) plus their
+tokenizers, pinned by SHA-256 in
+[`crates/cli/assets/MODEL_ASSETS.json`](crates/cli/assets/MODEL_ASSETS.json) and
+hosted as GitHub release assets — kept out of the git tree, never out of the
+binary. Nothing is downloaded at runtime and neither model can be disabled. Do
+not rename or install the binary as `grep`.
 
-The deterministic graph is published first. Code-span embeddings are a one-time
-local computation for each source generation and are reused by later agent
-sessions. On a large repository they continue in a generation-bound background
-job, so graph navigation remains available while Greppy trades local compute
-once for lower repeated cloud-model search and context cost. `semantic-search`
-never exposes partial vectors: until that generation is complete it returns
-`status: "indexing"` in JSON (exit 75), the selected CPU/Metal/CUDA backend,
-exact span progress, and an estimated completion time. Automatic selection
-prefers a compatible Metal or CUDA device with sufficient memory and otherwise
-uses the CPU fallback.
+The first structured query builds the local workspace index once per source
+generation and reuses it across later agent sessions. `semantic-search` never
+exposes partial vectors: until that generation completes it returns
+`status: "indexing"` in JSON (exit 75) with the active CPU/Metal/CUDA backend,
+exact span progress, and an estimated completion time, while graph navigation
+stays available throughout.
 
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
