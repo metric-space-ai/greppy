@@ -217,10 +217,15 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 27)
+        self.assertEqual(len(names), 24)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
+        # Release scope (SECURITY.md): the Windows runtime footprint is measured
+        # out of band (hours-long CPU index on the hosted runner), and the
+        # edit-regime coding benchmark publishes per commit but does not gate.
+        self.assertNotIn("runtime-footprint-windows-x86_64-cpu.json", names)
+        self.assertNotIn("greppy-coding-benchmark.tar.gz", names)
 
     def test_release_workflow_keeps_hardening_gates(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
@@ -235,7 +240,9 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('gh release create "$GITHUB_REF_NAME"', workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
-        self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 2)
+        # One Unix footprint invocation remains; the Windows measurement is out
+        # of band (see the release-scope comment in release.yml).
+        self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 1)
         self.assertIn('if [ "$device" = cpu ]', workflow)
 
 
