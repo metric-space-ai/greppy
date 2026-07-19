@@ -81,11 +81,16 @@ only on mismatch), so the command is safe to re-run. Add `--features metal`
 CPU inference always works, and the device is selected automatically (override
 with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`).
 
-Every greppy binary embeds EmbeddingGemma (300M) and Qwen3.5 (0.8B) plus their
-tokenizers, pinned by SHA-256 in
+Every greppy binary embeds EmbeddingGemma (300M, Google's quantized model) and a
+Qwen3.5 (0.8B) that greppy fine-tuned in-house to write the navigation hints, plus
+their tokenizers, pinned by SHA-256 in
 [`crates/cli/assets/MODEL_ASSETS.json`](crates/cli/assets/MODEL_ASSETS.json) and
-hosted as GitHub release assets — kept out of the git tree, never out of the
-binary. Nothing is downloaded at runtime and neither model can be disabled. Do
+hosted as public, ungated Hugging Face repos
+([EmbeddingGemma](https://huggingface.co/metricspace/embeddinggemma-300m-q4k),
+[greppy-Qwen3.5](https://huggingface.co/metricspace/greppy-qwen35-mtp-q4km)) —
+kept out of the git tree, never out of the binary. `fetch_model_assets.sh` pulls
+them (no token needed) and the build refuses any file whose SHA-256 does not
+match. Nothing is downloaded at runtime and neither model can be disabled. Do
 not rename or install the binary as `grep`.
 
 The first structured query builds the local workspace index once per source
@@ -288,7 +293,7 @@ protocol and first model panel, with the remaining panels in progress.
 
 - **Standard grep.** Any invocation that isn't one of the extra commands runs real `grep` and returns its output and exit code unchanged.
 - **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USES`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`find-usages`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches — collapsing several grep+read rounds into one call.
-- **Native semantic navigation.** `semantic-search` uses Google's embedded **EmbeddingGemma** to find code by meaning. Embedded **Qwen3.5-0.8B Q4_K_M with MTP** adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
+- **Native semantic navigation.** `semantic-search` uses Google's embedded **EmbeddingGemma** to find code by meaning. A **Qwen3.5-0.8B (Q4_K_M, MTP) that greppy fine-tuned in-house** — trained by distillation specifically to write code-navigation hints — adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
 - **Bounded warm daemons.** The embedding and summary engines use separate local daemons. A used model remains resident for five idle minutes; the process exits after 30 idle minutes. Failed inference never removes deterministic source or graph output.
 - **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
 

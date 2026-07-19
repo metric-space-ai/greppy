@@ -65,7 +65,7 @@ bench/agent_efficiency/realcorpus/*/
 /crates/embeddinggemma/
 *.log
 
-# Model assets are fetched from the pinned GitHub release (see
+# Model assets are fetched from Hugging Face (public, ungated; see
 # crates/cli/assets/MODEL_ASSETS.json + tools/fetch_model_assets.sh);
 # only the manifest and *.sha256 sidecars are tracked.
 crates/cli/assets/qwen35-0.8b-mtp-q4km/*.gguf
