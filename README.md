@@ -42,7 +42,7 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 Across four coding models spanning three providers — **MiniMax-M3, GLM-5.2, Qwen3.6-27B, and Kimi-K3** — pairing a coding agent with greppy strictly dominates the lexical (`grep` + file-read) baseline on the cost–correctness frontier: **more tasks answered correctly at every tool-call budget (+6 to +50 percentage points)**, and the lexical agent's best answer quality reached at **37–80 % lower billed API cost**.
 
-<img src="docs/assets/cost-success-frontier.png" width="100%" alt="Cost–success frontier across four models: pi+greppy dominates the lexical baseline in every panel."/>
+<img src="docs/assets/cost-success-frontier-4models.png" width="100%" alt="Cost–success frontier across four models: pi+greppy dominates the lexical baseline in every panel."/>
 
 <sub>Success rate over mean billed API cost per 1,000 attempted tasks (linear axis; the three cheaper models share $0–24, Kimi-K3's list-price costs use $0–76), four completed model panels. In every panel the greppy surface (blue) sits above and to the left of the lexical baseline (green) — more correct at lower cost. The 2×2 factorial isolates the source: an explicit *minimum-sufficient-context* **instruction** adds nothing measurable — it tracks the no-instruction arm and only adds cost (up to +\$21 per 1,000 tasks on Kimi-K3). **The structured tool surface, not prompt engineering, carries the advantage.**</sub>
 
