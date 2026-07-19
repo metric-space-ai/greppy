@@ -318,11 +318,12 @@ official release is cut until the packaged artifacts, native inference,
 daemon-fault tests, summary-quality corpus, agent benchmark, hardware matrix,
 signing, and notarization gates pass.
 
-- **Production-certified parser set:** Rust, Python, Java, JavaScript,
-  TypeScript, and Go.
-- **Additional parser coverage:** many more languages can be indexed and
-  searched, but are not claimed to have the same graph completeness until they
-  receive language-specific fixtures and real-repository acceptance tests.
+- **Language parsers — 18 bundled:** Bash, C, C#, C++, Go, Java, JavaScript,
+  Kotlin, Lua, PHP, Python, R, Ruby, Rust, Scala, Swift, TypeScript, and Zig.
+  All of them index and answer symbol-definition and text search.
+- **Graph-completeness certified:** Rust, Python, Java, JavaScript, TypeScript,
+  and Go, by language fixtures and real-repository acceptance tests; the other
+  twelve reach the same certification once they have that coverage.
 - **Supported release targets:** macOS Apple Silicon with Metal, Linux x86_64
   with CPU and NVIDIA CUDA, and Windows x86_64 CPU with named-pipe daemons.
 - **Known boundaries:** reflection, runtime dependency injection, generated
