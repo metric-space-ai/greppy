@@ -17,17 +17,21 @@ silently switching devices.
 
 ## Language support
 
-Greppy bundles tree-sitter parsers for 18 languages — Bash, C, C#, C++, Go,
-Java, JavaScript, Kotlin, Lua, PHP, Python, R, Ruby, Rust, Scala, Swift,
-TypeScript, and Zig — and all of them index and answer symbol-definition and
-text search.
+Greppy bundles tree-sitter parsers for **more than 60 languages**. Every one of
+them indexes symbols and answers definition and text search, and most of them —
+every procedural language, from the mainstream set through Ruby, C++, C#,
+Kotlin, Swift, Elixir, Scala, and dozens more — also extract call, usage, and
+import graph relations, so `who-calls`, `callees`, `find-usages`, and `impact`
+work out of the box (e.g. `greppy who-calls` resolves callers in an Elixir file
+with no extra setup).
 
-Six of them — Rust, Python, Java, JavaScript, TypeScript, and Go — are
-additionally production-certified for full graph completeness (callers,
-callees, usages, impact) by language fixtures and real-repository acceptance
-tests. The other twelve provide the same indexing and definition/text search;
-graph completeness for a language is certified once it reaches that same test
-coverage.
+Six languages — **Rust, Python, Java, JavaScript, TypeScript, and Go** — are
+additionally **acceptance-certified for graph completeness**: language fixtures
+and real-repository tests guarantee their caller/callee/usage/impact relations
+are correct and complete. Every other language extracts the same relations
+without that formal completeness guarantee — treat its graph as strong
+evidence, still verified against source. Purely declarative formats (JSON, YAML,
+TOML, Markdown, …) provide symbols and text search but no call graph, by nature.
 
 Static analysis can miss reflection, runtime dependency injection, generated
 code, macro expansion, monkeypatching, and dynamic dispatch. Greppy fails closed

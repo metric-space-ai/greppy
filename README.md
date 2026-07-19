@@ -319,12 +319,15 @@ official release is cut until the packaged artifacts, native inference,
 daemon-fault tests, summary-quality corpus, agent benchmark, hardware matrix,
 signing, and notarization gates pass.
 
-- **Language parsers — 18 bundled:** Bash, C, C#, C++, Go, Java, JavaScript,
-  Kotlin, Lua, PHP, Python, R, Ruby, Rust, Scala, Swift, TypeScript, and Zig.
-  All of them index and answer symbol-definition and text search.
+- **Language parsers — 60+ bundled:** every language indexes symbols and answers
+  definition and text search; most (every procedural language — Ruby, C++, C#,
+  Kotlin, Swift, Elixir, and dozens more, not only the six below) also extract
+  call, usage, and import relations, so `who-calls` / `callees` / `impact` work
+  out of the box.
 - **Graph-completeness certified:** Rust, Python, Java, JavaScript, TypeScript,
-  and Go, by language fixtures and real-repository acceptance tests; the other
-  twelve reach the same certification once they have that coverage.
+  and Go — fixtures and real-repository tests guarantee complete caller/callee/
+  usage/impact; other languages extract the same relations without that formal
+  guarantee.
 - **Supported release targets:** macOS Apple Silicon with Metal, Linux x86_64
   with CPU and NVIDIA CUDA, and Windows x86_64 CPU with named-pipe daemons.
 - **Known boundaries:** reflection, runtime dependency injection, generated
