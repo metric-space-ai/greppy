@@ -100,11 +100,23 @@ exposes partial vectors: until that generation completes it returns
 exact span progress, and an estimated completion time, while graph navigation
 stays available throughout.
 
-**2. Tell your agent the extra commands exist.** Delegate it — in your agent's
-chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
+**2. Paste the canonical prompt.** That is the entire integration: **no MCP
+server, no per-agent configuration, no API keys, no cloud account.** Any agent
+that can run shell commands — Claude Code, Cursor, Codex CLI, Gemini CLI, or
+your own — gets the full surface from this one block, and the index builds
+itself on the first query. Delegate it — in your agent's chat, say
+**`install https://github.com/metric-space-ai/greppy/`** — or
 paste the snippet below into the file your agent reads for project instructions
 (`CLAUDE.md`, `AGENTS.md`, `.cursor/rules`, `.windsurfrules`, or the system
 prompt).
+
+### The canonical agent prompt — use it verbatim
+
+This exact block is what every published benchmark and the paper's four-model
+evidence measured. Use it as-is. Do **not** write your own routing rules,
+tool-selection heuristics, or a "when to use which command" policy around it —
+the 2×2 factorial shows added method instructions contribute nothing measurable
+on top of this surface; they only add prompt cost.
 
 ```text
 This project has `greppy`, a local code-navigation tool over a symbol graph and
