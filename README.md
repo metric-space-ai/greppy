@@ -130,6 +130,19 @@ embeddings are still building, `semantic-search --json` returns
 `status: "indexing"` with progress and an ETA (exit 75) — retry it later or
 poll `greppy index status`; graph commands work immediately.
 
+Measured footprint (serde, 339 files / 4,573 symbols, hosted CI runners —
+numbers from the `runtime-footprint-*.json` assets on the release):
+
+| | |
+|---|---|
+| Release archive | 735–825 MB (models included) |
+| Installed binary | ~1 GB |
+| Graph index build | ~2 s (Apple Silicon), ~4 s (4-core Linux) — queries work immediately |
+| Semantic embeddings | background, one-time per repo: ~24 min (M-series CPU), ~63 min (4-core Linux CPU) |
+| Warm query, Metal | `brief` 0.7 s · `semantic-search` 1.5 s |
+| Warm query, CPU only | `brief` 3.6–7 s · `semantic-search` 6–16 s |
+| Per-repo store | ~32 MB; extracted model cache 814 MB, 10 GiB quota with GC |
+
 **2. Add the prompt to your agent.** That's the whole integration — no MCP
 server, no per-agent config, no API keys. Works in any agent that can run
 shell commands (Claude Code, Cursor, Codex CLI, Gemini CLI, your own).
@@ -340,6 +353,14 @@ greppy cache clear --all --yes   # explicit destructive operation
 
 The default workspace-cache TTL is 14 days. `GREPPY_STORE_TTL_DAYS=0` disables
 age eviction but not the independent size quota.
+
+Uninstall — removes all caches, extracted models, and the binary; idle daemons
+exit on their own within 30 minutes:
+
+```bash
+greppy cache clear --all --yes
+rm "$HOME/.local/bin/greppy"     # or wherever you installed it
+```
 
 ---
 
