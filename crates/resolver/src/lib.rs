@@ -65,7 +65,7 @@ const TYPE_LABELS: [&str; 7] = [
 /// symbol a reference could plausibly name. `Import`/`Call`/`Module`
 /// synthetic-ish labels are deliberately excluded so a usage resolves
 /// to a real definition, not another reference node.
-const DEF_LABELS: [&str; 9] = [
+const DEF_LABELS: [&str; 11] = [
     "Function",
     "Method",
     "Class",
@@ -75,6 +75,8 @@ const DEF_LABELS: [&str; 9] = [
     "Struct",
     "Trait",
     "TypeAlias",
+    "Variable",
+    "Field",
 ];
 
 /// Outcome of resolving one callee name against the project graph.
@@ -305,15 +307,16 @@ fn file_stem_matches(file_path: &str, module: &str) -> bool {
 /// symbol name. Exposed so the indexer and resolver agree on what an
 /// `IMPORTS` edge may point at.
 ///
-/// This is [`DEF_LABELS`] MINUS `Method`: an `import`/`use`/`from … import`
-/// names a top-level symbol — a type, a free function, an enum — never a
-/// method. Keeping `Method` here made every import ambiguous in languages
+/// This is the importable subset of [`DEF_LABELS`]: an `import`/`use`/`from …
+/// import` names a top-level type, free function, or enum — never a method,
+/// field, or variable. Keeping `Method` here made every import ambiguous in languages
 /// whose constructor shares the type's name (Java `class Checksum { Checksum()
 /// … }` yields both a `Class` and a `Method` named `Checksum` in the SAME
 /// file, so the name-tie could not be broken by module segment and every such
 /// import was dropped — java_medium IMPORTS resolved 0 of 152). Value
 /// references (`USES`/`USAGE`) DO include `Method` (you can reference a
-/// method), which is why they use [`DEF_LABELS`] and imports use this subset.
+/// method, field, or variable), which is why they use [`DEF_LABELS`] and
+/// imports use this subset.
 pub const IMPORTABLE_LABELS: [&str; 8] = [
     "Function",
     "Class",
@@ -640,6 +643,21 @@ mod tests {
         let cfg = insert_node_named(&mut s, "p", "Struct", "src/config.rs", "Config");
         let r = resolve_use(&s, "p", &referrer, "Config").unwrap();
         assert_eq!(r, CallResolution::Unique(cfg.id));
+    }
+
+    #[test]
+    fn resolve_use_resolves_named_values_and_fields() {
+        for label in ["Variable", "Field"] {
+            let mut s = store_with_project("p");
+            let referrer = insert_fn(&mut s, "p", "Function", "src/lib.cs", "caller");
+            let value = insert_node_named(&mut s, "p", label, "src/values.cs", "Seed");
+            let r = resolve_use(&s, "p", &referrer, "Seed").unwrap();
+            assert_eq!(
+                r,
+                CallResolution::Unique(value.id),
+                "USES must resolve a {label} target"
+            );
+        }
     }
 
     #[test]

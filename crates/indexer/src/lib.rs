@@ -1109,8 +1109,8 @@ const TYPE_LABELS: [&str; 7] = [
 ];
 
 /// Labels a `USES` edge may resolve to (mirrors the resolver's
-/// `DEF_LABELS`, which equals `IMPORTABLE_LABELS`).
-const DEF_LABELS: [&str; 9] = [
+/// `DEF_LABELS`), including named values and fields.
+const DEF_LABELS: [&str; 11] = [
     "Function",
     "Method",
     "Class",
@@ -1120,6 +1120,8 @@ const DEF_LABELS: [&str; 9] = [
     "Struct",
     "Trait",
     "TypeAlias",
+    "Variable",
+    "Field",
 ];
 
 /// Labels a `USAGE` edge may resolve to. The usage pass resolves a

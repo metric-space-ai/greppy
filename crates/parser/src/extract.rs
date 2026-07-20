@@ -4908,8 +4908,9 @@ fn c_cpp_is_definition_name(node: Node<'_>) -> bool {
 //   * every owned `method_declaration` / `constructor_declaration` yields a
 //     `DEFINES_METHOD` edge from its enclosing type node to the method node.
 //
-// C# emits NO `USAGE` edges (its edge schema has no USAGE row), so — unlike
-// Java — no usage pass is layered on.
+// A final reference pass classifies user-defined type positions as `TYPE_REF`
+// and value reads as `USES`. The indexer resolves both conservatively by name;
+// their persisted graph label remains the unified `USAGE` contract.
 fn extract_csharp(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
     let queries = crate::query::cached_query_set(&Language::CSharp)
         .map_err(|e| greppy_core::Error::Parse(format!("compile csharp queries: {e}")))?;
@@ -4922,6 +4923,7 @@ fn extract_csharp(source: &[u8], file_path: &str) -> greppy_core::Result<Extract
     )?;
     csharp_relabel_types_as_class(&mut result);
     csharp_member_pass(source, file_path, &mut result)?;
+    csharp_reference_pass(source, file_path, &mut result)?;
     Ok(result)
 }
 
@@ -5174,6 +5176,209 @@ fn first_child_of_kind_csharp<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>
     (0..node.named_child_count())
         .filter_map(|i| node.named_child(i))
         .find(|c| c.kind() == kind)
+}
+
+/// Supplementary C# reference pass. Identifiers in a `type:` / `returns:`
+/// subtree become `TYPE_REF`; other value reads become `USES`. Declaration
+/// names, namespace/import segments, and invocation callees/arguments are
+/// excluded because their dedicated passes own those syntax positions.
+fn csharp_reference_pass(
+    source: &[u8],
+    file_path: &str,
+    result: &mut ExtractionResult,
+) -> greppy_core::Result<()> {
+    let tree = crate::parse(Language::CSharp, source)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                stack.push(child);
+            }
+        }
+        if node.kind() != "identifier"
+            || csharp_is_declaration_name(node)
+            || csharp_inside_any(node, &["using_directive"])
+            || csharp_is_namespace_name(node)
+        {
+            continue;
+        }
+        let name = node_text(source, node);
+        if name.is_empty() || csharp_is_reference_keyword(name) {
+            continue;
+        }
+        let source_qname = csharp_reference_source_qname(source, node, file_path);
+        if csharp_is_type_reference(node) {
+            result.edges.push(ExtractedEdge {
+                edge_type: "TYPE_REF".into(),
+                source_qualified_name: source_qname,
+                target_qualified_name: format!("{file_path}::Class::{name}"),
+                file_path: file_path.to_string(),
+                line: node.start_position().row as u32 + 1,
+                properties: serde_json::json!({ "type_name": name }),
+            });
+        } else if !csharp_inside_any(node, &["invocation_expression"]) {
+            result.edges.push(ExtractedEdge {
+                edge_type: "USES".into(),
+                source_qualified_name: source_qname,
+                target_qualified_name: format!("{file_path}::__ref__::{name}"),
+                file_path: file_path.to_string(),
+                line: node.start_position().row as u32 + 1,
+                properties: serde_json::json!({ "ref_name": name }),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `node` names a declaration rather than referring to one. C# also
+/// uses `name:` for member-access selectors, so this must be restricted to
+/// declaration node kinds instead of applying the generic field-name check.
+fn csharp_is_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.kind(),
+        "class_declaration"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "record_declaration"
+            | "enum_declaration"
+            | "enum_member_declaration"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "property_declaration"
+            | "variable_declarator"
+            | "parameter"
+            | "type_parameter"
+    ) {
+        return false;
+    }
+    parent.child_by_field_name("name").is_some_and(|name| {
+        name.start_byte() == node.start_byte() && name.end_byte() == node.end_byte()
+    })
+}
+
+/// Whether `node` is contained by the `name:` field of a namespace declaration.
+/// The namespace body is deliberately not suppressed.
+fn csharp_is_namespace_name(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_declaration" {
+            return parent.child_by_field_name("name").is_some_and(|name| {
+                name.start_byte() <= node.start_byte() && name.end_byte() >= node.end_byte()
+            });
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// Whether an ancestor within the bounded syntax context has one of `kinds`.
+fn csharp_inside_any(node: Node<'_>, kinds: &[&str]) -> bool {
+    let mut current = node.parent();
+    let mut depth = 0;
+    while let Some(parent) = current {
+        if depth >= 12 {
+            break;
+        }
+        if kinds.contains(&parent.kind()) {
+            return true;
+        }
+        current = parent.parent();
+        depth += 1;
+    }
+    false
+}
+
+/// A C# type reference is any identifier contained by a parent's `type:` or
+/// method `returns:` field. This covers parameters, locals, fields/properties,
+/// casts, object creation, and method return types, including wrapped generic
+/// and qualified type nodes.
+fn csharp_is_type_reference(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    let mut depth = 0;
+    while let Some(parent) = current {
+        if depth >= 12 {
+            break;
+        }
+        for field in ["type", "returns"] {
+            if parent.child_by_field_name(field).is_some_and(|field_node| {
+                field_node.start_byte() <= node.start_byte()
+                    && field_node.end_byte() >= node.end_byte()
+            }) {
+                return true;
+            }
+        }
+        if matches!(
+            parent.kind(),
+            "block" | "declaration_list" | "compilation_unit"
+        ) {
+            break;
+        }
+        current = parent.parent();
+        depth += 1;
+    }
+    false
+}
+
+/// Reconstruct the spec-emitted qname of the nearest C# method/constructor;
+/// references outside a callable attach to the per-file Module node.
+fn csharp_reference_source_qname(source: &[u8], node: Node<'_>, file_path: &str) -> String {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                let name = node_text(source, name_node);
+                let mut owner = parent.parent();
+                while let Some(candidate) = owner {
+                    if csharp_type_label(candidate.kind()).is_some() {
+                        if let Some(owner_name) = candidate.child_by_field_name("name") {
+                            return format!(
+                                "{file_path}::{}::{name}",
+                                node_text(source, owner_name)
+                            );
+                        }
+                    }
+                    owner = candidate.parent();
+                }
+                return format!("{file_path}::Method::{name}");
+            }
+        }
+        current = parent.parent();
+    }
+    format!("{file_path}::__file__")
+}
+
+fn csharp_is_reference_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "this"
+            | "base"
+            | "true"
+            | "false"
+            | "null"
+            | "var"
+            | "void"
+            | "object"
+            | "string"
+            | "bool"
+            | "byte"
+            | "sbyte"
+            | "short"
+            | "ushort"
+            | "int"
+            | "uint"
+            | "long"
+            | "ulong"
+            | "float"
+            | "double"
+            | "decimal"
+            | "char"
+    )
 }
 
 fn extract_php(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
@@ -17745,6 +17950,54 @@ class Svc {
         assert!(
             dm.contains(&("s.cs::Class::Svc".into(), "s.cs::Svc::Svc".into())),
             "constructor DEFINES_METHOD: {dm:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_classifies_type_refs_and_qualified_enum_uses() {
+        const SRC: &str = r#"
+using Payload = Fixture.Types.Payload;
+using HelperCode = Fixture.Helpers.HelperCode;
+namespace Fixture.App {
+    class Flow {
+        Payload caller(Payload input) {
+            int seed = (int)HelperCode.Seed;
+            return input;
+        }
+    }
+}
+"#;
+        let r = cs(SRC, "Main.cs");
+        let refs: Vec<(&str, &str, &str)> = r
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let name = edge
+                    .properties
+                    .get(if edge.edge_type == "TYPE_REF" {
+                        "type_name"
+                    } else {
+                        "ref_name"
+                    })?
+                    .as_str()?;
+                Some((
+                    edge.edge_type.as_str(),
+                    edge.source_qualified_name.as_str(),
+                    name,
+                ))
+            })
+            .collect();
+        assert!(
+            refs.contains(&("TYPE_REF", "Main.cs::Flow::caller", "Payload")),
+            "return/parameter Payload must be a TYPE_REF from caller: {refs:?}"
+        );
+        assert!(
+            refs.contains(&("USES", "Main.cs::Flow::caller", "Seed")),
+            "HelperCode.Seed must classify the enum member read as USES: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|(_, source, _)| *source == "Main.cs::__file__"),
+            "using aliases must not leak into the reference pass: {refs:?}"
         );
     }
 

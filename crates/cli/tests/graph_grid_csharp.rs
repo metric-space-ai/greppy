@@ -257,7 +257,6 @@ fn graph_grid_csharp_find_usages_covers_call_and_import() {
 }
 
 #[test]
-#[ignore = "csharp graph gap: cross-file TYPE_REF for return types not resolved (only CALLS+IMPORTS)"]
 fn graph_grid_csharp_find_usages_type_reference() {
     let (repo, store) = index_fixture("usages-type-ref");
     let (code, out, err) = run(&["find-usages", "Payload"], &repo, &store);
@@ -498,7 +497,6 @@ namespace Fixture.App
 }
 
 #[test]
-#[ignore = "csharp graph gap: qualified enum-constant usage not resolved cross-file"]
 fn graph_grid_csharp_declarative_or_edge_case() {
     let (repo, store) = index_fixture("enum-constant-usage");
     // C#-specific edge case: an enum member is a named constant declaration,
