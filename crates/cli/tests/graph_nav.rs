@@ -475,10 +475,10 @@ fn direct_navigation_json_reports_exact_counts() {
     }
 }
 
-/// A refresh may start for small drift, but the triggering request must not
-/// observe the old graph generation.
+/// Small drift heals in-band (1b7135b): the triggering request reindexes and
+/// serves the POST-drift truth with `fresh: true` — never the old generation.
 #[test]
-fn direct_navigation_json_refuses_while_small_stale_drift_refreshes() {
+fn direct_navigation_json_heals_small_stale_drift_in_band() {
     let (repo, store) = index_fixture("nav-json-stale");
     std::fs::write(
         repo.join("src/lib.rs"),
@@ -490,6 +490,10 @@ fn caller() {
     helper::do_it();
 }
 
+fn caller_added_after_index() {
+    helper::do_it();
+}
+
 fn render(w: types::Widget) -> u32 { w.w + 1 }
 "#,
     )
@@ -497,27 +501,26 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
 
     let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
     assert_eq!(
-        code, 75,
-        "refreshing navigation must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "JSON freshness refusal must stay on stdout; stderr={err:?}"
+        code, 0,
+        "healable small drift must serve fresh results; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid nav json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "who-calls");
     assert_eq!(
-        v["status"], "skipped_stale_index",
-        "stale navigation must be skipped: {v:?}"
+        v["fresh"], true,
+        "the healed response must prove freshness: {v:?}"
     );
-    assert_eq!(
-        v["fresh"], false,
-        "the triggering request must not claim freshness: {v:?}"
-    );
-    assert_eq!(v["freshness"]["state"], "refreshing");
     let hits = v["hits"].as_array().expect("hits array");
-    assert!(hits.is_empty(), "stale graph rows must not escape: {v:?}");
+    assert!(
+        hits.iter().any(|h| {
+            h["qualified_name"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("caller_added_after_index")
+        }),
+        "healed graph must contain the post-drift caller: {v:?}"
+    );
 }
 
 /// Large drift starts a background refresh and fails closed. No command may
@@ -540,10 +543,15 @@ fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn graph_commands_refuse_rows_on_large_stale_drift() {
+fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
     let (repo, store) = large_stale_graph_fixture("graph-stale-gate-brief");
 
-    let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
+    let (code, out, err) = run_with_env(
+        &["brief", "do_it"],
+        &repo,
+        &store,
+        &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
+    );
     assert_eq!(
         code, 75,
         "refreshing brief must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
@@ -580,7 +588,8 @@ fn graph_commands_refuse_rows_on_large_stale_drift() {
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
         let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
-        let (code, out, err) = run(&args, &repo, &store);
+        let (code, out, err) =
+            run_with_env(&args, &repo, &store, &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")]);
         assert_eq!(
             code, 75,
             "refreshing {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"

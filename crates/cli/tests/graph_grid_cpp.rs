@@ -407,7 +407,6 @@ fn graph_grid_cpp_graph_survives_reindex() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "blocked by tracked freshness regression on dev-0.3.0 HEAD (stale drift serves rows instead of exit 75) — re-enable with that fix"]
 fn graph_grid_cpp_stale_edit_detected() {
     let (repo, store) = index_fixture("stale-edit");
     // Drift the index: edit the helper header (renames do_it -> do_it_renamed),
@@ -431,24 +430,21 @@ inline int do_it_renamed() {
     .unwrap();
 
     let (code, out, err) = run(&["who-calls", "do_it_renamed", "--json"], &repo, &store);
-    // EX_TEMPFAIL (75) when refresh is in flight and the request cannot be served.
+    // Heal-in-band contract (1b7135b): a healable drift is reindexed in-band
+    // and served fresh — the renamed symbol resolves against the NEW graph.
     assert_eq!(
-        code, 75,
-        "stale-edit must trigger freshness refusal (EX_TEMPFAIL); stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "JSON freshness refusal must stay on stdout; stderr={err:?}"
+        code, 0,
+        "healable stale edit must be healed in-band and served; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(
-        v["status"], "skipped_stale_index",
-        "stale who-calls must be skipped with skipped_stale_index; got: {v:?}"
+        v["fresh"], true,
+        "the healed response must prove freshness; got: {v:?}"
     );
     assert_eq!(
-        v["fresh"], false,
-        "the triggering request must not claim freshness; got: {v:?}"
+        v["symbol_found"], true,
+        "post-drift symbol must resolve against the healed graph; got: {v:?}"
     );
 }
 
