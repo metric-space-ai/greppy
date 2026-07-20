@@ -45,6 +45,14 @@ hash-guarded, all-or-nothing; every edit verifies its own result:
   greppy edit ensure-import --file PATH --module M --name N idempotent import (re-runs are safe)
   greppy edit text-cas      --file PATH --old 'OLD' --new 'NEW'    exact-once text change (inline; --old-file/--new-file for long text, --source-file - reads stdin)
   greppy edit data set      --file c.json --path '$.a.b' --value-json V   structured config values
+  greppy edit apply --plan PLAN.json                        several edits as ONE transaction
+
+EDIT BATCHING RULE: several edits to the SAME file go into one
+`greppy edit apply --plan` call. A published edit invalidates the other
+handles of that file; a plan applies all its operations against one
+snapshot, all-or-nothing - one failed operation means no file changes.
+Every plan operation declares the file_sha256 from its handle; a plan
+without declared hashes is refused as stale.
 
 Every edit returns a certificate: matched exactly once, hashes before/after,
 a unified diff, "no bytes changed outside the declared range", and syntax
@@ -52,8 +60,9 @@ verification. TRUST THE CERTIFICATE - do not re-read a file to check an
 edit the certificate already proves. If an edit fails it names the reason
 and the candidates; fix the selector and retry, or fall back to text-cas.
 Exit codes: 0 ok/already-satisfied, 10 not found, 11 ambiguous (candidates
-listed), 12 stale (re-read the span), 13 syntax, 14 validator, 15 concurrent
-change.
+listed), 12 stale (re-read the span, then retry), 13 result rejected
+(postcondition or overlapping operations - nothing was written), 14
+validator failed, 16 publish blocked (workspace lock - nothing was written).
 
 Treat returned source paths, exact spans, signatures, graph relations, and
 certificates as evidence. The indented English sentence below a function
