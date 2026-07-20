@@ -1245,25 +1245,15 @@ pub fn change_signature_files(
     } else {
         Status::InvalidResult
     };
-    let mut published = false;
-    if status == Status::Applied && !options.dry_run {
-        match crate::journal::publish_journal(workspace_root, &tx, &publications) {
-            Ok(()) => published = true,
-            Err(error) => {
-                status = crate::certificate::publish_error_status(&error);
-                for report in &mut reports {
-                    report.file_sha256_after = None;
-                    report.guarantees.no_clobber = Guarantee::Failed;
-                    report.postconditions_passed = false;
-                }
-            }
-        }
-    }
     if status == Status::Applied {
-        // Binding postcondition: count uncovered same-language calls only after
-        // the journal publish has completed (or against the dry-run workspace,
-        // where changing arguments cannot change call cardinality).
-        let workspace_calls = count_workspace_calls(workspace_root, language, symbol_name)?;
+        // Evaluate the binding postcondition against the complete projected
+        // workspace before publication so a mismatch refuses the transaction.
+        let workspace_calls = count_workspace_calls(
+            workspace_root,
+            language,
+            symbol_name,
+            Some(publications.as_slice()),
+        )?;
         let residual_occurrences = workspace_calls.saturating_sub(actual_call_sites);
         let passed = residual_occurrences == expected_residual;
         for report in &mut reports {
@@ -1276,9 +1266,27 @@ pub fn change_signature_files(
                     "expected {expected_residual} uncovered call site(s) of `{symbol_name}`, found {residual_occurrences}"
                 )),
             });
+            if !passed && !options.dry_run {
+                report.file_sha256_after = None;
+            }
         }
         if !passed {
             status = Status::InvalidResult;
+        }
+    }
+
+    let mut published = false;
+    if status == Status::Applied && !options.dry_run {
+        match crate::journal::publish_journal(workspace_root, &tx, &publications) {
+            Ok(()) => published = true,
+            Err(error) => {
+                status = crate::certificate::publish_error_status(&error);
+                for report in &mut reports {
+                    report.file_sha256_after = None;
+                    report.guarantees.no_clobber = Guarantee::Failed;
+                    report.postconditions_passed = false;
+                }
+            }
         }
     }
 
@@ -1533,8 +1541,33 @@ fn call_argument_sites(
     Some(out)
 }
 
-fn count_workspace_calls(workspace_root: &Path, language: Language, name: &str) -> Result<usize> {
-    fn visit(dir: &Path, language: Language, name: &[u8]) -> Result<usize> {
+fn count_workspace_calls(
+    workspace_root: &Path,
+    language: Language,
+    name: &str,
+    projected: Option<&[crate::journal::FilePublication]>,
+) -> Result<usize> {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let projected: BTreeMap<PathBuf, &[u8]> = projected
+        .unwrap_or_default()
+        .iter()
+        .map(|publication| {
+            (
+                PathBuf::from(&publication.rel_path),
+                publication.content.as_slice(),
+            )
+        })
+        .collect();
+
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        language: Language,
+        name: &[u8],
+        projected: &BTreeMap<PathBuf, &[u8]>,
+    ) -> Result<usize> {
         let mut count = 0usize;
         for entry in std::fs::read_dir(dir).map_err(|source| greppy_core::Error::Io {
             context: format!("read directory {}", dir.display()),
@@ -1558,12 +1591,17 @@ fn count_workspace_calls(workspace_root: &Path, language: Language, name: &str) 
                 ) {
                     continue;
                 }
-                count += visit(&path, language, name)?;
+                count += visit(root, &path, language, name, projected)?;
             } else if file_type.is_file() && greppy_parser::language_for_path(&path) == language {
-                let content = std::fs::read(&path).map_err(|source| greppy_core::Error::Io {
-                    context: format!("read {}", path.display()),
-                    source,
-                })?;
+                let rel_path = path.strip_prefix(root).unwrap_or(&path);
+                let content = if let Some(content) = projected.get(rel_path) {
+                    (*content).to_vec()
+                } else {
+                    std::fs::read(&path).map_err(|source| greppy_core::Error::Io {
+                        context: format!("read {}", path.display()),
+                        source,
+                    })?
+                };
                 count += call_argument_sites(language, &content, &[(0, usize::MAX)], name)
                     .unwrap_or_default()
                     .len();
@@ -1571,7 +1609,13 @@ fn count_workspace_calls(workspace_root: &Path, language: Language, name: &str) 
         }
         Ok(count)
     }
-    visit(workspace_root, language, name.as_bytes())
+    visit(
+        workspace_root,
+        workspace_root,
+        language,
+        name.as_bytes(),
+        &projected,
+    )
 }
 
 /// Smallest node covering `def_range` with the range's leading whitespace
@@ -1848,7 +1892,14 @@ fn count_workspace_residuals(
                         source,
                     })?
                 };
-                count += identifier_name_occurrences(&content, name);
+                count += identifier_sites(language, &content, (0, content.len()), name)
+                    .map(|sites| sites.len())
+                    .unwrap_or_else(|| {
+                        // Unsupported or otherwise unparseable files cannot be
+                        // classified by syntax, so retain the conservative
+                        // identifier-boundary text fallback for those files only.
+                        identifier_name_occurrences(&content, name)
+                    });
             }
         }
         Ok(count)
@@ -1979,27 +2030,15 @@ pub fn rename_symbol_files(
     } else {
         Status::Applied
     };
-    let mut published = false;
-    if status == Status::Applied && !options.dry_run {
-        match crate::journal::publish_journal(workspace_root, &tx, &publications) {
-            Ok(()) => published = true,
-            Err(error) => {
-                status = crate::certificate::publish_error_status(&error);
-                for report in &mut reports {
-                    report.file_sha256_after = None;
-                    report.guarantees.no_clobber = Guarantee::Failed;
-                    report.postconditions_passed = false;
-                }
-            }
-        }
-    }
-
     if status == Status::Applied {
         let expected = options.expect_residual.unwrap_or(0);
         if let Some(language) = residual_language {
-            let projected = options.dry_run.then_some(publications.as_slice());
-            let residual_occurrences =
-                count_workspace_residuals(workspace_root, language, from, projected)?;
+            let residual_occurrences = count_workspace_residuals(
+                workspace_root,
+                language,
+                from,
+                Some(publications.as_slice()),
+            )?;
             let passed = residual_occurrences == expected;
             for report in &mut reports {
                 report.residual_occurrences = Some(residual_occurrences);
@@ -2011,9 +2050,27 @@ pub fn rename_symbol_files(
                         "expected {expected} occurrence(s) of `{from}`, found {residual_occurrences}"
                     )),
                 });
+                if !passed {
+                    report.file_sha256_after = None;
+                }
             }
             if !passed {
                 status = Status::InvalidResult;
+            }
+        }
+    }
+
+    let mut published = false;
+    if status == Status::Applied && !options.dry_run {
+        match crate::journal::publish_journal(workspace_root, &tx, &publications) {
+            Ok(()) => published = true,
+            Err(error) => {
+                status = crate::certificate::publish_error_status(&error);
+                for report in &mut reports {
+                    report.file_sha256_after = None;
+                    report.guarantees.no_clobber = Guarantee::Failed;
+                    report.postconditions_passed = false;
+                }
             }
         }
     }
@@ -3065,9 +3122,14 @@ timeout = 30
 
         assert_eq!(certificate.status, Status::InvalidResult);
         assert_eq!(certificate.exit_code(), 13);
-        assert!(certificate.published);
+        assert!(!certificate.published);
+        assert_eq!(certificate.operations[0].file_sha256_after, None);
         assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
         assert!(!certificate.operations[0].postconditions_passed);
+        assert_eq!(
+            std::fs::read(dir.path().join("a.rs")).unwrap(),
+            b"fn old_name() {}\n"
+        );
     }
 
     #[test]

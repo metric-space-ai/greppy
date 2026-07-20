@@ -10,6 +10,7 @@ use greppy_edit::verbs::{
     RenameFileScope, SignatureDefinition, VerbOptions,
 };
 use greppy_edit::{EditHandle, Language, Status};
+use sha2::{Digest, Sha256};
 
 fn workspace() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -29,6 +30,29 @@ fn whole_file_scope(name: &str) -> RenameFileScope {
         rel_path: name.into(),
         spans: vec![(0, usize::MAX)],
     }
+}
+
+fn workspace_hashes(root: &Path) -> BTreeMap<PathBuf, String> {
+    fn visit(root: &Path, dir: &Path, hashes: &mut BTreeMap<PathBuf, String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, hashes);
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(std::fs::read(&path).unwrap());
+                hashes.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    format!("{:x}", hasher.finalize()),
+                );
+            }
+        }
+    }
+
+    let mut hashes = BTreeMap::new();
+    visit(root, root, &mut hashes);
+    hashes
 }
 
 #[cfg(unix)]
@@ -56,7 +80,10 @@ fn rename_symbol_rolls_back_all_three_files_when_file_two_publish_fails() {
         ],
         "old_name",
         "new_name",
-        &VerbOptions::default(),
+        &VerbOptions {
+            expect_residual: Some(1),
+            ..VerbOptions::default()
+        },
     )
     .unwrap();
 
@@ -73,10 +100,42 @@ fn rename_symbol_rolls_back_all_three_files_when_file_two_publish_fails() {
 }
 
 #[test]
-fn rename_symbol_default_zero_residual_fires_after_publish() {
+fn rename_symbol_ignores_doc_comments_and_string_literals_in_residual_count() {
+    let ws = workspace();
+    write(
+        ws.path(),
+        "definition.rs",
+        b"/// Calls foo() when ready.\npub fn foo() -> &'static str { \"foo\" }\nfn caller() { foo(); }\n",
+    );
+
+    let certificate = rename_symbol_files(
+        ws.path(),
+        &[whole_file_scope("definition.rs")],
+        "foo",
+        "bar",
+        &VerbOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(certificate.status, Status::Applied, "{certificate:?}");
+    assert!(certificate.published);
+    assert_eq!(certificate.operations[0].residual_occurrences, Some(0));
+    assert!(certificate.operations[0].postconditions_passed);
+    let content = std::fs::read_to_string(ws.path().join("definition.rs")).unwrap();
+    assert!(content.contains("/// Calls foo() when ready."), "{content}");
+    assert!(
+        content.contains("pub fn bar() -> &'static str { \"foo\" }"),
+        "{content}"
+    );
+    assert!(content.contains("fn caller() { bar(); }"), "{content}");
+}
+
+#[test]
+fn rename_symbol_residual_mismatch_refuses_before_publish() {
     let ws = workspace();
     write(ws.path(), "definition.rs", b"pub fn old_name() {}\n");
     write(ws.path(), "missed.rs", b"pub fn caller() { old_name(); }\n");
+    let hashes_before = workspace_hashes(ws.path());
 
     let certificate = rename_symbol_files(
         ws.path(),
@@ -89,12 +148,14 @@ fn rename_symbol_default_zero_residual_fires_after_publish() {
 
     assert_eq!(certificate.status, Status::InvalidResult);
     assert_eq!(certificate.exit_code(), 13);
-    assert!(certificate.published);
+    assert!(!certificate.published);
     assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
     assert!(!certificate.operations[0].postconditions_passed);
-    assert!(std::fs::read_to_string(ws.path().join("definition.rs"))
-        .unwrap()
-        .contains("new_name"));
+    assert!(certificate
+        .operations
+        .iter()
+        .all(|operation| operation.file_sha256_after.is_none()));
+    assert_eq!(workspace_hashes(ws.path()), hashes_before);
 }
 
 #[test]
@@ -192,12 +253,13 @@ fn change_signature_cardinality_mismatch_changes_nothing() {
 }
 
 #[test]
-fn change_signature_residual_fails_loudly_after_publish() {
+fn change_signature_residual_mismatch_refuses_before_publish() {
     let ws = workspace();
     let definition = b"def compute(a, b):\n    return a + b\n";
     write(ws.path(), "definition.py", definition);
     write(ws.path(), "one.py", b"value = compute(x, y)\n");
     write(ws.path(), "missed.py", b"other = compute(1, 2)\n");
+    let hashes_before = workspace_hashes(ws.path());
     let spec = ChangeSignatureSpec {
         old_parameters: "(a, b)".into(),
         new_parameters: "(b, a)".into(),
@@ -220,17 +282,18 @@ fn change_signature_residual_fails_loudly_after_publish() {
     .unwrap();
 
     assert_eq!(certificate.status, Status::InvalidResult);
+    assert_eq!(certificate.exit_code(), 13);
     assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
-    assert!(certificate.published);
-    assert!(std::fs::read_to_string(ws.path().join("definition.py"))
-        .unwrap()
-        .contains("compute(b, a)"));
-    assert!(std::fs::read_to_string(ws.path().join("one.py"))
-        .unwrap()
-        .contains("compute(y, x)"));
-    assert!(std::fs::read_to_string(ws.path().join("missed.py"))
-        .unwrap()
-        .contains("compute(1, 2)"));
+    assert!(!certificate.published);
+    assert!(certificate
+        .operations
+        .iter()
+        .all(|operation| operation.file_sha256_after.is_none()));
+    assert!(certificate
+        .operations
+        .iter()
+        .all(|operation| !operation.postconditions_passed));
+    assert_eq!(workspace_hashes(ws.path()), hashes_before);
 }
 
 fn assert_only_target_changed(before: &[u8], after: &[u8], old: &[u8], new: &[u8]) {
@@ -248,8 +311,10 @@ fn assert_only_target_changed(before: &[u8], after: &[u8], old: &[u8], new: &[u8
 
 #[test]
 fn data_edits_preserve_json_yaml_and_toml_bytes_outside_the_target() {
+    type Fixture<'a> = (&'a str, &'a [u8], &'a str, &'a [u8], &'a [u8]);
+
     let ws = workspace();
-    let fixtures: [(&str, &[u8], &str, &[u8], &[u8]); 3] = [
+    let fixtures: [Fixture<'_>; 3] = [
         (
             "config.json",
             b"{\n  \"server\": {\n    \"port\": 9000,\n    \"host\": \"x\"\n  }\n}\n",
