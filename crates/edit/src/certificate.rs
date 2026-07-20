@@ -134,6 +134,8 @@ pub struct OperationReport {
     pub syntax: SyntaxDelta,
     pub postconditions_passed: bool,
     pub postconditions: Vec<PostconditionResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_occurrences: Option<usize>,
     pub guarantees: Guarantees,
     pub formatter_expanded_change_scope: bool,
     pub store_refreshed: bool,
@@ -182,6 +184,36 @@ impl Certificate {
     pub fn exit_code(&self) -> i32 {
         self.status.exit_code()
     }
+
+    /// Render the stdout form of a certificate. The schema and field names are
+    /// unchanged, but evidence that is expensive in an agent context window is
+    /// omitted; `--report` continues to use the full `Serialize` form.
+    pub fn to_compact_json_pretty(&self) -> serde_json::Result<String> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(root) = value.as_object_mut() {
+            root.insert("exit_code".into(), serde_json::json!(self.exit_code()));
+            root.remove("validators");
+            if let Some(operations) = root.get_mut("operations").and_then(|v| v.as_array_mut()) {
+                for operation in operations {
+                    if let Some(operation) = operation.as_object_mut() {
+                        operation.remove("node_before");
+                        operation.remove("node_after");
+                        if let Some(postconditions) = operation
+                            .get_mut("postconditions")
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            for postcondition in postconditions {
+                                if let Some(postcondition) = postcondition.as_object_mut() {
+                                    postcondition.remove("detail");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::to_string_pretty(&value)
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +237,87 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Status::AlreadySatisfied).unwrap(),
             "\"already-satisfied\""
+        );
+    }
+
+    #[test]
+    fn compact_stdout_omits_heavy_evidence_full_report_retains_it() {
+        let certificate = Certificate {
+            schema_version: CERTIFICATE_SCHEMA.into(),
+            status: Status::Applied,
+            transaction_id: "ge-test".into(),
+            workspace: WorkspaceReport {
+                root: "/tmp/ws".into(),
+                git_head_before: None,
+                git_head_after: None,
+            },
+            operations: vec![OperationReport {
+                id: "rename".into(),
+                file: "src/lib.rs".into(),
+                selector_engine: SelectorEngine::Symbol,
+                selector_class: SelectorClass::Resolved,
+                scope_matches: 1,
+                target_matches: 2,
+                file_sha256_before: "before".into(),
+                file_sha256_after: Some("after".into()),
+                target_sha256_before: "target-before".into(),
+                target_sha256_after: Some("target-after".into()),
+                outside_declared_ranges_unchanged: true,
+                changed_byte_ranges: vec![(4, 9)],
+                node_before: Some("fn old() {}".into()),
+                node_after: Some("fn new() {}".into()),
+                unified_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n".into()),
+                syntax: SyntaxDelta {
+                    errors_before: 0,
+                    errors_after: 0,
+                    new_errors: 0,
+                    new_missing_nodes: 0,
+                },
+                postconditions_passed: false,
+                postconditions: vec![PostconditionResult {
+                    name: "residual-occurrences".into(),
+                    passed: false,
+                    detail: Some("expected 0, found 1".into()),
+                }],
+                residual_occurrences: Some(1),
+                guarantees: Guarantees {
+                    addressed_range: Guarantee::Proved,
+                    no_clobber: Guarantee::Proved,
+                    byte_isolation: Guarantee::Proved,
+                    syntax: Guarantee::Proved,
+                    validators: Guarantee::Failed,
+                },
+                formatter_expanded_change_scope: false,
+                store_refreshed: false,
+                candidates: vec![],
+            }],
+            validators: vec![ValidatorReport {
+                argv: vec!["cargo".into(), "test".into()],
+                exit_code: 1,
+                timed_out: false,
+            }],
+            published: true,
+            publish_mode: PublishMode::Atomic,
+        };
+
+        let compact: serde_json::Value =
+            serde_json::from_str(&certificate.to_compact_json_pretty().unwrap()).unwrap();
+        let full = serde_json::to_value(&certificate).unwrap();
+        assert_eq!(compact["exit_code"], 0);
+        assert_eq!(compact["operations"][0]["target_matches"], 2);
+        assert_eq!(compact["operations"][0]["changed_byte_ranges"][0][0], 4);
+        assert!(compact["operations"][0].get("node_before").is_none());
+        assert!(compact["operations"][0].get("node_after").is_none());
+        assert!(compact.get("validators").is_none());
+        assert!(compact["operations"][0]["postconditions"][0]
+            .get("detail")
+            .is_none());
+        assert_eq!(full["operations"][0]["node_before"], "fn old() {}");
+        assert_eq!(full["operations"][0]["node_after"], "fn new() {}");
+        assert_eq!(full["validators"][0]["argv"][0], "cargo");
+        assert_eq!(
+            full["operations"][0]["postconditions"][0]["detail"],
+            "expected 0, found 1"
         );
     }
 }

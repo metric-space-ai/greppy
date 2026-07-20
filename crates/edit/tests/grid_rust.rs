@@ -11,10 +11,8 @@
 //!     NotFound (10) — see NOTES-grid-rust.md for the 10-vs-11 mapping.
 //!     The byte-splice verbs return `Err` from `apply_in_memory` when
 //!     the resolved span is out of range.
-//!   - **stale**: file mutated between read and apply. The contract
-//!     binds exit 12 (Stale) to CAS-protected operations; these four
-//!     byte-range single-op verbs have no CAS today. Cells are
-//!     `#[ignore]`d and documented in NOTES-grid-rust.md.
+//!   - **stale**: file mutated between resolution and apply. Resolution-time
+//!     file and target hashes bind the call; every verb refuses with exit 12.
 //!   - **syntax-breaking**: InvalidResult, exit 13, file byte-identical
 //!     to the pre-call content.
 //!
@@ -26,7 +24,7 @@
 use greppy_edit::verbs::{
     delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions,
 };
-use greppy_edit::{Certificate, Language, Status};
+use greppy_edit::{Certificate, EditHandle, Language, Status};
 
 // ------------------------------------------------------------------ helpers
 
@@ -38,6 +36,27 @@ fn write(ws: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf
     let p = ws.join(name);
     std::fs::write(&p, content).unwrap();
     p
+}
+
+fn planned_options(
+    workspace: &std::path::Path,
+    content: &[u8],
+    range: (usize, usize),
+) -> VerbOptions {
+    let handle = EditHandle::for_range(
+        workspace,
+        std::path::Path::new("m.rs"),
+        content,
+        range.0,
+        range.1,
+    )
+    .unwrap();
+    VerbOptions {
+        planned_file_sha256: Some(handle.file_sha256),
+        planned_target_sha256: Some(handle.target_sha256),
+        planned_target_range: Some(range),
+        ..Default::default()
+    }
 }
 
 /// Byte range covering `fn NAME(` through the matching closing brace
@@ -294,16 +313,16 @@ fn grid_rust_delete_ambiguous() {
 }
 
 // =======================================================================
-// STALE — #[ignore]d, see NOTES-grid-rust.md
+// STALE — resolution hashes captured before the concurrent mutation
 // =======================================================================
 
 #[test]
-#[ignore = "replace_body has no CAS; see NOTES-grid-rust.md (stale cell defect)"]
 fn grid_rust_replace_body_stale() {
     let ws = workspace();
     let content = b"fn foo() -> u32 {\n    1\n}\n";
     let file = write(ws.path(), "m.rs", content);
     let planned_range = fn_def_range(content, "foo");
+    let options = planned_options(ws.path(), content, planned_range);
     let mutated = b"fn foo() -> u32 {\n    999\n}\nfn other() {}\n";
     std::fs::write(&file, mutated).unwrap();
 
@@ -313,7 +332,7 @@ fn grid_rust_replace_body_stale() {
         planned_range,
         b"{\n    99\n}",
         Language::Rust,
-        &VerbOptions::default(),
+        &options,
     )
     .unwrap();
 
@@ -324,12 +343,12 @@ fn grid_rust_replace_body_stale() {
 }
 
 #[test]
-#[ignore = "insert_adjacent has no CAS; see NOTES-grid-rust.md (stale cell defect)"]
 fn grid_rust_insert_after_stale() {
     let ws = workspace();
     let content = b"fn foo() {}\n";
     let file = write(ws.path(), "m.rs", content);
     let planned_range = (0usize, 11usize);
+    let options = planned_options(ws.path(), content, planned_range);
     let mutated = b"fn foo() { /* user edit between plan and apply */ }\n";
     std::fs::write(&file, mutated).unwrap();
 
@@ -340,7 +359,7 @@ fn grid_rust_insert_after_stale() {
         b"fn bar() {}",
         InsertPosition::After,
         Some(Language::Rust),
-        &VerbOptions::default(),
+        &options,
     )
     .unwrap();
 
@@ -351,12 +370,12 @@ fn grid_rust_insert_after_stale() {
 }
 
 #[test]
-#[ignore = "insert_adjacent has no CAS; see NOTES-grid-rust.md (stale cell defect)"]
 fn grid_rust_insert_before_stale() {
     let ws = workspace();
     let content = b"fn foo() {}\n";
     let file = write(ws.path(), "m.rs", content);
     let planned_range = (0usize, 11usize);
+    let options = planned_options(ws.path(), content, planned_range);
     let mutated = b"fn foo() { /* user edit between plan and apply */ }\n";
     std::fs::write(&file, mutated).unwrap();
 
@@ -367,7 +386,7 @@ fn grid_rust_insert_before_stale() {
         b"fn bar() {}",
         InsertPosition::Before,
         Some(Language::Rust),
-        &VerbOptions::default(),
+        &options,
     )
     .unwrap();
 
@@ -378,12 +397,12 @@ fn grid_rust_insert_before_stale() {
 }
 
 #[test]
-#[ignore = "delete_span has no CAS; see NOTES-grid-rust.md (stale cell defect)"]
 fn grid_rust_delete_stale() {
     let ws = workspace();
     let content = b"fn foo() {}\nfn bar() {}\n";
     let file = write(ws.path(), "m.rs", content);
     let planned_range = (0usize, 11usize);
+    let options = planned_options(ws.path(), content, planned_range);
     let mutated = b"fn foo() { /* user edit between plan and apply */ }\nfn bar() {}\n";
     std::fs::write(&file, mutated).unwrap();
 
@@ -392,7 +411,7 @@ fn grid_rust_delete_stale() {
         &file,
         planned_range,
         Some(Language::Rust),
-        &VerbOptions::default(),
+        &options,
     )
     .unwrap();
 

@@ -282,6 +282,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             syntax,
             postconditions_passed: syntax_ok && isolation_ok,
             postconditions: vec![],
+            residual_occurrences: None,
             guarantees: Guarantees {
                 addressed_range: Guarantee::Proved,
                 no_clobber: Guarantee::Proved,

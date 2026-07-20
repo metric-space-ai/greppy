@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use crate::certificate::{
-    Candidate, Certificate, Guarantee, Guarantees, OperationReport, PublishMode, SelectorClass,
-    SelectorEngine, Status, SyntaxDelta, WorkspaceReport,
+    Candidate, Certificate, Guarantee, Guarantees, OperationReport, PostconditionResult, PublishMode,
+    SelectorClass, SelectorEngine, Status, SyntaxDelta, WorkspaceReport,
 };
 use crate::handle::EditHandle;
 use crate::hash::sha256_hex;
@@ -38,6 +38,14 @@ pub struct VerbOptions {
     /// Emit the unified diff inline in the certificate.
     pub with_diff: bool,
     pub format: FormatPolicy,
+    /// File hash captured when a symbol or handle was resolved.
+    pub planned_file_sha256: Option<String>,
+    /// Hash of the resolved target span captured at the same time.
+    pub planned_target_sha256: Option<String>,
+    /// Original coordinates of the resolved target span.
+    pub planned_target_range: Option<(usize, usize)>,
+    /// Accepted old-name occurrences after a workspace rename.
+    pub expect_residual: Option<usize>,
 }
 
 impl Default for VerbOptions {
@@ -46,8 +54,52 @@ impl Default for VerbOptions {
             dry_run: false,
             with_diff: true,
             format: FormatPolicy::None,
+            planned_file_sha256: None,
+            planned_target_sha256: None,
+            planned_target_range: None,
+            expect_residual: None,
         }
     }
+}
+
+/// Check the resolution-time file and target hashes against one immutable
+/// snapshot. Supplying a target hash without its original range fails closed.
+pub(crate) fn planned_preconditions_hold(snapshot: &Snapshot, options: &VerbOptions) -> bool {
+    if options
+        .planned_file_sha256
+        .as_ref()
+        .is_some_and(|expected| expected != &snapshot.file_sha256)
+    {
+        return false;
+    }
+    match (
+        options.planned_target_sha256.as_ref(),
+        options.planned_target_range,
+    ) {
+        (Some(expected), Some((start, end))) => snapshot
+            .content
+            .get(start..end)
+            .is_some_and(|target| sha256_hex(target) == expected.as_str()),
+        (Some(_), None) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn planned_precondition_refusal(
+    workspace_root: &Path,
+    snapshot: &Snapshot,
+    options: &VerbOptions,
+) -> Option<Certificate> {
+    (!planned_preconditions_hold(snapshot, options)).then(|| {
+        single_refusal_certificate(
+            workspace_root,
+            snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::Stale,
+            options,
+        )
+    })
 }
 
 /// Run `argv` on a temp file containing `content`; return the formatted
@@ -464,6 +516,9 @@ pub fn replace_body(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let Some(body_range) = body_range_within(language, &snapshot.content, def_range) else {
         return Ok(single_op_certificate(
             workspace_root,
@@ -523,6 +578,9 @@ pub fn insert_adjacent(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let mut block = Vec::new();
     let at = match position {
         InsertPosition::Before => {
@@ -581,6 +639,9 @@ pub fn delete_span(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let mut end = def_range.1;
     if snapshot.content.get(end) == Some(&b'\n') {
         end += 1;
@@ -628,6 +689,9 @@ pub fn rename_in_span(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let sites = identifier_sites(language, &snapshot.content, def_range, from.as_bytes());
     let Some(sites) = sites else {
         return Ok(single_op_certificate(
@@ -787,6 +851,9 @@ pub fn change_signature(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let Some(param_range) = parameters_range_within(language, &snapshot.content, def_range) else {
         return Ok(single_refusal_certificate(
             workspace_root,
@@ -910,6 +977,113 @@ pub struct RenameFileScope {
     pub spans: Vec<(usize, usize)>,
 }
 
+fn identifier_name_occurrences(content: &[u8], name: &[u8]) -> usize {
+    if name.is_empty() {
+        return 0;
+    }
+    content
+        .windows(name.len())
+        .enumerate()
+        .filter(|(start, window)| {
+            if *window != name {
+                return false;
+            }
+            let before = start
+                .checked_sub(1)
+                .and_then(|index| content.get(index))
+                .copied();
+            let after = content.get(start + name.len()).copied();
+            let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+            before.is_none_or(|byte| !is_identifier(byte))
+                && after.is_none_or(|byte| !is_identifier(byte))
+        })
+        .count()
+}
+
+fn count_workspace_residuals(
+    workspace_root: &Path,
+    language: Language,
+    name: &str,
+    projected: Option<&[crate::journal::FilePublication]>,
+) -> Result<usize> {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let projected: BTreeMap<PathBuf, &[u8]> = projected
+        .unwrap_or_default()
+        .iter()
+        .map(|publication| {
+            (
+                PathBuf::from(&publication.rel_path),
+                publication.content.as_slice(),
+            )
+        })
+        .collect();
+
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        language: Language,
+        name: &[u8],
+        projected: &BTreeMap<PathBuf, &[u8]>,
+    ) -> Result<usize> {
+        let entries = std::fs::read_dir(dir).map_err(|source| greppy_core::Error::Io {
+            context: format!("read directory {}", dir.display()),
+            source,
+        })?;
+        let mut count = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|source| greppy_core::Error::Io {
+                context: format!("read directory entry in {}", dir.display()),
+                source,
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|source| greppy_core::Error::Io {
+                    context: format!("stat {}", path.display()),
+                    source,
+                })?;
+            if file_type.is_dir() {
+                let dir_name = entry.file_name();
+                let dir_name = dir_name.to_string_lossy();
+                if matches!(
+                    dir_name.as_ref(),
+                    ".git"
+                        | ".greppy-edit-journal"
+                        | "target"
+                        | "node_modules"
+                        | ".venv"
+                        | "venv"
+                ) {
+                    continue;
+                }
+                count += visit(root, &path, language, name, projected)?;
+            } else if file_type.is_file() && greppy_parser::language_for_path(&path) == language {
+                let rel_path = path.strip_prefix(root).unwrap_or(&path);
+                let content = if let Some(content) = projected.get(rel_path) {
+                    (*content).to_vec()
+                } else {
+                    std::fs::read(&path).map_err(|source| greppy_core::Error::Io {
+                        context: format!("read {}", path.display()),
+                        source,
+                    })?
+                };
+                count += identifier_name_occurrences(&content, name);
+            }
+        }
+        Ok(count)
+    }
+
+    visit(
+        workspace_root,
+        workspace_root,
+        language,
+        name.as_bytes(),
+        &projected,
+    )
+}
+
 /// Graph-backed `rename-symbol`: rename identifier occurrences of `from`
 /// inside the given per-file scopes, publish all files as one journal
 /// transaction. Every site is AST-verified (identifier-kind leaf nodes
@@ -922,6 +1096,11 @@ pub fn rename_symbol_files(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     use crate::journal::FilePublication;
+    let residual_language = scopes
+        .iter()
+        .find(|scope| scope.spans.contains(&(0, usize::MAX)))
+        .or_else(|| scopes.first())
+        .map(|scope| greppy_parser::language_for_path(Path::new(&scope.rel_path)));
     let mut op_reports = Vec::new();
     let mut publications = Vec::new();
     let mut total_sites = 0usize;
@@ -1015,6 +1194,7 @@ pub fn rename_symbol_files(
             syntax,
             postconditions_passed: true,
             postconditions: vec![],
+            residual_occurrences: None,
             guarantees: Guarantees {
                 addressed_range: Guarantee::Proved,
                 no_clobber: Guarantee::Proved,
@@ -1063,6 +1243,28 @@ pub fn rename_symbol_files(
             Ok(()) => published = true,
             Err(e) => {
                 status = crate::certificate::publish_error_status(&e);
+            }
+        }
+    }
+    if status == Status::Applied {
+        if let (Some(expected), Some(language)) = (options.expect_residual, residual_language) {
+            let projected = options.dry_run.then_some(publications.as_slice());
+            let residual_occurrences =
+                count_workspace_residuals(workspace_root, language, from, projected)?;
+            let passed = residual_occurrences == expected;
+            for report in &mut op_reports {
+                report.residual_occurrences = Some(residual_occurrences);
+                report.postconditions_passed &= passed;
+                report.postconditions.push(PostconditionResult {
+                    name: "residual-occurrences".into(),
+                    passed,
+                    detail: Some(format!(
+                        "expected {expected} occurrence(s) of `{from}`, found {residual_occurrences}"
+                    )),
+                });
+            }
+            if !passed {
+                status = Status::InvalidResult;
             }
         }
     }
@@ -1204,6 +1406,9 @@ fn run_pipeline(
     options: &VerbOptions,
     enforce_structure: bool,
 ) -> Result<Certificate> {
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
     let mut formatter_expanded = false;
@@ -1310,18 +1515,34 @@ fn run_pipeline(
     let mut published = false;
     let mut file_sha_after = None;
     if status == Status::Applied && !options.dry_run {
-        match publish_atomic(
-            workspace_root,
-            &snapshot.path,
-            &applied.content,
-            &snapshot.file_sha256,
-        ) {
-            Ok(sha) => {
-                published = true;
-                file_sha_after = Some(sha);
-            }
-            Err(e) => {
-                status = crate::certificate::publish_error_status(&e);
+        // Re-check the resolution-time hashes against the live file directly
+        // before the publication CAS. The atomic publisher closes the smaller
+        // race between this read and rename.
+        let planned_still_live = if options.planned_file_sha256.is_some()
+            || options.planned_target_sha256.is_some()
+        {
+            Snapshot::read(&snapshot.path)
+                .map(|live| planned_preconditions_hold(&live, options))
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if !planned_still_live {
+            status = Status::Stale;
+        } else {
+            match publish_atomic(
+                workspace_root,
+                &snapshot.path,
+                &applied.content,
+                &snapshot.file_sha256,
+            ) {
+                Ok(sha) => {
+                    published = true;
+                    file_sha_after = Some(sha);
+                }
+                Err(e) => {
+                    status = crate::certificate::publish_error_status(&e);
+                }
             }
         }
     } else if status == Status::Applied {
@@ -1357,6 +1578,7 @@ fn run_pipeline(
         syntax,
         postconditions_passed: syntax_ok && isolation_ok,
         postconditions: vec![],
+        residual_occurrences: None,
         guarantees: Guarantees {
             addressed_range: Guarantee::Proved,
             no_clobber: if published || options.dry_run {
@@ -1450,6 +1672,7 @@ fn single_op_certificate(
             },
             postconditions_passed: status == Status::AlreadySatisfied,
             postconditions: vec![],
+            residual_occurrences: None,
             guarantees: Guarantees {
                 addressed_range: Guarantee::NotApplicable,
                 no_clobber: Guarantee::Proved,
@@ -1712,6 +1935,7 @@ mod tests {
                 argv: vec!["sed".into(), "-i".into(), "".into(), "s/ *= */ = /".into()],
                 permit_outside: false,
             },
+            ..Default::default()
         };
         let err = text_cas(dir.path(), &f, b"a = 1", b"a = 9", 1, &opts);
         // der normalizer aendert auch zeile b -> scope-expansion ohne permit: Fehler,
@@ -1726,6 +1950,7 @@ mod tests {
                 argv: portable_normalizer_argv(),
                 permit_outside: true,
             },
+            ..Default::default()
         };
         let cert = text_cas(dir.path(), &f, b"a = 1", b"a = 9", 1, &opts).unwrap();
         assert_eq!(cert.status, Status::Applied);
@@ -2013,5 +2238,100 @@ timeout = 30
         assert_eq!(cert.exit_code(), 13);
         assert!(!cert.published);
         assert_eq!(std::fs::read(&f).unwrap(), content);
+    }
+
+    fn rename_options(expect_residual: usize) -> VerbOptions {
+        VerbOptions {
+            expect_residual: Some(expect_residual),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rename_symbol_clean_workspace_satisfies_zero_residuals() {
+        let dir = ws();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            b"fn old_name() {}\nfn caller() { old_name(); }\n",
+        )
+        .unwrap();
+        let scopes = vec![RenameFileScope {
+            rel_path: "a.rs".into(),
+            spans: vec![(0, usize::MAX)],
+        }];
+
+        let certificate = rename_symbol_files(
+            dir.path(),
+            &scopes,
+            "old_name",
+            "new_name",
+            &rename_options(0),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied);
+        assert_eq!(certificate.exit_code(), 0);
+        assert!(certificate.published);
+        assert_eq!(certificate.operations[0].residual_occurrences, Some(0));
+    }
+
+    #[test]
+    fn rename_symbol_unplanned_leftover_fails_residual_postcondition() {
+        let dir = ws();
+        std::fs::write(dir.path().join("a.rs"), b"fn old_name() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("leftover.rs"),
+            b"fn caller() { old_name(); }\n",
+        )
+        .unwrap();
+        let scopes = vec![RenameFileScope {
+            rel_path: "a.rs".into(),
+            spans: vec![(0, usize::MAX)],
+        }];
+
+        let certificate = rename_symbol_files(
+            dir.path(),
+            &scopes,
+            "old_name",
+            "new_name",
+            &rename_options(0),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::InvalidResult);
+        assert_eq!(certificate.exit_code(), 13);
+        assert!(certificate.published);
+        assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
+        assert!(!certificate.operations[0].postconditions_passed);
+    }
+
+    #[test]
+    fn rename_symbol_expected_one_residual_is_accepted() {
+        let dir = ws();
+        std::fs::write(dir.path().join("a.rs"), b"fn old_name() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("leftover.rs"),
+            b"fn caller() { old_name(); }\n",
+        )
+        .unwrap();
+        let scopes = vec![RenameFileScope {
+            rel_path: "a.rs".into(),
+            spans: vec![(0, usize::MAX)],
+        }];
+
+        let certificate = rename_symbol_files(
+            dir.path(),
+            &scopes,
+            "old_name",
+            "new_name",
+            &rename_options(1),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied);
+        assert_eq!(certificate.exit_code(), 0);
+        assert!(certificate.published);
+        assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
+        assert!(certificate.operations[0].postconditions_passed);
     }
 }

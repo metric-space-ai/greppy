@@ -869,6 +869,8 @@ pub enum EditCommand {
         /// The new parameter list including parentheses, e.g. "(a, b, *, timeout=30)"
         #[arg(long)]
         parameters: String,
+        #[arg(long = "expect-residual", default_value_t = 0)]
+        expect_residual: usize,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -943,6 +945,8 @@ pub enum EditCommand {
         /// graph (default) uses the resolved store; lsp is a later phase.
         #[arg(long, default_value = "graph", value_parser = ["graph", "lsp"])]
         backend: String,
+        #[arg(long = "expect-residual", default_value_t = 0)]
+        expect_residual: usize,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -6446,6 +6450,21 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
         InsertBefore,
         Other,
     }
+    fn resolved_options(
+        dry_run: bool,
+        range: (usize, usize),
+        planned_file_sha256: String,
+        planned_target_sha256: String,
+    ) -> greppy_edit::verbs::VerbOptions {
+        greppy_edit::verbs::VerbOptions {
+            dry_run,
+            with_diff: true,
+            planned_file_sha256: Some(planned_file_sha256),
+            planned_target_sha256: Some(planned_target_sha256),
+            planned_target_range: Some(range),
+            ..Default::default()
+        }
+    }
     let command_kind = match &command {
         EditCommand::InsertBefore { .. } => EditCommandKind::InsertBefore,
         _ => EditCommandKind::Other,
@@ -6500,14 +6519,20 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let new_body = read_source_arg(&source_file)?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved { rel_path, range } => {
+                EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                     let abs = root_path.join(&rel_path);
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                    let options = greppy_edit::verbs::VerbOptions {
+                    let options = resolved_options(
                         dry_run,
-                        with_diff: true,
-                        ..Default::default()
-                    };
+                        range,
+                        planned_file_sha256,
+                        planned_target_sha256,
+                    );
                     (
                         greppy_edit::verbs::replace_body(
                             &root_path, &abs, range, &new_body, language, &options,
@@ -6539,14 +6564,20 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let text = read_source_arg(&source_file)?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved { rel_path, range } => {
+                EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                     let abs = root_path.join(&rel_path);
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                    let options = greppy_edit::verbs::VerbOptions {
+                    let options = resolved_options(
                         dry_run,
-                        with_diff: true,
-                        ..Default::default()
-                    };
+                        range,
+                        planned_file_sha256,
+                        planned_target_sha256,
+                    );
                     (
                         greppy_edit::verbs::insert_adjacent(
                             &root_path,
@@ -6571,14 +6602,20 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             report,
         } => match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
             EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved { rel_path, range } => {
+            EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                 let abs = root_path.join(&rel_path);
                 let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options = greppy_edit::verbs::VerbOptions {
+                let options = resolved_options(
                     dry_run,
-                    with_diff: true,
-                    ..Default::default()
-                };
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                );
                 (
                     greppy_edit::verbs::rename_in_span(
                         &root_path, &abs, range, &from, &to, expect, language, &options,
@@ -6594,14 +6631,20 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             report,
         } => match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
             EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved { rel_path, range } => {
+            EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                 let abs = root_path.join(&rel_path);
                 let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options = greppy_edit::verbs::VerbOptions {
+                let options = resolved_options(
                     dry_run,
-                    with_diff: true,
-                    ..Default::default()
-                };
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                );
                 (
                     greppy_edit::verbs::delete_span(
                         &root_path,
@@ -6617,12 +6660,18 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
         EditCommand::ChangeSignature {
             symbol,
             parameters,
+            expect_residual,
             dry_run,
             report,
         } => {
             match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved { rel_path, range } => {
+                EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                     // call-site-checkliste aus dem graphen
                     let store = open_default_store_query_writer(root)?;
                     let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
@@ -6644,11 +6693,13 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                     call_sites.dedup_by(|a, b| a.path == b.path && a.line == b.line);
                     let abs = root_path.join(&rel_path);
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                    let options = greppy_edit::verbs::VerbOptions {
+                    let mut options = resolved_options(
                         dry_run,
-                        with_diff: true,
-                        ..Default::default()
-                    };
+                        range,
+                        planned_file_sha256,
+                        planned_target_sha256,
+                    );
+                    options.expect_residual = Some(expect_residual);
                     (
                         greppy_edit::verbs::change_signature(
                             &root_path,
@@ -6672,13 +6723,19 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             report,
         } => match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
             EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved { rel_path, range } => {
+            EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                 let abs = root_path.join(&rel_path);
-                let options = greppy_edit::verbs::VerbOptions {
+                let options = resolved_options(
                     dry_run,
-                    with_diff: true,
-                    ..Default::default()
-                };
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                );
                 (
                     greppy_edit::ensure::ensure_argument(
                         &root_path, &abs, range, &call, &arg, &options,
@@ -6700,13 +6757,19 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             })?;
             match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved { rel_path, range } => {
+                EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                     let abs = root_path.join(&rel_path);
-                    let options = greppy_edit::verbs::VerbOptions {
+                    let options = resolved_options(
                         dry_run,
-                        with_diff: true,
-                        ..Default::default()
-                    };
+                        range,
+                        planned_file_sha256,
+                        planned_target_sha256,
+                    );
                     (
                         greppy_edit::ensure::ensure_method(
                             &root_path, &abs, range, &name, &source, &options,
@@ -6723,13 +6786,19 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             report,
         } => match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
             EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved { rel_path, range } => {
+            EditTarget::Resolved {
+                rel_path,
+                range,
+                planned_file_sha256,
+                planned_target_sha256,
+            } => {
                 let abs = root_path.join(&rel_path);
-                let options = greppy_edit::verbs::VerbOptions {
+                let options = resolved_options(
                     dry_run,
-                    with_diff: true,
-                    ..Default::default()
-                };
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                );
                 (
                     greppy_edit::ensure::ensure_annotation(
                         &root_path,
@@ -6747,18 +6816,38 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             dry_run,
             report,
         } => {
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                ..Default::default()
-            };
-            let resolved = match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
-                EditTarget::Resolved { rel_path, range } => {
-                    Some((root_path.join(&rel_path), range))
-                }
-                EditTarget::Refusal(cert) if cert.status == greppy_edit::Status::NotFound => None,
-                EditTarget::Refusal(cert) => return finish_edit(*cert, report, root, &root_path),
-            };
+            let (resolved, options) =
+                match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
+                    EditTarget::Resolved {
+                        rel_path,
+                        range,
+                        planned_file_sha256,
+                        planned_target_sha256,
+                    } => (
+                        Some((root_path.join(&rel_path), range)),
+                        resolved_options(
+                            dry_run,
+                            range,
+                            planned_file_sha256,
+                            planned_target_sha256,
+                        ),
+                    ),
+                    EditTarget::Refusal(cert)
+                        if cert.status == greppy_edit::Status::NotFound =>
+                    {
+                        (
+                            None,
+                            greppy_edit::verbs::VerbOptions {
+                                dry_run,
+                                with_diff: true,
+                                ..Default::default()
+                            },
+                        )
+                    }
+                    EditTarget::Refusal(cert) => {
+                        return finish_edit(*cert, report, root, &root_path)
+                    }
+                };
             (
                 greppy_edit::ensure::remove_if_present(&root_path, resolved, &options)?,
                 report,
@@ -6768,6 +6857,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             symbol,
             new_name,
             backend,
+            expect_residual,
             dry_run,
             report,
         } => {
@@ -6839,6 +6929,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                expect_residual: Some(expect_residual),
                 ..Default::default()
             };
             (
@@ -7061,11 +7152,14 @@ fn finish_edit(
             op.store_refreshed = refreshed;
         }
     }
-    let rendered = serde_json::to_string_pretty(&certificate)
-        .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?;
-    println!("{rendered}");
+    let compact = certificate
+        .to_compact_json_pretty()
+        .map_err(|e| Error::Invalid(format!("serialize compact certificate: {e}")))?;
+    println!("{compact}");
     if let Some(path) = report_path {
-        std::fs::write(&path, format!("{rendered}\n")).map_err(|source| Error::Io {
+        let full = serde_json::to_string_pretty(&certificate)
+            .map_err(|e| Error::Invalid(format!("serialize full certificate: {e}")))?;
+        std::fs::write(&path, format!("{full}\n")).map_err(|source| Error::Io {
             context: format!("write report {path}"),
             source,
         })?;
@@ -7081,6 +7175,8 @@ enum EditTarget {
     Resolved {
         rel_path: String,
         range: (usize, usize),
+        planned_file_sha256: String,
+        planned_target_sha256: String,
     },
     Refusal(Box<greppy_edit::Certificate>),
 }
@@ -7132,6 +7228,7 @@ fn resolve_edit_target(
                 },
                 postconditions_passed: false,
                 postconditions: vec![],
+                residual_occurrences: None,
                 guarantees: cert::Guarantees {
                     addressed_range: cert::Guarantee::Failed,
                     no_clobber: cert::Guarantee::Proved,
@@ -7164,6 +7261,8 @@ fn resolve_edit_target(
             Ok(range) => Ok(EditTarget::Resolved {
                 rel_path: handle.path.clone(),
                 range,
+                planned_file_sha256: handle.file_sha256.clone(),
+                planned_target_sha256: handle.target_sha256.clone(),
             }),
             Err(_) => Ok(EditTarget::Refusal(Box::new(refusal(
                 root_path,
@@ -7268,9 +7367,18 @@ fn resolve_edit_target(
         ))));
     };
     let range = line_range_to_bytes(&content, node.start_line as usize, span.end_line as usize);
+    let planned = greppy_edit::EditHandle::for_range(
+        root_path,
+        std::path::Path::new(&node.file_path),
+        &content,
+        range.0,
+        range.1,
+    )?;
     Ok(EditTarget::Resolved {
         rel_path: node.file_path.clone(),
         range,
+        planned_file_sha256: planned.file_sha256,
+        planned_target_sha256: planned.target_sha256,
     })
 }
 

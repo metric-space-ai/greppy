@@ -9,7 +9,9 @@ use std::path::Path;
 
 use crate::certificate::{Certificate, SelectorClass, SelectorEngine, Status};
 use crate::txn::{PlannedOp, Snapshot};
-use crate::verbs::{run_pipeline_public, single_refusal_certificate, VerbOptions};
+use crate::verbs::{
+    planned_precondition_refusal, run_pipeline_public, single_refusal_certificate, VerbOptions,
+};
 use greppy_core::Result;
 use greppy_parser::Language;
 
@@ -110,6 +112,9 @@ pub fn ensure_import(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let language = greppy_parser::language_for_path(file);
     let Some(line) = import_line(language, module, name) else {
         return Ok(single_refusal_certificate(
@@ -209,6 +214,9 @@ pub fn ensure_annotation(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let language = greppy_parser::language_for_path(file);
     let line = annotation.trim();
     // indentation of the definition line
@@ -282,6 +290,9 @@ pub fn ensure_method(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let language = greppy_parser::language_for_path(file);
     // existiert eine methode dieses namens in der klasse?
     let existing = crate::verbs::identifier_sites_public(
@@ -346,6 +357,9 @@ pub fn ensure_argument(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+        return Ok(certificate);
+    }
     let language = greppy_parser::language_for_path(file);
     let Some(call_args) = call_argument_spans(language, &snapshot.content, def_range, callee)
     else {
