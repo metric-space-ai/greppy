@@ -8,13 +8,11 @@
 [![CodeQL](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-> **Measured across four coding models (MiniMax-M3, GLM-5.2, Qwen3.6-27B,
-> Kimi-K3): an agent with greppy answers +6 to +50 percentage points more
-> tasks correctly than the same agent with `grep` — at every tool-call
-> budget — and reaches the grep agent's best quality at 37–80 % lower API
-> cost.** Formalized, proven, and measured in the
-> [accompanying paper](docs/paper/mscc-greppy-paper.pdf); re-proven
-> mechanically on every release.
+> In a four-model benchmark (MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3), an
+> agent with greppy answered 6–50 percentage points more questions correctly
+> than the same agent with `grep`, and matched the grep agent's best quality
+> at 37–80 % lower API cost.
+> Method and full results: [paper](docs/paper/mscc-greppy-paper.pdf).
 
 `greppy` is a code-navigation tool that also accepts ordinary `grep`
 invocations. Those invocations execute the real system `grep` and forward its
@@ -46,13 +44,15 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 ---
 
-## Measured result: more correct and cheaper, across four models
+## Benchmark results
 
-Across four coding models spanning three providers — **MiniMax-M3, GLM-5.2, Qwen3.6-27B, and Kimi-K3** — pairing a coding agent with greppy strictly dominates the lexical (`grep` + file-read) baseline on the cost–correctness frontier: **more tasks answered correctly at every tool-call budget (+6 to +50 percentage points)**, and the lexical agent's best answer quality reached at **37–80 % lower billed API cost**.
+Across four coding models and three providers, the agent with greppy answered
+more tasks correctly at every tool-call budget (+6 to +50 percentage points)
+and reached the grep agent's best quality at 37–80 % lower billed API cost.
 
 <img src="docs/assets/cost-success-frontier-4models.png" width="100%" alt="Cost–success frontier across four models: pi+greppy dominates the lexical baseline in every panel."/>
 
-<sub>Success rate over mean billed API cost per 1,000 attempted tasks (linear axis; the three cheaper models share $0–24, Kimi-K3's list-price costs use $0–76), four completed model panels. In every panel the greppy surface (blue) sits above and to the left of the lexical baseline (green) — more correct at lower cost. The 2×2 factorial isolates the source: an explicit *minimum-sufficient-context* **instruction** adds nothing measurable — it tracks the no-instruction arm and only adds cost (up to +\$21 per 1,000 tasks on Kimi-K3). **The structured tool surface, not prompt engineering, carries the advantage.**</sub>
+<sub>Success rate vs. mean billed API cost per 1,000 tasks. Blue = agent with greppy, green = same agent with grep. The dashed lines are the 2×2 ablation: adding an explicit method instruction changes nothing except cost — the tool surface carries the effect.</sub>
 
 > 📄 **Full paper:** [*The Minimum Sufficient Code Context Problem — Complexity, Discovery Overhead, and Approximation in Coding Agents*](docs/paper/mscc-greppy-paper.pdf) — the graph formulation of MSCC, its NP-completeness, the lexical-navigation lower bounds, the no-trade-off theorem, and the full four-model empirical evidence.
 
@@ -60,10 +60,8 @@ Across four coding models spanning three providers — **MiniMax-M3, GLM-5.2, Qw
 
 ## Setup — two steps
 
-**1. Install greppy — the models ship inside the binary, either way.**
-
-There are two supported ways to install, and *both* give you a binary with both
-models compiled in. There is no third option that produces a model-less greppy.
+**1. Install.** Both install paths produce a binary with the two models
+embedded.
 
 *Prebuilt binary.* Download the archive for your platform from the
 [releases page](https://github.com/metric-space-ai/greppy/releases)
@@ -79,27 +77,22 @@ compiles them into the binary:
 sudo install -m 0755 target/release/greppy /usr/local/bin/greppy
 ```
 
-The build **refuses to produce a model-less binary**: if either model asset is
-missing or its SHA-256 does not match, `cargo build` fails with a precise error
-([`crates/cli/build.rs`](crates/cli/build.rs)) instead of shipping a greppy
-without its models — a `cargo build` that succeeds has the models embedded. The
-fetch step is idempotent (it verifies files already present and re-downloads
-only on mismatch), so the command is safe to re-run. Add `--features metal`
+`cargo build` fails if a model asset is missing or its SHA-256 does not match
+([`crates/cli/build.rs`](crates/cli/build.rs)). `fetch_model_assets.sh` is
+idempotent — it verifies existing files and re-downloads only on mismatch.
+Add `--features metal`
 (Apple Silicon) or `--features cuda` (Linux/NVIDIA) for the accelerated backend;
 CPU inference always works, and the device is selected automatically (override
 with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`).
 
-Every greppy binary embeds EmbeddingGemma (300M, Google's quantized model) and a
-Qwen3.5 (0.8B) that greppy fine-tuned in-house to write the navigation hints, plus
-their tokenizers, pinned by SHA-256 in
-[`crates/cli/assets/MODEL_ASSETS.json`](crates/cli/assets/MODEL_ASSETS.json) and
-hosted as public, ungated Hugging Face repos
+The binary embeds EmbeddingGemma (300M) and an in-house Qwen3.5 (0.8B)
+fine-tune that writes the navigation hints. The weights live on Hugging Face
 ([EmbeddingGemma](https://huggingface.co/metricspace/embeddinggemma-300m-q4k),
-[greppy-Qwen3.5](https://huggingface.co/metricspace/greppy-qwen35-mtp-q4km)) —
-kept out of the git tree, never out of the binary. `fetch_model_assets.sh` pulls
-them (no token needed) and the build refuses any file whose SHA-256 does not
-match. Nothing is downloaded at runtime and neither model can be disabled. Do
-not rename or install the binary as `grep`.
+[greppy-Qwen3.5](https://huggingface.co/metricspace/greppy-qwen35-mtp-q4km)),
+pinned by SHA-256 in
+[`MODEL_ASSETS.json`](crates/cli/assets/MODEL_ASSETS.json) and fetched at build
+time — no token needed. Nothing is downloaded at runtime. Don't install the
+binary as `grep`.
 
 The first structured query builds the local workspace index once per source
 generation and reuses it across later agent sessions. `semantic-search` never
@@ -108,23 +101,19 @@ exposes partial vectors: until that generation completes it returns
 exact span progress, and an estimated completion time, while graph navigation
 stays available throughout.
 
-**2. Paste the canonical prompt.** That is the entire integration: **no MCP
-server, no per-agent configuration, no API keys, no cloud account.** Any agent
-that can run shell commands — Claude Code, Cursor, Codex CLI, Gemini CLI, or
-your own — gets the full surface from this one block, and the index builds
-itself on the first query. Delegate it — in your agent's chat, say
-**`install https://github.com/metric-space-ai/greppy/`** — or
-paste the snippet below into the file your agent reads for project instructions
-(`CLAUDE.md`, `AGENTS.md`, `.cursor/rules`, `.windsurfrules`, or the system
-prompt).
+**2. Add the prompt to your agent.** That's the whole integration — no MCP
+server, no per-agent config, no API keys. Works in any agent that can run
+shell commands (Claude Code, Cursor, Codex CLI, Gemini CLI, your own). Paste
+the block below into `CLAUDE.md` / `AGENTS.md` / `.cursor/rules` / the system
+prompt — or tell your agent:
+`install https://github.com/metric-space-ai/greppy/`. The index builds itself
+on the first query.
 
-### The canonical agent prompt — use it verbatim
+### The agent prompt (use as-is)
 
-This exact block is what every published benchmark and the paper's four-model
-evidence measured. Use it as-is. Do **not** write your own routing rules,
-tool-selection heuristics, or a "when to use which command" policy around it —
-the 2×2 factorial shows added method instructions contribute nothing measurable
-on top of this surface; they only add prompt cost.
+This is the exact prompt from the published benchmarks. Custom routing or
+method instructions on top measurably change nothing except prompt cost
+(paper, 2×2 ablation).
 
 ```text
 This project has `greppy`, a local code-navigation tool over a symbol graph and
@@ -174,13 +163,6 @@ Treat returned source paths, exact spans, signatures, and graph relations as
 evidence. The indented English sentence below a function signature is a local
 Qwen navigation hint. Read the source and verify changes with builds and tests.
 ```
-
-That block *is* the prompt: it names the commands, explains the semantic index,
-and tells the agent to verify against source. It is the only instruction greppy
-needs. Do **not** also paste the paper's *minimum-sufficient-context* method
-instruction (Appendix A) — the 2×2 experiment shows it is a null control that
-adds cost without measurable benefit. The tool surface carries the effect; the
-extra prompt does not.
 
 ## CLI reference
 
@@ -236,12 +218,9 @@ output with exact counts. The first structured query builds the index; ordinary
 
 ## What it saves
 
-Greppy replaces exploratory search-and-open loops with one structured query
-plus directly attached evidence — and every release re-proves that
-mechanically: the pre-registered benchmarks below must pass on the exact
-release binary before a release can publish.
-
-Two complementary, pre-registered suites are checked in:
+Greppy replaces search-and-open loops with one structured query plus attached
+source evidence. Two pre-registered benchmark suites are checked in and gate
+every release:
 
 - [`bench/agent_efficiency/`](bench/agent_efficiency/) contains 115 pinned
   navigation tasks across six real repositories plus deterministic controls.
@@ -260,8 +239,7 @@ Task banks, prompts, binaries, runtime versions, setup commands, and repository
 commits are hashed into their manifests. Arm order is deterministically
 balanced per task and its ordering scheme is versioned in the manifest.
 
-Every release claim is mechanically enforced. A release publishes only after
-runs on the exact release commit prove all of the following:
+Release gates, run on the exact release commit:
 
 - at least as many paired correctness wins as losses, with no paired
   regression alarm at `p < 0.05`;
@@ -271,10 +249,9 @@ runs on the exact release commit prove all of the following:
   binary hash, per-task rows, grading, aggregate, and forensics are published;
 - raw agent traces remain private and are not release artifacts.
 
-`v0.2.1` shipped with these gates green; the run evidence is attached to the
-release as verifiable assets (manifests, hashes, benchmark tarballs), and the
-paper's four-model panels are that same evidence. Index construction is a
-reusable one-time cost, reported separately with its amortized break-even.
+v0.2.1 shipped with these gates green; the run evidence is attached to the
+release. Index construction is a one-time cost per repository, reported
+separately with its break-even.
 
 ---
 
@@ -334,12 +311,11 @@ age eviction but not the independent size quota.
 
 ## Status
 
-**Current release: [v0.2.1](https://github.com/metric-space-ai/greppy/releases/tag/v0.2.1)** —
-the first gate-qualified release. Every release is cut only after CI, CodeQL,
-the dependency security audit, the task-bank reproducibility audit, the
-navigation-regime agent benchmark, and the summary-quality gate pass on the
-exact release commit, followed by signing, notarization, SBOM, and provenance
-attestation. Pin the release tag for production use.
+**Current release: [v0.2.1](https://github.com/metric-space-ai/greppy/releases/tag/v0.2.1)**.
+Releases ship after CI, CodeQL, the security audit, the task-bank audit, the
+agent benchmark, and the summary-quality gate pass on the release commit, then
+get signed, notarized, and attested (SBOM + provenance). Pin the tag for
+production.
 
 - **Language parsers — 60+ bundled:** every language indexes symbols and answers
   definition and text search; most (every procedural language — Ruby, C++, C#,
