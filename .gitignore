@@ -27,9 +27,13 @@ __pycache__/
 .venv*/
 **/.venv*/
 
-# --- Agent / assistant working files (kept out of the public repo) ---
-CLAUDE.md
-AGENTS.md
+# --- Agent / assistant working files (kept out of the public repo). The
+# root AGENTS.md (the shipped agent prompt) and the root CLAUDE.md that
+# imports it are public and tracked; nested ones stay private. ---
+**/CLAUDE.md
+!/CLAUDE.md
+**/AGENTS.md
+!/AGENTS.md
 AGENT_PROJECT_ENTRYPOINT.md
 /docs/
 /reviews/
