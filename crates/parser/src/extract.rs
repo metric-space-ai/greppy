@@ -4808,6 +4808,24 @@ fn c_cpp_try_emit_usage(
     if !matches!(node.kind(), "identifier" | "type_identifier") {
         return;
     }
+    let name = node_text(source, node);
+    if name.is_empty() || C_CPP_KEYWORDS.contains(&name) {
+        return;
+    }
+    // Type positions have to be classified before the generic definition-name
+    // guard: `::Widget` is a `qualified_identifier` whose `name:` child is the
+    // `type_identifier`, but that field is a reference, not a declaration.
+    if c_cpp_is_type_reference(node) && !c_cpp_ancestor_in(node, import_kinds) {
+        result.edges.push(ExtractedEdge {
+            edge_type: "TYPE_REF".into(),
+            source_qualified_name: c_cpp_reference_source_qname(source, node, file_path),
+            target_qualified_name: format!("{file_path}::Class::{name}"),
+            file_path: file_path.to_string(),
+            line: node.start_position().row as u32 + 1,
+            properties: serde_json::json!({ "type_name": name }),
+        });
+        return;
+    }
     // Skip a reference sitting inside a call or an import (checks up to 10
     // ancestors for each set).
     if c_cpp_ancestor_in(node, call_kinds) || c_cpp_ancestor_in(node, import_kinds) {
@@ -4816,10 +4834,6 @@ fn c_cpp_try_emit_usage(
     // Skip a node that IS the `name:` field of its own parent (a definition
     // name, not a reference).
     if c_cpp_is_definition_name(node) {
-        return;
-    }
-    let name = node_text(source, node);
-    if name.is_empty() || C_CPP_KEYWORDS.contains(&name) {
         return;
     }
     // Every C / C++ usage is attributed to the per-file MODULE node, not the
@@ -4835,6 +4849,93 @@ fn c_cpp_try_emit_usage(
         line: node.start_position().row as u32 + 1,
         properties: serde_json::json!({ "ref_name": name }),
     });
+}
+
+/// Whether `node` is contained by a C/C++ syntax node's `type:` field. This
+/// catches parameter, return, field, and local declaration types while excluding
+/// the `name:` of a type declaration.
+fn c_cpp_is_type_reference(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    let mut depth = 0;
+    while let Some(parent) = current {
+        if depth >= 10 {
+            break;
+        }
+        if parent.child_by_field_name("type").is_some_and(|type_node| {
+            type_node.start_byte() <= node.start_byte() && type_node.end_byte() >= node.end_byte()
+        }) {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "compound_statement" | "declaration_list" | "translation_unit"
+        ) {
+            break;
+        }
+        current = parent.parent();
+        depth += 1;
+    }
+    false
+}
+
+/// Reconstruct the qname of the C/C++ function containing a reference. Free
+/// functions use `{file}::Function::{name}`; class-owned and out-of-line methods
+/// use `{file}::{Owner}::{name}`. File-scope type references use the Module node.
+fn c_cpp_reference_source_qname(source: &[u8], node: Node<'_>, file_path: &str) -> String {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition" {
+            if let Some((name, owner)) = c_cpp_function_name(source, parent) {
+                return match owner {
+                    Some(owner) => format!("{file_path}::{owner}::{name}"),
+                    None => format!("{file_path}::Function::{name}"),
+                };
+            }
+        }
+        current = parent.parent();
+    }
+    format!("{file_path}::__file__")
+}
+
+fn c_cpp_function_name<'a>(
+    source: &'a [u8],
+    function: Node<'_>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let declarator = function.child_by_field_name("declarator")?;
+    let (name, qualifier) = c_cpp_declarator_name(source, declarator)?;
+    let owner = qualifier.or_else(|| c_cpp_enclosing_class_name(source, function));
+    Some((name, owner))
+}
+
+fn c_cpp_declarator_name<'a>(
+    source: &'a [u8],
+    declarator: Node<'_>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    match declarator.kind() {
+        "identifier" | "field_identifier" => Some((node_text(source, declarator), None)),
+        "qualified_identifier" => {
+            let name = declarator.child_by_field_name("name")?;
+            let owner = declarator
+                .child_by_field_name("scope")
+                .map(|scope| node_text(source, scope));
+            let (leaf, _) = c_cpp_declarator_name(source, name)?;
+            Some((leaf, owner))
+        }
+        _ => c_cpp_declarator_name(source, declarator.child_by_field_name("declarator")?),
+    }
+}
+
+fn c_cpp_enclosing_class_name<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "class_specifier" | "struct_specifier") {
+            return parent
+                .child_by_field_name("name")
+                .map(|name| node_text(source, name));
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 /// Whether any ancestor of `node` within 10 levels has a kind in `kinds`
@@ -17689,6 +17790,27 @@ int helper(int n) { return n + 1; }
                 .any(|n| n.name == "helper" && n.label == "Function"),
             "b.cpp must define Function helper: {:?}",
             b.nodes
+        );
+    }
+
+    #[test]
+    fn cpp_parameter_type_emits_type_ref_from_enclosing_function() {
+        let r = cpp(
+            r#"
+namespace app {
+int render(::Widget w) { return w.w; }
+}
+"#,
+            "src/main.cpp",
+        );
+        let edge = r.edges.iter().find(|edge| {
+            edge.edge_type == "TYPE_REF"
+                && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some("Widget")
+        });
+        let edge = edge.unwrap_or_else(|| panic!("missing Widget TYPE_REF: {:?}", r.edges));
+        assert_eq!(
+            edge.source_qualified_name,
+            "src/main.cpp::Function::render"
         );
     }
 

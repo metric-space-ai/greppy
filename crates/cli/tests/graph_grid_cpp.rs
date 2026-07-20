@@ -237,7 +237,6 @@ fn graph_grid_cpp_find_usages_covers_call_and_import() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "cpp graph gap: cross-file type references not classified as TYPE_REF"]
 fn graph_grid_cpp_find_usages_type_reference() {
     let (repo, store) = index_fixture("find-usages-type-ref");
     // `Widget` is referenced as a parameter type in `render(::Widget w)`.
