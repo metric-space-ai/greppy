@@ -1,9 +1,17 @@
 # Changelog
 
-All notable changes are documented here. Greppy follows Semantic Versioning
-after the `v0.2.0` production gate.
+All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
+
+## [0.2.1] — 2026-07-20
+
+First gate-qualified release: cut only after CI, CodeQL, the dependency
+security audit, the task-bank reproducibility audit, the navigation-regime
+agent benchmark, and the summary-quality gate passed on the release commit,
+then signed, notarized, and attested (SBOM + provenance). Ships the complete
+four-model MSCC evidence (MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3) and the
+accompanying paper.
 
 ### Added
 
@@ -41,11 +49,14 @@ after the `v0.2.0` production gate.
 - Installation or packaging under the binary name `grep`.
 - The in-product self-updater.
 
-### Release blockers
+### Licensing and hosting
 
-- `v0.2.0` remains unreleased until clean packaged-artifact tests, hardware
-  performance gates, summary-quality evaluation, reproducible agent benchmark,
-  redistribution review, signing, notarization, SBOM, and provenance gates pass.
+- Source relicensed MIT → Apache-2.0 (embedded model terms unchanged:
+  EmbeddingGemma under the Gemma Terms, the in-house Qwen3.5 fine-tune under
+  Apache-2.0).
+- Model weights hosted as public, ungated Hugging Face repos
+  (`metricspace/embeddinggemma-300m-q4k`, `metricspace/greppy-qwen35-mtp-q4km`);
+  the build fetches and SHA-256-verifies them before embedding.
 
 ## [0.1.2]
 

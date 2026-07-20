@@ -7,6 +7,8 @@ authors:
 repository-code: "https://github.com/metric-space-ai/greppy"
 url: "https://github.com/metric-space-ai/greppy"
 license: Apache-2.0
+version: "0.2.1"
+date-released: "2026-07-20"
 abstract: >-
   Greppy is a local code-navigation CLI for coding agents. It combines
   byte-exact real-grep passthrough, freshness-checked symbol-graph evidence,

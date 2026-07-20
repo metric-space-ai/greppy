@@ -264,7 +264,7 @@ includes the amortized break-even instead of presenting precomputation as free.
 The navigation problem greppy optimizes is formalized in an accompanying
 paper: **“The Minimum Sufficient Code Context Problem — Complexity, Discovery
 Overhead, and Approximation in Coding Agents”** (Michael Welsch, GPT-5.6 Sol,
-Fable 5.0 — theory and empirical draft, July 2026).
+Fable 5.0 — July 2026).
 **[Read the PDF](docs/paper/mscc-greppy-paper.pdf)**
 
 It defines the minimum sufficient code context (MSCC) an agent needs for a
@@ -273,8 +273,9 @@ purely lexical navigation must pay for entry ambiguity and unresolved
 relations, and states the measurable conditions under which the combined
 policy greppy implements is strictly cheaper without losing correctness.
 The pre-registered factorial study in the paper is the same evidence design
-this repository enforces as release gates; the current draft ships the frozen
-protocol and first model panel, with the remaining panels in progress.
+this repository enforces as release gates; the paper ships the frozen protocol
+and the complete four-model panel evidence (MiniMax-M3, GLM-5.2, Qwen3.6-27B,
+Kimi-K3 — 23,000+ valid cells).
 
 ---
 
@@ -314,10 +315,12 @@ age eviction but not the independent size quota.
 
 ## Status
 
-The current `main` branch is qualifying for the gated `v0.2.1` release. No
-official release is cut until the packaged artifacts, native inference,
-daemon-fault tests, summary-quality corpus, agent benchmark, hardware matrix,
-signing, and notarization gates pass.
+**Current release: [v0.2.1](https://github.com/metric-space-ai/greppy/releases/tag/v0.2.1)** —
+the first gate-qualified release. Every release is cut only after CI, CodeQL,
+the dependency security audit, the task-bank reproducibility audit, the
+navigation-regime agent benchmark, and the summary-quality gate pass on the
+exact release commit, followed by signing, notarization, SBOM, and provenance
+attestation. Pin the release tag for production use.
 
 - **Language parsers — 60+ bundled:** every language indexes symbols and answers
   definition and text search; most (every procedural language — Ruby, C++, C#,

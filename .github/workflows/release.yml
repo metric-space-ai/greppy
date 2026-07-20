@@ -595,9 +595,11 @@ jobs:
           tar -C unpack -xzf "package/${{ matrix.asset }}"
           test ! -e unpack/grep
           if [[ "$GITHUB_REF" == refs/tags/* && "${{ runner.os }}" = macOS ]]; then
+            # codesign --verify --strict is the correct gate for a bare Mach-O
+            # CLI binary. stapler/spctl are app-bundle-only (see the build job's
+            # notarization comment): a bare binary cannot carry a stapled
+            # ticket, so those checks fail by construction, not by defect.
             codesign --verify --strict --verbose=2 unpack/greppy
-            xcrun stapler validate unpack/greppy
-            spctl --assess --type execute --verbose=4 unpack/greppy
           fi
           bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
           bash unpack/release_daemon_stress.sh "$PWD/unpack/greppy" "$PWD/daemon-stress"
