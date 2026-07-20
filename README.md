@@ -103,9 +103,13 @@ stays available throughout.
 
 **2. Add the prompt to your agent.** That's the whole integration — no MCP
 server, no per-agent config, no API keys. Works in any agent that can run
-shell commands (Claude Code, Cursor, Codex CLI, Gemini CLI, your own). Paste
-the block below into `CLAUDE.md` / `AGENTS.md` / `.cursor/rules` / the system
-prompt — or tell your agent:
+shell commands (Claude Code, Cursor, Codex CLI, Gemini CLI, your own).
+
+The prompt ships as [`AGENTS.md`](AGENTS.md) in this repo. Copy it into your
+repo root — agents that read `AGENTS.md` pick it up automatically; for Claude
+Code, add the line `@AGENTS.md` to your `CLAUDE.md` (that's all this repo's
+[`CLAUDE.md`](CLAUDE.md) contains). Or paste the block below into your
+project-instructions file, or tell your agent:
 `install https://github.com/metric-space-ai/greppy/`. The index builds itself
 on the first query.
 
