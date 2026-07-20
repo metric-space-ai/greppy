@@ -367,6 +367,8 @@ A symbol graph is built from source text. Edges a program wires up at runtime �
 
 Language support is tiered the same way, deliberately: 60+ languages have parser-level support, and graph completeness is certified per language by fixture grids — currently Rust, Python, Java, JavaScript, TypeScript, and Go, with C++, C#, Kotlin, Swift, and Ruby next. Certification means the tier is measured, not assumed.
 
+The index is per repository, deliberately: one root, one store, and multi-package workspaces inside that root (Cargo, npm, Go) are already a single relation space. Multiple repositories are queried per root via `--root`; a federated multi-root workspace — one search across registered roots, with dependency-level edges between them — is planned. What is not planned is a central team server: greppy stays local by design. The team answer is index snapshots — build the index once in CI, distribute it as an artifact, and let the per-query freshness checks reconcile local drift.
+
 ## Local data and cleanup
 
 Greppy stores workspace paths, source spans, graph edges, embeddings, and query
