@@ -19,6 +19,11 @@ thresholds: documented rationale, version bump, owner sign-off.
    scored.
 5. Failure is a next step: every non-zero exit carries machine-readable
    context (candidates, changed file, failing postcondition).
+6. Certificates are compact on stdout: status, exit code, match/target
+   counts, changed byte ranges, and the unified diff. Heavy evidence
+   (before/after node text, per-postcondition detail, validator output) is
+   written only to `--report FILE`. The certificate must stay cheaper than
+   the re-read it replaces.
 
 ## Commands
 
@@ -48,8 +53,8 @@ greppy edit insert-after    --symbol Q.SYM | --target HANDLE   --source-file F
 greppy edit insert-before   --symbol Q.SYM | --target HANDLE   --source-file F
 greppy edit delete          --symbol Q.SYM | --target HANDLE
 greppy edit rename-call     --in Q.SYM --from NAME --to NAME [--expect N]
-greppy edit rename-symbol   --symbol Q.SYM --new-name NAME [--backend graph|lsp]
-greppy edit change-signature --symbol Q.SYM --spec sig.json [--backend graph|lsp]
+greppy edit rename-symbol   --symbol Q.SYM --new-name NAME [--backend graph|lsp] [--expect-residual N]
+greppy edit change-signature --symbol Q.SYM --spec sig.json [--backend graph|lsp] [--expect-residual N]
 greppy edit ensure-import   --file PATH --module M [--name N]
 greppy edit ensure-method   --symbol CLASS --spec method.json
 greppy edit ensure-argument --symbol Q.SYM --call NAME --arg SPEC
@@ -61,6 +66,11 @@ greppy edit data set|ensure --file PATH --path JSONPATH --value-json V
 greppy edit apply           --plan plan.json [--publish atomic|journal|patch|shadow-worktree]
 greppy edit recover         [--workspace ROOT]      (journal crash recovery)
 ```
+
+Residual postcondition (binding, rename-symbol / change-signature): after
+publish, the workspace occurrence count of the old name in same-language code
+files must equal the declared residue (`--expect-residual N`, default 0);
+mismatch is exit 13 and the count is reported in the certificate.
 
 Common flags: `--json` (default when stdout is not a tty), `--report FILE`,
 `--diff FILE`, `--dry-run`, `--at PATH:LINE` (symbol disambiguation),
