@@ -85,21 +85,37 @@ pub(crate) fn planned_preconditions_hold(snapshot: &Snapshot, options: &VerbOpti
     }
 }
 
-pub(crate) fn planned_precondition_refusal(
+pub(crate) fn planned_precondition_refusal_for(
     workspace_root: &Path,
     snapshot: &Snapshot,
     options: &VerbOptions,
+    engine: SelectorEngine,
+    class: SelectorClass,
 ) -> Option<Certificate> {
     (!planned_preconditions_hold(snapshot, options)).then(|| {
         single_refusal_certificate(
             workspace_root,
             snapshot,
-            SelectorEngine::Symbol,
-            SelectorClass::Resolved,
+            engine,
+            class,
             Status::Stale,
             options,
         )
     })
+}
+
+pub(crate) fn planned_precondition_refusal(
+    workspace_root: &Path,
+    snapshot: &Snapshot,
+    options: &VerbOptions,
+) -> Option<Certificate> {
+    planned_precondition_refusal_for(
+        workspace_root,
+        snapshot,
+        options,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+    )
 }
 
 /// Run `argv` on a temp file containing `content`; return the formatted
@@ -447,26 +463,53 @@ pub fn regex_cas(
     let snapshot = Snapshot::read(file)?;
     let re = regex::Regex::new(pattern)
         .map_err(|e| greppy_core::Error::Invalid(format!("invalid regex: {e}")))?;
-    let text = String::from_utf8_lossy(&snapshot.content).into_owned();
-    let matches: Vec<(usize, usize)> = re.find_iter(&text).map(|m| (m.start(), m.end())).collect();
+    if let Some(certificate) = planned_precondition_refusal_for(
+        workspace_root,
+        &snapshot,
+        options,
+        SelectorEngine::Regex,
+        SelectorClass::RegexWeak,
+    ) {
+        return Ok(certificate);
+    }
+    let text = std::str::from_utf8(&snapshot.content)
+        .map_err(|e| greppy_core::Error::Invalid(format!("regex-cas requires UTF-8: {e}")))?;
+    let matches: Vec<(usize, usize)> = re.find_iter(text).map(|m| (m.start(), m.end())).collect();
     if matches.is_empty() {
-        return Ok(single_refusal_certificate(
+        let already_satisfied = expect == 0
+            || (!replacement.contains('$')
+                && find_all(&snapshot.content, replacement.as_bytes()).len() == expect);
+        return Ok(single_op_certificate(
             workspace_root,
             &snapshot,
             SelectorEngine::Regex,
             SelectorClass::RegexWeak,
-            Status::NotFound,
+            if already_satisfied {
+                Status::AlreadySatisfied
+            } else {
+                Status::NotFound
+            },
+            0,
+            &[],
+            None,
+            None,
             options,
+            PublishMode::Atomic,
         ));
     }
     if matches.len() != expect {
-        return Ok(single_refusal_certificate(
+        return Ok(single_op_certificate(
             workspace_root,
             &snapshot,
             SelectorEngine::Regex,
             SelectorClass::RegexWeak,
             Status::Ambiguous,
+            matches.len(),
+            &[],
+            None,
+            None,
             options,
+            PublishMode::Atomic,
         ));
     }
     let ops: Vec<PlannedOp> = matches
@@ -484,6 +527,24 @@ pub fn regex_cas(
             }
         })
         .collect();
+    if ops
+        .iter()
+        .all(|op| snapshot.content[op.range.0..op.range.1] == op.replacement)
+    {
+        return Ok(single_op_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Regex,
+            SelectorClass::RegexWeak,
+            Status::AlreadySatisfied,
+            matches.len(),
+            &[],
+            None,
+            None,
+            options,
+            PublishMode::Atomic,
+        ));
+    }
     run_pipeline(
         workspace_root,
         snapshot,
@@ -689,10 +750,26 @@ pub fn rename_in_span(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
-    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+    if let Some(certificate) = planned_precondition_refusal_for(
+        workspace_root,
+        &snapshot,
+        options,
+        SelectorEngine::TreeSitter,
+        SelectorClass::Structural,
+    ) {
         return Ok(certificate);
     }
-    let sites = identifier_sites(language, &snapshot.content, def_range, from.as_bytes());
+    if def_range.0 >= def_range.1 || def_range.1 > snapshot.content.len() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::NotFound,
+            options,
+        ));
+    }
+    let sites = call_callee_sites(language, &snapshot.content, def_range, from.as_bytes());
     let Some(sites) = sites else {
         return Ok(single_op_certificate(
             workspace_root,
@@ -724,14 +801,16 @@ pub fn rename_in_span(
         ));
     }
     if sites.is_empty() {
-        // idempotency: if `to` already appears where `from` is gone, report
-        // already-satisfied instead of not-found
-        let to_sites = identifier_sites(language, &snapshot.content, def_range, to.as_bytes())
+        // Idempotency: when the old callee is gone, validate the replacement
+        // call cardinality before declaring the requested end state satisfied.
+        let to_sites = call_callee_sites(language, &snapshot.content, def_range, to.as_bytes())
             .unwrap_or_default();
-        let status = if to_sites.is_empty() {
-            Status::NotFound
-        } else {
-            Status::AlreadySatisfied
+        let status = match expect {
+            Some(0) if to_sites.is_empty() => Status::AlreadySatisfied,
+            Some(n) if to_sites.len() == n => Status::AlreadySatisfied,
+            Some(_) if !to_sites.is_empty() => Status::Ambiguous,
+            _ if !to_sites.is_empty() => Status::AlreadySatisfied,
+            _ => Status::NotFound,
         };
         return Ok(single_op_certificate(
             workspace_root,
@@ -785,14 +864,78 @@ pub fn rename_in_span(
     )
 }
 
-/// Public wrapper for sibling modules.
-pub(crate) fn identifier_sites_public(
+/// Byte ranges of terminal callee identifiers for calls wholly contained in
+/// `def_range`. Receiver/object identifiers and non-call uses are excluded.
+fn call_callee_sites(
     language: Language,
     content: &[u8],
-    range: (usize, usize),
+    def_range: (usize, usize),
     name: &[u8],
 ) -> Option<Vec<(usize, usize)>> {
-    identifier_sites(language, content, range, name)
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        if node.start_byte() >= def_range.0 && node.end_byte() <= def_range.1 {
+            let target = node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("name"));
+            if node.child_by_field_name("arguments").is_some() {
+                if let Some(target) = target {
+                    let mut target_cursor = target.walk();
+                    let mut terminal_identifier = None;
+                    loop {
+                        let target_node = target_cursor.node();
+                        if target_node.child_count() == 0
+                            && target_node.kind().contains("identifier")
+                        {
+                            terminal_identifier =
+                                Some((target_node.start_byte(), target_node.end_byte()));
+                        }
+                        if target_cursor.goto_first_child() {
+                            continue;
+                        }
+                        loop {
+                            if target_cursor.goto_next_sibling() {
+                                break;
+                            }
+                            if !target_cursor.goto_parent() {
+                                if let Some((start, end)) = terminal_identifier {
+                                    if &content[start..end] == name {
+                                        out.push((start, end));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        if target_cursor.node() == target {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if node.end_byte() >= def_range.0
+            && node.start_byte() <= def_range.1
+            && cursor.goto_first_child()
+        {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
 }
 
 /// Byte ranges of identifier-kind leaf nodes whose text equals `name`,
@@ -1379,13 +1522,25 @@ pub(crate) fn single_refusal_certificate(
     status: Status,
     options: &VerbOptions,
 ) -> Certificate {
+    single_status_certificate(workspace_root, snapshot, engine, class, status, 0, options)
+}
+
+pub(crate) fn single_status_certificate(
+    workspace_root: &Path,
+    snapshot: &Snapshot,
+    engine: SelectorEngine,
+    class: SelectorClass,
+    status: Status,
+    matches: usize,
+    options: &VerbOptions,
+) -> Certificate {
     single_op_certificate(
         workspace_root,
         snapshot,
         engine,
         class,
         status,
-        0,
+        matches,
         &[],
         None,
         None,
@@ -1406,7 +1561,9 @@ fn run_pipeline(
     options: &VerbOptions,
     enforce_structure: bool,
 ) -> Result<Certificate> {
-    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+    if let Some(certificate) =
+        planned_precondition_refusal_for(workspace_root, &snapshot, options, engine, class)
+    {
         return Ok(certificate);
     }
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
@@ -2045,20 +2202,22 @@ timeout = 30
         assert_eq!(cert.status, Status::Applied);
         let out = std::fs::read_to_string(&f).unwrap();
         assert!(out.contains("validate()"), "{out}");
-        // string literal untouched
+        // String literals and non-call identifier uses are outside rename-call's
+        // structural target class and remain untouched.
         assert!(out.contains("print(\"legacy_auth\")"), "{out}");
-        assert!(out.contains("x = validate"), "{out}");
+        assert!(out.contains("x = legacy_auth"), "{out}");
     }
 
     #[test]
     fn rename_call_expect_mismatch_refuses() {
         let dir = ws();
         let f = dir.path().join("m.py");
-        std::fs::write(&f, b"def run():\n    a()\n    a()\n").unwrap();
+        let content = b"def run():\n    a()\n    a()\n";
+        std::fs::write(&f, content).unwrap();
         let cert = rename_in_span(
             dir.path(),
             &f,
-            (0, 24),
+            (0, content.len()),
             "a",
             "b",
             Some(1),

@@ -10,7 +10,8 @@ use std::path::Path;
 use crate::certificate::{Certificate, SelectorClass, SelectorEngine, Status};
 use crate::txn::{PlannedOp, Snapshot};
 use crate::verbs::{
-    planned_precondition_refusal, run_pipeline_public, single_refusal_certificate, VerbOptions,
+    planned_precondition_refusal, planned_precondition_refusal_for, run_pipeline_public,
+    single_refusal_certificate, single_status_certificate, VerbOptions,
 };
 use greppy_core::Result;
 use greppy_parser::Language;
@@ -112,7 +113,13 @@ pub fn ensure_import(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
-    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+    if let Some(certificate) = planned_precondition_refusal_for(
+        workspace_root,
+        &snapshot,
+        options,
+        SelectorEngine::TreeSitter,
+        SelectorClass::Structural,
+    ) {
         return Ok(certificate);
     }
     let language = greppy_parser::language_for_path(file);
@@ -137,12 +144,13 @@ pub fn ensure_import(
         ));
     };
     if scan.satisfied {
-        return Ok(single_refusal_certificate(
+        return Ok(single_status_certificate(
             workspace_root,
             &snapshot,
             SelectorEngine::TreeSitter,
             SelectorClass::Structural,
             Status::AlreadySatisfied,
+            1,
             options,
         ));
     }
@@ -218,6 +226,16 @@ pub fn ensure_annotation(
         return Ok(certificate);
     }
     let language = greppy_parser::language_for_path(file);
+    if def_range.0 >= def_range.1 || def_range.1 > snapshot.content.len() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::NotFound,
+            options,
+        ));
+    }
     let line = annotation.trim();
     // indentation of the definition line
     let def_line_start = snapshot.content[..def_range.0]
@@ -246,12 +264,13 @@ pub fn ensure_annotation(
             .to_string();
         if prev_line.starts_with('@') || prev_line.starts_with("#[") {
             if prev_line == line {
-                return Ok(single_refusal_certificate(
+                return Ok(single_status_certificate(
                     workspace_root,
                     &snapshot,
                     SelectorEngine::Symbol,
                     SelectorClass::Resolved,
                     Status::AlreadySatisfied,
+                    1,
                     options,
                 ));
             }
@@ -279,6 +298,78 @@ pub fn ensure_annotation(
     )
 }
 
+fn method_state_and_insertion(
+    language: Language,
+    content: &[u8],
+    class_range: (usize, usize),
+    method_name: &str,
+) -> Option<(bool, usize)> {
+    if class_range.0 >= class_range.1 || class_range.1 > content.len() {
+        return None;
+    }
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let class_bytes = &content[class_range.0..class_range.1];
+    let query_start = class_bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map(|offset| class_range.0 + offset)?;
+    let query_end = class_bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|offset| class_range.0 + offset + 1)?;
+    let mut scope = tree
+        .root_node()
+        .descendant_for_byte_range(query_start, query_end.saturating_sub(1))?;
+    let body = loop {
+        if let Some(body) = scope.child_by_field_name("body") {
+            if body.start_byte() >= class_range.0 && body.end_byte() <= class_range.1 {
+                break body;
+            }
+        }
+        scope = scope.parent()?;
+    };
+
+    let mut found = false;
+    let mut cursor = body.walk();
+    let mut reached_body = false;
+    while !reached_body {
+        let node = cursor.node();
+        let is_method = node != body
+            && (node.kind().contains("function") || node.kind().contains("method"));
+        if is_method
+            && node.child_by_field_name("name").is_some_and(|name| {
+                &content[name.start_byte()..name.end_byte()] == method_name.as_bytes()
+            })
+        {
+            found = true;
+            break;
+        }
+        // A nested definition is not a class method. Once a direct method node
+        // is reached, skip its subtree before looking for the next sibling.
+        if !is_method && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_body = true;
+                break;
+            }
+        }
+    }
+
+    let body_bytes = &content[body.start_byte()..body.end_byte()];
+    let insert_at = body_bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .filter(|offset| body_bytes[*offset] == b'}')
+        .map(|offset| body.start_byte() + offset)
+        .unwrap_or(body.end_byte());
+    Some((found, insert_at))
+}
+
 /// `greppy edit ensure-method --symbol CLASS`: append a method to a class
 /// body when no method of that name exists; present -> already-satisfied.
 pub fn ensure_method(
@@ -294,34 +385,29 @@ pub fn ensure_method(
         return Ok(certificate);
     }
     let language = greppy_parser::language_for_path(file);
-    // existiert eine methode dieses namens in der klasse?
-    let existing = crate::verbs::identifier_sites_public(
-        language,
-        &snapshot.content,
-        class_range,
-        method_name.as_bytes(),
-    )
-    .unwrap_or_default();
-    // grobe aber ehrliche pruefung: ein identifier-vorkommen mit
-    // definitionskontext (naechstes non-ws zeichen ist "(") direkt nach
-    // "def "/"fn " zaehlt als vorhandene methode
-    let text = String::from_utf8_lossy(&snapshot.content);
-    for (start, _end) in &existing {
-        let before = &text[..*start];
-        if before.trim_end().ends_with("def") || before.trim_end().ends_with("fn") {
-            return Ok(single_refusal_certificate(
-                workspace_root,
-                &snapshot,
-                SelectorEngine::Symbol,
-                SelectorClass::Resolved,
-                Status::AlreadySatisfied,
-                options,
-            ));
-        }
+    let Some((found, insert_at)) =
+        method_state_and_insertion(language, &snapshot.content, class_range, method_name)
+    else {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::NotFound,
+            options,
+        ));
+    };
+    if found {
+        return Ok(single_status_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::AlreadySatisfied,
+            1,
+            options,
+        ));
     }
-    // einfuegen am ende des klassenkoerpers (vor dem schliessenden ende),
-    // eingerueckt wie die letzte zeile des koerpers
-    let insert_at = class_range.1.min(snapshot.content.len());
     let mut block = Vec::new();
     block.push(b'\n');
     block.extend_from_slice(method_source.as_bytes());
@@ -357,10 +443,26 @@ pub fn ensure_argument(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let snapshot = Snapshot::read(file)?;
-    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+    if let Some(certificate) = planned_precondition_refusal_for(
+        workspace_root,
+        &snapshot,
+        options,
+        SelectorEngine::TreeSitter,
+        SelectorClass::Structural,
+    ) {
         return Ok(certificate);
     }
     let language = greppy_parser::language_for_path(file);
+    if def_range.0 >= def_range.1 || def_range.1 > snapshot.content.len() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::NotFound,
+            options,
+        ));
+    }
     let Some(call_args) = call_argument_spans(language, &snapshot.content, def_range, callee)
     else {
         return Ok(single_refusal_certificate(
@@ -400,12 +502,13 @@ pub fn ensure_argument(
         });
     }
     if ops.is_empty() {
-        return Ok(single_refusal_certificate(
+        return Ok(single_status_certificate(
             workspace_root,
             &snapshot,
             SelectorEngine::TreeSitter,
             SelectorClass::Structural,
             Status::AlreadySatisfied,
+            call_args.len(),
             options,
         ));
     }
