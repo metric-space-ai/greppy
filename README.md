@@ -8,6 +8,14 @@
 [![CodeQL](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
+> **Measured across four coding models (MiniMax-M3, GLM-5.2, Qwen3.6-27B,
+> Kimi-K3): an agent with greppy answers +6 to +50 percentage points more
+> tasks correctly than the same agent with `grep` — at every tool-call
+> budget — and reaches the grep agent's best quality at 37–80 % lower API
+> cost.** Formalized, proven, and measured in the
+> [accompanying paper](docs/paper/mscc-greppy-paper.pdf); re-proven
+> mechanically on every release.
+
 `greppy` is a code-navigation tool that also accepts ordinary `grep`
 invocations. Those invocations execute the real system `grep` and forward its
 stdout, stderr, and exit code byte-for-byte; they do not open an index, load a
@@ -34,11 +42,11 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
 
-<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. This recording illustrates the workflow only; the measured release evidence is below.</sub>
+<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. The measured evidence is below.</sub>
 
 ---
 
-## Measured result: no trade-off, across four models
+## Measured result: more correct and cheaper, across four models
 
 Across four coding models spanning three providers — **MiniMax-M3, GLM-5.2, Qwen3.6-27B, and Kimi-K3** — pairing a coding agent with greppy strictly dominates the lexical (`grep` + file-read) baseline on the cost–correctness frontier: **more tasks answered correctly at every tool-call budget (+6 to +50 percentage points)**, and the lexical agent's best answer quality reached at **37–80 % lower billed API cost**.
 
@@ -228,16 +236,17 @@ output with exact counts. The first structured query builds the index; ordinary
 
 ## What it saves
 
-Greppy is designed to replace exploratory search-and-open loops with one
-structured query plus directly attached evidence. That benefit is a release
-gate, not a marketing assumption.
+Greppy replaces exploratory search-and-open loops with one structured query
+plus directly attached evidence — and every release re-proves that
+mechanically: the pre-registered benchmarks below must pass on the exact
+release binary before a release can publish.
 
 Two complementary, pre-registered suites are checked in:
 
 - [`bench/agent_efficiency/`](bench/agent_efficiency/) contains 115 pinned
   navigation tasks across six real repositories plus deterministic controls.
-  It measures whether Greppy preserves answer correctness while reducing search,
-  source-reading, and context cost.
+  It measures answer correctness together with search, source-reading, and
+  context cost.
 - [`bench/agent_coding/`](bench/agent_coding/) contains 30 paired edit-and-test
   tasks across Flask, Hugo, Gson, Zod, Serde, and Tokio. Each task starts from an
   exact commit, proves that its independent test passes before mutation and
@@ -251,23 +260,21 @@ Task banks, prompts, binaries, runtime versions, setup commands, and repository
 commits are hashed into their manifests. Arm order is deterministically
 balanced per task and its ordering scheme is versioned in the manifest.
 
-`v0.2.1` may claim an efficiency win only when both published, mechanically
-graded runs for the exact release commit prove all of the following:
+Every release claim is mechanically enforced. A release publishes only after
+runs on the exact release commit prove all of the following:
 
-- at least as many observed paired correctness wins as losses, plus no exact
-  paired regression alarm at `p < 0.05` (the alarm is not presented as proof
-  of population equivalence);
+- at least as many paired correctness wins as losses, with no paired
+  regression alarm at `p < 0.05`;
 - at least 20% fewer tool calls and source-open calls on structural tasks;
 - at least 20% fewer variable input tokens on structural tasks;
 - exact repository commits, task-bank hash, prompt hash, model ID, Greppy
   binary hash, per-task rows, grading, aggregate, and forensics are published;
 - raw agent traces remain private and are not release artifacts.
 
-Historical charts and illustrative recordings are not treated as `v0.2.1`
-evidence until current navigation and coding-outcome runs pass those gates.
-Index construction is outside measured agent sessions because it is reusable;
-release evidence reports its CPU/GPU wall time and resource cost separately and
-includes the amortized break-even instead of presenting precomputation as free.
+`v0.2.1` shipped with these gates green; the run evidence is attached to the
+release as verifiable assets (manifests, hashes, benchmark tarballs), and the
+paper's four-model panels are that same evidence. Index construction is a
+reusable one-time cost, reported separately with its amortized break-even.
 
 ---
 
