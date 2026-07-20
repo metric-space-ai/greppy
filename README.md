@@ -356,6 +356,17 @@ repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 - **Bounded warm daemons.** The embedding and summary engines use separate local daemons. A used model remains resident for five idle minutes; the process exits after 30 idle minutes. Failed inference never removes deterministic source or graph output.
 - **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
 
+## What the graph cannot see
+
+A symbol graph is built from source text. Edges a program wires up at runtime — reflection, dependency injection, monkeypatching, dynamically dispatched calls, code generated during the build — are invisible to every static tool, greppy included. Greppy is built so these blind spots do not turn into wrong answers:
+
+- `semantic-search` finds code by meaning, not by graph edges. A reflection target or a generated handler is still findable by describing what it does.
+- `find-usages` reports references and imports, not only resolved calls — dynamic call sites almost always still name the symbol somewhere in the text.
+- The grep passthrough stays available for string-level certainty.
+- The shipped agent prompt states the rule outright: an empty result does not prove that no relation exists — switch navigation methods instead of concluding.
+
+Language support is tiered the same way, deliberately: 60+ languages have parser-level support, and graph completeness is certified per language by fixture grids — currently Rust, Python, Java, JavaScript, TypeScript, and Go, with C++, C#, Kotlin, Swift, and Ruby next. Certification means the tier is measured, not assumed.
+
 ## Local data and cleanup
 
 Greppy stores workspace paths, source spans, graph edges, embeddings, and query
