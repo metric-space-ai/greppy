@@ -306,14 +306,12 @@ pub enum Command {
     /// call, instead of iterating semantic-search + who-calls + callees separately.
     Brief {
         symbol: Option<String>,
-        /// Optional file to disambiguate SYMBOL when it resolves in several
-        /// files. Agents reach for `brief open src/flask/testing.py` or
-        /// `brief open --path src/flask/testing.py`; both narrow resolution to
-        /// that file (equivalent to the `path::SYMBOL` form). Serving this
-        /// reasonable call is cheaper than punishing it with a parse error.
-        path: Option<String>,
-        /// Same disambiguation as the positional path, in flag form.
-        #[arg(long = "path", value_name = "FILE")]
+        /// Restrict returned definitions/callers/callees to these files or
+        /// directory subtrees. Graph resolution itself remains workspace-wide.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+        /// Flag spelling for one additional result-path filter.
+        #[arg(long = "path", value_name = "PATH")]
         path_opt: Option<String>,
         /// Accepted for agent ergonomics: brief already prints the
         /// definition's source, so --code is a no-op — but agents
@@ -392,6 +390,9 @@ pub enum Command {
     /// separate file Read.
     WhoCalls {
         symbol: Option<String>,
+        /// Restrict returned callers to these files or directory subtrees.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
         code: bool,
@@ -408,6 +409,9 @@ pub enum Command {
     /// source span.
     Callees {
         symbol: Option<String>,
+        /// Restrict returned callees to these files or directory subtrees.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
         code: bool,
@@ -423,6 +427,9 @@ pub enum Command {
     /// referencing node's source span.
     FindUsages {
         symbol: Option<String>,
+        /// Restrict returned usage sites to these files or directory subtrees.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
         code: bool,
@@ -517,6 +524,9 @@ pub enum Command {
     /// Code search.
     SearchCode {
         query: Option<String>,
+        /// Restrict returned matches to these files or directory subtrees.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
         /// Restrict search to files changed in the current git worktree.
         #[arg(long)]
         changed: bool,
@@ -542,6 +552,9 @@ pub enum Command {
     /// Symbol-only search (search-symbols alias).
     SearchSymbols {
         query: Option<String>,
+        /// Restrict returned symbols to these files or directory subtrees.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
         /// Restrict to one node kind (Function, Method, Struct, Class, …).
         /// Matches the label case-insensitively; agents guess this flag,
         /// so it is real (P3 forensics).
@@ -580,10 +593,11 @@ pub enum Command {
     #[command(name = "semantic-search", alias = "semantic")]
     Semantic {
         query: Option<String>,
-        /// Accepted for agent ergonomics — semantic-search ranks across the
-        /// whole workspace, so --path is advisory only and does not restrict
-        /// results; it must not turn a reasonable call into a parse error.
-        #[arg(long = "path", value_name = "FILE")]
+        /// Restrict returned semantic hits to these files or directory subtrees.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+        /// Flag spelling for one additional result-path filter.
+        #[arg(long = "path", value_name = "PATH")]
         path_opt: Option<String>,
         /// Emit machine-readable JSON.
         #[arg(long)]
@@ -1214,15 +1228,20 @@ fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
 /// costs the agent a turn of thinking plus a tool call).
 fn subcommand_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "who-calls" => "greppy who-calls SYMBOL [--code|--json] [--all] [--root DIR]",
-        "callees" => "greppy callees SYMBOL [--code|--json] [--all] [--root DIR]",
-        "find-usages" | "references" => {
-            "greppy find-usages SYMBOL [--code|--json] [--all] [--root DIR]"
+        "who-calls" => {
+            "greppy who-calls SYMBOL [PATH ...] [--code|--json] [--all] [--root DIR]"
         }
+        "callees" => {
+            "greppy callees SYMBOL [PATH ...] [--code|--json] [--all] [--root DIR]"
+        }
+        "find-usages" => {
+            "greppy find-usages SYMBOL [PATH ...] [--code|--json] [--all] [--root DIR]"
+        }
+        "references" => "greppy references SYMBOL [--code|--json] [--all] [--root DIR]",
         "impact" => {
             "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
-        "brief" => "greppy brief SYMBOL [--root DIR]",
+        "brief" => "greppy brief SYMBOL [PATH ...] [--root DIR]",
         "read" => {
             "greppy read SYMBOL [--handle] [--json] [--root DIR]  \
              (SYMBOL is a definition name like Owner::method - not a file \
@@ -1233,14 +1252,15 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
              delete|rename-call|ensure-import|text-cas|regex-cas|apply> --help"
         }
         "expand" => "greppy expand ID [--json] [--root DIR]",
-        "semantic-search" | "semantic" => "greppy semantic-search \"QUERY\" [--root DIR]",
+        "semantic-search" | "semantic" => {
+            "greppy semantic-search \"QUERY\" [PATH ...] [--root DIR]"
+        }
         "context" => "greppy context \"QUERY\" [--root DIR]",
         "search-code" => {
-            "greppy search-code QUERY [--json] [--root DIR]  \
-             (no path filter flags; to scope to a file, grep it: greppy PATTERN FILE)"
+            "greppy search-code QUERY [PATH ...] [--json] [--root DIR]"
         }
         "search-symbols" => {
-            "greppy search-symbols NAME [--kind function|method|struct|class] [--json] [--root DIR]"
+            "greppy search-symbols NAME [PATH ...] [--kind function|method|struct|class] [--json] [--root DIR]"
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
@@ -1812,17 +1832,16 @@ fn dispatch_subcommand(
         ),
         Command::Brief {
             symbol,
-            path,
+            mut paths,
             path_opt,
             code: _,
             all: _,
             json,
         } => {
-            let folded = qualify_symbol_with_path(
-                symbol.as_deref(),
-                path.as_deref().or(path_opt.as_deref()),
-            );
-            dispatch_brief(folded.as_deref().or(symbol.as_deref()), json, root)
+            if let Some(path) = path_opt {
+                paths.push(path);
+            }
+            dispatch_brief(symbol.as_deref(), &paths, json, root)
         }
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
@@ -1845,22 +1864,25 @@ fn dispatch_subcommand(
         Command::Doctor { json } => dispatch_doctor(json, root),
         Command::WhoCalls {
             symbol,
+            paths,
             code,
             all,
             json,
-        } => dispatch_who_calls(symbol.as_deref(), code, all, json, root),
+        } => dispatch_who_calls(symbol.as_deref(), &paths, code, all, json, root),
         Command::Callees {
             symbol,
+            paths,
             code,
             all,
             json,
-        } => dispatch_callees(symbol.as_deref(), code, all, json, root),
+        } => dispatch_callees(symbol.as_deref(), &paths, code, all, json, root),
         Command::FindUsages {
             symbol,
+            paths,
             code,
             all,
             json,
-        } => dispatch_find_usages(symbol.as_deref(), code, all, json, root),
+        } => dispatch_find_usages(symbol.as_deref(), &paths, code, all, json, root),
         Command::References {
             symbol,
             code,
@@ -1889,6 +1911,7 @@ fn dispatch_subcommand(
         } => dispatch_path(from.as_deref(), to.as_deref(), &edge, json, root),
         Command::SearchCode {
             query,
+            paths,
             changed,
             staged,
             since,
@@ -1898,6 +1921,7 @@ fn dispatch_subcommand(
             all: _,
         } => dispatch_search_code(
             query.as_deref(),
+            &paths,
             changed,
             staged,
             since.as_deref(),
@@ -1907,11 +1931,12 @@ fn dispatch_subcommand(
         ),
         Command::SearchSymbols {
             query,
+            paths,
             kind,
             json,
             code: _,
             all: _,
-        } => dispatch_search_symbols(query.as_deref(), kind.as_deref(), json, root),
+        } => dispatch_search_symbols(query.as_deref(), &paths, kind.as_deref(), json, root),
         Command::Plus {
             query,
             k,
@@ -1929,14 +1954,21 @@ fn dispatch_subcommand(
         ),
         Command::Semantic {
             query,
-            path_opt: _,
+            mut paths,
+            path_opt,
             json,
-        } => dispatch_semantic(
-            query.as_deref(),
-            json,
-            EmbeddingCliArgs { device, no_gpu },
-            root,
-        ),
+        } => {
+            if let Some(path) = path_opt {
+                paths.push(path);
+            }
+            dispatch_semantic(
+                query.as_deref(),
+                &paths,
+                json,
+                EmbeddingCliArgs { device, no_gpu },
+                root,
+            )
+        }
         Command::Context {
             query,
             k,
@@ -2254,35 +2286,6 @@ fn symbol_candidate_rows(
         None => greppy_search::GraphQuery::any().with_limit(1),
     };
     let rows = greppy_search::search_graph(store, &q)?;
-    if !rows.is_empty() {
-        return Ok(rows);
-    }
-    // P3 (agent ergonomics): agents guess casing (`Coerce` vs `coerce`).
-    // When the exact name misses, accept a case-variant IF it is
-    // unambiguous — every case-insensitive match shares one spelling.
-    // Multiple distinct spellings stay unresolved (never-guess), and the
-    // not-found path then lists them as suggestions.
-    if let Some(s) = symbol {
-        let lookup_name = split_qualified(s).map(|(_, member)| member).unwrap_or(s);
-        let project = store
-            .list_projects()
-            .ok()
-            .and_then(|ps| ps.into_iter().next().map(|p| p.name));
-        if let Some(project) = project {
-            if let Ok(similar) = store.similar_node_names(&project, lookup_name, 10) {
-                let exact_ci: Vec<&String> = similar
-                    .iter()
-                    .filter(|n| n.eq_ignore_ascii_case(lookup_name))
-                    .collect();
-                if exact_ci.len() == 1 {
-                    let q = greppy_search::GraphQuery::any()
-                        .with_name(exact_ci[0].clone())
-                        .with_limit(10_000);
-                    return greppy_search::search_graph(store, &q);
-                }
-            }
-        }
-    }
     Ok(rows)
 }
 
@@ -2341,6 +2344,53 @@ fn suggestion_needles(query: &str) -> Vec<String> {
         needles.push(query.to_string());
     }
     needles
+}
+
+fn symbol_miss_suggestions(store: &greppy_store::Store, project: &str, query: &str) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    for needle in suggestion_needles(query) {
+        let mut similar = store
+            .similar_node_names(project, &needle, 5)
+            .unwrap_or_default();
+        similar.sort_by_key(|name| !name.eq_ignore_ascii_case(&needle));
+        for name in similar {
+            if !suggestions.iter().any(|candidate| candidate == &name) {
+                suggestions.push(name);
+            }
+            if suggestions.len() == 5 {
+                return suggestions;
+            }
+        }
+    }
+    suggestions
+}
+
+fn print_symbol_miss_guidance(store: &greppy_store::Store, project: &str, query: &str) {
+    println!("symbol not found: `{query}`");
+    for suggestion in symbol_miss_suggestions(store, project, query) {
+        println!("suggestion: `{suggestion}`");
+    }
+    println!("try: greppy search-symbols {}", shell_example_arg(query));
+    println!("try: greppy semantic-search {}", shell_example_arg(query));
+}
+
+fn symbol_miss_json(store: &greppy_store::Store, project: &str, query: &str) -> serde_json::Value {
+    serde_json::json!({
+        "suggestions": symbol_miss_suggestions(store, project, query),
+        "next": [
+            format!("greppy search-symbols {}", shell_example_arg(query)),
+            format!("greppy semantic-search {}", shell_example_arg(query)),
+        ],
+    })
+}
+
+fn has_case_variant_suggestion(suggestions: &[String], query: &str) -> bool {
+    let needle = split_qualified(query)
+        .map(|(_, member)| member)
+        .unwrap_or(query);
+    suggestions
+        .iter()
+        .any(|candidate| candidate != needle && candidate.eq_ignore_ascii_case(needle))
 }
 
 /// Split `file/path.ext::REST` into `(path, rest)` when the head segment is a
@@ -3323,6 +3373,11 @@ fn nav_counts_json_with_expand(
         "all": all,
         "hits": hits,
     });
+    if !symbol_found {
+        let miss = symbol_miss_json(store, project, symbol);
+        v["suggestions"] = miss["suggestions"].clone();
+        v["next"] = miss["next"].clone();
+    }
     if let Some(expand) = expand {
         v["expand"] = expand.json_value();
     }
@@ -5800,7 +5855,13 @@ fn dispatch_impact(
             )?;
             return Ok(1);
         }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "impact");
+        return content_fallback(
+            &store,
+            root,
+            symbol.unwrap_or(""),
+            "impact",
+            &QueryPathFilters::default(),
+        );
     };
     // Aggregate over every same-name start node (e.g. a Class and its Impl) and
     // union the reach, keeping the minimum hop count. For default incoming
@@ -6217,8 +6278,8 @@ fn dispatch_read(
         // wastes the second engine and forces the agent to guess formats
         // (trace forensics 2026-07-17: 12 read not-founds, 4-5 turns each).
         let query = symbol.unwrap_or("");
-        let hits =
-            greppy_search::semantic_query(&store, query, None, Some(&project), 6).unwrap_or_default();
+        let hits = greppy_search::semantic_query(&store, query, None, Some(&project), 6)
+            .unwrap_or_default();
         // A clearly dominant hit is safe to read directly (read mutates
         // nothing); otherwise offer addressable candidates and let the agent
         // pick. Dominance = single hit, or top score >= 1.4x the runner-up.
@@ -6628,12 +6689,8 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             } => {
                 let abs = root_path.join(&rel_path);
                 let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options = resolved_options(
-                    dry_run,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                );
+                let options =
+                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
                 (
                     greppy_edit::verbs::rename_in_span(
                         &root_path, &abs, range, &from, &to, expect, language, &options,
@@ -6657,12 +6714,8 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             } => {
                 let abs = root_path.join(&rel_path);
                 let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options = resolved_options(
-                    dry_run,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                );
+                let options =
+                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
                 (
                     greppy_edit::verbs::delete_span(
                         &root_path,
@@ -6793,12 +6846,8 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 planned_target_sha256,
             } => {
                 let abs = root_path.join(&rel_path);
-                let options = resolved_options(
-                    dry_run,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                );
+                let options =
+                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
                 (
                     greppy_edit::ensure::ensure_argument(
                         &root_path, &abs, range, &call, &arg, &options,
@@ -6856,12 +6905,8 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 planned_target_sha256,
             } => {
                 let abs = root_path.join(&rel_path);
-                let options = resolved_options(
-                    dry_run,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                );
+                let options =
+                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
                 (
                     greppy_edit::ensure::ensure_annotation(
                         &root_path,
@@ -6895,18 +6940,14 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                             planned_target_sha256,
                         ),
                     ),
-                    EditTarget::Refusal(cert)
-                        if cert.status == greppy_edit::Status::NotFound =>
-                    {
-                        (
-                            None,
-                            greppy_edit::verbs::VerbOptions {
-                                dry_run,
-                                with_diff: true,
-                                ..Default::default()
-                            },
-                        )
-                    }
+                    EditTarget::Refusal(cert) if cert.status == greppy_edit::Status::NotFound => (
+                        None,
+                        greppy_edit::verbs::VerbOptions {
+                            dry_run,
+                            with_diff: true,
+                            ..Default::default()
+                        },
+                    ),
                     EditTarget::Refusal(cert) => {
                         return finish_edit(*cert, report, root, &root_path)
                     }
@@ -7455,11 +7496,17 @@ fn resolve_edit_file(root_path: &std::path::Path, file: &str) -> std::path::Path
     }
 }
 
-fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
+fn dispatch_brief(
+    symbol: Option<&str>,
+    paths: &[String],
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    let query_symbol = symbol.unwrap_or("");
+    let path_filters = prepare_query_path_filters(root, "brief", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
-    let query_symbol = symbol.unwrap_or("");
     if let Some(code) = graph_stale_gate(
         &store,
         root,
@@ -7485,6 +7532,7 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
     let targets = resolve_symbol_nodes(&store, symbol)?;
     if targets.is_empty() {
         if json {
+            let miss = symbol_miss_json(&store, &project, query_symbol);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -7493,6 +7541,8 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
                     "status": "not_found",
                     "project": project,
                     "query": query_symbol,
+                    "suggestions": miss["suggestions"].clone(),
+                    "next": miss["next"].clone(),
                     "definitions": [],
                     "callers": [],
                     "references": [],
@@ -7503,11 +7553,19 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
             );
             return Ok(1);
         }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "brief");
+        return content_fallback(&store, root, symbol.unwrap_or(""), "brief", &path_filters);
     }
     let root_path = resolve_root(root)?;
     if json {
-        return dispatch_brief_json(&store, &project, query_symbol, &targets, &root_path, root);
+        return dispatch_brief_json(
+            &store,
+            &project,
+            query_symbol,
+            &targets,
+            &root_path,
+            root,
+            &path_filters,
+        );
     }
     let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
 
@@ -7515,7 +7573,7 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
     let mut seen_def = std::collections::BTreeSet::new();
     for id in &targets {
         if let Some(n) = store.get_node(*id)? {
-            if seen_def.insert(n.id) {
+            if path_filters.matches(&n.file_path) && seen_def.insert(n.id) {
                 evidence_nodes.push((
                     format!("definition {}", display_node_name(&n)),
                     n.clone(),
@@ -7555,7 +7613,8 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
         }
     }
 
-    let callers = incoming_call_nodes_for_targets(&store, &targets)?;
+    let mut callers = incoming_call_nodes_for_targets(&store, &targets)?;
+    callers.retain(|node| path_filters.matches(&node.file_path));
     let cshown = callers.len().min(BRIEF_LIMIT);
     println!("\n-- CALLERS ({}) --", callers.len());
     for n in &callers[..cshown] {
@@ -7569,8 +7628,14 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
     print_nav_more_footer(callers.len(), cshown);
 
     if targets_include_non_callable(&store, &targets)? {
-        let total = greppy_search::count_references_to_any(&store, &project, &targets)?;
-        let refs = greppy_search::find_references_to_any(&store, &targets, BRIEF_LIMIT)?;
+        let mut refs = greppy_search::find_references_to_any(
+            &store,
+            &targets,
+            greppy_search::MAX_REACH_RESULTS,
+        )?;
+        refs.retain(|reference| path_filters.matches(&reference.node.file_path));
+        let total = refs.len();
+        refs.truncate(BRIEF_LIMIT);
         println!("\n-- REFERENCES ({}) --", total);
         for r in &refs {
             if let Some(node) = store.get_node(r.node.id)? {
@@ -7601,6 +7666,7 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
             }
         }
     }
+    callees.retain(|_, node| path_filters.matches(&node.file_path));
     let eshown = callees.len().min(BRIEF_LIMIT);
     println!("\n-- CALLS ({}) --", callees.len());
     for n in callees.values().take(eshown) {
@@ -7612,6 +7678,12 @@ fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Resul
         println!("  {} {}", display_node_name(n), node_line_span(n));
     }
     print_nav_more_footer(callees.len(), eshown);
+    if evidence_nodes.is_empty() && !path_filters.is_empty() {
+        println!(
+            "\n(no brief results under path filter: {})",
+            path_filters.shown()
+        );
+    }
     let evidence_rows = evidence_nodes
         .iter()
         .map(|(title, node, extra_json)| ExpandEvidenceNode {
@@ -7642,6 +7714,7 @@ fn dispatch_brief_json(
     targets: &[i64],
     root_path: &std::path::Path,
     root: Option<&str>,
+    path_filters: &QueryPathFilters,
 ) -> Result<i32> {
     let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
     let mut definitions = Vec::new();
@@ -7650,7 +7723,7 @@ fn dispatch_brief_json(
         let Some(node) = store.get_node(*id)? else {
             continue;
         };
-        if !seen_def.insert(node.id) {
+        if !path_filters.matches(&node.file_path) || !seen_def.insert(node.id) {
             continue;
         }
         let span = read_span_with_meta(
@@ -7697,7 +7770,8 @@ fn dispatch_brief_json(
         ));
     }
 
-    let callers = incoming_call_nodes_for_targets(store, targets)?;
+    let mut callers = incoming_call_nodes_for_targets(store, targets)?;
+    callers.retain(|node| path_filters.matches(&node.file_path));
     let callers_json = callers.iter().map(node_hit_json).collect::<Vec<_>>();
     for node in &callers {
         evidence_nodes.push((
@@ -7709,7 +7783,15 @@ fn dispatch_brief_json(
 
     let mut references_json = Vec::new();
     if targets_include_non_callable(store, targets)? {
-        for reference in greppy_search::find_references_to_any(store, targets, BRIEF_LIMIT)? {
+        for reference in
+            greppy_search::find_references_to_any(store, targets, greppy_search::MAX_REACH_RESULTS)?
+        {
+            if !path_filters.matches(&reference.node.file_path) {
+                continue;
+            }
+            if references_json.len() == BRIEF_LIMIT {
+                break;
+            }
             references_json.push(serde_json::json!({
                 "edge_type": &reference.edge_type,
                 "qualified_name": &reference.node.qualified_name,
@@ -7742,6 +7824,7 @@ fn dispatch_brief_json(
             }
         }
     }
+    callees.retain(|_, node| path_filters.matches(&node.file_path));
     let calls_json = callees.values().map(node_hit_json).collect::<Vec<_>>();
     for node in callees.values() {
         evidence_nodes.push((
@@ -7776,6 +7859,7 @@ fn dispatch_brief_json(
         "status": "ok",
         "project": project,
         "query": query_symbol,
+        "path_filters": path_filters.json_value(),
         "freshness": freshness,
         "definitions": definitions,
         "callers": callers_json,
@@ -8666,29 +8750,30 @@ fn content_fallback(
     root: Option<&str>,
     symbol: &str,
     kind: &str,
+    path_filters: &QueryPathFilters,
 ) -> Result<i32> {
     let project = project_for(root)?;
-    let mut hits = greppy_search::search_code(store, &project, symbol, 50)?;
-    if hits.is_empty() {
-        hits = live_grep_code_hits(symbol, &resolve_root(root)?)?
-            .into_iter()
-            .take(50)
-            .collect();
+    let suggestions = symbol_miss_suggestions(store, &project, symbol);
+    if has_case_variant_suggestion(&suggestions, symbol) {
+        print_symbol_miss_guidance(store, &project, symbol);
+        return Ok(1);
     }
+    let mut hits = greppy_search::search_code(store, &project, symbol, 200)?;
     if hits.is_empty() {
-        // Truly nothing — not a graph symbol and no indexed text either.
-        // Offer the closest indexed names so the dead end carries a next
-        // step (P3: agents otherwise retry blind variants or bail to grep).
-        let needle = split_qualified(symbol).map(|(_, m)| m).unwrap_or(symbol);
-        let similar = store
-            .similar_node_names(&project, needle, 5)
-            .unwrap_or_default();
-        if similar.is_empty() {
-            println!("(symbol not found: `{symbol}`; no {kind} and no source matches)");
-        } else {
+        hits = live_grep_code_hits(symbol, &resolve_root(root)?)?;
+    }
+    hits.retain(|hit| {
+        hit.location
+            .rsplit_once(':')
+            .is_some_and(|(path, _)| path_filters.matches(path))
+    });
+    hits.truncate(50);
+    if hits.is_empty() {
+        print_symbol_miss_guidance(store, &project, symbol);
+        if !path_filters.is_empty() {
             println!(
-                "(symbol not found: `{symbol}`; no {kind}. Similar indexed names: {} — retry with one of these)",
-                similar.join(", ")
+                "no {kind} or source matches under path filter: {}",
+                path_filters.shown()
             );
         }
         return Ok(1);
@@ -8700,20 +8785,27 @@ fn content_fallback(
     for h in &hits {
         println!("{}  {}", h.location, clamp_snippet(&h.snippet));
     }
+    for suggestion in suggestions {
+        println!("suggestion: `{suggestion}`");
+    }
+    println!("try: greppy search-symbols {}", shell_example_arg(symbol));
+    println!("try: greppy semantic-search {}", shell_example_arg(symbol));
     Ok(0)
 }
 
 fn dispatch_who_calls(
     symbol: Option<&str>,
+    paths: &[String],
     code: bool,
     all: bool,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
+    let query_symbol = symbol.unwrap_or("");
+    let path_filters = prepare_query_path_filters(root, "who-calls", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
         "symbol": query_symbol,
@@ -8763,7 +8855,7 @@ fn dispatch_who_calls(
             )?;
             return Ok(1);
         }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "callers");
+        return content_fallback(&store, root, symbol.unwrap_or(""), "callers", &path_filters);
     }
     let mut edges = Vec::new();
     for target in &targets {
@@ -8789,12 +8881,23 @@ fn dispatch_who_calls(
             )?;
             return Ok(0);
         }
-        println!("(no callers)");
+        if path_filters.is_empty() {
+            println!("(no callers)");
+        } else {
+            println!("(no callers under path filter: {})", path_filters.shown());
+        }
         print_zero_nav_footer(&store, &project, "caller", &targets, "calls")?;
         // O6: zero RESOLVED callers on a defined symbol is exactly where
         // dynamic dispatch hides — offer the textual candidates so the
         // agent doesn't re-derive them with its own grep rounds.
-        print_textual_call_candidates(&store, &project, query_symbol, &targets, &[])?;
+        print_textual_call_candidates(
+            &store,
+            &project,
+            query_symbol,
+            &targets,
+            &[],
+            &path_filters,
+        )?;
         return Ok(0);
     }
     // `--code` reads spans from disk relative to the resolved repo root.
@@ -8823,6 +8926,11 @@ fn dispatch_who_calls(
         if let Some(n) = store.get_node(e.source_id)? {
             nodes.push(n);
         }
+    }
+    nodes.retain(|node| path_filters.matches(&node.file_path));
+    if nodes.is_empty() && !path_filters.is_empty() && !json {
+        println!("(no callers under path filter: {})", path_filters.shown());
+        return Ok(0);
     }
     let total = nodes.len();
     let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
@@ -8896,7 +9004,14 @@ fn dispatch_who_calls(
         provider_incomplete,
     }
     .print();
-    print_textual_call_candidates(&store, &project, query_symbol, &targets, &nodes)?;
+    print_textual_call_candidates(
+        &store,
+        &project,
+        query_symbol,
+        &targets,
+        &nodes,
+        &path_filters,
+    )?;
     if let Some(expand) = &expand {
         println!("{}", expand.text_line());
     }
@@ -8922,6 +9037,7 @@ fn print_textual_call_candidates(
     symbol: &str,
     target_ids: &[i64],
     resolved: &[greppy_store::Node],
+    path_filters: &QueryPathFilters,
 ) -> Result<()> {
     const CANDIDATE_CAP: usize = 10;
     let name = symbol
@@ -8977,6 +9093,9 @@ fn print_textual_call_candidates(
             continue;
         }
         let file = h.location.rsplit_once(':').map(|(f, _)| f).unwrap_or("");
+        if !path_filters.matches(file) {
+            continue;
+        }
         if resolved_files.contains(file) {
             continue; // already represented by a resolved caller
         }
@@ -9016,15 +9135,17 @@ fn print_textual_call_candidates(
 /// deterministically ordered by node id.
 fn dispatch_callees(
     symbol: Option<&str>,
+    paths: &[String],
     code: bool,
     all: bool,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
+    let query_symbol = symbol.unwrap_or("");
+    let path_filters = prepare_query_path_filters(root, "callees", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
         "symbol": query_symbol,
@@ -9071,7 +9192,7 @@ fn dispatch_callees(
             )?;
             return Ok(1);
         }
-        println!("(symbol not found)");
+        print_symbol_miss_guidance(&store, &project, query_symbol);
         return Ok(1);
     }
     // Aggregate direct callees across the resolved source nodes, keyed on
@@ -9088,6 +9209,7 @@ fn dispatch_callees(
             }
         }
     }
+    callees.retain(|_, node| path_filters.matches(&node.file_path));
     if callees.is_empty() {
         if json {
             let project = project_for(root)?;
@@ -9105,7 +9227,11 @@ fn dispatch_callees(
             )?;
             return Ok(0);
         }
-        println!("(no callees)");
+        if path_filters.is_empty() {
+            println!("(no callees)");
+        } else {
+            println!("(no callees under path filter: {})", path_filters.shown());
+        }
         print_zero_nav_footer(&store, &project, "callee", &sources, "calls")?;
         return Ok(0);
     }
@@ -9187,15 +9313,17 @@ fn dispatch_callees(
 /// file:line` so the edge kind is visible.
 fn dispatch_find_usages(
     symbol: Option<&str>,
+    paths: &[String],
     code: bool,
     all: bool,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
     ensure_nav_json_mode(code, json)?;
+    let query_symbol = symbol.unwrap_or("");
+    let path_filters = prepare_query_path_filters(root, "find-usages", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let query_symbol = symbol.unwrap_or("");
     let project = project_for(root)?;
     let graph_gate_extra = serde_json::json!({
         "symbol": query_symbol,
@@ -9250,7 +9378,7 @@ fn dispatch_find_usages(
             )?;
             return Ok(1);
         }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "usages");
+        return content_fallback(&store, root, symbol.unwrap_or(""), "usages", &path_filters);
     }
     let mut edges = Vec::new();
     // P10: "usages" to an agent means EVERY reference. A function whose
@@ -9282,7 +9410,11 @@ fn dispatch_find_usages(
             )?;
             return Ok(0);
         }
-        println!("(no usages)");
+        if path_filters.is_empty() {
+            println!("(no usages)");
+        } else {
+            println!("(no usages under path filter: {})", path_filters.shown());
+        }
         print_zero_nav_footer(&store, &project, "usage", &targets, "usages")?;
         return Ok(0);
     }
@@ -9314,6 +9446,11 @@ fn dispatch_find_usages(
         if let Some(n) = store.get_node(e.source_id)? {
             rows.push((e.edge_type.clone(), n));
         }
+    }
+    rows.retain(|(_, node)| path_filters.matches(&node.file_path));
+    if rows.is_empty() && !path_filters.is_empty() && !json {
+        println!("(no usages under path filter: {})", path_filters.shown());
+        return Ok(0);
     }
     let total = rows.len();
     let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
@@ -9469,7 +9606,7 @@ fn dispatch_references(
             )?;
             return Ok(1);
         }
-        println!("(symbol not found)");
+        print_symbol_miss_guidance(&store, &project, query_symbol);
         return Ok(1);
     }
 
@@ -10017,15 +10154,17 @@ fn dispatch_path(
 
 fn dispatch_search_symbols(
     query: Option<&str>,
+    paths: &[String],
     kind: Option<&str>,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    let store = open_default_store(root)?;
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
         return Err(Error::Invalid("search-symbols requires a query".into()));
     }
+    let path_filters = prepare_query_path_filters(root, "search-symbols", q, paths)?;
+    let store = open_default_store(root)?;
     let project = project_for(root)?;
     // Symbol rows are visible only from a freshness-proven snapshot.
     let decision = freshness_serve_decision(&store, root, &project);
@@ -10038,6 +10177,8 @@ fn dispatch_search_symbols(
                 "skipped_stale_index",
                 Some(freshness),
                 &[],
+                &path_filters,
+                Some(0),
             )?;
         } else {
             println!(
@@ -10058,6 +10199,8 @@ fn dispatch_search_symbols(
                 "skipped_incomplete_provider",
                 Some(&freshness),
                 &[],
+                &path_filters,
+                Some(0),
             )?;
         } else {
             println!(
@@ -10068,9 +10211,13 @@ fn dispatch_search_symbols(
         return Ok(1);
     }
 
-    // --kind: fetch a wider candidate set, then keep only nodes whose
-    // label matches case-insensitively (agents type `--kind function`).
-    let fetch = if kind.is_some() { 100 } else { 20 };
+    // Path/kind filters are post-query result filters: fetch broadly, then
+    // narrow on node metadata without changing symbol ranking/resolution.
+    let fetch = if kind.is_some() || !path_filters.is_empty() {
+        10_000
+    } else {
+        20
+    };
     let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
     if let Some(k) = kind {
         let want = k.to_ascii_lowercase();
@@ -10082,14 +10229,35 @@ fn dispatch_search_symbols(
                 .map(|n| n.label.to_ascii_lowercase() == want)
                 .unwrap_or(false)
         });
-        hits.truncate(20);
     }
+    hits.retain(|hit| {
+        store
+            .get_node(hit.node_id)
+            .ok()
+            .flatten()
+            .is_some_and(|node| path_filters.matches(&node.file_path))
+    });
+    let total_filtered = hits.len() as i64;
+    hits.truncate(20);
     if json {
-        search_symbols_json(&store, q, &project, "ok", Some(&freshness), &hits)?;
+        search_symbols_json(
+            &store,
+            q,
+            &project,
+            "ok",
+            Some(&freshness),
+            &hits,
+            &path_filters,
+            (!path_filters.is_empty() || kind.is_some()).then_some(total_filtered),
+        )?;
         return Ok(if hits.is_empty() { 1 } else { 0 });
     }
     if hits.is_empty() {
-        println!("(no matches)");
+        if path_filters.is_empty() {
+            println!("(no matches)");
+        } else {
+            println!("(no matches under path filter: {})", path_filters.shown());
+        }
     } else {
         for h in &hits {
             // Resolve each FTS hit to its node so we can print the
@@ -10110,6 +10278,7 @@ fn dispatch_search_symbols(
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_symbols_json(
     store: &greppy_store::Store,
     query: &str,
@@ -10117,10 +10286,15 @@ fn search_symbols_json(
     status: &str,
     freshness: Option<&serde_json::Value>,
     hits: &[greppy_search::SymbolHit],
+    path_filters: &QueryPathFilters,
+    total_override: Option<i64>,
 ) -> Result<()> {
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let total_exact = if status == "ok" {
-        greppy_search::count_symbols_in_project(store, project, query)?
+        match total_override {
+            Some(total) => total,
+            None => greppy_search::count_symbols_in_project(store, project, query)?,
+        }
     } else {
         0
     };
@@ -10153,6 +10327,7 @@ fn search_symbols_json(
             "status": status,
             "query": query,
             "project": project,
+            "path_filters": path_filters.json_value(),
             "fresh": freshness
                 .and_then(|v| v.get("fresh"))
                 .and_then(serde_json::Value::as_bool)
@@ -10172,8 +10347,10 @@ fn search_symbols_json(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_search_code(
     query: Option<&str>,
+    paths: &[String],
     changed: bool,
     staged: bool,
     since: Option<&str>,
@@ -10185,6 +10362,7 @@ fn dispatch_search_code(
     if q.is_empty() {
         return Err(Error::Invalid("search-code requires a query".into()));
     }
+    let path_filters = prepare_query_path_filters(root, "search-code", q, paths)?;
     let git_scope_count = usize::from(changed)
         + usize::from(staged)
         + usize::from(since.is_some())
@@ -10195,16 +10373,16 @@ fn dispatch_search_code(
         ));
     }
     if changed {
-        return dispatch_search_code_changed(q, json, root);
+        return dispatch_search_code_changed(q, json, root, &path_filters);
     }
     if staged {
-        return dispatch_search_code_staged(q, json, root);
+        return dispatch_search_code_staged(q, json, root, &path_filters);
     }
     if let Some(rev) = since {
-        return dispatch_search_code_since(q, rev, json, root);
+        return dispatch_search_code_since(q, rev, json, root, &path_filters);
     }
     if let Some(rev) = base {
-        return dispatch_search_code_base(q, rev, json, root);
+        return dispatch_search_code_base(q, rev, json, root, &path_filters);
     }
     let store = open_default_store(root)?;
     // Project identity is derived from the
@@ -10224,11 +10402,41 @@ fn dispatch_search_code(
                     indexed_stale_skip_message("search-code", freshness)
                 );
             }
-            return live_grep_search_code(q, root, json, Some(freshness));
+            if path_filters.is_empty() {
+                return live_grep_search_code(q, root, json, Some(freshness));
+            }
+            return live_grep_search_code_filtered(q, root, json, Some(freshness), &path_filters);
         }
         FreshnessServe::Fresh(_) => {}
     }
     let freshness = decision.freshness().clone();
+    if !path_filters.is_empty() {
+        let all_hits = live_grep_code_hits_filtered(q, &resolve_root(root)?, &path_filters)?;
+        let shown_hits = all_hits
+            .iter()
+            .take(SEARCH_CODE_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        if json {
+            search_code_json(
+                &store,
+                q,
+                &project,
+                "ok",
+                Some(&freshness),
+                all_hits.len(),
+                &shown_hits,
+                &path_filters,
+            )?;
+        } else if shown_hits.is_empty() {
+            println!("(no matches under path filter: {})", path_filters.shown());
+        } else {
+            for hit in &shown_hits {
+                println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
+            }
+        }
+        return Ok(if all_hits.is_empty() { 1 } else { 0 });
+    }
 
     let indexed_hits = greppy_search::search_code(&store, &project, q, SEARCH_CODE_LIMIT)?;
     if indexed_hits.is_empty() {
@@ -10250,6 +10458,7 @@ fn dispatch_search_code(
                 Some(&freshness),
                 live_hits.len(),
                 &shown_hits,
+                &path_filters,
             )?;
         } else if shown_hits.is_empty() {
             println!("(no matches)");
@@ -10270,6 +10479,7 @@ fn dispatch_search_code(
             Some(&freshness),
             total_exact,
             &indexed_hits,
+            &path_filters,
         )?;
         return Ok(if total_exact == 0 { 1 } else { 0 });
     }
@@ -10279,6 +10489,7 @@ fn dispatch_search_code(
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_code_json(
     store: &greppy_store::Store,
     query: &str,
@@ -10287,6 +10498,7 @@ fn search_code_json(
     freshness: Option<&serde_json::Value>,
     total_exact: usize,
     hits: &[greppy_search::CodeHit],
+    path_filters: &QueryPathFilters,
 ) -> Result<()> {
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let shown = hits.len();
@@ -10308,6 +10520,7 @@ fn search_code_json(
             "status": status,
             "query": query,
             "project": project,
+            "path_filters": path_filters.json_value(),
             "fresh": freshness
                 .and_then(|v| v.get("fresh"))
                 .and_then(serde_json::Value::as_bool)
@@ -10327,10 +10540,16 @@ fn search_code_json(
     Ok(())
 }
 
-fn dispatch_search_code_changed(query: &str, json: bool, root: Option<&str>) -> Result<i32> {
+fn dispatch_search_code_changed(
+    query: &str,
+    json: bool,
+    root: Option<&str>,
+    path_filters: &QueryPathFilters,
+) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let project = workspace_locator::project_identity(&root_path);
-    let changed_files = git_changed_files(&root_path)?;
+    let mut changed_files = git_changed_files(&root_path)?;
+    changed_files.retain(|path| path_filters.matches(path));
     let all_hits = live_grep_search_code_paths(query, &root_path, &changed_files)?;
     let shown_hits = all_hits
         .iter()
@@ -10345,6 +10564,7 @@ fn dispatch_search_code_changed(query: &str, json: bool, root: Option<&str>) -> 
             changed_files.len(),
             all_hits.len(),
             &shown_hits,
+            path_filters,
         )?;
         return Ok(if all_hits.is_empty() { 1 } else { 0 });
     }
@@ -10365,6 +10585,7 @@ fn search_code_changed_json(
     changed_files_total: usize,
     total_exact: usize,
     hits: &[greppy_search::CodeHit],
+    path_filters: &QueryPathFilters,
 ) -> Result<()> {
     let shown = hits.len();
     let omitted = total_exact.saturating_sub(shown);
@@ -10386,6 +10607,7 @@ fn search_code_changed_json(
             "query": query,
             "project": project,
             "scope": "changed",
+            "path_filters": path_filters.json_value(),
             "backend": "live_grep",
             "fresh": true,
             "freshness": serde_json::Value::Null,
@@ -10401,10 +10623,16 @@ fn search_code_changed_json(
     Ok(())
 }
 
-fn dispatch_search_code_staged(query: &str, json: bool, root: Option<&str>) -> Result<i32> {
+fn dispatch_search_code_staged(
+    query: &str,
+    json: bool,
+    root: Option<&str>,
+    path_filters: &QueryPathFilters,
+) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let project = workspace_locator::project_identity(&root_path);
-    let staged_files = git_staged_files(&root_path)?;
+    let mut staged_files = git_staged_files(&root_path)?;
+    staged_files.retain(|path| path_filters.matches(path));
     let all_hits = grep_staged_git_blobs(query, &root_path, &staged_files)?;
     let shown_hits = all_hits
         .iter()
@@ -10480,8 +10708,15 @@ fn dispatch_search_code_since(
     rev: &str,
     json: bool,
     root: Option<&str>,
+    path_filters: &QueryPathFilters,
 ) -> Result<i32> {
-    dispatch_search_code_diff_scope(query, DiffSearchScope::Since { rev }, json, root)
+    dispatch_search_code_diff_scope(
+        query,
+        DiffSearchScope::Since { rev },
+        json,
+        root,
+        path_filters,
+    )
 }
 
 fn dispatch_search_code_base(
@@ -10489,8 +10724,15 @@ fn dispatch_search_code_base(
     base: &str,
     json: bool,
     root: Option<&str>,
+    path_filters: &QueryPathFilters,
 ) -> Result<i32> {
-    dispatch_search_code_diff_scope(query, DiffSearchScope::Base { base }, json, root)
+    dispatch_search_code_diff_scope(
+        query,
+        DiffSearchScope::Base { base },
+        json,
+        root,
+        path_filters,
+    )
 }
 
 enum DiffSearchScope<'a> {
@@ -10510,10 +10752,12 @@ fn dispatch_search_code_diff_scope(
     scope: DiffSearchScope<'_>,
     json: bool,
     root: Option<&str>,
+    path_filters: &QueryPathFilters,
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let project = workspace_locator::project_identity(&root_path);
-    let spec = git_diff_search_spec(&root_path, scope)?;
+    let mut spec = git_diff_search_spec(&root_path, scope)?;
+    spec.files.retain(|path| path_filters.matches(path));
     let all_hits = live_grep_search_code_paths(query, &root_path, &spec.files)?;
     let shown_hits = all_hits
         .iter()
@@ -11668,6 +11912,55 @@ fn live_grep_search_code(
     Ok(if hits.is_empty() { 1 } else { 0 })
 }
 
+fn live_grep_search_code_filtered(
+    query: &str,
+    root: Option<&str>,
+    json: bool,
+    index_freshness: Option<&serde_json::Value>,
+    path_filters: &QueryPathFilters,
+) -> Result<i32> {
+    let root_path = resolve_root(root)?;
+    let hits = live_grep_code_hits_filtered(query, &root_path, path_filters)?;
+    let shown = hits.len().min(SEARCH_CODE_LIMIT);
+    if json {
+        let rows = hits[..shown]
+            .iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "location": hit.location,
+                    "rank": hit.rank,
+                    "snippet": clamp_snippet(&hit.snippet).as_ref(),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "command": "search-code",
+                "status": "live-fallback",
+                "backend": "live-filesystem",
+                "query": query,
+                "path_filters": path_filters.json_value(),
+                "fresh": true,
+                "index_freshness": index_freshness,
+                "total_exact": hits.len(),
+                "shown": shown,
+                "omitted": hits.len().saturating_sub(shown),
+                "truncated": hits.len() > shown,
+                "hits": rows,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize live search-code JSON: {error}")))?
+        );
+    } else if shown == 0 {
+        println!("(no matches under path filter: {})", path_filters.shown());
+    } else {
+        for hit in &hits[..shown] {
+            println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
+        }
+    }
+    Ok(if hits.is_empty() { 1 } else { 0 })
+}
+
 fn live_grep_code_hits(
     query: &str,
     root_path: &std::path::Path,
@@ -11683,6 +11976,20 @@ fn live_grep_code_hits(
         .map(|entry| entry.rel_path)
         .collect::<Vec<_>>();
     live_grep_search_code_paths(query, root_path, &paths)
+}
+
+fn live_grep_code_hits_filtered(
+    query: &str,
+    root_path: &std::path::Path,
+    path_filters: &QueryPathFilters,
+) -> Result<Vec<greppy_search::CodeHit>> {
+    let mut hits = live_grep_code_hits(query, root_path)?;
+    hits.retain(|hit| {
+        hit.location
+            .rsplit_once(':')
+            .is_some_and(|(path, _)| path_filters.matches(path))
+    });
+    Ok(hits)
 }
 
 fn source_code_hits_ranked(
@@ -12108,6 +12415,7 @@ fn parse_grep_code_hit(line: &str) -> Option<greppy_search::CodeHit> {
 
 fn dispatch_semantic(
     query: Option<&str>,
+    paths: &[String],
     json: bool,
     embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
@@ -12116,6 +12424,7 @@ fn dispatch_semantic(
     if q.is_empty() {
         return Err(Error::Invalid("semantic-search requires a query".into()));
     }
+    let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
 
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
@@ -12245,7 +12554,9 @@ fn dispatch_semantic(
         match embed_query_cached(&cfg, root, q) {
             Ok(query_vector) => {
                 scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
-                let candidates = greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
+                let mut candidates =
+                    greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
+                candidates.retain(|hit| path_filters.matches(&hit.embedding.file_path));
                 let hits = dedupe_semantic_vector_hits(candidates, SEMANTIC_VECTOR_RESULT_LIMIT);
                 let shown = hits.len().min(SEMANTIC_VECTOR_DISPLAY_LIMIT);
                 let display_hits = hits[..shown].to_vec();
@@ -13831,6 +14142,140 @@ fn find_repo_root(start: &std::path::Path) -> std::path::PathBuf {
 fn project_for(root: Option<&str>) -> Result<String> {
     let p = resolve_root(root)?;
     Ok(workspace_locator::project_identity(&p))
+}
+
+#[derive(Debug, Clone)]
+struct QueryPathFilter {
+    shown: String,
+    repo_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryPathFilters {
+    filters: Vec<QueryPathFilter>,
+}
+
+impl QueryPathFilters {
+    fn from_args(root_path: &std::path::Path, paths: &[String]) -> Self {
+        Self {
+            filters: paths
+                .iter()
+                .filter(|path| !path.trim().is_empty())
+                .map(|path| QueryPathFilter {
+                    shown: path.clone(),
+                    repo_prefix: normalize_query_filter_path(root_path, path),
+                })
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+
+    fn matches(&self, file_path: &str) -> bool {
+        self.filters.is_empty()
+            || self.filters.iter().any(|filter| {
+                let Some(prefix) = filter.repo_prefix.as_deref() else {
+                    return false;
+                };
+                prefix.is_empty()
+                    || file_path == prefix
+                    || file_path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+
+    fn shown(&self) -> String {
+        self.filters
+            .iter()
+            .map(|filter| filter.shown.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        serde_json::json!(self
+            .filters
+            .iter()
+            .map(|filter| filter.shown.as_str())
+            .collect::<Vec<_>>())
+    }
+}
+
+fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option<String> {
+    let supplied = std::path::Path::new(raw);
+    let candidate = if supplied.is_absolute() {
+        absolutize_path(supplied)
+    } else {
+        let cwd = std::env::current_dir().ok();
+        let cwd_candidate = cwd.as_ref().map(|cwd| cwd.join(supplied));
+        if let Some(path) = cwd_candidate.as_ref().filter(|path| path.exists()) {
+            absolutize_path(path)
+        } else if root_path.join(supplied).exists() {
+            absolutize_path(&root_path.join(supplied))
+        } else if let Some(cwd) = cwd.filter(|cwd| cwd.starts_with(root_path)) {
+            cwd.join(supplied)
+        } else {
+            root_path.join(supplied)
+        }
+    };
+    let relative = candidate.strip_prefix(root_path).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn shell_example_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.+:".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn validate_query_root_usage(root: Option<&str>, command: &str, subject: &str) -> Result<()> {
+    let Some(raw_root) = root else {
+        return Ok(());
+    };
+    let supplied = absolutize_path(std::path::Path::new(raw_root));
+    let repo_root = workspace_locator::resolve_workspace_root(&supplied);
+    if supplied == repo_root
+        || workspace_locator::store_path(&supplied).exists()
+        || !workspace_locator::store_path(&repo_root).exists()
+    {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "--root selects the indexed repository root, not a file or subtree filter.\nretry: greppy {command} {} {} --root {}",
+        shell_example_arg(subject),
+        shell_example_arg(raw_root),
+        shell_example_arg(&repo_root.to_string_lossy()),
+    )))
+}
+
+fn prepare_query_path_filters(
+    root: Option<&str>,
+    command: &str,
+    subject: &str,
+    paths: &[String],
+) -> Result<QueryPathFilters> {
+    validate_query_root_usage(root, command, subject)?;
+    Ok(QueryPathFilters::from_args(&resolve_root(root)?, paths))
 }
 
 fn embedding_config_for_index(args: EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>> {
@@ -16865,26 +17310,20 @@ mod tests {
             match Cli::try_parse_from(argv).unwrap().command {
                 Some(Command::Brief {
                     symbol,
-                    path,
+                    paths,
                     path_opt,
                     ..
                 }) => {
                     assert_eq!(symbol.as_deref(), Some("open"));
-                    let scope = path.as_deref().or(path_opt.as_deref());
+                    let scope = paths.first().map(String::as_str).or(path_opt.as_deref());
                     assert_eq!(scope, Some("src/flask/testing.py"));
-                    assert_eq!(
-                        qualify_symbol_with_path(symbol.as_deref(), scope).as_deref(),
-                        Some("src/flask/testing.py::open"),
-                    );
                 }
                 other => panic!("unexpected: {other:?}"),
             }
         }
 
         // read carries the nav commands' --code flag as an accepted no-op.
-        assert!(
-            Cli::try_parse_from(["greppy", "read", "open", "a/mod.py", "--code"]).is_ok()
-        );
+        assert!(Cli::try_parse_from(["greppy", "read", "open", "a/mod.py", "--code"]).is_ok());
 
         // An already-qualified symbol is not double-qualified.
         assert_eq!(
@@ -16896,12 +17335,26 @@ mod tests {
 
         // text-cas / regex-cas accept values beginning with '-' (real diff/RST lines).
         assert!(Cli::try_parse_from([
-            "greppy", "edit", "text-cas", "--file", "CHANGES.rst", "--old", "-   Fix how",
-            "--new", "-   Fix what",
+            "greppy",
+            "edit",
+            "text-cas",
+            "--file",
+            "CHANGES.rst",
+            "--old",
+            "-   Fix how",
+            "--new",
+            "-   Fix what",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
-            "greppy", "edit", "regex-cas", "--file", "f.py", "--pattern", "-x", "--replacement",
+            "greppy",
+            "edit",
+            "regex-cas",
+            "--file",
+            "f.py",
+            "--pattern",
+            "-x",
+            "--replacement",
             "-y",
         ])
         .is_ok());
@@ -17517,6 +17970,7 @@ where
                 json,
                 code: _,
                 all: _,
+                paths: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(changed);
@@ -17543,6 +17997,7 @@ where
                 json,
                 code: _,
                 all: _,
+                paths: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(!changed);
@@ -17576,6 +18031,7 @@ where
                 json,
                 code: _,
                 all: _,
+                paths: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(!changed);
@@ -17609,6 +18065,7 @@ where
                 json,
                 code: _,
                 all: _,
+                paths: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(!changed);
@@ -17761,13 +18218,13 @@ where
         let cli = Cli::try_parse_from(["greppy", "who-calls", "do_it"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::WhoCalls { symbol: Some(ref s), code: false, all: false, json: false }) if s == "do_it"
+            Some(Command::WhoCalls { symbol: Some(ref s), code: false, all: false, json: false, paths }) if s == "do_it" && paths.is_empty()
         ));
 
         let cli = Cli::try_parse_from(["greppy", "find-usages", "Widget"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::FindUsages { symbol: Some(ref s), code: false, all: false, json: false }) if s == "Widget"
+            Some(Command::FindUsages { symbol: Some(ref s), code: false, all: false, json: false, paths }) if s == "Widget" && paths.is_empty()
         ));
 
         let cli = Cli::try_parse_from(["greppy", "references", "Widget"]).unwrap();
