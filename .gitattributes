@@ -2,6 +2,10 @@ crates/cli/tests/assets/ci-test/** -text
 
 # Redistribution lock records are hashed byte-for-byte on every release
 # platform. Keep LF checkout bytes stable when Git runs on Windows.
+# Cargo.lock and the summary-quality case bank are hashed the same way
+# (build-environment records / evidence manifests are verified cross-platform).
+Cargo.lock text eol=lf
+bench/summary_quality/cases_v1.json text eol=lf
 licenses/*.html text eol=lf
 licenses/*.json text eol=lf
 licenses/*.md text eol=lf
