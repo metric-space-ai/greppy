@@ -110,10 +110,15 @@ GREPPY_EDIT_POLICY_TEMPLATE = (
     "`edit rename-call --in SYM --from A --to B`, `edit ensure-import --file P --module M --name N`, "
     "`edit text-cas --file P --old 'OLD' --new 'NEW'` for small exact swaps "
     "(file forms --old-file/--new-file exist too; --source-file - reads stdin for heredocs). "
+    "Several edits to the SAME file go into ONE `edit apply --plan PLAN.json` call: a plan "
+    "applies all operations against one snapshot, all-or-nothing, and each plan operation "
+    "declares the file_sha256 from its handle (a plan without hashes is refused as stale). "
     "Every edit prints a certificate: matched exactly once, hashes before/after, a unified "
     "diff, and syntax verification. TRUST THE CERTIFICATE - do not re-read a file to check "
     "an edit the certificate already proves. Exit codes: 0 ok/already-satisfied, 10 not "
-    "found, 11 ambiguous (candidates listed), 12 stale (re-read the span), 13 syntax. "
+    "found, 11 ambiguous (candidates listed), 12 stale (re-read the span, then retry), "
+    "13 result rejected (postcondition or overlapping operations - nothing was written), "
+    "14 validator failed, 16 publish blocked (workspace lock - nothing was written). "
     "Verify the final result with the supplied verification command."
 )
 
