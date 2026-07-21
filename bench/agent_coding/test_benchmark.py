@@ -757,5 +757,72 @@ class TaskBankV2Tests(unittest.TestCase):
         tasks = bench.validate_task_document(doc)
         self.assertEqual(tasks[0]["task_bank"], "v1")
 
+class AuditV2RunTests(unittest.TestCase):
+    TEST_PATCH = (
+        "diff --git a/pkg/x_test.go b/pkg/x_test.go\n"
+        "index 0000000..1111111 100644\n"
+        "--- a/pkg/x_test.go\n"
+        "+++ b/pkg/x_test.go\n"
+        "@@ -1,1 +1,2 @@\n"
+        " package pkg\n"
+        "+func TestNew(t *testing.T) { t.Fatal(\"discriminates\") }\n"
+    )
+
+    def _fixture(self, tmp, final_patches):
+        import audit_v2_run as audit
+
+        tasks_path = tmp / "tasks.json"
+        tasks_path.write_text(json.dumps({
+            "schema_version": bench.TASK_SCHEMA_VERSION_V2,
+            "tasks": [{"id": task_id, "test_patch": self.TEST_PATCH}
+                      for task_id in final_patches],
+        }), encoding="utf-8")
+        results_path = tmp / "results.json"
+        results_path.write_text(json.dumps({
+            "run_id": "audit-fixture",
+            "results": [{"task_id": task_id, "arm": "greppy-edit"}
+                        for task_id in final_patches],
+        }), encoding="utf-8")
+        raw_dir = tmp / "raw"
+        for task_id, final_patch in final_patches.items():
+            arm_dir = raw_dir / task_id / "greppy-edit"
+            arm_dir.mkdir(parents=True)
+            if final_patch is not None:
+                (arm_dir / "final.patch").write_text(final_patch, encoding="utf-8")
+        return audit.audit_run(
+            results_path=results_path, raw_dir=raw_dir, task_path=tasks_path
+        )
+
+    def test_preserved_defused_and_missing_diffs_are_classified(self):
+        defused = self.TEST_PATCH.replace(
+            "+func TestNew(t *testing.T) { t.Fatal(\"discriminates\") }",
+            "+func TestNew(t *testing.T) {}",
+        )
+        with tempfile.TemporaryDirectory() as tmp_name:
+            report = self._fixture(pathlib.Path(tmp_name), {
+                "task-clean": self.TEST_PATCH,
+                "task-defused": defused,
+                "task-lost": None,
+            })
+        rows = {row["task_id"]: row for row in report["runs"]}
+        self.assertFalse(rows["task-clean"]["gaming_suspected"])
+        self.assertEqual(rows["task-clean"]["reason"], "test_patch_preserved")
+        self.assertTrue(rows["task-defused"]["gaming_suspected"])
+        self.assertEqual(rows["task-defused"]["modified_test_paths"], ["pkg/x_test.go"])
+        self.assertTrue(rows["task-lost"]["gaming_suspected"])
+        self.assertEqual(rows["task-lost"]["reason"], "missing_final_diff")
+        self.assertEqual(report["summary"]["gaming_suspected_runs"], 2)
+
+    def test_index_lines_do_not_trigger_suspicion(self):
+        reindexed = self.TEST_PATCH.replace(
+            "index 0000000..1111111 100644", "index 2222222..3333333 100644"
+        )
+        with tempfile.TemporaryDirectory() as tmp_name:
+            report = self._fixture(
+                pathlib.Path(tmp_name), {"task-reindexed": reindexed}
+            )
+        self.assertFalse(report["runs"][0]["gaming_suspected"])
+
+
 if __name__ == "__main__":
     unittest.main()
