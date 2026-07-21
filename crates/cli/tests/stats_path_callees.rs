@@ -283,7 +283,7 @@ fn callees_reports_missing_symbol() {
     let (code, out, _err) = run(&["callees", "does_not_exist_xyz"], &repo, &store);
     assert_eq!(code, 1, "missing symbol must exit 1; got out={out:?}");
     assert!(
-        out.contains("(symbol not found)"),
+        out.contains("symbol not found"),
         "missing symbol must report not-found; got: {out:?}"
     );
 }
