@@ -14205,6 +14205,17 @@ fn extract_zig(source: &[u8], file_path: &str) -> greppy_core::Result<Extraction
     let root = tree.root_node();
     let file_module_qname = format!("{file_path}::__file__");
 
+    // MODULE / IMPORT PASS.
+    //
+    // The shared import resolver only targets importable definition labels,
+    // not synthetic Module nodes. Model each Zig source file as an importable
+    // Class namespace named by its file stem, normalize `.zig` import basenames
+    // to that stem, and materialize extensionless package imports (for example
+    // `std`) as external namespace stubs. This keeps the fix local to Zig while
+    // giving every @import edge a real graph target.
+    emit_zig_file_namespace(root, file_path, &mut result);
+    normalize_zig_imports(file_path, &mut result);
+
     // FUNCTION (test) PASS.
     //
     // The Zig func kinds = {function_declaration, test_declaration,
@@ -14259,6 +14270,82 @@ fn extract_zig(source: &[u8], file_path: &str) -> greppy_core::Result<Extraction
     emit_zig_usages(source, root, file_path, &file_module_qname, &mut result);
 
     Ok(result)
+}
+
+/// The importable namespace name for a Zig source path or `@import` path.
+/// `foo/bar.zig` becomes `bar`; extensionless package names such as `std`
+/// remain unchanged.
+fn zig_module_basename(path: &str) -> &str {
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    basename.strip_suffix(".zig").unwrap_or(basename)
+}
+
+/// Emit the current source file's importable namespace. The shared resolver
+/// intentionally excludes synthetic Module nodes, so Zig uses the same
+/// importable-Class technique as other language-specific module passes.
+fn emit_zig_file_namespace(
+    root: Node<'_>,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let module_name = zig_module_basename(file_path);
+    if module_name.is_empty() {
+        return;
+    }
+    result.nodes.push(ExtractedNode {
+        label: "Class".into(),
+        name: module_name.to_string(),
+        qualified_name: format!("{file_path}::Class::{module_name}"),
+        file_path: file_path.to_string(),
+        start_line: 1,
+        end_line: root.end_position().row as u32 + 1,
+        properties: serde_json::json!({ "kind": "zig_file_namespace" }),
+    });
+}
+
+/// Normalize Zig IMPORTS keys to the imported module basename without the
+/// `.zig` suffix. Project files resolve to the Class namespace emitted above;
+/// extensionless packages such as `std` get a local external namespace stub so
+/// their IMPORTS edge remains navigable even though the package is outside the
+/// indexed repository.
+fn normalize_zig_imports(file_path: &str, result: &mut ExtractionResult) {
+    let mut external_modules = std::collections::BTreeSet::new();
+    for edge in result
+        .edges
+        .iter_mut()
+        .filter(|edge| edge.edge_type == "IMPORTS")
+    {
+        let Some(path) = edge
+            .properties
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let imported_name = zig_module_basename(&path);
+        if imported_name.is_empty() {
+            continue;
+        }
+        if let Some(properties) = edge.properties.as_object_mut() {
+            properties.insert("imported_name".into(), serde_json::json!(imported_name));
+        }
+        if !path.ends_with(".zig") {
+            external_modules.insert(imported_name.to_string());
+        }
+    }
+
+    for module_name in external_modules {
+        result.nodes.push(ExtractedNode {
+            label: "Class".into(),
+            name: module_name.clone(),
+            qualified_name: format!("{file_path}::Class::{module_name}"),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 1,
+            properties: serde_json::json!({ "kind": "zig_external_module" }),
+        });
+    }
 }
 
 /// The nearest enclosing Zig callable qname for `node`, keyed on the func kinds
