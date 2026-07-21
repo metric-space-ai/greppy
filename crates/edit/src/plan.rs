@@ -7,7 +7,7 @@
 //! per file and the complete publication set is committed with one journal.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,7 @@ use crate::certificate::{
 };
 use crate::hash::sha256_hex;
 use crate::journal::{publish_journal_locked, FilePublication, WorkspaceLock};
+use crate::publish::require_inside_workspace;
 use crate::txn::{
     apply_in_memory, outside_ranges_unchanged, syntax_counts, Applied, PlannedOp, Snapshot,
 };
@@ -137,6 +138,7 @@ struct OperationProblem {
 #[derive(Debug)]
 struct PlannedOperation<'a> {
     operation: &'a PlanOperation,
+    file_key: String,
     selector_engine: SelectorEngine,
     selector_class: SelectorClass,
     target_ranges: Vec<(usize, usize)>,
@@ -155,6 +157,61 @@ struct FileProjection {
     syntax_applicable: bool,
     syntax_ok: bool,
     isolation_ok: bool,
+}
+
+fn lexical_relative_path(path: &str) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(Error::Invalid(format!(
+                        "operation file escapes the workspace: {path}"
+                    )));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::Invalid(format!(
+                    "operation file must be relative to the workspace: {path}"
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(Error::Invalid(format!(
+            "operation file is empty after normalization: {path}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn operation_file_key(root: &Path, file: &str) -> Result<String> {
+    let lexical = lexical_relative_path(file)?;
+    let candidate = root.join(&lexical);
+    let resolved = match require_inside_workspace(root, &candidate) {
+        Ok(resolved) => resolved,
+        // Preserve the certificate-producing publication path for final-component
+        // symlinks and hardlinks. The atomic publisher will reject them; they do
+        // not need canonical alias coalescing because they cannot be published.
+        Err(Error::Workspace(message)) if message.starts_with("refusing to publish through ") => {
+            return Ok(lexical.to_string_lossy().into_owned());
+        }
+        Err(error) => return Err(error),
+    };
+    let canonical_root = root.canonicalize().map_err(|source| Error::Io {
+        context: format!("canonicalize {}", root.display()),
+        source,
+    })?;
+    let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+        Error::Workspace(format!(
+            "path {} escapes workspace {}",
+            resolved.display(),
+            canonical_root.display()
+        ))
+    })?;
+    Ok(relative.to_string_lossy().into_owned())
 }
 
 /// Execute a parsed plan as one transaction. The workspace lock is held from
@@ -187,22 +244,27 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
     let takeover_reason = lock.takeover_reason().map(str::to_owned);
     let git_head_before = git_head(root);
 
-    // Snapshot every distinct file exactly once while holding the workspace
-    // lock. Plan order is retained separately for reports and error precedence.
+    // Normalize aliases before keying snapshots. For ordinary files the key is
+    // the canonical path relative to the canonical workspace root, so `a.py`,
+    // `./a.py`, `dir/../a.py`, and an in-workspace parent symlink cannot create
+    // separate snapshots for one physical target.
     let mut snapshots = BTreeMap::new();
+    let mut operation_files = Vec::with_capacity(plan.operations.len());
     for operation in &plan.operations {
-        if !snapshots.contains_key(&operation.file) {
-            let snapshot = Snapshot::read(&root.join(&operation.file))?;
-            snapshots.insert(operation.file.clone(), snapshot);
+        let file_key = operation_file_key(root, &operation.file)?;
+        if !snapshots.contains_key(&file_key) {
+            let snapshot = Snapshot::read(&root.join(&file_key))?;
+            snapshots.insert(file_key.clone(), snapshot);
         }
+        operation_files.push(file_key);
     }
 
     let mut planned = Vec::with_capacity(plan.operations.len());
-    for operation in &plan.operations {
+    for (operation, file_key) in plan.operations.iter().zip(operation_files) {
         let snapshot = snapshots
-            .get(&operation.file)
+            .get(&file_key)
             .expect("every operation file was snapshotted");
-        planned.push(plan_operation(plan, operation, snapshot));
+        planned.push(plan_operation(plan, operation, file_key, snapshot));
     }
 
     // Selector overlap is defined on original target coordinates, before an
@@ -212,7 +274,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
     let mut found_overlap = false;
     for first_index in 0..planned.len() {
         for second_index in first_index + 1..planned.len() {
-            if planned[first_index].operation.file != planned[second_index].operation.file {
+            if planned[first_index].file_key != planned[second_index].file_key {
                 continue;
             }
             let overlaps = overlapping_target_ranges(
@@ -260,7 +322,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
                 refusal_report(
                     operation,
                     snapshots
-                        .get(&operation.operation.file)
+                        .get(&operation.file_key)
                         .expect("snapshot retained"),
                     git_head_stale,
                     takeover_reason.as_deref(),
@@ -290,7 +352,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
     for (file, snapshot) in &snapshots {
         let mutations: Vec<PlannedOp> = planned
             .iter()
-            .filter(|operation| operation.operation.file == *file)
+            .filter(|operation| operation.file_key == *file)
             .flat_map(|operation| operation.mutations.iter().cloned())
             .collect();
         match apply_in_memory(snapshot, &mutations) {
@@ -341,9 +403,9 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             projected_report(
                 operation,
                 snapshots
-                    .get(&operation.operation.file)
+                    .get(&operation.file_key)
                     .expect("snapshot retained"),
-                projections.get(&operation.operation.file),
+                projections.get(&operation.file_key),
                 projection_error.as_deref(),
                 takeover_reason.as_deref(),
             )
@@ -470,6 +532,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
 fn plan_operation<'a>(
     plan: &Plan,
     operation: &'a PlanOperation,
+    file_key: String,
     snapshot: &Snapshot,
 ) -> PlannedOperation<'a> {
     let (selector_engine, selector_class) = selector_profile(&operation.selector);
@@ -575,6 +638,7 @@ fn plan_operation<'a>(
 
     PlannedOperation {
         operation,
+        file_key,
         selector_engine,
         selector_class,
         target_ranges,
@@ -688,7 +752,7 @@ fn refusal_report(
     append_takeover_postcondition(&mut postconditions, takeover_reason);
     OperationReport {
         id: planned.operation.id.clone(),
-        file: planned.operation.file.clone(),
+        file: planned.file_key.clone(),
         selector_engine: planned.selector_engine,
         selector_class: planned.selector_class,
         scope_matches: 1,
@@ -760,7 +824,7 @@ fn projected_report(
                 projection.syntax_ok,
                 projection.isolation_ok,
                 Some(crate::verbs::unified_diff_public(
-                    &planned.operation.file,
+                    &planned.file_key,
                     &snapshot.content,
                     &projection.applied.content,
                 )),
@@ -777,7 +841,7 @@ fn projected_report(
     let postconditions_passed = projection.is_some() && syntax_ok && isolation_ok;
     OperationReport {
         id: planned.operation.id.clone(),
-        file: planned.operation.file.clone(),
+        file: planned.file_key.clone(),
         selector_engine: planned.selector_engine,
         selector_class: planned.selector_class,
         scope_matches: 1,

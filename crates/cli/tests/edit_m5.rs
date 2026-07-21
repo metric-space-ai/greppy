@@ -122,6 +122,38 @@ fn text_cas_stdout_includes_the_resulting_span() {
 }
 
 #[test]
+fn aliased_plan_paths_share_overlap_checks_and_exit_13() {
+    let (repo, store) = fresh_workspace("aliased-overlap");
+    std::fs::write(repo.join("a.txt"), "alpha beta\n").unwrap();
+    let hash = sha256_hex(b"alpha beta\n");
+    let ops = format!(
+        r#"
+    {{ "id": "plain-path", "file": "a.txt",
+      "selector": {{ "engine": "text", "old_text": "alpha", "expect": 1 }},
+      "action": {{ "type": "replace", "content": "ALPHA" }},
+      "preconditions": {{ "file_sha256": "{hash}" }} }},
+    {{ "id": "dot-path", "file": "./a.txt",
+      "selector": {{ "engine": "text", "old_text": "alpha", "expect": 1 }},
+      "action": {{ "type": "replace", "content": "OMEGA" }},
+      "preconditions": {{ "file_sha256": "{hash}" }} }}
+"#
+    );
+    std::fs::write(repo.join("plan.json"), plan_json(&repo, &ops)).unwrap();
+
+    let (code, stdout, stderr) = run(&repo, &store, &["edit", "apply", "--plan", "plan.json"]);
+
+    assert_eq!(code, 13, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let certificate: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(certificate["status"], "invalid-result");
+    assert_eq!(certificate["operations"][0]["file"], "a.txt");
+    assert_eq!(certificate["operations"][1]["file"], "a.txt");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "alpha beta\n"
+    );
+}
+
+#[test]
 fn plan_with_stale_precondition_changes_nothing_and_exits_12() {
     let (repo, store) = fresh_workspace("stale");
     std::fs::write(repo.join("a.txt"), "alpha one\n").unwrap();
