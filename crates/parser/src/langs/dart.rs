@@ -19,15 +19,11 @@
 //! intentionally NOT claimed as `supported`.
 //!
 //! CALLS caveat: Dart splits the signature (`function_signature`) from the body
-//! (`function_body`) as *siblings* under the declaration, so the def node
-//! (`function_signature`) is NOT an ancestor of the call sites in the body. The
-//! generic caller-attribution (`spec::enclosing_callable_qname`) resolves a
-//! call's *source* function by walking the call's ancestors for a callable
-//! DefRule node — which never reaches `function_signature`. The `call_query`
-//! below matches callee names correctly, but no CALLS *edge* is emitted
-//! (verified: 0 edges on the fixture). Dart call-graph extraction therefore
-//! needs an engine change and is NOT yet supported; definitions are the working
-//! surface.
+//! (`function_body`) as siblings under the declaration, so the generic
+//! ancestor-only call pass cannot attribute body callsites. The Dart bespoke
+//! extractor repairs this by resolving the enclosing `function_declaration` /
+//! `method_declaration`, then reading its sibling signature. Relative imports
+//! are likewise emitted by that pass because this registry query remains empty.
 
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};

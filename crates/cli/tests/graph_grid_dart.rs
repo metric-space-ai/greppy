@@ -156,7 +156,6 @@ fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_who_calls_finds_cross_file_caller() {
     let (repo, store) = index_fixture("who-calls-cross");
     // `do_it` is defined in helper.dart and called by `caller` in main.dart.
@@ -200,7 +199,6 @@ fn graph_grid_dart_who_calls_empty_for_uncalled() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_callees_lists_cross_file_target() {
     let (repo, store) = index_fixture("callees-cross");
     // `caller` calls `do_it` which is defined in helper.dart.
@@ -221,7 +219,6 @@ fn graph_grid_dart_callees_lists_cross_file_target() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_find_usages_covers_call_and_import() {
     let (repo, store) = index_fixture("find-usages-call-import");
     // `find-usages do_it` should aggregate CALLS (caller) AND IMPORTS
@@ -279,7 +276,6 @@ fn graph_grid_dart_find_usages_type_reference() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact-transitive");
     // `impact do_it` must report `caller` as an incoming CALLS dependent —
@@ -327,7 +323,6 @@ fn graph_grid_dart_search_symbols_finds_all_definitions() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_brief_shows_definition_with_callers() {
     let (repo, store) = index_fixture("brief");
     let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
@@ -351,7 +346,6 @@ fn graph_grid_dart_brief_shows_definition_with_callers() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     // `path --from caller --to do_it` over CALLS must find the single-hop
@@ -471,7 +465,6 @@ int do_it_renamed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "dart graph gap: cross-file CALLS not resolved (callsites remain unresolved textual candidates) — one root cause across the CALLS-dependent cells"]
 fn graph_grid_dart_declarative_or_edge_case() {
     let (repo, store) = index_fixture("ns-qualified-call");
     // `HELPER_VALUE` is read inside `caller()` — a free-standing top-level

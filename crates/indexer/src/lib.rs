@@ -1888,8 +1888,36 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
-        if target_id != src.id {
-            resolved.push(new_edge(project, src.id, target_id, edge));
+        let mut target_ids = vec![target_id];
+        if edge
+            .properties
+            .get("dart_relative_import")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            // A Dart library import exposes every top-level definition
+            // from the imported file. Persist the file-Module edge and symbol
+            // edges so `find-usages <symbol>` can surface the import directly.
+            if let Some(target_file) = index.file_of(target_id) {
+                target_ids.extend(
+                    index
+                        .by_qname
+                        .values()
+                        .filter(|node| {
+                            node.file_path == target_file
+                                && greppy_resolver::IMPORTABLE_LABELS
+                                    .contains(&node.label.as_str())
+                        })
+                        .map(|node| node.id),
+                );
+            }
+        }
+        target_ids.sort_unstable();
+        target_ids.dedup();
+        for target_id in target_ids {
+            if target_id != src.id {
+                resolved.push(new_edge(project, src.id, target_id, edge));
+            }
         }
     }
     insert_edges_batched(store, &resolved)
@@ -2333,17 +2361,29 @@ impl GraphIndex {
     /// bare `require` falls back to a unique file stem, preserving never-guess
     /// behavior when multiple files share the stem.
     fn resolve_filesystem_module_import(&self, edge: &ExtractedEdge, stem: &str) -> Option<i64> {
-        if edge
+        let relative_extension = if edge
             .properties
             .get("ruby_require_relative")
             .and_then(|value| value.as_bool())
             == Some(true)
         {
+            Some("rb")
+        } else if edge
+            .properties
+            .get("dart_relative_import")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            Some("dart")
+        } else {
+            None
+        };
+        if let Some(extension) = relative_extension {
             let path = edge
                 .properties
                 .get("path")
                 .and_then(|value| value.as_str())?;
-            if let Some(qname) = relative_ruby_module_qname(&edge.file_path, path) {
+            if let Some(qname) = relative_module_qname(&edge.file_path, path, extension) {
                 if let Some(module) = self.by_qname(&qname) {
                     if module.label == "Module" {
                         return Some(module.id);
@@ -2389,13 +2429,17 @@ impl GraphIndex {
 /// Build the exact per-file Module qname targeted by Ruby
 /// `require_relative`. The path is resolved lexically against the importing
 /// file, without touching the filesystem, and an omitted extension means `.rb`.
-fn relative_ruby_module_qname(source_file: &str, import_path: &str) -> Option<String> {
+fn relative_module_qname(
+    source_file: &str,
+    import_path: &str,
+    default_extension: &str,
+) -> Option<String> {
     let parent = Path::new(source_file)
         .parent()
         .unwrap_or_else(|| Path::new(""));
     let mut candidate = parent.join(import_path);
     if candidate.extension().is_none() {
-        candidate.set_extension("rb");
+        candidate.set_extension(default_extension);
     }
 
     let mut normalized = std::path::PathBuf::new();
@@ -2960,14 +3004,14 @@ mod tests {
     #[test]
     fn ruby_relative_module_qname_normalizes_path_and_extension() {
         assert_eq!(
-            relative_ruby_module_qname("src/app.rb", "../lib/helper"),
+            relative_module_qname("src/app.rb", "../lib/helper", "rb"),
             Some("lib/helper.rb::__file__".into())
         );
         assert_eq!(
-            relative_ruby_module_qname("app.rb", "./helper.rb"),
+            relative_module_qname("app.rb", "./helper.rb", "rb"),
             Some("helper.rb::__file__".into())
         );
-        assert_eq!(relative_ruby_module_qname("app.rb", "../helper"), None);
+        assert_eq!(relative_module_qname("app.rb", "../helper", "rb"), None);
     }
 
     #[test]
@@ -3002,6 +3046,75 @@ mod tests {
             .unwrap()
             .expect("import source Module");
         assert_eq!(source.qualified_name, "app.rb::__file__");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn dart_relative_import_targets_exact_module_and_public_symbols() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-dart-relative-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("lib/nested")).unwrap();
+        fs::write(
+            repo.join("lib/main.dart"),
+            "import 'nested/helper.dart';\nint caller() => do_it() + HELPER_VALUE;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("lib/helper.dart"),
+            "int do_it() => 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("lib/nested/helper.dart"),
+            "const int HELPER_VALUE = 7;\nint do_it() => 2;\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").expect("index Dart relative import fixture");
+        let nested_module = store
+            .get_node_by_qname("test", "lib/nested/helper.dart::__file__")
+            .unwrap()
+            .expect("nested helper Module");
+        let nested_function = store
+            .get_node_by_qname("test", "lib/nested/helper.dart::Function::do_it")
+            .unwrap()
+            .expect("nested do_it Function");
+        let source = store
+            .get_node_by_qname("test", "lib/main.dart::__file__")
+            .unwrap()
+            .expect("main Module");
+        let imports = store.outgoing_edges(source.id, Some("IMPORTS"), 10).unwrap();
+        assert!(
+            imports.iter().any(|edge| edge.target_id == nested_module.id),
+            "relative import must target exact nested Module: {imports:?}"
+        );
+        assert!(
+            imports
+                .iter()
+                .any(|edge| edge.target_id == nested_function.id),
+            "Dart import must expose imported top-level function: {imports:?}"
+        );
+        let helper_value = store
+            .get_node_by_qname("test", "lib/nested/helper.dart::Variable::HELPER_VALUE")
+            .unwrap()
+            .expect("nested HELPER_VALUE Variable");
+        let usages = store
+            .incoming_edges(helper_value.id, Some("USAGE"), 10)
+            .unwrap();
+        assert_eq!(usages.len(), 1, "cross-file constant usage: {usages:?}");
+        let usage_source = store
+            .get_node(usages[0].source_id)
+            .unwrap()
+            .expect("usage source");
+        assert_eq!(usage_source.name, "caller");
 
         fs::remove_dir_all(repo).unwrap();
     }

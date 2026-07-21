@@ -10536,9 +10536,9 @@ fn is_haskell_usage_keyword(name: &str) -> bool {
 // `function_signature` def-nodes, so it emits `Method` (class members) and
 // `Function` (free) nodes plus the per-file `Module`. It does NOT emit the
 // `Class` / `Enum` type nodes, the enum-constant `Variable`s, the
-// `DEFINES_METHOD` edges, the `USAGE` edges, or the `IMPORTS` edges.
-// `extract_dart` runs the base pass and then adds exactly
-// those.
+// `DEFINES_METHOD` edges, correctly attributed `CALLS` / `USAGE` edges, or
+// relative-file `IMPORTS` edges. `extract_dart` runs the base pass and adds
+// those bespoke passes.
 //
 // Grammar note: this crate uses `tree-sitter-dart` 0.2, so a class is a
 // `class_declaration` node. The emitted *counts / labels* are grammar-independent,
@@ -10570,8 +10570,9 @@ fn extract_dart(
     file_path: &str,
 ) -> greppy_core::Result<ExtractionResult> {
     // Base pass: `Method` (class/mixin members) + free `Function` + per-file
-    // `Module` nodes. (The dart CALLS query currently resolves to 0 edges and
-    // the import_query is empty, so the base contributes only def-nodes.)
+    // `Module` nodes. The shared CALLS pass cannot cross the signature/body
+    // sibling boundary and the registry import query is empty, so bespoke
+    // passes below supply calls and relative imports.
     let queries = d
         .compiled_queries()
         .map_err(|e| greppy_core::Error::Parse(format!("compile {} queries: {e}", d.name)))?;
@@ -10595,6 +10596,12 @@ fn extract_dart(
     // (b) Type nodes (Class/Enum) + enum-constant Variables + DEFINES_METHOD.
     dart_defs_pass(source, root, file_path, &mut result);
 
+    // (c) Calls and relative imports. Dart places a declaration's signature
+    // and body beside each other, so the shared ancestor-only call pass cannot
+    // attribute body callsites to their Function/Method node.
+    dart_emit_calls(source, root, file_path, &mut result);
+    dart_emit_relative_imports(source, root, file_path, &mut result);
+
     // The enum names declared in this file. A USAGE never resolves
     // to an `Enum` node (every usage resolves to
     // Class / Method / Function / Variable, none to
@@ -10608,7 +10615,7 @@ fn extract_dart(
         .map(|n| n.name.clone())
         .collect();
 
-    // (c) USAGE walk for Dart.
+    // (d) USAGE walk for Dart.
     let file_module_qname = format!("{file_path}::__file__");
     dart_emit_usages(
         source,
@@ -10618,14 +10625,6 @@ fn extract_dart(
         &local_enums,
         &mut result,
     );
-
-    // IMPORTS: Dart's `import '...'` names a whole FILE (resolving File/Module →
-    // the target file's `Module` node). That is the `require`→File shape the
-    // shared indexer does NOT resolve — its IMPORTS pass keys `imported_name` on
-    // `IMPORTABLE_LABELS`, which excludes `Module`, so a File/Module→Module edge
-    // cannot be produced through the shared plumbing. This is the SAME documented
-    // carve-out as Ruby's `require`→File IMPORTS, so
-    // no IMPORTS edge is emitted here (out of scope, honesty guard).
 
     Ok(result)
 }
@@ -10695,11 +10694,51 @@ fn dart_member_method_name<'a>(source: &'a [u8], class_member: Node<'_>) -> Opti
 fn dart_defs_pass(source: &[u8], root: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if node.kind() == "top_level_variable_declaration" {
+            dart_emit_top_level_variables(source, node, file_path, result);
+        }
         if let Some(label) = dart_type_label(node.kind()) {
             dart_emit_type(source, node, label, file_path, result);
         }
         let mut c = node.walk();
         for child in node.named_children(&mut c) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Emit `Variable` nodes for initialized top-level Dart declarations. These
+/// definitions are cross-file USAGE targets (for example imported constants).
+fn dart_emit_top_level_variables(
+    source: &[u8],
+    declaration: Node<'_>,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let mut stack = vec![declaration];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "initialized_variable_definition" | "static_final_declaration"
+        ) {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(source, name_node);
+                if !name.is_empty() {
+                    result.nodes.push(ExtractedNode {
+                        label: "Variable".into(),
+                        name: name.to_string(),
+                        qualified_name: format!("{file_path}::Variable::{name}"),
+                        file_path: file_path.to_string(),
+                        start_line: node.start_position().row as u32 + 1,
+                        end_line: node.end_position().row as u32 + 1,
+                        properties: serde_json::json!({}),
+                    });
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
             stack.push(child);
         }
     }
@@ -10783,6 +10822,127 @@ fn dart_emit_type(
     }
 }
 
+/// Emit Dart CALLS edges with a source reconstructed from the enclosing
+/// declaration. The grammar makes `function_signature` and `function_body`
+/// siblings, so the shared spec walk sees the callee but cannot find its caller.
+fn dart_emit_calls(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "call_expression" {
+            continue;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            continue;
+        };
+        let Some(callee) = dart_call_name_node(function) else {
+            continue;
+        };
+        let name = node_text(source, callee);
+        if name.is_empty() {
+            continue;
+        }
+        let Some(source_qname) = dart_enclosing_qname(source, node, file_path) else {
+            continue;
+        };
+        if result.edges.iter().any(|edge| {
+            edge.edge_type == "CALLS"
+                && edge.line == callee.start_position().row as u32 + 1
+                && edge.source_qualified_name == source_qname
+                && edge
+                    .properties
+                    .get("callee_name")
+                    .and_then(|value| value.as_str())
+                    == Some(name)
+        }) {
+            continue;
+        }
+        result.edges.push(ExtractedEdge {
+            edge_type: "CALLS".into(),
+            source_qualified_name: source_qname,
+            target_qualified_name: format!("{file_path}::Function::{name}"),
+            file_path: file_path.to_string(),
+            line: callee.start_position().row as u32 + 1,
+            properties: serde_json::json!({
+                "callee_text": name,
+                "callee_name": name,
+            }),
+        });
+    }
+}
+
+/// Return the final statically named callee from a direct or member call.
+fn dart_call_name_node(function: Node<'_>) -> Option<Node<'_>> {
+    match function.kind() {
+        "identifier" => Some(function),
+        "member_expression" | "null_aware_member_expression" => {
+            function.child_by_field_name("property")
+        }
+        _ => None,
+    }
+}
+
+/// Emit one filesystem import candidate for each relative Dart `import` URI.
+/// The indexer resolves it lexically against the importing file and fans the
+/// import out to the target library's public definition nodes.
+fn dart_emit_relative_imports(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "import_specification" {
+            continue;
+        }
+        let Some(path) = dart_import_path(source, node) else {
+            continue;
+        };
+        if path.contains(':') || path.contains('$') {
+            continue;
+        }
+        let imported_name = path.rsplit('/').next().unwrap_or(path);
+        result.edges.push(ExtractedEdge {
+            edge_type: "IMPORTS".into(),
+            source_qualified_name: format!("{file_path}::__file__"),
+            target_qualified_name: format!("{file_path}::Import::{path}"),
+            file_path: file_path.to_string(),
+            line: node.start_position().row as u32 + 1,
+            properties: serde_json::json!({
+                "path": path,
+                "imported_name": imported_name,
+                "original_name": imported_name,
+                "glob": true,
+                "filesystem_module_import": true,
+                "dart_relative_import": true,
+            }),
+        });
+    }
+}
+
+fn dart_import_path<'a>(source: &'a [u8], import: Node<'_>) -> Option<&'a str> {
+    let uri = import.child_by_field_name("uri")?;
+    let text = node_text(source, uri).trim();
+    let text = text.strip_prefix('r').unwrap_or(text);
+    text.strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+        .or_else(|| text.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')))
+        .filter(|path| !path.is_empty())
+}
+
 /// USAGE pass for Dart. Every
 /// `identifier` / `type_identifier` reference emits a USAGE edge unless it sits
 /// inside a call node (this grammar's call/
@@ -10839,13 +10999,13 @@ fn dart_emit_usages(
 /// Call/constructor node kinds a Dart reference must NOT be inside to count as a
 /// USAGE (those references are already CALLS candidates). The call types are
 /// `{selector, new_expression}`; in THIS grammar the equivalent invocation
-/// wrappers are `member_expression` (the `obj.method` / `.field` access),
-/// `arguments` (a call's argument list), and `new_expression`.
+/// wrappers are `member_expression` (the `obj.method` / `.field` access) and
+/// `new_expression`. Call arguments remain ordinary value/type references —
+/// for example `Widget(answer + HELPER_VALUE)` must retain the constant usage.
 /// A bare direct call `foo()` leaves its callee `foo` as a plain `identifier`
-/// under `call_expression` (NOT inside any of these), so
-/// direct-call callees still count as usages while `obj.method()` receivers /
-/// selectors do not.
-const DART_CALL_SKIP_KINDS: &[&str] = &["member_expression", "arguments", "new_expression"];
+/// under `call_expression` (NOT inside either wrapper), so direct-call callees
+/// still count as usages while `obj.method()` selectors do not.
+const DART_CALL_SKIP_KINDS: &[&str] = &["member_expression", "new_expression"];
 
 /// True if `node` is the *type qualifier* of a `constant_pattern` — the `X` in a
 /// `case X.member:` enum-value pattern (`constant_pattern > identifier(X) . name`).
@@ -10873,20 +11033,39 @@ const DART_IMPORT_KINDS: &[&str] = &["import_or_export", "import_specification",
 /// or free → `{file}::Function::{name}`). Returns `None` at file / type scope
 /// (the caller substitutes the file Module qname).
 fn dart_enclosing_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
-    let mut p = node.parent();
-    while let Some(cur) = p {
-        if cur.kind() == "function_signature" {
-            let name = cur
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        let signature = match candidate.kind() {
+            "function_signature" => Some(candidate),
+            "function_declaration" => candidate.child_by_field_name("signature"),
+            "method_declaration" => candidate
+                .child_by_field_name("signature")
+                .and_then(dart_function_signature_child),
+            _ => None,
+        };
+        if let Some(signature) = signature {
+            let name = signature
                 .child_by_field_name("name")
-                .map(|n| node_text(source, n))?;
-            return Some(match dart_owner_type_name(source, cur) {
+                .map(|name| node_text(source, name))?;
+            return Some(match dart_owner_type_name(source, candidate) {
                 Some(owner) => format!("{file_path}::{owner}::{name}"),
                 None => format!("{file_path}::Function::{name}"),
             });
         }
-        p = cur.parent();
+        current = candidate.parent();
     }
     None
+}
+
+fn dart_function_signature_child(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "function_signature" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    let signature = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "function_signature");
+    signature
 }
 
 /// The owning type *name* for a `function_signature` (its nearest enclosing
@@ -19508,6 +19687,77 @@ String labelOfMode(Mode mode) {
                 .iter()
                 .any(|(_, rn)| matches!(*rn, "this" | "return" | "switch" | "case")),
             "keywords must not emit USAGE: {usages:?}"
+        );
+    }
+
+    #[test]
+    fn dart_body_calls_usages_and_relative_imports_use_function_scope() {
+        const SRC: &str = r#"
+import 'helper.dart';
+
+int caller() {
+  final answer = do_it();
+  return answer + HELPER_VALUE;
+}
+"#;
+        let r = dart(SRC, "lib/main.dart");
+        let call = r
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge
+                        .properties
+                        .get("callee_name")
+                        .and_then(|value| value.as_str())
+                        == Some("do_it")
+            })
+            .expect("do_it CALLS edge");
+        assert_eq!(
+            call.source_qualified_name,
+            "lib/main.dart::Function::caller"
+        );
+        let usage = r
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "USAGE"
+                    && edge
+                        .properties
+                        .get("ref_name")
+                        .and_then(|value| value.as_str())
+                        == Some("HELPER_VALUE")
+            })
+            .expect("HELPER_VALUE usage");
+        assert_eq!(
+            usage.source_qualified_name,
+            "lib/main.dart::Function::caller"
+        );
+        let import = r
+            .edges
+            .iter()
+            .find(|edge| edge.edge_type == "IMPORTS")
+            .expect("relative Dart import");
+        assert_eq!(
+            import.properties.get("path").and_then(|value| value.as_str()),
+            Some("helper.dart")
+        );
+        assert_eq!(
+            import
+                .properties
+                .get("dart_relative_import")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        let helper = dart("const int HELPER_VALUE = 7;\n", "lib/helper.dart");
+        assert!(
+            helper
+                .nodes
+                .iter()
+                .any(|node| node.label == "Variable" && node.name == "HELPER_VALUE"),
+            "top-level constants must be resolvable usage targets: {:?}",
+            helper.nodes
         );
     }
 
