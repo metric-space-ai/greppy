@@ -7600,32 +7600,21 @@ fn groovy_is_keyword(name: &str) -> bool {
 // OCaml — bespoke pass.
 // ===========================================================================
 //
-// This pass models OCaml as a FLAT set of `Function` nodes plus the per-file
-// `Module` node — it emits NO Class/Type/Enum/Variable/Method nodes for OCaml
-// at all (`type_definition`, `module_definition`, `record_declaration` carry no
-// resolvable name here, so they emit nothing; the module body is still
-// descended into). Concretely, the pass emits:
+// This pass models OCaml definitions and references as follows:
 //
-//   * **Function** — one per `value_definition` (`let ... = ...`), whether or
-//     not it has parameters and whether it is top-level or nested inside a
-//     `module ... = struct ... end`. The name is the FIRST `let_binding`'s
-//     `pattern:` text (only the first binding is taken, so `let a = 1 and b = 2`
-//     is ONE Function named `a`). A `unit` pattern (`let () = ...`) is a
-//     Function named `()`.
-//   * **CALLS** — source is the per-file `Module` node (`{file}::__file__`,
-//     since a `let_binding` has no `name` field the call source falls back to
-//     the module), target is the applied function resolved by its final path
-//     segment (the head of an `application_expression`; the operator of an
-//     `infix_expression` never names a Function so it produces no edge).
-//   * **USAGE** — a `value_path` / `constructor_path` reference that is NOT
-//     inside a call or an `open`/`include`, and is not a definition name,
-//     resolved by its final segment. The source is again the per-file `Module`
-//     node.
+//   * **Class** — one importable compilation-unit namespace per source file,
+//     named by OCaml's capitalized file stem (`helper.ml` -> `Helper`).
+//   * **Function** — one per reachable `value_definition` (`let ... = ...`),
+//     whether parameterized or constant. The first `let_binding`'s `pattern:`
+//     field supplies the name; nested local lets are not emitted.
+//   * **Type** — one per `type_binding`, covering records, variants, and aliases.
+//   * **CALLS / USAGE / TYPE_REF** — source is the nearest emitted Function,
+//     falling back to the per-file Module at file scope. Targets resolve by the
+//     final path segment.
+//   * **IMPORTS** — `open` / `include` module paths resolve to the compilation-
+//     unit Class node named by their final segment.
 //
-// DEFINES (File→Function, File→Module) and CONTAINS_* are auto-derived by the
-// indexer's structural pass from the nodes above, so this pass emits none.
-// `open`/`include` produce no IMPORTS edge (the OCaml import path does not
-// resolve to a name), so none are emitted.
+// DEFINES and CONTAINS_* are auto-derived by the indexer's structural pass.
 fn extract_ocaml(
     d: &'static crate::registry::LangDef,
     source: &[u8],
@@ -7636,11 +7625,40 @@ fn extract_ocaml(
     let mut result = ExtractionResult::default();
     let file_module_qname = format!("{file_path}::__file__");
 
+    ocaml_emit_compilation_unit(file_path, root, &mut result);
     ocaml_defs_pass(source, root, file_path, &mut result);
     ocaml_calls_pass(source, root, &file_module_qname, file_path, &mut result);
+    ocaml_imports_pass(d, source, root, &file_module_qname, file_path, &mut result)?;
+    ocaml_type_refs_pass(source, root, &file_module_qname, file_path, &mut result);
     ocaml_usages_pass(source, root, &file_module_qname, file_path, &mut result);
 
     Ok(result)
+}
+
+/// Emit an importable namespace node for the OCaml compilation unit. OCaml
+/// capitalizes the source-file stem (`helper.ml` -> `Helper`) when naming the
+/// module. The shared IMPORTS resolver deliberately excludes synthetic Module
+/// nodes, so the language pass models this namespace like Elixir's `defmodule`:
+/// as a Class node carrying an explicit `ocaml_compilation_unit` marker.
+fn ocaml_emit_compilation_unit(file_path: &str, root: Node<'_>, result: &mut ExtractionResult) {
+    let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    let mut chars = stem.chars();
+    let Some(first) = chars.next() else {
+        return;
+    };
+    let name = first.to_uppercase().chain(chars).collect::<String>();
+    result.nodes.push(ExtractedNode {
+        label: "Class".into(),
+        name: name.clone(),
+        qualified_name: format!("{file_path}::Class::{name}"),
+        file_path: file_path.to_string(),
+        start_line: 1,
+        end_line: root.end_position().row as u32 + 1,
+        properties: serde_json::json!({ "kind": "ocaml_compilation_unit" }),
+    });
 }
 
 /// The OCaml node kinds that become a "Function" node.
@@ -7665,6 +7683,22 @@ const OCAML_IMPORT_KINDS: [&str; 2] = ["open_module", "include_module"];
 fn ocaml_defs_pass(source: &[u8], root: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if node.kind() == "type_binding" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(source, name_node);
+                if !name.is_empty() {
+                    result.nodes.push(ExtractedNode {
+                        label: "Type".into(),
+                        name: name.to_string(),
+                        qualified_name: format!("{file_path}::Type::{name}"),
+                        file_path: file_path.to_string(),
+                        start_line: node.start_position().row as u32 + 1,
+                        end_line: node.end_position().row as u32 + 1,
+                        properties: serde_json::json!({}),
+                    });
+                }
+            }
+        }
         if OCAML_FUNC_KINDS.contains(&node.kind()) {
             if let Some(name) = ocaml_def_name(source, node) {
                 // Drop empty names and the literal "function"; the `_`
@@ -7713,7 +7747,44 @@ fn ocaml_def_name(source: &[u8], node: Node<'_>) -> Option<String> {
         .map(|n| node_text(source, n).to_string())
 }
 
-/// Emit CALLS edges from the per-file `Module` node to each applied function.
+/// Resolve the nearest enclosing emitted OCaml callable. For top-level values,
+/// the callable name lives under the first `let_binding`'s `pattern:` field,
+/// not a generic `name:` field. Walking to the containing `value_definition`
+/// also skips nested local `let` bindings, which do not emit Function nodes.
+fn ocaml_enclosing_callable_qname(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+) -> Option<String> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if OCAML_FUNC_KINDS.contains(&candidate.kind())
+            && !ocaml_is_nested_callable_definition(candidate)
+        {
+            let name = ocaml_def_name(source, candidate)?;
+            if !name.is_empty() {
+                return Some(format!("{file_path}::Function::{name}"));
+            }
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+/// The defs walk stops after emitting a callable, so a callable-shaped node
+/// nested inside another callable is not a graph node and cannot own edges.
+fn ocaml_is_nested_callable_definition(node: Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if OCAML_FUNC_KINDS.contains(&candidate.kind()) {
+            return true;
+        }
+        parent = candidate.parent();
+    }
+    false
+}
+
+/// Emit CALLS edges from the nearest callable (or per-file Module) to each applied function.
 /// The callee is resolved by its final path segment; the indexer's resolver
 /// then links it same-file (by the direct `{file}::Function::{seg}` qname) or
 /// cross-file (by unique name).
@@ -7729,9 +7800,11 @@ fn ocaml_calls_pass(
         if OCAML_CALL_KINDS.contains(&node.kind()) {
             if let Some(callee) = ocaml_callee_name(source, node) {
                 if !callee.is_empty() {
+                    let source_qname = ocaml_enclosing_callable_qname(source, node, file_path)
+                        .unwrap_or_else(|| file_module_qname.to_string());
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
-                        source_qualified_name: file_module_qname.to_string(),
+                        source_qualified_name: source_qname,
                         target_qualified_name: format!("{file_path}::Function::{callee}"),
                         file_path: file_path.to_string(),
                         line: node.start_position().row as u32 + 1,
@@ -7786,6 +7859,93 @@ fn ocaml_value_path_leaf(source: &[u8], node: Node<'_>) -> Option<String> {
     }
 }
 
+/// Emit one file-sourced IMPORTS edge for each `open` / `include` module path.
+/// The target name is the final module segment; compilation-unit Class nodes
+/// provide importable namespace targets without changing shared resolution.
+fn ocaml_imports_pass(
+    d: &'static crate::registry::LangDef,
+    source: &[u8],
+    root: Node<'_>,
+    file_module_qname: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) -> greppy_core::Result<()> {
+    let language = (d.grammar)();
+    let query = tree_sitter::Query::new(&language, d.import_query)
+        .map_err(|e| greppy_core::Error::Parse(format!("compile ocaml imports query: {e}")))?;
+    let imported_capture = query
+        .capture_index_for_name("imported")
+        .ok_or_else(|| greppy_core::Error::Parse("ocaml imports query lacks @imported".into()))?;
+    let mut cursor = QueryCursor::new();
+    let mut captures = cursor.captures(&query, root, source);
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = query_match.captures[*capture_index];
+        if capture.index != imported_capture {
+            continue;
+        }
+        let path = node_text(source, capture.node);
+        let imported_name = path.rsplit('.').next().unwrap_or(path);
+        if path.is_empty() || imported_name.is_empty() {
+            continue;
+        }
+        result.edges.push(ExtractedEdge {
+            edge_type: "IMPORTS".into(),
+            source_qualified_name: file_module_qname.to_string(),
+            target_qualified_name: format!("{file_path}::__import__::{path}"),
+            file_path: file_path.to_string(),
+            line: capture.node.start_position().row as u32 + 1,
+            properties: serde_json::json!({
+                "path": path,
+                "imported_name": imported_name,
+                "original_name": imported_name,
+                "glob": true,
+            }),
+        });
+    }
+    Ok(())
+}
+
+/// Emit TYPE_REF edges for qualified and bare OCaml type constructors. A path
+/// such as `Types.widget` resolves by its final segment (`widget`) to the Type
+/// node emitted from the corresponding `type_binding`.
+fn ocaml_type_refs_pass(
+    source: &[u8],
+    root: Node<'_>,
+    file_module_qname: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let is_path = node.kind() == "type_constructor_path";
+        let is_bare = node.kind() == "type_constructor"
+            && node.parent().map(|parent| parent.kind()) != Some("type_constructor_path");
+        if (is_path || is_bare) && !is_definition_name(node) {
+            let path = node_text(source, node);
+            let type_name = path.rsplit('.').next().unwrap_or(path);
+            if !type_name.is_empty() {
+                let source_qname = ocaml_enclosing_callable_qname(source, node, file_path)
+                    .unwrap_or_else(|| file_module_qname.to_string());
+                result.edges.push(ExtractedEdge {
+                    edge_type: "TYPE_REF".into(),
+                    source_qualified_name: source_qname,
+                    target_qualified_name: format!("{file_path}::__type__::{type_name}"),
+                    file_path: file_path.to_string(),
+                    line: node.start_position().row as u32 + 1,
+                    properties: serde_json::json!({ "type_name": type_name }),
+                });
+            }
+            if is_path {
+                continue;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
 /// Emit USAGE edges for OCaml: every `value_path` / `constructor_path`
 /// reference that is NOT inside a call or an `open`/`include`, and is not a
 /// definition name. The source is the per-file `Module` node; the reference
@@ -7806,9 +7966,11 @@ fn ocaml_usages_pass(
         {
             if let Some(refname) = ocaml_value_path_leaf(source, node) {
                 if !refname.is_empty() && !ocaml_is_keyword(&refname) {
+                    let source_qname = ocaml_enclosing_callable_qname(source, node, file_path)
+                        .unwrap_or_else(|| file_module_qname.to_string());
                     result.edges.push(ExtractedEdge {
                         edge_type: "USAGE".into(),
-                        source_qualified_name: file_module_qname.to_string(),
+                        source_qualified_name: source_qname,
                         target_qualified_name: format!("{file_path}::__ref__::{refname}"),
                         file_path: file_path.to_string(),
                         line: node.start_position().row as u32 + 1,
@@ -20270,6 +20432,12 @@ func freeFn() { freeOther() }
         // binding that is NOT (`dx`), a same-file CALL (`square`), and a
         // non-call value_path USAGE (`origin`).
         const SRC: &str = r#"
+open Helper
+
+type widget = { value : int }
+
+let render (w : Helper.widget) = w.value
+
 let origin = 0
 
 let square n = n * n
@@ -20301,27 +20469,47 @@ end
             !fns.contains(&"dx"),
             "local let..in must NOT be a Function: {fns:?}"
         );
-        // No Class/Type/Module def node for the `module Fib` (C emits none).
-        assert!(
-            !r.nodes.iter().any(|n| n.label != "Function"),
-            "OCaml emits only Function nodes: {:?}",
-            r.nodes.iter().map(|n| &n.label).collect::<Vec<_>>()
-        );
+        // The source file becomes the importable OCaml compilation unit `M`;
+        // the nested `module Fib` is still not emitted as a separate container.
+        assert!(r.nodes.iter().any(|n| {
+            n.label == "Class"
+                && n.name == "M"
+                && n.properties.get("kind").and_then(|v| v.as_str())
+                    == Some("ocaml_compilation_unit")
+        }));
+        assert!(!r.nodes.iter().any(|n| n.name == "Fib"));
+        assert!(r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Type" && n.name == "widget"));
+        assert!(r.edges.iter().any(|edge| {
+            edge.edge_type == "IMPORTS"
+                && edge
+                    .properties
+                    .get("imported_name")
+                    .and_then(|v| v.as_str())
+                    == Some("Helper")
+        }));
+        assert!(r.edges.iter().any(|edge| {
+            edge.edge_type == "TYPE_REF"
+                && edge.source_qualified_name == "m.ml::Function::render"
+                && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some("widget")
+        }));
 
-        // CALLS source is the per-file Module node; `square` resolves same-file.
+        // CALLS source is the enclosing `dist`; `square` resolves same-file.
         let call = r
             .edges
             .iter()
             .find(|e| e.edge_type == "CALLS")
             .expect("a CALLS edge");
-        assert_eq!(call.source_qualified_name, "m.ml::__file__");
+        assert_eq!(call.source_qualified_name, "m.ml::Function::dist");
         assert_eq!(
             call.properties.get("callee_name").and_then(|v| v.as_str()),
             Some("square")
         );
 
-        // USAGE: `origin` referenced (not in a call) → one USAGE from the file
-        // Module keyed by `ref_name`.
+        // USAGE: `origin` referenced (not in a call) → one USAGE from the
+        // enclosing `alias` binding, keyed by `ref_name`.
         let usage = r
             .edges
             .iter()
@@ -20330,7 +20518,7 @@ end
                     && e.properties.get("ref_name").and_then(|v| v.as_str()) == Some("origin")
             })
             .expect("a USAGE of origin");
-        assert_eq!(usage.source_qualified_name, "m.ml::__file__");
+        assert_eq!(usage.source_qualified_name, "m.ml::Function::alias");
     }
 
     #[test]

@@ -4,14 +4,10 @@
 //! (build.rs discovers this module automatically).
 //!
 //! Status: **experimental**. OCaml models a function as a `let_binding` whose
-//! `pattern:` field holds the `value_name` and which carries one or more
-//! `parameter` children (a value binding with no `parameter` is a plain
-//! constant, not a function). Definition extraction is precise, but CALLS
-//! edges are LIMITED: the engine resolves an enclosing callable's own name via
-//! `child_by_field_name("name")`, while OCaml exposes the name under the
-//! `pattern:` field, so a call's *source* callable cannot be named by the
-//! generic engine and the CALLS edge is dropped. Callee capture itself works.
-//! Not claimed as `supported` (no verification corpus).
+//! `pattern:` field holds the `value_name`; type declarations use `type_binding`
+//! with a `name:` field. The bespoke extractor consumes these provider queries
+//! and supplies callable attribution, imports, and type references. Not claimed
+//! as `supported` (no verification corpus).
 
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};
@@ -24,11 +20,14 @@ use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStr
 /// (`let x = 3`) from being counted as functions.
 static OCAML_SPEC: LangSpec = LangSpec {
     name: NameStrategy::Capture,
-    defs: &[DefRule::func("let_binding")],
+    defs: &[
+        DefRule::func("let_binding"),
+        DefRule::ty("type_binding", "Type"),
+    ],
     owner_kinds: &[],
     calls: CallSpec { skip_callees: &[] },
-    // OCaml `open`/`include` imports are not extracted yet (import_query is
-    // empty); any variant is inert without a query.
+    // The bespoke OCaml extractor consumes IMPORTS below directly. The Bash
+    // strategy is inert on this path.
     imports: ImportStrategy::Bash,
     docs: DocStyle::None,
 };
@@ -42,6 +41,8 @@ const DEFINITIONS: &str = r#"
     (let_binding
       pattern: (value_name) @name
       (parameter)) @def
+    (type_binding
+      name: (type_constructor) @name) @def
 "#;
 
 /// Function application `f x` / `M.f x` parses as `(application_expression
@@ -50,6 +51,16 @@ const DEFINITIONS: &str = r#"
 const CALLS: &str = r#"
     (application_expression
       function: (value_path (value_name) @callee))
+"#;
+
+/// OCaml namespace imports. The module expression is captured generically so
+/// both simple (`open Helper`) and qualified module paths are available to the
+/// bespoke import pass.
+pub(crate) const IMPORTS: &str = r#"
+    [
+      (open_module module: (_) @imported)
+      (include_module module: (_) @imported)
+    ] @import
 "#;
 
 inventory::submit! {
@@ -61,6 +72,6 @@ inventory::submit! {
         spec: &OCAML_SPEC,
         def_query: DEFINITIONS,
         call_query: CALLS,
-        import_query: "",
+        import_query: IMPORTS,
     }
 }
