@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const CERTIFICATE_SCHEMA: &str = "greppy.edit-certificate.v1";
+const COMPACT_RESULT_SPAN_MAX_BYTES: usize = 2000;
+const COMPACT_DIFF_OMITTED: &str = "omitted; use --report for the full diff";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -185,9 +187,10 @@ impl Certificate {
         self.status.exit_code()
     }
 
-    /// Render the stdout form of a certificate. The schema and field names are
-    /// unchanged, but evidence that is expensive in an agent context window is
-    /// omitted; `--report` continues to use the full `Serialize` form.
+    /// Render the stdout form of a certificate. Evidence that is expensive in
+    /// an agent context window is omitted, while the resulting target span is
+    /// retained in bounded form; `--report` continues to use the full
+    /// `Serialize` form.
     pub fn to_compact_json_pretty(&self) -> serde_json::Result<String> {
         let mut value = serde_json::to_value(self)?;
         if let Some(root) = value.as_object_mut() {
@@ -196,8 +199,22 @@ impl Certificate {
             if let Some(operations) = root.get_mut("operations").and_then(|v| v.as_array_mut()) {
                 for operation in operations {
                     if let Some(operation) = operation.as_object_mut() {
+                        let result_span = operation
+                            .get("node_after")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        let (result_span, truncated, total_bytes) =
+                            bounded_result_span(result_span);
+                        operation.insert("result_span".into(), result_span.into());
+                        if truncated {
+                            operation.insert("result_span_truncated".into(), true.into());
+                            operation.insert("result_span_total_bytes".into(), total_bytes.into());
+                        }
                         operation.remove("node_before");
                         operation.remove("node_after");
+                        if let Some(unified_diff) = operation.get_mut("unified_diff") {
+                            *unified_diff = COMPACT_DIFF_OMITTED.into();
+                        }
                         if let Some(postconditions) = operation
                             .get_mut("postconditions")
                             .and_then(|v| v.as_array_mut())
@@ -214,6 +231,19 @@ impl Certificate {
         }
         serde_json::to_string_pretty(&value)
     }
+}
+
+fn bounded_result_span(result_span: &str) -> (&str, bool, usize) {
+    let total_bytes = result_span.len();
+    if total_bytes <= COMPACT_RESULT_SPAN_MAX_BYTES {
+        return (result_span, false, total_bytes);
+    }
+
+    let mut end = COMPACT_RESULT_SPAN_MAX_BYTES;
+    while !result_span.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&result_span[..end], true, total_bytes)
 }
 
 #[cfg(test)]
@@ -240,9 +270,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_stdout_omits_heavy_evidence_full_report_retains_it() {
-        let certificate = Certificate {
+    fn sample_certificate(node_after: String) -> Certificate {
+        Certificate {
             schema_version: CERTIFICATE_SCHEMA.into(),
             status: Status::Applied,
             transaction_id: "ge-test".into(),
@@ -265,7 +294,7 @@ mod tests {
                 outside_declared_ranges_unchanged: true,
                 changed_byte_ranges: vec![(4, 9)],
                 node_before: Some("fn old() {}".into()),
-                node_after: Some("fn new() {}".into()),
+                node_after: Some(node_after),
                 unified_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n".into()),
                 syntax: SyntaxDelta {
                     errors_before: 0,
@@ -298,7 +327,12 @@ mod tests {
             }],
             published: true,
             publish_mode: PublishMode::Atomic,
-        };
+        }
+    }
+
+    #[test]
+    fn compact_stdout_includes_result_span_and_omits_heavy_evidence() {
+        let certificate = sample_certificate("fn new() {}".into());
 
         let compact: serde_json::Value =
             serde_json::from_str(&certificate.to_compact_json_pretty().unwrap()).unwrap();
@@ -306,18 +340,44 @@ mod tests {
         assert_eq!(compact["exit_code"], 0);
         assert_eq!(compact["operations"][0]["target_matches"], 2);
         assert_eq!(compact["operations"][0]["changed_byte_ranges"][0][0], 4);
+        assert_eq!(compact["operations"][0]["result_span"], "fn new() {}");
+        assert!(compact["operations"][0]
+            .get("result_span_truncated")
+            .is_none());
         assert!(compact["operations"][0].get("node_before").is_none());
         assert!(compact["operations"][0].get("node_after").is_none());
+        assert_eq!(
+            compact["operations"][0]["unified_diff"],
+            COMPACT_DIFF_OMITTED
+        );
         assert!(compact.get("validators").is_none());
         assert!(compact["operations"][0]["postconditions"][0]
             .get("detail")
             .is_none());
+        assert!(full["operations"][0].get("result_span").is_none());
         assert_eq!(full["operations"][0]["node_before"], "fn old() {}");
         assert_eq!(full["operations"][0]["node_after"], "fn new() {}");
+        assert_eq!(
+            full["operations"][0]["unified_diff"],
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n"
+        );
         assert_eq!(full["validators"][0]["argv"][0], "cargo");
         assert_eq!(
             full["operations"][0]["postconditions"][0]["detail"],
             "expected 0, found 1"
         );
+    }
+
+    #[test]
+    fn compact_result_span_is_truncated_at_2000_bytes_with_total_size() {
+        let certificate = sample_certificate("x".repeat(2001));
+
+        let compact: serde_json::Value =
+            serde_json::from_str(&certificate.to_compact_json_pretty().unwrap()).unwrap();
+        let operation = &compact["operations"][0];
+        assert_eq!(operation["result_span"].as_str().unwrap().len(), 2000);
+        assert_eq!(operation["result_span"], "x".repeat(2000));
+        assert_eq!(operation["result_span_truncated"], true);
+        assert_eq!(operation["result_span_total_bytes"], 2001);
     }
 }

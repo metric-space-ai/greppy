@@ -55,9 +55,10 @@ Every plan operation declares the file_sha256 from its handle; a plan
 without declared hashes is refused as stale.
 
 Every edit returns a certificate: matched exactly once, hashes before/after,
-a unified diff, "no bytes changed outside the declared range", and syntax
-verification. TRUST THE CERTIFICATE - do not re-read a file to check an
-edit the certificate already proves. If an edit fails it names the reason
+changed ranges, "no bytes changed outside the declared range", and syntax
+verification. The certificate includes the resulting span (`result_span`) —
+you have already seen the result; do not re-read the file after a successful
+edit. If an edit fails it names the reason
 and the candidates; fix the selector and retry, or fall back to text-cas.
 Exit codes: 0 ok/already-satisfied, 10 not found, 11 ambiguous (candidates
 listed), 12 stale (re-read the span, then retry), 13 result rejected

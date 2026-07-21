@@ -1763,7 +1763,7 @@ fn plan_semantic_file(
         outside_declared_ranges_unchanged: isolation_ok,
         changed_byte_ranges: applied.changed_ranges.clone(),
         node_before: None,
-        node_after: None,
+        node_after: String::from_utf8(target_after.clone()).ok(),
         unified_diff: (options.with_diff && changed)
             .then(|| unified_diff(rel_path, &snapshot.content, &applied.content)),
         syntax,

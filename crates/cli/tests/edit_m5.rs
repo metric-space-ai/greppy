@@ -93,6 +93,35 @@ fn plan_edits_two_files_in_one_transaction() {
 }
 
 #[test]
+fn text_cas_stdout_includes_the_resulting_span() {
+    let (repo, store) = fresh_workspace("text-cas-result-span");
+    std::fs::write(repo.join("note.txt"), "before text\n").unwrap();
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "text-cas",
+            "--file",
+            "note.txt",
+            "--old",
+            "before text",
+            "--new",
+            "after text",
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let certificate: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(certificate["operations"][0]["result_span"], "after text");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt")).unwrap(),
+        "after text\n"
+    );
+}
+
+#[test]
 fn plan_with_stale_precondition_changes_nothing_and_exits_12() {
     let (repo, store) = fresh_workspace("stale");
     std::fs::write(repo.join("a.txt"), "alpha one\n").unwrap();
