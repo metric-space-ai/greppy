@@ -25,9 +25,12 @@ import graph relations, so `who-calls`, `callees`, `find-usages`, and `impact`
 work out of the box (e.g. `greppy who-calls` resolves callers in an Elixir file
 with no extra setup).
 
-Six languages — **Rust, Python, Java, JavaScript, TypeScript, and Go** — are
-additionally **acceptance-certified for graph completeness**: language fixtures
-and real-repository tests guarantee their caller/callee/usage/impact relations
+Eleven languages — **Rust, Python, Java, JavaScript, TypeScript, Go, C++,
+C#, Kotlin, Swift, and Ruby** — are additionally **acceptance-certified for
+graph completeness**: per-language certification grids (12 cells over
+cross-file CALLS/USES/TYPE_REF/IMPORTS plus reindex stability and freshness
+behavior, `crates/cli/tests/graph_grid_*.rs`), language fixtures, and
+real-repository tests guarantee their caller/callee/usage/impact relations
 are correct and complete. Every other language extracts the same relations
 without that formal completeness guarantee — treat its graph as strong
 evidence, still verified against source. Purely declarative formats (JSON, YAML,

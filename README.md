@@ -287,6 +287,42 @@ output with exact counts. The first structured query builds the index; ordinary
 | `greppy plus QUERY` | fused ranking: literal + symbol + semantic + graph-neighbour signals |
 | `greppy expand ID` | the full source of results from a previous query (`Expand: greppy expand <id>`) |
 
+**Read by span** *(new in 0.3.0)*
+
+| Command | Returns |
+|---|---|
+| `greppy read SYMBOL --handle` | the definition's exact source span plus a **HANDLE** that pins file, byte range, and content hashes — pass it to edit commands instead of re-locating the code |
+| `greppy expand ID --handle` | the same, for a hit from a previous search |
+
+**Edit transactionally** *(new in 0.3.0)* — hash-guarded, all-or-nothing; never
+patch source files by hand when a verb fits:
+
+| Command | Does |
+|---|---|
+| `greppy edit replace-span --target HANDLE --source-file F` | replace exactly the span a `read --handle` returned |
+| `greppy edit replace-body --symbol SYM --source-file F` | replace a definition's body |
+| `greppy edit insert-after` / `insert-before --symbol SYM --source-file F` | add code next to a definition |
+| `greppy edit delete --symbol SYM` | remove a definition |
+| `greppy edit rename-call --in SYM --from A --to B` | retarget calls inside one definition |
+| `greppy edit rename-symbol --symbol SYM --new-name B` | rename with all references and imports, residual-checked |
+| `greppy edit change-signature --symbol SYM --spec F` | change a signature plus every call site, as one transaction |
+| `greppy edit ensure-import` / `ensure-method` / `ensure-argument` / `ensure-annotation` | idempotent structural edits — re-runs are safe |
+| `greppy edit text-cas --file P --old 'OLD' --new 'NEW'` | exact-once text change (configs, docs); `regex-cas` with declared match count |
+| `greppy edit data set --file c.json --path '$.a.b' --value-json V` | structured JSON/TOML/YAML values, format- and comment-preserving |
+| `greppy edit apply --plan PLAN.json` | several edits — same or multiple files — as **one** journal transaction with overlap rejection; one failure means no file changes |
+| `greppy edit recover [--report FILE]` | restore a crashed journal transaction explicitly |
+
+Every edit prints a **certificate**: matched exactly once, hashes before/after,
+changed byte ranges, syntax verification, and the resulting span
+(`result_span`) — the agent has already seen the outcome and never needs to
+re-read the file. Full evidence (complete diff, AST nodes) goes to `--report
+FILE`. Exit codes: `0` ok/already-satisfied · `10` not found · `11` ambiguous
+(candidates listed) · `12` stale — re-read the span, retry · `13` result
+rejected, nothing written · `14` validator failed · `16` publish blocked
+(workspace lock), nothing written. Batching rule: several edits to the same
+file belong in one `apply --plan` call; each plan operation declares the
+`file_sha256` from its handle.
+
 **Workspace & health**
 
 | Command | Does |
@@ -408,7 +444,7 @@ A symbol graph is built from source text. Edges a program wires up at runtime �
 - The grep passthrough stays available for string-level certainty.
 - The shipped agent prompt states the rule outright: an empty result does not prove that no relation exists — switch navigation methods instead of concluding.
 
-Language support is tiered the same way, deliberately: 60+ languages have parser-level support, and graph completeness is certified per language by fixture grids — currently Rust, Python, Java, JavaScript, TypeScript, and Go, with C++, C#, Kotlin, Swift, and Ruby next. Certification means the tier is measured, not assumed.
+Language support is tiered the same way, deliberately: 60+ languages have parser-level support, and graph completeness is certified per language by 12-cell fixture grids — currently Rust, Python, Java, JavaScript, TypeScript, Go, C++, C#, Kotlin, Swift, and Ruby; the remaining procedural languages follow in waves. Certification means the tier is measured, not assumed.
 
 The index is per repository, deliberately: one root, one store, and multi-package workspaces inside that root (Cargo, npm, Go) are already a single relation space. Multiple repositories are queried per root via `--root`; a federated multi-root workspace — one search across registered roots, with dependency-level edges between them — is planned. What is not planned is a central team server: greppy stays local by design. The team answer is index snapshots — build the index once in CI, distribute it as an artifact, and let the per-query freshness checks reconcile local drift.
 
