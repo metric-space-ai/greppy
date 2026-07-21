@@ -523,6 +523,81 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
     );
 }
 
+/// Multi-file drift below the large-drift threshold heals in the same way:
+/// one request reindexes BOTH changed files and serves post-drift truth from
+/// each of them — never a mix of generations.
+#[test]
+fn direct_navigation_json_heals_multi_file_stale_drift_in_band() {
+    let (repo, store) = index_fixture("nav-json-stale-multi");
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        r#"
+mod helper;
+mod types;
+
+fn caller() {
+    helper::do_it();
+}
+
+fn second_caller_added_after_index() {
+    helper::do_it();
+    helper::late_helper();
+}
+
+fn render(w: types::Widget) -> u32 { w.w + 1 }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/helper.rs"),
+        "pub fn do_it() -> u32 { 42 }\npub fn late_helper() -> u32 { 7 }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "healable multi-file drift must serve fresh results; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("invalid nav json: {e}; stdout={out:?}"));
+    assert_eq!(
+        v["fresh"], true,
+        "the healed response must prove freshness: {v:?}"
+    );
+    let hits = v["hits"].as_array().expect("hits array");
+    assert!(
+        hits.iter().any(|h| {
+            h["qualified_name"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("second_caller_added_after_index")
+        }),
+        "healed graph must contain the caller added in lib.rs: {v:?}"
+    );
+
+    // The same healed generation must also know the symbol added in the
+    // SECOND drifted file, with its post-drift caller.
+    let (code, out, err) = run(&["who-calls", "late_helper", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "the healed generation must resolve the symbol added in helper.rs; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("invalid nav json: {e}; stdout={out:?}"));
+    assert_eq!(v["fresh"], true, "second lookup must stay fresh: {v:?}");
+    let hits = v["hits"].as_array().expect("hits array");
+    assert!(
+        hits.iter().any(|h| {
+            h["qualified_name"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("second_caller_added_after_index")
+        }),
+        "late_helper must be called by the post-drift caller: {v:?}"
+    );
+}
+
 /// Large drift starts a background refresh and fails closed. No command may
 /// expose rows from the old generation while that refresh is in flight.
 fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {

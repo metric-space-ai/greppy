@@ -393,18 +393,26 @@ pub(crate) fn publish_journal_locked(
         }
     }
     if let Some(e) = failure {
+        // Best-effort: attempt every rollback even if one fails, so a single
+        // unreadable pre-image cannot strand the other published files.
+        let mut rollback_failures: Vec<String> = Vec::new();
         for (f, entry) in files.iter().zip(&journal.entries).take(published) {
-            let pre =
-                std::fs::read(dir.join(&entry.pre_image_file)).map_err(|source| Error::Io {
-                    context: format!("read pre-image for {}", f.rel_path),
-                    source,
-                })?;
             // rollback ignores CAS: restoring the pre-image is the contract
             let abs = workspace_root.join(&f.rel_path);
-            std::fs::write(&abs, &pre).map_err(|source| Error::Io {
-                context: format!("rollback {}", abs.display()),
-                source,
-            })?;
+            let restored = std::fs::read(dir.join(&entry.pre_image_file))
+                .and_then(|pre| std::fs::write(&abs, &pre));
+            if let Err(source) = restored {
+                rollback_failures.push(format!("{}: {source}", f.rel_path));
+            }
+        }
+        if !rollback_failures.is_empty() {
+            // Keep the committed journal so `greppy edit recover` can finish
+            // the job; surface both the publish failure and the stranded files.
+            return Err(Error::Workspace(format!(
+                "publish failed ({e}) and rollback is incomplete for {}; \
+                 the journal was kept — run `greppy edit recover`",
+                rollback_failures.join(", ")
+            )));
         }
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
