@@ -237,8 +237,194 @@ impl Certificate {
                 }
             }
         }
+        if let Some((diagnosis, failed_operation, next_steps)) = self.failure_guidance() {
+            let mut ordered = serde_json::Map::new();
+            ordered.insert("diagnosis".into(), diagnosis.into());
+            ordered.insert("failed_operation".into(), failed_operation);
+            ordered.insert("next_steps".into(), serde_json::json!(next_steps));
+            if let Some(root) = value.as_object() {
+                for (key, value) in root {
+                    ordered.insert(key.clone(), value.clone());
+                }
+            }
+            value = ordered.into();
+        }
         serde_json::to_string_pretty(&value)
     }
+
+    fn failure_guidance(&self) -> Option<(String, serde_json::Value, Vec<String>)> {
+        if !matches!(
+            self.status,
+            Status::NotFound
+                | Status::Ambiguous
+                | Status::Stale
+                | Status::InvalidResult
+                | Status::ValidationFailed
+        ) {
+            return None;
+        }
+
+        let (operation_index, operation) = self
+            .operations
+            .iter()
+            .enumerate()
+            .find(|(_, operation)| !operation.postconditions_passed)
+            .or_else(|| self.operations.iter().enumerate().next())?;
+        let failed_operation = serde_json::json!({
+            "id": operation.id,
+            "index": operation_index,
+        });
+        let detail = operation
+            .postconditions
+            .iter()
+            .find(|postcondition| !postcondition.passed)
+            .and_then(|postcondition| postcondition.detail.as_deref());
+        let file = shell_quote(&operation.file);
+        let candidate_selectors = operation
+            .candidates
+            .iter()
+            .map(|candidate| format!("{}::{}", candidate.path, candidate.qualified_name))
+            .collect::<Vec<_>>();
+
+        let (diagnosis, next_steps) = match self.status {
+            Status::NotFound => {
+                let selectors = if candidate_selectors.is_empty() {
+                    "no indexed candidates were found".to_string()
+                } else {
+                    format!(
+                        "accepted path::SYMBOL candidates: {}",
+                        candidate_selectors.join(", ")
+                    )
+                };
+                let mut steps = candidate_selectors
+                    .iter()
+                    .map(|selector| format!("greppy read {} --json", shell_quote(selector)))
+                    .collect::<Vec<_>>();
+                if steps.is_empty() {
+                    steps.push(format!("greppy search-symbols {} --json", file));
+                }
+                (
+                    format!(
+                        "operation `{}` expected at least one target but found 0; {selectors}.",
+                        operation.id
+                    ),
+                    steps,
+                )
+            }
+            Status::Ambiguous => {
+                let selectors = if candidate_selectors.is_empty() {
+                    "the selector matched multiple targets".to_string()
+                } else {
+                    format!(
+                        "disambiguate with path::SYMBOL: {}",
+                        candidate_selectors.join(", ")
+                    )
+                };
+                let mut steps = candidate_selectors
+                    .iter()
+                    .map(|selector| {
+                        format!("greppy read {} --handle --json", shell_quote(selector))
+                    })
+                    .collect::<Vec<_>>();
+                if steps.is_empty() {
+                    steps.push(format!("greppy search-symbols {} --json", file));
+                }
+                (
+                    format!(
+                        "operation `{}` expected one target but found {}; {selectors}.",
+                        operation.id, operation.target_matches
+                    ),
+                    steps,
+                )
+            }
+            Status::Stale => {
+                let found = detail.unwrap_or("the live file or target hash no longer matches");
+                (
+                    format!(
+                        "operation `{}` expected its planned span and hashes to be unchanged but found {found}.",
+                        operation.id
+                    ),
+                    vec![
+                        format!("nl -ba {file} | sed -n '1,400p'"),
+                        "echo 'Rebuild the edit plan from the fresh span, then rerun it with --dry-run.'"
+                            .into(),
+                    ],
+                )
+            }
+            Status::InvalidResult => {
+                let violation = detail
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        (operation.syntax.new_errors > 0 || operation.syntax.new_missing_nodes > 0)
+                            .then(|| {
+                                format!(
+                                    "{} new syntax error(s) and {} new missing node(s)",
+                                    operation.syntax.new_errors, operation.syntax.new_missing_nodes
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|| "the projected edit violated its declared scope".into());
+                let alternative = match operation.selector_engine {
+                    SelectorEngine::Symbol | SelectorEngine::TreeSitter | SelectorEngine::Lsp => {
+                        "greppy edit patch-span --help"
+                    }
+                    SelectorEngine::Text | SelectorEngine::Regex => "greppy edit text-cas --help",
+                    SelectorEngine::DataPath => "greppy edit data --help",
+                };
+                (
+                    format!(
+                        "operation `{}` expected no new syntax or scope violation but found {violation}.",
+                        operation.id
+                    ),
+                    vec![format!("greppy read {file} --json"), alternative.into()],
+                )
+            }
+            Status::ValidationFailed => {
+                let validator = self.validators.first();
+                let found = validator.map_or_else(
+                    || "a validator failure".to_string(),
+                    |validator| {
+                        format!(
+                            "validator exit {}{}",
+                            validator.exit_code,
+                            if validator.timed_out {
+                                " after timeout"
+                            } else {
+                                ""
+                            }
+                        )
+                    },
+                );
+                let rerun = validator
+                    .map(|validator| {
+                        validator
+                            .argv
+                            .iter()
+                            .map(|argument| shell_quote(argument))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .filter(|command| !command.is_empty())
+                    .unwrap_or_else(|| "greppy edit apply --help".into());
+                (
+                    format!(
+                        "operation `{}` expected every validator to exit 0 but found {found}.",
+                        operation.id
+                    ),
+                    vec![rerun, format!("greppy read {file} --json")],
+                )
+            }
+            _ => unreachable!("failure status filtered above"),
+        };
+        Some((diagnosis, failed_operation, next_steps))
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".into();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn bounded_result_span(result_span: &str) -> (&str, bool, usize) {
@@ -402,5 +588,107 @@ mod tests {
         assert_eq!(operation["result_span"], "x".repeat(2000));
         assert_eq!(operation["result_span_truncated"], true);
         assert_eq!(operation["result_span_total_bytes"], 2001);
+    }
+
+    fn compact_failure(status: Status) -> (String, serde_json::Value) {
+        let mut certificate = sample_certificate("projected".into());
+        certificate.status = status;
+        certificate.published = false;
+        certificate.operations[0].candidates = vec![Candidate {
+            qualified_name: "api::target".into(),
+            path: "src/api.rs".into(),
+            line: 7,
+        }];
+        certificate.operations[0].postconditions = vec![PostconditionResult {
+            name: "syntax-no-new-errors".into(),
+            passed: false,
+            detail: Some("first new syntax error at line 9".into()),
+        }];
+        certificate.operations[0].syntax.new_errors = 1;
+        certificate.validators = vec![ValidatorReport {
+            argv: vec!["cargo".into(), "test".into(), "-p".into(), "demo".into()],
+            exit_code: 1,
+            timed_out: false,
+        }];
+        let rendered = certificate.to_compact_json_pretty().unwrap();
+        let parsed = serde_json::from_str(&rendered).unwrap();
+        (rendered, parsed)
+    }
+
+    fn assert_actionable_failure(rendered: &str, compact: &serde_json::Value, exit_code: i32) {
+        assert!(rendered.starts_with("{\n  \"diagnosis\""), "{rendered}");
+        assert_eq!(compact["exit_code"], exit_code);
+        assert_eq!(compact["failed_operation"]["id"], "rename");
+        assert_eq!(compact["failed_operation"]["index"], 0);
+        assert!(compact["diagnosis"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()));
+        assert!(compact["next_steps"]
+            .as_array()
+            .is_some_and(|steps| !steps.is_empty()));
+    }
+
+    #[test]
+    fn compact_exit_10_has_diagnosis_and_candidate_commands() {
+        let (rendered, compact) = compact_failure(Status::NotFound);
+        assert_actionable_failure(&rendered, &compact, 10);
+        assert!(compact["diagnosis"]
+            .as_str()
+            .unwrap()
+            .contains("src/api.rs::api::target"));
+        assert!(compact["next_steps"][0]
+            .as_str()
+            .unwrap()
+            .contains("greppy read 'src/api.rs::api::target'"));
+    }
+
+    #[test]
+    fn compact_exit_11_has_diagnosis_and_disambiguating_command() {
+        let (rendered, compact) = compact_failure(Status::Ambiguous);
+        assert_actionable_failure(&rendered, &compact, 11);
+        assert!(compact["diagnosis"]
+            .as_str()
+            .unwrap()
+            .contains("path::SYMBOL"));
+        assert!(compact["next_steps"][0]
+            .as_str()
+            .unwrap()
+            .contains("--handle --json"));
+    }
+
+    #[test]
+    fn compact_exit_12_has_diagnosis_and_reread_replan_commands() {
+        let (rendered, compact) = compact_failure(Status::Stale);
+        assert_actionable_failure(&rendered, &compact, 12);
+        assert!(compact["next_steps"][0]
+            .as_str()
+            .unwrap()
+            .contains("nl -ba 'src/lib.rs'"));
+        assert!(compact["next_steps"][1]
+            .as_str()
+            .unwrap()
+            .contains("Rebuild the edit plan"));
+    }
+
+    #[test]
+    fn compact_exit_13_has_diagnosis_and_alternative_verb() {
+        let (rendered, compact) = compact_failure(Status::InvalidResult);
+        assert_actionable_failure(&rendered, &compact, 13);
+        assert!(compact["diagnosis"]
+            .as_str()
+            .unwrap()
+            .contains("first new syntax error"));
+        assert_eq!(compact["next_steps"][1], "greppy edit patch-span --help");
+    }
+
+    #[test]
+    fn compact_exit_14_has_diagnosis_and_validator_command() {
+        let (rendered, compact) = compact_failure(Status::ValidationFailed);
+        assert_actionable_failure(&rendered, &compact, 14);
+        assert!(compact["diagnosis"]
+            .as_str()
+            .unwrap()
+            .contains("validator exit 1"));
+        assert_eq!(compact["next_steps"][0], "'cargo' 'test' '-p' 'demo'");
     }
 }
