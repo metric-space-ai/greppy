@@ -2157,6 +2157,23 @@ fn qname_owner_segment(qualified_name: &str) -> Option<&str> {
     it.next() // the segment before it is the owner (or Label for free defs)
 }
 
+/// Lua providers preserve dotted declaration names (`function helper.do_it()`)
+/// verbatim. Return the final member only for that representation; ordinary
+/// bare names and `::`-qualified qnames are not rewritten here.
+fn verbatim_dotted_leaf(name: &str) -> Option<&str> {
+    let (_, leaf) = name.rsplit_once('.')?;
+    (!leaf.is_empty()).then_some(leaf)
+}
+
+/// Match a bare query against either an ordinary node name or the final segment
+/// of a provider-preserved dotted name. Qualified queries are handled by
+/// `resolve_qualified_ids`, where the full dotted spelling is authoritative.
+fn bare_symbol_name_matches(node_name: &str, query: &str) -> bool {
+    node_name.eq_ignore_ascii_case(query)
+        || (split_qualified(query).is_none()
+            && verbatim_dotted_leaf(node_name).is_some_and(|leaf| leaf.eq_ignore_ascii_case(query)))
+}
+
 /// If `symbol` is a qualified `Owner.member` / `Owner::member` query,
 /// return the node ids of every primary-labelled node that genuinely
 /// matches it: `name == member` AND the node's [`qname_owner_segment`]
@@ -2191,9 +2208,10 @@ fn resolve_qualified_ids(
     let mut ids: Vec<i64> = rows
         .iter()
         .filter(|r| {
-            r.name == member
-                && is_primary_label(&r.label)
-                && qname_owner_segment(&r.qualified_name) == Some(owner_tail)
+            is_primary_label(&r.label)
+                && (r.name.eq_ignore_ascii_case(symbol)
+                    || (r.name == member
+                        && qname_owner_segment(&r.qualified_name) == Some(owner_tail)))
         })
         .map(|r| r.id)
         .collect();
@@ -2240,7 +2258,7 @@ fn resolve_symbol_id(store: &greppy_store::Store, symbol: Option<&str>) -> Resul
         Some(s) => {
             let best = rows
                 .iter()
-                .filter(|r| r.name.eq_ignore_ascii_case(s))
+                .filter(|r| bare_symbol_name_matches(&r.name, s))
                 .min_by(|a, b| {
                     label_rank(&a.label)
                         .cmp(&label_rank(&b.label))
@@ -2267,25 +2285,46 @@ fn resolve_symbol_id(store: &greppy_store::Store, symbol: Option<&str>) -> Resul
 
 /// The candidate rows a symbol query resolves against, fetched with the
 /// filter pushed into SQL (never a capped whole-project scan):
-///   * bare name → all nodes with that exact `name`;
-///   * qualified `Owner.member` → all nodes named `member` (the owner is
-///     matched in [`resolve_qualified_ids`]);
+///   * bare name → exact `name` matches plus provider-preserved dotted names
+///     ending in `.name` (Lua's `function helper.do_it()` representation);
+///   * qualified `Owner.member` → exact full-name matches plus nodes named
+///     `member` (the owner is matched in [`resolve_qualified_ids`]);
 ///   * no symbol → the first node in qualified_name order (the historical
 ///     no-arg `trace` seed).
 fn symbol_candidate_rows(
     store: &greppy_store::Store,
     symbol: Option<&str>,
 ) -> Result<Vec<greppy_search::graph::SearchGraphRow>> {
-    let q = match symbol {
-        Some(s) => {
-            let lookup_name = split_qualified(s).map(|(_, member)| member).unwrap_or(s);
-            greppy_search::GraphQuery::any()
-                .with_name(lookup_name)
-                .with_limit(10_000)
-        }
-        None => greppy_search::GraphQuery::any().with_limit(1),
+    let Some(s) = symbol else {
+        let q = greppy_search::GraphQuery::any().with_limit(1);
+        return greppy_search::search_graph(store, &q);
     };
-    let rows = greppy_search::search_graph(store, &q)?;
+
+    let mut rows = greppy_search::search_graph(
+        store,
+        &greppy_search::GraphQuery::any()
+            .with_name(s)
+            .with_limit(10_000),
+    )?;
+
+    if let Some((_, member)) = split_qualified(s) {
+        rows.extend(greppy_search::search_graph(
+            store,
+            &greppy_search::GraphQuery::any()
+                .with_name(member)
+                .with_limit(10_000),
+        )?);
+    } else {
+        rows.extend(greppy_search::search_graph(
+            store,
+            &greppy_search::GraphQuery::any()
+                .with_name_contains(format!(".{s}"))
+                .with_limit(10_000),
+        )?);
+    }
+
+    rows.sort_by_key(|row| row.id);
+    rows.dedup_by_key(|row| row.id);
     Ok(rows)
 }
 
@@ -2509,7 +2548,7 @@ fn resolve_symbol_nodes(store: &greppy_store::Store, symbol: Option<&str>) -> Re
         .iter()
         // Case-insensitive equality: symbol_candidate_rows only returns a
         // case-variant when it is UNAMBIGUOUS, so this never guesses.
-        .filter(|r| r.name.eq_ignore_ascii_case(s) && is_primary_label(&r.label))
+        .filter(|r| bare_symbol_name_matches(&r.name, s) && is_primary_label(&r.label))
         .map(|r| r.id)
         .collect();
     ids.sort_unstable();
