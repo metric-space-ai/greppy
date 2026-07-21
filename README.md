@@ -2,7 +2,7 @@
 
 # greppy
 
-**Local code navigation for coding agents: deterministic symbol-graph evidence, native semantic search, compact function briefings, and byte-exact real-`grep` passthrough. One native Rust binary.**
+**Local code navigation and transactional editing for coding agents: deterministic symbol-graph evidence, native semantic search, compact function briefings, certificate-backed edits, and byte-exact real-`grep` passthrough. One native Rust binary.**
 
 [![CI](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml?query=branch%3Amain)
 [![CodeQL](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml?query=branch%3Amain)
@@ -15,8 +15,8 @@
 > Method and full results: [paper](docs/paper/mscc-greppy-paper.pdf); the
 > benchmark suites are in this repo.
 
-`greppy` is a code-navigation tool that also accepts ordinary `grep`
-invocations. Those invocations execute the real system `grep` and forward its
+`greppy` is a code-navigation and code-editing tool that also accepts ordinary
+`grep` invocations. Those invocations execute the real system `grep` and forward its
 stdout, stderr, and exit code byte-for-byte; they do not open an index, load a
 model, or mutate a Greppy cache. ripgrep-style invocations (`--smart-case`,
 `-t rust`, `-g '!target'`, …) are recognized too: they delegate byte-exactly
@@ -47,6 +47,11 @@ greppy who-calls parse_config                  # who calls this function
 greppy impact User --direction incoming        # what breaks if I change User
 greppy semantic-search "restrict a value to a range"   # find code by meaning
 greppy brief _split_blueprint_path             # definition + callers + callees
+
+# And since 0.3.0, editing on the same evidence — transactional, certificate-backed:
+greppy read parse_config --handle              # exact source + a hash-pinned edit handle
+greppy edit replace-body --symbol parse_config --source-file fix.rs   # all-or-nothing, proves its result
+greppy edit apply --plan refactor.json         # many files, ONE transaction: all publish or none
 ```
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
