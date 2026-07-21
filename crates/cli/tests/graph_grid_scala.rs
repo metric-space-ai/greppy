@@ -344,7 +344,6 @@ fn graph_grid_scala_brief_shows_definition_with_callers() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "scala graph gap: path finds no CALLS chain to the cross-file helper (who-calls resolves it — path-specific resolution)"]
 fn graph_grid_scala_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     // `path --from caller --to doIt` over CALLS must find the single-hop

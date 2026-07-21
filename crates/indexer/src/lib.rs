@@ -1954,6 +1954,20 @@ struct NodeLite {
     file_path: String,
 }
 
+/// Rank graph labels exactly like CLI symbol navigation. When one source symbol
+/// has multiple persisted facets (for example Scala Method + Function twins),
+/// CALLS resolution and single-node navigation must choose the same facet or a
+/// real edge can appear unreachable to `path`.
+fn navigation_label_rank(label: &str) -> u8 {
+    match label {
+        "Class" | "Interface" | "Type" | "Struct" | "Enum" | "Trait" | "Function"
+        | "Method" | "TypeAlias" => 0,
+        "Impl" | "EnumVariant" | "AssocConst" | "AssocType" | "Module" => 1,
+        "Call" | "Import" => 3,
+        _ => 2,
+    }
+}
+
 /// In-memory mirror of the project's node graph, built **once** per index
 /// run so edge resolution issues no per-edge SQLite queries. It replicates
 /// the `greppy-resolver` semantics exactly:
@@ -2174,26 +2188,20 @@ impl GraphIndex {
         if candidates.is_empty() {
             return UniqueResolution::Unresolved;
         }
-        // Import-disambiguation (preference): if the referrer's file imports
-        // exactly one of the candidates, that is the intended target.
-        if let Some(set) = self.imports_by_file.get(referrer_file) {
-            if !set.is_empty() {
-                let preferred: Vec<&&NodeLite> =
-                    candidates.iter().filter(|n| set.contains(&n.id)).collect();
-                if preferred.len() == 1 {
-                    return UniqueResolution::Unique(preferred[0].id);
-                }
-            }
-        }
-        // Resolution for SAME-FILE ambiguity only. The node model can
-        // emit multiple nodes for ONE source symbol — a Function AND a Method
-        // twin per Ruby/PHP method, a Field AND a Variable per Java member —
-        // so a reference to that symbol maps to >1 candidate that all live in
-        // the SAME file. Those candidates are the same source entity, so
-        // resolving to the first (candidates are `ORDER BY qualified_name`
-        // from GraphIndex::load → deterministic, parallel == sequential)
-        // yields ONE edge. Languages with no twin nodes (e.g. rust/python)
-        // never reach here.
+        // Resolution for SAME-FILE ambiguity takes precedence over import
+        // disambiguation. An import can resolve to only one compatibility facet
+        // (Scala imports the free Function twin, since Method is not importable)
+        // even though navigation selects another facet of the same symbol.
+        // Resolve the symbol's facets together before consulting that signal.
+        //
+        // The node model can emit multiple nodes for ONE source symbol — a
+        // Function AND a Method twin per Ruby/PHP/Scala method, a Field AND a
+        // Variable per Java member — so a reference to that symbol maps to >1
+        // candidate that all live in the SAME file. Those candidates are the
+        // same source entity. Choose them with the exact label-rank + node-id
+        // ordering used by CLI single-symbol navigation; otherwise CALLS can
+        // target one twin while `path --to <name>` selects the other and falsely
+        // reports no path. Languages with no twins never reach here.
         //
         // Genuinely CROSS-FILE ambiguity — the same name defined in DIFFERENT
         // files, i.e. distinct symbols — is still NOT guessed: picking one
@@ -2207,9 +2215,23 @@ impl GraphIndex {
             .all(|n| n.file_path.as_str() == first_file.as_str())
         {
             return candidates
-                .first()
-                .map(|n| UniqueResolution::Unique(n.id))
+                .iter()
+                .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
+                .map(|node| UniqueResolution::Unique(node.id))
                 .unwrap_or(UniqueResolution::Unresolved);
+        }
+
+        // Import-disambiguation (preference): if the genuinely cross-file
+        // candidates include exactly one target imported by the referrer's
+        // file, that is the intended definition.
+        if let Some(set) = self.imports_by_file.get(referrer_file) {
+            if !set.is_empty() {
+                let preferred: Vec<&&NodeLite> =
+                    candidates.iter().filter(|n| set.contains(&n.id)).collect();
+                if preferred.len() == 1 {
+                    return UniqueResolution::Unique(preferred[0].id);
+                }
+            }
         }
         UniqueResolution::Ambiguous
     }
@@ -3181,6 +3203,57 @@ mod tests {
             .filter(|e| e.target_id == b.id && e.edge_type == "CALLS")
             .collect();
         assert_eq!(outs.len(), 1, "expected one CALLS edge a→b, got {outs:?}");
+    }
+
+    #[test]
+    fn scala_call_targets_same_twin_as_single_symbol_navigation() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-scala-path-twin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/main.scala"),
+            "package grid.main\nimport grid.helper.Helper.doIt\nobject MainFlow { def caller(): Int = doIt(2) }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/helper.scala"),
+            "package grid.helper\nobject Helper { def doIt(x: Int): Int = x }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").expect("index Scala twin fixture");
+
+        let caller = store
+            .list_nodes_by_name("test", "caller", 10)
+            .unwrap()
+            .into_iter()
+            .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
+            .expect("caller definition");
+        let twins: Vec<_> = store
+            .list_nodes_by_name("test", "doIt", 10)
+            .unwrap()
+            .into_iter()
+            .filter(|node| matches!(node.label.as_str(), "Function" | "Method"))
+            .collect();
+        assert_eq!(twins.len(), 2, "Scala method must expose both facets");
+        let navigated = twins
+            .iter()
+            .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
+            .expect("navigation target");
+        let calls = store.outgoing_edges(caller.id, Some("CALLS"), 10).unwrap();
+        assert!(
+            calls.iter().any(|edge| edge.target_id == navigated.id),
+            "CALLS must target the same twin selected by path navigation: twins={twins:?}, calls={calls:?}"
+        );
+
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
