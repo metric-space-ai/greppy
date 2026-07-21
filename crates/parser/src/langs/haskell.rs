@@ -22,8 +22,9 @@ static HASKELL_SPEC: LangSpec = LangSpec {
     defs: &[DefRule::func("function"), DefRule::func("bind")],
     owner_kinds: &[],
     calls: CallSpec { skip_callees: &[] },
-    // Haskell imports (`import Foo`) are not extracted yet (import_query is
-    // empty); any variant is inert without a query.
+    // The bespoke Haskell extractor consumes IMPORTS below directly. The
+    // strategy remains inert on this path, while the registered query declares
+    // the provider's import capability.
     imports: ImportStrategy::Bash,
     docs: DocStyle::LineDashComment,
 };
@@ -46,6 +47,15 @@ const CALLS: &str = r#"
       function: (variable) @callee)
 "#;
 
+/// Explicit names imported from a module import list. The bespoke extractor
+/// emits one IMPORTS edge per `import_name`, keyed by the imported symbol text.
+pub(crate) const IMPORTS: &str = r#"
+    (import
+      module: (module) @module
+      names: (import_list
+        name: (import_name) @imported)) @import
+"#;
+
 inventory::submit! {
     LangDef {
         name: "haskell",
@@ -55,6 +65,6 @@ inventory::submit! {
         spec: &HASKELL_SPEC,
         def_query: DEFINITIONS,
         call_query: CALLS,
-        import_query: "",
+        import_query: IMPORTS,
     }
 }

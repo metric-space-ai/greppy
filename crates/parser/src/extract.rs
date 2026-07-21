@@ -10175,10 +10175,12 @@ fn is_scala_usage_keyword(name: &str) -> bool {
 //     all three are labelled "Class" (none matches the
 //     Interface/Enum/Type kinds). `type_synomym` (`type X = …`) is in NO type
 //     list, so it is deliberately NOT emitted.
+//   * an IMPORTS pass over explicit import lists, keyed by each imported name;
 //   * the `pass_usages` USAGE walk: every
-//     `variable` / `constructor` reference that is not inside a call
+//     `variable` / `constructor` reference that is not inside a runtime call
 //     (`apply` / `infix`) or import (`import` / `instance`), is not a
-//     definition name, and is not a keyword.
+//     definition name, and is not a keyword. Constructor applies in a function
+//     LHS pattern are usages, not calls.
 // ---------------------------------------------------------------------------
 
 /// The Haskell type-declaration kinds routed through the class path.
@@ -10197,7 +10199,7 @@ const HASKELL_IMPORT_KINDS: [&str; 2] = ["import", "instance"];
 
 fn extract_haskell(
     language: Language,
-    _d: &'static crate::registry::LangDef,
+    d: &'static crate::registry::LangDef,
     source: &[u8],
     file_path: &str,
 ) -> greppy_core::Result<ExtractionResult> {
@@ -10210,11 +10212,13 @@ fn extract_haskell(
     //     `bind` and per class-body `signature`/`function`, but NOT `where`-bound
     //     locals (a function is not descended into);
     //     "Class" per `class`/`data_type`/`newtype`.
-    //   * calls: one call candidate per `apply`
+    //   * calls: one call candidate per runtime `apply`
     //     (callee = first child, if `variable`/`constructor`) and per `infix`
-    //     (callee = the `operator:` field).
+    //     (callee = the `operator:` field); LHS constructor patterns are skipped.
+    //   * imports: one IMPORTS edge per explicit import-list name.
     //   * usages: one USAGE per `variable`/
-    //     `constructor` reference not inside a call/import, not a def name.
+    //     `constructor` reference not inside a runtime call/import, not a def
+    //     name; LHS constructor patterns are included.
     // The Module/File/Folder/Project structural nodes and the File→DEFINES /
     // CONTAINS edges are added by the indexer's shared structural pass.
     let tree = crate::parse(language, source)?;
@@ -10225,6 +10229,7 @@ fn extract_haskell(
     haskell_walk_calls(source, root, file_path, &mut result);
 
     let file_module_qname = format!("{file_path}::__file__");
+    haskell_imports_pass(d, source, root, file_path, &file_module_qname, &mut result)?;
     haskell_emit_usages(source, root, file_path, &file_module_qname, &mut result);
 
     Ok(result)
@@ -10336,7 +10341,11 @@ fn haskell_walk_calls(
     let file_module_qname = format!("{file_path}::__file__");
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let callee = haskell_call_callee(source, node);
+        let callee = if haskell_is_function_lhs_pattern(node) {
+            None
+        } else {
+            haskell_call_callee(source, node)
+        };
         if let Some(callee) = callee {
             if !callee.is_empty() && !is_haskell_usage_keyword(callee) {
                 let source_qname = haskell_enclosing_qname(source, node, file_path)
@@ -10383,6 +10392,28 @@ fn haskell_call_callee<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> 
     }
 }
 
+/// Whether `node` is inside the `patterns:` field of an enclosing function.
+/// Constructor application syntax on the left-hand side is destructuring, not
+/// a runtime call, and is instead classified by the USAGE pass.
+fn haskell_is_function_lhs_pattern(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    let mut patterns = None;
+    while let Some(candidate) = current {
+        if candidate.kind() == "patterns" {
+            patterns = Some(candidate);
+        }
+        if candidate.kind() == "function" {
+            return patterns.is_some_and(|pattern_node| {
+                candidate
+                    .child_by_field_name("patterns")
+                    .is_some_and(|field| field.id() == pattern_node.id())
+            });
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
 /// Emit the "Class" node for one `class` / `data_type` / `newtype`. The name is
 /// the `name:` field (a `name` node in tree-sitter-haskell).
 /// Empty names are dropped.
@@ -10410,6 +10441,66 @@ fn haskell_emit_type(
     });
 }
 
+/// Emit one file-sourced IMPORTS edge per explicit `import_name`. The provider
+/// query maps `import -> module + import_list -> import_name`; resolution keys
+/// on the imported symbol while retaining the module path for disambiguation.
+fn haskell_imports_pass(
+    d: &'static crate::registry::LangDef,
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    file_module_qname: &str,
+    result: &mut ExtractionResult,
+) -> greppy_core::Result<()> {
+    let language = (d.grammar)();
+    let query = tree_sitter::Query::new(&language, d.import_query)
+        .map_err(|e| greppy_core::Error::Parse(format!("compile haskell imports query: {e}")))?;
+    let module_capture = query
+        .capture_index_for_name("module")
+        .ok_or_else(|| greppy_core::Error::Parse("haskell imports query lacks @module".into()))?;
+    let imported_capture = query
+        .capture_index_for_name("imported")
+        .ok_or_else(|| greppy_core::Error::Parse("haskell imports query lacks @imported".into()))?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source);
+    while let Some(query_match) = matches.next() {
+        let mut module = None;
+        let mut imported = None;
+        for capture in query_match.captures {
+            if capture.index == module_capture {
+                module = Some(node_text(source, capture.node));
+            } else if capture.index == imported_capture {
+                imported = capture
+                    .node
+                    .child_by_field_name("variable")
+                    .or_else(|| capture.node.child_by_field_name("type"))
+                    .or_else(|| capture.node.child_by_field_name("operator"))
+                    .map(|name| node_text(source, name));
+            }
+        }
+        let (Some(path), Some(imported_name)) = (module, imported) else {
+            continue;
+        };
+        if path.is_empty() || imported_name.is_empty() {
+            continue;
+        }
+        result.edges.push(ExtractedEdge {
+            edge_type: "IMPORTS".into(),
+            source_qualified_name: file_module_qname.to_string(),
+            target_qualified_name: format!("{file_path}::__import__::{path}::{imported_name}"),
+            file_path: file_path.to_string(),
+            line: query_match.captures[0].node.start_position().row as u32 + 1,
+            properties: serde_json::json!({
+                "path": path,
+                "imported_name": imported_name,
+                "original_name": imported_name,
+                "glob": false,
+            }),
+        });
+    }
+    Ok(())
+}
+
 /// USAGE pass for Haskell over reference nodes
 /// (`variable` / `constructor`). Every such
 /// reference emits a USAGE edge unless it sits inside a call node
@@ -10427,7 +10518,7 @@ fn haskell_emit_usages(
 ) {
     let kind = node.kind();
     if matches!(kind, "variable" | "constructor")
-        && !haskell_is_inside(node, &HASKELL_CALL_KINDS)
+        && (!haskell_is_inside(node, &HASKELL_CALL_KINDS) || haskell_is_function_lhs_pattern(node))
         && !haskell_is_inside(node, &HASKELL_IMPORT_KINDS)
         && !is_definition_name(node)
     {
@@ -10825,12 +10916,7 @@ fn dart_emit_type(
 /// Emit Dart CALLS edges with a source reconstructed from the enclosing
 /// declaration. The grammar makes `function_signature` and `function_body`
 /// siblings, so the shared spec walk sees the callee but cannot find its caller.
-fn dart_emit_calls(
-    source: &[u8],
-    root: Node<'_>,
-    file_path: &str,
-    result: &mut ExtractionResult,
-) {
+fn dart_emit_calls(source: &[u8], root: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         let mut cursor = node.walk();
@@ -10939,7 +11025,10 @@ fn dart_import_path<'a>(source: &'a [u8], import: Node<'_>) -> Option<&'a str> {
     let text = text.strip_prefix('r').unwrap_or(text);
     text.strip_prefix('\'')
         .and_then(|inner| inner.strip_suffix('\''))
-        .or_else(|| text.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')))
+        .or_else(|| {
+            text.strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+        })
         .filter(|path| !path.is_empty())
 }
 
@@ -18480,10 +18569,7 @@ int render(::Widget w) { return w.w; }
                 && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some("Widget")
         });
         let edge = edge.unwrap_or_else(|| panic!("missing Widget TYPE_REF: {:?}", r.edges));
-        assert_eq!(
-            edge.source_qualified_name,
-            "src/main.cpp::Function::render"
-        );
+        assert_eq!(edge.source_qualified_name, "src/main.cpp::Function::render");
     }
 
     #[test]
@@ -18825,7 +18911,9 @@ namespace Fixture.App {
             "HelperCode.Seed must classify the enum member read as USES: {refs:?}"
         );
         assert!(
-            !refs.iter().any(|(_, source, _)| *source == "Main.cs::__file__"),
+            !refs
+                .iter()
+                .any(|(_, source, _)| *source == "Main.cs::__file__"),
             "using aliases must not leak into the reference pass: {refs:?}"
         );
     }
@@ -19517,7 +19605,9 @@ helper n = doubled
         // body attributes to that def; a call inside a `where` attributes to the
         // module (so per-file duplicates collapse).
         const SRC: &str = r#"
-module M (f, g) where
+module M (f, g, render) where
+
+data Widget = Widget Int
 
 f :: Int -> Int
 f x = g (h x)
@@ -19526,6 +19616,9 @@ g :: Int -> Int
 g y = h y
   where
     h z = z + z
+
+render :: Widget -> Int
+render (Widget n) = g n
 "#;
         let r = haskell(SRC, "M.hs");
         let calls = calls_edges(&r);
@@ -19544,6 +19637,17 @@ g y = h y
             !calls.iter().any(|(src, _)| src.contains("::Function::h")),
             "no call may be sourced from the unemitted where-def h: {calls:?}"
         );
+        // `(Widget n)` is an `apply` in the grammar, but it is in the function's
+        // LHS `patterns:` field: classify it as USAGE, never CALLS.
+        assert!(
+            !calls.iter().any(|(_, target)| target == "Widget"),
+            "{calls:?}"
+        );
+        assert!(r.edges.iter().any(|edge| {
+            edge.edge_type == "USAGE"
+                && edge.source_qualified_name == "M.hs::Function::render"
+                && edge.properties.get("ref_name").and_then(|v| v.as_str()) == Some("Widget")
+        }));
     }
 
     #[test]
@@ -19571,8 +19675,19 @@ topB = 1
         // Export-list `topA`, `topB` and the body reference `topB` in topA.
         assert!(usage_refs.contains(&"topA"), "{usage_refs:?}");
         assert!(usage_refs.contains(&"topB"), "{usage_refs:?}");
-        // The imported `dep` is inside an `import` — never a usage.
+        // The imported `dep` is inside an `import` — never a usage, but the
+        // explicit import-list mapping emits an IMPORTS edge keyed by `dep`.
         assert!(!usage_refs.contains(&"dep"), "{usage_refs:?}");
+        assert!(r.edges.iter().any(|edge| {
+            edge.edge_type == "IMPORTS"
+                && edge.source_qualified_name == "M.hs::__file__"
+                && edge.properties.get("path").and_then(|v| v.as_str()) == Some("Other")
+                && edge
+                    .properties
+                    .get("imported_name")
+                    .and_then(|v| v.as_str())
+                    == Some("dep")
+        }));
         // Every USAGE source qname is a real node qname (a Function or the file
         // module), never a dangling `where`/`let`-bound name.
         for e in r.edges.iter().filter(|e| e.edge_type == "USAGE") {
@@ -19859,7 +19974,10 @@ int caller() {
             .find(|edge| edge.edge_type == "IMPORTS")
             .expect("relative Dart import");
         assert_eq!(
-            import.properties.get("path").and_then(|value| value.as_str()),
+            import
+                .properties
+                .get("path")
+                .and_then(|value| value.as_str()),
             Some("helper.dart")
         );
         assert_eq!(
