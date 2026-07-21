@@ -17,10 +17,21 @@ silently switching devices.
 
 ## Language support
 
-Rust, Python, Java, JavaScript, TypeScript, and Go are production-certified by
-language fixtures and real-repository acceptance tests. Other bundled parsers
-can provide indexing and text/definition search, but graph completeness is not
-claimed until that language receives the same test coverage.
+Greppy bundles tree-sitter parsers for **more than 60 languages**. Every one of
+them indexes symbols and answers definition and text search, and most of them —
+every procedural language, from the mainstream set through Ruby, C++, C#,
+Kotlin, Swift, Elixir, Scala, and dozens more — also extract call, usage, and
+import graph relations, so `who-calls`, `callees`, `find-usages`, and `impact`
+work out of the box (e.g. `greppy who-calls` resolves callers in an Elixir file
+with no extra setup).
+
+Six languages — **Rust, Python, Java, JavaScript, TypeScript, and Go** — are
+additionally **acceptance-certified for graph completeness**: language fixtures
+and real-repository tests guarantee their caller/callee/usage/impact relations
+are correct and complete. Every other language extracts the same relations
+without that formal completeness guarantee — treat its graph as strong
+evidence, still verified against source. Purely declarative formats (JSON, YAML,
+TOML, Markdown, …) provide symbols and text search but no call graph, by nature.
 
 Static analysis can miss reflection, runtime dependency injection, generated
 code, macro expansion, monkeypatching, and dynamic dispatch. Greppy fails closed

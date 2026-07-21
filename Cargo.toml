@@ -17,10 +17,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.95"
-license = "MIT"
+license = "Apache-2.0"
 description = "Local code navigation for coding agents: deterministic code graph, native semantic search, and byte-exact grep passthrough."
 repository = "https://github.com/metric-space-ai/greppy"
 homepage = "https://github.com/metric-space-ai/greppy"

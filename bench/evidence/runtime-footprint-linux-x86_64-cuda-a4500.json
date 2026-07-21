@@ -1,0 +1,1043 @@
+{
+  "binary": {
+    "bytes": 1114754528,
+    "sha256": "c8c1a0fa117e681d77b5264ada5e7fa6461a988c88cde950dc7b5900054f6ac1"
+  },
+  "commands": [
+    {
+      "argument_count": 5,
+      "argv_template_sha256": "ac1376aaa3f3bf39f1e5ff205c2863c588a764aaeca51165edf0010bcf2f6ab2",
+      "exit_code": 1,
+      "phase": "doctor_before",
+      "wall_time_ms": 1933.453
+    },
+    {
+      "argument_count": 3,
+      "argv_template_sha256": "438be5da2a5896c5176b143669c8c90f9aceac9690d93b9c728f58cd5143a451",
+      "exit_code": 0,
+      "phase": "index",
+      "wall_time_ms": 14526.295
+    },
+    {
+      "argument_count": 5,
+      "argv_template_sha256": "ac1376aaa3f3bf39f1e5ff205c2863c588a764aaeca51165edf0010bcf2f6ab2",
+      "exit_code": 0,
+      "phase": "doctor_after_index",
+      "wall_time_ms": 547.529
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "f079c99f78259d7719c7493020a135364bac6ca7c9af2d9f68d52f923c172fca",
+      "exit_code": 0,
+      "phase": "semantic_first",
+      "wall_time_ms": 2440.301
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "f079c99f78259d7719c7493020a135364bac6ca7c9af2d9f68d52f923c172fca",
+      "exit_code": 0,
+      "iteration": 1,
+      "phase": "semantic_warm",
+      "wall_time_ms": 198.834
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "f079c99f78259d7719c7493020a135364bac6ca7c9af2d9f68d52f923c172fca",
+      "exit_code": 0,
+      "iteration": 2,
+      "phase": "semantic_warm",
+      "wall_time_ms": 200.447
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "f079c99f78259d7719c7493020a135364bac6ca7c9af2d9f68d52f923c172fca",
+      "exit_code": 0,
+      "iteration": 3,
+      "phase": "semantic_warm",
+      "wall_time_ms": 200.499
+    },
+    {
+      "argument_count": 5,
+      "argv_template_sha256": "ac1376aaa3f3bf39f1e5ff205c2863c588a764aaeca51165edf0010bcf2f6ab2",
+      "exit_code": 0,
+      "phase": "doctor_after_semantic",
+      "wall_time_ms": 555.443
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "60b5439e44c1588b5c437d1d1488d00c2a6f6519d51c689363c0549149cb4693",
+      "exit_code": 0,
+      "phase": "brief_first",
+      "wall_time_ms": 1078.775
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "60b5439e44c1588b5c437d1d1488d00c2a6f6519d51c689363c0549149cb4693",
+      "exit_code": 0,
+      "iteration": 1,
+      "phase": "brief_warm",
+      "wall_time_ms": 119.613
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "60b5439e44c1588b5c437d1d1488d00c2a6f6519d51c689363c0549149cb4693",
+      "exit_code": 0,
+      "iteration": 2,
+      "phase": "brief_warm",
+      "wall_time_ms": 93.306
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "60b5439e44c1588b5c437d1d1488d00c2a6f6519d51c689363c0549149cb4693",
+      "exit_code": 0,
+      "iteration": 3,
+      "phase": "brief_warm",
+      "wall_time_ms": 99.565
+    },
+    {
+      "argument_count": 6,
+      "argv_template_sha256": "b58e59f9e6cf45a8c972408aa22ed3b062f59aaa3df65f2a91b3d1e1cf74b8a4",
+      "exit_code": 0,
+      "phase": "cache_status",
+      "wall_time_ms": 7.047
+    },
+    {
+      "argument_count": 5,
+      "argv_template_sha256": "ac1376aaa3f3bf39f1e5ff205c2863c588a764aaeca51165edf0010bcf2f6ab2",
+      "exit_code": 0,
+      "phase": "doctor_after",
+      "wall_time_ms": 531.119
+    }
+  ],
+  "configuration": {
+    "command_timeout_seconds": 900.0,
+    "device": "cuda",
+    "private_store": true,
+    "warm_repeat_count": 3
+  },
+  "doctor": {
+    "after": {
+      "current_embedding_rows": 2443,
+      "embedding_complete": true,
+      "expected_schema_version": 15,
+      "fresh": true,
+      "git_tracked_files": 361,
+      "graph_generation": 1,
+      "healthy": true,
+      "incomplete_provider_count": 5,
+      "inference": {
+        "daemons": {
+          "embedding": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          },
+          "summary": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": 4,
+            "pending_requests": 1,
+            "pid_reported": true,
+            "protocol": 2,
+            "queue_capacity": 8,
+            "rejected_requests": 0,
+            "state": "ready",
+            "state_elapsed_ms": 745
+          }
+        },
+        "models": {
+          "embedding": {
+            "embedded": true,
+            "format": "gguf-q4k",
+            "model_bytes": 238991680,
+            "model_id": "google/embeddinggemma-300m@sha256:b469d441220e6327d89ed6109d31ed45f6d5e97ae76d35f159ae22a43cb4e4bf",
+            "model_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+            "prompt_version": "embeddinggemma-code-retrieval-st-v2",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": "embeddinggemma_code_retrieval",
+            "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+          },
+          "summary": {
+            "embedded": true,
+            "format": "gguf-q4-k-m-mtp",
+            "model_bytes": 529297152,
+            "model_id": "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11",
+            "model_sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+            "prompt_version": "qwen35-brief-path-v5",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": null,
+            "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          }
+        },
+        "registry": {
+          "explicit": true,
+          "preference": "cuda",
+          "probes": [
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cuda",
+              "backend_id": "greppy-cuda-q4k-v1",
+              "build_info": "greppy-cuda-q4k;abi=1;min-cc=7.5",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cuda",
+                  "capabilities": [
+                    "q4_k",
+                    "mmq",
+                    "cuda-graphs"
+                  ],
+                  "compute_capability": "8.6",
+                  "description": "NVIDIA RTX A4500",
+                  "device_type": "discrete_gpu",
+                  "id": "cuda:0",
+                  "memory_free": 19896664064,
+                  "memory_total": 21018640384,
+                  "metal_family": null,
+                  "name": "NVIDIA RTX A4500",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 400
+            },
+            {
+              "abi_version": 1,
+              "available": false,
+              "backend": "metal",
+              "backend_id": "greppy-metal-q4k-v1",
+              "build_info": "x86_64-linux",
+              "compiled": false,
+              "devices": [],
+              "reason_present": true,
+              "reason_sha256": "46b1fc79f409a45bfdf8a19ba2a24c33964e0dbce481a1e007f0da691cc3f04f",
+              "score": 0
+            },
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cpu",
+              "backend_id": "greppy-cpu-q4k-v1",
+              "build_info": "rust-x86_64-linux",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cpu",
+                  "capabilities": [
+                    "sse4.2",
+                    "avx2",
+                    "fma",
+                    "avx-vnni"
+                  ],
+                  "compute_capability": null,
+                  "description": "x86_64 CPU",
+                  "device_type": "cpu",
+                  "id": "cpu:0",
+                  "memory_free": 7719837696,
+                  "memory_total": 134730141696,
+                  "metal_family": null,
+                  "name": "x86_64",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 100
+            }
+          ],
+          "required_gpu_memory": 2647337024,
+          "selected_backend": "cuda",
+          "selected_device_id": "cuda:0",
+          "version": 1
+        }
+      },
+      "integrity_ok": true,
+      "project_present": true,
+      "provider_failure_count": 0,
+      "schema_current": true,
+      "schema_version": 15,
+      "stats": {
+        "edges": 10181,
+        "files": 339,
+        "nodes": 4573
+      },
+      "status": "ok",
+      "store_bytes": 28803190,
+      "store_exists": true,
+      "vectors_missing_with_model": false
+    },
+    "after_embedding": {
+      "current_embedding_rows": 2443,
+      "embedding_complete": true,
+      "expected_schema_version": 15,
+      "fresh": true,
+      "git_tracked_files": 361,
+      "graph_generation": 1,
+      "healthy": true,
+      "incomplete_provider_count": 5,
+      "inference": {
+        "daemons": {
+          "embedding": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          },
+          "summary": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          }
+        },
+        "models": {
+          "embedding": {
+            "embedded": true,
+            "format": "gguf-q4k",
+            "model_bytes": 238991680,
+            "model_id": "google/embeddinggemma-300m@sha256:b469d441220e6327d89ed6109d31ed45f6d5e97ae76d35f159ae22a43cb4e4bf",
+            "model_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+            "prompt_version": "embeddinggemma-code-retrieval-st-v2",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": "embeddinggemma_code_retrieval",
+            "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+          },
+          "summary": {
+            "embedded": true,
+            "format": "gguf-q4-k-m-mtp",
+            "model_bytes": 529297152,
+            "model_id": "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11",
+            "model_sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+            "prompt_version": "qwen35-brief-path-v5",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": null,
+            "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          }
+        },
+        "registry": {
+          "explicit": true,
+          "preference": "cuda",
+          "probes": [
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cuda",
+              "backend_id": "greppy-cuda-q4k-v1",
+              "build_info": "greppy-cuda-q4k;abi=1;min-cc=7.5",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cuda",
+                  "capabilities": [
+                    "q4_k",
+                    "mmq",
+                    "cuda-graphs"
+                  ],
+                  "compute_capability": "8.6",
+                  "description": "NVIDIA RTX A4500",
+                  "device_type": "discrete_gpu",
+                  "id": "cuda:0",
+                  "memory_free": 20724121600,
+                  "memory_total": 21018640384,
+                  "metal_family": null,
+                  "name": "NVIDIA RTX A4500",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 400
+            },
+            {
+              "abi_version": 1,
+              "available": false,
+              "backend": "metal",
+              "backend_id": "greppy-metal-q4k-v1",
+              "build_info": "x86_64-linux",
+              "compiled": false,
+              "devices": [],
+              "reason_present": true,
+              "reason_sha256": "46b1fc79f409a45bfdf8a19ba2a24c33964e0dbce481a1e007f0da691cc3f04f",
+              "score": 0
+            },
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cpu",
+              "backend_id": "greppy-cpu-q4k-v1",
+              "build_info": "rust-x86_64-linux",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cpu",
+                  "capabilities": [
+                    "sse4.2",
+                    "avx2",
+                    "fma",
+                    "avx-vnni"
+                  ],
+                  "compute_capability": null,
+                  "description": "x86_64 CPU",
+                  "device_type": "cpu",
+                  "id": "cpu:0",
+                  "memory_free": 8279621632,
+                  "memory_total": 134730141696,
+                  "metal_family": null,
+                  "name": "x86_64",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 100
+            }
+          ],
+          "required_gpu_memory": 2647337024,
+          "selected_backend": "cuda",
+          "selected_device_id": "cuda:0",
+          "version": 1
+        }
+      },
+      "integrity_ok": true,
+      "project_present": true,
+      "provider_failure_count": 0,
+      "schema_current": true,
+      "schema_version": 15,
+      "stats": {
+        "edges": 10181,
+        "files": 339,
+        "nodes": 4573
+      },
+      "status": "ok",
+      "store_bytes": 28733558,
+      "store_exists": true,
+      "vectors_missing_with_model": false
+    },
+    "after_index": {
+      "current_embedding_rows": 2443,
+      "embedding_complete": true,
+      "expected_schema_version": 15,
+      "fresh": true,
+      "git_tracked_files": 361,
+      "graph_generation": 1,
+      "healthy": true,
+      "incomplete_provider_count": 5,
+      "inference": {
+        "daemons": {
+          "embedding": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          },
+          "summary": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          }
+        },
+        "models": {
+          "embedding": {
+            "embedded": true,
+            "format": "gguf-q4k",
+            "model_bytes": 238991680,
+            "model_id": "google/embeddinggemma-300m@sha256:b469d441220e6327d89ed6109d31ed45f6d5e97ae76d35f159ae22a43cb4e4bf",
+            "model_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+            "prompt_version": "embeddinggemma-code-retrieval-st-v2",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": "embeddinggemma_code_retrieval",
+            "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+          },
+          "summary": {
+            "embedded": true,
+            "format": "gguf-q4-k-m-mtp",
+            "model_bytes": 529297152,
+            "model_id": "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11",
+            "model_sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+            "prompt_version": "qwen35-brief-path-v5",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": null,
+            "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          }
+        },
+        "registry": {
+          "explicit": true,
+          "preference": "cuda",
+          "probes": [
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cuda",
+              "backend_id": "greppy-cuda-q4k-v1",
+              "build_info": "greppy-cuda-q4k;abi=1;min-cc=7.5",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cuda",
+                  "capabilities": [
+                    "q4_k",
+                    "mmq",
+                    "cuda-graphs"
+                  ],
+                  "compute_capability": "8.6",
+                  "description": "NVIDIA RTX A4500",
+                  "device_type": "discrete_gpu",
+                  "id": "cuda:0",
+                  "memory_free": 20724121600,
+                  "memory_total": 21018640384,
+                  "metal_family": null,
+                  "name": "NVIDIA RTX A4500",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 400
+            },
+            {
+              "abi_version": 1,
+              "available": false,
+              "backend": "metal",
+              "backend_id": "greppy-metal-q4k-v1",
+              "build_info": "x86_64-linux",
+              "compiled": false,
+              "devices": [],
+              "reason_present": true,
+              "reason_sha256": "46b1fc79f409a45bfdf8a19ba2a24c33964e0dbce481a1e007f0da691cc3f04f",
+              "score": 0
+            },
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cpu",
+              "backend_id": "greppy-cpu-q4k-v1",
+              "build_info": "rust-x86_64-linux",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cpu",
+                  "capabilities": [
+                    "sse4.2",
+                    "avx2",
+                    "fma",
+                    "avx-vnni"
+                  ],
+                  "compute_capability": null,
+                  "description": "x86_64 CPU",
+                  "device_type": "cpu",
+                  "id": "cpu:0",
+                  "memory_free": 8279621632,
+                  "memory_total": 134730141696,
+                  "metal_family": null,
+                  "name": "x86_64",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 100
+            }
+          ],
+          "required_gpu_memory": 2647337024,
+          "selected_backend": "cuda",
+          "selected_device_id": "cuda:0",
+          "version": 1
+        }
+      },
+      "integrity_ok": true,
+      "project_present": true,
+      "provider_failure_count": 0,
+      "schema_current": true,
+      "schema_version": 15,
+      "stats": {
+        "edges": 10181,
+        "files": 339,
+        "nodes": 4573
+      },
+      "status": "ok",
+      "store_bytes": 28733558,
+      "store_exists": true,
+      "vectors_missing_with_model": false
+    },
+    "after_semantic": {
+      "current_embedding_rows": 2443,
+      "embedding_complete": true,
+      "expected_schema_version": 15,
+      "fresh": true,
+      "git_tracked_files": 361,
+      "graph_generation": 1,
+      "healthy": true,
+      "incomplete_provider_count": 5,
+      "inference": {
+        "daemons": {
+          "embedding": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": 1,
+            "pending_requests": 1,
+            "pid_reported": true,
+            "protocol": 2,
+            "queue_capacity": 8,
+            "rejected_requests": 0,
+            "state": "ready",
+            "state_elapsed_ms": 2172
+          },
+          "summary": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": 8,
+            "pending_requests": 1,
+            "pid_reported": true,
+            "protocol": 2,
+            "queue_capacity": 8,
+            "rejected_requests": 0,
+            "state": "ready",
+            "state_elapsed_ms": 1174
+          }
+        },
+        "models": {
+          "embedding": {
+            "embedded": true,
+            "format": "gguf-q4k",
+            "model_bytes": 238991680,
+            "model_id": "google/embeddinggemma-300m@sha256:b469d441220e6327d89ed6109d31ed45f6d5e97ae76d35f159ae22a43cb4e4bf",
+            "model_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+            "prompt_version": "embeddinggemma-code-retrieval-st-v2",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": "embeddinggemma_code_retrieval",
+            "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+          },
+          "summary": {
+            "embedded": true,
+            "format": "gguf-q4-k-m-mtp",
+            "model_bytes": 529297152,
+            "model_id": "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11",
+            "model_sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+            "prompt_version": "qwen35-brief-path-v5",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": null,
+            "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          }
+        },
+        "registry": {
+          "explicit": true,
+          "preference": "cuda",
+          "probes": [
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cuda",
+              "backend_id": "greppy-cuda-q4k-v1",
+              "build_info": "greppy-cuda-q4k;abi=1;min-cc=7.5",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cuda",
+                  "capabilities": [
+                    "q4_k",
+                    "mmq",
+                    "cuda-graphs"
+                  ],
+                  "compute_capability": "8.6",
+                  "description": "NVIDIA RTX A4500",
+                  "device_type": "discrete_gpu",
+                  "id": "cuda:0",
+                  "memory_free": 19432013824,
+                  "memory_total": 21018640384,
+                  "metal_family": null,
+                  "name": "NVIDIA RTX A4500",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 400
+            },
+            {
+              "abi_version": 1,
+              "available": false,
+              "backend": "metal",
+              "backend_id": "greppy-metal-q4k-v1",
+              "build_info": "x86_64-linux",
+              "compiled": false,
+              "devices": [],
+              "reason_present": true,
+              "reason_sha256": "46b1fc79f409a45bfdf8a19ba2a24c33964e0dbce481a1e007f0da691cc3f04f",
+              "score": 0
+            },
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cpu",
+              "backend_id": "greppy-cpu-q4k-v1",
+              "build_info": "rust-x86_64-linux",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cpu",
+                  "capabilities": [
+                    "sse4.2",
+                    "avx2",
+                    "fma",
+                    "avx-vnni"
+                  ],
+                  "compute_capability": null,
+                  "description": "x86_64 CPU",
+                  "device_type": "cpu",
+                  "id": "cpu:0",
+                  "memory_free": 7123968000,
+                  "memory_total": 134730141696,
+                  "metal_family": null,
+                  "name": "x86_64",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 100
+            }
+          ],
+          "required_gpu_memory": 2647337024,
+          "selected_backend": "cuda",
+          "selected_device_id": "cuda:0",
+          "version": 1
+        }
+      },
+      "integrity_ok": true,
+      "project_present": true,
+      "provider_failure_count": 0,
+      "schema_current": true,
+      "schema_version": 15,
+      "stats": {
+        "edges": 10181,
+        "files": 339,
+        "nodes": 4573
+      },
+      "status": "ok",
+      "store_bytes": 28762230,
+      "store_exists": true,
+      "vectors_missing_with_model": false
+    },
+    "before": {
+      "current_embedding_rows": null,
+      "embedding_complete": false,
+      "expected_schema_version": null,
+      "fresh": false,
+      "git_tracked_files": null,
+      "graph_generation": null,
+      "healthy": false,
+      "incomplete_provider_count": null,
+      "inference": {
+        "daemons": {
+          "embedding": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          },
+          "summary": {
+            "active_request_elapsed_ms": null,
+            "completed_requests": null,
+            "pending_requests": null,
+            "pid_reported": false,
+            "protocol": 2,
+            "queue_capacity": null,
+            "rejected_requests": null,
+            "state": "stopped",
+            "state_elapsed_ms": null
+          }
+        },
+        "models": {
+          "embedding": {
+            "embedded": true,
+            "format": "gguf-q4k",
+            "model_bytes": 238991680,
+            "model_id": "google/embeddinggemma-300m@sha256:b469d441220e6327d89ed6109d31ed45f6d5e97ae76d35f159ae22a43cb4e4bf",
+            "model_sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+            "prompt_version": "embeddinggemma-code-retrieval-st-v2",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": "embeddinggemma_code_retrieval",
+            "tokenizer_sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+          },
+          "summary": {
+            "embedded": true,
+            "format": "gguf-q4-k-m-mtp",
+            "model_bytes": 529297152,
+            "model_id": "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11",
+            "model_sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+            "prompt_version": "qwen35-brief-path-v5",
+            "runtime_state": null,
+            "state": null,
+            "task_profile": null,
+            "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+          }
+        },
+        "registry": {
+          "explicit": true,
+          "preference": "cuda",
+          "probes": [
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cuda",
+              "backend_id": "greppy-cuda-q4k-v1",
+              "build_info": "greppy-cuda-q4k;abi=1;min-cc=7.5",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cuda",
+                  "capabilities": [
+                    "q4_k",
+                    "mmq",
+                    "cuda-graphs"
+                  ],
+                  "compute_capability": "8.6",
+                  "description": "NVIDIA RTX A4500",
+                  "device_type": "discrete_gpu",
+                  "id": "cuda:0",
+                  "memory_free": 20724121600,
+                  "memory_total": 21018640384,
+                  "metal_family": null,
+                  "name": "NVIDIA RTX A4500",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 400
+            },
+            {
+              "abi_version": 1,
+              "available": false,
+              "backend": "metal",
+              "backend_id": "greppy-metal-q4k-v1",
+              "build_info": "x86_64-linux",
+              "compiled": false,
+              "devices": [],
+              "reason_present": true,
+              "reason_sha256": "46b1fc79f409a45bfdf8a19ba2a24c33964e0dbce481a1e007f0da691cc3f04f",
+              "score": 0
+            },
+            {
+              "abi_version": 1,
+              "available": true,
+              "backend": "cpu",
+              "backend_id": "greppy-cpu-q4k-v1",
+              "build_info": "rust-x86_64-linux",
+              "compiled": true,
+              "devices": [
+                {
+                  "backend": "cpu",
+                  "capabilities": [
+                    "sse4.2",
+                    "avx2",
+                    "fma",
+                    "avx-vnni"
+                  ],
+                  "compute_capability": null,
+                  "description": "x86_64 CPU",
+                  "device_type": "cpu",
+                  "id": "cpu:0",
+                  "memory_free": 8446136320,
+                  "memory_total": 134730141696,
+                  "metal_family": null,
+                  "name": "x86_64",
+                  "rejection_reason_present": false,
+                  "rejection_reason_sha256": null
+                }
+              ],
+              "reason_present": false,
+              "reason_sha256": null,
+              "score": 100
+            }
+          ],
+          "required_gpu_memory": 2647337024,
+          "selected_backend": "cuda",
+          "selected_device_id": "cuda:0",
+          "version": 1
+        }
+      },
+      "integrity_ok": false,
+      "project_present": false,
+      "provider_failure_count": null,
+      "schema_current": false,
+      "schema_version": null,
+      "stats": null,
+      "status": "no_index",
+      "store_bytes": 0,
+      "store_exists": false,
+      "vectors_missing_with_model": null
+    }
+  },
+  "harness_sha256": "75f66aed5c9fd8fdd3edfb5bf255e1b67bc234e2505710c0127f5ce97e48021b",
+  "measurements": {
+    "brief": {
+      "first_wall_time_ms": 1078.775,
+      "result": {
+        "callers_count": 0,
+        "calls_count": 0,
+        "definition_count": 1,
+        "definitions_with_summary": 1,
+        "expand_available": true,
+        "references_count": 0,
+        "status": "ok",
+        "summary_line_count": 1
+      },
+      "warm": {
+        "maximum_ms": 119.613,
+        "median_ms": 99.565,
+        "minimum_ms": 93.306,
+        "samples_ms": [
+          119.613,
+          93.306,
+          99.565
+        ]
+      }
+    },
+    "cache": {
+      "entries": {
+        "model": {
+          "bytes": 814482596,
+          "entries": 4,
+          "locked": 1,
+          "orphaned": 0
+        },
+        "workspace": {
+          "bytes": 28770422,
+          "entries": 1,
+          "locked": 0,
+          "orphaned": 0
+        }
+      },
+      "locked_bytes": 529297346,
+      "low_water_bytes": 9663676416,
+      "managed_bytes": 843253018,
+      "quota_bytes": 10737418240,
+      "ttl_secs": 1209600,
+      "unmanaged_bytes": 163440624,
+      "unmanaged_entry_count": 1
+    },
+    "daemon_processes": [
+      {
+        "daemon": "embedding",
+        "pid_reported": false,
+        "rss_bytes": null,
+        "state": "stopped"
+      },
+      {
+        "daemon": "summary",
+        "pid_reported": true,
+        "rss_bytes": 541036544,
+        "state": "ready"
+      }
+    ],
+    "embedding_build": {
+      "deferred": false,
+      "poll_count": 0,
+      "wait_wall_time_ms": 0.002
+    },
+    "index": {
+      "wall_time_ms": 14526.295
+    },
+    "semantic_search": {
+      "daemon_processes": [
+        {
+          "daemon": "embedding",
+          "pid_reported": true,
+          "rss_bytes": 702910464,
+          "state": "ready"
+        },
+        {
+          "daemon": "summary",
+          "pid_reported": true,
+          "rss_bytes": 541208576,
+          "state": "ready"
+        }
+      ],
+      "first_wall_time_ms": 2440.301,
+      "result": {
+        "candidate_total": 2443,
+        "expand_available": true,
+        "fresh": true,
+        "hit_count": 3,
+        "hits_with_summary": 2,
+        "mode": "vector",
+        "omitted": 3,
+        "retrieved": 6,
+        "shown": 3,
+        "status": "ok",
+        "summary_line_count": 2,
+        "total_exact": 2443,
+        "truncated": true,
+        "unranked_candidates": 2437
+      },
+      "warm": {
+        "maximum_ms": 200.499,
+        "median_ms": 200.447,
+        "minimum_ms": 198.834,
+        "samples_ms": [
+          198.834,
+          200.447,
+          200.499
+        ]
+      }
+    }
+  },
+  "platform": {
+    "cpu": "13th Gen Intel(R) Core(TM) i5-13400F",
+    "logical_cpu_count": 16,
+    "machine": "x86_64",
+    "release": "6.8.0-124-generic",
+    "system": "Linux"
+  },
+  "schema_version": "greppy.runtime-footprint.v1"
+}

@@ -1,12 +1,12 @@
 # Third-Party Notices
 
-Greppy source is MIT-licensed. Embedded model weights, Rust dependencies, and
+Greppy source is Apache-2.0-licensed. Embedded model weights, Rust dependencies, and
 vendored accelerator kernels retain their own licenses and notices. Release
 archives must include this file and the complete `licenses/` directory.
 
 ## Embedded model assets
 
-The MIT license does not apply to the embedded model weight files. Their
+The Apache-2.0 license does not apply to the embedded model weight files. Their
 binding terms are collected in `licenses/EMBEDDED-MODEL-TERMS.md`, which is a
 condition of using and redistributing greppy binaries and archives.
 
@@ -21,7 +21,7 @@ condition of using and redistributing greppy binaries and archives.
 - Notice: `licenses/EMBEDDINGGEMMA-NOTICE.txt`.
 
 The Gemma terms require a copy of the agreement and a specific Notice for
-redistribution. They are not replaced by Greppy's MIT license; the binding
+redistribution. They are not replaced by Greppy's Apache-2.0 license; the binding
 use-restriction provision is `licenses/EMBEDDED-MODEL-TERMS.md`. The packaged
 copies were compared with the current official terms on 2026-07-13 (Gemma
 Terms of Use last modified 2026-04-01; Prohibited Use Policy last modified

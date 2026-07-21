@@ -27,9 +27,13 @@ __pycache__/
 .venv*/
 **/.venv*/
 
-# --- Agent / assistant working files (kept out of the public repo) ---
-CLAUDE.md
-AGENTS.md
+# --- Agent / assistant working files (kept out of the public repo). The
+# root AGENTS.md (the shipped agent prompt) and the root CLAUDE.md that
+# imports it are public and tracked; nested ones stay private. ---
+**/CLAUDE.md
+!/CLAUDE.md
+**/AGENTS.md
+!/AGENTS.md
 AGENT_PROJECT_ENTRYPOINT.md
 /docs/
 /reviews/
@@ -65,7 +69,7 @@ bench/agent_efficiency/realcorpus/*/
 /crates/embeddinggemma/
 *.log
 
-# Model assets are fetched from the pinned GitHub release (see
+# Model assets are fetched from Hugging Face (public, ungated; see
 # crates/cli/assets/MODEL_ASSETS.json + tools/fetch_model_assets.sh);
 # only the manifest and *.sha256 sidecars are tracked.
 crates/cli/assets/qwen35-0.8b-mtp-q4km/*.gguf

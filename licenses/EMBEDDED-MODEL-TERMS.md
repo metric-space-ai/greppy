@@ -1,6 +1,6 @@
-# Embedded Model Terms (binding supplement to the MIT license)
+# Embedded Model Terms (binding supplement to the Apache-2.0 license)
 
-Greppy's source code is MIT-licensed. The MIT license does NOT apply to the
+Greppy's source code is Apache-2.0-licensed. That license does NOT apply to the
 embedded model weight files listed below; they are licensed to you only under
 their own terms, which are a condition of your use and redistribution of
 greppy binaries and archives.

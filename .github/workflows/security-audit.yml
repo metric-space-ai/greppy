@@ -27,11 +27,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      # rustsec/audit-check v2.0.0, pinned to immutable source.
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Informational maintenance advisory only. The locked `paste` crate
-          # is a transitive compile-time proc macro, not runtime code. The
-          # bounded exception and removal condition are in SECURITY.md.
-          ignore: RUSTSEC-2024-0436
+      # Install cargo-audit with --locked so it uses its own published
+      # Cargo.lock. Installing the unlocked "latest" resolves the transitive
+      # dep kstring to 2.0.4, whose MSRV (Rust 1.96) exceeds the toolchain and
+      # fails to compile cargo-audit itself (not a project advisory).
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Informational maintenance advisory only. The locked `paste` crate is a
+      # transitive compile-time proc macro, not runtime code. The bounded
+      # exception and removal condition are in SECURITY.md.
+      - name: Run cargo audit
+        run: cargo audit --ignore RUSTSEC-2024-0436

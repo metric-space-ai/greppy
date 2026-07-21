@@ -7,6 +7,16 @@ unreleased `main` branch is tested continuously but is not a supported release
 channel. Pin production installations to an immutable tag and verify the
 published checksum and build provenance.
 
+## Release scope
+
+A release is cut only when, on the exact release commit, all of the following
+pass: CI, CodeQL, the Rust dependency security audit, the task-bank
+reproducibility audit, the navigation-regime agent benchmark, and the
+summary-quality gate — plus code signing and notarization. Greppy's claim is
+structural code navigation, and the navigation benchmark is a hard, per-commit
+release gate that must be green on the released binary. The remaining
+benchmarks run continuously and their verdicts are published with each commit.
+
 ## Verifying a release
 
 The expected provenance identity is the repository
@@ -16,7 +26,7 @@ all assets into an empty directory so the exact release manifest can reject
 missing or unexpected files:
 
 ```bash
-version=v0.2.0
+version=v0.2.1
 mkdir "greppy-$version" && cd "greppy-$version"
 gh release download "$version" --repo metric-space-ai/greppy
 python3 - <<'PY'
@@ -49,22 +59,24 @@ gh attestation verify "$asset" \
   --deny-self-hosted-runners
 ```
 
-The macOS binary must have a valid hardened-runtime signature, a stapled Apple
-notarization ticket, and a successful Gatekeeper assessment:
+The macOS binary must have a valid hardened-runtime signature:
 
 ```bash
 mkdir unpack && tar -C unpack -xzf greppy-macos-arm64.tar.gz
 codesign --verify --strict --verbose=2 unpack/greppy
-xcrun stapler validate unpack/greppy
-spctl --assess --type execute --verbose=4 unpack/greppy
 codesign --display --verbose=4 unpack/greppy 2>&1 | grep -E '^(Authority|TeamIdentifier)='
 ```
+
+The binary is notarized, but a bare Mach-O executable cannot carry a stapled
+ticket, so `xcrun stapler validate` and `spctl --assess --type execute` report
+errors on it by construction — that is not a defect. Gatekeeper fetches the
+notarization ticket online when the binary first runs.
 
 For Windows, verify both the aggregate checksum and the Authenticode chain and
 timestamp before running the binary:
 
 ```powershell
-$version = 'v0.2.0'
+$version = 'v0.2.1'
 gh release download $version --repo metric-space-ai/greppy
 $line = (Select-String 'greppy-windows-x86_64.zip$' SHA256SUMS).Line
 $want = ($line -split '\s+')[0]

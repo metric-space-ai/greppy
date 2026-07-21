@@ -9,8 +9,8 @@ The model is the byte-identical Q4_K GGUF from the pinned
 `cduk/embeddinggemma-300m-GGUF-with-dense-modules` snapshot. That repository
 identifies `google/embeddinggemma-300m` as its base model and includes the dense
 post-processing modules required for sentence-transformers-compatible
-embeddings. The model is governed by the Gemma Terms of Use, not the Greppy MIT
-source-code license. Redistribution notices and a frozen review copy of the
+embeddings. The model is governed by the Gemma Terms of Use, not the Greppy
+Apache-2.0 source-code license. Redistribution notices and a frozen review copy of the
 terms are under the repository-level `licenses/` directory.
 
 Source: https://huggingface.co/cduk/embeddinggemma-300m-GGUF-with-dense-modules/tree/16eaef07700282e488368e27b992b8fe5a40c423
