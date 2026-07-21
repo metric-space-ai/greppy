@@ -802,8 +802,9 @@ pub enum EditCommand {
         symbol: Option<String>,
         #[arg(long)]
         target: Option<String>,
-        #[arg(long = "source-file")]
-        source_file: String,
+        /// File containing the new content, or `-` to read it from stdin.
+        #[arg(long = "content-file", alias = "source-file")]
+        content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -816,8 +817,9 @@ pub enum EditCommand {
         symbol: Option<String>,
         #[arg(long)]
         target: Option<String>,
-        #[arg(long = "source-file")]
-        source_file: String,
+        /// File containing the new content, or `-` to read it from stdin.
+        #[arg(long = "content-file", alias = "source-file")]
+        content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -830,8 +832,9 @@ pub enum EditCommand {
         symbol: Option<String>,
         #[arg(long)]
         target: Option<String>,
-        #[arg(long = "source-file")]
-        source_file: String,
+        /// File containing the new content, or `-` to read it from stdin.
+        #[arg(long = "content-file", alias = "source-file")]
+        content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -6759,6 +6762,57 @@ fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
     })
 }
 
+fn reject_ignored_edit_stdin(content_file: &str, verb: &str) -> Result<()> {
+    use std::io::{IsTerminal, Read};
+
+    if content_file == "-" || std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    let mut piped = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut piped)
+        .map_err(|source| Error::Io {
+            context: "inspect piped edit content".into(),
+            source,
+        })?;
+    if piped.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "status: invalid-request\n{verb} received non-empty stdin but --content-file {content_file} would ignore it; retry with: greppy edit {verb} --content-file - < content.txt"
+    )))
+}
+
+fn reject_target_as_content_file(
+    content_file: &str,
+    target_file: &std::path::Path,
+    verb: &str,
+    symbol: Option<&str>,
+) -> Result<()> {
+    if content_file == "-" {
+        return Ok(());
+    }
+    let content_path = std::path::Path::new(content_file);
+    let content_canonical = content_path.canonicalize().map_err(|source| Error::Io {
+        context: format!("canonicalize content file {content_file}"),
+        source,
+    })?;
+    let target_canonical = target_file.canonicalize().map_err(|source| Error::Io {
+        context: format!("canonicalize edit target {}", target_file.display()),
+        source,
+    })?;
+    if content_canonical != target_canonical {
+        return Ok(());
+    }
+    let selector = symbol
+        .map(|symbol| format!("--symbol {}", shell_quote_cli(symbol)))
+        .unwrap_or_else(|| "--target HANDLE".into());
+    Err(Error::Invalid(format!(
+        "status: invalid-request\n--content-file must contain only the new content, not the target file {}; retry with: printf '%s\\n' 'NEW_CONTENT' | greppy edit {verb} {selector} --content-file -",
+        target_file.display()
+    )))
+}
+
 fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
     match dispatch_edit_inner(command, root) {
         Err(error @ Error::Invalid(_)) => {
@@ -6838,11 +6892,11 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
         EditCommand::ReplaceBody {
             symbol,
             target,
-            source_file,
+            content_file,
             dry_run,
             report,
         } => {
-            let new_body = read_source_arg(&source_file)?;
+            reject_ignored_edit_stdin(&content_file, "replace-body")?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
@@ -6852,6 +6906,13 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                     planned_target_sha256,
                 } => {
                     let abs = root_path.join(&rel_path);
+                    reject_target_as_content_file(
+                        &content_file,
+                        &abs,
+                        "replace-body",
+                        symbol.as_deref(),
+                    )?;
+                    let new_body = read_source_arg(&content_file)?;
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
                     let options = resolved_options(
                         dry_run,
@@ -6871,23 +6932,23 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
         EditCommand::InsertAfter {
             symbol,
             target,
-            source_file,
+            content_file,
             dry_run,
             report,
         }
         | EditCommand::InsertBefore {
             symbol,
             target,
-            source_file,
+            content_file,
             dry_run,
             report,
         } => {
-            let position = if matches!(command_kind, EditCommandKind::InsertBefore) {
-                greppy_edit::verbs::InsertPosition::Before
+            let (position, verb) = if matches!(command_kind, EditCommandKind::InsertBefore) {
+                (greppy_edit::verbs::InsertPosition::Before, "insert-before")
             } else {
-                greppy_edit::verbs::InsertPosition::After
+                (greppy_edit::verbs::InsertPosition::After, "insert-after")
             };
-            let text = read_source_arg(&source_file)?;
+            reject_ignored_edit_stdin(&content_file, verb)?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
@@ -6897,6 +6958,8 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                     planned_target_sha256,
                 } => {
                     let abs = root_path.join(&rel_path);
+                    reject_target_as_content_file(&content_file, &abs, verb, symbol.as_deref())?;
+                    let text = read_source_arg(&content_file)?;
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
                     let options = resolved_options(
                         dry_run,
@@ -17090,7 +17153,7 @@ mod tests {
                 EditCommand::ReplaceBody {
                     symbol: Some("computeTotal".into()),
                     target: None,
-                    source_file: replacement_path.to_string_lossy().into_owned(),
+                    content_file: replacement_path.to_string_lossy().into_owned(),
                     dry_run: true,
                     report: None,
                 },

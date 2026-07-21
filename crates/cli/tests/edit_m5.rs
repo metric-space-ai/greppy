@@ -1,7 +1,8 @@
 //! End-to-end smoke coverage for the M5 multi-file plan and recover CLI paths.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -35,6 +36,36 @@ fn run(repo: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+fn run_with_stdin(repo: &Path, store: &Path, args: &[&str], stdin: &[u8]) -> (i32, String, String) {
+    let mut child = Command::new(bin())
+        .args(args)
+        .current_dir(repo)
+        .env("GREPPY_STORE_DIR", store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run greppy with stdin");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin)
+        .expect("write greppy stdin");
+    let output = child.wait_with_output().expect("wait for greppy");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn index_repo(repo: &Path, store: &Path) {
+    let (code, stdout, stderr) = run(repo, store, &["index", "."]);
+    assert_eq!(code, 0, "index failed\nstdout={stdout}\nstderr={stderr}");
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -203,4 +234,94 @@ fn recover_reports_clean_workspace_and_writes_report_file() {
     let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
     assert_eq!(parsed["found_journal"], false, "{report}");
     assert_eq!(parsed["action"], "nothing-to-recover", "{report}");
+}
+
+#[test]
+fn replace_body_rejects_nonempty_ignored_stdin() {
+    let (repo, store) = fresh_workspace("ignored-stdin");
+    std::fs::write(repo.join("body.rs"), "{ 2 }\n").unwrap();
+
+    let (code, stdout, stderr) = run_with_stdin(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-body",
+            "--symbol",
+            "target",
+            "--content-file",
+            "body.rs",
+        ],
+        b"{ 3 }\n",
+    );
+
+    assert_eq!(code, 20, "stdout={stdout}\nstderr={stderr}");
+    let output = format!("{stdout}\n{stderr}");
+    assert!(output.contains("status: invalid-request"), "{output}");
+    assert!(output.contains("received non-empty stdin"), "{output}");
+    assert!(output.contains("--content-file -"), "{output}");
+}
+
+#[test]
+fn replace_body_rejects_target_file_as_content_before_planning() {
+    let (repo, store) = fresh_workspace("same-content-target");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let original = "pub fn target() -> i32 { 1 }\n";
+    std::fs::write(repo.join("src/lib.rs"), original).unwrap();
+    index_repo(&repo, &store);
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-body",
+            "--symbol",
+            "target",
+            "--content-file",
+            "src/lib.rs",
+        ],
+    );
+
+    assert_eq!(code, 20, "stdout={stdout}\nstderr={stderr}");
+    let output = format!("{stdout}\n{stderr}");
+    assert!(output.contains("status: invalid-request"), "{output}");
+    assert!(
+        output.contains("must contain only the new content"),
+        "{output}"
+    );
+    assert!(output.contains("--content-file -"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn replace_body_reads_content_file_dash_from_stdin() {
+    let (repo, store) = fresh_workspace("stdin-content");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn target() -> i32 { 1 }\n").unwrap();
+    index_repo(&repo, &store);
+
+    let (code, stdout, stderr) = run_with_stdin(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-body",
+            "--symbol",
+            "target",
+            "--content-file",
+            "-",
+        ],
+        b"{ 2 }",
+    );
+
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("\"status\": \"applied\""), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "pub fn target() -> i32 { 2 }\n"
+    );
 }
