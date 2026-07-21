@@ -30,6 +30,7 @@ mod inference_daemon;
 #[cfg(any(unix, windows))]
 mod summarize_daemon;
 mod trial;
+mod verify;
 
 /// Exit code for subcommands that are recognised but not yet implemented
 /// in the current phase. EX_UNAVAILABLE (69) is the standard BSD sysexits
