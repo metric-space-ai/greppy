@@ -262,7 +262,6 @@ fn graph_grid_php_find_usages_covers_call_and_import() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "php graph gap: cross-file type references not classified as TYPE_REF (same family as fixed csharp/kotlin/cpp)"]
 fn graph_grid_php_find_usages_type_reference() {
     let (repo, store) = index_fixture("find-usages-type-ref");
     // `Payload` is used as a return type in `function caller(): Payload` in

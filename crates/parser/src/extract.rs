@@ -5682,6 +5682,14 @@ fn extract_php(source: &[u8], file_path: &str) -> greppy_core::Result<Extraction
     //    such duplicate. Reproduce that enum-only duplication.
     emit_php_type_members(source, root, file_path, &mut result);
 
+    // TYPE-REFERENCE PASS.
+    //
+    // PHP's shared query set has no reference query. Walk the grammar's
+    // `named_type` nodes so parameter and return annotations (including union,
+    // intersection, and nullable wrappers) participate in the same cross-file
+    // TYPE_REF resolution used by the other certified providers.
+    emit_php_type_references(source, root, file_path, &file_module_qname, &mut result);
+
     // MODULE-SCOPE CALLS PASS.
     //
     // The shared `spec_calls` only emits a `CALLS` edge when the call has an
@@ -5721,6 +5729,93 @@ fn php_type_label(kind: &str) -> Option<&'static str> {
         "enum_declaration" => Some("Enum"),
         _ => None,
     }
+}
+
+/// Emit a `TYPE_REF` edge for each PHP `named_type`. The grammar uses this node
+/// only in declared type positions; primitive types have their own
+/// `primitive_type` node and are therefore excluded structurally.
+fn emit_php_type_references(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+    file_module_qname: &str,
+    result: &mut ExtractionResult,
+) {
+    if node.kind() == "named_type" {
+        if let Some(name_node) = php_named_type_name(node) {
+            let name = node_text(source, name_node);
+            if !name.is_empty() {
+                let source_qname = php_reference_source_qname(source, node, file_path)
+                    .unwrap_or_else(|| file_module_qname.to_string());
+                result.edges.push(ExtractedEdge {
+                    edge_type: "TYPE_REF".into(),
+                    source_qualified_name: source_qname,
+                    target_qualified_name: format!("{file_path}::Class::{name}"),
+                    file_path: file_path.to_string(),
+                    line: name_node.start_position().row as u32 + 1,
+                    properties: serde_json::json!({ "type_name": name }),
+                });
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        emit_php_type_references(source, child, file_path, file_module_qname, result);
+    }
+}
+
+/// Return the final unqualified `name` inside a PHP `named_type`.
+fn php_named_type_name(node: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![node];
+    let mut found = None;
+    while let Some(current) = stack.pop() {
+        if current.kind() == "name"
+            && found.is_none_or(|previous: Node<'_>| current.start_byte() > previous.start_byte())
+        {
+            found = Some(current);
+        }
+        for index in 0..current.named_child_count() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    found
+}
+
+/// Reconstruct the spec-emitted qname of the nearest PHP function or method.
+fn php_reference_source_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "function_definition" => {
+                let name = parent.child_by_field_name("name")?;
+                return Some(format!(
+                    "{file_path}::Function::{}",
+                    node_text(source, name)
+                ));
+            }
+            "method_declaration" => {
+                let name = parent.child_by_field_name("name")?;
+                let mut owner = parent.parent();
+                while let Some(candidate) = owner {
+                    if php_type_label(candidate.kind()).is_some() {
+                        let owner_name = candidate.child_by_field_name("name")?;
+                        return Some(format!(
+                            "{file_path}::{}::{}",
+                            node_text(source, owner_name),
+                            node_text(source, name)
+                        ));
+                    }
+                    owner = candidate.parent();
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 /// For every PHP type declaration under `node`, emit a `DEFINES_METHOD` edge for
@@ -18511,6 +18606,47 @@ trait T { public function shared() {} }
             "trait method DEFINES_METHOD: {:?}",
             r.edges
         );
+    }
+
+    #[test]
+    fn php_named_types_emit_type_refs_from_enclosing_callable() {
+        const SRC: &str = r#"<?php
+class Service {
+    public function render(Widget $widget): Result|Error {
+        return new Result();
+    }
+}
+function load(): ?Vendor\\Payload { return null; }
+"#;
+        let r = php(SRC, "types.php");
+        let refs: Vec<(&str, &str)> = r
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_type == "TYPE_REF")
+            .filter_map(|edge| {
+                Some((
+                    edge.source_qualified_name.as_str(),
+                    edge.properties.get("type_name")?.as_str()?,
+                ))
+            })
+            .collect();
+        assert!(
+            refs.contains(&("types.php::Service::render", "Widget")),
+            "parameter type: {refs:?}"
+        );
+        assert!(
+            refs.contains(&("types.php::Service::render", "Result")),
+            "union return type: {refs:?}"
+        );
+        assert!(
+            refs.contains(&("types.php::Service::render", "Error")),
+            "union return type: {refs:?}"
+        );
+        assert!(
+            refs.contains(&("types.php::Function::load", "Payload")),
+            "qualified nullable return type uses final name: {refs:?}"
+        );
+        assert_eq!(refs.len(), 4, "only declared named types: {refs:?}");
     }
 
     #[test]
