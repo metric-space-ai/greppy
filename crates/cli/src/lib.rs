@@ -1312,6 +1312,12 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // STDOUT, not stderr: agents habitually append `2>/dev/null`,
             // and a usage lesson they never see teaches nothing (P3).
             println!("{first}");
+            if replace_span_symbol_retry(&argv, &msg) {
+                println!(
+                    "replace-span is handle-addressed: run `greppy read SYM --handle`, then retry with `greppy edit replace-span --target <HANDLE> --source-file FILE`"
+                );
+                return EXIT_USAGE;
+            }
             // Skip greppy-owned global flags when picking the usage line:
             // agents habitually write `greppy --root . read ...`, and argv[1]
             // is then "--root", which used to fall through to the generic
@@ -1400,6 +1406,15 @@ fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
         break;
     }
     &argv[index..]
+}
+
+fn replace_span_symbol_retry(argv: &[std::ffi::OsString], clap_message: &str) -> bool {
+    if !clap_message.contains("unexpected argument '--symbol'") {
+        return false;
+    }
+    grep_passthrough_args(argv).windows(2).any(|pair| {
+        pair[0].to_str() == Some("edit") && pair[1].to_str() == Some("replace-span")
+    })
 }
 
 fn closest_valid_invocation(

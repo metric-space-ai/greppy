@@ -140,6 +140,26 @@ fn change_signature_accepts_inline_json_spec() {
 }
 
 #[test]
+fn replace_span_symbol_error_teaches_handle_workflow() {
+    let fixture = Fixture::new("replace-span-symbol-error");
+    let source = fixture.scratch("replacement.rs", "pub fn greet() {}\n");
+
+    let output = fixture.run(&[
+        "edit",
+        "replace-span",
+        "--symbol",
+        "greet",
+        "--source-file",
+        source.to_str().unwrap(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(64));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("greppy read SYM --handle"), "{stdout}");
+    assert!(stdout.contains("--target <HANDLE>"), "{stdout}");
+}
+
+#[test]
 fn replace_body_with_content_file_does_not_wait_for_open_stdin_pipe() {
     let fixture = Fixture::new("replace-body-open-stdin");
     let body = fixture.scratch("body.rs", r#"{ format!("hey {}", name) }"#);
