@@ -33,6 +33,48 @@ mod summarize_daemon;
 mod trial;
 mod verify;
 
+// Route this module's stdout through one optional collector. Query commands
+// activate it only for --max-bytes/--offset, leaving ordinary output and all
+// grep passthrough bytes untouched.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::output_write(format_args!($($arg)*), false);
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        crate::output_write(format_args!(""), true);
+    }};
+    ($($arg:tt)*) => {{
+        crate::output_write(format_args!($($arg)*), true);
+    }};
+}
+
+fn output_write(arguments: std::fmt::Arguments<'_>, newline: bool) {
+    use std::io::Write as _;
+
+    let text = arguments.to_string();
+    let captured = OUTPUT_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        let Some(bytes) = capture.as_mut() else {
+            return false;
+        };
+        bytes.extend_from_slice(text.as_bytes());
+        if newline {
+            bytes.push(b'\n');
+        }
+        true
+    });
+    if !captured {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(text.as_bytes());
+        if newline {
+            let _ = stdout.write_all(b"\n");
+        }
+    }
+}
+
 /// Exit code for subcommands that are recognised but not yet implemented
 /// in the current phase. EX_UNAVAILABLE (69) is the standard BSD sysexits
 /// value.
@@ -103,6 +145,11 @@ thread_local! {
     static CLI_INFERENCE_OVERRIDE: std::cell::RefCell<CliInferenceOverride> =
         std::cell::RefCell::new(CliInferenceOverride::default());
     static CLI_RESULT_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static CLI_RESULT_OFFSET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLI_INVOCATION: std::cell::RefCell<Vec<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static OUTPUT_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn set_cli_inference_override(device: Option<String>, no_gpu: bool) {
@@ -115,14 +162,20 @@ fn cli_inference_override() -> CliInferenceOverride {
     CLI_INFERENCE_OVERRIDE.with(|value| value.borrow().clone())
 }
 
-fn set_cli_result_limit(limit: Option<usize>) {
+fn set_cli_result_window(limit: Option<usize>, offset: usize) {
     CLI_RESULT_LIMIT.with(|value| value.set(limit));
+    CLI_RESULT_OFFSET.with(|value| value.set(offset));
+}
+
+fn cli_result_offset() -> usize {
+    CLI_RESULT_OFFSET.with(std::cell::Cell::get)
 }
 
 fn cli_result_limit(default: usize) -> usize {
     CLI_RESULT_LIMIT
         .with(|value| value.get())
         .unwrap_or(default)
+        .saturating_add(cli_result_offset())
 }
 
 fn cli_result_limit_unless_all(default: usize, all: bool) -> usize {
@@ -222,6 +275,15 @@ pub struct Cli {
     /// `--max` is accepted as a Postel-style alias; `--all` still lifts caps.
     #[arg(long, alias = "max", global = true, value_name = "N")]
     pub limit: Option<usize>,
+
+    /// Hard stdout payload budget for navigation, search, and read commands.
+    /// Result rows/content are trimmed before status and continuation metadata.
+    #[arg(long, global = true, value_name = "N")]
+    pub max_bytes: Option<usize>,
+
+    /// Continue a budgeted navigation, search, or read result at row N.
+    #[arg(long, global = true, default_value_t = 0, value_name = "N")]
+    pub offset: usize,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -1189,6 +1251,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         };
     }
     let argv = normalize_global_output_flags(argv);
+    CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
     if is_grep_passthrough(&argv) {
         // argv[0] is the binary name; the rest are grep args. Build a
         // synthetic argv for the shared runner whose argv[0] is a
@@ -1300,7 +1363,13 @@ fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
     let mut index = 1;
     while index < argv.len() {
         let token = &argv[index];
-        if token == "--root" || token == "--device" || token == "--limit" || token == "--max" {
+        if token == "--root"
+            || token == "--device"
+            || token == "--limit"
+            || token == "--max"
+            || token == "--max-bytes"
+            || token == "--offset"
+        {
             index = (index + 2).min(argv.len());
             continue;
         }
@@ -1309,6 +1378,8 @@ fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
             || token_lossy.starts_with("--device=")
             || token_lossy.starts_with("--limit=")
             || token_lossy.starts_with("--max=")
+            || token_lossy.starts_with("--max-bytes=")
+            || token_lossy.starts_with("--offset=")
             || token == "--no-gpu"
             || token == "--no-summaries"
         {
@@ -1333,7 +1404,15 @@ fn closest_valid_invocation(
         return None;
     }
     let mut candidates = vec![
-        "--root", "--device", "--json", "--code", "--all", "--limit", "--max",
+        "--root",
+        "--device",
+        "--json",
+        "--code",
+        "--all",
+        "--limit",
+        "--max",
+        "--max-bytes",
+        "--offset",
     ];
     candidates.extend(match subcommand {
         "read" => vec!["--symbol", "--path", "--handle", "--lines"],
@@ -1820,7 +1899,12 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
             i += 1;
             continue;
         }
-        if tok == "--device" || tok == "--limit" || tok == "--max" {
+        if tok == "--device"
+            || tok == "--limit"
+            || tok == "--max"
+            || tok == "--max-bytes"
+            || tok == "--offset"
+        {
             i += 2;
             continue;
         }
@@ -1828,6 +1912,8 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
         if token_lossy.starts_with("--device=")
             || token_lossy.starts_with("--limit=")
             || token_lossy.starts_with("--max=")
+            || token_lossy.starts_with("--max-bytes=")
+            || token_lossy.starts_with("--offset=")
             || tok == "--no-gpu"
         {
             i += 1;
@@ -1864,7 +1950,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     if cli.limit == Some(0) {
         return Err(Error::Invalid("--limit/--max must be at least 1".into()));
     }
-    set_cli_result_limit(cli.limit);
+    if cli.max_bytes == Some(0) {
+        return Err(Error::Invalid("--max-bytes must be at least 1".into()));
+    }
+    set_cli_result_window(cli.limit, cli.offset);
     let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
     if !no_gpu {
         configure_explicit_cuda_device(configured_device.as_deref())?;
@@ -17272,6 +17361,263 @@ fn open_directory_for_sync(path: &std::path::Path) -> std::io::Result<std::fs::F
     std::fs::File::open(path)
 }
 
+#[derive(Debug, Clone)]
+struct OutputBudgetSpec {
+    command: &'static str,
+    json: bool,
+    max_bytes: Option<usize>,
+    offset: usize,
+}
+
+fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
+    if cli.max_bytes.is_none() && cli.offset == 0 {
+        return None;
+    }
+    let (command, json) = match cli.command.as_ref()? {
+        Command::SearchGraph { json, .. } => ("search-graph", *json),
+        Command::Trace { json, .. } => ("trace", *json),
+        Command::Impact { json, .. } => ("impact", *json),
+        Command::Brief { json, .. } => ("brief", *json),
+        Command::Expand { json, .. } => ("expand", *json),
+        Command::Read { json, .. } => ("read", *json),
+        Command::WhoCalls { json, .. } => ("who-calls", *json),
+        Command::Callees { json, .. } => ("callees", *json),
+        Command::FindUsages { json, .. } => ("find-usages", *json),
+        Command::References { json, .. } => ("references", *json),
+        Command::FanIn { json, .. } => ("fan-in", *json),
+        Command::FanOut { json, .. } => ("fan-out", *json),
+        Command::GraphLocate { json, .. } => ("graph-locate", *json),
+        Command::Path { json, .. } => ("path", *json),
+        Command::SearchCode { json, .. } => ("search-code", *json),
+        Command::SearchSymbols { json, .. } => ("search-symbols", *json),
+        Command::Plus { json, .. } => ("plus", *json),
+        Command::Semantic { json, .. } => ("semantic-search", *json),
+        Command::Context { json, .. } => ("context", *json),
+        _ => return None,
+    };
+    Some(OutputBudgetSpec {
+        command,
+        json,
+        max_bytes: cli.max_bytes,
+        offset: cli.offset,
+    })
+}
+
+fn begin_output_capture() {
+    OUTPUT_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+}
+
+fn finish_output_capture(spec: &OutputBudgetSpec, exit_code: u8) {
+    use std::io::Write as _;
+
+    let captured = OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default());
+    let rendered = if spec.json {
+        budget_json_output(&captured, spec).unwrap_or(captured)
+    } else {
+        budget_text_output(&captured, spec, exit_code)
+    };
+    let _ = std::io::stdout().lock().write_all(&rendered);
+}
+
+fn retry_with_offset(command: &str, offset: usize) -> String {
+    let invocation = CLI_INVOCATION.with(|value| value.borrow().clone());
+    if invocation.is_empty() {
+        return format!("greppy {command} --offset {offset}");
+    }
+    let mut args = vec!["greppy".to_string()];
+    let mut index = 1usize;
+    while index < invocation.len() {
+        let token = invocation[index].to_string_lossy();
+        if token == "--offset" {
+            index = (index + 2).min(invocation.len());
+            continue;
+        }
+        if token.starts_with("--offset=") {
+            index += 1;
+            continue;
+        }
+        args.push(shell_quote_cli(&token));
+        index += 1;
+    }
+    args.push("--offset".into());
+    args.push(offset.to_string());
+    args.join(" ")
+}
+
+const BUDGET_ARRAY_FIELDS: &[&str] = &[
+    "hits",
+    "lines",
+    "steps",
+    "results",
+    "matches",
+    "nodes",
+    "definitions",
+    "callers",
+    "references",
+    "callees",
+];
+
+fn result_item_count(value: &serde_json::Value) -> usize {
+    BUDGET_ARRAY_FIELDS
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_array))
+        .map(Vec::len)
+        .sum::<usize>()
+        + value
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .map(|source| source.lines().count())
+            .unwrap_or(0)
+}
+
+fn skip_result_items(value: &mut serde_json::Value, mut count: usize) {
+    for key in BUDGET_ARRAY_FIELDS {
+        let Some(rows) = value
+            .get_mut(*key)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let take = count.min(rows.len());
+        rows.drain(..take);
+        count -= take;
+        if count == 0 {
+            return;
+        }
+    }
+    if count > 0 {
+        if let Some(source) = value.get_mut("source") {
+            if let Some(text) = source.as_str() {
+                let retained = text.lines().skip(count).collect::<Vec<_>>().join("\n");
+                *source = retained.into();
+            }
+        }
+    }
+}
+
+fn pop_result_item(value: &mut serde_json::Value) -> bool {
+    if let Some(source) = value.get_mut("source") {
+        if let Some(text) = source.as_str() {
+            let mut lines = text.lines().collect::<Vec<_>>();
+            if lines.pop().is_some() {
+                *source = lines.join("\n").into();
+                return true;
+            }
+        }
+    }
+    for key in BUDGET_ARRAY_FIELDS.iter().rev() {
+        if let Some(rows) = value
+            .get_mut(*key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            if rows.pop().is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn exact_result_total(value: &serde_json::Value, available: usize, offset: usize) -> usize {
+    ["total_exact", "total", "total_hits", "match_count"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_u64))
+        .and_then(|total| usize::try_from(total).ok())
+        .unwrap_or_else(|| offset.saturating_add(available))
+}
+
+fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let available = result_item_count(&value);
+    let total = exact_result_total(&value, available, spec.offset);
+    skip_result_items(&mut value, spec.offset);
+
+    loop {
+        let shown = result_item_count(&value);
+        let end = spec.offset.saturating_add(shown).min(total);
+        let truncated = end < total;
+        value["total"] = total.into();
+        value["offset"] = spec.offset.into();
+        value["shown"] = shown.into();
+        value["omitted"] = total.saturating_sub(end).into();
+        value["truncated"] = truncated.into();
+        if truncated {
+            value["try"] = retry_with_offset(spec.command, end).into();
+        }
+        let mut rendered = serde_json::to_vec(&value).ok()?;
+        rendered.push(b'\n');
+        if spec
+            .max_bytes
+            .is_none_or(|max_bytes| rendered.len() <= max_bytes)
+            || !pop_result_item(&mut value)
+        {
+            return Some(rendered);
+        }
+    }
+}
+
+fn text_line_is_priority(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.is_empty()
+        || trimmed.starts_with("diagnosis:")
+        || trimmed.starts_with("status:")
+        || trimmed.starts_with("next_steps:")
+        || trimmed.starts_with("try:")
+        || trimmed.starts_with("usage:")
+        || trimmed.starts_with("suggestion:")
+        || trimmed.starts_with("hint:")
+        || trimmed.starts_with("query_interpreted_as:")
+        || trimmed.starts_with("path_filters:")
+        || trimmed.starts_with("expand:")
+        || trimmed.starts_with("— ")
+        || trimmed.starts_with("… ")
+        || trimmed.starts_with("(no ")
+        || trimmed.starts_with("read:")
+        || trimmed.starts_with("-- ")
+        || trimmed.starts_with("unresolved textual candidates:")
+}
+
+fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    if exit_code != 0 {
+        return bytes.to_vec();
+    }
+    let mut priority = Vec::new();
+    let mut content = Vec::new();
+    for line in text.lines() {
+        if text_line_is_priority(line) {
+            priority.push(line.to_string());
+        } else {
+            content.push(line.to_string());
+        }
+    }
+    let total = content.len();
+    let start = spec.offset.min(total);
+    let mut selected = content[start..].to_vec();
+    loop {
+        let end = start.saturating_add(selected.len());
+        let truncated = end < total;
+        let mut lines = priority.clone();
+        if truncated || spec.offset > 0 {
+            lines.push(format!("truncated: {truncated}"));
+            lines.push(format!("total: {total}"));
+            lines.push(format!("offset: {}", spec.offset));
+            if truncated {
+                lines.push(format!("try: {}", retry_with_offset(spec.command, end)));
+            }
+        }
+        lines.extend(selected.iter().cloned());
+        let rendered = format!("{}\n", lines.join("\n")).into_bytes();
+        if spec
+            .max_bytes
+            .is_none_or(|max_bytes| rendered.len() <= max_bytes)
+            || selected.pop().is_none()
+        {
+            return rendered;
+        }
+    }
+}
+
 /// Translate a `Result<i32>` into the actual exit code we should return.
 /// Errors get the documented code; OK keeps its inner i32.
 ///
@@ -17283,7 +17629,11 @@ fn open_directory_for_sync(path: &std::path::Path) -> std::io::Result<std::fs::F
 /// hint before returning `Err`; the summary line here may then repeat the
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
-    match dispatch(cli) {
+    let budget = output_budget_spec(&cli);
+    if budget.is_some() {
+        begin_output_capture();
+    }
+    let code = match dispatch(cli) {
         Ok(code) => code.clamp(0, 255) as u8,
         Err(e) => {
             eprintln!("greppy: {e}");
@@ -17294,7 +17644,11 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
             }
             error_exit_code(&e)
         }
+    };
+    if let Some(spec) = &budget {
+        finish_output_capture(spec, code);
     }
+    code
 }
 
 fn error_exit_code(error: &Error) -> u8 {
