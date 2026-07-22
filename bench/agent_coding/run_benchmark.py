@@ -1574,6 +1574,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", type=pathlib.Path, required=True, help="task JSON matching task.schema.json")
     parser.add_argument("--task", action="append", dest="task_ids", help="run one task id (repeatable)")
+    parser.add_argument(
+        "--arms",
+        help="comma-separated subset of arms to run (default: all). "
+        "Other arms are neither run nor marked failed, so an existing baseline stays intact.",
+    )
     parser.add_argument("--output-dir", type=pathlib.Path, help="checkpoint/manifest directory")
     parser.add_argument("--run-id", help="stable run id; defaults to UTC timestamp plus task hash")
     parser.add_argument("--resume", action="store_true", help="resume completed arms from output-dir/results.json")
@@ -1646,8 +1651,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     completed = {(row["task_id"], row["arm"]) for row in rows}
     secrets = [api_key]
 
+    if args.arms:
+        requested = [a.strip() for a in args.arms.split(",") if a.strip()]
+        unknown = [a for a in requested if a not in ARMS]
+        if unknown:
+            raise SystemExit(f"unknown arm(s): {unknown}; valid arms are {list(ARMS)}")
+        selected_arms = tuple(a for a in ARMS if a in requested)
+    else:
+        selected_arms = ARMS
+
     for task in tasks:
-        if all((task["id"], arm) in completed for arm in ARMS):
+        if all((task["id"], arm) in completed for arm in selected_arms):
             continue
         print(f"[{task['id']}] preparing pinned repository", flush=True)
         # ignore_cleanup_errors: the greppy daemon may still be flushing into
@@ -1675,6 +1689,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "and a mutated-source test failure without timeout"
                     )
                 for arm in deterministic_arm_order(task["id"]):
+                    if arm not in selected_arms:
+                        continue
                     if (task["id"], arm) in completed:
                         continue
                     print(f"[{task['id']}] {arm}", flush=True)
@@ -1727,7 +1743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     completed.add((task["id"], arm))
                     save_checkpoint(run_dir=run_dir, run_id=run_id, rows=rows, base_manifest=base_manifest, expected_task_ids=expected_ids)
             except Exception as error:
-                for arm in ARMS:
+                for arm in selected_arms:
                     if (task["id"], arm) not in completed:
                         rows.append(sanitized_failure_row(task["id"], arm, error))
                         completed.add((task["id"], arm))
