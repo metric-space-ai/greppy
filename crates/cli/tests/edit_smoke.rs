@@ -140,6 +140,130 @@ fn change_signature_accepts_inline_json_spec() {
 }
 
 #[test]
+fn replace_span_uses_read_handle() {
+    let fixture = Fixture::new("replace-span");
+    let read = fixture.run(&["read", "greet", "--handle", "--json"]);
+    assert!(
+        read.status.success(),
+        "read failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&read.stdout),
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read_json: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    let handle = read_json["handle"].as_str().expect("read handle");
+    let source = fixture.scratch(
+        "replacement.rs",
+        r#"pub fn greet(name: &str) -> String {
+    format!("welcome {}", name)
+}
+"#,
+    );
+
+    let output = fixture.run(&[
+        "edit",
+        "replace-span",
+        "--target",
+        handle,
+        "--source-file",
+        source.to_str().unwrap(),
+    ]);
+
+    assert_success("replace-span", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(
+        changed.contains(r#"format!("welcome {}", name)"#),
+        "{changed}"
+    );
+}
+
+#[test]
+fn text_cas_replaces_exact_text() {
+    let fixture = Fixture::new("text-cas");
+
+    let output = fixture.run(&[
+        "edit",
+        "text-cas",
+        "--file",
+        "src/lib.rs",
+        "--old",
+        "42",
+        "--new",
+        "43",
+    ]);
+
+    assert_success("text-cas", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(changed.contains("pub const ANSWER: i32 = 43;"), "{changed}");
+}
+
+#[test]
+fn insert_after_adds_top_level_definition() {
+    let fixture = Fixture::new("insert-after");
+    let content = fixture.scratch(
+        "insert.rs",
+        "pub fn inserted() -> i32 {\n    ANSWER + 1\n}\n",
+    );
+
+    let output = fixture.run(&[
+        "edit",
+        "insert-after",
+        "--symbol",
+        "greet",
+        "--content-file",
+        content.to_str().unwrap(),
+    ]);
+
+    assert_success("insert-after", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(changed.contains("pub fn inserted() -> i32"), "{changed}");
+}
+
+#[test]
+fn rename_symbol_updates_definition_and_call() {
+    let fixture = Fixture::new("rename-symbol");
+
+    let output = fixture.run(&[
+        "edit",
+        "rename-symbol",
+        "--symbol",
+        "combine",
+        "--new-name",
+        "merge_numbers",
+    ]);
+
+    assert_success("rename-symbol", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(
+        changed.contains("pub fn merge_numbers(a: i32, b: i32)"),
+        "{changed}"
+    );
+    assert!(changed.contains("merge_numbers(1, 2)"), "{changed}");
+}
+
+#[test]
+fn ensure_import_adds_rust_use() {
+    let fixture = Fixture::new("ensure-import");
+
+    let output = fixture.run(&[
+        "edit",
+        "ensure-import",
+        "--file",
+        "src/lib.rs",
+        "--module",
+        "std::collections",
+        "--name",
+        "HashMap",
+    ]);
+
+    assert_success("ensure-import", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(
+        changed.starts_with("use std::collections::HashMap;\n"),
+        "{changed}"
+    );
+}
+
+#[test]
 fn replace_span_symbol_error_teaches_handle_workflow() {
     let fixture = Fixture::new("replace-span-symbol-error");
     let source = fixture.scratch("replacement.rs", "pub fn greet() {}\n");
