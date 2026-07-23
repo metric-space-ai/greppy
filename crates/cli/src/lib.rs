@@ -1449,8 +1449,14 @@ fn closest_valid_invocation(
         "--max-bytes",
         "--offset",
     ];
+    let invocation = grep_passthrough_args(argv);
+    let nested_edit = if subcommand == "edit" {
+        invocation.get(1).and_then(|argument| argument.to_str())
+    } else {
+        None
+    };
     candidates.extend(match subcommand {
-        "read" => vec!["--symbol", "--path", "--handle", "--lines"],
+        "read" => vec!["--symbol", "--path", "--handle", "--lines", "--line"],
         "who-calls" | "callees" | "find-usages" | "brief" | "semantic-search" | "semantic" => {
             vec!["--path"]
         }
@@ -1463,6 +1469,41 @@ fn closest_valid_invocation(
         "graph-locate" => vec!["--file", "--line"],
         "plus" => vec!["--k", "--explain"],
         "context" => vec!["--k", "--lines"],
+        "edit" => match nested_edit {
+            Some("replace-body" | "insert-after" | "insert-before") => vec![
+                "--symbol",
+                "--target",
+                "--content-file",
+                "--source-file",
+                "--source",
+                "--dry-run",
+                "--report",
+            ],
+            Some("replace-span") => {
+                vec!["--target", "--source-file", "--source", "--dry-run", "--report"]
+            }
+            Some("text-cas") => vec![
+                "--file",
+                "--old-file",
+                "--new-file",
+                "--old",
+                "--new",
+                "--expect",
+                "--dry-run",
+                "--report",
+            ],
+            Some("regex-cas") => vec![
+                "--file",
+                "--pattern",
+                "--replacement",
+                "--old",
+                "--new",
+                "--expect",
+                "--dry-run",
+                "--report",
+            ],
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     });
     let replacement = candidates
@@ -1535,9 +1576,8 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "brief" => "greppy brief SYMBOL [PATH ...] [--root DIR]",
         "read" => {
-            "greppy read SYMBOL [--handle] [--json] [--root DIR]  \
-             (SYMBOL is a definition name like Owner::method - not a file \
-             path; raw file bytes: use cat/sed via bash)"
+            "greppy read SYMBOL [--path FILE] [--handle] [--json] [--root DIR]  \
+             or: greppy read FILE [--line N[:M]] [--handle] [--json] [--root DIR]"
         }
         "edit" => {
             "greppy edit <replace-body|replace-span|patch-span|insert-after|insert-before|\

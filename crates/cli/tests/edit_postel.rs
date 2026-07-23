@@ -67,6 +67,37 @@ fn assert_applied(result: &(i32, String, String), label: &str) {
 }
 
 #[test]
+fn misspelled_nested_edit_flag_suggests_complete_source_invocation() {
+    let (repo, store) = fresh_workspace();
+    let body = repo.join("body.rs");
+    std::fs::write(&body, "{ 11 }").unwrap();
+
+    let result = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-body",
+            "--symbol",
+            "first",
+            "--sorce",
+            body.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+
+    assert_eq!(result.0, 64, "stdout={}\nstderr={}", result.1, result.2);
+    assert!(
+        result.1.contains(&format!(
+            " edit replace-body --symbol first --source {} --dry-run",
+            body.display()
+        )),
+        "{}",
+        result.1
+    );
+}
+
+#[test]
 fn source_and_regex_old_new_aliases_are_accepted_end_to_end() {
     let (repo, store) = fresh_workspace();
     let indexed = run(&repo, &store, &["index", "."]);
