@@ -312,30 +312,51 @@ impl Certificate {
                 )
             }
             Status::Ambiguous => {
-                let selectors = if candidate_selectors.is_empty() {
-                    "the selector matched multiple targets".to_string()
-                } else {
-                    format!(
-                        "disambiguate with path::SYMBOL: {}",
-                        candidate_selectors.join(", ")
+                if operation.selector_engine == SelectorEngine::Text
+                    && operation.selector_class == SelectorClass::ExactText
+                {
+                    (
+                        detail.map_or_else(
+                            || {
+                                format!(
+                                    "`OLD` occurs {} times; text-cas requires the explicit expected cardinality.",
+                                    operation.target_matches
+                                )
+                            },
+                            str::to_owned,
+                        ),
+                        vec![
+                            "greppy edit text-cas --help".into(),
+                            "greppy edit rename-symbol --help".into(),
+                            "greppy edit rename-call --help".into(),
+                        ],
                     )
-                };
-                let mut steps = candidate_selectors
-                    .iter()
-                    .map(|selector| {
-                        format!("greppy read {} --handle --json", shell_quote(selector))
-                    })
-                    .collect::<Vec<_>>();
-                if steps.is_empty() {
-                    steps.push(format!("greppy search-symbols {} --json", file));
+                } else {
+                    let selectors = if candidate_selectors.is_empty() {
+                        "the selector matched multiple targets".to_string()
+                    } else {
+                        format!(
+                            "disambiguate with path::SYMBOL: {}",
+                            candidate_selectors.join(", ")
+                        )
+                    };
+                    let mut steps = candidate_selectors
+                        .iter()
+                        .map(|selector| {
+                            format!("greppy read {} --handle --json", shell_quote(selector))
+                        })
+                        .collect::<Vec<_>>();
+                    if steps.is_empty() {
+                        steps.push(format!("greppy search-symbols {} --json", file));
+                    }
+                    (
+                        format!(
+                            "operation `{}` expected one target but found {}; {selectors}.",
+                            operation.id, operation.target_matches
+                        ),
+                        steps,
+                    )
                 }
-                (
-                    format!(
-                        "operation `{}` expected one target but found {}; {selectors}.",
-                        operation.id, operation.target_matches
-                    ),
-                    steps,
-                )
             }
             Status::Stale => {
                 let found = detail.unwrap_or("the live file or target hash no longer matches");

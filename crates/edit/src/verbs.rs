@@ -216,7 +216,7 @@ pub fn text_cas(
         ));
     }
     if occurrences.len() != expect {
-        return Ok(single_op_certificate(
+        let mut certificate = single_op_certificate(
             workspace_root,
             &snapshot,
             SelectorEngine::Text,
@@ -228,7 +228,19 @@ pub fn text_cas(
             None,
             options,
             PublishMode::Atomic,
-        ));
+        );
+        let operation = &mut certificate.operations[0];
+        operation.id = "text-cas".into();
+        operation.postconditions = vec![PostconditionResult {
+            name: "expected-old-occurrences".into(),
+            passed: false,
+            detail: Some(format!(
+                "`OLD` occurs {} times, expected {expect}; use `--expect {}`, or a structure-aware verb (`rename-symbol`/`rename-call`) for a true rename.",
+                occurrences.len(),
+                occurrences.len(),
+            )),
+        }];
+        return Ok(certificate);
     }
 
     let ops: Vec<PlannedOp> = occurrences
@@ -2697,10 +2709,11 @@ mod tests {
     }
 
     #[test]
-    fn text_cas_ambiguous_changes_nothing() {
+    fn text_cas_ambiguous_reports_cardinality_and_changes_nothing() {
         let dir = ws();
         let f = dir.path().join("conf.ini");
-        std::fs::write(&f, b"x = 1\nx = 1\n").unwrap();
+        let original = b"x = 1\nx = 1\nx = 1\n";
+        std::fs::write(&f, original).unwrap();
         let cert = text_cas(
             dir.path(),
             &f,
@@ -2710,9 +2723,43 @@ mod tests {
             &VerbOptions::default(),
         )
         .unwrap();
+
         assert_eq!(cert.status, Status::Ambiguous);
         assert_eq!(cert.exit_code(), 11);
-        assert_eq!(std::fs::read(&f).unwrap(), b"x = 1\nx = 1\n");
+        assert!(!cert.published);
+        assert_eq!(cert.operations[0].target_matches, 3);
+        assert_eq!(std::fs::read(&f).unwrap(), original);
+        let compact: serde_json::Value =
+            serde_json::from_str(&cert.to_compact_json_pretty().unwrap()).unwrap();
+        let diagnosis = compact["diagnosis"].as_str().unwrap();
+        assert!(diagnosis.contains("`OLD` occurs 3 times"), "{diagnosis}");
+        assert!(diagnosis.contains("expected 1"), "{diagnosis}");
+        assert!(diagnosis.contains("`--expect 3`"), "{diagnosis}");
+        assert!(diagnosis.contains("rename-symbol"), "{diagnosis}");
+        assert!(diagnosis.contains("rename-call"), "{diagnosis}");
+    }
+
+    #[test]
+    fn text_cas_expect_three_replaces_all_three_occurrences() {
+        let dir = ws();
+        let f = dir.path().join("conf.ini");
+        std::fs::write(&f, b"x = 1\nx = 1\nx = 1\n").unwrap();
+
+        let cert = text_cas(
+            dir.path(),
+            &f,
+            b"x = 1",
+            b"x = 2",
+            3,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(cert.status, Status::Applied);
+        assert_eq!(cert.exit_code(), 0);
+        assert!(cert.published);
+        assert_eq!(cert.operations[0].target_matches, 3);
+        assert_eq!(std::fs::read(&f).unwrap(), b"x = 2\nx = 2\nx = 2\n");
     }
 
     #[test]

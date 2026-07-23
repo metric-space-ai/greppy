@@ -197,6 +197,51 @@ fn text_cas_replaces_exact_text() {
 }
 
 #[test]
+fn text_cas_reports_ambiguous_cardinality_then_accepts_explicit_expect() {
+    let fixture = Fixture::new("text-cas-ambiguous");
+    let file = fixture.repo.join("repeated.txt");
+    let original = "OLD\nOLD\nOLD\n";
+    std::fs::write(&file, original).unwrap();
+
+    let ambiguous = fixture.run(&[
+        "edit",
+        "text-cas",
+        "--file",
+        "repeated.txt",
+        "--old",
+        "OLD",
+        "--new",
+        "NEW",
+    ]);
+
+    assert_eq!(ambiguous.status.code(), Some(11));
+    let stdout = String::from_utf8_lossy(&ambiguous.stdout);
+    assert!(stdout.contains("\"status\": \"ambiguous\""), "{stdout}");
+    assert!(stdout.contains("`OLD` occurs 3 times"), "{stdout}");
+    assert!(stdout.contains("expected 1"), "{stdout}");
+    assert!(stdout.contains("`--expect 3`"), "{stdout}");
+    assert!(stdout.contains("rename-symbol"), "{stdout}");
+    assert!(stdout.contains("rename-call"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+
+    let applied = fixture.run(&[
+        "edit",
+        "text-cas",
+        "--file",
+        "repeated.txt",
+        "--old",
+        "OLD",
+        "--new",
+        "NEW",
+        "--expect",
+        "3",
+    ]);
+
+    assert_success("text-cas --expect 3", &applied);
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "NEW\nNEW\nNEW\n");
+}
+
+#[test]
 fn insert_after_adds_top_level_definition() {
     let fixture = Fixture::new("insert-after");
     let content = fixture.scratch(
