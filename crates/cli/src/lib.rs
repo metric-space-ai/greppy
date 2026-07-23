@@ -120,6 +120,11 @@ const ENV_TEST_SKIP_INFERENCE: &str = "GREPPY_TEST_SKIP_INFERENCE";
 /// in the background) without a real inference failure.
 #[cfg(debug_assertions)]
 const ENV_TEST_EMBED_UNAVAILABLE: &str = "GREPPY_TEST_EMBED_UNAVAILABLE";
+/// Test-only failpoint for the agent-facing missing-asset fallback. Unlike
+/// `GREPPY_TEST_EMBED_UNAVAILABLE`, this fails model configuration before any
+/// inference attempt, matching an embedded asset that could not be extracted.
+#[cfg(debug_assertions)]
+const ENV_TEST_EMBED_ASSET_MISSING: &str = "GREPPY_TEST_EMBED_ASSET_MISSING";
 
 #[cfg(feature = "ci-test-assets")]
 fn test_inference_skipped() -> bool {
@@ -5815,24 +5820,26 @@ fn embedding_progress_text(progress: &serde_json::Value) -> String {
         .get("total_spans")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let counts = if total == 0 {
-        String::new()
-    } else {
-        format!(" ({completed}/{total} spans)")
-    };
     if let Some(eta) = progress
         .get("eta_seconds")
         .and_then(serde_json::Value::as_u64)
     {
         format!(
-            "semantic-search: semantic index is building on {backend}{counts}; semantic results will be available in about {}.",
+            "semantic index building — {completed}/{total} spans, ETA ~{} (backend {backend})",
             format_embedding_eta(eta)
         )
     } else {
         format!(
-            "semantic-search: semantic index is building on {backend}{counts}; completion time is being measured."
+            "semantic index building — {completed}/{total} spans, ETA measuring (backend {backend})"
         )
     }
+}
+
+#[derive(Clone, Copy)]
+struct SemanticFallbackContext<'a> {
+    query: &'a str,
+    paths: &'a [String],
+    root: Option<&'a str>,
 }
 
 fn semantic_embedding_indexing_json(
@@ -5841,6 +5848,7 @@ fn semantic_embedding_indexing_json(
     graph_generation: u64,
     freshness: &serde_json::Value,
     progress: &serde_json::Value,
+    fallback: SemanticFallbackContext<'_>,
 ) -> Result<()> {
     let eta_seconds = progress
         .get("eta_seconds")
@@ -5863,6 +5871,8 @@ fn semantic_embedding_indexing_json(
             "retryable": true,
             "retry_after_seconds": retry_after_seconds,
             "embedding_index": progress,
+            "query_tokens": semantic_fallback_tokens(fallback.query),
+            "next": semantic_fallback_commands(fallback.query, fallback.paths, fallback.root),
             "total_exact": 0,
             "shown": 0,
             "omitted": 0,
@@ -5871,6 +5881,47 @@ fn semantic_embedding_indexing_json(
         }))
         .map_err(|error| Error::Invalid(format!("serialize semantic indexing JSON: {error}")))?
     );
+    Ok(())
+}
+
+fn emit_semantic_backend_unavailable(
+    project: &str,
+    query: &str,
+    paths: &[String],
+    root: Option<&str>,
+    json: bool,
+    detail: &str,
+) -> Result<()> {
+    let next = semantic_fallback_commands(query, paths, root);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
+                "command": "semantic-search",
+                "mode": "vector",
+                "status": "backend_unavailable",
+                "project": project,
+                "query": query,
+                "reason": "asset_missing",
+                "detail": detail,
+                "retryable": false,
+                "query_tokens": semantic_fallback_tokens(query),
+                "next": next,
+                "total_exact": 0,
+                "shown": 0,
+                "omitted": 0,
+                "truncated": false,
+                "hits": [],
+            }))
+            .map_err(|error| {
+                Error::Invalid(format!("serialize semantic unavailable JSON: {error}"))
+            })?
+        );
+    } else {
+        println!("semantic backend unavailable (asset missing) — {detail}");
+        print_semantic_fallback_commands(query, paths, root);
+    }
     Ok(())
 }
 
@@ -8301,6 +8352,24 @@ fn resolve_edit_file(root_path: &std::path::Path, file: &str) -> std::path::Path
     }
 }
 
+struct BriefJsonContext<'a> {
+    root: Option<&'a str>,
+    path_filters: &'a QueryPathFilters,
+    semantic_backend_unavailable: Option<&'a str>,
+}
+
+fn brief_semantic_backend_json(unavailable: Option<&str>) -> serde_json::Value {
+    match unavailable {
+        Some(detail) => serde_json::json!({
+            "status": "unavailable",
+            "reason": "asset_missing",
+            "detail": detail,
+            "fallback": "graph_only",
+        }),
+        None => serde_json::json!({"status": "available"}),
+    }
+}
+
 fn dispatch_brief(
     symbol: Option<&str>,
     paths: &[String],
@@ -8334,6 +8403,21 @@ fn dispatch_brief(
     )? {
         return Ok(code);
     }
+    // `brief` is graph-first and must remain useful when EmbeddingGemma cannot
+    // be resolved. Probe configuration only (never load the model), surface the
+    // degradation, then continue with definition/callers/callees unchanged.
+    let semantic_backend_unavailable = embedding_config_for_required_use(EmbeddingCliArgs {
+        device: None,
+        no_gpu: false,
+    })
+    .err()
+    .filter(embedding_asset_missing_error)
+    .map(|error| error.to_string());
+    if !json && semantic_backend_unavailable.is_some() {
+        println!(
+            "semantic backend unavailable (asset missing) — brief continuing with graph-only definition/callers/callees"
+        );
+    }
     let targets = resolve_symbol_nodes(&store, symbol)?;
     if targets.is_empty() {
         if json {
@@ -8346,6 +8430,9 @@ fn dispatch_brief(
                     "status": "not_found",
                     "project": project,
                     "query": query_symbol,
+                    "semantic_backend": brief_semantic_backend_json(
+                        semantic_backend_unavailable.as_deref()
+                    ),
                     "suggestions": miss["suggestions"].clone(),
                     "next": miss["next"].clone(),
                     "definitions": [],
@@ -8368,8 +8455,11 @@ fn dispatch_brief(
             query_symbol,
             &targets,
             &root_path,
-            root,
-            &path_filters,
+            BriefJsonContext {
+                root,
+                path_filters: &path_filters,
+                semantic_backend_unavailable: semantic_backend_unavailable.as_deref(),
+            },
         );
     }
     let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
@@ -8518,9 +8608,11 @@ fn dispatch_brief_json(
     query_symbol: &str,
     targets: &[i64],
     root_path: &std::path::Path,
-    root: Option<&str>,
-    path_filters: &QueryPathFilters,
+    context: BriefJsonContext<'_>,
 ) -> Result<i32> {
+    let root = context.root;
+    let path_filters = context.path_filters;
+    let semantic_backend_unavailable = context.semantic_backend_unavailable;
     let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
     let mut definitions = Vec::new();
     let mut seen_def = std::collections::BTreeSet::new();
@@ -8666,6 +8758,7 @@ fn dispatch_brief_json(
         "query": query_symbol,
         "path_filters": path_filters.json_value(),
         "freshness": freshness,
+        "semantic_backend": brief_semantic_backend_json(semantic_backend_unavailable),
         "definitions": definitions,
         "callers": callers_json,
         "references": references_json,
@@ -13283,7 +13376,21 @@ fn dispatch_semantic(
         return Ok(1);
     }
 
-    let cfg = embedding_config_for_required_use(embedding_args)?;
+    let cfg = match embedding_config_for_required_use(embedding_args) {
+        Ok(cfg) => cfg,
+        Err(error) if embedding_asset_missing_error(&error) => {
+            emit_semantic_backend_unavailable(
+                &project,
+                q,
+                paths,
+                root,
+                json,
+                "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
+            )?;
+            return Ok(i32::from(EXIT_NOT_IMPLEMENTED));
+        }
+        Err(error) => return Err(error),
+    };
     {
         let generation = current_graph_generation(&store, root)?;
         let candidate_limit = vector_exact_candidate_limit()?;
@@ -13322,10 +13429,20 @@ fn dispatch_semantic(
             let progress = embedding_progress_value(&root_path, &cfg, generation);
             if json {
                 semantic_embedding_indexing_json(
-                    &project, &cfg, generation, &freshness, &progress,
+                    &project,
+                    &cfg,
+                    generation,
+                    &freshness,
+                    &progress,
+                    SemanticFallbackContext {
+                        query: q,
+                        paths,
+                        root,
+                    },
                 )?;
             } else {
                 println!("{}", embedding_progress_text(&progress));
+                print_semantic_fallback_commands(q, paths, root);
             }
             return Ok(i32::from(EXIT_TEMPFAIL));
         }
@@ -13351,9 +13468,10 @@ fn dispatch_semantic(
                 )?;
             } else {
                 println!(
-                    "(no vector embeddings for model {}; run `greppy index` first)",
+                    "semantic index unavailable — 0 indexed spans for model {}",
                     cfg.model_id
                 );
+                print_semantic_fallback_commands(q, paths, root);
             }
             return Ok(freshness_refusal_exit(&freshness));
         }
@@ -15081,6 +15199,117 @@ fn shell_example_arg(value: &str) -> String {
     }
 }
 
+/// Keep fallback searches tied to the user's actual words. Natural-language
+/// glue is dropped so the grep pattern remains selective; when every word is
+/// glue, preserve the original tokens rather than inventing a pattern.
+fn semantic_fallback_tokens(query: &str) -> Vec<String> {
+    fn is_search_glue(token: &str) -> bool {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "a" | "an"
+                | "and"
+                | "are"
+                | "as"
+                | "at"
+                | "be"
+                | "by"
+                | "code"
+                | "find"
+                | "for"
+                | "from"
+                | "how"
+                | "in"
+                | "is"
+                | "it"
+                | "of"
+                | "on"
+                | "or"
+                | "search"
+                | "that"
+                | "the"
+                | "this"
+                | "to"
+                | "what"
+                | "where"
+                | "which"
+                | "with"
+        )
+    }
+
+    let all = query
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut selected = all
+        .iter()
+        .filter(|token| token.len() >= 2 && !is_search_glue(token))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        selected = all;
+    }
+    let mut seen = std::collections::HashSet::new();
+    selected.retain(|token| seen.insert(token.to_ascii_lowercase()));
+    selected.truncate(8);
+    selected
+}
+
+fn semantic_fallback_commands(query: &str, paths: &[String], root: Option<&str>) -> Vec<String> {
+    let tokens = semantic_fallback_tokens(query);
+    let mut commands = Vec::new();
+    if let Some(symbol_token) = tokens.last() {
+        let mut command = format!("greppy search-symbols {}", shell_example_arg(symbol_token));
+        for path in paths {
+            command.push(' ');
+            command.push_str(&shell_example_arg(path));
+        }
+        if let Some(root) = root {
+            command.push_str(" --root ");
+            command.push_str(&shell_example_arg(root));
+        }
+        commands.push(command);
+    }
+
+    let pattern = if tokens.is_empty() {
+        query.to_string()
+    } else {
+        tokens.join("|")
+    };
+    let grep_targets = if paths.is_empty() {
+        vec![root.unwrap_or(".").to_string()]
+    } else if let Some(root) = root {
+        paths
+            .iter()
+            .map(|path| {
+                std::path::Path::new(root)
+                    .join(path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    } else {
+        paths.to_vec()
+    };
+    let mut grep = format!("greppy grep -rnE {}", shell_example_arg(&pattern));
+    for target in grep_targets {
+        grep.push(' ');
+        grep.push_str(&shell_example_arg(&target));
+    }
+    commands.push(grep);
+    commands
+}
+
+fn print_semantic_fallback_commands(query: &str, paths: &[String], root: Option<&str>) {
+    for command in semantic_fallback_commands(query, paths, root) {
+        println!("try: {command}");
+    }
+}
+
+fn embedding_asset_missing_error(error: &Error) -> bool {
+    matches!(error, Error::Config(message) if message.contains("EmbeddingGemma assets are unavailable"))
+}
+
 fn validate_query_root_usage(root: Option<&str>, command: &str, subject: &str) -> Result<()> {
     let Some(raw_root) = root else {
         return Ok(());
@@ -15614,6 +15843,12 @@ fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
 }
 
 fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(ENV_TEST_EMBED_ASSET_MISSING).is_some() {
+        return Err(Error::Config(
+            "embedded EmbeddingGemma assets are unavailable (test failpoint)".into(),
+        ));
+    }
     let device = embedding_device_preference(args.device, args.no_gpu)?;
     let source = match embeddinggemma_assets::paths() {
         Some((gguf, tokenizer)) => EmbeddingModelSource::Gguf {
@@ -18141,8 +18376,15 @@ mod tests {
         });
         assert_eq!(
             embedding_progress_text(&progress),
-            "semantic-search: semantic index is building on metal (412/2443 spans); semantic results will be available in about 2m 14s."
+            "semantic index building — 412/2443 spans, ETA ~2m 14s (backend metal)"
         );
+    }
+
+    #[test]
+    fn semantic_fallback_commands_use_query_tokens() {
+        let commands = semantic_fallback_commands("find semantic progress marker", &[], None);
+        assert_eq!(commands[0], "greppy search-symbols marker");
+        assert_eq!(commands[1], "greppy grep -rnE 'semantic|progress|marker' .");
     }
 
     #[test]
