@@ -110,9 +110,8 @@ pub fn load_plan(text: &str, default_workspace: &Path) -> Result<LoadedPlan> {
         }
     }
 
-    let operations = object
-        .get("operations")
-        .and_then(serde_json::Value::as_array);
+    let operations_value = object.get("operations");
+    let operations = operations_value.and_then(serde_json::Value::as_array);
     let operation_uses_shorthand = operations.is_some_and(|operations| {
         operations.iter().any(|operation| {
             operation.as_object().is_some_and(|operation| {
@@ -125,11 +124,14 @@ pub fn load_plan(text: &str, default_workspace: &Path) -> Result<LoadedPlan> {
     let shorthand = used_ops_alias || operation_uses_shorthand;
 
     let mut problems = Vec::new();
-    let Some(operations) = operations else {
-        problems.push("missing required field `operations` (alias: `ops`)".into());
-        return Err(invalid_plan(problems));
-    };
-    if operations.is_empty() {
+    match operations_value {
+        None => problems.push("missing required field `operations` (alias: `ops`)".into()),
+        Some(value) if !value.is_array() => {
+            problems.push("field `operations` must be an array".into())
+        }
+        Some(_) => {}
+    }
+    if operations.is_some_and(Vec::is_empty) {
         problems.push("`operations` must contain at least one operation".into());
     }
     if !shorthand && !object.contains_key("schema_version") {
@@ -148,12 +150,15 @@ pub fn load_plan(text: &str, default_workspace: &Path) -> Result<LoadedPlan> {
         }
     }
 
-    for (index, operation) in operations.iter().enumerate() {
-        validate_operation(operation, index, &mut problems);
+    if let Some(operations) = operations {
+        for (index, operation) in operations.iter().enumerate() {
+            validate_operation(operation, index, &mut problems);
+        }
     }
     if !problems.is_empty() {
         return Err(invalid_plan(problems));
     }
+    let operations = operations.expect("validated operations array");
 
     let schema_version = match object.get("schema_version") {
         Some(value) => json_string(value, "schema_version")?,

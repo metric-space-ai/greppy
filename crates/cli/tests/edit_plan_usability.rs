@@ -115,6 +115,22 @@ fn text_cas_plan_template_round_trips_without_edits() {
 }
 
 #[test]
+fn broken_plan_reports_all_missing_fields_and_a_complete_example() {
+    let (repo, store) = fresh_workspace("broken");
+
+    let (code, stdout, stderr) = apply_plan(&repo, &store, r#"{"operations":[{}]}"#);
+
+    assert_eq!(code, 20, "stdout={stdout}\nstderr={stderr}");
+    for field in ["schema_version", "publish", "file", "selector", "action"] {
+        assert!(stderr.contains(field), "missing {field} in:\n{stderr}");
+    }
+    assert!(stderr.contains("operations"), "{stderr}");
+    assert!(stderr.contains("minimal complete example:"), "{stderr}");
+    assert!(stderr.contains(r#""old": "OLD""#), "{stderr}");
+    assert!(stderr.contains("allowed optional fields:"), "{stderr}");
+}
+
+#[test]
 fn canonical_long_form_remains_valid() {
     let (repo, store) = fresh_workspace("canonical");
     let original = b"alpha one\n";
