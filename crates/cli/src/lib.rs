@@ -7107,8 +7107,6 @@ fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (u
     (start, end)
 }
 
-const MINIMAL_EDIT_PLAN_EXAMPLE: &str =
-    include_str!("../../../docs/contracts/edit-plan.minimal.json");
 const MINIMAL_CHANGE_SIGNATURE_EXAMPLE: &str =
     include_str!("../../../docs/contracts/change-signature-spec.minimal.json");
 
@@ -7743,15 +7741,70 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 context: format!("read {plan}"),
                 source,
             })?;
-            let mut parsed: greppy_edit::plan::Plan = serde_json::from_str(&text).map_err(|error| {
-                Error::Invalid(format!(
-                    "plan invalid: {error}\nminimal complete example:\n{}",
-                    MINIMAL_EDIT_PLAN_EXAMPLE.trim()
-                ))
+            let loaded = greppy_edit::plan::load_plan(&text, &root_path)?;
+            let plan_root = std::path::PathBuf::from(loaded.workspace_root());
+            let plan_root_arg = plan_root.to_string_lossy().into_owned();
+            let parsed = loaded.into_plan(|shortcut| {
+                let resolved = resolve_edit_target(
+                    Some(&shortcut.symbol),
+                    None,
+                    Some(&plan_root_arg),
+                    &plan_root,
+                )?;
+                let EditTarget::Resolved {
+                    rel_path,
+                    range,
+                    ..
+                } = resolved
+                else {
+                    let EditTarget::Refusal(certificate) = resolved else {
+                        unreachable!()
+                    };
+                    return Err(Error::Invalid(format!(
+                        "replace-body operation `{}` could not resolve symbol `{}` (status {:?})",
+                        shortcut.id, shortcut.symbol, certificate.status
+                    )));
+                };
+
+                let declared_file = resolve_edit_file(&plan_root, &shortcut.file);
+                let resolved_file = plan_root.join(&rel_path);
+                let declared_canonical = declared_file.canonicalize().map_err(|source| Error::Io {
+                    context: format!("canonicalize {}", declared_file.display()),
+                    source,
+                })?;
+                let resolved_canonical = resolved_file.canonicalize().map_err(|source| Error::Io {
+                    context: format!("canonicalize {}", resolved_file.display()),
+                    source,
+                })?;
+                if declared_canonical != resolved_canonical {
+                    return Err(Error::Invalid(format!(
+                        "replace-body operation `{}` declares file `{}` but symbol `{}` resolves to `{}`",
+                        shortcut.id, shortcut.file, shortcut.symbol, rel_path
+                    )));
+                }
+
+                let new_body = match &shortcut.body {
+                    greppy_edit::plan::ReplaceBodySource::Inline(body) => body.clone(),
+                    greppy_edit::plan::ReplaceBodySource::File(source_file) => {
+                        let source_path = resolve_edit_file(&plan_root, source_file);
+                        std::fs::read_to_string(&source_path).map_err(|source| Error::Io {
+                            context: format!("read {}", source_path.display()),
+                            source,
+                        })?
+                    }
+                };
+                let file_content = std::fs::read(&resolved_file).map_err(|source| Error::Io {
+                    context: format!("read {}", resolved_file.display()),
+                    source,
+                })?;
+                greppy_edit::plan::resolve_replace_body_operation(
+                    shortcut,
+                    rel_path,
+                    range,
+                    &file_content,
+                    &new_body,
+                )
             })?;
-            if parsed.workspace.root.is_empty() || parsed.workspace.root == "." {
-                parsed.workspace.root = root_path.to_string_lossy().into_owned();
-            }
             (greppy_edit::plan::apply_plan(&parsed, dry_run)?, report)
         }
         EditCommand::Recover { report } => {

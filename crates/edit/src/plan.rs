@@ -25,6 +25,392 @@ use greppy_core::{Error, Result};
 
 pub const PLAN_SCHEMA: &str = "greppy.edit-plan.v1";
 
+pub const MINIMAL_PLAN_EXAMPLE: &str =
+    include_str!("../../../docs/contracts/edit-plan.minimal.json");
+
+/// A parsed plan may still contain CLI-resolved operations. Text-CAS shorthand
+/// is normalized immediately; replace-body shorthand is resolved by the CLI,
+/// which owns symbol/store lookup and source-file loading.
+#[derive(Debug, Clone)]
+pub struct LoadedPlan {
+    schema_version: String,
+    workspace: PlanWorkspace,
+    operations: Vec<LoadedPlanOperation>,
+    validators: Vec<PlanValidator>,
+    publish: PlanPublish,
+}
+
+#[derive(Debug, Clone)]
+enum LoadedPlanOperation {
+    Ready(PlanOperation),
+    ReplaceBody(ReplaceBodyShortcut),
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplaceBodyShortcut {
+    pub id: String,
+    pub file: String,
+    pub symbol: String,
+    pub body: ReplaceBodySource,
+    pub preconditions: PlanPreconditions,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReplaceBodySource {
+    Inline(String),
+    File(String),
+}
+
+impl LoadedPlan {
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace.root
+    }
+
+    pub fn into_plan<F>(self, mut resolve_replace_body: F) -> Result<Plan>
+    where
+        F: FnMut(ReplaceBodyShortcut) -> Result<PlanOperation>,
+    {
+        let operations = self
+            .operations
+            .into_iter()
+            .map(|operation| match operation {
+                LoadedPlanOperation::Ready(operation) => Ok(operation),
+                LoadedPlanOperation::ReplaceBody(operation) => resolve_replace_body(operation),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Plan {
+            schema_version: self.schema_version,
+            workspace: self.workspace,
+            operations,
+            validators: self.validators,
+            publish: self.publish,
+        })
+    }
+}
+
+/// Parse either the canonical `greppy.edit-plan.v1` shape or the CLI-oriented
+/// shorthand. The shorthand deliberately defaults schema/workspace/id/publish;
+/// canonical selector/action plans retain the schema-version requirement.
+pub fn load_plan(text: &str, default_workspace: &Path) -> Result<LoadedPlan> {
+    let mut value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| invalid_plan(vec![format!("JSON syntax: {error}")]))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(invalid_plan(vec!["top level must be a JSON object".into()]));
+    };
+
+    let used_ops_alias = object.contains_key("ops");
+    if object.contains_key("operations") && used_ops_alias {
+        return Err(invalid_plan(vec![
+            "use either `operations` or its alias `ops`, not both".into(),
+        ]));
+    }
+    if !object.contains_key("operations") {
+        if let Some(operations) = object.remove("ops") {
+            object.insert("operations".into(), operations);
+        }
+    }
+
+    let operations = object
+        .get("operations")
+        .and_then(serde_json::Value::as_array);
+    let operation_uses_shorthand = operations.is_some_and(|operations| {
+        operations.iter().any(|operation| {
+            operation.as_object().is_some_and(|operation| {
+                ["old", "new", "symbol", "source_file", "new_body"]
+                    .iter()
+                    .any(|field| operation.contains_key(*field))
+            })
+        })
+    });
+    let shorthand = used_ops_alias || operation_uses_shorthand;
+
+    let mut problems = Vec::new();
+    let Some(operations) = operations else {
+        problems.push("missing required field `operations` (alias: `ops`)".into());
+        return Err(invalid_plan(problems));
+    };
+    if operations.is_empty() {
+        problems.push("`operations` must contain at least one operation".into());
+    }
+    if !shorthand && !object.contains_key("schema_version") {
+        problems.push("missing required field `schema_version` for canonical long form".into());
+    }
+    if !shorthand && !object.contains_key("publish") {
+        problems.push("missing required field `publish` for canonical long form".into());
+    }
+    if let Some(workspace) = object.get("workspace") {
+        match workspace.as_object() {
+            Some(workspace) if !workspace.contains_key("root") => {
+                problems.push("missing required field `workspace.root`".into());
+            }
+            Some(_) => {}
+            None => problems.push("field `workspace` must be an object".into()),
+        }
+    }
+
+    for (index, operation) in operations.iter().enumerate() {
+        validate_operation(operation, index, &mut problems);
+    }
+    if !problems.is_empty() {
+        return Err(invalid_plan(problems));
+    }
+
+    let schema_version = match object.get("schema_version") {
+        Some(value) => json_string(value, "schema_version")?,
+        None => PLAN_SCHEMA.into(),
+    };
+    let workspace = parse_workspace(object.get("workspace"), default_workspace, shorthand)?;
+    let validators = match object.get("validators") {
+        Some(value) => from_plan_value(value.clone(), "validators")?,
+        None => vec![],
+    };
+    let publish = match object.get("publish") {
+        Some(value) => from_plan_value(value.clone(), "publish")?,
+        None => PlanPublish {
+            mode: PlanPublishMode::Journal,
+        },
+    };
+
+    let mut normalized = Vec::with_capacity(operations.len());
+    for (index, operation) in operations.iter().enumerate() {
+        normalized.push(normalize_operation(operation.clone(), index)?);
+    }
+
+    Ok(LoadedPlan {
+        schema_version,
+        workspace,
+        operations: normalized,
+        validators,
+        publish,
+    })
+}
+
+fn validate_operation(value: &serde_json::Value, index: usize, problems: &mut Vec<String>) {
+    let prefix = format!("operations[{index}]");
+    let Some(operation) = value.as_object() else {
+        problems.push(format!("field `{prefix}` must be an object"));
+        return;
+    };
+    let is_replace_body = ["symbol", "source_file", "new_body"]
+        .iter()
+        .any(|field| operation.contains_key(*field));
+    let is_text_cas = ["old", "new"]
+        .iter()
+        .any(|field| operation.contains_key(*field));
+
+    require_field(operation, "file", &prefix, problems);
+    if is_replace_body {
+        require_field(operation, "symbol", &prefix, problems);
+        match (
+            operation.contains_key("source_file"),
+            operation.contains_key("new_body"),
+        ) {
+            (false, false) => problems.push(format!(
+                "missing required field `{prefix}.source_file` or `{prefix}.new_body`"
+            )),
+            (true, true) => problems.push(format!(
+                "fields `{prefix}.source_file` and `{prefix}.new_body` are mutually exclusive"
+            )),
+            _ => {}
+        }
+    } else if is_text_cas {
+        require_field(operation, "old", &prefix, problems);
+        require_field(operation, "new", &prefix, problems);
+    } else {
+        require_field(operation, "selector", &prefix, problems);
+        require_field(operation, "action", &prefix, problems);
+        if let Some(selector) = operation
+            .get("selector")
+            .and_then(serde_json::Value::as_object)
+        {
+            require_field(selector, "engine", &format!("{prefix}.selector"), problems);
+            match selector.get("engine").and_then(serde_json::Value::as_str) {
+                Some("text") => require_field(
+                    selector,
+                    "old_text",
+                    &format!("{prefix}.selector"),
+                    problems,
+                ),
+                Some("resolved") => {
+                    require_field(
+                        selector,
+                        "byte_start",
+                        &format!("{prefix}.selector"),
+                        problems,
+                    );
+                    require_field(
+                        selector,
+                        "byte_end",
+                        &format!("{prefix}.selector"),
+                        problems,
+                    );
+                }
+                _ => {}
+            }
+        }
+        if let Some(action) = operation
+            .get("action")
+            .and_then(serde_json::Value::as_object)
+        {
+            require_field(action, "type", &format!("{prefix}.action"), problems);
+            if matches!(
+                action.get("type").and_then(serde_json::Value::as_str),
+                Some("replace" | "insert-after" | "insert-before")
+            ) {
+                require_field(action, "content", &format!("{prefix}.action"), problems);
+            }
+        }
+    }
+}
+
+fn require_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    prefix: &str,
+    problems: &mut Vec<String>,
+) {
+    if !object.contains_key(field) {
+        problems.push(format!("missing required field `{prefix}.{field}`"));
+    }
+}
+
+fn normalize_operation(value: serde_json::Value, index: usize) -> Result<LoadedPlanOperation> {
+    let operation = value
+        .as_object()
+        .expect("operations were validated as objects");
+    let id = operation
+        .get("id")
+        .map(|value| json_string(value, &format!("operations[{index}].id")))
+        .transpose()?
+        .unwrap_or_else(|| format!("op-{}", index + 1));
+    let file = json_string(
+        operation.get("file").expect("operation file was validated"),
+        &format!("operations[{index}].file"),
+    )?;
+    let preconditions = match operation.get("preconditions") {
+        Some(value) => {
+            from_plan_value(value.clone(), &format!("operations[{index}].preconditions"))?
+        }
+        None => PlanPreconditions::default(),
+    };
+
+    if operation.contains_key("symbol")
+        || operation.contains_key("source_file")
+        || operation.contains_key("new_body")
+    {
+        let symbol = json_string(
+            operation
+                .get("symbol")
+                .expect("replace-body symbol was validated"),
+            &format!("operations[{index}].symbol"),
+        )?;
+        let body = if let Some(value) = operation.get("source_file") {
+            ReplaceBodySource::File(json_string(
+                value,
+                &format!("operations[{index}].source_file"),
+            )?)
+        } else {
+            ReplaceBodySource::Inline(json_string(
+                operation
+                    .get("new_body")
+                    .expect("replace-body body was validated"),
+                &format!("operations[{index}].new_body"),
+            )?)
+        };
+        return Ok(LoadedPlanOperation::ReplaceBody(ReplaceBodyShortcut {
+            id,
+            file,
+            symbol,
+            body,
+            preconditions,
+        }));
+    }
+
+    if operation.contains_key("old") || operation.contains_key("new") {
+        let old_text = json_string(
+            operation.get("old").expect("text old was validated"),
+            &format!("operations[{index}].old"),
+        )?;
+        let content = json_string(
+            operation.get("new").expect("text new was validated"),
+            &format!("operations[{index}].new"),
+        )?;
+        let expect = match operation.get("expect") {
+            Some(value) => from_plan_value(value.clone(), &format!("operations[{index}].expect"))?,
+            None => 1,
+        };
+        return Ok(LoadedPlanOperation::Ready(PlanOperation {
+            id,
+            file,
+            selector: PlanSelector::Text { old_text, expect },
+            action: PlanAction::Replace { content },
+            preconditions,
+        }));
+    }
+
+    let mut value = value;
+    value
+        .as_object_mut()
+        .expect("operation was validated as an object")
+        .insert("id".into(), serde_json::Value::String(id));
+    Ok(LoadedPlanOperation::Ready(from_plan_value(
+        value,
+        &format!("operations[{index}]"),
+    )?))
+}
+
+fn parse_workspace(
+    value: Option<&serde_json::Value>,
+    default_workspace: &Path,
+    shorthand: bool,
+) -> Result<PlanWorkspace> {
+    let default_root = default_workspace.to_string_lossy().into_owned();
+    let Some(value) = value else {
+        return Ok(PlanWorkspace {
+            root: default_root,
+            expect_git_head: None,
+            require_unchanged_files: false,
+        });
+    };
+    let mut value = value.clone();
+    let object = value
+        .as_object_mut()
+        .expect("workspace was validated as an object");
+    if object.get("root").and_then(serde_json::Value::as_str) == Some(".") {
+        object.insert("root".into(), serde_json::Value::String(default_root));
+    }
+    if shorthand && !object.contains_key("require_unchanged_files") {
+        object.insert(
+            "require_unchanged_files".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    from_plan_value(value, "workspace")
+}
+
+fn json_string(value: &serde_json::Value, field: &str) -> Result<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_plan(vec![format!("field `{field}` must be a string")]))
+}
+
+fn from_plan_value<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    field: &str,
+) -> Result<T> {
+    serde_json::from_value(value)
+        .map_err(|error| invalid_plan(vec![format!("field `{field}` is invalid: {error}")]))
+}
+
+fn invalid_plan(problems: Vec<String>) -> Error {
+    Error::Invalid(format!(
+        "plan invalid:\n- {}\nallowed optional fields: top-level `schema_version` (shorthand only), `workspace`, `validators`, `publish`, and alias `ops`; operation `id`, `expect`, `preconditions`, `_comment`; replace-body uses exactly one of `source_file` or `new_body`. Canonical selector/action form requires `schema_version` and `publish`.\nminimal complete example:\n{}",
+        problems.join("\n- "),
+        MINIMAL_PLAN_EXAMPLE.trim()
+    ))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Plan {
@@ -93,6 +479,127 @@ pub enum PlanAction {
         #[serde(alias = "content_literal")]
         content: String,
     },
+}
+
+/// Convert a symbol-resolved replace-body shorthand operation into the
+/// canonical resolved-range operation used by the transactional executor.
+pub fn resolve_replace_body_operation(
+    shortcut: ReplaceBodyShortcut,
+    resolved_file: String,
+    definition_range: (usize, usize),
+    file_content: &[u8],
+    new_body: &str,
+) -> Result<PlanOperation> {
+    let language = greppy_parser::language_for_path(Path::new(&resolved_file));
+    let body_range =
+        plan_body_range_within(language, file_content, definition_range).ok_or_else(|| {
+            Error::Invalid(format!(
+                "replace-body operation `{}` could not locate the body of symbol `{}` in `{}`",
+                shortcut.id, shortcut.symbol, resolved_file
+            ))
+        })?;
+    let current_body = &file_content[body_range.0..body_range.1];
+    let replacement = plan_replacement_body(current_body, new_body.as_bytes());
+    let content = String::from_utf8(replacement).map_err(|error| {
+        Error::Invalid(format!(
+            "replace-body operation `{}` produced non-UTF-8 content: {error}",
+            shortcut.id
+        ))
+    })?;
+    Ok(PlanOperation {
+        id: shortcut.id,
+        file: resolved_file,
+        selector: PlanSelector::Resolved {
+            byte_start: body_range.0,
+            byte_end: body_range.1,
+        },
+        action: PlanAction::Replace { content },
+        preconditions: shortcut.preconditions,
+    })
+}
+
+fn plan_padded_range_start(content: &[u8], range: (usize, usize)) -> usize {
+    content
+        .get(range.0..range.1)
+        .and_then(|span| span.iter().position(|byte| !byte.is_ascii_whitespace()))
+        .map(|offset| range.0 + offset)
+        .unwrap_or(range.0)
+}
+
+fn plan_body_range_within(
+    language: greppy_parser::Language,
+    content: &[u8],
+    definition_range: (usize, usize),
+) -> Option<(usize, usize)> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut node = tree.root_node().descendant_for_byte_range(
+        plan_padded_range_start(content, definition_range),
+        definition_range.1.saturating_sub(1),
+    )?;
+    loop {
+        let body = node.child_by_field_name("body").or_else(|| {
+            let mut cursor = node.walk();
+            if matches!(language, greppy_parser::Language::TypeScript { .. })
+                && node.kind() == "export_statement"
+            {
+                node.named_children(&mut cursor)
+                    .find_map(|child| child.child_by_field_name("body"))
+            } else if language == greppy_parser::Language::Kotlin
+                && node.kind() == "function_declaration"
+            {
+                node.named_children(&mut cursor)
+                    .find(|child| matches!(child.kind(), "function_body" | "block"))
+            } else {
+                None
+            }
+        });
+        if let Some(body) = body {
+            if body.start_byte() >= definition_range.0 && body.end_byte() <= definition_range.1 {
+                let mut start = body.start_byte();
+                let line_start = content[..start]
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                if content[line_start..start]
+                    .iter()
+                    .all(|byte| byte.is_ascii_whitespace())
+                {
+                    start = line_start;
+                }
+                return Some((start, body.end_byte()));
+            }
+        }
+        node = node.parent()?;
+        if node.start_byte() < definition_range.0.saturating_sub(1) {
+            return None;
+        }
+    }
+}
+
+fn plan_replacement_body(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
+    fn outer_braces(content: &[u8]) -> Option<(usize, usize)> {
+        let open = content
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())?;
+        let close = content
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())?;
+        (content[open] == b'{' && content[close] == b'}').then_some((open, close))
+    }
+
+    if outer_braces(requested).is_some() {
+        return requested.to_vec();
+    }
+    let Some((open, close)) = outer_braces(current_body) else {
+        return requested.to_vec();
+    };
+    let mut replacement =
+        Vec::with_capacity(open + 1 + requested.len() + current_body.len() - close);
+    replacement.extend_from_slice(&current_body[..=open]);
+    replacement.extend_from_slice(requested);
+    replacement.extend_from_slice(&current_body[close..]);
+    replacement
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
