@@ -58,31 +58,25 @@ VERIFY — baseline-vs-after test comparison without touching your worktree:
       22 = infrastructure error. Use this instead of stashing to check
       whether a failure is yours or preexisting.
 
-EDIT COMMANDS — transactional, hash-guarded, all-or-nothing. Every command
-verifies its own result and emits a certificate; on failure nothing is written
-and the error names the next step. A successful certificate's result_span IS
-the written state — do not re-read files to confirm an edit:
-  greppy edit replace-span --target HANDLE --source-file F replace exactly the span a `read --handle` returned
-  greppy edit replace-body --symbol S --source-file F      replace only the body; the signature stays byte-identical (--target HANDLE instead of --symbol)
-  greppy edit patch-span --target HANDLE                   unified diff applied to exactly a read span (every hunk byte-exact, else refusal)
-  greppy edit text-cas --file F                            exact-once text replacement, hash-gated (--expect N for exactly N occurrences)
-  greppy edit insert-after / insert-before --source-file F new top-level block next to a definition
-  greppy edit delete / remove-if-present                   delete a definition (remove-if-present: absent reports already-satisfied)
-  greppy edit rename-call --in S --from OLD --to NEW       retarget identifiers inside one definition (AST-based; strings and comments never touched)
-  greppy edit rename-symbol --symbol S --new-name N        rename across the whole workspace via the graph, in one transaction
-  greppy edit change-signature --symbol S --spec J         change a signature and every graph-resolved call site in one transaction
-  greppy edit ensure-import --file F --module M            idempotent: absent -> inserted canonically; present -> already-satisfied
-  greppy edit ensure-argument / ensure-method / ensure-annotation   same idempotent contract for call args, methods, decorators
-  greppy edit data --file F --path P --value-json V set|ensure     set a value in JSON/TOML/YAML by path, format-preserving
-  greppy edit regex-cas                                    regex with exact expected count (weakest selector — prefer the commands above)
+EDIT — transactional, hash-guarded, all-or-nothing. Every edit verifies its own
+result and emits a certificate; on failure nothing is written and the error names
+the next step. A successful certificate's result_span IS the written state — never
+re-read a file to confirm an edit.
 
-MULTI-FILE PLANS — many operations, one transaction:
-  greppy edit apply --plan FILE
-      Execute a plan (schema greppy.edit-plan.v1) as ONE journal transaction:
-      all files publish or none. --diff first emits the unified diff without
-      touching the workspace.
-  greppy edit recover
-      Restore pre-images from a crashed transaction.
+The workflow is read → edit: `greppy read SYM --handle` pins the exact span and its
+content hashes; pass that handle (or just --symbol) to an edit verb. Five cover
+almost everything:
+  greppy edit replace-body --symbol S --content-file F   replace a definition's body with the code in F
+  greppy edit text-cas --file F --old '…' --new '…'      exact text replacement; add --expect N when it occurs N times
+  greppy edit apply --plan P                             many edits as ONE atomic transaction; a plan is just
+                                                         {"operations":[{"file":"a.rs","old":"x","new":"y"}]}
+  greppy edit rename-symbol --symbol S --new-name N       rename S and every reference across the workspace at once
+  greppy edit change-signature --symbol S --spec '{…}'    change a signature and every call site in one transaction
+
+When a change spans many call sites, prefer rename-symbol / change-signature — one
+transaction beats many text edits. `greppy edit --help` lists every verb and
+`greppy edit VERB --help` prints a working example. `greppy edit recover` restores a
+crashed transaction.
 
 FLAGS (append to any command above):
   --code            include each result's source lines (so no separate read is needed)
