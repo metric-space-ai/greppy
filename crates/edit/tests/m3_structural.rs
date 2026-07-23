@@ -321,6 +321,61 @@ fn ensure_import_conflict_and_stale_are_atomic() {
 }
 
 #[test]
+fn ensure_import_inserts_go_module_inside_existing_group() {
+    let ws = workspace();
+    let original =
+        b"package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc main() { fmt.Println(\"ok\") }\n";
+    let file = write(ws.path(), "m.go", original);
+
+    let certificate = ensure_import(
+        ws.path(),
+        &file,
+        "time",
+        Some("time"),
+        &VerbOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(certificate.status, Status::Applied);
+    assert_eq!(certificate.exit_code(), 0);
+    assert!(certificate.published);
+    assert_eq!(certificate.operations[0].syntax.new_errors, 0);
+    assert_eq!(certificate.operations[0].syntax.new_missing_nodes, 0);
+    let changed = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        changed.contains("import (\n\t\"fmt\"\n\t\"time\"\n)"),
+        "{changed}"
+    );
+    assert!(!changed.contains(")\nimport \"time\""), "{changed}");
+}
+
+#[test]
+fn ensure_import_rejects_syntax_breaking_projection() {
+    let ws = workspace();
+    let original =
+        b"package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc main() { fmt.Println(\"ok\") }\n";
+    let file = write(ws.path(), "m.go", original);
+
+    let certificate = ensure_import(
+        ws.path(),
+        &file,
+        "bad\npath",
+        None,
+        &VerbOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(certificate.status, Status::InvalidResult);
+    assert_eq!(certificate.exit_code(), 13);
+    assert!(!certificate.published);
+    assert!(
+        certificate.operations[0].syntax.new_errors > 0
+            || certificate.operations[0].syntax.new_missing_nodes > 0
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+}
+
+#[test]
 fn ensure_annotation_is_idempotent() {
     let ws = workspace();
     let original = b"def run():\n    pass\n";

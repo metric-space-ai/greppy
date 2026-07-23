@@ -45,14 +45,38 @@ fn import_kinds(language: Language) -> &'static [&'static str] {
     }
 }
 
+struct GroupedImportInsertion {
+    insert_at: usize,
+    indent: Vec<u8>,
+    needs_leading_newline: bool,
+}
+
 struct ImportScan {
     /// byte offset AFTER the last top-level import (insertion point), or the
     /// canonical start-of-file position when no import exists
     insert_at: usize,
+    /// insertion point inside an existing grouped import declaration
+    grouped: Option<GroupedImportInsertion>,
     /// an import binding `name` (or bare `module`) already exists
     satisfied: bool,
     /// `name` is already bound from a DIFFERENT module
     conflict: Option<String>,
+}
+
+fn line_start(content: &[u8], at: usize) -> usize {
+    content[..at]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |newline| newline + 1)
+}
+
+fn leading_indent(content: &[u8], at: usize) -> Vec<u8> {
+    let start = line_start(content, at);
+    content[start..at]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_whitespace)
+        .collect()
 }
 
 fn scan_imports(
@@ -64,6 +88,7 @@ fn scan_imports(
     let tree = greppy_parser::parse(language, content).ok()?;
     let kinds = import_kinds(language);
     let mut insert_at = 0usize;
+    let mut grouped = None;
     let mut satisfied = false;
     let mut conflict = None;
     let root = tree.root_node();
@@ -78,6 +103,50 @@ fn scan_imports(
             end += 1;
         }
         insert_at = end;
+        if language == Language::Go {
+            let list = {
+                let mut declaration_cursor = node.walk();
+                let found = node
+                    .named_children(&mut declaration_cursor)
+                    .find(|child| child.kind() == "import_spec_list");
+                found
+            };
+            if let Some(list) = list {
+                let close = list.end_byte().checked_sub(1)?;
+                let close_line_start = line_start(content, close);
+                let close_on_own_line = content[close_line_start..close]
+                    .iter()
+                    .all(u8::is_ascii_whitespace);
+                let first_spec = {
+                    let mut list_cursor = list.walk();
+                    let found = list
+                        .named_children(&mut list_cursor)
+                        .find(|child| child.kind() == "import_spec");
+                    found
+                };
+                let indent = first_spec
+                    .map(|spec| leading_indent(content, spec.start_byte()))
+                    .filter(|indent| !indent.is_empty())
+                    .unwrap_or_else(|| {
+                        let mut indent = if close_on_own_line {
+                            content[close_line_start..close].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        indent.push(b'\t');
+                        indent
+                    });
+                grouped = Some(GroupedImportInsertion {
+                    insert_at: if close_on_own_line {
+                        close_line_start
+                    } else {
+                        close
+                    },
+                    indent,
+                    needs_leading_newline: !close_on_own_line,
+                });
+            }
+        }
         let mentions_module = text.contains(module);
         match name {
             Some(n) => {
@@ -99,6 +168,7 @@ fn scan_imports(
     }
     Some(ImportScan {
         insert_at,
+        grouped,
         satisfied,
         conflict,
     })
@@ -164,11 +234,24 @@ pub fn ensure_import(
             options,
         ));
     }
-    let mut block = line.into_bytes();
-    block.push(b'\n');
+    let (insert_at, block) = if let Some(grouped) = scan.grouped {
+        let mut block = Vec::new();
+        if grouped.needs_leading_newline {
+            block.push(b'\n');
+        }
+        block.extend_from_slice(&grouped.indent);
+        block.push(b'"');
+        block.extend_from_slice(module.as_bytes());
+        block.extend_from_slice(b"\"\n");
+        (grouped.insert_at, block)
+    } else {
+        let mut block = line.into_bytes();
+        block.push(b'\n');
+        (scan.insert_at, block)
+    };
     let ops = vec![PlannedOp {
         id: "ensure-import".into(),
-        range: (scan.insert_at, scan.insert_at),
+        range: (insert_at, insert_at),
         replacement: block,
     }];
     run_pipeline_public(

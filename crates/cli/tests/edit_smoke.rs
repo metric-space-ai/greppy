@@ -264,6 +264,36 @@ fn ensure_import_adds_rust_use() {
 }
 
 #[test]
+fn ensure_import_adds_go_module_inside_existing_group() {
+    let fixture = Fixture::new("ensure-import-go-group");
+    let go_file = fixture.repo.join("main.go");
+    std::fs::write(
+        &go_file,
+        "package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc main() { fmt.Println(\"ok\") }\n",
+    )
+    .unwrap();
+
+    let output = fixture.run(&[
+        "edit",
+        "ensure-import",
+        "--file",
+        "main.go",
+        "--module",
+        "time",
+        "--name",
+        "time",
+    ]);
+
+    assert_success("ensure-import Go group", &output);
+    let changed = std::fs::read_to_string(go_file).unwrap();
+    assert!(
+        changed.contains("import (\n\t\"fmt\"\n\t\"time\"\n)"),
+        "{changed}"
+    );
+    assert!(!changed.contains(")\nimport \"time\""), "{changed}");
+}
+
+#[test]
 fn replace_span_symbol_error_teaches_handle_workflow() {
     let fixture = Fixture::new("replace-span-symbol-error");
     let source = fixture.scratch("replacement.rs", "pub fn greet() {}\n");
