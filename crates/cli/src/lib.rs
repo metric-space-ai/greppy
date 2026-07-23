@@ -464,8 +464,9 @@ pub enum Command {
         /// Same disambiguation as the positional path, in flag form.
         #[arg(long = "path", value_name = "FILE")]
         path_opt: Option<String>,
-        /// For file reads, print only the inclusive 1-based range A:B.
-        #[arg(long, value_name = "A:B")]
+        /// For file reads, print only the inclusive 1-based line N or range N:M.
+        /// `--line` is accepted as the conventional singular spelling.
+        #[arg(long, alias = "line", value_name = "N[:M]")]
         lines: Option<String>,
         /// Also return an edit handle for the symbol, file, or selected line range.
         #[arg(long)]
@@ -2170,20 +2171,34 @@ fn dispatch_subcommand(
             code: _,
             json,
         } => {
-            if symbol_opt.is_none() && path.is_none() && path_opt.is_none() {
-                if let Some(subject) = symbol.as_deref() {
-                    if read_subject_is_path(subject, root)? {
+            let positional_symbol = symbol.as_deref();
+            let flagged_symbol = symbol_opt.as_deref();
+            let flagged_path = path_opt.as_deref();
+
+            // `read --path FILE [--line N[:M]]` is the flag-form file read.
+            // A path-qualified symbol (`FILE::Symbol`) must reach graph
+            // resolution instead of being mistaken for a slash-containing
+            // filesystem path.
+            if flagged_symbol.is_none() && path.is_none() {
+                if let Some(file) = flagged_path.filter(|_| positional_symbol.is_none()) {
+                    return dispatch_read_file(file, lines.as_deref(), handle, json, root);
+                }
+                if let Some(subject) = positional_symbol {
+                    if split_path_qualified(subject).is_none()
+                        && read_subject_is_path(subject, root)?
+                    {
                         return dispatch_read_file(subject, lines.as_deref(), handle, json, root);
                     }
                 }
             }
             if lines.is_some() {
                 return Err(Error::Invalid(
-                    "read --lines A:B requires a file path (for symbols, omit --lines)".into(),
+                    "read --lines/--line N[:M] requires a file path (for symbols, omit the line flag)"
+                        .into(),
                 ));
             }
-            let symbol = symbol_opt.as_deref().or(symbol.as_deref());
-            let folded = qualify_symbol_with_path(symbol, path.as_deref().or(path_opt.as_deref()));
+            let symbol = flagged_symbol.or(positional_symbol);
+            let folded = qualify_symbol_with_path(symbol, path.as_deref().or(flagged_path));
             dispatch_read(folded.as_deref().or(symbol), handle, json, root)
         }
         Command::Edit { command } => dispatch_edit(command, root),
@@ -2816,12 +2831,14 @@ fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
 fn qualify_symbol_with_path(symbol: Option<&str>, path: Option<&str>) -> Option<String> {
     let s = symbol?;
     let p = path?;
-    if p.is_empty() || s.contains("::") {
+    if p.is_empty() || split_path_qualified(s).is_some() {
         return None;
     }
     // Require a file-like path (a basename carrying an extension) so
     // split_path_qualified recognises the `path.ext::` boundary; otherwise the
-    // fold would only manufacture an unresolvable query.
+    // fold would only manufacture an unresolvable query. Owner-qualified
+    // symbols such as `Type::method` are still folded: only an already
+    // path-qualified symbol makes the explicit --path redundant.
     let basename = p.rsplit(['/', '\\']).next().unwrap_or(p);
     if !basename.contains('.') {
         return None;
@@ -6673,29 +6690,25 @@ fn parse_read_line_range(raw: Option<&str>, line_count: usize) -> Result<(usize,
     let Some(raw) = raw else {
         return Ok((1, line_count));
     };
-    let Some((start, end)) = raw.split_once(':') else {
-        return Err(Error::Invalid(format!(
-            "read --lines expects an inclusive range A:B, got `{raw}`"
-        )));
-    };
+    let (start, end) = raw.split_once(':').unwrap_or((raw, raw));
     let start = start.parse::<usize>().map_err(|_| {
         Error::Invalid(format!(
-            "read --lines expects positive line numbers A:B, got `{raw}`"
+            "read --lines/--line expects a positive line N or range N:M, got `{raw}`"
         ))
     })?;
     let end = end.parse::<usize>().map_err(|_| {
         Error::Invalid(format!(
-            "read --lines expects positive line numbers A:B, got `{raw}`"
+            "read --lines/--line expects a positive line N or range N:M, got `{raw}`"
         ))
     })?;
     if start == 0 || end < start {
         return Err(Error::Invalid(format!(
-            "read --lines expects 1 <= A <= B, got `{raw}`"
+            "read --lines/--line expects 1 <= N <= M, got `{raw}`"
         )));
     }
     if start > line_count && line_count > 0 {
         return Err(Error::Invalid(format!(
-            "read --lines starts at {start}, but the file has {line_count} line(s)"
+            "read --lines/--line starts at {start}, but the file has {line_count} line(s)"
         )));
     }
     Ok((start, end.min(line_count)))

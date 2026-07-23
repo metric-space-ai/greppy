@@ -57,11 +57,7 @@ fn read_path_lines_selects_an_inclusive_range() {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "alpha\nbeta\ngamma\ndelta\n").unwrap();
 
-    let (code, stdout, stderr) = run(
-        &repo,
-        &store,
-        &["read", "src/lib.rs", "--lines", "2:3"],
-    );
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "src/lib.rs", "--lines", "2:3"]);
 
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.starts_with("src/lib.rs:2-3\n"), "{stdout}");
@@ -69,6 +65,84 @@ fn read_path_lines_selects_an_inclusive_range() {
     assert!(stdout.contains("3 | gamma"), "{stdout}");
     assert!(!stdout.contains("alpha"), "{stdout}");
     assert!(!stdout.contains("delta"), "{stdout}");
+}
+
+#[test]
+fn read_path_flag_and_singular_line_return_a_replaceable_range_handle() {
+    let (repo, store) = fresh_workspace("path-line-handle");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "alpha\nbeta\ngamma\n").unwrap();
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &[
+            "read",
+            "--path",
+            "src/lib.rs",
+            "--line",
+            "2",
+            "--handle",
+            "--json",
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let read: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(read["path"], "src/lib.rs");
+    assert_eq!(read["start_line"], 2);
+    assert_eq!(read["end_line"], 2);
+    assert_eq!(read["lines"][0]["text"], "beta");
+    let handle = read["handle"].as_str().expect("range handle");
+
+    let replacement = repo.join("replacement.txt");
+    std::fs::write(&replacement, "changed\n").unwrap();
+    let (edit_code, edit_stdout, edit_stderr) = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-span",
+            "--target",
+            handle,
+            "--source-file",
+            replacement.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(edit_code, 0, "stdout={edit_stdout}\nstderr={edit_stderr}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "alpha\nchanged\ngamma\n"
+    );
+}
+
+#[test]
+fn read_path_qualified_symbol_never_leaks_same_named_foreign_definition() {
+    let (repo, store) = fresh_workspace("path-qualified-symbol");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/a.rs"),
+        "pub fn target() -> &'static str { \"from_a\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/b.rs"),
+        "pub fn target() -> &'static str { \"from_b\" }\n",
+    )
+    .unwrap();
+    let (index_code, index_stdout, index_stderr) = run(&repo, &store, &["index", "."]);
+    assert_eq!(
+        index_code, 0,
+        "stdout={index_stdout}\nstderr={index_stderr}"
+    );
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "src/a.rs::target"]);
+
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("src/a.rs"), "{stdout}");
+    assert!(stdout.contains("from_a"), "{stdout}");
+    assert!(!stdout.contains("src/b.rs"), "{stdout}");
+    assert!(!stdout.contains("from_b"), "{stdout}");
 }
 
 #[test]
