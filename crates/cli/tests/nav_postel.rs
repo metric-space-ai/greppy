@@ -86,6 +86,16 @@ fn indexed_repo(tag: &str) -> (PathBuf, PathBuf) {
     (repo, store)
 }
 
+fn without_expand_id(output: (i32, String, String)) -> (i32, String, String) {
+    let stdout = output
+        .1
+        .lines()
+        .filter(|line| !line.starts_with("Expand: greppy expand "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (output.0, stdout, output.2)
+}
+
 #[test]
 fn who_calls_positional_directory_filter_returns_subset_and_explains_empty_scope() {
     let (repo, store) = indexed_repo("path-filter");
@@ -171,13 +181,24 @@ fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
     let max = run(&["search-code", "pub", "--max", "1"], &repo, &store);
     assert_eq!(limit, max, "--limit and --max must be exact aliases");
 
-    let positional = run(&["search-code", "target", "src/inside"], &repo, &store);
-    let flagged = run(
-        &["search-code", "target", "--path", "src/inside"],
-        &repo,
-        &store,
-    );
-    assert_eq!(positional, flagged, "positional PATH and --path differ");
+    for (command, query, path) in [
+        ("who-calls", "target", "src/inside"),
+        ("callees", "caller_inside", "src/api.rs"),
+        ("find-usages", "target", "src/inside"),
+        ("search-code", "target", "src/inside"),
+        ("search-symbols", "target", "src/api.rs"),
+    ] {
+        let positional = without_expand_id(run(&[command, query, path], &repo, &store));
+        let flagged = without_expand_id(run(
+            &[command, query, "--path", path],
+            &repo,
+            &store,
+        ));
+        assert_eq!(
+            positional, flagged,
+            "{command}: positional PATH and --path differ"
+        );
+    }
 
     let positional = run(&["read", "target"], &repo, &store);
     let flagged = run(&["read", "--symbol", "target"], &repo, &store);
