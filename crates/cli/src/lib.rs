@@ -16097,11 +16097,13 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // `greppy grep -R foo .`, `greppy rg -S foo` and `greppy -R foo .`
     // all agree.
     let args: &[std::ffi::OsString] = &full[1..];
-    let (stripped, named_rg): (&[std::ffi::OsString], bool) =
+    let (stripped, named_rg, named_grep): (&[std::ffi::OsString], bool, bool) =
         match args.first().and_then(|s| s.to_str()) {
-            Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => (&args[1..], false),
-            Some("rg") | Some("ripgrep") => (&args[1..], true),
-            _ => (args, false),
+            Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => {
+                (&args[1..], false, true)
+            }
+            Some("rg") | Some("ripgrep") => (&args[1..], true, false),
+            _ => (args, false, false),
         };
 
     // rg-style invocations (named, or carrying rg-only flags such as
@@ -16113,12 +16115,164 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
         return dispatch_rg_os(stripped);
     }
 
-    let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(stripped.len() + 1);
+    // Agents routinely omit -r when the file operand is a directory. Real
+    // grep then rejects an otherwise clear request with "Is a directory".
+    // Preserve byte-exact passthrough for ordinary invocations, but add the
+    // conventional recursive default when we can prove that a file operand is
+    // an existing directory and no recursive mode was requested explicitly.
+    let recursive_args = if named_grep {
+        grep_args_with_implicit_recursion(stripped)
+    } else {
+        None
+    };
+    let grep_args = recursive_args.as_deref().unwrap_or(stripped);
+    let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
     rebuilt.push(std::ffi::OsString::from("greppy"));
-    rebuilt.extend_from_slice(stripped);
+    rebuilt.extend_from_slice(grep_args);
 
     let real = greppy_passthrough::discover_grep()?;
     greppy_passthrough::run_grep_os(&real, &rebuilt)
+}
+
+fn grep_args_with_implicit_recursion(
+    args: &[std::ffi::OsString],
+) -> Option<Vec<std::ffi::OsString>> {
+    if grep_has_recursive_option(args) || !grep_has_directory_operand(args) {
+        return None;
+    }
+    let mut adjusted = Vec::with_capacity(args.len() + 1);
+    adjusted.push(std::ffi::OsString::from("-r"));
+    adjusted.extend_from_slice(args);
+    Some(adjusted)
+}
+
+fn grep_has_recursive_option(args: &[std::ffi::OsString]) -> bool {
+    let mut options = true;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if !options {
+            index += 1;
+            continue;
+        }
+        let Some(text) = argument.to_str() else {
+            index += 1;
+            continue;
+        };
+        if matches!(text, "--recursive" | "--dereference-recursive")
+            || grep_short_option_has_recursive_flag(text)
+        {
+            return true;
+        }
+        let (takes_value, _) = grep_option_value_mode(text);
+        if takes_value && !text.contains('=') && !grep_short_option_has_attached_value(text) {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn grep_short_option_has_recursive_flag(option: &str) -> bool {
+    let Some(cluster) = option.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+        return false;
+    };
+    for flag in cluster.chars() {
+        if matches!(flag, 'r' | 'R') {
+            return true;
+        }
+        if matches!(flag, 'e' | 'f' | 'A' | 'B' | 'C' | 'd' | 'D' | 'm') {
+            return false;
+        }
+    }
+    false
+}
+
+fn grep_has_directory_operand(args: &[std::ffi::OsString]) -> bool {
+    let mut options = true;
+    let mut explicit_pattern = false;
+    let mut positional_pattern_seen = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(text) = argument
+                .to_str()
+                .filter(|text| text.starts_with('-') && *text != "-")
+            {
+                let (takes_value, supplies_pattern) = grep_option_value_mode(text);
+                explicit_pattern |= supplies_pattern;
+                if takes_value && !text.contains('=') && !grep_short_option_has_attached_value(text) {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+        }
+        if !explicit_pattern && !positional_pattern_seen {
+            positional_pattern_seen = true;
+        } else if std::path::Path::new(argument).is_dir() {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn grep_option_value_mode(option: &str) -> (bool, bool) {
+    if option.starts_with("--regexp=") || option.starts_with("--file=") {
+        return (false, true);
+    }
+    if matches!(option, "-e" | "--regexp" | "-f" | "--file") {
+        return (true, true);
+    }
+    let long_takes_value = matches!(
+        option,
+        "--after-context"
+            | "--before-context"
+            | "--context"
+            | "--directories"
+            | "--devices"
+            | "--exclude"
+            | "--exclude-from"
+            | "--exclude-dir"
+            | "--include"
+            | "--label"
+            | "--max-count"
+    );
+    if long_takes_value {
+        return (true, false);
+    }
+    if option.starts_with('-') && !option.starts_with("--") {
+        let supplies_pattern = option[1..].chars().any(|flag| matches!(flag, 'e' | 'f'));
+        let takes_value = option[1..]
+            .chars()
+            .any(|flag| matches!(flag, 'e' | 'f' | 'A' | 'B' | 'C' | 'd' | 'D' | 'm'));
+        return (takes_value, supplies_pattern);
+    }
+    (false, false)
+}
+
+fn grep_short_option_has_attached_value(option: &str) -> bool {
+    let Some(cluster) = option.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+        return false;
+    };
+    cluster.char_indices().any(|(index, flag)| {
+        matches!(flag, 'e' | 'f' | 'A' | 'B' | 'C' | 'd' | 'D' | 'm')
+            && index + flag.len_utf8() < cluster.len()
+    })
 }
 
 /// Route a ripgrep-style invocation: byte-exact delegation to real
