@@ -32,3 +32,10 @@ Metrics curve of the nightly training cycle. Model assets ship via Git LFS.
 - eval_loss: 1.4201239347457886 | holdout gates: {"n": 30, "format_valid": 29, "empty": 1, "format_valid_rate": 0.967, "empty_rate": 0.033} | MTP 77.90%
 - ** PROMOTED ** best gated checkpoint staged: release-staging/ckpt-2026-07-18
 - auto-release to main: RELEASED: 69ed5d4083789c3b3b5402aa79385c27a7687b22751afd56f786946af3b3806a via model-qwen35-nano-20260719-1604 to main
+## 2026-07-21
+## 2026-07-22
+- generated total: 33633 sft rows (+-548924 new) — below 1000, no training today
+## 2026-07-24
+## 2026-07-23
+- rows total: 943672 (+361115 trained today, 1 epoch continuation from )
+- eval_loss: 1.4269930124282837 | holdout gates: {"n": 30, "format_valid": 28, "empty": 2, "format_valid_rate": 0.933, "empty_rate": 0.067} | MTP 78.31%
