@@ -2,7 +2,6 @@
 
 Metrics curve of the nightly training cycle. Model assets ship via Git LFS.
 
-## 2026-07-10
 - generated total: 498 sft rows (+498 new) — below 1000, no training today
 ## 2026-07-10
 - rows total: 4509 (+4509 trained today, 1 epoch continuation from BASE)
@@ -39,3 +38,6 @@ Metrics curve of the nightly training cycle. Model assets ship via Git LFS.
 ## 2026-07-23
 - rows total: 943672 (+361115 trained today, 1 epoch continuation from )
 - eval_loss: 1.4269930124282837 | holdout gates: {"n": 30, "format_valid": 28, "empty": 2, "format_valid_rate": 0.933, "empty_rate": 0.067} | MTP 78.31%
+## 2026-07-25
+- rows total: 999769 (+56097 trained today, 1 epoch continuation from )
+- eval_loss: 1.5850708484649658 | holdout gates: {"n": 30, "format_valid": 29, "empty": 1, "format_valid_rate": 0.967, "empty_rate": 0.033} | MTP 77.04%
