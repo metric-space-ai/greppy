@@ -2144,7 +2144,7 @@ pub fn rename_symbol_files(
 /// Locate the byte range of the `body` field of the smallest named node
 /// covering `def_range`. None when the language has no tree-sitter grammar
 /// or the node has no body field (e.g. a struct without one).
-fn body_range_within(
+pub fn body_range_within(
     language: Language,
     content: &[u8],
     def_range: (usize, usize),

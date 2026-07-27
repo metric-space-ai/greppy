@@ -19,6 +19,7 @@ greppy-discover = { path = "../discover" }
 greppy-embed-native = { path = "../embed-native" }
 greppy-freshness = { path = "../freshness" }
 greppy-passthrough = { path = "../greppy" }
+greppy-parser = { path = "../parser" }
 greppy-indexer = { path = "../indexer" }
 greppy-qwen35-native = { path = "../qwen35-native" }
 greppy-search = { path = "../search" }
@@ -30,6 +31,7 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
+regex = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

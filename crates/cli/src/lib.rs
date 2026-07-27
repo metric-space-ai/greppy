@@ -35,8 +35,8 @@ mod trial;
 mod verify;
 
 // Route this module's stdout through one optional collector. Query commands
-// activate it only for --max-bytes/--offset, leaving ordinary output and all
-// grep passthrough bytes untouched.
+// activate it for --max-bytes/--offset, and whole-file reads also activate a
+// conservative default budget; grep passthrough bytes remain untouched.
 macro_rules! print {
     ($($arg:tt)*) => {{
         crate::output_write(format_args!($($arg)*), false);
@@ -76,6 +76,334 @@ fn output_write(arguments: std::fmt::Arguments<'_>, newline: bool) {
     }
 }
 
+#[cfg(feature = "agent")]
+#[derive(Debug, Parser)]
+#[command(
+    name = "greppy",
+    bin_name = "greppy",
+    disable_help_subcommand = true,
+    about = "Run Greppy's optional isolated headless coding agent."
+)]
+struct AgentInvocation {
+    /// Run a headless coding task against an isolated snapshot.
+    #[arg(short = 'p', long = "prompt", conflicts_with = "apply_result")]
+    prompt: Option<String>,
+    /// Apply a previously returned run artifact.
+    #[arg(long, value_name = "RUN_ID", conflicts_with = "prompt")]
+    apply_result: Option<String>,
+    #[arg(long)]
+    root: Option<String>,
+    #[arg(long, value_name = "URL")]
+    base_url: Option<String>,
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+    #[arg(long, default_value = "OPENAI_API_KEY", value_name = "ENV_NAME")]
+    api_key_env: String,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    keep_run: bool,
+    #[arg(long, default_value_t = 24)]
+    max_turns: usize,
+    #[arg(long)]
+    max_output_tokens: Option<u64>,
+    #[arg(long, default_value_t = 900)]
+    timeout_seconds: u64,
+}
+
+#[cfg(feature = "agent")]
+struct AgentInferenceHooks {
+    root: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    cfg: EmbeddingModelConfig,
+}
+
+#[cfg(feature = "agent")]
+struct DaemonCodeEmbeddingProvider {
+    cache_dir: std::path::PathBuf,
+    model_key: String,
+    cfg: EmbeddingModelConfig,
+}
+
+#[cfg(feature = "agent")]
+impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider {
+    fn model_id(&self) -> &str {
+        &self.cfg.model_id
+    }
+
+    fn prompt_version(&self) -> &str {
+        greppy_embed_native::PROMPT_VERSION
+    }
+
+    fn task_profile(&self) -> &str {
+        greppy_embed_native::CODE_RETRIEVAL_PROFILE
+    }
+
+    fn embed_code_document(
+        &mut self,
+        title: Option<&str>,
+        content: &str,
+    ) -> greppy_core::Result<Vec<f32>> {
+        self.embed_code_documents(&[(title, content)])
+            .and_then(|mut vectors| {
+                vectors
+                    .pop()
+                    .ok_or_else(|| Error::Store("document embedder returned no vector".into()))
+            })
+    }
+
+    fn embed_code_documents(
+        &mut self,
+        documents: &[(Option<&str>, &str)],
+    ) -> greppy_core::Result<Vec<Vec<f32>>> {
+        use sha2::{Digest, Sha256};
+        let cache = greppy_store::QueryEmbeddingCache::open(&self.cache_dir).ok();
+        let cache_model_key = format!("{}|document", self.model_key);
+        let keys = documents
+            .iter()
+            .map(|(title, content)| {
+                let mut hasher = Sha256::new();
+                hasher.update(title.unwrap_or_default().as_bytes());
+                hasher.update([0]);
+                hasher.update(content.as_bytes());
+                format!("{:x}", hasher.finalize())
+            })
+            .collect::<Vec<_>>();
+        let mut vectors = vec![None; documents.len()];
+        let mut missing_by_key = std::collections::BTreeMap::<String, Vec<usize>>::new();
+        for (index, key) in keys.iter().enumerate() {
+            if let Some(vector) = cache
+                .as_ref()
+                .and_then(|cache| cache.get(&cache_model_key, key).ok().flatten())
+            {
+                vectors[index] = Some(vector);
+            } else {
+                missing_by_key.entry(key.clone()).or_default().push(index);
+            }
+        }
+        if !missing_by_key.is_empty() {
+            let mut singleflight_locks = Vec::new();
+            let mut missing = Vec::new();
+            for (key, indexes) in &missing_by_key {
+                let lock = greppy_core::cache::acquire_named_lock(
+                    &format!("agent-embedding-{key}"),
+                    greppy_core::cache::LockMode::Exclusive,
+                    false,
+                )
+                .map_err(|error| Error::io("acquire embedding singleflight lock", error))?
+                .ok_or_else(|| Error::Store("blocking embedding lock returned no guard".into()))?;
+                if let Some(vector) = cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(&cache_model_key, key).ok().flatten())
+                {
+                    for index in indexes {
+                        vectors[*index] = Some(vector.clone());
+                    }
+                } else {
+                    missing.push(indexes[0]);
+                    singleflight_locks.push(lock);
+                }
+            }
+            let missing_documents = missing
+                .iter()
+                .map(|index| documents[*index])
+                .collect::<Vec<_>>();
+            if !missing_documents.is_empty() {
+                #[cfg(any(unix, windows))]
+                let daemon = embed_daemon::embed_documents_via_daemon_result(
+                    &self.cfg,
+                    &self.model_key,
+                    &missing_documents,
+                );
+                #[cfg(not(any(unix, windows)))]
+                let daemon = embed_daemon::EmbedDocumentsDaemonResult::NoDaemon;
+                let embedded = match daemon {
+                    embed_daemon::EmbedDocumentsDaemonResult::Embedded(vectors) => vectors,
+                    embed_daemon::EmbedDocumentsDaemonResult::NoDaemon => {
+                        let model = load_embedding_model(&self.cfg, Some(self.cache_dir.clone()))?;
+                        model.embed_documents(&missing_documents).map_err(|error| {
+                            Error::Store(format!("document embedding fallback: {error}"))
+                        })?
+                    }
+                    embed_daemon::EmbedDocumentsDaemonResult::DaemonBusy => {
+                        return Err(Error::Store(
+                            "EmbeddingGemma daemon remained busy for document embeddings".into(),
+                        ));
+                    }
+                    embed_daemon::EmbedDocumentsDaemonResult::Failed => {
+                        return Err(Error::Store(
+                            "EmbeddingGemma daemon failed document embeddings".into(),
+                        ));
+                    }
+                };
+                if embedded.len() != missing.len() {
+                    return Err(Error::Store(format!(
+                        "document embedder returned {} vectors for {} inputs",
+                        embedded.len(),
+                        missing.len()
+                    )));
+                }
+                for (index, vector) in missing.into_iter().zip(embedded) {
+                    if let Some(cache) = &cache {
+                        let _ = cache.put(&cache_model_key, &keys[index], &vector);
+                    }
+                    for duplicate in &missing_by_key[&keys[index]] {
+                        vectors[*duplicate] = Some(vector.clone());
+                    }
+                }
+            }
+            drop(singleflight_locks);
+        }
+        vectors
+            .into_iter()
+            .enumerate()
+            .map(|(index, vector)| {
+                vector.ok_or_else(|| {
+                    Error::Store(format!("missing document embedding at index {index}"))
+                })
+            })
+            .collect()
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        self.cfg.max_length.unwrap_or(2_048)
+    }
+}
+
+#[cfg(feature = "agent")]
+impl greppy_agent::EmbeddingHooks for AgentInferenceHooks {
+    fn refresh(
+        &self,
+        store_path: &std::path::Path,
+        source_root: &std::path::Path,
+        project: &str,
+        graph_generation: u64,
+    ) -> greppy_agent::Result<()> {
+        let mut store =
+            greppy_store::Store::open_with(store_path, greppy_store::OpenOptions::query_writer())
+                .map_err(|error| {
+                greppy_agent::Error::Workspace(format!("open task embedding store: {error}"))
+            })?;
+        let mut provider = DaemonCodeEmbeddingProvider {
+            cache_dir: self.cache_dir.clone(),
+            model_key: embedding_query_cache_key(&self.cfg),
+            cfg: self.cfg.clone(),
+        };
+        let report = greppy_indexer::index_code_embeddings_for_project(
+            &mut store,
+            source_root,
+            project,
+            &mut provider,
+            greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation),
+        )
+        .map_err(|error| {
+            greppy_agent::Error::Workspace(format!("refresh task embeddings: {error}"))
+        })?;
+        if report.is_complete() {
+            let key = embedding_complete_key(project);
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![key, format!("{}|{}", graph_generation, self.cfg.model_id)],
+                )
+                .map_err(|error| {
+                    greppy_agent::Error::Workspace(format!(
+                        "record task embedding completeness: {error}"
+                    ))
+                })?;
+        }
+        let _ = store
+            .conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "agent")]
+impl greppy_agent::NavigationHooks for AgentInferenceHooks {
+    fn semantic_search(
+        &self,
+        workspace: &greppy_agent::TaskWorkspace,
+        query: &str,
+        limit: usize,
+    ) -> greppy_agent::Result<serde_json::Value> {
+        workspace.ensure_index()?;
+        let store = greppy_store::Store::open_with(
+            workspace.graph_path(),
+            greppy_store::OpenOptions::read_only(),
+        )
+        .map_err(|error| greppy_agent::Error::Tool {
+            tool: "semantic_search".into(),
+            message: format!("open task graph: {error}"),
+        })?;
+        let generation = store
+            .list_workspace_states()
+            .map_err(|error| greppy_agent::Error::Tool {
+                tool: "semantic_search".into(),
+                message: error.to_string(),
+            })?
+            .into_iter()
+            .map(|state| state.graph_generation)
+            .max()
+            .unwrap_or(0);
+        let complete = store
+            .conn()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                [embedding_complete_key(workspace.project())],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            == Some(format!("{}|{}", generation, self.cfg.model_id));
+        if complete {
+            let root = self.root.to_string_lossy();
+            if let Ok(vector) = embed_query_cached(&self.cfg, Some(root.as_ref()), query) {
+                let scope = greppy_search::embeddinggemma_code_retrieval_scope(
+                    workspace.project(),
+                    &self.cfg.model_id,
+                    Some(generation),
+                    limit,
+                );
+                if let Ok(hits) = greppy_search::vector_search_exact(&store, &vector, &scope) {
+                    return Ok(serde_json::json!({
+                        "query": query,
+                        "backend": "embeddinggemma",
+                        "hits": hits.into_iter().map(|hit| serde_json::json!({
+                            "score": hit.score,
+                            "qualified_name": hit.embedding.qualified_name,
+                            "file": hit.embedding.file_path,
+                            "start_line": hit.embedding.start_line,
+                            "end_line": hit.embedding.end_line
+                        })).collect::<Vec<_>>()
+                    }));
+                }
+            }
+        }
+        let hits =
+            greppy_search::semantic_query(&store, query, None, Some(workspace.project()), limit)
+                .map_err(|error| greppy_agent::Error::Tool {
+                    tool: "semantic_search".into(),
+                    message: error.to_string(),
+                })?;
+        Ok(serde_json::json!({
+            "query": query,
+            "backend": "algorithmic",
+            "hits": hits.into_iter().map(|hit| serde_json::json!({
+                "score": hit.score,
+                "qualified_name": hit.node.qualified_name,
+                "kind": hit.node.label,
+                "file": hit.node.file_path,
+                "start_line": hit.node.start_line,
+                "end_line": hit.node.end_line
+            })).collect::<Vec<_>>()
+        }))
+    }
+}
+
 /// Exit code for subcommands that are recognised but not yet implemented
 /// in the current phase. EX_UNAVAILABLE (69) is the standard BSD sysexits
 /// value.
@@ -92,6 +420,10 @@ pub const EXIT_IO: u8 = 73;
 /// agents) can distinguish a transient lock contention from a real
 /// IO error. EX_TEMPFAIL (75) is the BSD sysexits value.
 pub const EXIT_TEMPFAIL: u8 = 75;
+
+/// Cap on test names listed per bucket in `changes` text output; the full
+/// lists remain in `--json`.
+const CHANGES_TEST_LIST_CAP: usize = 10;
 
 const DEFAULT_EMBEDDINGGEMMA_MODEL_ID: &str = "google/embeddinggemma-300m";
 const ENV_DEVICE: &str = "GREPPY_DEVICE";
@@ -175,6 +507,20 @@ fn set_cli_result_window(limit: Option<usize>, offset: usize) {
 
 fn cli_result_offset() -> usize {
     CLI_RESULT_OFFSET.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// `read --context N`: how many lines above a definition come along, so its
+    /// doc comment arrives with it instead of costing a second call.
+    static CLI_READ_CONTEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn set_cli_read_context(context: Option<usize>) {
+    CLI_READ_CONTEXT.with(|value| value.set(context.unwrap_or(0)));
+}
+
+fn cli_read_context() -> i64 {
+    i64::try_from(CLI_READ_CONTEXT.with(std::cell::Cell::get)).unwrap_or(0)
 }
 
 fn cli_result_limit(default: usize) -> usize {
@@ -322,6 +668,23 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// One line per definition in that file: kind, signature, span.
+    #[command(
+        after_help = "Example:\n  greppy outline src/lib.rs\n\n\
+                      `search-symbols` looks a name up across the repository; `outline` answers\n\
+                      what stands in THIS file, in the order it stands there."
+    )]
+    Outline {
+        /// The file to outline.
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Return every definition instead of the first page.
+        #[arg(long)]
+        all: bool,
+    },
     /// Group working-tree changes by definitions and graph impact.
     Changes {
         /// Compare the working tree with this commit (default: HEAD).
@@ -386,7 +749,14 @@ pub enum Command {
     /// callers); `--direction outgoing` answers "what does S ultimately reach?".
     /// Replaces a dozen iterative who-calls/callees an agent would otherwise run.
     Impact {
-        symbol: Option<String>,
+        /// The symbols to answer for. Several are answered in one call:
+        /// `greppy impact A B C`. `-` reads them from the pipe.
+        #[arg(value_name = "SYMBOL")]
+        symbols: Vec<String>,
+        /// Restrict the reported reach to these files or directory subtrees.
+        /// Repeatable; this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
         /// Accepted for agent ergonomics — no-op (impact prints locations, not
         /// bodies); an agent carrying --code over must not hit a parse error.
         #[arg(long)]
@@ -421,14 +791,15 @@ pub enum Command {
     /// "how does S work / what is its role / what depends on it" in a SINGLE
     /// call, instead of iterating semantic-search + who-calls + callees separately.
     Brief {
-        symbol: Option<String>,
+        /// The symbols to brief. Several are briefed in one call:
+        /// `greppy brief A B C`. `-` reads them from the pipe.
+        #[arg(value_name = "SYMBOL")]
+        symbols: Vec<String>,
         /// Restrict returned definitions/callers/callees to these files or
         /// directory subtrees. Graph resolution itself remains workspace-wide.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for one additional result-path filter.
+        /// Repeatable.
         #[arg(long = "path", value_name = "PATH")]
-        path_opt: Option<String>,
+        path_opts: Vec<String>,
         /// Accepted for agent ergonomics: brief already prints the
         /// definition's source, so --code is a no-op — but agents
         /// carrying the flag over from the nav commands must not be
@@ -458,21 +829,26 @@ pub enum Command {
     /// Prefer this
     /// over opening whole files: it returns exactly the code that matters.
     Read {
-        symbol: Option<String>,
-        /// Flag spelling for the positional symbol.
+        /// What to read: symbols, files, or `-` to take them from the pipe.
+        /// Several targets are read in one call. A name that is also a path on
+        /// disk is read as the file; `--symbol` forces the definition.
+        #[arg(value_name = "TARGET")]
+        targets: Vec<String>,
+        /// Force symbol reads, and name further symbols. Repeatable.
         #[arg(long = "symbol", value_name = "SYMBOL")]
-        symbol_opt: Option<String>,
-        /// Optional file to disambiguate SYMBOL when it resolves in several
-        /// files: `read open src/flask/testing.py` or `read open --path FILE`
-        /// (equivalent to the `path::SYMBOL` form).
-        path: Option<String>,
-        /// Same disambiguation as the positional path, in flag form.
+        symbol_opts: Vec<String>,
+        /// Read these files, or disambiguate a symbol that resolves in several
+        /// files (equivalent to the `path::SYMBOL` form). Repeatable.
         #[arg(long = "path", value_name = "FILE")]
-        path_opt: Option<String>,
+        path_opts: Vec<String>,
         /// For file reads, print only the inclusive 1-based line N or range N:M.
         /// `--line` is accepted as the conventional singular spelling.
         #[arg(long, alias = "line", value_name = "N[:M]")]
         lines: Option<String>,
+        /// For symbol reads, also the N lines above the definition, so its doc
+        /// comment comes along instead of costing a second call.
+        #[arg(long, value_name = "N")]
+        context: Option<usize>,
         /// Also return an edit handle for the symbol, file, or selected line range.
         #[arg(long)]
         handle: bool,
@@ -484,6 +860,9 @@ pub enum Command {
         /// Emit machine-readable JSON (source, span, handle, candidates).
         #[arg(long)]
         json: bool,
+        /// For whole-file reads, lift the default stdout byte budget.
+        #[arg(long)]
+        all: bool,
     },
     /// Transactional, hash-guarded, all-or-nothing edits. Every command
     /// verifies its own result and emits a certificate; on failure nothing
@@ -492,6 +871,9 @@ pub enum Command {
     Edit {
         #[command(subcommand)]
         command: EditCommand,
+        /// Emit the complete edit certificate JSON on stdout.
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Print deterministic graph statistics for the workspace project:
     /// file count, node counts by label, edge counts by type, and the
@@ -515,12 +897,13 @@ pub enum Command {
     /// each caller's source span so the agent reads the body without a
     /// separate file Read.
     WhoCalls {
-        symbol: Option<String>,
+        /// The symbols to answer for. Several are answered in one call:
+        /// `greppy who-calls A B C`. `-` reads them from the pipe.
+        #[arg(value_name = "SYMBOL")]
+        symbols: Vec<String>,
         /// Restrict returned callers to these files or directory subtrees.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for an additional result-path filter.
-        #[arg(long = "path", value_name = "FILE")]
+        /// Repeatable; this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
@@ -537,12 +920,13 @@ pub enum Command {
     /// `callees_of` helper. With `--code`, also prints each callee's
     /// source span.
     Callees {
-        symbol: Option<String>,
+        /// The symbols to answer for. Several are answered in one call:
+        /// `greppy callees A B C`. `-` reads them from the pipe.
+        #[arg(value_name = "SYMBOL")]
+        symbols: Vec<String>,
         /// Restrict returned callees to these files or directory subtrees.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for an additional result-path filter.
-        #[arg(long = "path", value_name = "FILE")]
+        /// Repeatable; this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
@@ -558,12 +942,13 @@ pub enum Command {
     /// `KIND qualified_name file:line`. With `--code`, also prints each
     /// referencing node's source span.
     FindUsages {
-        symbol: Option<String>,
+        /// The symbols to answer for. Several are answered in one call:
+        /// `greppy find-usages A B C`. `-` reads them from the pipe.
+        #[arg(value_name = "SYMBOL")]
+        symbols: Vec<String>,
         /// Restrict returned usage sites to these files or directory subtrees.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for an additional result-path filter.
-        #[arg(long = "path", value_name = "FILE")]
+        /// Repeatable; this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
@@ -674,6 +1059,13 @@ pub enum Command {
         /// Emit machine-readable JSON with exact count/truncation metadata.
         #[arg(long)]
         json: bool,
+        /// Keep the legacy grep-shaped `file:line  text` output without
+        /// resolving matches to enclosing definitions or creating handles.
+        #[arg(long)]
+        no_code: bool,
+        /// Treat PATTERN as literal text instead of a regular expression.
+        #[arg(long)]
+        fixed: bool,
         /// Accepted for agent ergonomics — no-op.
         #[arg(long)]
         code: bool,
@@ -683,12 +1075,13 @@ pub enum Command {
     },
     /// Symbol-only search (search-symbols alias).
     SearchSymbols {
-        query: Option<String>,
+        /// The names (or fragments) to look up. Several are answered in one
+        /// call: `greppy search-symbols A B`. `-` reads them from the pipe.
+        #[arg(value_name = "NAME")]
+        queries: Vec<String>,
         /// Restrict returned symbols to these files or directory subtrees.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for an additional result-path filter.
-        #[arg(long = "path", value_name = "FILE")]
+        /// Repeatable; this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,
         /// Restrict to one node kind (Function, Method, Struct, Class, …).
         /// Matches the label case-insensitively; agents guess this flag,
@@ -727,13 +1120,14 @@ pub enum Command {
     /// Semantic query using EmbeddingGemma vectors with Qwen purpose hints.
     #[command(name = "semantic-search", alias = "semantic")]
     Semantic {
-        query: Option<String>,
-        /// Restrict returned semantic hits to these files or directory subtrees.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for one additional result-path filter.
+        /// The plain-English descriptions to search for. Several are answered
+        /// in one call. `-` reads them from the pipe.
+        #[arg(value_name = "QUERY")]
+        queries: Vec<String>,
+        /// Restrict returned semantic hits to these files or directory
+        /// subtrees. Repeatable; this is the only path filter.
         #[arg(long = "path", value_name = "PATH")]
-        path_opt: Option<String>,
+        path_opts: Vec<String>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -850,200 +1244,312 @@ pub enum CacheCommand {
 /// 20 invalid spec.
 #[derive(clap::Subcommand, Debug)]
 pub enum EditCommand {
-    /// Exact-once text replacement, hash-gated: OLD must occur exactly
-    /// --expect times (default 1); the file must be unchanged since
-    /// planning. No regex, no fuzz. Re-running after success reports
-    /// already-satisfied.
+    /// Put new text in place of WHERE.
     #[command(
-        name = "text-cas",
-        about = "Replace exact text with a declared occurrence count.",
-        after_help = "Example:\n  greppy edit text-cas --file notes.txt --old 'before' --new 'after' --expect 1"
+        name = "replace",
+        about = "Put new text in place of the selected span.",
+        after_help = "WHERE is exactly one of:\n  \
+                      --file F --old TEXT | --old-file F2   that exact text (once by default)\n  \
+                      --file F --pattern REGEX              what the regular expression matches\n  \
+                      --file F --lines A:B                  those lines, both ends included\n  \
+                      --file F                              the whole file\n  \
+                      --symbol S                            the whole definition of S\n  \
+                      --symbol S --body                     only its body\n  \
+                      --target H                            the span a handle marks\n\n\
+                      Example:\n  greppy edit replace --symbol greet --content-file body.rs"
     )]
-    TextCas {
-        /// File to edit (workspace-relative or absolute).
+    Replace {
         #[arg(long)]
-        file: String,
-        /// File containing the exact old text.
-        #[arg(long = "old-file", conflicts_with = "old")]
-        old_file: Option<String>,
-        /// File containing the replacement text.
-        #[arg(long = "new-file", conflicts_with = "new")]
-        new_file: Option<String>,
-        /// Exact old text inline (for short replacements; K3/M3 agents
-        /// reach for this form first and only then create temp files).
-        /// allow_hyphen_values: real diffs/RST/markdown lines begin with `-`.
+        file: Option<String>,
+        /// The exact text to look for.
         #[arg(long, allow_hyphen_values = true)]
         old: Option<String>,
-        /// Replacement text inline.
+        /// The exact text to look for, from a file (`-` reads the pipe).
+        #[arg(long = "old-file")]
+        old_file: Option<String>,
+        /// A regular expression selecting the span.
         #[arg(long, allow_hyphen_values = true)]
-        new: Option<String>,
-        /// Exact number of occurrences OLD must have.
-        #[arg(long, default_value_t = 1)]
-        expect: usize,
-        /// Plan and verify everything, write nothing.
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// Write the certificate JSON to FILE (also printed to stdout).
+        pattern: Option<String>,
+        /// A line range A:B, 1-based, both ends included.
         #[arg(long)]
-        report: Option<String>,
-    },
-    /// Replace exactly the span a previous `greppy read --handle` returned.
-    /// The handle's hashes are re-verified immediately before writing; a
-    /// changed file fails stale (exit 12) and writes nothing.
-    /// Replace only the BODY of a definition; the signature stays
-    /// byte-identical. Address by --symbol (resolved like `read`) or by
-    /// --target HANDLE from a previous read.
-    #[command(
-        name = "replace-body",
-        about = "Replace a definition body without changing its signature.",
-        after_help = "Example:\n  greppy edit replace-body --symbol greet --content-file body.rs"
-    )]
-    ReplaceBody {
+        lines: Option<String>,
+        /// A definition, resolved like `read`.
         #[arg(long)]
         symbol: Option<String>,
+        /// Only the definition's body; the signature stays as it is.
+        #[arg(long)]
+        body: bool,
+        /// The span a handle marks.
         #[arg(long)]
         target: Option<String>,
-        /// File containing the new content, or `-` to read it from stdin.
+        /// The new text, for short single-line text.
+        #[arg(long, allow_hyphen_values = true)]
+        content: Option<String>,
+        /// The new text from a file; `-` reads it from the pipe.
         #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Insert a new top-level block after a definition.
-    #[command(
-        name = "insert-after",
-        about = "Insert a top-level block after a definition.",
-        after_help = "Example:\n  greppy edit insert-after --symbol greet --content-file inserted.rs"
-    )]
-    InsertAfter {
-        #[arg(long)]
-        symbol: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        /// File containing the new content, or `-` to read it from stdin.
-        #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Insert a new top-level block before a definition.
-    #[command(
-        name = "insert-before",
-        about = "Insert a top-level block before a definition.",
-        after_help = "Example:\n  greppy edit insert-before --symbol greet --content-file inserted.rs"
-    )]
-    InsertBefore {
-        #[arg(long)]
-        symbol: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        /// File containing the new content, or `-` to read it from stdin.
-        #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Retarget identifier occurrences inside one definition (AST-based:
-    /// strings and comments are never touched). Without --expect, all
-    /// occurrences are renamed; with --expect N, exactly N or refusal.
-    #[command(
-        name = "rename-call",
-        about = "Rename calls inside one definition with AST verification.",
-        after_help = "Example:\n  greppy edit rename-call --in caller --from old_name --to new_name --expect 1"
-    )]
-    RenameCall {
-        /// The definition to edit (resolved like `read`).
-        #[arg(long = "in")]
-        in_symbol: String,
-        #[arg(long)]
-        from: String,
-        #[arg(long)]
-        to: String,
+        content_file: Option<String>,
+        /// Require exactly N matches instead of one.
         #[arg(long)]
         expect: Option<usize>,
+        /// Only results under that file or directory.
+        #[arg(long)]
+        path: Option<String>,
+        /// Report what it would write and write nothing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
+        #[arg(long)]
+        verify: bool,
+        /// Write the full record of the edit to a file.
         #[arg(long)]
         report: Option<String>,
     },
-    /// Delete a definition (including its trailing newline; a doubled blank
-    /// line is collapsed).
+    /// Put new text next to WHERE, on the side `--before`/`--after` names.
+    #[command(
+        name = "insert",
+        about = "Put new text next to the selected span.",
+        after_help = "WHERE is exactly one of --symbol S, --file F --lines A:B, or --target H;\n\
+                      a text or regex match has no defined side to land on.\n\n\
+                      Example:\n  greppy edit insert --symbol greet --after --content-file block.rs"
+    )]
+    Insert {
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        old: Option<String>,
+        #[arg(long = "old-file")]
+        old_file: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        pattern: Option<String>,
+        /// A line range A:B, 1-based, both ends included.
+        #[arg(long)]
+        lines: Option<String>,
+        /// A definition, resolved like `read`.
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Anchor on the definition's body instead of the whole definition.
+        #[arg(long)]
+        body: bool,
+        /// The span a handle marks.
+        #[arg(long)]
+        target: Option<String>,
+        /// Land on the side above the anchor.
+        #[arg(long)]
+        before: bool,
+        /// Land on the side below the anchor.
+        #[arg(long)]
+        after: bool,
+        /// The new text, for short single-line text.
+        #[arg(long, allow_hyphen_values = true)]
+        content: Option<String>,
+        /// The new text from a file; `-` reads it from the pipe.
+        #[arg(long = "content-file", aliases = ["source-file", "source"])]
+        content_file: Option<String>,
+        /// Only results under that file or directory.
+        #[arg(long)]
+        path: Option<String>,
+        /// Report what it would write and write nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
+        #[arg(long)]
+        verify: bool,
+        /// Write the full record of the edit to a file.
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Remove what WHERE points at.
     #[command(
         name = "delete",
-        about = "Delete one resolved definition.",
-        after_help = "Example:\n  greppy edit delete --symbol obsolete"
+        about = "Remove what the selector points at.",
+        after_help = "WHERE is exactly one of:\n  \
+                      --file F --old TEXT | --old-file F2   that exact text (once by default)\n  \
+                      --file F --pattern REGEX              what the regular expression matches\n  \
+                      --file F --lines A:B                  those lines, both ends included\n  \
+                      --file F                              the whole file's contents\n  \
+                      --symbol S                            the whole definition of S\n  \
+                      --target H                            the span a handle marks\n\n\
+                      Example:\n  greppy edit delete --symbol obsolete"
     )]
     Delete {
         #[arg(long)]
+        file: Option<String>,
+        /// The exact text to look for.
+        #[arg(long, allow_hyphen_values = true)]
+        old: Option<String>,
+        /// The exact text to look for, from a file (`-` reads the pipe).
+        #[arg(long = "old-file")]
+        old_file: Option<String>,
+        /// A regular expression selecting the span.
+        #[arg(long, allow_hyphen_values = true)]
+        pattern: Option<String>,
+        /// A line range A:B, 1-based, both ends included.
+        #[arg(long)]
+        lines: Option<String>,
+        /// A definition, resolved like `read`.
+        #[arg(long)]
         symbol: Option<String>,
+        /// Only the definition's body.
+        #[arg(long)]
+        body: bool,
+        /// The span a handle marks.
         #[arg(long)]
         target: Option<String>,
+        /// Require exactly N matches instead of one.
+        #[arg(long)]
+        expect: Option<usize>,
+        /// Only results under that file or directory.
+        #[arg(long)]
+        path: Option<String>,
+        /// Report what it would write and write nothing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
+        #[arg(long)]
+        verify: bool,
+        /// Write the full record of the edit to a file.
         #[arg(long)]
         report: Option<String>,
     },
-    /// Apply a unified diff to exactly the span of a previous read
-    /// (fuzz 0: every hunk must match byte-for-byte, else refusal).
+    /// Apply a unified diff inside WHERE. The diff's line numbers may count
+    /// from the start of the file or from the start of WHERE — whichever the
+    /// context lines confirm. Paths inside the diff are ignored.
     #[command(
-        name = "patch-span",
-        about = "Apply an exact unified diff within a read handle's span.",
-        after_help = "Example:\n  greppy edit patch-span --target \"$(greppy read greet --handle --json | jq -r .handle)\" --patch-file greet.patch"
+        name = "patch",
+        about = "Apply a unified diff inside the selected span.",
+        after_help = "WHERE is exactly one of --symbol S, --file F --lines A:B, --file F, or\n\
+                      --target H; a text or regex match gives the hunks nothing to count from.\n\n\
+                      Example:\n  greppy edit patch --symbol greet --patch-file greet.diff"
     )]
-    PatchSpan {
+    Patch {
         #[arg(long)]
-        target: String,
+        file: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        old: Option<String>,
+        #[arg(long = "old-file")]
+        old_file: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        pattern: Option<String>,
+        /// A line range A:B, 1-based, both ends included.
+        #[arg(long)]
+        lines: Option<String>,
+        /// A definition, resolved like `read`.
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Anchor on the definition's body instead of the whole definition.
+        #[arg(long)]
+        body: bool,
+        /// The span a handle marks.
+        #[arg(long)]
+        target: Option<String>,
+        /// The unified diff to apply; `-` reads it from the pipe.
         #[arg(long = "patch-file")]
-        patch_file: String,
+        patch_file: Option<String>,
+        /// Only results under that file or directory.
+        #[arg(long)]
+        path: Option<String>,
+        /// Report what it would write and write nothing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
+        #[arg(long)]
+        verify: bool,
+        /// Write the full record of the edit to a file.
         #[arg(long)]
         report: Option<String>,
     },
-    /// Regex replacement with exact expected match count (the weakest
-    /// selector class - prefer symbol or text-cas addressing).
+    /// Create a file. `replace --file F` needs one that already exists.
     #[command(
-        name = "regex-cas",
-        about = "Replace regex matches with a declared match count.",
-        after_help = "Example:\n  greppy edit regex-cas --file src/lib.rs --old 'ANSWER: i32 = [0-9]+' --new 'ANSWER: i32 = 43' --expect 1"
+        name = "write",
+        about = "Create a file from the given content.",
+        after_help = "Example:\n  greppy edit write --file src/new.rs --content-file new.rs"
     )]
-    RegexCas {
+    Write {
         #[arg(long)]
         file: String,
-        /// Regex selector inline; `--old` mirrors text-cas terminology.
-        #[arg(long, alias = "old", allow_hyphen_values = true)]
-        pattern: String,
-        /// Replacement inline; `--new` mirrors text-cas terminology.
-        #[arg(long, alias = "new", allow_hyphen_values = true)]
-        replacement: String,
-        #[arg(long, default_value_t = 1)]
-        expect: usize,
+        /// The new text, for short single-line text.
+        #[arg(long, allow_hyphen_values = true)]
+        content: Option<String>,
+        /// The new text from a file; `-` reads it from the pipe.
+        #[arg(long = "content-file", aliases = ["source-file", "source"])]
+        content_file: Option<String>,
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
+        #[arg(long)]
+        verify: bool,
         #[arg(long)]
         report: Option<String>,
     },
-    /// Idempotent import: absent -> inserted at the canonical position;
-    /// present -> already-satisfied (exit 0, nothing written); the same
-    /// name bound from a different module -> refusal, nothing written.
+    /// Move or rename a file, and update the declarations naming it.
     #[command(
-        name = "ensure-import",
-        about = "Insert an import once at the canonical position.",
-        after_help = "Example:\n  greppy edit ensure-import --file src/lib.rs --module std::collections --name HashMap"
+        name = "move",
+        about = "Move or rename a file and update what names it.",
+        after_help = "Example:\n  greppy edit move --file src/old.rs --to src/new.rs"
     )]
-    EnsureImport {
+    Move {
         #[arg(long)]
         file: String,
+        /// The new path.
         #[arg(long)]
-        module: String,
+        to: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
         #[arg(long)]
-        name: Option<String>,
+        verify: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Delete a file, and report what still references it. Refuses while
+    /// something still points at it; `--force` overrides that.
+    #[command(
+        name = "remove",
+        about = "Delete a file; refuses while something still references it.",
+        after_help = "Example:\n  greppy edit remove --file src/obsolete.rs\n  \
+                      greppy edit remove --file src/obsolete.rs --force"
+    )]
+    Remove {
+        #[arg(long)]
+        file: String,
+        /// Delete it even though something still references it.
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// After writing, run the build or linter for the touched files.
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Rename a definition and every reference to it (`--symbol S --to N`),
+    /// or make one definition call something else (`--in S --call A --to B`).
+    #[command(
+        name = "rename",
+        about = "Rename a definition, or redirect a call inside one definition.",
+        after_help = "Example:\n  greppy edit rename --symbol combine --to merge\n  \
+                      greppy edit rename --in caller --call combine --to merge"
+    )]
+    Rename {
+        /// The definition to rename.
+        #[arg(long)]
+        symbol: Option<String>,
+        /// The definition whose calls are redirected.
+        #[arg(long = "in")]
+        r#in: Option<String>,
+        /// The callee to redirect.
+        #[arg(long)]
+        call: Option<String>,
+        /// The new name.
+        #[arg(long)]
+        to: String,
+        /// Require exactly N redirected calls.
+        #[arg(long)]
+        expect: Option<usize>,
+        /// Accepted old-name occurrences left over after a workspace rename.
+        #[arg(long = "expect-residual", default_value_t = 0)]
+        expect_residual: usize,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -1075,6 +1581,24 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Add an import if the file is missing it.
+    #[command(
+        name = "ensure-import",
+        about = "Insert an import once at the canonical position.",
+        after_help = "Example:\n  greppy edit ensure-import --file src/lib.rs --module std::collections --name HashMap"
+    )]
+    EnsureImport {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        module: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Within one definition, append an argument to every call of NAME
     /// that does not already carry it (idempotent).
     #[command(
@@ -1096,12 +1620,11 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
-    /// Append a method to a class body when absent; present reports
-    /// already-satisfied.
+    /// Add a method a class lacks.
     #[command(
         name = "ensure-method",
         about = "Append a method to a class when it is absent.",
-        after_help = "Example:\n  greppy edit ensure-method --symbol Greeter --name greet --source-file greet_method.py"
+        after_help = "Example:\n  greppy edit ensure-method --symbol Greeter --name greet --content-file greet_method.py"
     )]
     EnsureMethod {
         /// The class (resolved like read).
@@ -1110,15 +1633,15 @@ pub enum EditCommand {
         /// The new method's name (idempotency key).
         #[arg(long)]
         name: String,
-        /// File containing the full method source (indented for the class body).
-        #[arg(long = "source-file")]
-        source_file: String,
+        /// File containing the full method source, indented for the class body.
+        #[arg(long = "content-file", aliases = ["source-file", "source"])]
+        content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
         report: Option<String>,
     },
-    /// Idempotent decorator/attribute line directly above a definition.
+    /// Add an annotation to a definition, once.
     #[command(
         name = "ensure-annotation",
         about = "Add a decorator or attribute above a definition once.",
@@ -1134,71 +1657,32 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
-    /// Delete a definition when present; absent reports already-satisfied.
-    #[command(
-        name = "remove-if-present",
-        about = "Delete a definition if present; otherwise do nothing.",
-        after_help = "Example:\n  greppy edit remove-if-present --symbol obsolete"
-    )]
-    RemoveIfPresent {
-        #[arg(long)]
-        symbol: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Rename a symbol across the workspace using the resolved graph:
-    /// the definition, every referencing definition's span, and import
-    /// lines are AST-verified and renamed in one journal transaction.
-    #[command(
-        name = "rename-symbol",
-        about = "Rename a symbol and its graph-resolved references.",
-        after_help = "Example:\n  greppy edit rename-symbol --symbol combine --new-name merge_numbers --expect-residual 0"
-    )]
-    RenameSymbol {
-        #[arg(long)]
-        symbol: String,
-        #[arg(long = "new-name")]
-        new_name: String,
-        /// graph (default) uses the resolved store; lsp is a later phase.
-        #[arg(long, default_value = "graph", value_parser = ["graph", "lsp"])]
-        backend: String,
-        #[arg(long = "expect-residual", default_value_t = 0)]
-        expect_residual: usize,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Set a value in a structured file (JSON/TOML/YAML) by path,
-    /// format-preserving. `ensure` reports already-satisfied when the value
-    /// already holds.
+    /// Set or remove a value in JSON, TOML or YAML by path.
     #[command(
         name = "data",
-        about = "Set or ensure a value in JSON, TOML, or YAML.",
-        after_help = "Example:\n  greppy edit data set --file config.json --path '$.server.port' --value-json 8080"
+        about = "Set or remove a value in JSON, TOML, or YAML.",
+        after_help = "Example:\n  greppy edit data set --file config.json --path '$.server.port' --value-json 8080\n  \
+                      greppy edit data delete --file config.json --path '$.server.port'"
     )]
     Data {
-        /// set (always write) or ensure (idempotent)
-        #[arg(value_parser = ["set", "ensure"])]
+        /// set (write the value), ensure (idempotent), or delete (remove it)
+        #[arg(value_parser = ["set", "ensure", "delete"])]
         mode: String,
         #[arg(long)]
         file: String,
         /// Path like $.server.port or $.items[2].name
         #[arg(long)]
         path: String,
-        /// New value as JSON (strings quoted: '"text"')
+        /// New value as JSON (strings quoted: '"text"'); not used by delete.
         #[arg(long = "value-json")]
-        value_json: String,
+        value_json: Option<String>,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
         report: Option<String>,
     },
-    /// Execute a multi-operation plan file (schema greppy.edit-plan.v1).
-    /// Journal mode publishes all files or none; patch mode emits a
-    /// unified diff without touching the workspace.
+    /// Execute a multi-operation plan file (schema greppy.edit-plan.v1) as one
+    /// single change: all files or none. `-` reads the plan from the pipe.
     #[command(
         name = "apply",
         about = "Execute a multi-operation edit plan transactionally.",
@@ -1216,17 +1700,19 @@ pub enum EditCommand {
         #[arg(long)]
         diff: Option<String>,
     },
-    /// Print a valid, copyable minimal plan to stdout; write nothing.
+    /// Reverse the last edit, if the file still looks the way that edit left it.
     #[command(
-        name = "plan-template",
-        about = "Print a minimal valid edit plan.",
-        after_help = "Example:\n  greppy edit plan-template --op text-cas"
+        name = "undo",
+        about = "Reverse the last edit in this workspace.",
+        after_help = "Example:\n  greppy edit undo"
     )]
-    PlanTemplate {
-        #[arg(long, default_value = "text-cas", value_parser = ["text-cas", "replace-body"])]
-        op: String,
+    Undo {
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
     },
-    /// Restore pre-images from a crashed journal transaction.
+    /// Finish or roll back an edit that was interrupted.
     #[command(
         name = "recover",
         about = "Restore pre-images from an interrupted journal transaction.",
@@ -1234,26 +1720,6 @@ pub enum EditCommand {
     )]
     Recover {
         /// Write the full recovery report as JSON to FILE.
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Replace the exact definition span pinned by a previous read handle.
-    #[command(
-        name = "replace-span",
-        about = "Replace the exact span pinned by a read handle.",
-        after_help = "Example:\n  greppy edit replace-span --target \"$(greppy read greet --handle --json | jq -r .handle)\" --source-file replacement.rs"
-    )]
-    ReplaceSpan {
-        /// Edit handle from `greppy read SYMBOL --handle`.
-        #[arg(long)]
-        target: String,
-        /// File containing the replacement source.
-        #[arg(long = "source-file", alias = "source")]
-        source_file: String,
-        /// Plan and verify everything, write nothing.
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// Write the certificate JSON to FILE (also printed to stdout).
         #[arg(long)]
         report: Option<String>,
     },
@@ -1274,6 +1740,7 @@ const SUBCOMMANDS: &[&str] = &[
     "grep",
     "index",
     "map",
+    "outline",
     "changes",
     "cache",
     "trial",
@@ -1310,6 +1777,59 @@ const SUBCOMMANDS: &[&str] = &[
     "embed-daemon",
     "summarize-daemon",
 ];
+
+/// The verbs the new edit grammar replaced, each with the invocation that now
+/// does its work. They are gone without an alias, so naming one is an error —
+/// and the error says which spelling does the job, because the caller's
+/// intent is known exactly.
+const RETIRED_EDIT_VERBS: &[(&str, &str)] = &[
+    ("text-cas", "greppy edit replace --file F --old TEXT"),
+    ("regex-cas", "greppy edit replace --file F --pattern REGEX"),
+    ("replace-body", "greppy edit replace --symbol S --body"),
+    ("replace-span", "greppy edit replace --file F --lines A:B"),
+    ("patch-span", "greppy edit patch --file F --lines A:B"),
+    ("insert-after", "greppy edit insert --symbol S --after"),
+    ("insert-before", "greppy edit insert --symbol S --before"),
+    ("remove-if-present", "greppy edit delete --file F --old TEXT"),
+];
+
+fn retired_edit_verb(name: &str) -> Option<&'static str> {
+    RETIRED_EDIT_VERBS
+        .iter()
+        .find(|(verb, _)| *verb == name)
+        .map(|(_, replacement)| *replacement)
+}
+
+/// An argv that carries a greppy flag, or names a verb the grammar retired, is
+/// a greppy command whose verb is unknown. Answer with the verb that does the
+/// work instead of letting the passthrough turn the verb's own name into a
+/// search pattern — that is the same silent reinterpretation rule 1 forbids.
+fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
+    let rest = grep_passthrough_args(argv);
+    let verb = rest.first()?.to_str()?;
+    if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
+        return None;
+    }
+    let replacement = retired_edit_verb(verb);
+    if replacement.is_none() && greppy_only_flag(&rest[1..]).is_none() {
+        return None;
+    }
+    let mut message = format!("unrecognized command `{verb}`");
+    if let Some(replacement) = replacement {
+        message.push_str(&format!("\n{replacement} does that work"));
+        message.push_str(&format!(
+            "\nusage: {}",
+            subcommand_usage("edit").unwrap_or_default()
+        ));
+    } else {
+        message.push_str(
+            "\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
+             find-usages, impact, brief, semantic-search, search-code, search-symbols, path, \
+             read, edit)",
+        );
+    }
+    Some(message)
+}
 
 /// Top-level entry point that captures argv as `OsString` BEFORE clap
 /// consumes it.
@@ -1361,6 +1881,32 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     }
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
+    #[cfg(feature = "agent")]
+    if is_agent_invocation(&argv) {
+        // Refuse a nested run BEFORE anything else — before argument validation,
+        // before the store, and long before a model call. The agent runs build
+        // and test commands through `/bin/sh -lc` with PATH passed through, so a
+        // task can reach this binary; without this the run could cascade, each
+        // level burning its own model budget. Keyed on the ENVIRONMENT, never on
+        // the command line, so `$(which greppy) -p`, aliases and wrappers are all
+        // caught. greppy_agent::run_agent holds the same line for library callers.
+        if let Err(error) = agent_refuse_nested_invocation() {
+            eprintln!("greppy: {error}");
+            return EXIT_USAGE;
+        }
+        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+        return match dispatch_agent_invocation(argv) {
+            Ok(code) => code.clamp(0, 255) as u8,
+            Err(error) => {
+                eprintln!("greppy: {error}");
+                error_exit_code(&error)
+            }
+        };
+    }
+    if let Some(message) = unknown_verb_refusal(&argv) {
+        println!("{message}");
+        return EXIT_USAGE;
+    }
     if is_grep_passthrough(&argv) {
         // argv[0] is the binary name; the rest are grep args. Build a
         // synthetic argv for the shared runner whose argv[0] is a
@@ -1410,11 +1956,14 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // STDOUT, not stderr: agents habitually append `2>/dev/null`,
             // and a usage lesson they never see teaches nothing (P3).
             println!("{first}");
-            if replace_span_symbol_retry(&argv, &msg) {
+            // clap reports a bundled short-flag mistake by its first letter
+            // (`-gamma` becomes `-g`), which does not name what the caller
+            // wrote. Print the argument verbatim so the refusal is actionable.
+            if let Some(raw) = unabbreviated_invalid_argument(&argv, first) {
                 println!(
-                    "replace-span is handle-addressed: run `greppy read SYM --handle`, then retry with `greppy edit replace-span --target <HANDLE> --source-file FILE`"
+                    "`{raw}` is not a flag, and a positional argument is a symbol name, never a \
+                     path — the path filter is `--path`"
                 );
-                return EXIT_USAGE;
             }
             // Skip greppy-owned global flags when picking the usage line:
             // agents habitually write `greppy --root . read ...`, and argv[1]
@@ -1426,6 +1975,16 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
+            // `greppy edit text-cas …`: clap can only say the subcommand is
+            // unknown. The caller's intent is known exactly, so name the
+            // spelling that does the work.
+            if let Some(replacement) = grep_passthrough_args(&argv)
+                .get(1)
+                .and_then(|token| token.to_str())
+                .and_then(retired_edit_verb)
+            {
+                println!("{replacement} does that work");
+            }
             if let Some(corrected) = closest_valid_invocation(&argv, sub, &msg) {
                 println!("try: {corrected}");
             }
@@ -1442,6 +2001,220 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         }
     };
     dispatch_to_code(cli)
+}
+
+/// clap prints `unexpected argument '-g' found` for `-gamma`, because it reads
+/// a leading single dash as bundled short flags. Recover the token the caller
+/// actually typed so the refusal names it.
+fn unabbreviated_invalid_argument(argv: &[std::ffi::OsString], first_line: &str) -> Option<String> {
+    let mut parts = first_line.split('\'');
+    parts.next()?;
+    let reported = parts.next()?;
+    if reported.len() < 2 || !reported.starts_with('-') {
+        return None;
+    }
+    argv.iter()
+        .skip(1)
+        .map(|token| token.to_string_lossy().into_owned())
+        .find(|token| token.starts_with(reported) && token != reported)
+}
+
+#[cfg(feature = "agent")]
+fn is_agent_invocation(argv: &[std::ffi::OsString]) -> bool {
+    if argv.get(1).is_some_and(|token| token == "grep") {
+        return false;
+    }
+    argv.iter().skip(1).any(|token| {
+        token == "-p"
+            || token == "--prompt"
+            || token == "--apply-result"
+            || token.to_string_lossy().starts_with("--prompt=")
+            || token.to_string_lossy().starts_with("--apply-result=")
+    })
+}
+
+#[cfg(feature = "agent")]
+fn dispatch_agent_invocation(argv: Vec<std::ffi::OsString>) -> Result<i32> {
+    let args = match AgentInvocation::try_parse_from(argv.iter()) {
+        Ok(args) => args,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error
+                .print()
+                .map_err(|error| Error::io("print agent help", error))?;
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(Error::Invalid(
+                error
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("invalid agent arguments")
+                    .to_string(),
+            ));
+        }
+    };
+    if let Some(run_id) = args.apply_result.as_deref() {
+        let root = args
+            .root
+            .as_deref()
+            .map(|root| resolve_root(Some(root)))
+            .transpose()?;
+        let report = greppy_agent::apply_result(run_id, root.as_deref())
+            .map_err(|error| Error::Store(format!("apply agent result: {error}")))?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|error| Error::Invalid(format!("serialize apply report: {error}")))?
+            );
+        } else if report.applied {
+            println!(
+                "applied run {} ({} files)",
+                report.run_id,
+                report.changed_files.len()
+            );
+        } else {
+            println!(
+                "run {} was not applied; conflicts: {}",
+                report.run_id,
+                report.conflicts.join(", ")
+            );
+        }
+        return Ok(if report.applied {
+            0
+        } else {
+            EXIT_TEMPFAIL as i32
+        });
+    }
+
+    let prompt = args
+        .prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| {
+            Error::Invalid("`-p PROMPT` or `--apply-result RUN_ID` is required".into())
+        })?;
+    let root = resolve_root(args.root.as_deref())?;
+    let base_url = args
+        .base_url
+        .or_else(|| env_nonempty("GREPPY_AGENT_BASE_URL"))
+        .or_else(|| env_nonempty("OPENAI_BASE_URL"))
+        .unwrap_or_else(|| "https://api.openai.com/v1".into());
+    let model = args
+        .model
+        .or_else(|| env_nonempty("GREPPY_AGENT_MODEL"))
+        .or_else(|| env_nonempty("OPENAI_MODEL"))
+        .ok_or_else(|| {
+            Error::Invalid("`--model MODEL` or GREPPY_AGENT_MODEL/OPENAI_MODEL is required".into())
+        })?;
+    let api_key = std::env::var(&args.api_key_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "API key environment variable {} is not set or empty",
+                args.api_key_env
+            ))
+        })?;
+    drop(open_default_store(Some(root.to_string_lossy().as_ref()))?);
+    let base_graph = workspace_locator::store_path(&root);
+    let project = workspace_locator::project_identity(&root);
+
+    let embedding_cfg = embedding_config_optional(EmbeddingCliArgs {
+        device: None,
+        no_gpu: false,
+    })?;
+    let inference_hooks = embedding_cfg.map(|cfg| {
+        std::sync::Arc::new(AgentInferenceHooks {
+            root: root.clone(),
+            cache_dir: workspace_locator::store_dir(&root),
+            cfg,
+        })
+    });
+    let embedding_hooks = inference_hooks
+        .as_ref()
+        .map(|hooks| hooks.clone() as std::sync::Arc<dyn greppy_agent::EmbeddingHooks>);
+    let navigation_hooks = inference_hooks
+        .as_ref()
+        .map(|hooks| hooks.clone() as std::sync::Arc<dyn greppy_agent::NavigationHooks>);
+    let workspace = greppy_agent::TaskWorkspace::create(
+        &root,
+        &base_graph,
+        project,
+        args.keep_run,
+        embedding_hooks,
+    )
+    .map_err(|error| Error::Store(format!("create agent workspace: {error}")))?;
+    let cancellation_workspace = workspace.clone();
+    if let Err(error) = ctrlc::set_handler(move || cancellation_workspace.cancel()) {
+        let _ = workspace.discard_run();
+        return Err(Error::Store(format!(
+            "install agent cancellation handler: {error}"
+        )));
+    }
+
+    let mut config = greppy_agent::AgentConfig::with_defaults(
+        prompt,
+        greppy_agent::ResponsesConfig {
+            base_url,
+            model,
+            api_key,
+            max_output_tokens: args.max_output_tokens,
+            request_timeout: std::time::Duration::from_secs(args.timeout_seconds.clamp(1, 3600)),
+        },
+        workspace,
+    );
+    config.max_assistant_turns = args.max_turns.clamp(1, 200);
+    config.apply = args.apply;
+    config.navigation_hooks = navigation_hooks;
+    if !args.json {
+        config.event_sink = Some(std::sync::Arc::new(|event: &greppy_agent::AgentEvent| {
+            if let greppy_agent::AgentEvent::ToolCallStarted { name, .. } = event {
+                eprintln!("greppy -p: {name}");
+            }
+        }));
+    }
+    let result = greppy_agent::run_agent(config)
+        .map_err(|error| Error::Store(format!("agent run: {error}")))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .map_err(|error| Error::Invalid(format!("serialize agent result: {error}")))?
+        );
+    } else {
+        println!("{}", result.message);
+        println!();
+        println!("Run: {}", result.run_id);
+        println!("Changes: {}", result.changeset.changes.len());
+        if let Some(path) = result.artifact.as_deref() {
+            println!("Artifact: {}", path.display());
+        }
+        if let Some(apply) = result.apply.as_ref() {
+            println!(
+                "Apply: {}",
+                if apply.applied {
+                    "applied"
+                } else {
+                    "conflicted"
+                }
+            );
+        }
+    }
+    Ok(if result.status == "cancelled" {
+        130
+    } else if result.status != "completed"
+        || result.apply.as_ref().is_some_and(|report| !report.applied)
+    {
+        EXIT_TEMPFAIL as i32
+    } else {
+        0
+    })
 }
 
 fn normalize_global_output_flags(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
@@ -1506,15 +2279,6 @@ fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
     &argv[index..]
 }
 
-fn replace_span_symbol_retry(argv: &[std::ffi::OsString], clap_message: &str) -> bool {
-    if !clap_message.contains("unexpected argument '--symbol'") {
-        return false;
-    }
-    grep_passthrough_args(argv).windows(2).any(|pair| {
-        pair[0].to_str() == Some("edit") && pair[1].to_str() == Some("replace-span")
-    })
-}
-
 fn closest_valid_invocation(
     argv: &[std::ffi::OsString],
     subcommand: &str,
@@ -1549,7 +2313,15 @@ fn closest_valid_invocation(
         "who-calls" | "callees" | "find-usages" | "brief" | "semantic-search" | "semantic" => {
             vec!["--path"]
         }
-        "search-code" => vec!["--path", "--changed", "--staged", "--since", "--base"],
+        "search-code" => vec![
+            "--path",
+            "--changed",
+            "--staged",
+            "--since",
+            "--base",
+            "--no-code",
+            "--fixed",
+        ],
         "changes" => vec!["--base"],
         "search-symbols" => vec!["--path", "--kind"],
         "impact" => vec!["--direction", "--edge", "--depth", "--since", "--base"],
@@ -1559,35 +2331,37 @@ fn closest_valid_invocation(
         "plus" => vec!["--k", "--explain"],
         "context" => vec!["--k", "--lines"],
         "edit" => match nested_edit {
-            Some("replace-body" | "insert-after" | "insert-before") => vec![
-                "--symbol",
-                "--target",
-                "--content-file",
-                "--source-file",
-                "--source",
-                "--dry-run",
-                "--report",
-            ],
-            Some("replace-span") => {
-                vec!["--target", "--source-file", "--source", "--dry-run", "--report"]
-            }
-            Some("text-cas") => vec![
+            Some("replace") | Some("delete") => vec![
                 "--file",
+                "--old",
                 "--old-file",
-                "--new-file",
-                "--old",
-                "--new",
+                "--pattern",
+                "--lines",
+                "--symbol",
+                "--body",
+                "--target",
+                "--content",
+                "--content-file",
                 "--expect",
                 "--dry-run",
                 "--report",
             ],
-            Some("regex-cas") => vec![
-                "--file",
-                "--pattern",
-                "--replacement",
-                "--old",
-                "--new",
-                "--expect",
+            Some("insert") => vec![
+                "--symbol",
+                "--lines",
+                "--target",
+                "--before",
+                "--after",
+                "--content",
+                "--content-file",
+                "--dry-run",
+                "--report",
+            ],
+            Some("patch") => vec![
+                "--symbol",
+                "--lines",
+                "--target",
+                "--patch-file",
                 "--dry-run",
                 "--report",
             ],
@@ -1651,37 +2425,37 @@ fn shell_quote_cli(value: &str) -> String {
 fn subcommand_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
         "who-calls" => {
-            "greppy who-calls SYMBOL [PATH ...] [--code|--json] [--all] [--root DIR]"
+            "greppy who-calls SYMBOL [SYMBOL ...] [--path PATH] [--code] [--json] [--all] [--root DIR]"
         }
         "callees" => {
-            "greppy callees SYMBOL [PATH ...] [--code|--json] [--all] [--root DIR]"
+            "greppy callees SYMBOL [SYMBOL ...] [--path PATH] [--code] [--json] [--all] [--root DIR]"
         }
         "find-usages" => {
-            "greppy find-usages SYMBOL [PATH ...] [--code|--json] [--all] [--root DIR]"
+            "greppy find-usages SYMBOL [SYMBOL ...] [--path PATH] [--code] [--json] [--all] [--root DIR]"
         }
         "references" => "greppy references SYMBOL [--code|--json] [--all] [--root DIR]",
         "impact" => {
             "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
-        "brief" => "greppy brief SYMBOL [PATH ...] [--root DIR]",
+        "brief" => "greppy brief SYMBOL [SYMBOL ...] [--path PATH] [--json] [--root DIR]",
         "read" => {
             "greppy read SYMBOL [--path FILE] [--handle] [--json] [--root DIR]  \
              or: greppy read FILE [--line N[:M]] [--handle] [--json] [--root DIR]"
         }
         "edit" => {
-            "greppy edit <replace-body|replace-span|patch-span|insert-after|insert-before|\
-             delete|rename-call|ensure-import|text-cas|regex-cas|apply|plan-template> --help"
+            "greppy edit <replace|insert|delete|patch|write|move|remove|rename|\
+             change-signature|ensure-import|data|apply|undo|recover> --help"
         }
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "semantic-search" | "semantic" => {
-            "greppy semantic-search \"QUERY\" [PATH ...] [--root DIR]"
+            "greppy semantic-search \"QUERY\" [--path PATH] [--json] [--root DIR]"
         }
         "context" => "greppy context \"QUERY\" [--root DIR]",
         "search-code" => {
-            "greppy search-code QUERY [PATH ...] [--json] [--root DIR]"
+            "greppy search-code PATTERN [PATH ...] [--no-code] [--fixed] [--json] [--root DIR]"
         }
         "search-symbols" => {
-            "greppy search-symbols NAME [PATH ...] [--kind function|method|struct|class] [--json] [--root DIR]"
+            "greppy search-symbols NAME [NAME ...] [--path PATH] [--kind function|method|struct|class] [--json] [--root DIR]"
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
@@ -1749,6 +2523,363 @@ fn prune_expired_evidence_packs() {
         };
         let _ = store.prune_expired_expand_packs();
     }
+}
+
+// ---------------------------------------------------------------------------
+// outline — what stands in THIS file
+//
+// `search-symbols` looks a name up across the repository; `outline` answers the
+// other question, "what is in this file", which today costs a whole `read`. The
+// symbol graph already holds every definition of a file with its span, so the
+// answer is a projection of the graph, not a second parse.
+// ---------------------------------------------------------------------------
+
+/// One row of an outline.
+struct OutlineRow {
+    name: String,
+    qualified_name: String,
+    kind: String,
+    signature: String,
+    start: i64,
+    end: i64,
+}
+
+/// Definitions only. The graph also carries fields, parameters, imports and
+/// call sites; an outline that listed them would be the file again, in a worse
+/// order.
+fn outline_label_is_definition(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "function"
+            | "method"
+            | "class"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "interface"
+            | "protocol"
+            | "record"
+            | "union"
+            | "module"
+            | "constructor"
+            | "typealias"
+    )
+}
+
+fn outline_label_is_callable(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "function" | "method" | "constructor"
+    )
+}
+
+/// The keyword a type-like definition is introduced with. The graph labels a
+/// Rust `struct`, a Go `type … struct` and a Python `class` all as `Class`,
+/// because they occupy the same place in the graph — but an outline reports the
+/// kind the caller reads in the file, so the declaration decides.
+fn outline_declared_keyword(first_line: &str) -> Option<&'static str> {
+    for word in first_line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let kind = match word {
+            "struct" => "struct",
+            "enum" => "enum",
+            "trait" => "trait",
+            "interface" => "interface",
+            "protocol" => "protocol",
+            "union" => "union",
+            "record" => "record",
+            "class" => "class",
+            _ => continue,
+        };
+        return Some(kind);
+    }
+    None
+}
+
+fn outline_rows(nodes: &[greppy_store::Node], source: &str) -> Vec<OutlineRow> {
+    let lines: Vec<&str> = source.lines().collect();
+    let line_text = |line: i64| -> &str {
+        usize::try_from(line)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| lines.get(n).copied())
+            .unwrap_or("")
+    };
+    let mut ordered: Vec<&greppy_store::Node> = nodes
+        .iter()
+        .filter(|node| outline_label_is_definition(&node.label))
+        .collect();
+    ordered.sort_by_key(|node| (node.start_line, node.end_line, node.id));
+    ordered
+        .iter()
+        .map(|node| {
+            // The innermost definition that encloses this one. A definition
+            // inside a *callable* is a local function, whatever the graph calls
+            // it — the graph names it after the type that owns the outer
+            // method, which is true of the method and not of the closure.
+            let parent = ordered
+                .iter()
+                .filter(|other| {
+                    other.id != node.id
+                        && other.start_line <= node.start_line
+                        && other.end_line >= node.end_line
+                        && (other.start_line, other.end_line) != (node.start_line, node.end_line)
+                })
+                .min_by_key(|other| other.end_line - other.start_line);
+            let signature = line_text(node.start_line).trim().to_string();
+            let kind = if parent.is_some_and(|parent| outline_label_is_callable(&parent.label)) {
+                "function".to_string()
+            } else if outline_label_is_callable(&node.label) {
+                node.label.to_ascii_lowercase()
+            } else {
+                outline_declared_keyword(&signature)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| node.label.to_ascii_lowercase())
+            };
+            OutlineRow {
+                name: node.name.clone(),
+                qualified_name: node.qualified_name.clone(),
+                kind,
+                signature,
+                start: node.start_line,
+                end: node.end_line,
+            }
+        })
+        .collect()
+}
+
+/// Refusals print the cause on stderr and exit 1, like every other command that
+/// cannot answer the question it was asked.
+fn outline_refusal(message: String) -> Result<i32> {
+    eprintln!("{message}");
+    Ok(1)
+}
+
+const OUTLINE_PAGE: usize = 50;
+
+fn dispatch_outline(path: &str, json: bool, all: bool, root: Option<&str>) -> Result<i32> {
+    let root_path = resolve_root(root)?;
+    let candidate = std::path::Path::new(path);
+    let abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root_path.join(candidate)
+    };
+    if !abs.exists() {
+        return outline_refusal(format!("no file {path}"));
+    }
+    if abs.is_dir() {
+        return outline_refusal(format!("{path} is a directory, not a file"));
+    }
+    let bytes = std::fs::read(&abs).map_err(|error| Error::io(format!("read {path}"), error))?;
+    let Ok(source) = String::from_utf8(bytes) else {
+        return outline_refusal(format!("{path} is not text; it has no definitions to outline"));
+    };
+    let rel = abs
+        .strip_prefix(&root_path)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string());
+
+    let mut store = open_default_store(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    let nodes = store
+        .list_nodes(&project, "", &rel, 0, 100_000)
+        .map_err(|error| Error::Invalid(format!("read the outline of {rel}: {error}")))?;
+    let rows = outline_rows(&nodes, &source);
+    if rows.is_empty() && !greppy_discover::detect_language(&abs).is_detected() {
+        // Silence here would read as "this file has no definitions", which is a
+        // different answer from "greppy has no parser for this language".
+        return outline_refusal(format!("{path}: no language greppy parses"));
+    }
+
+    let total = rows.len();
+    let offset = cli_result_offset().min(total);
+    let limit = if all {
+        usize::MAX
+    } else {
+        cli_result_limit_raw().unwrap_or(OUTLINE_PAGE)
+    };
+    let end = offset.saturating_add(limit).min(total);
+    let window = &rows[offset..end];
+
+    if json {
+        let definitions: Vec<serde_json::Value> = window
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "name": row.name,
+                    "qualified_name": row.qualified_name,
+                    "kind": row.kind,
+                    "signature": row.signature,
+                    "file": rel,
+                    "start": row.start,
+                    "end": row.end,
+                    "span": format!("{}:{}", row.start, row.end),
+                })
+            })
+            .collect();
+        let mut value = serde_json::json!({
+            "command": "outline",
+            "file": rel,
+            "total": total,
+            "offset": offset,
+            "shown": definitions.len(),
+            "truncated": end < total,
+            "definitions": definitions,
+        });
+        if end < total {
+            value["try"] = serde_json::json!(retry_with_offset("outline", end));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| Error::Invalid(format!("serialize outline JSON: {error}")))?
+        );
+        return Ok(0);
+    }
+    for row in window {
+        println!(
+            "{}  {}  {}:{}-{}",
+            row.kind, row.signature, rel, row.start, row.end
+        );
+    }
+    if end < total {
+        // The continuation is the command itself, so it can be run verbatim.
+        println!("{}", retry_with_offset("outline", end));
+    }
+    Ok(0)
+}
+
+fn dispatch_changes(base: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
+    if json {
+        return changes::run(base, true, root);
+    }
+
+    // Keep the stable JSON producer in `changes` as the single source of
+    // truth. The default renderer consumes that complete record, prints only
+    // counts plus changed symbols, and stores the original behind expand.
+    let root_path = resolve_root(root)?;
+    let mut command = std::process::Command::new(
+        std::env::current_exe().map_err(|error| Error::io("locate greppy executable", error))?,
+    );
+    command.arg("--root").arg(&root_path).arg("changes");
+    if let Some(base) = base {
+        command.arg("--base").arg(base);
+    }
+    let output = command
+        .arg("--json")
+        .output()
+        .map_err(|error| Error::io("run changes JSON renderer", error))?;
+    if !output.status.success() {
+        let diagnosis = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error::Invalid(if diagnosis.is_empty() {
+            "changes JSON renderer failed".into()
+        } else {
+            diagnosis
+        }));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| Error::Parse(format!("parse changes JSON: {error}")))?;
+    let files = value["files"].as_array().cloned().unwrap_or_default();
+    let callsites = value["callsite_impact"].as_array().map_or(0, Vec::len);
+    let known_tests = value["tests"]["known_impacted"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let unknown_tests = value["tests"]["unknown_or_unindexed"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let mut symbols = Vec::new();
+    for file in &files {
+        let path = file["path"].as_str().unwrap_or("?");
+        for change in ["modified", "added", "deleted"] {
+            for symbol in file["definitions"][change].as_array().into_iter().flatten() {
+                let kind = symbol["kind"].as_str().unwrap_or("Symbol");
+                let qualified = symbol["qualified_name"].as_str().unwrap_or("?");
+                let span = symbol["after_span"]
+                    .as_object()
+                    .or_else(|| symbol["before_span"].as_object());
+                let location = span.map_or_else(
+                    || path.to_string(),
+                    |span| {
+                        format!(
+                            "{}:{}-{}",
+                            path,
+                            span.get("start_line")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(1),
+                            span.get("end_line")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(1)
+                        )
+                    },
+                );
+                symbols.push(format!("{change} {kind} {qualified} {location}"));
+            }
+        }
+    }
+    println!(
+        "changes: {} files, {} changed symbols, {} direct callsites",
+        files.len(),
+        symbols.len(),
+        callsites
+    );
+    println!("tests: {known_tests} known_impacted, {unknown_tests} unknown_or_unindexed");
+    // The strict known/unknown split is a contract, and the agent needs the NAMES
+    // to decide what to run — counts alone are not actionable. Keep both headings
+    // and their entries, capped; the full lists stay in --json and the evidence pack.
+    for (heading, key) in [
+        ("known_impacted", "known_impacted"),
+        ("unknown_or_unindexed", "unknown_or_unindexed"),
+    ] {
+        let entries = value["tests"][key].as_array().cloned().unwrap_or_default();
+        println!("  {heading}:");
+        for entry in entries.iter().take(CHANGES_TEST_LIST_CAP) {
+            let name = entry
+                .get("test_symbol")
+                .or_else(|| entry.get("path"))
+                .or_else(|| entry.get("file"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| entry.as_str().unwrap_or("?"));
+            println!("    {name}");
+        }
+        if entries.len() > CHANGES_TEST_LIST_CAP {
+            println!(
+                "    … {} more (use --json)",
+                entries.len() - CHANGES_TEST_LIST_CAP
+            );
+        }
+    }
+    for symbol in &symbols {
+        println!("{symbol}");
+    }
+
+    let payload_text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let requested_base = base.unwrap_or("HEAD");
+    if let (Ok(store), Ok(project)) = (open_default_store_query_writer(root), project_for(root)) {
+        let summary = serde_json::json!({
+            "text": format!(
+                "{} changed symbols, {} callsites, {} known tests, {} unknown tests",
+                symbols.len(), callsites, known_tests, unknown_tests
+            ),
+            "changed_symbols": symbols.len(),
+            "callsites": callsites,
+            "known_impacted": known_tests,
+            "unknown_or_unindexed": unknown_tests,
+        });
+        if let Some(expand) = insert_expand_pack_best_effort(
+            &store,
+            &project,
+            "changes",
+            requested_base,
+            current_graph_generation_or_zero(&store, root),
+            summary,
+            payload_text,
+            Some(value),
+        ) {
+            println!("Expand: greppy expand {}", expand.id);
+        }
+    }
+    Ok(0)
 }
 
 fn dispatch_cache(command: CacheCommand, root: Option<&str>) -> Result<i32> {
@@ -2046,6 +3177,10 @@ fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
 /// * If it equals a recognised subcommand name → NOT a passthrough.
 /// * Otherwise (a flag like `-R`, a pattern, or nothing) → passthrough.
 fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
+    #[cfg(feature = "agent")]
+    if is_agent_invocation(argv) {
+        return false;
+    }
     let mut i = 1; // skip argv[0]
     while i < argv.len() {
         let tok = &argv[i];
@@ -2229,7 +3364,8 @@ fn dispatch_subcommand(
             }
         }
         Command::Map { path, json } => map::run(path.as_deref(), json, root),
-        Command::Changes { base, json } => changes::run(base.as_deref(), json, root),
+        Command::Outline { path, json, all } => dispatch_outline(&path, json, all, root),
+        Command::Changes { base, json } => dispatch_changes(base.as_deref(), json, root),
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Trial { args } => trial::run(args, root),
         Command::Verify { args } => Ok(verify::run(args, root)),
@@ -2258,7 +3394,8 @@ fn dispatch_subcommand(
             root,
         ),
         Command::Impact {
-            symbol,
+            symbols,
+            path_opts,
             code: _,
             direction,
             edge,
@@ -2267,108 +3404,171 @@ fn dispatch_subcommand(
             base,
             all,
             json,
-        } => dispatch_impact(
-            symbol.as_deref(),
-            &direction,
-            edge.as_deref(),
-            depth,
-            since.as_deref(),
-            base.as_deref(),
-            all,
-            json,
-            root,
-        ),
+        } => {
+            let targets = nav_targets(&symbols)?;
+            validate_path_filters(root, &path_opts, "--path")?;
+            if targets.len() > 1 {
+                return dispatch_nav_multi(NavMultiRequest {
+                    command: "impact",
+                    kind: NavKind::Impact,
+                    targets: &targets,
+                    paths: &path_opts,
+                    code: false,
+                    all,
+                    json,
+                    root,
+                    direction: &direction,
+                    edge: edge.as_deref(),
+                    depth,
+                });
+            }
+            dispatch_impact(
+                targets.first().map(String::as_str),
+                &path_opts,
+                &direction,
+                edge.as_deref(),
+                depth,
+                since.as_deref(),
+                base.as_deref(),
+                all,
+                json,
+                root,
+            )
+        }
         Command::Brief {
-            symbol,
-            mut paths,
-            path_opt,
+            symbols,
+            path_opts,
             code: _,
             all: _,
             json,
         } => {
-            if let Some(path) = path_opt {
-                paths.push(path);
+            let targets = nav_targets(&symbols)?;
+            validate_path_filters(root, &path_opts, "--path")?;
+            if targets.len() > 1 {
+                return dispatch_brief_multi(&targets, &path_opts, json, root);
             }
-            dispatch_brief(symbol.as_deref(), &paths, json, root)
+            dispatch_brief(targets.first().map(String::as_str), &path_opts, json, root)
         }
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
-            symbol,
-            symbol_opt,
-            path,
-            path_opt,
+            targets,
+            symbol_opts,
+            path_opts,
             lines,
+            context,
             handle,
             code: _,
             json,
+            all: _,
         } => {
-            let positional_symbol = symbol.as_deref();
-            let flagged_symbol = symbol_opt.as_deref();
-            let flagged_path = path_opt.as_deref();
-
-            // `read --path FILE [--line N[:M]]` is the flag-form file read.
+            set_cli_read_context(context);
+            let plan = read_plan(&targets, &symbol_opts, &path_opts, lines.as_deref())?;
+            if plan.subjects.len() > 1 {
+                return dispatch_read_multi(&plan, handle, json, root);
+            }
+            let subject = plan.subjects.first().cloned();
             // A path-qualified symbol (`FILE::Symbol`) must reach graph
             // resolution instead of being mistaken for a slash-containing
             // filesystem path.
-            if flagged_symbol.is_none() && path.is_none() {
-                if let Some(file) = flagged_path.filter(|_| positional_symbol.is_none()) {
-                    return dispatch_read_file(file, lines.as_deref(), handle, json, root);
-                }
-                if let Some(subject) = positional_symbol {
+            if !plan.forced_symbol {
+                if let Some(subject) = subject.as_deref() {
+                    // Every greppy result line is printed as `path:START-END`, so agents
+                    // paste that form straight back into `read`. Accept it: split the
+                    // trailing `:START[-END]` off and treat it as `--lines`. Without this
+                    // the whole string is looked up as a symbol name and answers
+                    // "no exact match", which cost turns in the measured runs.
+                    if plan.lines.is_none() {
+                        if let Some((file, range)) = split_trailing_line_range(subject) {
+                            if read_subject_is_path(file, root)? {
+                                return dispatch_read_file(file, Some(&range), handle, json, root);
+                            }
+                        }
+                    }
                     if split_path_qualified(subject).is_none()
                         && read_subject_is_path(subject, root)?
                     {
-                        return dispatch_read_file(subject, lines.as_deref(), handle, json, root);
+                        return dispatch_read_file(
+                            subject,
+                            plan.lines.as_deref(),
+                            handle,
+                            json,
+                            root,
+                        );
+                    }
+                    if looks_like_path(subject) {
+                        // Path-shaped and not on disk: keep the file answer
+                        // (closest-paths guidance) instead of hunting for a
+                        // symbol that cannot exist under that name.
+                        return dispatch_read_file(
+                            subject,
+                            plan.lines.as_deref(),
+                            handle,
+                            json,
+                            root,
+                        );
                     }
                 }
             }
-            if lines.is_some() {
+            if plan.lines.is_some() {
                 return Err(Error::Invalid(
                     "read --lines/--line N[:M] requires a file path (for symbols, omit the line flag)"
                         .into(),
                 ));
             }
-            let symbol = flagged_symbol.or(positional_symbol);
-            let folded = qualify_symbol_with_path(symbol, path.as_deref().or(flagged_path));
-            dispatch_read(folded.as_deref().or(symbol), handle, json, root)
+            dispatch_read(subject.as_deref(), handle, json, root)
         }
-        Command::Edit { command } => dispatch_edit(command, root),
+        Command::Edit { command, json } => dispatch_edit(command, json, root),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
         Command::WhoCalls {
-            symbol,
-            mut paths,
+            symbols,
             path_opts,
             code,
             all,
             json,
-        } => {
-            paths.extend(path_opts);
-            dispatch_who_calls(symbol.as_deref(), &paths, code, all, json, root)
-        }
+        } => dispatch_nav(
+            "who-calls",
+            NavKind::WhoCalls,
+            &symbols,
+            &path_opts,
+            code,
+            all,
+            json,
+            root,
+        ),
         Command::Callees {
-            symbol,
-            mut paths,
+            symbols,
             path_opts,
             code,
             all,
             json,
-        } => {
-            paths.extend(path_opts);
-            dispatch_callees(symbol.as_deref(), &paths, code, all, json, root)
-        }
+        } => dispatch_nav(
+            "callees",
+            NavKind::Callees,
+            &symbols,
+            &path_opts,
+            code,
+            all,
+            json,
+            root,
+        ),
         Command::FindUsages {
-            symbol,
-            mut paths,
+            symbols,
             path_opts,
             code,
             all,
             json,
-        } => {
-            paths.extend(path_opts);
-            dispatch_find_usages(symbol.as_deref(), &paths, code, all, json, root)
-        }
+        } => dispatch_nav(
+            "find-usages",
+            NavKind::FindUsages,
+            &symbols,
+            &path_opts,
+            code,
+            all,
+            json,
+            root,
+        ),
         Command::References {
             symbol,
             code,
@@ -2414,9 +3614,18 @@ fn dispatch_subcommand(
             since,
             base,
             json,
+            no_code,
+            fixed,
             code: _,
             all: _,
         } => {
+            // `AGENTS.md` keeps `search-code "PATTERN" [PATH …]`: the grep-shaped
+            // verb is the one place where a positional path is the convention,
+            // not a filter smuggled in behind a target. Rule 1 still applies to
+            // it — a path that is not there cannot narrow anything, so it is a
+            // mistake, never an empty scope.
+            validate_path_filters(root, &paths, "path")?;
+            validate_path_filters(root, &path_opts, "--path")?;
             paths.extend(path_opts);
             dispatch_search_code(
                 query.as_deref(),
@@ -2426,20 +3635,22 @@ fn dispatch_subcommand(
                 since.as_deref(),
                 base.as_deref(),
                 json,
+                no_code,
+                fixed,
                 root,
             )
         }
         Command::SearchSymbols {
-            query,
-            mut paths,
+            queries,
             path_opts,
             kind,
             json,
             code: _,
             all: _,
         } => {
-            paths.extend(path_opts);
-            dispatch_search_symbols(query.as_deref(), &paths, kind.as_deref(), json, root)
+            let targets = nav_targets(&queries)?;
+            validate_path_filters(root, &path_opts, "--path")?;
+            dispatch_search_symbols_multi(&targets, &path_opts, kind.as_deref(), json, root)
         }
         Command::Plus {
             query,
@@ -2457,21 +3668,32 @@ fn dispatch_subcommand(
             root,
         ),
         Command::Semantic {
-            query,
-            mut paths,
-            path_opt,
+            queries,
+            path_opts,
             json,
         } => {
-            if let Some(path) = path_opt {
-                paths.push(path);
+            validate_path_filters(root, &path_opts, "--path")?;
+            let queries = semantic_queries(&queries)?;
+            let mut last = 0;
+            for query in &queries {
+                last = dispatch_semantic(
+                    Some(query.as_str()),
+                    &path_opts,
+                    json,
+                    EmbeddingCliArgs { device, no_gpu },
+                    root,
+                )?;
             }
-            dispatch_semantic(
-                query.as_deref(),
-                &paths,
-                json,
-                EmbeddingCliArgs { device, no_gpu },
-                root,
-            )
+            if queries.is_empty() {
+                last = dispatch_semantic(
+                    None,
+                    &path_opts,
+                    json,
+                    EmbeddingCliArgs { device, no_gpu },
+                    root,
+                )?;
+            }
+            Ok(last)
         }
         Command::Context {
             query,
@@ -2714,8 +3936,9 @@ fn resolve_qualified_ids(
         .filter(|r| {
             is_primary_label(&r.label)
                 && (r.name.eq_ignore_ascii_case(symbol)
-                    || (r.name == member
-                        && qname_owner_segment(&r.qualified_name) == Some(owner_tail)))
+                    || (r.name.eq_ignore_ascii_case(member)
+                        && qname_owner_segment(&r.qualified_name)
+                            .is_some_and(|owner| owner.eq_ignore_ascii_case(owner_tail))))
         })
         .map(|r| r.id)
         .collect();
@@ -2889,22 +4112,89 @@ fn suggestion_needles(query: &str) -> Vec<String> {
     needles
 }
 
-fn symbol_miss_suggestions(store: &greppy_store::Store, project: &str, query: &str) -> Vec<String> {
-    let mut suggestions = Vec::new();
-    for needle in suggestion_needles(query) {
-        let mut similar = store
-            .similar_node_names(project, &needle, 5)
-            .unwrap_or_default();
-        similar.sort_by_key(|name| !name.eq_ignore_ascii_case(&needle));
-        for name in similar {
-            if !suggestions.iter().any(|candidate| candidate == &name) {
-                suggestions.push(name);
+fn fuzzy_symbol_name_probes(needle: &str) -> Vec<String> {
+    let characters = needle.chars().collect::<Vec<_>>();
+    let len = characters.len();
+    let mut probes = Vec::new();
+    let mut push_probe = |probe: String| {
+        if probe.chars().count() >= 3 && !probes.iter().any(|existing| existing == &probe) {
+            probes.push(probe);
+        }
+    };
+    push_probe(needle.to_string());
+    if len > 3 {
+        let prefix_lengths = [
+            len.saturating_sub(1),
+            len.saturating_sub(2),
+            len.saturating_mul(3) / 4,
+            len / 2,
+            3,
+        ];
+        for prefix_len in prefix_lengths {
+            if prefix_len >= 3 && prefix_len < len {
+                push_probe(characters[..prefix_len].iter().collect());
             }
-            if suggestions.len() == 5 {
-                return suggestions;
+        }
+        let suffix_starts = [1, 2, len / 4, len / 2, len.saturating_sub(3)];
+        for suffix_start in suffix_starts {
+            if suffix_start < len && len - suffix_start >= 3 {
+                push_probe(characters[suffix_start..].iter().collect());
             }
         }
     }
+    probes
+}
+
+fn symbol_name_distance(name: &str, needles: &[String]) -> usize {
+    let name = name.to_ascii_lowercase();
+    needles
+        .iter()
+        .map(|needle| levenshtein(&name, &needle.to_ascii_lowercase()))
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+fn is_near_symbol_name(name: &str, needles: &[String]) -> bool {
+    let name_lower = name.to_ascii_lowercase();
+    needles.iter().any(|needle| {
+        let needle_lower = needle.to_ascii_lowercase();
+        let needle_len = needle_lower.chars().count();
+        let distance = levenshtein(&name_lower, &needle_lower);
+        let threshold = match needle_len {
+            0..=4 => 1,
+            5..=8 => 2,
+            _ => (needle_len / 3).max(3),
+        };
+        distance <= threshold
+            || (needle_len >= 3
+                && (name_lower.contains(&needle_lower) || needle_lower.contains(&name_lower)))
+    })
+}
+
+fn symbol_miss_suggestions(store: &greppy_store::Store, project: &str, query: &str) -> Vec<String> {
+    let needles = suggestion_needles(query);
+    let mut suggestions = Vec::new();
+    for needle in &needles {
+        for probe in fuzzy_symbol_name_probes(needle) {
+            for name in store
+                .similar_node_names(project, &probe, 25)
+                .unwrap_or_default()
+            {
+                if !suggestions.iter().any(|candidate| candidate == &name) {
+                    suggestions.push(name);
+                }
+            }
+        }
+    }
+    suggestions.retain(|name| is_near_symbol_name(name, &needles));
+    suggestions.sort_by(|left, right| {
+        symbol_name_distance(left, &needles)
+            .cmp(&symbol_name_distance(right, &needles))
+            .then_with(|| left.len().cmp(&right.len()))
+            .then_with(|| left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()))
+            .then_with(|| left.cmp(right))
+    });
+    suggestions.truncate(5);
     suggestions
 }
 
@@ -2951,6 +4241,32 @@ fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
             .and_then(|e| e.to_str())
             .is_some_and(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()));
     looks_like_path.then(|| (head, &query[idx + 2..]))
+}
+
+fn indexed_path_matches_query(indexed_path: &str, query_path: &str) -> bool {
+    let normalized_query = query_path.replace('\\', "/");
+    if normalized_query.contains('/') {
+        indexed_path == normalized_query.trim_start_matches("./")
+    } else {
+        std::path::Path::new(indexed_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(normalized_query.as_str())
+    }
+}
+
+fn accepted_symbol_spelling(query: &str) -> Option<&'static str> {
+    if let Some((path, _)) = split_path_qualified(query) {
+        return Some(if path.contains('/') || path.contains('\\') {
+            "path-qualified `path/file::Symbol` spelling"
+        } else {
+            "bare-file-qualified `file.ext::Symbol` spelling"
+        });
+    }
+    if query.contains('.') && split_qualified(query).is_some() {
+        return Some("dotted `Owner.method` spelling");
+    }
+    None
 }
 
 /// Fold an optional disambiguating file path into a `path::SYMBOL` query so the
@@ -3004,9 +4320,9 @@ fn resolve_symbol_nodes(store: &greppy_store::Store, symbol: Option<&str>) -> Re
         let in_path: Vec<&greppy_search::graph::SearchGraphRow> = rows
             .iter()
             .filter(|r| {
-                r.name == name
+                r.name.eq_ignore_ascii_case(name)
                     && is_primary_label(&r.label)
-                    && r.qualified_name.starts_with(&format!("{path}::"))
+                    && indexed_path_matches_query(&r.file_path, path)
             })
             .collect();
         // If a middle segment was given (Kind label or owner), prefer the
@@ -3846,6 +5162,10 @@ fn current_graph_generation_or_zero(store: &greppy_store::Store, root: Option<&s
 fn node_hit_json(node: &greppy_store::Node) -> serde_json::Value {
     serde_json::json!({
         "qualified_name": &node.qualified_name,
+        // AGENTS.md prints every result as `qualified_name file:line`; the JSON
+        // carries the same two fields under the same names, plus the span.
+        "file": &node.file_path,
+        "line": node.start_line,
         "file_path": &node.file_path,
         "start_line": node.start_line,
         "end_line": node.end_line,
@@ -3901,9 +5221,23 @@ fn nav_counts_json_with_expand(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let incomplete_providers = incomplete_provider_json(store, project)?;
+    // Rule 3: a one-symbol answer is a batch of one. The caller parses ONE
+    // shape — `targets` plus per-hit attribution — however many symbols it
+    // named.
+    let mut hits = hits;
+    for hit in &mut hits {
+        if hit.get("target").is_none() {
+            hit["target"] = serde_json::json!(symbol);
+        }
+    }
     let mut v = serde_json::json!({
         "command": command,
         "symbol": symbol,
+        "targets": [{
+            "symbol": symbol,
+            "symbol_found": symbol_found,
+            "total_exact": total_exact,
+        }],
         "project": project,
         "symbol_found": symbol_found,
         "fresh": fresh,
@@ -4248,6 +5582,7 @@ fn impact_counts_json(
         all,
         meta,
         hits,
+        Vec::new(),
         None,
     )
 }
@@ -4264,6 +5599,7 @@ fn impact_counts_json_with_expand(
     all: bool,
     meta: ImpactJsonMeta<'_>,
     hits: Vec<serde_json::Value>,
+    tests: Vec<serde_json::Value>,
     expand: Option<&ExpandHandle>,
 ) -> Result<()> {
     let omitted = total_exact.saturating_sub(shown);
@@ -4275,9 +5611,22 @@ fn impact_counts_json_with_expand(
     // Only real code providers count toward impact completeness; `.stderr` /
     // `.snap` snapshot files are not callers (see `code_incomplete_provider_json`).
     let incomplete_providers = code_incomplete_provider_json(store, project)?;
+    // Rule 3: the one-symbol answer has the same shape as a batch of several.
+    let mut hits = hits;
+    for hit in &mut hits {
+        if hit.get("target").is_none() {
+            hit["target"] = serde_json::json!(symbol);
+        }
+    }
     let mut v = serde_json::json!({
         "command": "impact",
         "symbol": symbol,
+        "targets": [{
+            "symbol": symbol,
+            "symbol_found": symbol_found,
+            "total_exact": total_exact,
+            "tests": tests,
+        }],
         "project": project,
         "symbol_found": symbol_found,
         "fresh": fresh,
@@ -4958,6 +6307,12 @@ fn freshness_serve_decision(
 /// stale gate to refuse. Best-effort: a failed reindex leaves the old store,
 /// and the gate then decides.
 fn maybe_reindex_stale(store: &mut greppy_store::Store, root: Option<&str>) -> Result<()> {
+    // An explicit auto-reindex opt-out must fall through to the fail-closed
+    // stale gate. In particular, do not wait on an active writer that the
+    // caller has said must not be joined for automatic healing.
+    if !auto_reindex_enabled() {
+        return Ok(());
+    }
     let project = project_for(root)?;
     if freshness_is_reindexable_stale(store, root, &project) {
         let rebuilt = try_auto_reindex_inline(root);
@@ -5005,7 +6360,32 @@ fn freshness_is_reindexable_stale(
         .get("state")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    freshness_state_can_trigger_reindex(state)
+    if !freshness_state_can_trigger_reindex(state) {
+        return false;
+    }
+    let scope_or_version_drift = freshness
+        .get("reasons")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|reasons| {
+            reasons
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|reason| reason.contains("indexer version/scope"))
+        });
+    if scope_or_version_drift {
+        return version_drift_is_scope_stable(&freshness);
+    }
+    if metadata_only_fingerprint_drift(&freshness) {
+        return false;
+    }
+    freshness
+        .get("stale_file_count")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|count| {
+            count as usize <= AUTO_REINDEX_MAX_FILES
+                && freshness_changed_bytes(root, &freshness)
+                    .is_some_and(|bytes| bytes <= 8 * 1024 * 1024)
+        })
 }
 
 /// `allow_auto_reindex = false` for a surface that cannot guarantee its
@@ -6054,12 +7434,10 @@ fn read_source_line(root: &std::path::Path, file_path: &str, line: u32) -> Optio
     Some(s)
 }
 
-fn ensure_nav_json_mode(code: bool, json: bool) -> Result<()> {
-    if code && json {
-        return Err(Error::Invalid(
-            "--json cannot be combined with --code for navigation commands".into(),
-        ));
-    }
+/// `--code` and `--json` compose: AGENTS.md gives `--code` as "also print each
+/// result's source and a handle for it" and `--json` as "the same answer as
+/// data", so the source and the handle belong ON the hit.
+fn ensure_nav_json_mode(_code: bool, _json: bool) -> Result<()> {
     Ok(())
 }
 
@@ -6362,6 +7740,7 @@ fn dispatch_trace(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_impact(
     symbol: Option<&str>,
+    paths: &[String],
     direction: &str,
     edge: Option<&str>,
     depth: usize,
@@ -6371,6 +7750,7 @@ fn dispatch_impact(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
+    let path_filters = prepare_query_path_filters(root, "impact", symbol.unwrap_or(""), paths)?;
     let dir = match direction.to_ascii_lowercase().as_str() {
         "incoming" | "in" | "callers" => greppy_search::ReachDirection::Incoming,
         "outgoing" | "out" | "callees" => greppy_search::ReachDirection::Outgoing,
@@ -6520,6 +7900,17 @@ fn dispatch_impact(
     }
     let mut reached: Vec<greppy_search::ImpactNode> = by_id.into_values().collect();
     reached.sort_by(|a, b| a.hops.cmp(&b.hops).then_with(|| a.node.id.cmp(&b.node.id)));
+    reached.retain(|n| path_filters.matches(&n.node.file_path));
+    // "and the tests among it" — the reason to run impact before a change is
+    // to learn which tests will speak up.
+    let mut impact_tests = Vec::new();
+    for step in &reached {
+        if let Some(node) = store.get_node(step.node.id)? {
+            if is_test_node(&node) {
+                impact_tests.push(node_hit_json(&node));
+            }
+        }
+    }
     if reached.is_empty() {
         if json {
             impact_counts_json(
@@ -6597,6 +7988,8 @@ fn dispatch_impact(
                     "hops": n.hops,
                     "qualified_name": &n.node.qualified_name,
                     "label": &n.node.label,
+                    "file": &n.node.file_path,
+                    "line": n.node.start_line,
                     "file_path": &n.node.file_path,
                     "start_line": n.node.start_line,
                     "end_line": n.node.end_line,
@@ -6620,6 +8013,7 @@ fn dispatch_impact(
                 scope: "transitive",
             },
             hits,
+            impact_tests,
             expand.as_ref(),
         )?;
         return Ok(0);
@@ -6870,15 +8264,47 @@ fn read_subject_is_path(subject: &str, root: Option<&str>) -> Result<bool> {
     {
         return Ok(true);
     }
-    let path_extension = supplied.extension().and_then(|extension| extension.to_str());
+    let path_extension = supplied
+        .extension()
+        .and_then(|extension| extension.to_str());
     Ok(matches!(
         path_extension,
         Some(
-            "rs" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "go"
-                | "rb" | "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh"
-                | "cs" | "php" | "sh" | "bash" | "lua" | "kt" | "kts" | "scala"
-                | "sc" | "swift" | "zig" | "r" | "json" | "toml" | "yaml" | "yml"
-                | "md" | "txt"
+            "rs" | "py"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "ts"
+                | "tsx"
+                | "go"
+                | "rb"
+                | "java"
+                | "c"
+                | "h"
+                | "cpp"
+                | "cc"
+                | "cxx"
+                | "hpp"
+                | "hh"
+                | "cs"
+                | "php"
+                | "sh"
+                | "bash"
+                | "lua"
+                | "kt"
+                | "kts"
+                | "scala"
+                | "sc"
+                | "swift"
+                | "zig"
+                | "r"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "md"
+                | "txt"
         )
     ))
 }
@@ -6936,11 +8362,32 @@ fn closest_read_paths(root_path: &std::path::Path, subject: &str) -> Result<Vec<
         .collect::<Vec<_>>();
     ranked.sort();
     ranked.dedup_by(|left, right| left.1 == right.1);
-    Ok(ranked
-        .into_iter()
-        .take(5)
-        .map(|(_, path)| path)
-        .collect())
+    Ok(ranked.into_iter().take(5).map(|(_, path)| path).collect())
+}
+
+/// Split a trailing `:START[-END]` (or `:START[:END]`) off a read subject.
+///
+/// greppy prints spans as `path:120-160`, so that is what an agent hands back.
+/// Returns the bare path and the range in the `START:END` form `--lines` takes.
+/// A path-qualified symbol (`file.rs::Symbol`) is left alone.
+fn split_trailing_line_range(subject: &str) -> Option<(&str, String)> {
+    if subject.contains("::") {
+        return None;
+    }
+    let (path, tail) = subject.rsplit_once(':')?;
+    if path.is_empty() || tail.is_empty() {
+        return None;
+    }
+    let (start, end) = match tail.split_once(['-', ':']) {
+        Some((start, end)) => (start, if end.is_empty() { start } else { end }),
+        None => (tail, tail),
+    };
+    let start: usize = start.parse().ok()?;
+    let end: usize = end.parse().ok()?;
+    if start == 0 || end < start {
+        return None;
+    }
+    Some((path, format!("{start}:{end}")))
 }
 
 fn dispatch_read_file(
@@ -7047,10 +8494,14 @@ fn dispatch_read_file(
             .map_err(|error| Error::Invalid(format!("serialize read file JSON: {error}")))?
         );
     } else {
+        // The header already states the span, so a per-line number repeats it
+        // once per line. Measured over a 41-task benchmark that repetition was
+        // 16.6% of everything `read` returned -- about 12,600 characters per
+        // task, re-billed on every subsequent turn -- while edits are addressed
+        // by content or by handle, not by line number.
         println!("{shown_path}:{start}-{end}");
-        let width = end.max(start).to_string().len();
-        for (offset, text) in selected.iter().enumerate() {
-            println!("{:>width$} | {text}", start + offset);
+        for text in selected {
+            println!("{text}");
         }
         if let Some(token) = &handle_token {
             println!("handle: {token}");
@@ -7103,6 +8554,17 @@ fn dispatch_read(
                 nodes.push(node);
             }
         }
+    }
+    // The per-file synthetic anchor answers to the file stem, so `greet` also
+    // hits `pkg/greet.go` and a unique definition reads as ambiguous. A file is
+    // read by path; the anchor only stands in when nothing else answered.
+    if nodes
+        .iter()
+        .any(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name))
+    {
+        nodes.retain(|node| {
+            !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+        });
     }
     if nodes.is_empty() {
         // Exact/graph resolution missed. greppy has an EMBEDDING engine
@@ -7227,10 +8689,13 @@ fn dispatch_read(
         context: format!("read {}", abs.display()),
         source,
     })?;
+    // `--context N` widens the span upwards only: the doc comment sits above the
+    // signature, and a definition's own end is where it ends.
+    let start_line = (node.start_line - cli_read_context()).max(1);
     let Some(span) = read_span_with_meta(
         &root_path,
         &node.file_path,
-        node.start_line,
+        start_line,
         node.end_line,
         usize::MAX,
         false,
@@ -7243,7 +8708,7 @@ fn dispatch_read(
     };
     // line range -> byte range against the SAME live bytes
     let (byte_start, byte_end) =
-        line_range_to_bytes(&content, node.start_line as usize, span.end_line as usize);
+        line_range_to_bytes(&content, start_line as usize, span.end_line as usize);
     let handle_token = if with_handle {
         let mut handle = greppy_edit::EditHandle::for_range(
             &root_path,
@@ -7349,38 +8814,8 @@ fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
     })
 }
 
-fn reject_target_as_content_file(
-    content_file: &str,
-    target_file: &std::path::Path,
-    verb: &str,
-    symbol: Option<&str>,
-) -> Result<()> {
-    if content_file == "-" {
-        return Ok(());
-    }
-    let content_path = std::path::Path::new(content_file);
-    let content_canonical = content_path.canonicalize().map_err(|source| Error::Io {
-        context: format!("canonicalize content file {content_file}"),
-        source,
-    })?;
-    let target_canonical = target_file.canonicalize().map_err(|source| Error::Io {
-        context: format!("canonicalize edit target {}", target_file.display()),
-        source,
-    })?;
-    if content_canonical != target_canonical {
-        return Ok(());
-    }
-    let selector = symbol
-        .map(|symbol| format!("--symbol {}", shell_quote_cli(symbol)))
-        .unwrap_or_else(|| "--target HANDLE".into());
-    Err(Error::Invalid(format!(
-        "status: invalid-request\n--content-file must contain only the new content, not the target file {}; retry with: printf '%s\\n' 'NEW_CONTENT' | greppy edit {verb} {selector} --content-file -",
-        target_file.display()
-    )))
-}
-
-fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
-    match dispatch_edit_inner(command, root) {
+fn dispatch_edit(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
+    match dispatch_edit_inner(command, json, root) {
         Err(error @ Error::Invalid(_)) => {
             eprintln!("greppy: {error}");
             Ok(20)
@@ -7389,34 +8824,15 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
     }
 }
 
-fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> {
+fn dispatch_edit_inner(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
     let root_path = resolve_root(root)?;
-    let command = match command {
-        EditCommand::PlanTemplate { op } => {
-            let template = if op == "replace-body" {
-                r#"{
-  "_comment": "Replace only a symbol body. workspace, schema_version, id, and publish are optional in this shorthand.",
-  "operations": [
-    {
-      "file": "src/lib.rs",
-      "symbol": "target",
-      "new_body": "{\n    42\n}"
-    }
-  ]
-}"#
-            } else {
-                greppy_edit::plan::MINIMAL_PLAN_EXAMPLE.trim()
-            };
-            println!("{template}");
-            return Ok(0);
-        }
-        command => command,
+    // The four operations of the new grammar, the whole-file verbs and `undo`
+    // answer with an edit record - file, span, resulting text, handle - rather
+    // than a certificate, so they are dispatched before the certificate verbs.
+    let command = match dispatch_edit_grammar(command, json, root, &root_path)? {
+        GrammarDispatch::Handled(code) => return Ok(code),
+        GrammarDispatch::Passthrough(command) => *command,
     };
-    #[derive(PartialEq)]
-    enum EditCommandKind {
-        InsertBefore,
-        Other,
-    }
     fn resolved_options(
         dry_run: bool,
         range: (usize, usize),
@@ -7432,149 +8848,97 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             ..Default::default()
         }
     }
-    let command_kind = match &command {
-        EditCommand::InsertBefore { .. } => EditCommandKind::InsertBefore,
-        _ => EditCommandKind::Other,
-    };
     let (certificate, report_path) = match command {
-        EditCommand::TextCas {
-            file,
-            old_file,
-            new_file,
-            old: old_inline,
-            new: new_inline,
+        EditCommand::Rename {
+            symbol,
+            r#in,
+            call,
+            to,
             expect,
+            expect_residual,
             dry_run,
             report,
-        } => {
-            fn text_arg(
-                inline: Option<String>,
-                path: Option<String>,
-                which: &str,
-            ) -> Result<Vec<u8>> {
-                match (inline, path) {
-                    (Some(s), None) => Ok(s.into_bytes()),
-                    (None, Some(p)) => std::fs::read(&p).map_err(|source| Error::Io {
-                        context: format!("read {p}"),
-                        source,
-                    }),
-                    _ => Err(Error::Invalid(format!(
-                        "text-cas needs exactly one of --{which} STR or --{which}-file FILE"
-                    ))),
+        } => match (symbol, r#in, call) {
+            (Some(symbol), None, None) => {
+                let new_name = to;
+            let store = open_default_store_query_writer(root)?;
+            let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
+            let mut def_nodes = Vec::new();
+            for id in &ids {
+                if let Some(node) = store.get_node(*id)? {
+                    if !node.file_path.is_empty() && node.start_line >= 1 {
+                        def_nodes.push(node);
+                    }
                 }
             }
-            let old = text_arg(old_inline, old_file, "old")?;
-            let new = text_arg(new_inline, new_file, "new")?;
-            let target = resolve_edit_file(&root_path, &file);
+            if def_nodes.is_empty() {
+                println!("no symbol `{symbol}`");
+                return Ok(10);
+            }
+            let short_name = def_nodes[0].name.clone();
+            // collect per-file scopes: definition files fully (definition,
+            // same-file usages, imports), and every referencing node's span
+            use std::collections::BTreeMap;
+            let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+            for def in &def_nodes {
+                scopes
+                    .entry(def.file_path.clone())
+                    .or_default()
+                    .push((0, usize::MAX));
+                for edge in store.incoming_edges(def.id, None, 100_000)? {
+                    if let Some(src) = store.get_node(edge.source_id)? {
+                        if src.file_path.is_empty() || src.start_line < 1 {
+                            continue;
+                        }
+                        let abs = root_path.join(&src.file_path);
+                        let Ok(content) = std::fs::read(&abs) else {
+                            continue;
+                        };
+                        let Some(span) = read_span_with_meta(
+                            &root_path,
+                            &src.file_path,
+                            src.start_line,
+                            src.end_line,
+                            usize::MAX,
+                            false,
+                        ) else {
+                            continue;
+                        };
+                        let range = line_range_to_bytes(
+                            &content,
+                            src.start_line as usize,
+                            span.end_line as usize,
+                        );
+                        scopes.entry(src.file_path.clone()).or_default().push(range);
+                    }
+                }
+            }
+            // import lines in every affected file: cover the whole file for
+            // files that already have narrower spans is wasteful, so add a
+            // full-file span only where imports may bind the name
+            let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
+                .into_iter()
+                .map(|(rel_path, spans)| greppy_edit::verbs::RenameFileScope { rel_path, spans })
+                .collect();
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                expect_residual: Some(expect_residual),
                 ..Default::default()
             };
             (
-                greppy_edit::verbs::text_cas(&root_path, &target, &old, &new, expect, &options)?,
+                greppy_edit::verbs::rename_symbol_files(
+                    &root_path,
+                    &scope_vec,
+                    &short_name,
+                    &new_name,
+                    &options,
+                )?,
                 report,
             )
-        }
-        EditCommand::ReplaceBody {
-            symbol,
-            target,
-            content_file,
-            dry_run,
-            report,
-        } => {
-            match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
-                EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved {
-                    rel_path,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                } => {
-                    let abs = root_path.join(&rel_path);
-                    reject_target_as_content_file(
-                        &content_file,
-                        &abs,
-                        "replace-body",
-                        symbol.as_deref(),
-                    )?;
-                    let new_body = read_source_arg(&content_file)?;
-                    let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                    let options = resolved_options(
-                        dry_run,
-                        range,
-                        planned_file_sha256,
-                        planned_target_sha256,
-                    );
-                    (
-                        greppy_edit::verbs::replace_body(
-                            &root_path, &abs, range, &new_body, language, &options,
-                        )?,
-                        report,
-                    )
-                }
             }
-        }
-        EditCommand::InsertAfter {
-            symbol,
-            target,
-            content_file,
-            dry_run,
-            report,
-        }
-        | EditCommand::InsertBefore {
-            symbol,
-            target,
-            content_file,
-            dry_run,
-            report,
-        } => {
-            let (position, verb) = if matches!(command_kind, EditCommandKind::InsertBefore) {
-                (greppy_edit::verbs::InsertPosition::Before, "insert-before")
-            } else {
-                (greppy_edit::verbs::InsertPosition::After, "insert-after")
-            };
-            match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
-                EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved {
-                    rel_path,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                } => {
-                    let abs = root_path.join(&rel_path);
-                    reject_target_as_content_file(&content_file, &abs, verb, symbol.as_deref())?;
-                    let text = read_source_arg(&content_file)?;
-                    let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                    let options = resolved_options(
-                        dry_run,
-                        range,
-                        planned_file_sha256,
-                        planned_target_sha256,
-                    );
-                    (
-                        greppy_edit::verbs::insert_adjacent(
-                            &root_path,
-                            &abs,
-                            range,
-                            &text,
-                            position,
-                            Some(language),
-                            &options,
-                        )?,
-                        report,
-                    )
-                }
-            }
-        }
-        EditCommand::RenameCall {
-            in_symbol,
-            from,
-            to,
-            expect,
-            dry_run,
-            report,
-        } => match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
+            (None, Some(in_symbol), Some(from)) => {
+                match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
             EditTarget::Refusal(cert) => (*cert, report),
             EditTarget::Resolved {
                 rel_path,
@@ -7593,34 +8957,12 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                     report,
                 )
             }
-        },
-        EditCommand::Delete {
-            symbol,
-            target,
-            dry_run,
-            report,
-        } => match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
-            EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
-                let abs = root_path.join(&rel_path);
-                let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options =
-                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
-                (
-                    greppy_edit::verbs::delete_span(
-                        &root_path,
-                        &abs,
-                        range,
-                        Some(language),
-                        &options,
-                    )?,
-                    report,
-                )
+                }
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "rename takes --symbol S --to N, or --in S --call A --to B".into(),
+                ))
             }
         },
         EditCommand::ChangeSignature {
@@ -7759,14 +9101,11 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
         EditCommand::EnsureMethod {
             symbol,
             name,
-            source_file,
+            content_file,
             dry_run,
             report,
         } => {
-            let source = std::fs::read_to_string(&source_file).map_err(|source| Error::Io {
-                context: format!("read {source_file}"),
-                source,
-            })?;
+            let source = String::from_utf8_lossy(&read_source_arg(&content_file)?).into_owned();
             match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
@@ -7776,6 +9115,30 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                     planned_target_sha256,
                 } => {
                     let abs = root_path.join(&rel_path);
+                    // Rust keeps a type and its methods apart: `struct Greeter;`
+                    // has no body at all and the methods live in `impl Greeter`.
+                    // `--symbol Greeter` names the type, so a definition without
+                    // a body is followed to its inherent impl block instead of
+                    // being reported as a class with nowhere to add a method.
+                    let (range, planned_target_sha256) = std::fs::read(&abs)
+                        .ok()
+                        .filter(|content| {
+                            !content[range.0.min(content.len())..range.1.min(content.len())]
+                                .contains(&b'{')
+                        })
+                        .and_then(|content| {
+                            let block = rust_inherent_impl_range(&content, &symbol)?;
+                            let planned = greppy_edit::EditHandle::for_range(
+                                &root_path,
+                                std::path::Path::new(&rel_path),
+                                &content,
+                                block.0,
+                                block.1,
+                            )
+                            .ok()?;
+                            Some((block, planned.target_sha256))
+                        })
+                        .unwrap_or((range, planned_target_sha256));
                     let options = resolved_options(
                         dry_run,
                         range,
@@ -7819,129 +9182,6 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 )
             }
         },
-        EditCommand::RemoveIfPresent {
-            symbol,
-            dry_run,
-            report,
-        } => {
-            let (resolved, options) =
-                match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
-                    EditTarget::Resolved {
-                        rel_path,
-                        range,
-                        planned_file_sha256,
-                        planned_target_sha256,
-                    } => (
-                        Some((root_path.join(&rel_path), range)),
-                        resolved_options(
-                            dry_run,
-                            range,
-                            planned_file_sha256,
-                            planned_target_sha256,
-                        ),
-                    ),
-                    EditTarget::Refusal(cert) if cert.status == greppy_edit::Status::NotFound => (
-                        None,
-                        greppy_edit::verbs::VerbOptions {
-                            dry_run,
-                            with_diff: true,
-                            ..Default::default()
-                        },
-                    ),
-                    EditTarget::Refusal(cert) => {
-                        return finish_edit(*cert, report, root, &root_path)
-                    }
-                };
-            (
-                greppy_edit::ensure::remove_if_present(&root_path, resolved, &options)?,
-                report,
-            )
-        }
-        EditCommand::RenameSymbol {
-            symbol,
-            new_name,
-            backend,
-            expect_residual,
-            dry_run,
-            report,
-        } => {
-            greppy_edit::verbs::require_semantic_backend(&backend)?;
-            let store = open_default_store_query_writer(root)?;
-            let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
-            let mut def_nodes = Vec::new();
-            for id in &ids {
-                if let Some(node) = store.get_node(*id)? {
-                    if !node.file_path.is_empty() && node.start_line >= 1 {
-                        def_nodes.push(node);
-                    }
-                }
-            }
-            if def_nodes.is_empty() {
-                println!("rename-symbol: `{symbol}` not found");
-                return Ok(10);
-            }
-            let short_name = def_nodes[0].name.clone();
-            // collect per-file scopes: definition files fully (definition,
-            // same-file usages, imports), and every referencing node's span
-            use std::collections::BTreeMap;
-            let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-            for def in &def_nodes {
-                scopes
-                    .entry(def.file_path.clone())
-                    .or_default()
-                    .push((0, usize::MAX));
-                for edge in store.incoming_edges(def.id, None, 100_000)? {
-                    if let Some(src) = store.get_node(edge.source_id)? {
-                        if src.file_path.is_empty() || src.start_line < 1 {
-                            continue;
-                        }
-                        let abs = root_path.join(&src.file_path);
-                        let Ok(content) = std::fs::read(&abs) else {
-                            continue;
-                        };
-                        let Some(span) = read_span_with_meta(
-                            &root_path,
-                            &src.file_path,
-                            src.start_line,
-                            src.end_line,
-                            usize::MAX,
-                            false,
-                        ) else {
-                            continue;
-                        };
-                        let range = line_range_to_bytes(
-                            &content,
-                            src.start_line as usize,
-                            span.end_line as usize,
-                        );
-                        scopes.entry(src.file_path.clone()).or_default().push(range);
-                    }
-                }
-            }
-            // import lines in every affected file: cover the whole file for
-            // files that already have narrower spans is wasteful, so add a
-            // full-file span only where imports may bind the name
-            let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
-                .into_iter()
-                .map(|(rel_path, spans)| greppy_edit::verbs::RenameFileScope { rel_path, spans })
-                .collect();
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                expect_residual: Some(expect_residual),
-                ..Default::default()
-            };
-            (
-                greppy_edit::verbs::rename_symbol_files(
-                    &root_path,
-                    &scope_vec,
-                    &short_name,
-                    &new_name,
-                    &options,
-                )?,
-                report,
-            )
-        }
         EditCommand::Data {
             mode,
             file,
@@ -7956,7 +9196,13 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 with_diff: true,
                 ..Default::default()
             };
-            (
+            let before = std::fs::read(&target).ok();
+            let certificate = if mode == "delete" {
+                greppy_edit::data::data_delete(&root_path, &target, &path, &options)?
+            } else {
+                let value_json = value_json.ok_or_else(|| {
+                    Error::Invalid("data set needs --value-json VALUE".into())
+                })?;
                 greppy_edit::data::data_set(
                     &root_path,
                     &target,
@@ -7964,9 +9210,22 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                     &value_json,
                     mode == "ensure",
                     &options,
-                )?,
-                report,
-            )
+                )?
+            };
+            if certificate.published {
+                let rel = target
+                    .strip_prefix(&root_path)
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| file.clone());
+                record_edit_undo(
+                    &root_path,
+                    &[UndoBefore {
+                        rel,
+                        content: before,
+                    }],
+                );
+            }
+            (certificate, report)
         }
         EditCommand::Apply {
             plan,
@@ -7974,11 +9233,66 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             report,
             diff: _,
         } => {
-            let text = std::fs::read_to_string(&plan).map_err(|source| Error::Io {
-                context: format!("read {plan}"),
-                source,
-            })?;
-            let loaded = greppy_edit::plan::load_plan(&text, &root_path)?;
+            // `-` means stdin here as it does for every other file argument.
+            // Without it a multi-edit plan needs a temporary file first, which
+            // turns the one transaction this verb exists for into two turns.
+            let text = if plan == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|source| Error::Io {
+                        context: "read edit plan from stdin".into(),
+                        source,
+                    })?;
+                buf
+            } else {
+                std::fs::read_to_string(&plan).map_err(|source| Error::Io {
+                    context: format!("read {plan}"),
+                    source,
+                })?
+            };
+            // A plan that could not be read is a refused edit, not a usage
+            // error: the caller asked for `--json` and must get an answer as
+            // data, not a bare line of prose on stderr.
+            if text.trim().is_empty() {
+                return emit_edit_outcome(
+                    Err(EditRefusal::new(
+                        "plan_empty",
+                        format!(
+                            "--plan {plan}: the plan is empty; the command that was to \
+                             produce it printed nothing"
+                        ),
+                        20,
+                    )),
+                    json,
+                    report,
+                );
+            }
+            // A plan written in the whole-file verbs is executed by the verbs
+            // themselves: `write`, `move` and `remove` are not spans in a file,
+            // so the span planner has nothing to say about them.
+            if let Some(operations) = plan_is_whole_file(&text) {
+                return emit_edit_outcome(
+                    run_edit_plan_whole_file(&root_path, &operations, dry_run, false),
+                    json,
+                    report,
+                );
+            }
+            let loaded = match greppy_edit::plan::load_plan(&text, &root_path) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return emit_edit_outcome(
+                        Err(EditRefusal::new(
+                            "invalid_plan",
+                            format!("--plan {plan}: {error}"),
+                            20,
+                        )),
+                        json,
+                        report,
+                    );
+                }
+            };
             let plan_root = std::path::PathBuf::from(loaded.workspace_root());
             let plan_root_arg = plan_root.to_string_lossy().into_owned();
             let parsed = loaded.into_plan(|shortcut| {
@@ -8042,10 +9356,29 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                     &new_body,
                 )
             })?;
-            (greppy_edit::plan::apply_plan(&parsed, dry_run)?, report)
+            let undo_before = plan_undo_snapshot(&root_path, &text);
+            let mut certificate = greppy_edit::plan::apply_plan(&parsed, dry_run)?;
+            if certificate.published {
+                record_edit_undo(&root_path, &undo_before);
+            } else {
+                annotate_plan_refusal(&mut certificate, &text);
+            }
+            (certificate, report)
         }
-        EditCommand::PlanTemplate { .. } => unreachable!("plan-template returned before edit dispatch"),
         EditCommand::Recover { report } => {
+            // The grammar verbs journal into the workspace store, so their
+            // interrupted transactions are the ones to look for first.
+            match run_edit_recover(&root_path) {
+                Ok(Some(restored)) => {
+                    println!("rolled back an interrupted edit: {restored} file(s) restored");
+                    return Ok(0);
+                }
+                Ok(None) => {}
+                Err(refusal) => {
+                    eprintln!("{}", refusal.message);
+                    return Ok(refusal.exit);
+                }
+            }
             let outcome = greppy_edit::journal::recover_with_report(&root_path)?;
             let msg = match outcome.action {
                 greppy_edit::journal::RecoveryAction::NothingToRecover => {
@@ -8071,60 +9404,6 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             println!("{msg}");
             return Ok(0);
         }
-        EditCommand::PatchSpan {
-            target,
-            patch_file,
-            dry_run,
-            report,
-        } => {
-            let handle = greppy_edit::EditHandle::decode(&target)?;
-            let patch = std::fs::read(&patch_file).map_err(|source| Error::Io {
-                context: format!("read {patch_file}"),
-                source,
-            })?;
-            let language = greppy_edit::language_for_path(std::path::Path::new(&handle.path));
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                ..Default::default()
-            };
-            (
-                greppy_edit::verbs::patch_span(
-                    &root_path,
-                    &handle,
-                    &patch,
-                    Some(language),
-                    &options,
-                )?,
-                report,
-            )
-        }
-        EditCommand::RegexCas {
-            file,
-            pattern,
-            replacement,
-            expect,
-            dry_run,
-            report,
-        } => {
-            let target = resolve_edit_file(&root_path, &file);
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                ..Default::default()
-            };
-            (
-                greppy_edit::verbs::regex_cas(
-                    &root_path,
-                    &target,
-                    &pattern,
-                    &replacement,
-                    expect,
-                    &options,
-                )?,
-                report,
-            )
-        }
         EditCommand::EnsureImport {
             file,
             module,
@@ -8149,44 +9428,3116 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 report,
             )
         }
-        EditCommand::ReplaceSpan {
-            target,
-            source_file,
-            dry_run,
-            report,
-        } => {
-            let handle = greppy_edit::EditHandle::decode(&target)?;
-            let new = read_source_arg(&source_file)?;
-            let language = greppy_edit::language_for_path(std::path::Path::new(&handle.path));
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                ..Default::default()
-            };
-            (
-                greppy_edit::verbs::replace_span(
-                    &root_path,
-                    &handle,
-                    &new,
-                    Some(language),
-                    &options,
-                )?,
-                report,
-            )
+        EditCommand::Replace { .. }
+        | EditCommand::Insert { .. }
+        | EditCommand::Delete { .. }
+        | EditCommand::Patch { .. }
+        | EditCommand::Write { .. }
+        | EditCommand::Move { .. }
+        | EditCommand::Remove { .. }
+        | EditCommand::Undo { .. } => {
+            unreachable!("the grammar verbs answered before the certificate verbs")
         }
     };
-    finish_edit(certificate, report_path, root, &root_path)
+    finish_edit(certificate, report_path, json, root, &root_path)
+}
+
+// ---------------------------------------------------------------------------
+// The new edit grammar: four operations over one WHERE selector.
+//
+// `AGENTS.md` states the surface: `replace`, `insert`, `delete` and `patch`
+// each take exactly one WHERE, and WHERE is one of `--file F --old TEXT`,
+// `--file F --old-file F2`, `--file F --pattern REGEX`, `--file F --lines A:B`,
+// `--file F`, `--symbol S`, `--symbol S --body`, or `--target H`. Every
+// combination that the grammar does not provide is a refusal with a stable
+// `error.code`, never a guess: `dev/CLI-SPEC.md` rule 1 forbids reinterpreting
+// an argument into a different question.
+// ---------------------------------------------------------------------------
+
+/// A refused edit. The code is what a caller branches on; the message says
+/// what is the case and stops there.
+struct EditRefusal {
+    code: &'static str,
+    message: String,
+    exit: i32,
+    extra: Vec<(&'static str, serde_json::Value)>,
+}
+
+impl EditRefusal {
+    fn new(code: &'static str, message: impl Into<String>, exit: i32) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            exit,
+            extra: Vec::new(),
+        }
+    }
+
+    fn with(mut self, key: &'static str, value: serde_json::Value) -> Self {
+        self.extra.push((key, value));
+        self
+    }
+}
+
+type EditResult<T> = std::result::Result<T, EditRefusal>;
+
+fn edit_sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+/// The record schema every edit answers with, in the compact form on stdout
+/// and in the full form `--report` writes.
+const EDIT_RECORD_SCHEMA: &str = "greppy.edit-record.v1";
+
+/// One written file inside a record: the spans it received, the text that is
+/// now in the first of them, and the handle that marks it.
+#[derive(Default)]
+struct EditOperation {
+    file: String,
+    /// `[start, end)` in the bytes of the file as it now stands, one per span
+    /// written. `--expect N` writes N of them and the report names all N.
+    ranges: Vec<(usize, usize)>,
+    result_span: Option<String>,
+    handle: Option<String>,
+    sha_before: Option<String>,
+    sha_after: Option<String>,
+    diff: Option<String>,
+}
+
+/// What an applied edit answers: the file, the span it wrote, the resulting
+/// text, and a handle for that new span.
+#[derive(Default)]
+struct EditRecord {
+    files: Vec<String>,
+    span: Option<(usize, usize)>,
+    text: Option<String>,
+    handle: Option<String>,
+    diagnostics: Option<Vec<String>>,
+    notes: Vec<String>,
+    operations: Vec<EditOperation>,
+    /// What this particular verb owes the caller beyond the common shape: the
+    /// files a `move` rewrote, what still references a removed file, what an
+    /// `undo` put back. It appears in the compact answer and in `--report`.
+    extra: Vec<(&'static str, serde_json::Value)>,
+    /// False for `--dry-run`: the record says what would be written.
+    published: bool,
+}
+
+/// A minimal line-based unified diff for the full record. The byte ranges are
+/// the precise answer; this is the readable view of the same change.
+fn edit_unified_diff(path: &str, before: &[u8], after: &[u8]) -> String {
+    let before_text = String::from_utf8_lossy(before);
+    let after_text = String::from_utf8_lossy(after);
+    let old_lines: Vec<&str> = before_text.lines().collect();
+    let new_lines: Vec<&str> = after_text.lines().collect();
+    let mut head = 0usize;
+    while head < old_lines.len() && head < new_lines.len() && old_lines[head] == new_lines[head] {
+        head += 1;
+    }
+    let mut tail = 0usize;
+    while tail < old_lines.len() - head
+        && tail < new_lines.len() - head
+        && old_lines[old_lines.len() - 1 - tail] == new_lines[new_lines.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let old_span = &old_lines[head..old_lines.len() - tail];
+    let new_span = &new_lines[head..new_lines.len() - tail];
+    let mut diff = format!("--- a/{path}\n+++ b/{path}\n");
+    diff.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        head + 1,
+        old_span.len(),
+        head + 1,
+        new_span.len()
+    ));
+    for line in old_span {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in new_span {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+
+enum GrammarDispatch {
+    Handled(i32),
+    Passthrough(Box<EditCommand>),
+}
+
+/// Selector arguments, before they are read as a WHERE.
+struct WhereSpec {
+    file: Option<String>,
+    old: Option<String>,
+    old_file: Option<String>,
+    pattern: Option<String>,
+    lines: Option<String>,
+    symbol: Option<String>,
+    body: bool,
+    target: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelectorKind {
+    Text,
+    Pattern,
+    Lines,
+    WholeFile,
+    Symbol,
+    Target,
+}
+
+impl SelectorKind {
+    /// Line-oriented spans address whole lines, so the newline that ends the
+    /// last one belongs to the file, not to the span: replacing a line with
+    /// text that has no newline must not join it to the next one.
+    fn line_oriented(self) -> bool {
+        matches!(self, SelectorKind::Lines | SelectorKind::Symbol | SelectorKind::Target)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SelectorKind::Text => "--old",
+            SelectorKind::Pattern => "--pattern",
+            SelectorKind::Lines => "--lines",
+            SelectorKind::WholeFile => "--file",
+            SelectorKind::Symbol => "--symbol",
+            SelectorKind::Target => "--target",
+        }
+    }
+}
+
+/// A WHERE resolved against the bytes on disk.
+struct Located {
+    rel: String,
+    abs: std::path::PathBuf,
+    content: Vec<u8>,
+    ranges: Vec<(usize, usize)>,
+    kind: SelectorKind,
+    regex: Option<regex::bytes::Regex>,
+    /// What a searching selector was looking for. A refusal that only says
+    /// "matched 0 times" leaves the caller unable to tell which of two texts
+    /// was wrong, so the text itself is carried to the message.
+    needle: Option<String>,
+}
+
+fn classify_selector(spec: &WhereSpec) -> EditResult<SelectorKind> {
+    let mut chosen: Vec<&'static str> = Vec::new();
+    if spec.old.is_some() {
+        chosen.push("--old");
+    }
+    if spec.old_file.is_some() {
+        chosen.push("--old-file");
+    }
+    if spec.pattern.is_some() {
+        chosen.push("--pattern");
+    }
+    if spec.lines.is_some() {
+        chosen.push("--lines");
+    }
+    if spec.symbol.is_some() {
+        chosen.push("--symbol");
+    }
+    if spec.target.is_some() {
+        chosen.push("--target");
+    }
+    if chosen.len() > 1 {
+        return Err(EditRefusal::new(
+            "selector_conflict",
+            format!(
+                "{} name different targets; WHERE is exactly one of them",
+                chosen.join(" and ")
+            ),
+            20,
+        )
+        .with("selectors", serde_json::json!(chosen)));
+    }
+    let kind = match chosen.first().copied() {
+        Some("--old") | Some("--old-file") => SelectorKind::Text,
+        Some("--pattern") => SelectorKind::Pattern,
+        Some("--lines") => SelectorKind::Lines,
+        Some("--symbol") => SelectorKind::Symbol,
+        Some("--target") => SelectorKind::Target,
+        _ => {
+            if spec.file.is_some() {
+                SelectorKind::WholeFile
+            } else {
+                return Err(EditRefusal::new(
+                    "selector_missing",
+                    "no WHERE: pass --file F with --old/--old-file/--pattern/--lines, \
+                     --file F alone, --symbol S, or --target H",
+                    20,
+                ));
+            }
+        }
+    };
+    match kind {
+        SelectorKind::Text | SelectorKind::Pattern | SelectorKind::Lines => {
+            if spec.file.is_none() {
+                return Err(EditRefusal::new(
+                    "selector_missing",
+                    format!("{} addresses a file; pass --file F with it", kind.name()),
+                    20,
+                ));
+            }
+        }
+        SelectorKind::Symbol | SelectorKind::Target => {
+            if spec.file.is_some() {
+                return Err(EditRefusal::new(
+                    "selector_conflict",
+                    format!(
+                        "--file and {} name different targets; WHERE is exactly one of them",
+                        kind.name()
+                    ),
+                    20,
+                ));
+            }
+        }
+        SelectorKind::WholeFile => {}
+    }
+    if spec.body && spec.symbol.is_none() {
+        return Err(EditRefusal::new(
+            "body_without_symbol",
+            "--body names the body of a definition; it needs --symbol S",
+            20,
+        ));
+    }
+    Ok(kind)
+}
+
+fn edit_line_count(content: &[u8]) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+    let newlines = content.iter().filter(|byte| **byte == b'\n').count();
+    if content.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
+fn edit_line_of_offset(content: &[u8], offset: usize) -> usize {
+    content[..offset.min(content.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
+}
+
+/// The 1-based inclusive line span a written region occupies.
+fn edit_span_lines(content: &[u8], start: usize, length: usize) -> (usize, usize) {
+    let first = edit_line_of_offset(content, start);
+    if length == 0 {
+        return (first, first);
+    }
+    let last = first
+        + content[start..start + length - 1]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+    (first, last)
+}
+
+fn edit_strip_trailing_newline(content: &[u8], range: (usize, usize)) -> (usize, usize) {
+    let (start, mut end) = range;
+    if end > start && content[end - 1] == b'\n' {
+        end -= 1;
+        if end > start && content[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    (start, end)
+}
+
+/// Extend a line-oriented span over the newline that ends it, so a deletion
+/// removes the line rather than leaving an empty one behind.
+fn edit_extend_over_newline(content: &[u8], range: (usize, usize)) -> (usize, usize) {
+    let (start, mut end) = range;
+    if end < content.len() && content[end] == b'\r' {
+        end += 1;
+    }
+    if end < content.len() && content[end] == b'\n' {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn edit_find_all(haystack: &[u8], needle: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return out;
+    }
+    let mut index = 0usize;
+    while index + needle.len() <= haystack.len() {
+        if &haystack[index..index + needle.len()] == needle {
+            out.push((index, index + needle.len()));
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Splice every edit in one pass and report, for each of them, the byte range
+/// it occupies in the RESULT. `--expect N` writes N spans and the report has to
+/// name all of them, so the offsets are collected while they are still exact
+/// rather than recomputed from the old content afterwards.
+fn edit_splice(
+    content: &[u8],
+    edits: &mut [(usize, usize, Vec<u8>)],
+) -> (Vec<u8>, Vec<(usize, usize)>) {
+    edits.sort_by_key(|(start, _, _)| *start);
+    let mut out = Vec::with_capacity(content.len());
+    let mut written = Vec::with_capacity(edits.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in edits.iter() {
+        out.extend_from_slice(&content[cursor..*start]);
+        let at = out.len();
+        out.extend_from_slice(replacement);
+        written.push((at, out.len()));
+        cursor = *end;
+    }
+    out.extend_from_slice(&content[cursor..]);
+    (out, written)
+}
+
+/// Refuse a path that leaves the repository, whether by climbing out of it or
+/// through a symlink that points out.
+fn edit_guard_path(root_path: &std::path::Path, abs: &std::path::Path) -> EditResult<()> {
+    match greppy_edit::publish::require_inside_workspace(root_path, abs) {
+        Ok(_) => Ok(()),
+        Err(Error::Io { .. }) => Err(EditRefusal::new(
+            "file_not_found",
+            format!("no file {}", abs.display()),
+            10,
+        )),
+        Err(error) => Err(EditRefusal::new("path_outside_repo", error.to_string(), 17)),
+    }
+}
+
+fn edit_read_file(
+    root_path: &std::path::Path,
+    file: &str,
+) -> EditResult<(String, std::path::PathBuf, Vec<u8>)> {
+    let candidate = std::path::Path::new(file);
+    let abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root_path.join(candidate)
+    };
+    if std::fs::symlink_metadata(&abs).is_err() {
+        return Err(EditRefusal::new(
+            "file_not_found",
+            format!("no file `{file}`"),
+            10,
+        ));
+    }
+    edit_guard_path(root_path, &abs)?;
+    let content = std::fs::read(&abs).map_err(|error| {
+        EditRefusal::new("file_unreadable", format!("read {file}: {error}"), 10)
+    })?;
+    let rel = abs
+        .strip_prefix(root_path)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| file.to_string());
+    Ok((rel, abs, content))
+}
+
+/// A resolved definition: its path relative to the root, its absolute path,
+/// the bytes of the file it lives in, and the byte range it occupies.
+type ResolvedSpan = (String, std::path::PathBuf, Vec<u8>, (usize, usize));
+
+/// Resolve `--symbol S` against the graph for the file, then against the bytes
+/// on disk for the span: the graph is a cache and the file is the truth, so a
+/// definition that moved since indexing is still addressed correctly.
+fn edit_resolve_symbol(
+    root_path: &std::path::Path,
+    root: Option<&str>,
+    name: &str,
+    path_filter: Option<&str>,
+    want_body: bool,
+) -> EditResult<ResolvedSpan> {
+    let store = open_default_store_query_writer(root).map_err(|error| {
+        EditRefusal::new("symbol_not_found", format!("no symbol `{name}`: {error}"), 10)
+    })?;
+    let ids = resolve_symbol_nodes(&store, Some(name)).map_err(|error| {
+        EditRefusal::new("symbol_not_found", format!("no symbol `{name}`: {error}"), 10)
+    })?;
+    let mut nodes = Vec::new();
+    for id in &ids {
+        if let Ok(Some(node)) = store.get_node(*id) {
+            if node.file_path.is_empty() || node.start_line < 1 {
+                continue;
+            }
+            if let Some(filter) = path_filter {
+                let filter = filter.trim_start_matches("./");
+                if !node.file_path.starts_with(filter) {
+                    continue;
+                }
+            }
+            nodes.push(node);
+        }
+    }
+    // `--symbol S` names a definition. The graph also carries one synthetic
+    // anchor per file, and its name is the file stem — so `pkg/greet.go`
+    // answers to `greet` and turns an unambiguous edit into "2 definitions".
+    // A file is addressed by `--file`, never by `--symbol`, so the anchor is
+    // dropped whenever a real definition answered as well (rule 1: an argument
+    // is never reinterpreted into a different question).
+    if nodes
+        .iter()
+        .any(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name))
+    {
+        nodes.retain(|node| {
+            !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+        });
+    }
+    if nodes.is_empty() {
+        return Err(EditRefusal::new(
+            "symbol_not_found",
+            format!("no symbol `{name}`"),
+            10,
+        ));
+    }
+    let mut sites: Vec<(String, i64)> = nodes
+        .iter()
+        .map(|node| (node.file_path.clone(), node.start_line))
+        .collect();
+    sites.sort();
+    sites.dedup();
+    if sites.len() > 1 {
+        let candidates: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|node| {
+                serde_json::json!({
+                    "qualified_name": node.qualified_name,
+                    "path": node.file_path,
+                    "line": node.start_line,
+                })
+            })
+            .collect();
+        let listed = nodes
+            .iter()
+            .map(|node| format!("  {} {}:{}", node.qualified_name, node.file_path, node.start_line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(EditRefusal::new(
+            "ambiguous_symbol",
+            format!("`{name}` resolves to {} definitions\n{listed}", sites.len()),
+            11,
+        )
+        .with("candidates", serde_json::json!(candidates)));
+    }
+    let node = &nodes[0];
+    let abs = root_path.join(&node.file_path);
+    edit_guard_path(root_path, &abs)?;
+    let content = std::fs::read(&abs).map_err(|error| {
+        EditRefusal::new(
+            "file_unreadable",
+            format!("read {}: {error}", node.file_path),
+            10,
+        )
+    })?;
+    let language = greppy_edit::language_for_path(std::path::Path::new(&node.file_path));
+    let (start_line, end_line) = edit_live_definition_lines(language, &content, node)
+        .unwrap_or((node.start_line as usize, node.end_line as usize));
+    let range = line_range_to_bytes(&content, start_line, end_line);
+    let mut range = edit_strip_trailing_newline(&content, range);
+    if want_body {
+        let Some(body) = greppy_edit::verbs::body_range_within(language, &content, range) else {
+            return Err(EditRefusal::new(
+                "no_body",
+                format!("`{name}` has no body"),
+                13,
+            )
+            .with("symbol", serde_json::json!(name)));
+        };
+        range = edit_strip_trailing_newline(&content, body);
+    }
+    Ok((node.file_path.clone(), abs, content, range))
+}
+
+/// Re-extract the definitions of one file and return the live line span of the
+/// node the graph named. Falls back to the cached span when the language has no
+/// extraction pass.
+fn edit_live_definition_lines(
+    language: greppy_edit::Language,
+    content: &[u8],
+    node: &greppy_store::Node,
+) -> Option<(usize, usize)> {
+    let extracted = greppy_parser::extract::extract(language, content, &node.file_path).ok()?;
+    let exact = extracted
+        .nodes
+        .iter()
+        .find(|candidate| candidate.qualified_name == node.qualified_name);
+    let chosen = exact.or_else(|| {
+        let mut by_name = extracted
+            .nodes
+            .iter()
+            .filter(|candidate| candidate.name == node.name);
+        let first = by_name.next()?;
+        if by_name.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
+    })?;
+    Some((chosen.start_line as usize, chosen.end_line as usize))
+}
+
+fn edit_parse_line_range(spec: &str) -> EditResult<(usize, usize)> {
+    let bad = || {
+        EditRefusal::new(
+            "invalid_selector",
+            format!("--lines takes A:B, 1-based and both ends included; got `{spec}`"),
+            20,
+        )
+    };
+    let (first, last) = spec.split_once(':').unwrap_or((spec, spec));
+    let first: usize = first.trim().parse().map_err(|_| bad())?;
+    let last: usize = last.trim().parse().map_err(|_| bad())?;
+    if first == 0 || last < first {
+        return Err(bad());
+    }
+    Ok((first, last))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_locate(
+    spec: &WhereSpec,
+    kind: SelectorKind,
+    root: Option<&str>,
+    root_path: &std::path::Path,
+) -> EditResult<Located> {
+    match kind {
+        SelectorKind::Symbol => {
+            let name = spec.symbol.as_deref().unwrap_or_default();
+            let (rel, abs, content, range) =
+                edit_resolve_symbol(root_path, root, name, spec.path.as_deref(), spec.body)?;
+            Ok(Located {
+                rel,
+                abs,
+                content,
+                ranges: vec![range],
+                kind,
+                regex: None,
+                needle: None,
+            })
+        }
+        SelectorKind::Target => {
+            let token = spec.target.as_deref().unwrap_or_default();
+            let handle = greppy_edit::EditHandle::decode(token).map_err(|error| {
+                EditRefusal::new("invalid_handle", format!("not a usable handle: {error}"), 20)
+            })?;
+            let handle_root = std::path::Path::new(&handle.workspace_root)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&handle.workspace_root));
+            let here = root_path
+                .canonicalize()
+                .unwrap_or_else(|_| root_path.to_path_buf());
+            if handle_root != here {
+                return Err(EditRefusal::new(
+                    "foreign_handle",
+                    format!(
+                        "that handle was taken in {}, not in {}",
+                        handle.workspace_root,
+                        here.display()
+                    ),
+                    20,
+                ));
+            }
+            let abs = if std::path::Path::new(&handle.path).is_absolute() {
+                std::path::PathBuf::from(&handle.path)
+            } else {
+                root_path.join(&handle.path)
+            };
+            edit_guard_path(root_path, &abs)?;
+            let content = std::fs::read(&abs).map_err(|error| {
+                EditRefusal::new(
+                    "file_unreadable",
+                    format!("read {}: {error}", handle.path),
+                    10,
+                )
+            })?;
+            let range = handle.verify(&content).map_err(|_| {
+                EditRefusal::new(
+                    "stale_handle",
+                    format!("{} changed since that handle was taken", handle.path),
+                    12,
+                )
+            })?;
+            let range = edit_strip_trailing_newline(&content, range);
+            Ok(Located {
+                rel: handle.path.clone(),
+                abs,
+                content,
+                ranges: vec![range],
+                kind,
+                regex: None,
+                needle: None,
+            })
+        }
+        _ => {
+            let file = spec.file.as_deref().unwrap_or_default();
+            let (rel, abs, content, ranges, regex, needle) = match kind {
+                SelectorKind::WholeFile => {
+                    let (rel, abs, content) = edit_read_file(root_path, file)?;
+                    let length = content.len();
+                    (rel, abs, content, vec![(0, length)], None, None)
+                }
+                SelectorKind::Lines => {
+                    let (first, last) = edit_parse_line_range(
+                        spec.lines.as_deref().unwrap_or_default(),
+                    )?;
+                    let (rel, abs, content) = edit_read_file(root_path, file)?;
+                    let total = edit_line_count(&content);
+                    if last > total || first > total {
+                        return Err(EditRefusal::new(
+                            "range_out_of_bounds",
+                            format!("{rel} has {total} line(s); {first}:{last} runs past its end"),
+                            13,
+                        ));
+                    }
+                    let range = line_range_to_bytes(&content, first, last);
+                    let range = edit_strip_trailing_newline(&content, range);
+                    (rel, abs, content, vec![range], None, None)
+                }
+                SelectorKind::Text => {
+                    let needle = match (&spec.old, &spec.old_file) {
+                        (Some(text), None) => text.as_bytes().to_vec(),
+                        (None, Some(path)) => read_source_arg(path).map_err(|error| {
+                            EditRefusal::new(
+                                "invalid_selector",
+                                format!("--old-file {path}: {error}"),
+                                20,
+                            )
+                        })?,
+                        _ => Vec::new(),
+                    };
+                    if needle.is_empty() {
+                        return Err(EditRefusal::new(
+                            "invalid_selector",
+                            "--old is empty; empty text matches between every pair of characters",
+                            20,
+                        ));
+                    }
+                    let (rel, abs, content) = edit_read_file(root_path, file)?;
+                    let ranges = edit_find_all(&content, &needle);
+                    let shown = String::from_utf8_lossy(&needle).into_owned();
+                    (rel, abs, content, ranges, None, Some(shown))
+                }
+                SelectorKind::Pattern => {
+                    let pattern = spec.pattern.as_deref().unwrap_or_default();
+                    let regex = regex::bytes::Regex::new(pattern).map_err(|error| {
+                        EditRefusal::new(
+                            "invalid_pattern",
+                            format!("--pattern is not a regular expression: {error}"),
+                            20,
+                        )
+                    })?;
+                    let (rel, abs, content) = edit_read_file(root_path, file)?;
+                    let ranges = regex
+                        .find_iter(&content)
+                        .map(|found| (found.start(), found.end()))
+                        .collect();
+                    (rel, abs, content, ranges, Some(regex), Some(pattern.to_string()))
+                }
+                SelectorKind::Symbol | SelectorKind::Target => unreachable!(),
+            };
+            Ok(Located {
+                rel,
+                abs,
+                content,
+                ranges,
+                kind,
+                regex,
+                needle,
+            })
+        }
+    }
+}
+
+/// The number of matches a selector is allowed to have. `--old` and
+/// `--pattern` search, so they can find none or many; every other selector
+/// addresses exactly one span by construction.
+fn edit_check_cardinality(located: &Located, expect: Option<usize>) -> EditResult<()> {
+    if !matches!(located.kind, SelectorKind::Text | SelectorKind::Pattern) {
+        return Ok(());
+    }
+    let expect = expect.unwrap_or(1);
+    if located.ranges.len() != expect {
+        // The count alone does not let a caller decide between "pass --expect N"
+        // and "I anchored on the wrong text", so the refusal names what was
+        // searched for and where every match sits.
+        let subject = located
+            .needle
+            .as_deref()
+            .map_or_else(|| located.kind.name().to_string(), |text| format!("`{text}`"));
+        let sites: Vec<String> = located
+            .ranges
+            .iter()
+            .take(20)
+            .map(|(start, _)| {
+                format!(
+                    "{}:{}",
+                    located.rel,
+                    edit_line_of_offset(&located.content, *start)
+                )
+            })
+            .collect();
+        let mut message = format!(
+            "{subject} matched {} time(s), expected {expect}; nothing was written",
+            located.ranges.len()
+        );
+        for site in &sites {
+            message.push_str("\n  ");
+            message.push_str(site);
+        }
+        return Err(EditRefusal::new("match_count", message, 13)
+            .with("expected", serde_json::json!(expect))
+            .with("found", serde_json::json!(located.ranges.len()))
+            .with("matches", serde_json::json!(sites)));
+    }
+    Ok(())
+}
+
+fn edit_expect_positive(expect: Option<usize>) -> EditResult<()> {
+    if expect == Some(0) {
+        return Err(EditRefusal::new(
+            "invalid_expect",
+            "--expect 0 asks for an edit that writes nothing",
+            20,
+        ));
+    }
+    Ok(())
+}
+
+/// There is exactly one stdin, so two arguments asking for it leave the
+/// caller's intent unrecoverable — one of them would get nothing, or both would
+/// get half. The collision is refused before any of them reads a byte.
+fn edit_guard_single_stdin(flags: &[(&'static str, Option<&str>)]) -> EditResult<()> {
+    let asking: Vec<&'static str> = flags
+        .iter()
+        .filter(|(_, value)| *value == Some("-"))
+        .map(|(name, _)| *name)
+        .collect();
+    if asking.len() > 1 {
+        return Err(EditRefusal::new(
+            "stdin_conflict",
+            format!(
+                "{} both read stdin; exactly one argument may take `-`",
+                asking.join(" and ")
+            ),
+            20,
+        )
+        .with("flags", serde_json::json!(asking)));
+    }
+    Ok(())
+}
+
+/// An empty replacement is never an intention: it is a command substitution
+/// that produced nothing, a file that was created but never written, or a
+/// broken pipe. Writing it would delete working code and report success.
+const EMPTY_CONTENT_HINT: &str = "`delete` is the verb that removes a span";
+
+fn edit_content_bytes(
+    content: Option<String>,
+    content_file: Option<String>,
+) -> EditResult<Vec<u8>> {
+    match (content, content_file) {
+        (Some(text), None) => {
+            if text.is_empty() {
+                return Err(EditRefusal::new(
+                    "content_empty",
+                    format!("--content is empty; {EMPTY_CONTENT_HINT}"),
+                    20,
+                ));
+            }
+            Ok(text.into_bytes())
+        }
+        (None, Some(path)) => {
+            let bytes = read_source_arg(&path).map_err(|error| {
+                EditRefusal::new(
+                    "content_unreadable",
+                    format!("--content-file {path}: {error}"),
+                    20,
+                )
+            })?;
+            if bytes.is_empty() {
+                let message = if path == "-" {
+                    format!("--content-file -: stdin was empty; {EMPTY_CONTENT_HINT}")
+                } else {
+                    format!("--content-file {path} is empty; {EMPTY_CONTENT_HINT}")
+                };
+                return Err(EditRefusal::new("content_empty", message, 20));
+            }
+            Ok(bytes)
+        }
+        (Some(_), Some(_)) => Err(EditRefusal::new(
+            "content_conflict",
+            "--content and --content-file both name the new text; pass exactly one of them",
+            20,
+        )),
+        (None, None) => Err(EditRefusal::new(
+            "content_missing",
+            "no new text: pass --content TEXT or --content-file FILE",
+            20,
+        )),
+    }
+}
+
+/// Publish one file and answer with the record the contract promises: the
+/// file, every span it wrote, the resulting text, and a handle for the new
+/// span so the next edit needs no `read` in between.
+fn edit_publish(
+    root_path: &std::path::Path,
+    located: &Located,
+    new_content: Vec<u8>,
+    changed: Vec<(usize, usize)>,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    let (first_start, first_end) = changed.first().copied().unwrap_or((0, 0));
+    let first_end = first_end.min(new_content.len());
+    let text = String::from_utf8_lossy(&new_content[first_start..first_end]).into_owned();
+    let span = edit_span_lines(&new_content, first_start, first_end - first_start);
+    let mut operation = EditOperation {
+        file: located.rel.clone(),
+        ranges: changed,
+        result_span: Some(text.clone()),
+        sha_before: Some(edit_sha256_hex(&located.content)),
+        sha_after: Some(edit_sha256_hex(&new_content)),
+        diff: Some(edit_unified_diff(&located.rel, &located.content, &new_content)),
+        ..EditOperation::default()
+    };
+    let mut record = EditRecord {
+        files: vec![located.rel.clone()],
+        span: Some(span),
+        text: Some(text),
+        published: !dry_run,
+        ..EditRecord::default()
+    };
+    if dry_run {
+        // A handle addresses bytes on disk. A dry run wrote none, so handing
+        // one back would hand back an address that is already stale.
+        record.operations = vec![operation];
+        return Ok(record);
+    }
+    let before_sha = edit_sha256_hex(&located.content);
+    // The journal goes down before the write, so an edit that dies in between
+    // leaves the evidence `recover` needs instead of a half-written file.
+    let transaction = edit_journal_open(
+        root_path,
+        &[UndoBefore {
+            rel: located.rel.clone(),
+            content: Some(located.content.clone()),
+        }],
+    );
+    edit_journal_crash_hook()?;
+    if let Err(error) =
+        greppy_edit::publish::publish_atomic(root_path, &located.abs, &new_content, &before_sha)
+    {
+        edit_journal_abort(root_path);
+        return Err(EditRefusal::new("publish_failed", error.to_string(), 16));
+    }
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+    }
+    let handle = greppy_edit::EditHandle::for_range(
+        root_path,
+        std::path::Path::new(&located.rel),
+        &new_content,
+        first_start,
+        first_end,
+    )
+    .ok()
+    .map(|handle| handle.encode());
+    operation.handle = handle.clone();
+    record.handle = handle;
+    record.operations = vec![operation];
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
+/// A rewritten file, and the byte ranges of it the edit wrote.
+type EditedContent = (Vec<u8>, Vec<(usize, usize)>);
+
+fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditedContent {
+    // A line-oriented span stops before the newline that ends its last line,
+    // because that newline belongs to the file (see `SelectorKind::line_oriented`).
+    // New text that carries one of its own would therefore add a blank line the
+    // caller never wrote, so the span's own ending is the one that survives.
+    let new_bytes = if located.kind.line_oriented() {
+        let trimmed = new_bytes
+            .strip_suffix(b"\n")
+            .map(|text| text.strip_suffix(b"\r").unwrap_or(text));
+        trimmed.unwrap_or(new_bytes)
+    } else {
+        new_bytes
+    };
+    let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    for (start, end) in &located.ranges {
+        let replacement = match &located.regex {
+            Some(regex) => {
+                let mut expanded = Vec::new();
+                if let Some(captures) = regex.captures_at(&located.content, *start) {
+                    captures.expand(new_bytes, &mut expanded);
+                } else {
+                    expanded.extend_from_slice(new_bytes);
+                }
+                expanded
+            }
+            None => new_bytes.to_vec(),
+        };
+        edits.push((*start, *end, replacement));
+    }
+    edit_splice(&located.content, &mut edits)
+}
+
+fn edit_op_delete(located: &Located) -> EditedContent {
+    let mut edits: Vec<(usize, usize, Vec<u8>)> = located
+        .ranges
+        .iter()
+        .map(|range| {
+            let range = if located.kind.line_oriented() {
+                edit_extend_over_newline(&located.content, *range)
+            } else {
+                *range
+            };
+            (range.0, range.1, Vec::new())
+        })
+        .collect();
+    edit_splice(&located.content, &mut edits)
+}
+
+fn edit_op_insert(located: &Located, text: &[u8], before: bool) -> EditedContent {
+    let (start, end) = located.ranges[0];
+    let at = if before {
+        start
+    } else {
+        edit_extend_over_newline(&located.content, (start, end)).1
+    };
+    let mut edits = vec![(at, at, text.to_vec())];
+    edit_splice(&located.content, &mut edits)
+}
+
+/// Apply a unified diff inside the located span. The hunk headers are read
+/// twice — once as file line numbers, once as offsets from the start of WHERE —
+/// and whichever reading the context lines confirm is the one that applies.
+fn edit_op_patch(located: &Located, patch: &[u8]) -> EditResult<EditedContent> {
+    let patch_text = String::from_utf8_lossy(patch);
+    let mut hunks: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
+    let mut current: Option<(usize, Vec<String>, Vec<String>)> = None;
+    for line in patch_text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with("@@") {
+            if let Some(hunk) = current.take() {
+                hunks.push(hunk);
+            }
+            let start = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|field| field.strip_prefix('-'))
+                .map(|field| field.split(',').next().unwrap_or(field))
+                .and_then(|number| number.parse::<usize>().ok())
+                .unwrap_or(1);
+            current = Some((start, Vec::new(), Vec::new()));
+            continue;
+        }
+        let Some((_, old_lines, new_lines)) = current.as_mut() else {
+            continue;
+        };
+        match line.as_bytes().first() {
+            Some(b' ') => {
+                old_lines.push(line[1..].to_string());
+                new_lines.push(line[1..].to_string());
+            }
+            Some(b'-') => old_lines.push(line[1..].to_string()),
+            Some(b'+') => new_lines.push(line[1..].to_string()),
+            Some(b'\\') => {}
+            None => {}
+            _ => {}
+        }
+    }
+    if let Some(hunk) = current.take() {
+        hunks.push(hunk);
+    }
+    if hunks.is_empty() {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            "the patch carries no hunk to apply",
+            20,
+        ));
+    }
+
+    // Physical lines of the file, each with the byte range it occupies.
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < located.content.len() {
+        let end = located.content[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| cursor + offset + 1)
+            .unwrap_or(located.content.len());
+        lines.push((cursor, end));
+        cursor = end;
+    }
+    let line_text = |index: usize| -> Option<String> {
+        let (start, end) = *lines.get(index.checked_sub(1)?)?;
+        let raw = &located.content[start..end];
+        let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        Some(String::from_utf8_lossy(raw).into_owned())
+    };
+    let (span_start, span_end) = located.ranges[0];
+    let span_first_line = edit_line_of_offset(&located.content, span_start);
+    let span_last_line = edit_line_of_offset(&located.content, span_end.saturating_sub(1).max(span_start));
+
+    let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    for (declared, old_lines, new_lines) in &hunks {
+        let matches_at = |first: usize| -> bool {
+            if first < span_first_line {
+                return false;
+            }
+            if old_lines.is_empty() {
+                return first <= span_last_line + 1;
+            }
+            if first + old_lines.len() - 1 > span_last_line {
+                return false;
+            }
+            old_lines
+                .iter()
+                .enumerate()
+                .all(|(offset, expected)| line_text(first + offset).as_ref() == Some(expected))
+        };
+        let relative = span_first_line + declared.saturating_sub(1);
+        let first = if matches_at(*declared) {
+            *declared
+        } else if matches_at(relative) {
+            relative
+        } else {
+            // Which hunk failed is not enough to act on: the caller needs the
+            // context lines that were expected and not found, or it cannot tell
+            // a wrong WHERE from a stale diff.
+            let expected = old_lines
+                .iter()
+                .take(6)
+                .map(|line| format!("\n  {line}"))
+                .collect::<String>();
+            return Err(EditRefusal::new(
+                "patch_context",
+                format!(
+                    "the hunk at line {declared} matches neither {} nor the selected span; \
+                     it expects:{expected}",
+                    located.rel
+                ),
+                13,
+            ));
+        };
+        let (start, end) = if old_lines.is_empty() {
+            let at = lines
+                .get(first.saturating_sub(1))
+                .map(|(start, _)| *start)
+                .unwrap_or(located.content.len());
+            (at, at)
+        } else {
+            (
+                lines[first - 1].0,
+                lines[first + old_lines.len() - 2].1,
+            )
+        };
+        let ending = if located.content[start..end].ends_with(b"\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let mut replacement = String::new();
+        for line in new_lines {
+            replacement.push_str(line);
+            replacement.push_str(ending);
+        }
+        // A hunk that reached the end of a file without a final newline must
+        // not grow one.
+        if !located.content[start..end].ends_with(b"\n") && replacement.ends_with(ending) {
+            replacement.truncate(replacement.len() - ending.len());
+        }
+        edits.push((start, end, replacement.into_bytes()));
+    }
+    let first_start = edits.iter().map(|(start, _, _)| *start).min().unwrap_or(0);
+    let last_end = edits.iter().map(|(_, end, _)| *end).max().unwrap_or(0);
+    let delta: isize = edits
+        .iter()
+        .map(|(start, end, replacement)| replacement.len() as isize - (*end - *start) as isize)
+        .sum();
+    let (new_content, _) = edit_splice(&located.content, &mut edits);
+    // A diff is one change even when it carries several hunks, so the span the
+    // report names is the whole patched region, not each hunk on its own.
+    let length = ((last_end - first_start) as isize + delta).max(0) as usize;
+    Ok((new_content, vec![(first_start, first_start + length)]))
+}
+
+/// The compiler or linter for the touched files, when the workspace declares
+/// one. No tests: a test run is too long for a single edit call.
+fn edit_verify_diagnostics(root_path: &std::path::Path, files: &[String]) -> Vec<String> {
+    let mut argv: Option<Vec<&str>> = None;
+    if root_path.join("Cargo.toml").is_file() {
+        argv = Some(vec!["cargo", "check", "--message-format", "short", "--quiet"]);
+    } else if root_path.join("go.mod").is_file() {
+        argv = Some(vec!["go", "build", "./..."]);
+    } else if files.iter().any(|file| file.ends_with(".py"))
+        && root_path.join("pyproject.toml").is_file()
+    {
+        argv = Some(vec!["python3", "-m", "compileall", "-q", "."]);
+    }
+    let Some(argv) = argv else {
+        return Vec::new();
+    };
+    let Ok(output) = std::process::Command::new(argv[0])
+        .args(&argv[1..])
+        .current_dir(root_path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.contains("error") || line.contains("warning"))
+        .take(50)
+        .map(str::to_string)
+        .collect()
+}
+
+// --- the undo journal -------------------------------------------------------
+//
+// The journal lives in the workspace's store directory, never inside the
+// repository: a directory of pre-images in the tree would turn up in every
+// `git status`, in every `index`, and in every check that a refused edit
+// changed nothing — greppy's own bookkeeping would read as the caller's work.
+
+const EDIT_JOURNAL_DIR: &str = "edit-journal";
+const EDIT_JOURNAL_STACK: &str = "stack.json";
+const EDIT_JOURNAL_PENDING: &str = "pending.json";
+const EDIT_JOURNAL_BLOBS: &str = "blobs";
+/// How far back `undo` can walk. One call still reverses exactly one edit; the
+/// depth only decides how many of them are still on record.
+const EDIT_JOURNAL_DEPTH: usize = 100;
+
+/// What one file looked like before an edit touched it. `None` means the file
+/// was not there, so undoing that edit removes it again rather than emptying
+/// it — an empty file still shadows a module and still shows up in the index.
+#[derive(Clone)]
+struct UndoBefore {
+    rel: String,
+    content: Option<Vec<u8>>,
+}
+
+impl UndoBefore {
+    fn read(root_path: &std::path::Path, rel: &str) -> Self {
+        Self {
+            rel: rel.to_string(),
+            content: std::fs::read(root_path.join(rel)).ok(),
+        }
+    }
+}
+
+fn edit_journal_dir(root_path: &std::path::Path) -> std::path::PathBuf {
+    greppy_core::cache::workspace_store_dir(root_path).join(EDIT_JOURNAL_DIR)
+}
+
+fn edit_journal_read(path: &std::path::Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn edit_journal_write(path: &std::path::Path, value: &serde_json::Value) {
+    if let Ok(text) = serde_json::to_string_pretty(value) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Record the pre-images and open a transaction. Anything that dies between
+/// here and [`edit_journal_close`] leaves `pending.json` behind — which is
+/// exactly what `recover` looks for.
+fn edit_journal_open(root_path: &std::path::Path, before: &[UndoBefore]) -> Option<String> {
+    if before.is_empty() {
+        return None;
+    }
+    let dir = edit_journal_dir(root_path);
+    std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).ok()?;
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
+    let mut entries = Vec::new();
+    for (index, item) in before.iter().enumerate() {
+        let blob = match &item.content {
+            Some(bytes) => {
+                let name = format!("{id}-{index}.bin");
+                std::fs::write(dir.join(EDIT_JOURNAL_BLOBS).join(&name), bytes).ok()?;
+                Some(name)
+            }
+            None => None,
+        };
+        entries.push(serde_json::json!({ "path": item.rel, "blob": blob }));
+    }
+    edit_journal_write(
+        &dir.join(EDIT_JOURNAL_PENDING),
+        &serde_json::json!({ "id": id, "entries": entries }),
+    );
+    Some(id)
+}
+
+/// Die after the journal is on disk and before anything is published, so the
+/// interrupted-edit path can be exercised without killing the process from the
+/// outside. Only ever reached when the environment variable is set.
+fn edit_journal_crash_hook() -> EditResult<()> {
+    if std::env::var_os("GREPPY_TEST_CRASH_AFTER_JOURNAL").is_some() {
+        return Err(EditRefusal::new(
+            "interrupted",
+            "interrupted after the journal was written and before anything was published",
+            16,
+        ));
+    }
+    Ok(())
+}
+
+/// Close the transaction: record what the files look like now, and push it onto
+/// the stack. The after-image is what `undo` checks against, so an edit that
+/// somebody else overwrote in the meantime cannot be reversed blindly (D3).
+fn edit_journal_close(root_path: &std::path::Path, id: &str) {
+    let dir = edit_journal_dir(root_path);
+    let Some(mut record) = edit_journal_read(&dir.join(EDIT_JOURNAL_PENDING)) else {
+        return;
+    };
+    if record["id"].as_str() != Some(id) {
+        return;
+    }
+    let closed: Vec<serde_json::Value> = record["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut entry| {
+            let rel = entry["path"].as_str().unwrap_or_default().to_string();
+            match std::fs::read(root_path.join(&rel)) {
+                Ok(bytes) => {
+                    entry["existed_after"] = serde_json::json!(true);
+                    entry["after_sha256"] = serde_json::json!(edit_sha256_hex(&bytes));
+                }
+                Err(_) => {
+                    entry["existed_after"] = serde_json::json!(false);
+                    entry["after_sha256"] = serde_json::Value::Null;
+                }
+            }
+            entry
+        })
+        .collect();
+    record["entries"] = serde_json::json!(closed);
+    let mut stack = edit_journal_read(&dir.join(EDIT_JOURNAL_STACK))
+        .and_then(|value| value["transactions"].as_array().cloned())
+        .unwrap_or_default();
+    stack.push(record);
+    if stack.len() > EDIT_JOURNAL_DEPTH {
+        let excess = stack.len() - EDIT_JOURNAL_DEPTH;
+        stack.drain(..excess);
+    }
+    edit_journal_write(
+        &dir.join(EDIT_JOURNAL_STACK),
+        &serde_json::json!({ "transactions": stack }),
+    );
+    let _ = std::fs::remove_file(dir.join(EDIT_JOURNAL_PENDING));
+}
+
+/// Abandon an open transaction without recording it. Used when the work it was
+/// opened for turned out to write nothing after all.
+fn edit_journal_abort(root_path: &std::path::Path) {
+    let _ = std::fs::remove_file(edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING));
+}
+
+/// Put a transaction's files back the way they were. `guarded` is the D3 rule:
+/// `undo` refuses if a file no longer looks the way that edit left it, because
+/// it would otherwise overwrite bytes the caller has never seen. `recover`
+/// restores unguarded — an interrupted edit has no after-image to compare with.
+fn edit_journal_restore(
+    root_path: &std::path::Path,
+    record: &serde_json::Value,
+    guarded: bool,
+) -> EditResult<Vec<String>> {
+    let dir = edit_journal_dir(root_path);
+    let entries = record["entries"].as_array().cloned().unwrap_or_default();
+    if guarded {
+        for entry in &entries {
+            let rel = entry["path"].as_str().unwrap_or_default();
+            let live = std::fs::read(root_path.join(rel));
+            let expected_after = entry["existed_after"].as_bool().unwrap_or(true);
+            let unchanged = match (&live, expected_after) {
+                (Ok(bytes), true) => {
+                    edit_sha256_hex(bytes) == entry["after_sha256"].as_str().unwrap_or_default()
+                }
+                (Err(_), false) => true,
+                _ => false,
+            };
+            if !unchanged {
+                return Err(EditRefusal::new(
+                    "changed_since_edit",
+                    format!("{rel} no longer looks the way that edit left it"),
+                    12,
+                ));
+            }
+        }
+    }
+    let mut restored = Vec::new();
+    for entry in &entries {
+        let rel = entry["path"].as_str().unwrap_or_default().to_string();
+        let abs = root_path.join(&rel);
+        match entry["blob"].as_str() {
+            Some(blob) => {
+                let bytes = std::fs::read(dir.join(EDIT_JOURNAL_BLOBS).join(blob)).map_err(
+                    |error| {
+                        EditRefusal::new(
+                            "nothing_to_undo",
+                            format!("{rel}: the pre-image is gone ({error})"),
+                            10,
+                        )
+                    },
+                )?;
+                if let Some(parent) = abs.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&abs, &bytes).map_err(|error| {
+                    EditRefusal::new("publish_failed", format!("{rel}: {error}"), 16)
+                })?;
+                restored.push(rel);
+            }
+            // The file was created by that edit, so putting it back means
+            // taking it away again.
+            None => {
+                let _ = std::fs::remove_file(&abs);
+            }
+        }
+    }
+    restored.sort();
+    Ok(restored)
+}
+
+fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditResult<EditRecord> {
+    let dir = edit_journal_dir(root_path);
+    let mut stack = edit_journal_read(&dir.join(EDIT_JOURNAL_STACK))
+        .and_then(|value| value["transactions"].as_array().cloned())
+        .unwrap_or_default();
+    let Some(last) = stack.pop() else {
+        return Err(EditRefusal::new(
+            "nothing_to_undo",
+            "nothing to undo in this workspace",
+            10,
+        ));
+    };
+    let files: Vec<String> = last["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["path"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut record = EditRecord {
+        files,
+        published: !dry_run,
+        ..EditRecord::default()
+    };
+    if dry_run {
+        return Ok(record);
+    }
+    let restored = edit_journal_restore(root_path, &last, true)?;
+    // The entry is consumed, or every further call would restore the same
+    // snapshot and answer with a cheerful exit 0 while the repo stops moving.
+    edit_journal_write(
+        &dir.join(EDIT_JOURNAL_STACK),
+        &serde_json::json!({ "transactions": stack }),
+    );
+    record
+        .notes
+        .push(format!("reversed {} file(s)", record.files.len()));
+    record
+        .extra
+        .push(("restored", serde_json::json!(restored)));
+    Ok(record)
+}
+
+/// Finish or roll back an edit that was interrupted between the journal and the
+/// publish. Returns `None` when there is nothing pending, so the caller can fall
+/// through to the transaction journal of the certificate verbs.
+fn run_edit_recover(root_path: &std::path::Path) -> EditResult<Option<usize>> {
+    let dir = edit_journal_dir(root_path);
+    let pending = dir.join(EDIT_JOURNAL_PENDING);
+    let Some(record) = edit_journal_read(&pending) else {
+        return Ok(None);
+    };
+    let restored = edit_journal_restore(root_path, &record, false)?;
+    let _ = std::fs::remove_file(&pending);
+    Ok(Some(restored.len()))
+}
+
+/// Record a transaction whose files are already on disk. The verbs that go
+/// through a certificate publish before they report, so there is nothing left
+/// to interrupt by the time this runs.
+fn record_edit_undo(root_path: &std::path::Path, before: &[UndoBefore]) {
+    if let Some(id) = edit_journal_open(root_path, before) {
+        edit_journal_close(root_path, &id);
+    }
+}
+
+/// Pre-images for the files a plan names, captured before it runs.
+fn plan_undo_snapshot(root_path: &std::path::Path, plan_text: &str) -> Vec<UndoBefore> {
+    let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) else {
+        return Vec::new();
+    };
+    let mut out: Vec<UndoBefore> = Vec::new();
+    for operation in plan["operations"].as_array().unwrap_or(&Vec::new()) {
+        for key in ["file", "to"] {
+            let Some(file) = operation[key].as_str() else {
+                continue;
+            };
+            if out.iter().any(|item| item.rel == file) {
+                continue;
+            }
+            out.push(UndoBefore::read(root_path, file));
+        }
+    }
+    out
+}
+
+// --- whole-file verbs -------------------------------------------------------
+//
+// `write`, `move` and `remove` are the three questions that are about the file
+// rather than about a span inside it. `move` and `remove` are only worth having
+// because they do the language work `mv` and `rm` cannot: a rename that leaves
+// the importers behind produces a repository that does not build, and a delete
+// that leaves dangling imports turns one mistake into a broken build.
+
+/// Which bytes of a file are code, as opposed to a comment or a string.
+///
+/// The distinction is the whole point of the rewrite: a module path inside a
+/// comment or a string literal is prose, and rewriting it edits documentation
+/// nobody asked about — while a rewrite that stops at the first occurrence
+/// leaves a call pointing at a module that is gone.
+fn edit_code_mask(text: &str, hash_comments: bool) -> Vec<bool> {
+    let bytes = text.as_bytes();
+    let mut mask = vec![true; bytes.len()];
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let rest = &bytes[index..];
+        let line_comment = if hash_comments {
+            rest.first() == Some(&b'#')
+        } else {
+            rest.starts_with(b"//")
+        };
+        if line_comment {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                mask[index] = false;
+                index += 1;
+            }
+            continue;
+        }
+        if !hash_comments && rest.starts_with(b"/*") {
+            let end = text[index..]
+                .find("*/")
+                .map(|offset| index + offset + 2)
+                .unwrap_or(bytes.len());
+            for flag in mask.iter_mut().take(end).skip(index) {
+                *flag = false;
+            }
+            index = end;
+            continue;
+        }
+        if hash_comments && (rest.starts_with(b"\"\"\"") || rest.starts_with(b"'''")) {
+            let quote = &text[index..index + 3];
+            let end = text[index + 3..]
+                .find(quote)
+                .map(|offset| index + 3 + offset + 3)
+                .unwrap_or(bytes.len());
+            for flag in mask.iter_mut().take(end).skip(index) {
+                *flag = false;
+            }
+            index = end;
+            continue;
+        }
+        if rest[0] == b'"' || rest[0] == b'\'' {
+            let quote = rest[0];
+            let mut cursor = index + 1;
+            mask[index] = false;
+            while cursor < bytes.len() {
+                mask[cursor] = false;
+                if bytes[cursor] == b'\\' {
+                    cursor += 2;
+                    continue;
+                }
+                if bytes[cursor] == quote || bytes[cursor] == b'\n' {
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            index = cursor.min(bytes.len());
+            continue;
+        }
+        index += 1;
+    }
+    mask
+}
+
+fn edit_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Replace every code occurrence of `from` with `to`, where an occurrence is
+/// bounded by something that is not part of a name — so `crate::helper` never
+/// matches inside `crate::helper_answer`, and `pkg.helper` never matches inside
+/// `pkg.helpers`.
+fn edit_replace_in_code(text: &str, mask: &[bool], from: &str, to: &str) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let boundary = |offset: usize, delta: isize| -> bool {
+        let probe = if delta < 0 {
+            match offset.checked_sub(1) {
+                Some(index) => index,
+                None => return true,
+            }
+        } else if offset >= bytes.len() {
+            return true;
+        } else {
+            offset
+        };
+        !edit_ident_byte(bytes[probe])
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut hits = 0usize;
+    while let Some(found) = text[cursor..].find(from) {
+        let start = cursor + found;
+        let end = start + from.len();
+        out.push_str(&text[cursor..start]);
+        let leading = text[..start]
+            .as_bytes()
+            .last()
+            .is_none_or(|byte| !edit_ident_byte(*byte) && *byte != b'.' && *byte != b':');
+        if mask.get(start).copied().unwrap_or(false)
+            && leading
+            && boundary(start, -1)
+            && boundary(end, 1)
+        {
+            out.push_str(to);
+            hits += 1;
+        } else {
+            out.push_str(&text[start..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    (out, hits)
+}
+
+/// How a language spells "the module this file is". Only the languages whose
+/// module identity greppy can state exactly are here; for anything else `move`
+/// moves the file and says it rewrote nothing, rather than guessing.
+enum ModuleIdentity {
+    /// `crate::a::helper`, plus the bare identifier its declaring file uses.
+    Rust { path: String, ident: String },
+    /// `pkg.helper`.
+    Python { path: String },
+}
+
+fn edit_module_identity(rel: &str) -> Option<ModuleIdentity> {
+    let path = std::path::Path::new(rel);
+    let extension = path.extension().and_then(|value| value.to_str())?;
+    match extension {
+        "rs" => {
+            let mut segments: Vec<String> = rel
+                .trim_end_matches(".rs")
+                .split('/')
+                .map(str::to_string)
+                .collect();
+            if segments.first().is_some_and(|first| first == "src") {
+                segments.remove(0);
+            }
+            if segments.last().is_some_and(|last| last == "mod") {
+                segments.pop();
+            }
+            if segments
+                .last()
+                .is_some_and(|last| last == "lib" || last == "main")
+            {
+                segments.pop();
+            }
+            let ident = segments.last()?.clone();
+            Some(ModuleIdentity::Rust {
+                path: format!("crate::{}", segments.join("::")),
+                ident,
+            })
+        }
+        "py" => {
+            let mut segments: Vec<String> = rel
+                .trim_end_matches(".py")
+                .split('/')
+                .map(str::to_string)
+                .collect();
+            if segments.last().is_some_and(|last| last == "__init__") {
+                segments.pop();
+            }
+            if segments.is_empty() {
+                return None;
+            }
+            Some(ModuleIdentity::Python {
+                path: segments.join("."),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The files that could declare a Rust module: the parent module's own file.
+/// `src/a/helper.rs` is declared in `src/a/mod.rs`, `src/helper.rs` in
+/// `src/lib.rs` or `src/main.rs`. Only those files may have their bare
+/// `mod helper;` and `helper::…` rewritten — every other file has to say
+/// `crate::…`, and rewriting a bare identifier there would hit an unrelated name.
+fn edit_rust_declaring_files(rel: &str) -> Vec<String> {
+    let path = std::path::Path::new(rel);
+    let mut dir = path.parent().map(std::path::Path::to_path_buf);
+    if path.file_stem().and_then(|stem| stem.to_str()) == Some("mod") {
+        dir = dir.and_then(|inner| inner.parent().map(std::path::Path::to_path_buf));
+    }
+    let Some(dir) = dir else {
+        return Vec::new();
+    };
+    ["mod.rs", "lib.rs", "main.rs"]
+        .iter()
+        .map(|name| {
+            let joined = dir.join(name);
+            joined.to_string_lossy().replace('\\', "/")
+        })
+        .filter(|candidate| candidate != rel)
+        .collect()
+}
+
+/// Every source file of the same language, so "which files name this module" is
+/// answered from what is on disk now — the index is a cache, and a cache is
+/// wrong the moment somebody edits a file outside greppy.
+fn edit_sibling_sources(root_path: &std::path::Path, extension: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![root_path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some(extension) {
+                continue;
+            }
+            if let Ok(relative) = path.strip_prefix(root_path) {
+                found.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One file that names the moved module, and — when a new path was given — the
+/// text it has to carry afterwards.
+struct ModuleReference {
+    file: String,
+    rewritten: Option<String>,
+}
+
+/// Which files name the module `rel` is, and how they read once it becomes
+/// `to`. This is what makes `move` more than `mv` and `remove` more than `rm`.
+fn edit_module_references(
+    root_path: &std::path::Path,
+    rel: &str,
+    to: Option<&str>,
+) -> Vec<ModuleReference> {
+    let Some(identity) = edit_module_identity(rel) else {
+        return Vec::new();
+    };
+    let target = to.and_then(edit_module_identity);
+    let (extension, hash_comments) = match identity {
+        ModuleIdentity::Rust { .. } => ("rs", false),
+        ModuleIdentity::Python { .. } => ("py", true),
+    };
+    let declaring = edit_rust_declaring_files(rel);
+    let mut found = Vec::new();
+    for file in edit_sibling_sources(root_path, extension) {
+        if file == rel || Some(file.as_str()) == to {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(root_path.join(&file)) else {
+            continue;
+        };
+        let mut current = text.clone();
+        let mut hits = 0usize;
+        let apply = |current: &mut String, hits: &mut usize, from: &str, to: &str| {
+            let mask = edit_code_mask(current, hash_comments);
+            let (next, count) = edit_replace_in_code(current, &mask, from, to);
+            *hits += count;
+            *current = next;
+        };
+        match (&identity, &target) {
+            (ModuleIdentity::Rust { path, ident }, target) => {
+                let (new_path, new_ident) = match target {
+                    Some(ModuleIdentity::Rust {
+                        path: new_path,
+                        ident: new_ident,
+                    }) => (new_path.clone(), new_ident.clone()),
+                    _ => (path.clone(), ident.clone()),
+                };
+                // The fully qualified path first: after it is rewritten there is
+                // no bare segment left to confuse the second pass.
+                apply(&mut current, &mut hits, path, &new_path);
+                if declaring.contains(&file) {
+                    apply(
+                        &mut current,
+                        &mut hits,
+                        &format!("mod {ident};"),
+                        &format!("mod {new_ident};"),
+                    );
+                    apply(
+                        &mut current,
+                        &mut hits,
+                        &format!("{ident}::"),
+                        &format!("{new_ident}::"),
+                    );
+                }
+            }
+            (ModuleIdentity::Python { path }, target) => {
+                let new_path = match target {
+                    Some(ModuleIdentity::Python { path: new_path }) => new_path.clone(),
+                    _ => path.clone(),
+                };
+                apply(&mut current, &mut hits, path, &new_path);
+            }
+        }
+        if hits == 0 {
+            continue;
+        }
+        found.push(ModuleReference {
+            file,
+            rewritten: (to.is_some() && current != text).then_some(current),
+        });
+    }
+    found
+}
+
+/// A path that may not exist yet, resolved against the root and checked for
+/// escapes lexically — `canonicalize` cannot answer for a file that is about to
+/// be created, and a `..` that leaves the repository must never reach the disk.
+fn edit_resolve_new_path(
+    root_path: &std::path::Path,
+    file: &str,
+) -> EditResult<(String, std::path::PathBuf)> {
+    let base = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+    let candidate = std::path::Path::new(file);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(EditRefusal::new(
+                        "path_outside_repo",
+                        format!("{file} is outside {}", base.display()),
+                        17,
+                    ));
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let Ok(relative) = normalized.strip_prefix(&base) else {
+        return Err(EditRefusal::new(
+            "path_outside_repo",
+            format!("{file} is outside {}", base.display()),
+            17,
+        ));
+    };
+    let rel = relative.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        return Err(EditRefusal::new(
+            "path_outside_repo",
+            format!("{file} is the repository root, not a file in it"),
+            17,
+        ));
+    }
+    let abs = root_path.join(&rel);
+    Ok((rel, abs))
+}
+
+/// The record a whole-file verb answers with once the work is done.
+fn edit_whole_file_record(
+    root_path: &std::path::Path,
+    rel: &str,
+    bytes: &[u8],
+    before: &[u8],
+    published: bool,
+) -> EditRecord {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let mut operation = EditOperation {
+        file: rel.to_string(),
+        ranges: vec![(0, bytes.len())],
+        result_span: Some(text.clone()),
+        sha_before: Some(edit_sha256_hex(before)),
+        sha_after: Some(edit_sha256_hex(bytes)),
+        diff: Some(edit_unified_diff(rel, before, bytes)),
+        ..EditOperation::default()
+    };
+    let mut record = EditRecord {
+        files: vec![rel.to_string()],
+        span: Some(edit_span_lines(bytes, 0, bytes.len())),
+        text: Some(text),
+        published,
+        ..EditRecord::default()
+    };
+    if published {
+        let handle = greppy_edit::EditHandle::for_range(
+            root_path,
+            std::path::Path::new(rel),
+            bytes,
+            0,
+            bytes.len(),
+        )
+        .ok()
+        .map(|handle| handle.encode());
+        operation.handle = handle.clone();
+        record.handle = handle;
+    }
+    record.operations = vec![operation];
+    record
+}
+
+fn run_edit_write(
+    root_path: &std::path::Path,
+    file: &str,
+    content: Option<String>,
+    content_file: Option<String>,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    // The content is resolved first on purpose: "there is no new text" is the
+    // caller's mistake whether or not the target happens to exist, and naming
+    // the target instead would send it looking in the wrong place.
+    let bytes = edit_content_bytes(content, content_file)?;
+    let (rel, abs) = edit_resolve_new_path(root_path, file)?;
+    if abs.is_dir() {
+        return Err(EditRefusal::new(
+            "file_exists",
+            format!("{file} is a directory, not a file"),
+            13,
+        ));
+    }
+    if abs.exists() {
+        // D5: two ways to do the same thing without a named difference breaks
+        // "one name per thing". `write` creates; rewriting is `replace --file`.
+        return Err(EditRefusal::new(
+            "file_exists",
+            format!("{file} already exists; `replace --file {file}` rewrites it"),
+            13,
+        ));
+    }
+    if dry_run {
+        return Ok(edit_whole_file_record(root_path, &rel, &bytes, b"", false));
+    }
+    // There is no `greppy mkdir`, so a new module in a new directory has to be
+    // possible here or it is not possible through greppy at all.
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            EditRefusal::new(
+                "publish_failed",
+                format!("create {}: {error}", parent.display()),
+                16,
+            )
+        })?;
+    }
+    let transaction = edit_journal_open(
+        root_path,
+        &[UndoBefore {
+            rel: rel.clone(),
+            content: None,
+        }],
+    );
+    edit_journal_crash_hook()?;
+    if let Err(error) = std::fs::write(&abs, &bytes) {
+        edit_journal_abort(root_path);
+        return Err(EditRefusal::new(
+            "publish_failed",
+            format!("{file}: {error}"),
+            16,
+        ));
+    }
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+    }
+    let mut record = edit_whole_file_record(root_path, &rel, &bytes, b"", true);
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
+fn run_edit_move(
+    root_path: &std::path::Path,
+    file: &str,
+    to: &str,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    let (rel, abs, content) = edit_read_file(root_path, file)?;
+    if abs.is_dir() {
+        return Err(EditRefusal::new(
+            "file_not_found",
+            format!("{file} is a directory, not a file"),
+            10,
+        ));
+    }
+    let (new_rel, destination) = edit_resolve_new_path(root_path, to)?;
+    // A rename that only changes the case of the name is a rename, and on a
+    // case-insensitive file system it is the one an `exists()` check refuses by
+    // mistake.
+    let case_only = new_rel != rel && new_rel.to_lowercase() == rel.to_lowercase();
+    if new_rel == rel {
+        // Moving a file onto itself is a no-op, not a way to lose it.
+        return Ok(EditRecord {
+            files: vec![rel.clone()],
+            published: !dry_run,
+            extra: vec![
+                ("from", serde_json::json!(rel)),
+                ("to", serde_json::json!(new_rel)),
+                ("rewrote", serde_json::json!(Vec::<String>::new())),
+            ],
+            ..EditRecord::default()
+        });
+    }
+    if destination.exists() && !case_only {
+        return Err(EditRefusal::new(
+            "file_exists",
+            format!("{to} already exists; nothing was moved"),
+            13,
+        ));
+    }
+    let references = edit_module_references(root_path, &rel, Some(&new_rel));
+    let rewrote: Vec<String> = references
+        .iter()
+        .filter(|reference| reference.rewritten.is_some())
+        .map(|reference| reference.file.clone())
+        .collect();
+    let mut record = EditRecord {
+        files: std::iter::once(new_rel.clone())
+            .chain(rewrote.iter().cloned())
+            .collect(),
+        published: !dry_run,
+        extra: vec![
+            ("from", serde_json::json!(rel)),
+            ("to", serde_json::json!(new_rel)),
+            ("rewrote", serde_json::json!(rewrote)),
+        ],
+        ..EditRecord::default()
+    };
+    if dry_run {
+        return Ok(record);
+    }
+    let mut before = vec![
+        UndoBefore {
+            rel: rel.clone(),
+            content: Some(content.clone()),
+        },
+        UndoBefore {
+            rel: new_rel.clone(),
+            content: None,
+        },
+    ];
+    for reference in &references {
+        if reference.rewritten.is_some() {
+            before.push(UndoBefore::read(root_path, &reference.file));
+        }
+    }
+    let transaction = edit_journal_open(root_path, &before);
+    edit_journal_crash_hook()?;
+    let publish = (|| -> std::io::Result<()> {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if case_only {
+            // Writing the destination and unlinking the source is the same file
+            // twice on a case-insensitive file system, which destroys it.
+            let interim = abs.with_extension("greppy-rename");
+            std::fs::rename(&abs, &interim)?;
+            std::fs::rename(&interim, &destination)?;
+        } else {
+            std::fs::write(&destination, &content)?;
+            std::fs::remove_file(&abs)?;
+        }
+        for reference in &references {
+            if let Some(text) = &reference.rewritten {
+                std::fs::write(root_path.join(&reference.file), text)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        if let Some(record) = edit_journal_read(
+            &edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING),
+        ) {
+            let _ = edit_journal_restore(root_path, &record, false);
+        }
+        edit_journal_abort(root_path);
+        return Err(EditRefusal::new(
+            "publish_failed",
+            format!("{file} -> {to}: {error}"),
+            16,
+        ));
+    }
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+    }
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
+fn run_edit_remove(
+    root_path: &std::path::Path,
+    file: &str,
+    force: bool,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    let (rel, abs, content) = edit_read_file(root_path, file)?;
+    if abs.is_dir() {
+        return Err(EditRefusal::new(
+            "file_not_found",
+            format!("{file} is a directory, not a file"),
+            10,
+        ));
+    }
+    let references: Vec<String> = edit_module_references(root_path, &rel, None)
+        .into_iter()
+        .map(|reference| reference.file)
+        .collect();
+    if !references.is_empty() && !force {
+        // Owner decision 4: a delete that leaves dangling imports turns a
+        // one-command mistake into a broken build, and it cannot be undone by
+        // reading, because the content is gone.
+        let listed = references
+            .iter()
+            .map(|file| format!("\n  {file}"))
+            .collect::<String>();
+        return Err(
+            EditRefusal::new(
+                "still_referenced",
+                format!("{rel} is still referenced by:{listed}"),
+                13,
+            )
+            .with("references", serde_json::json!(references)),
+        );
+    }
+    let mut record = EditRecord {
+        files: vec![rel.clone()],
+        published: !dry_run,
+        extra: vec![("references", serde_json::json!(references))],
+        ..EditRecord::default()
+    };
+    for reference in record
+        .extra
+        .first()
+        .and_then(|(_, value)| value.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        if let Some(file) = reference.as_str() {
+            record.notes.push(format!("{file} still references {rel}"));
+        }
+    }
+    if dry_run {
+        return Ok(record);
+    }
+    let transaction = edit_journal_open(
+        root_path,
+        &[UndoBefore {
+            rel: rel.clone(),
+            content: Some(content),
+        }],
+    );
+    edit_journal_crash_hook()?;
+    if let Err(error) = std::fs::remove_file(&abs) {
+        edit_journal_abort(root_path);
+        return Err(EditRefusal::new(
+            "publish_failed",
+            format!("{rel}: {error}"),
+            16,
+        ));
+    }
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+    }
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
+// --- a plan of whole-file verbs ---------------------------------------------
+
+/// `apply --plan` over `write` / `move` / `remove`: all of it or none of it, and
+/// one entry in the journal, so one `undo` takes the whole batch back.
+fn run_edit_plan_whole_file(
+    root_path: &std::path::Path,
+    operations: &[serde_json::Value],
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    let mut before: Vec<UndoBefore> = Vec::new();
+    let remember = |root_path: &std::path::Path, rel: &str, before: &mut Vec<UndoBefore>| {
+        if !before.iter().any(|item| item.rel == rel) {
+            before.push(UndoBefore::read(root_path, rel));
+        }
+    };
+    for operation in operations {
+        for key in ["file", "to"] {
+            if let Some(file) = operation[key].as_str() {
+                if let Ok((rel, _)) = edit_resolve_new_path(root_path, file) {
+                    remember(root_path, &rel, &mut before);
+                }
+            }
+        }
+        // A move rewrites the files that name the module, and they belong to the
+        // same transaction — otherwise one `undo` puts the file back and leaves
+        // the imports pointing at a module that is gone again.
+        if operation["verb"].as_str() == Some("move") {
+            if let (Some(file), Some(to)) = (operation["file"].as_str(), operation["to"].as_str()) {
+                if let (Ok((rel, _)), Ok((new_rel, _))) = (
+                    edit_resolve_new_path(root_path, file),
+                    edit_resolve_new_path(root_path, to),
+                ) {
+                    for reference in edit_module_references(root_path, &rel, Some(&new_rel)) {
+                        remember(root_path, &reference.file, &mut before);
+                    }
+                }
+            }
+        }
+    }
+    let transaction = (!dry_run)
+        .then(|| edit_journal_open(root_path, &before))
+        .flatten();
+    if !dry_run {
+        edit_journal_crash_hook()?;
+    }
+    let mut files = Vec::new();
+    let mut failure = None;
+    for operation in operations {
+        let verb = operation["verb"].as_str().unwrap_or_default();
+        let file = operation["file"].as_str().unwrap_or_default().to_string();
+        let outcome = match verb {
+            "write" => run_edit_write(
+                root_path,
+                &file,
+                operation["content"].as_str().map(str::to_string),
+                operation["content_file"].as_str().map(str::to_string),
+                dry_run,
+                false,
+            ),
+            "move" => run_edit_move(
+                root_path,
+                &file,
+                operation["to"].as_str().unwrap_or_default(),
+                dry_run,
+                false,
+            ),
+            "remove" => run_edit_remove(
+                root_path,
+                &file,
+                operation["force"].as_bool().unwrap_or(false),
+                dry_run,
+                false,
+            ),
+            other => Err(EditRefusal::new(
+                "invalid_plan",
+                format!("`{other}` is not one of the whole-file verbs write, move and remove"),
+                20,
+            )),
+        };
+        match outcome {
+            Ok(record) => files.extend(record.files),
+            Err(refusal) => {
+                failure = Some(refusal);
+                break;
+            }
+        }
+    }
+    if let Some(refusal) = failure {
+        // "Many edits as one single change" is the only reason to send a plan:
+        // a batch whose first two operations are already on disk is worse than
+        // no plan at all, because the caller believes nothing happened.
+        if !dry_run {
+            if let Some(record) =
+                edit_journal_read(&edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING))
+            {
+                let _ = edit_journal_restore(root_path, &record, false);
+            }
+            edit_journal_abort(root_path);
+        }
+        return Err(refusal);
+    }
+    files.sort();
+    files.dedup();
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+    }
+    let mut record = EditRecord {
+        files,
+        published: !dry_run,
+        ..EditRecord::default()
+    };
+    if verify && !dry_run {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
+/// Whether a plan is written in the whole-file verbs. A plan that mixes them
+/// with the span verbs is not silently split: it is refused by the executor
+/// that owns it.
+fn plan_is_whole_file(plan_text: &str) -> Option<Vec<serde_json::Value>> {
+    let plan: serde_json::Value = serde_json::from_str(plan_text).ok()?;
+    let operations = plan["operations"].as_array()?.clone();
+    if operations.is_empty() {
+        return None;
+    }
+    operations
+        .iter()
+        .all(|operation| {
+            matches!(
+                operation["verb"].as_str(),
+                Some("write") | Some("move") | Some("remove")
+            )
+        })
+        .then_some(operations)
+}
+
+
+// --- reporting --------------------------------------------------------------
+
+/// The record as data. `full` is the archival form `--report` writes: it adds
+/// the diff and the resulting text, which stdout deliberately leaves out
+/// because they cost the context window the compact form exists to protect.
+fn edit_record_json(
+    record: &EditRecord,
+    full: bool,
+    report_path: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert("schema_version".into(), serde_json::json!(EDIT_RECORD_SCHEMA));
+    value.insert(
+        "status".into(),
+        serde_json::json!(if record.published {
+            "applied"
+        } else {
+            // A dry run that reports "applied" is read as a completed edit by
+            // every caller that trusts `status` over `published`.
+            "would_apply"
+        }),
+    );
+    value.insert("published".into(), serde_json::json!(record.published));
+    value.insert("exit_code".into(), serde_json::json!(0));
+    if let Some(first) = record.files.first() {
+        value.insert("file".into(), serde_json::json!(first));
+    }
+    value.insert("files".into(), serde_json::json!(record.files));
+    for (key, extra) in &record.extra {
+        value.insert((*key).into(), extra.clone());
+    }
+    if let Some((first, last)) = record.span {
+        value.insert("span".into(), serde_json::json!(format!("{first}:{last}")));
+    }
+    if let Some(text) = &record.text {
+        value.insert("text".into(), serde_json::json!(text));
+    }
+    if let Some(handle) = &record.handle {
+        value.insert("handle".into(), serde_json::json!(handle));
+    }
+    let operations: Vec<serde_json::Value> = record
+        .operations
+        .iter()
+        .map(|operation| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("file".into(), serde_json::json!(operation.file));
+            entry.insert(
+                "changed_byte_ranges".into(),
+                serde_json::json!(operation.ranges),
+            );
+            if let Some(text) = &operation.result_span {
+                entry.insert("result_span".into(), serde_json::json!(text));
+                if full {
+                    entry.insert("node_after".into(), serde_json::json!(text));
+                }
+            }
+            if let Some(handle) = &operation.handle {
+                entry.insert("handle".into(), serde_json::json!(handle));
+            }
+            if let Some(sha) = &operation.sha_before {
+                entry.insert("file_sha256_before".into(), serde_json::json!(sha));
+            }
+            if let Some(sha) = &operation.sha_after {
+                entry.insert("file_sha256_after".into(), serde_json::json!(sha));
+            }
+            if full {
+                if let Some(diff) = &operation.diff {
+                    entry.insert("unified_diff".into(), serde_json::json!(diff));
+                }
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect();
+    value.insert("operations".into(), serde_json::json!(operations));
+    if let Some(diagnostics) = &record.diagnostics {
+        value.insert("diagnostics".into(), serde_json::json!(diagnostics));
+        value.insert(
+            "verify".into(),
+            serde_json::json!({ "diagnostics": diagnostics }),
+        );
+    }
+    if !record.notes.is_empty() {
+        value.insert("references".into(), serde_json::json!(record.notes));
+    }
+    if let Some(path) = report_path {
+        value.insert("report_path".into(), serde_json::json!(path));
+    }
+    serde_json::Value::Object(value)
+}
+
+/// A refusal is an answer too: the same shape, with the cause named. Without
+/// `published` and `exit_code` a caller that asked for `--json` cannot tell a
+/// refusal from a success without re-reading the process exit code.
+fn edit_refusal_json(refusal: &EditRefusal, report_path: Option<&str>) -> serde_json::Value {
+    let mut error = serde_json::Map::new();
+    error.insert("code".into(), serde_json::json!(refusal.code));
+    error.insert("message".into(), serde_json::json!(refusal.message));
+    for (key, value) in &refusal.extra {
+        error.insert((*key).into(), value.clone());
+    }
+    let mut value = serde_json::Map::new();
+    value.insert("schema_version".into(), serde_json::json!(EDIT_RECORD_SCHEMA));
+    value.insert("status".into(), serde_json::json!("refused"));
+    value.insert("published".into(), serde_json::json!(false));
+    value.insert("exit_code".into(), serde_json::json!(refusal.exit));
+    value.insert("operations".into(), serde_json::json!([]));
+    value.insert("error".into(), serde_json::Value::Object(error));
+    if let Some(path) = report_path {
+        value.insert("report_path".into(), serde_json::json!(path));
+    }
+    serde_json::Value::Object(value)
+}
+
+/// Write the archival record. A refusal is the case where the evidence matters
+/// most, so `--report` is honoured there too.
+fn write_edit_report(path: &str, value: &serde_json::Value) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(value)
+        .map_err(|error| Error::Invalid(format!("serialize edit record: {error}")))?;
+    std::fs::write(path, format!("{rendered}\n")).map_err(|source| Error::Io {
+        context: format!("write report {path}"),
+        source,
+    })
+}
+
+fn emit_edit_outcome(
+    outcome: EditResult<EditRecord>,
+    json: bool,
+    report: Option<String>,
+) -> Result<i32> {
+    let report_path = report.as_deref();
+    match outcome {
+        Ok(record) => {
+            if let Some(path) = report_path {
+                write_edit_report(path, &edit_record_json(&record, true, report_path))?;
+            }
+            if json {
+                let compact = edit_record_json(&record, false, report_path);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&compact)
+                        .map_err(|error| Error::Invalid(format!("serialize edit record: {error}")))?
+                );
+            } else {
+                for (index, file) in record.files.iter().enumerate() {
+                    match record.span {
+                        // `file:line` is how every greppy answer addresses a
+                        // place; an edit report is no exception.
+                        Some((first, last)) if index == 0 => {
+                            println!("applied {file}:{first}-{last}");
+                        }
+                        _ => println!("applied {file}"),
+                    }
+                }
+                if let Some(text) = &record.text {
+                    if !text.is_empty() {
+                        println!("{text}");
+                    }
+                }
+                for note in &record.notes {
+                    println!("{note}");
+                }
+                if let Some(diagnostics) = &record.diagnostics {
+                    for diagnostic in diagnostics {
+                        println!("diagnostic: {diagnostic}");
+                    }
+                }
+                if let Some(handle) = &record.handle {
+                    println!("handle: {handle}");
+                }
+            }
+            Ok(0)
+        }
+        Err(refusal) => {
+            let value = edit_refusal_json(&refusal, report_path);
+            if let Some(path) = report_path {
+                write_edit_report(path, &value)?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                // stdout carries answers; a refusal is not one. A caller that
+                // pipes an edit into the next command must receive nothing
+                // rather than a line of prose it would then act on.
+                eprintln!("{}", refusal.message);
+            }
+            Ok(refusal.exit)
+        }
+    }
+}
+
+/// Map a certificate refusal onto the same `error.code` shape the grammar
+/// verbs use, so one caller-side branch covers every edit verb.
+fn certificate_refusal_code(certificate: &greppy_edit::Certificate) -> &'static str {
+    let occurrence_miss = certificate.operations.iter().any(|operation| {
+        operation.postconditions.iter().any(|postcondition| {
+            !postcondition.passed
+                && (postcondition.name.contains("occurrences")
+                    || postcondition.name.contains("cardinality"))
+        })
+    });
+    if occurrence_miss {
+        return "match_count";
+    }
+    match certificate.status {
+        greppy_edit::Status::NotFound => "not_found",
+        greppy_edit::Status::Ambiguous => "ambiguous_symbol",
+        greppy_edit::Status::Stale => "stale_handle",
+        greppy_edit::Status::InvalidResult => "invalid_result",
+        greppy_edit::Status::ValidationFailed => "validation_failed",
+        greppy_edit::Status::PublishFailed => "publish_failed",
+        _ => "refused",
+    }
+}
+
+// --- dispatch ---------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+fn dispatch_edit_grammar(
+    command: EditCommand,
+    json: bool,
+    root: Option<&str>,
+    root_path: &std::path::Path,
+) -> Result<GrammarDispatch> {
+    let code = match command {
+        EditCommand::Replace {
+            file,
+            old,
+            old_file,
+            pattern,
+            lines,
+            symbol,
+            body,
+            target,
+            content,
+            content_file,
+            expect,
+            path,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                edit_guard_single_stdin(&[
+                    ("--old-file", old_file.as_deref()),
+                    ("--content-file", content_file.as_deref()),
+                ])?;
+                let new_bytes = edit_content_bytes(content, content_file)?;
+                let spec = WhereSpec {
+                    file,
+                    old,
+                    old_file,
+                    pattern,
+                    lines,
+                    symbol,
+                    body,
+                    target,
+                    path,
+                };
+                let kind = classify_selector(&spec)?;
+                edit_expect_positive(expect)?;
+                let located = edit_locate(&spec, kind, root, root_path)?;
+                edit_check_cardinality(&located, expect)?;
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Insert {
+            file,
+            old,
+            old_file,
+            pattern,
+            lines,
+            symbol,
+            body,
+            target,
+            before,
+            after,
+            content,
+            content_file,
+            path,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                edit_guard_single_stdin(&[
+                    ("--old-file", old_file.as_deref()),
+                    ("--content-file", content_file.as_deref()),
+                ])?;
+                let new_bytes = edit_content_bytes(content, content_file)?;
+                if before == after {
+                    return Err(EditRefusal::new(
+                        "side_missing",
+                        "insert lands on one side of the anchor: pass --before or --after",
+                        20,
+                    ));
+                }
+                let spec = WhereSpec {
+                    file,
+                    old,
+                    old_file,
+                    pattern,
+                    lines,
+                    symbol,
+                    body,
+                    target,
+                    path,
+                };
+                let kind = classify_selector(&spec)?;
+                if !matches!(
+                    kind,
+                    SelectorKind::Symbol | SelectorKind::Lines | SelectorKind::Target
+                ) {
+                    return Err(EditRefusal::new(
+                        "selector_not_supported",
+                        format!(
+                            "insert takes --symbol S, --file F --lines A:B or --target H; \
+                             {} has no side to land on",
+                            kind.name()
+                        ),
+                        20,
+                    ));
+                }
+                let located = edit_locate(&spec, kind, root, root_path)?;
+                let (new_content, changed) = edit_op_insert(&located, &new_bytes, before);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Delete {
+            file,
+            old,
+            old_file,
+            pattern,
+            lines,
+            symbol,
+            body,
+            target,
+            expect,
+            path,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                let spec = WhereSpec {
+                    file,
+                    old,
+                    old_file,
+                    pattern,
+                    lines,
+                    symbol,
+                    body,
+                    target,
+                    path,
+                };
+                let kind = classify_selector(&spec)?;
+                edit_expect_positive(expect)?;
+                let located = edit_locate(&spec, kind, root, root_path)?;
+                edit_check_cardinality(&located, expect)?;
+                let (new_content, changed) = edit_op_delete(&located);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Patch {
+            file,
+            old,
+            old_file,
+            pattern,
+            lines,
+            symbol,
+            body,
+            target,
+            patch_file,
+            path,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                edit_guard_single_stdin(&[
+                    ("--old-file", old_file.as_deref()),
+                    ("--patch-file", patch_file.as_deref()),
+                ])?;
+                let Some(patch_file) = patch_file else {
+                    return Err(EditRefusal::new(
+                        "content_missing",
+                        "no diff: pass --patch-file FILE",
+                        20,
+                    ));
+                };
+                let patch = read_source_arg(&patch_file).map_err(|error| {
+                    EditRefusal::new(
+                        "invalid_patch",
+                        format!("--patch-file {patch_file}: {error}"),
+                        20,
+                    )
+                })?;
+                let spec = WhereSpec {
+                    file,
+                    old,
+                    old_file,
+                    pattern,
+                    lines,
+                    symbol,
+                    body,
+                    target,
+                    path,
+                };
+                let kind = classify_selector(&spec)?;
+                if matches!(kind, SelectorKind::Text | SelectorKind::Pattern) {
+                    return Err(EditRefusal::new(
+                        "selector_not_supported",
+                        format!(
+                            "patch takes --symbol S, --file F --lines A:B, --file F or --target H; \
+                             {} gives the hunks nothing to count from",
+                            kind.name()
+                        ),
+                        20,
+                    ));
+                }
+                let located = edit_locate(&spec, kind, root, root_path)?;
+                let (new_content, changed) = edit_op_patch(&located, &patch)?;
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Write {
+            file,
+            content,
+            content_file,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = run_edit_write(root_path, &file, content, content_file, dry_run, verify);
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Move {
+            file,
+            to,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = run_edit_move(root_path, &file, &to, dry_run, verify);
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Remove {
+            file,
+            force,
+            dry_run,
+            verify,
+            report,
+        } => {
+            let outcome = run_edit_remove(root_path, &file, force, dry_run, verify);
+            emit_edit_outcome(outcome, json, report)?
+        }
+        EditCommand::Undo { dry_run, report } => {
+            let outcome = run_edit_undo(root_path, dry_run);
+            emit_edit_outcome(outcome, json, report)?
+        }
+        other => return Ok(GrammarDispatch::Passthrough(Box::new(other))),
+    };
+    Ok(GrammarDispatch::Handled(code))
+}
+
+fn edit_status_name(status: greppy_edit::Status) -> &'static str {
+    match status {
+        greppy_edit::Status::Applied => "applied",
+        greppy_edit::Status::AlreadySatisfied => "already-satisfied",
+        greppy_edit::Status::NotFound => "not-found",
+        greppy_edit::Status::Ambiguous => "ambiguous",
+        greppy_edit::Status::Stale => "stale",
+        greppy_edit::Status::InvalidResult => "invalid-result",
+        greppy_edit::Status::ValidationFailed => "validation-failed",
+        greppy_edit::Status::PublishFailed => "publish-failed",
+    }
+}
+
+fn edit_operation_path(
+    operation: &greppy_edit::certificate::OperationReport,
+    root_path: &std::path::Path,
+) -> String {
+    let path = std::path::Path::new(&operation.file);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root_path).unwrap_or(path)
+    } else {
+        path
+    };
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+fn diff_after_line_span(diff: &str) -> Option<(usize, usize)> {
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    for line in diff.lines().filter(|line| line.starts_with("@@ ")) {
+        let range = line
+            .split_whitespace()
+            .find(|field| field.starts_with('+'))?
+            .trim_start_matches('+');
+        let (line_start, count) = range.split_once(',').unwrap_or((range, "1"));
+        let line_start = line_start.parse::<usize>().ok()?.max(1);
+        let count = count.parse::<usize>().ok()?;
+        start = start.min(line_start);
+        end = end.max(line_start.saturating_add(count.saturating_sub(1)));
+    }
+    (start != usize::MAX).then_some((start, end.max(start)))
+}
+
+fn line_for_byte(content: &[u8], offset: usize) -> usize {
+    content[..offset.min(content.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
+}
+
+fn edit_operation_line_span(
+    operation: &greppy_edit::certificate::OperationReport,
+    root_path: &std::path::Path,
+) -> (usize, usize) {
+    if let Some(span) = operation
+        .unified_diff
+        .as_deref()
+        .and_then(diff_after_line_span)
+    {
+        return span;
+    }
+    let path = if std::path::Path::new(&operation.file).is_absolute() {
+        std::path::PathBuf::from(&operation.file)
+    } else {
+        root_path.join(&operation.file)
+    };
+    let content = std::fs::read(path).unwrap_or_default();
+    if let Some(start_byte) = operation
+        .changed_byte_ranges
+        .iter()
+        .map(|range| range.0)
+        .min()
+    {
+        let start = line_for_byte(&content, start_byte);
+        let end = operation.node_after.as_deref().map_or_else(
+            || {
+                operation
+                    .changed_byte_ranges
+                    .iter()
+                    .map(|range| line_for_byte(&content, range.1))
+                    .max()
+                    .unwrap_or(start)
+            },
+            |span| start.saturating_add(span.lines().count().max(1) - 1),
+        );
+        return (start, end.max(start));
+    }
+    let line_count = content.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
+    (1, line_count.max(1))
+}
+
+fn one_line_truncated(text: &str, max_chars: usize) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_control() => escaped.extend(control.escape_default()),
+            printable => escaped.push(printable),
+        }
+    }
+    let mut chars = escaped.chars();
+    let mut compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() && max_chars > 0 {
+        compact.pop();
+        compact.push('…');
+    }
+    compact
+}
+
+fn render_compact_edit_certificate(
+    certificate: &greppy_edit::Certificate,
+    root_path: &std::path::Path,
+) {
+    // The output states what is the case; it does not tell the caller what to do
+    // next. A hard-wired suggestion does not know the task, and the traces show it
+    // guesses wrong: one handed `search-symbols` a file path, a query that cannot
+    // match by construction. Printed nine times, followed twice.
+    if let Some(diagnosis) = certificate.compact_failure_diagnosis() {
+        println!("diagnosis: {}", one_line_truncated(&diagnosis, 500));
+        return;
+    }
+    if certificate.exit_code() != 0 {
+        println!(
+            "diagnosis: edit {} for {} operation(s)",
+            edit_status_name(certificate.status),
+            certificate.operations.len()
+        );
+        return;
+    }
+    let status = edit_status_name(certificate.status);
+    for operation in &certificate.operations {
+        let path = edit_operation_path(operation, root_path);
+        let (start, end) = edit_operation_line_span(operation, root_path);
+        let matches = operation.target_matches;
+        println!(
+            "{status} {path}:{start}-{end}  {matches} match{}",
+            if matches == 1 { "" } else { "es" }
+        );
+        // Echo the written state on every applied operation. Without it the
+        // agent does not trust the receipt and issues a confirming `read`:
+        // measured on a 41-task run, 130 of 269 successful edits were followed
+        // immediately by a re-read. One truncated line here costs ~160 bytes
+        // and saves a whole turn, and a turn re-bills the entire conversation.
+        if let Some(result_span) = operation.node_after.as_deref() {
+            if !result_span.trim().is_empty() {
+                let label = if operation.formatter_expanded_change_scope {
+                    "formatter widened the change; written"
+                } else {
+                    "written"
+                };
+                println!("  {label}: {}", one_line_truncated(result_span, 160));
+            }
+        }
+    }
+    if certificate.status == greppy_edit::Status::Applied && certificate.operations.len() > 1 {
+        println!(
+            "applied {} operations atomically",
+            certificate.operations.len()
+        );
+    }
 }
 
 /// Shared tail of every edit command: refresh the store after a published
-/// edit, render the certificate, honour --report, map the exit code.
+/// edit, preserve the full certificate, render compact stdout, map the exit code.
+/// Say what the operation was looking for. "expected 1 target(s), found 0"
+/// names the count but not the text, and the caller cannot tell a typo in the
+/// anchor from a file that moved on. The plan it submitted has the text, so it
+/// is put back on the postcondition that failed.
+fn annotate_plan_refusal(certificate: &mut greppy_edit::Certificate, plan_text: &str) {
+    let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) else {
+        return;
+    };
+    let operations = plan
+        .get("operations")
+        .or_else(|| plan.get("ops"))
+        .and_then(|value| value.as_array());
+    let Some(operations) = operations else { return };
+    for (index, report) in certificate.operations.iter_mut().enumerate() {
+        if report.postconditions_passed {
+            continue;
+        }
+        let declared = operations.get(index).filter(|operation| {
+            operation
+                .get("file")
+                .and_then(|file| file.as_str())
+                .is_none_or(|file| file.ends_with(&report.file) || report.file.ends_with(file))
+        });
+        let Some(declared) = declared else { continue };
+        let sought = ["old", "pattern", "symbol", "selector"]
+            .iter()
+            .find_map(|key| declared.get(*key).and_then(|value| value.as_str()));
+        let Some(sought) = sought else { continue };
+        for postcondition in &mut report.postconditions {
+            if postcondition.passed {
+                continue;
+            }
+            let detail = postcondition.detail.get_or_insert_with(String::new);
+            if !detail.contains(sought) {
+                detail.push_str(&format!("; looking for `{sought}`"));
+            }
+            break;
+        }
+    }
+}
+
+/// A handle for every span a certificate operation wrote. A plan writes several
+/// spans, so one handle is not enough: without one per operation a multi-file
+/// change forces a re-read of every file it touched. Only a published
+/// operation gets one — a handle addresses bytes that are on disk.
+fn certificate_operation_handles(
+    certificate: &greppy_edit::Certificate,
+    root_path: &std::path::Path,
+) -> Vec<Option<String>> {
+    certificate
+        .operations
+        .iter()
+        .map(|operation| {
+            if !certificate.published {
+                return None;
+            }
+            // `changed_byte_ranges` addresses the file as it WAS; the handle
+            // has to address it as it now IS, and the text that is now there is
+            // exactly `node_after`.
+            let (start, before_end) = *operation.changed_byte_ranges.first()?;
+            let end = operation
+                .node_after
+                .as_ref()
+                .map_or(before_end, |text| start + text.len());
+            let candidate = std::path::Path::new(&operation.file);
+            let abs = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                root_path.join(candidate)
+            };
+            let content = std::fs::read(&abs).ok()?;
+            let rel = abs
+                .strip_prefix(root_path)
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| operation.file.clone());
+            greppy_edit::EditHandle::for_range(
+                root_path,
+                std::path::Path::new(&rel),
+                &content,
+                start,
+                end.min(content.len()),
+            )
+            .ok()
+            .map(|handle| handle.encode())
+        })
+        .collect()
+}
+
+/// Put the transaction every operation belongs to, and the handle for the span
+/// it wrote, on the operation itself. A single id printed above the list does
+/// not prove the operations share it.
+fn certificate_operation_extras(
+    value: &mut serde_json::Value,
+    transaction_id: &str,
+    handles: &[Option<String>],
+) {
+    let Some(operations) = value.get_mut("operations").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for (index, operation) in operations.iter_mut().enumerate() {
+        let Some(operation) = operation.as_object_mut() else {
+            continue;
+        };
+        operation.insert("transaction_id".into(), serde_json::json!(transaction_id));
+        if let Some(Some(handle)) = handles.get(index) {
+            operation.insert("handle".into(), serde_json::json!(handle));
+        }
+    }
+}
+
+/// The operation that actually refused. Once one operation of an all-or-nothing
+/// plan refuses, every operation is marked failed, so the first one is usually
+/// only a casualty; the caller needs the one that names a cause.
+fn certificate_refusal_message(certificate: &greppy_edit::Certificate) -> Option<String> {
+    let mut casualty = None;
+    for operation in &certificate.operations {
+        if operation.postconditions_passed {
+            continue;
+        }
+        let Some(detail) = operation
+            .postconditions
+            .iter()
+            .find(|postcondition| !postcondition.passed)
+            .and_then(|postcondition| postcondition.detail.as_deref())
+        else {
+            continue;
+        };
+        let line = format!("{}: {detail}", operation.file);
+        if detail.contains("another operation") {
+            casualty.get_or_insert(line);
+        } else {
+            return Some(line);
+        }
+    }
+    casualty
+}
+
 fn finish_edit(
     certificate: greppy_edit::Certificate,
     report_path: Option<String>,
+    json: bool,
     root: Option<&str>,
     root_path: &std::path::Path,
 ) -> Result<i32> {
-    let _ = root;
     let mut certificate = certificate;
     if certificate.published {
         // close the read->edit->read loop: refresh the store so the next
@@ -8194,9 +12545,6 @@ fn finish_edit(
         // reindex. index() is incremental from the second run, so this
         // touches only the changed file. A refresh failure downgrades the
         // flag, never the edit (the workspace write already happened).
-        // run the refresh as a self-subprocess: the full index path prints
-        // its report to stdout, which must stay reserved for the
-        // certificate; semantics are identical to `greppy index .`
         let refreshed = std::env::current_exe()
             .ok()
             .and_then(|exe| {
@@ -8216,19 +12564,141 @@ fn finish_edit(
             op.store_refreshed = refreshed;
         }
     }
-    let compact = certificate
-        .to_compact_json_pretty()
-        .map_err(|e| Error::Invalid(format!("serialize compact certificate: {e}")))?;
-    println!("{compact}");
+    let handles = certificate_operation_handles(&certificate, root_path);
+    let mut full_value = serde_json::to_value(&certificate)
+        .map_err(|e| Error::Invalid(format!("serialize full certificate: {e}")))?;
+    certificate_operation_extras(&mut full_value, &certificate.transaction_id, &handles);
+    let full = serde_json::to_string_pretty(&full_value)
+        .map_err(|e| Error::Invalid(format!("serialize full certificate: {e}")))?;
+    let mut report_written = None;
     if let Some(path) = report_path {
-        let full = serde_json::to_string_pretty(&certificate)
-            .map_err(|e| Error::Invalid(format!("serialize full certificate: {e}")))?;
         std::fs::write(&path, format!("{full}\n")).map_err(|source| Error::Io {
             context: format!("write report {path}"),
             source,
         })?;
+        report_written = Some(path);
+    }
+
+    let expand = if let (Ok(store), Ok(project)) =
+        (open_default_store_query_writer(root), project_for(root))
+    {
+        let summary = serde_json::json!({
+            "text": format!(
+                "edit certificate: {} operation(s), status {}",
+                certificate.operations.len(),
+                edit_status_name(certificate.status)
+            ),
+            "transaction_id": &certificate.transaction_id,
+            "status": edit_status_name(certificate.status),
+            "operations": certificate.operations.len(),
+        });
+        insert_expand_pack_best_effort(
+            &store,
+            &project,
+            "edit",
+            &certificate.transaction_id,
+            current_graph_generation_or_zero(&store, root),
+            summary,
+            format!("{full}\n"),
+            serde_json::to_value(&certificate).ok(),
+        )
+    } else {
+        None
+    };
+
+    if let Some(expand) = &expand {
+        insert_expand_alias_best_effort(root, &certificate.transaction_id, &expand.id);
+    }
+    if json {
+        // The stdout form, not the archival one: it carries `exit_code` and
+        // drops evidence that only `--report` and `expand` need. Printing the
+        // full Serialize form here silently dropped `exit_code` from the
+        // documented certificate contract.
+        let stdout_form = certificate
+            .to_compact_json_pretty()
+            .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?;
+        // One caller-side branch for every edit verb: a certificate that did
+        // not apply carries the same `error.code` the grammar verbs emit.
+        let mut value: serde_json::Value = serde_json::from_str(&stdout_form)
+            .map_err(|e| Error::Invalid(format!("re-read certificate: {e}")))?;
+        certificate_operation_extras(&mut value, &certificate.transaction_id, &handles);
+        if let Some(root) = value.as_object_mut() {
+            // The evidence stdout omits is omitted, not replaced by a stand-in
+            // string that reads like a diff to anything parsing the field.
+            if let Some(operations) = root.get_mut("operations").and_then(|v| v.as_array_mut()) {
+                for operation in operations {
+                    if let Some(operation) = operation.as_object_mut() {
+                        operation.remove("unified_diff");
+                    }
+                }
+            }
+            if let Some(path) = &report_written {
+                root.insert("report_path".into(), serde_json::json!(path));
+            }
+            if certificate.exit_code() != 0 {
+                let message = certificate_refusal_message(&certificate)
+                    .or_else(|| certificate.compact_failure_diagnosis())
+                    .unwrap_or_else(|| format!("edit {}", edit_status_name(certificate.status)));
+                root.insert(
+                    "error".into(),
+                    serde_json::json!({
+                        "code": certificate_refusal_code(&certificate),
+                        "message": message,
+                    }),
+                );
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?
+        );
+    } else {
+        render_compact_edit_certificate(&certificate, root_path);
+        if expand.is_some() {
+            println!("Expand: greppy expand {}", certificate.transaction_id);
+        }
     }
     Ok(certificate.exit_code())
+}
+
+fn edit_symbol_miss_candidates(
+    store: &greppy_store::Store,
+    project: &str,
+    symbol: &str,
+) -> Vec<greppy_edit::certificate::Candidate> {
+    let mut candidates = Vec::new();
+    for name in symbol_miss_suggestions(store, project, symbol) {
+        let Ok(ids) = resolve_symbol_nodes(store, Some(&name)) else {
+            continue;
+        };
+        for id in ids {
+            let Ok(Some(node)) = store.get_node(id) else {
+                continue;
+            };
+            if node.file_path.is_empty() || node.start_line < 1 {
+                continue;
+            }
+            let duplicate =
+                candidates
+                    .iter()
+                    .any(|candidate: &greppy_edit::certificate::Candidate| {
+                        candidate.qualified_name == node.qualified_name
+                            && candidate.path == node.file_path
+                    });
+            if !duplicate {
+                candidates.push(greppy_edit::certificate::Candidate {
+                    qualified_name: node.qualified_name,
+                    path: node.file_path,
+                    line: node.start_line as usize,
+                });
+            }
+            if candidates.len() == 5 {
+                return candidates;
+            }
+        }
+    }
+    candidates
 }
 
 /// Resolve an edit target: either a `--target HANDLE` (verified against the
@@ -8257,8 +12727,25 @@ fn resolve_edit_target(
         root_path: &std::path::Path,
         path: &str,
         status: greppy_edit::Status,
+        requested_symbol: Option<&str>,
+        accepted_spelling: Option<&str>,
         candidates: Vec<cert::Candidate>,
     ) -> greppy_edit::Certificate {
+        let mut postconditions = Vec::new();
+        if let Some(symbol) = requested_symbol {
+            postconditions.push(cert::PostconditionResult {
+                name: "requested-symbol".into(),
+                passed: true,
+                detail: Some(symbol.into()),
+            });
+        }
+        if let Some(spelling) = accepted_spelling {
+            postconditions.push(cert::PostconditionResult {
+                name: "accepted-symbol-spelling".into(),
+                passed: true,
+                detail: Some(spelling.into()),
+            });
+        }
         greppy_edit::Certificate {
             schema_version: cert::CERTIFICATE_SCHEMA.into(),
             status,
@@ -8274,7 +12761,11 @@ fn resolve_edit_target(
                 selector_engine: cert::SelectorEngine::Symbol,
                 selector_class: cert::SelectorClass::Resolved,
                 scope_matches: 0,
-                target_matches: candidates.len(),
+                target_matches: if status == greppy_edit::Status::NotFound {
+                    0
+                } else {
+                    candidates.len()
+                },
                 file_sha256_before: String::new(),
                 file_sha256_after: None,
                 target_sha256_before: String::new(),
@@ -8291,7 +12782,7 @@ fn resolve_edit_target(
                     new_missing_nodes: 0,
                 },
                 postconditions_passed: false,
-                postconditions: vec![],
+                postconditions,
                 residual_occurrences: None,
                 guarantees: cert::Guarantees {
                     addressed_range: cert::Guarantee::Failed,
@@ -8332,6 +12823,8 @@ fn resolve_edit_target(
                 root_path,
                 &handle.path,
                 greppy_edit::Status::Stale,
+                None,
+                None,
                 vec![],
             )))),
         };
@@ -8352,38 +12845,16 @@ fn resolve_edit_target(
         }
     }
     if nodes.is_empty() {
-        // Same P3 rule as read: a not-found edit target lists the closest
-        // indexed names as candidates, so the certificate itself carries
-        // the retry instead of sending the agent back into name guessing.
+        // Carry ranked, addressable near misses in the refusal itself so an
+        // agent can recover without another discovery turn.
         let project = project_for(root)?;
-        let mut similar = Vec::new();
-        for needle in suggestion_needles(symbol) {
-            similar = store
-                .similar_node_names(&project, &needle, 5)
-                .unwrap_or_default();
-            if !similar.is_empty() {
-                break;
-            }
-        }
-        let mut candidates = Vec::new();
-        for name in similar {
-            if let Ok(ids) = resolve_symbol_nodes(&store, Some(&name)) {
-                if let Some(node) = ids
-                    .first()
-                    .and_then(|id| store.get_node(*id).ok().flatten())
-                {
-                    candidates.push(cert::Candidate {
-                        qualified_name: node.qualified_name.clone(),
-                        path: node.file_path.clone(),
-                        line: node.start_line as usize,
-                    });
-                }
-            }
-        }
+        let candidates = edit_symbol_miss_candidates(&store, &project, symbol);
         return Ok(EditTarget::Refusal(Box::new(refusal(
             root_path,
             "",
             greppy_edit::Status::NotFound,
+            Some(symbol),
+            accepted_symbol_spelling(symbol),
             candidates,
         ))));
     }
@@ -8406,6 +12877,8 @@ fn resolve_edit_target(
             root_path,
             "",
             greppy_edit::Status::Ambiguous,
+            Some(symbol),
+            accepted_symbol_spelling(symbol),
             candidates,
         ))));
     }
@@ -8427,6 +12900,8 @@ fn resolve_edit_target(
             root_path,
             &node.file_path,
             greppy_edit::Status::Stale,
+            Some(symbol),
+            accepted_symbol_spelling(symbol),
             vec![],
         ))));
     };
@@ -8444,6 +12919,42 @@ fn resolve_edit_target(
         planned_file_sha256: planned.file_sha256,
         planned_target_sha256: planned.target_sha256,
     })
+}
+
+/// The byte range of `impl NAME { … }` — the type's own methods, not a trait
+/// implementation. Used only when the definition `--symbol NAME` resolved to
+/// carries no body of its own, so nothing that already works changes.
+fn rust_inherent_impl_range(content: &[u8], name: &str) -> Option<(usize, usize)> {
+    let text = std::str::from_utf8(content).ok()?;
+    let mut cursor = 0usize;
+    while let Some(found) = text[cursor..].find("impl ") {
+        let at = cursor + found;
+        cursor = at + 5;
+        let rest = &text[cursor..];
+        let Some(brace) = rest.find('{') else { break };
+        let head = rest[..brace].trim();
+        // `impl Trait for Name` implements someone else's contract; the method
+        // an agent asks for belongs in the type's own block.
+        if head != name {
+            continue;
+        }
+        let open = cursor + brace;
+        let mut depth = 0usize;
+        for (offset, byte) in text[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((at, open + offset + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+    None
 }
 
 /// Edit targets may be workspace-relative or absolute.
@@ -8881,6 +13392,39 @@ fn dispatch_brief_json(
     Ok(0)
 }
 
+fn expand_alias_path(root: Option<&str>, alias: &str) -> Option<std::path::PathBuf> {
+    if alias.is_empty()
+        || !alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let root_path = resolve_root(root).ok()?;
+    let store_path = workspace_locator::store_path(&root_path);
+    Some(store_path.parent()?.join("expand-aliases").join(alias))
+}
+
+fn insert_expand_alias_best_effort(root: Option<&str>, alias: &str, id: &str) {
+    let Some(path) = expand_alias_path(root, alias) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_ok() {
+        let _ = std::fs::write(path, id);
+    }
+}
+
+fn resolve_expand_alias(root: Option<&str>, alias: &str) -> Option<String> {
+    let path = expand_alias_path(root, alias)?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
 fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
     let id = id.unwrap_or("").trim();
     if id.is_empty() {
@@ -8888,7 +13432,8 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     }
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let Some(pack) = store.get_expand_pack(id)? else {
+    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
+    let Some(pack) = store.get_expand_pack(&lookup_id)? else {
         println!("expand: id not found or expired: {id}");
         return Ok(1);
     };
@@ -9795,6 +14340,1290 @@ fn content_fallback(
     Ok(0)
 }
 
+// ---------------------------------------------------------------------------
+// Several targets per call — `dev/CLI-SPEC.md` rules 1-3, 5.
+//
+// A positional argument is a TARGET, never a path filter: the only path filter
+// is `--path`, and it narrows every target in the batch. An argument the
+// grammar does not provide — a path, a glob, an empty string, a name that does
+// not resolve — is an error that names it, never an invented answer for the
+// targets that happened to resolve. Every result says which target it answers
+// for, in text and in `--json`.
+// ---------------------------------------------------------------------------
+
+/// Path-shaped: it carries a directory separator and is not one of the
+/// `file.rs::Symbol` qualified names greppy itself prints.
+fn looks_like_path(target: &str) -> bool {
+    (target.contains('/') || target.contains('\\')) && !target.contains("::")
+}
+
+fn looks_like_glob(target: &str) -> bool {
+    target.contains('*') || target.contains('?') || (target.contains('[') && target.contains(']'))
+}
+
+/// Rule 1: reject what the grammar does not provide instead of reinterpreting
+/// it. Each of these used to become a silent path filter or an empty answer.
+fn validate_nav_target(target: &str) -> Result<()> {
+    if target.trim().is_empty() {
+        return Err(Error::Invalid(
+            "empty target: a symbol name was expected (an unexpanded shell variable produces \
+             this). Nothing was looked up."
+                .into(),
+        ));
+    }
+    // A mistyped flag must not be swallowed as a target. `-x` stays a target
+    // (after `--` a leading dash is part of the name) and fails as an unknown
+    // symbol, which names it just as clearly.
+    if target.starts_with("--") {
+        return Err(Error::Invalid(format!(
+            "unknown flag `{target}`; it was not read as a symbol. The path filter is `--path`"
+        )));
+    }
+    if looks_like_glob(target) {
+        let literal = target.replace(['*', '?', '[', ']'], "");
+        return Err(Error::Invalid(format!(
+            "`{target}` is a glob, not a symbol name, and greppy never expands one. Run \
+             `greppy search-symbols {}` for the exact name first",
+            shell_example_arg(&literal)
+        )));
+    }
+    if looks_like_path(target) {
+        return Err(Error::Invalid(format!(
+            "`{target}` is a path, but a positional argument is always a symbol. To restrict the \
+             results to it write `--path {target}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Targets exactly as written, with `-` replaced by what arrived on the pipe.
+fn nav_targets(raw: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for value in raw {
+        if value == "-" {
+            out.extend(targets_from_stdin()?);
+            continue;
+        }
+        out.push(value.clone());
+    }
+    for target in &out {
+        validate_nav_target(target)?;
+    }
+    Ok(out)
+}
+
+/// Semantic queries are plain English, so the symbol-shape rules do not apply;
+/// only `-` is expanded.
+fn semantic_queries(raw: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for value in raw {
+        if value == "-" {
+            out.extend(targets_from_stdin()?);
+            continue;
+        }
+        if value.trim().is_empty() {
+            return Err(Error::Invalid(
+                "empty query: semantic-search needs a plain-English description".into(),
+            ));
+        }
+        out.push(value.clone());
+    }
+    Ok(out)
+}
+
+/// CHAIN: `greppy who-calls S --json | greppy brief -`. Result rows become the
+/// next command's targets; the previous call's `targets` echo does not — that
+/// is what it was asked, not what it answered.
+fn targets_from_stdin() -> Result<Vec<String>> {
+    use std::io::Read as _;
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .map_err(|source| Error::io("read targets from stdin", source))?;
+    let text = buffer.trim();
+    if text.is_empty() {
+        return Err(Error::Invalid(
+            "`-` was given but nothing arrived on the pipe".into(),
+        ));
+    }
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        collect_piped_targets(&value, &mut out);
+    }
+    if out.is_empty() {
+        for line in text.lines() {
+            let name = line.split_whitespace().next().unwrap_or("").trim();
+            if !name.is_empty() && !out.iter().any(|kept| kept == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::Invalid(
+            "`-` was given but the piped input carried no targets".into(),
+        ));
+    }
+    Ok(out)
+}
+
+fn collect_piped_targets(value: &serde_json::Value, out: &mut Vec<String>) {
+    let mut rows: Vec<&serde_json::Value> = Vec::new();
+    for key in ["hits", "definitions", "candidates"] {
+        if let Some(array) = value.get(key).and_then(serde_json::Value::as_array) {
+            rows.extend(array.iter());
+        }
+    }
+    if rows.is_empty() {
+        match value.as_array() {
+            Some(array) => rows.extend(array.iter()),
+            None => rows.push(value),
+        }
+    }
+    // (name, file) per row; the file only enters the target when the bare
+    // qualified name would be ambiguous — otherwise the shortest form wins.
+    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+    for row in rows {
+        let name = if let Some(text) = row.as_str() {
+            Some(text.to_string())
+        } else {
+            row.get("qualified_name")
+                .or_else(|| row.get("symbol"))
+                .or_else(|| row.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let Some(name) = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let file = row
+            .get("file")
+            .or_else(|| row.get("file_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        pairs.push((name, file));
+    }
+    for index in 0..pairs.len() {
+        let (name, file) = &pairs[index];
+        let ambiguous = pairs
+            .iter()
+            .enumerate()
+            .any(|(other, (candidate, _))| other != index && candidate == name);
+        let target = match (ambiguous, file) {
+            (true, Some(file)) if !name.starts_with(file.as_str()) => format!("{file}::{name}"),
+            _ => name.clone(),
+        };
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    }
+}
+
+/// Rule 2: `--path` is the only path filter, so a `--path` that cannot narrow
+/// anything is a mistake, not an empty scope. Answering "nothing found" would
+/// confirm a typo as a fact about the repository.
+///
+/// `label` is how the caller spelled the filter, so the message names what was
+/// actually written: `--path` for the flag, `path` for `search-code`'s
+/// grep-shaped `PATTERN [PATH …]` positional.
+fn validate_path_filters(root: Option<&str>, paths: &[String], label: &str) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
+    for raw in paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{label} needs a file or directory inside the repository"
+            )));
+        }
+        let supplied = std::path::Path::new(trimmed);
+        let mut candidates = Vec::new();
+        if supplied.is_absolute() {
+            candidates.push(supplied.to_path_buf());
+        } else {
+            if let Ok(cwd) = std::env::current_dir() {
+                candidates.push(cwd.join(supplied));
+            }
+            candidates.push(root_path.join(supplied));
+        }
+        let Some(canonical) = candidates.iter().find_map(|c| c.canonicalize().ok()) else {
+            return Err(Error::Invalid(format!(
+                "{label} `{trimmed}` does not exist under {}",
+                root_path.display()
+            )));
+        };
+        if !canonical.starts_with(&canonical_root) {
+            return Err(Error::Invalid(format!(
+                "{label} `{trimmed}` is outside the repository {}; it cannot narrow anything in it",
+                root_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A refusal has to identify WHICH target failed — "symbol not found" without
+/// the name forces the caller to bisect their own batch — and it keeps the
+/// near-match guidance that turns the refusal into one cheap retry.
+fn unknown_targets_message(
+    store: &greppy_store::Store,
+    project: &str,
+    missing: &[String],
+) -> String {
+    let mut message = if missing.len() == 1 {
+        format!("symbol not found: `{}`", missing[0])
+    } else {
+        format!(
+            "symbols not found: {}",
+            missing
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    message.push_str(" — no results were printed for the other targets either.");
+    for name in missing {
+        let suggestions = symbol_miss_suggestions(store, project, name);
+        if !suggestions.is_empty() {
+            message.push_str(&format!(
+                "\n  `{name}`: did you mean {}?",
+                suggestions
+                    .iter()
+                    .take(5)
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    message
+}
+
+/// A bare name that names definitions in more than one FILE is ambiguous.
+/// Answering for one of them, or silently merging both into one answer, is the
+/// same reinterpretation rule 1 forbids — so refuse and print the qualified
+/// names that select each definition. Several nodes on one definition site (a
+/// struct and its impl) are not ambiguity.
+fn ensure_unambiguous_target(
+    store: &greppy_store::Store,
+    target: &str,
+    ids: &[i64],
+) -> Result<()> {
+    if ids.len() < 2 || split_path_qualified(target).is_some() {
+        return Ok(());
+    }
+    let mut files: Vec<String> = Vec::new();
+    for id in ids {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+            continue;
+        }
+        if !files.contains(&node.file_path) {
+            files.push(node.file_path.clone());
+        }
+    }
+    if files.len() < 2 {
+        return Ok(());
+    }
+    files.sort();
+    Err(Error::Invalid(format!(
+        "`{target}` is defined in {} files, so the answer would be for one of them or for a \
+         merge of both. Name the definition: {}",
+        files.len(),
+        files
+            .iter()
+            .map(|file| format!("`{file}::{target}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// A definition is not a reference to itself: the target nodes, the members the
+/// target owns, and the synthetic anchor of the file the target is defined in
+/// are all part of the definition. Import anchors of OTHER files stay — they
+/// are how an import dependency is represented.
+fn self_reference_ids(
+    store: &greppy_store::Store,
+    project: &str,
+    target_ids: &[i64],
+) -> Result<std::collections::HashSet<i64>> {
+    let mut ids: std::collections::HashSet<i64> = target_ids.iter().copied().collect();
+    let mut own_files = std::collections::BTreeSet::new();
+    for id in target_ids {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        own_files.insert(node.file_path.clone());
+        for owned in owned_callable_ids_for_type(store, project, &node)? {
+            ids.insert(owned);
+        }
+    }
+    for file in &own_files {
+        for candidate in store.list_nodes(project, "", file, 0, 10_000)? {
+            if is_synthetic_file_anchor(
+                &candidate.label,
+                &candidate.name,
+                &candidate.qualified_name,
+            ) {
+                ids.insert(candidate.id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// A definition that only exists to exercise other code. `brief` reports "the
+/// tests that reach it" and `impact` "the tests among it"; both mean the
+/// callable test functions, never the synthetic per-file anchors.
+fn is_test_node(node: &greppy_store::Node) -> bool {
+    if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+        return false;
+    }
+    let path = node.file_path.as_str();
+    let in_test_tree = path.starts_with("tests/")
+        || path.starts_with("test/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+        || path.contains("_test.")
+        || path.contains("test_")
+        || path.contains(".test.")
+        || path.contains(".spec.");
+    let name = node.name.as_str();
+    let test_name = name.starts_with("test_")
+        || name.starts_with("t_")
+        || name.starts_with("Test")
+        || name.ends_with("_test");
+    in_test_tree || test_name
+}
+
+/// The raw `--limit`, without the offset `cli_result_limit` folds in: the
+/// multi-target window is computed explicitly as `[offset, offset + limit)`.
+fn cli_result_limit_raw() -> Option<usize> {
+    CLI_RESULT_LIMIT.with(|value| value.get())
+}
+
+/// Rule 5: the handle marks exactly the span that was printed — when the source
+/// is capped, it covers the shown lines only, never the rest of the definition.
+fn node_source_and_handle(
+    root_path: &std::path::Path,
+    node: &greppy_store::Node,
+) -> Option<(String, String)> {
+    let span = read_span_with_meta(
+        root_path,
+        &node.file_path,
+        node.start_line,
+        node.end_line,
+        CODE_SPAN_CAP,
+        false,
+    )?;
+    let content = std::fs::read(root_path.join(&node.file_path)).ok()?;
+    let (byte_start, byte_end) =
+        line_range_to_bytes(&content, node.start_line as usize, span.end_line as usize);
+    let handle = greppy_edit::EditHandle::for_range(
+        root_path,
+        std::path::Path::new(&node.file_path),
+        &content,
+        byte_start,
+        byte_end,
+    )
+    .ok()?;
+    Some((span.text, handle.encode()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavKind {
+    WhoCalls,
+    Callees,
+    FindUsages,
+    Impact,
+}
+
+struct NavMultiRequest<'a> {
+    command: &'a str,
+    kind: NavKind,
+    targets: &'a [String],
+    paths: &'a [String],
+    code: bool,
+    all: bool,
+    json: bool,
+    root: Option<&'a str>,
+    direction: &'a str,
+    edge: Option<&'a str>,
+    depth: usize,
+}
+
+struct NavRow {
+    target: usize,
+    node: greppy_store::Node,
+    edge_type: Option<String>,
+    hops: Option<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_nav(
+    command: &str,
+    kind: NavKind,
+    symbols: &[String],
+    paths: &[String],
+    code: bool,
+    all: bool,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    let targets = nav_targets(symbols)?;
+    validate_path_filters(root, paths, "--path")?;
+    if targets.len() > 1 {
+        return dispatch_nav_multi(NavMultiRequest {
+            command,
+            kind,
+            targets: &targets,
+            paths,
+            code,
+            all,
+            json,
+            root,
+            direction: "incoming",
+            edge: None,
+            depth: 0,
+        });
+    }
+    let symbol = targets.first().map(String::as_str);
+    match kind {
+        NavKind::WhoCalls => dispatch_who_calls(symbol, paths, code, all, json, root),
+        NavKind::Callees => dispatch_callees(symbol, paths, code, all, json, root),
+        NavKind::FindUsages => dispatch_find_usages(symbol, paths, code, all, json, root),
+        NavKind::Impact => Err(Error::Invalid("impact has its own dispatch arm".into())),
+    }
+}
+
+fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
+    let mut store = open_default_store_query_writer(req.root)?;
+    maybe_reindex_stale(&mut store, req.root)?;
+    let project = project_for(req.root)?;
+    let gate_extra = serde_json::json!({
+        "symbol": req.targets.join(" "),
+        "symbol_found": false,
+        "all": req.all,
+    });
+    if let Some(code) = graph_stale_gate(
+        &store,
+        req.root,
+        &project,
+        req.command,
+        req.json,
+        gate_extra.clone(),
+        "hits",
+    )? {
+        return Ok(code);
+    }
+    if let Some(code) = provider_policy_graph_gate(
+        &store,
+        req.root,
+        &project,
+        req.command,
+        req.json,
+        gate_extra,
+        "hits",
+    )? {
+        return Ok(code);
+    }
+    // Rule 1: resolve EVERY target before anything is printed. Answering for
+    // the neighbours of an unknown name looks like a complete answer and hides
+    // the typo for the rest of the session.
+    let mut resolved: Vec<Vec<i64>> = Vec::with_capacity(req.targets.len());
+    let mut missing: Vec<String> = Vec::new();
+    for target in req.targets {
+        let ids = resolve_symbol_nodes(&store, Some(target.as_str()))?;
+        if ids.is_empty() {
+            missing.push(target.clone());
+        }
+        resolved.push(ids);
+    }
+    if !missing.is_empty() {
+        return Err(Error::Invalid(unknown_targets_message(
+            &store, &project, &missing,
+        )));
+    }
+    for (index, ids) in resolved.iter().enumerate() {
+        ensure_unambiguous_target(&store, &req.targets[index], ids)?;
+    }
+    let dir = match req.direction.to_ascii_lowercase().as_str() {
+        "incoming" | "in" | "callers" => greppy_search::ReachDirection::Incoming,
+        "outgoing" | "out" | "callees" => greppy_search::ReachDirection::Outgoing,
+        other => {
+            return Err(Error::Invalid(format!(
+                "impact --direction must be 'incoming' or 'outgoing', got '{other}'"
+            )));
+        }
+    };
+    let edge_upper = req.edge.map(|edge| edge.trim().to_ascii_uppercase());
+    let edge_spec = impact_edge_spec(dir, edge_upper.as_deref());
+    let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
+
+    let mut rows: Vec<NavRow> = Vec::new();
+    let mut totals = vec![0usize; req.targets.len()];
+    let mut tests: Vec<Vec<serde_json::Value>> = vec![Vec::new(); req.targets.len()];
+    for (index, ids) in resolved.iter().enumerate() {
+        let mut collected = nav_rows_for_target(
+            &store, &project, ids, index, req.kind, dir, &edge_spec, req.depth,
+        )?;
+        collected.retain(|row| path_filters.matches(&row.node.file_path));
+        totals[index] = collected.len();
+        tests[index] = collected
+            .iter()
+            .filter(|row| is_test_node(&row.node))
+            .map(|row| node_hit_json(&row.node))
+            .collect();
+        rows.extend(collected);
+    }
+
+    // `--offset` is applied by the shared output-budget layer, which skips the
+    // first N result rows of whatever a command emitted. Producers therefore
+    // emit `offset + limit` rows from the top of the stream — the same
+    // convention every other greppy command follows.
+    let total = rows.len();
+    let default_cap = if req.code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    let end = cli_result_limit_unless_all(default_cap, req.all).min(total);
+    let window = &rows[..end];
+    let shown = window.len();
+    let root_path = resolve_root(req.root)?;
+
+    if req.json {
+        let hits: Vec<serde_json::Value> = window
+            .iter()
+            .map(|row| nav_row_json(row, &req.targets[row.target], req.code, &root_path))
+            .collect();
+        let targets_json: Vec<serde_json::Value> = req
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(index, symbol)| {
+                let mut entry = serde_json::json!({
+                    "symbol": symbol,
+                    "symbol_found": true,
+                    "total_exact": totals[index],
+                });
+                entry["tests"] = serde_json::json!(tests[index]);
+                entry
+            })
+            .collect();
+        let freshness = nav_freshness_json(&store, req.root, &project);
+        let fresh = freshness
+            .get("fresh")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let incomplete_providers = incomplete_provider_json(&store, &project)?;
+        let omitted = total.saturating_sub(shown);
+        let value = serde_json::json!({
+            "command": req.command,
+            "symbol": req.targets.join(" "),
+            "targets": targets_json,
+            "project": project,
+            "symbol_found": true,
+            "fresh": fresh,
+            "freshness": freshness,
+            "provider_complete": incomplete_providers.is_empty(),
+            "incomplete_provider_count": incomplete_providers.len(),
+            "incomplete_providers": incomplete_providers,
+            "total_exact": total,
+            "shown": shown,
+            "omitted": omitted,
+            "truncated": omitted > 0,
+            "all": req.all,
+            "hits": hits,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::Invalid(format!("serialize nav JSON: {e}")))?
+        );
+        return Ok(0);
+    }
+
+    for row in window {
+        let mut line = String::new();
+        if let Some(hops) = row.hops {
+            line.push_str(&format!("hop {hops} "));
+        }
+        if let Some(edge_type) = &row.edge_type {
+            line.push_str(edge_type);
+            line.push(' ');
+        }
+        line.push_str(&display_node_name(&row.node));
+        line.push_str(&format!(" {}:{}", row.node.file_path, row.node.start_line));
+        println!("{line}");
+        if req.code {
+            if let Some((source, handle)) = node_source_and_handle(&root_path, &row.node) {
+                print_code_span_text(&source);
+                println!("handle: {handle}");
+            }
+        }
+    }
+    // With `--offset` the budget layer prints its own `try:` continuation.
+    if !req.all && cli_result_offset() == 0 && end < total {
+        println!("{}", nav_continuation_command(&req, end));
+    }
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nav_rows_for_target(
+    store: &greppy_store::Store,
+    project: &str,
+    ids: &[i64],
+    index: usize,
+    kind: NavKind,
+    dir: greppy_search::ReachDirection,
+    edge_spec: &ImpactEdgeSpec<'_>,
+    depth: usize,
+) -> Result<Vec<NavRow>> {
+    let out = match kind {
+        NavKind::WhoCalls => incoming_call_nodes_for_targets(store, ids)?
+            .into_iter()
+            .map(|node| NavRow {
+                target: index,
+                node,
+                edge_type: None,
+                hops: None,
+            })
+            .collect(),
+        NavKind::Callees => {
+            let mut callees: std::collections::BTreeMap<i64, greppy_store::Node> =
+                std::collections::BTreeMap::new();
+            for source in callee_source_ids_for_symbols(store, project, ids)? {
+                for step in greppy_search::callees_of(store, source)? {
+                    if let Some(node) = step.node {
+                        callees.entry(step.node_id).or_insert(node);
+                    }
+                }
+            }
+            callees
+                .into_values()
+                .map(|node| NavRow {
+                    target: index,
+                    node,
+                    edge_type: None,
+                    hops: None,
+                })
+                .collect()
+        }
+        NavKind::FindUsages => {
+            let self_ids = self_reference_ids(store, project, ids)?;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut out = Vec::new();
+            for id in ids {
+                for &edge_type in greppy_search::REFERENCE_EDGE_TYPES {
+                    for edge in store.incoming_edges(*id, Some(edge_type), 1024)? {
+                        if self_ids.contains(&edge.source_id) {
+                            continue;
+                        }
+                        if !seen.insert((edge.edge_type.clone(), edge.source_id)) {
+                            continue;
+                        }
+                        if let Some(node) = store.get_node(edge.source_id)? {
+                            out.push(NavRow {
+                                target: index,
+                                node,
+                                edge_type: Some(edge.edge_type.clone()),
+                                hops: None,
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        }
+        NavKind::Impact => {
+            let start_ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
+            let mut by_id: std::collections::HashMap<i64, greppy_search::ImpactNode> =
+                std::collections::HashMap::new();
+            for id in ids {
+                for reached in greppy_search::impact_radius_any_edge_type(
+                    store,
+                    *id,
+                    dir,
+                    &edge_spec.edge_types,
+                    depth,
+                    4096,
+                )? {
+                    if start_ids.contains(&reached.node.id) {
+                        continue;
+                    }
+                    by_id
+                        .entry(reached.node.id)
+                        .and_modify(|kept| {
+                            if reached.hops < kept.hops {
+                                kept.hops = reached.hops;
+                            }
+                        })
+                        .or_insert(reached);
+                }
+            }
+            let mut reached: Vec<greppy_search::ImpactNode> = by_id.into_values().collect();
+            reached.sort_by(|a, b| a.hops.cmp(&b.hops).then_with(|| a.node.id.cmp(&b.node.id)));
+            let mut out = Vec::new();
+            for step in reached {
+                if let Some(node) = store.get_node(step.node.id)? {
+                    out.push(NavRow {
+                        target: index,
+                        node,
+                        edge_type: None,
+                        hops: Some(step.hops),
+                    });
+                }
+            }
+            out
+        }
+    };
+    Ok(out)
+}
+
+fn nav_row_json(
+    row: &NavRow,
+    target: &str,
+    code: bool,
+    root_path: &std::path::Path,
+) -> serde_json::Value {
+    let node = &row.node;
+    let mut value = serde_json::json!({
+        "target": target,
+        "qualified_name": &node.qualified_name,
+        "name": display_node_name(node),
+        "label": &node.label,
+        "file": &node.file_path,
+        "line": node.start_line,
+        "file_path": &node.file_path,
+        "start_line": node.start_line,
+        "end_line": node.end_line,
+    });
+    if let Some(edge_type) = &row.edge_type {
+        value["edge_type"] = serde_json::json!(edge_type);
+    }
+    if let Some(hops) = row.hops {
+        value["hops"] = serde_json::json!(hops);
+    }
+    if code {
+        if let Some((source, handle)) = node_source_and_handle(root_path, node) {
+            value["code"] = serde_json::json!(source);
+            value["handle"] = serde_json::json!(handle);
+        }
+    }
+    value
+}
+
+/// AGENTS.md, `--all`: "without it long results are cut and the output ends
+/// with the exact command that continues them" — so the last line IS a command.
+fn nav_continuation_command(req: &NavMultiRequest<'_>, offset: usize) -> String {
+    let mut parts = vec!["greppy".to_string(), req.command.to_string()];
+    for target in req.targets {
+        parts.push(shell_example_arg(target));
+    }
+    for path in req.paths {
+        parts.push("--path".to_string());
+        parts.push(shell_example_arg(path));
+    }
+    if req.code {
+        parts.push("--code".to_string());
+    }
+    if let Some(limit) = cli_result_limit_raw() {
+        parts.push("--limit".to_string());
+        parts.push(limit.to_string());
+    }
+    parts.push("--offset".to_string());
+    parts.push(offset.to_string());
+    parts.join(" ")
+}
+
+/// `brief A B` — the same briefing per target, in one call: the definition,
+/// the callers, the callees, and the tests that reach it.
+fn dispatch_brief_multi(
+    targets: &[String],
+    paths: &[String],
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    if let Some(code) = graph_stale_gate(
+        &store,
+        root,
+        &project,
+        "brief",
+        json,
+        serde_json::json!({"schema_version": BRIEF_JSON_SCHEMA_VERSION}),
+        "definitions",
+    )? {
+        return Ok(code);
+    }
+    if let Some(code) = provider_policy_graph_gate(
+        &store,
+        root,
+        &project,
+        "brief",
+        json,
+        serde_json::json!({"schema_version": BRIEF_JSON_SCHEMA_VERSION}),
+        "definitions",
+    )? {
+        return Ok(code);
+    }
+    let mut resolved: Vec<Vec<i64>> = Vec::with_capacity(targets.len());
+    let mut missing: Vec<String> = Vec::new();
+    for target in targets {
+        let ids = resolve_symbol_nodes(&store, Some(target.as_str()))?;
+        if ids.is_empty() {
+            missing.push(target.clone());
+        }
+        resolved.push(ids);
+    }
+    if !missing.is_empty() {
+        return Err(Error::Invalid(unknown_targets_message(
+            &store, &project, &missing,
+        )));
+    }
+    let path_filters = prepare_query_path_filters(root, "brief", "", paths)?;
+    let root_path = resolve_root(root)?;
+    let incoming = impact_edge_spec(greppy_search::ReachDirection::Incoming, None);
+
+    let mut entries = Vec::with_capacity(targets.len());
+    let mut hits = Vec::new();
+    for (index, ids) in resolved.iter().enumerate() {
+        let symbol = &targets[index];
+        let mut definition = serde_json::Value::Null;
+        for id in ids {
+            let Some(node) = store.get_node(*id)? else {
+                continue;
+            };
+            if !path_filters.matches(&node.file_path) {
+                continue;
+            }
+            let span = read_span_with_meta(
+                &root_path,
+                &node.file_path,
+                node.start_line,
+                node.end_line,
+                CONTEXT_SPAN_CAP,
+                false,
+            );
+            let source = span.as_ref().map(|s| s.text.as_str()).unwrap_or("");
+            let mut value = node_hit_json(&node);
+            value["target"] = serde_json::json!(symbol);
+            value["label"] = serde_json::json!(&node.label);
+            value["source"] = serde_json::json!(source);
+            if definition.is_null() {
+                definition = value.clone();
+            }
+            hits.push(value);
+            break;
+        }
+        let mut callers = incoming_call_nodes_for_targets(&store, ids)?;
+        callers.retain(|node| path_filters.matches(&node.file_path));
+        let mut callees: std::collections::BTreeMap<i64, greppy_store::Node> =
+            std::collections::BTreeMap::new();
+        for source in callee_source_ids_for_symbols(&store, &project, ids)? {
+            for step in greppy_search::callees_of(&store, source)? {
+                if let Some(node) = step.node {
+                    callees.entry(step.node_id).or_insert(node);
+                }
+            }
+        }
+        callees.retain(|_, node| path_filters.matches(&node.file_path));
+        let reaching = nav_rows_for_target(
+            &store,
+            &project,
+            ids,
+            index,
+            NavKind::Impact,
+            greppy_search::ReachDirection::Incoming,
+            &incoming,
+            6,
+        )?;
+        let tests: Vec<serde_json::Value> = reaching
+            .iter()
+            .filter(|row| is_test_node(&row.node) && path_filters.matches(&row.node.file_path))
+            .map(|row| node_hit_json(&row.node))
+            .collect();
+        entries.push(serde_json::json!({
+            "symbol": symbol,
+            "symbol_found": true,
+            "total_exact": callers.len() + callees.len(),
+            "definition": definition,
+            "callers": callers.iter().map(node_hit_json).collect::<Vec<_>>(),
+            "callees": callees.values().map(node_hit_json).collect::<Vec<_>>(),
+            "tests": tests,
+        }));
+    }
+
+    if json {
+        let value = serde_json::json!({
+            "schema_version": BRIEF_JSON_SCHEMA_VERSION,
+            "command": "brief",
+            "status": "ok",
+            "project": project,
+            "targets": entries,
+            "total_exact": hits.len(),
+            "shown": hits.len(),
+            "hits": hits,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::Invalid(format!("serialize brief JSON: {e}")))?
+        );
+        return Ok(0);
+    }
+    for entry in &entries {
+        println!("== {} ==", entry["symbol"].as_str().unwrap_or(""));
+        if let Some(source) = entry["definition"]["source"].as_str() {
+            let file = entry["definition"]["file"].as_str().unwrap_or("");
+            let line = entry["definition"]["line"].as_i64().unwrap_or(0);
+            println!("{file}:{line}");
+            print_code_span_text(source);
+        }
+        for (label, key) in [("caller", "callers"), ("callee", "callees"), ("test", "tests")] {
+            for row in entry[key].as_array().into_iter().flatten() {
+                println!(
+                    "{label} {} {}:{}",
+                    row["qualified_name"].as_str().unwrap_or(""),
+                    row["file"].as_str().unwrap_or(""),
+                    row["line"].as_i64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// What `read` was asked to read, after `-`, `--symbol` and `--path` have been
+/// folded into one ordered list of subjects.
+struct ReadPlan {
+    subjects: Vec<String>,
+    forced_symbol: bool,
+    lines: Option<String>,
+}
+
+fn read_plan(
+    targets: &[String],
+    symbol_opts: &[String],
+    path_opts: &[String],
+    lines: Option<&str>,
+) -> Result<ReadPlan> {
+    let mut positional = Vec::new();
+    for value in targets {
+        if value == "-" {
+            positional.extend(targets_from_stdin()?);
+            continue;
+        }
+        positional.push(value.clone());
+    }
+    let forced_symbol = !symbol_opts.is_empty();
+    let mut subjects: Vec<String> = Vec::new();
+    if forced_symbol {
+        subjects.extend(symbol_opts.iter().cloned());
+        subjects.extend(positional);
+        // A single `--path` next to a single symbol is the historic
+        // disambiguator (`read open --path FILE`), not another subject.
+        if subjects.len() == 1 && path_opts.len() == 1 {
+            if let Some(folded) = qualify_symbol_with_path(
+                subjects.first().map(String::as_str),
+                Some(path_opts[0].as_str()),
+            ) {
+                subjects[0] = folded;
+            }
+        } else {
+            subjects.extend(path_opts.iter().cloned());
+        }
+    } else if positional.len() == 1 && path_opts.len() == 1 {
+        if let Some(folded) = qualify_symbol_with_path(
+            positional.first().map(String::as_str),
+            Some(path_opts[0].as_str()),
+        ) {
+            subjects.push(folded);
+        } else {
+            subjects.extend(positional);
+            subjects.extend(path_opts.iter().cloned());
+        }
+    } else {
+        subjects.extend(positional);
+        subjects.extend(path_opts.iter().cloned());
+    }
+    for subject in &subjects {
+        if subject.trim().is_empty() {
+            return Err(Error::Invalid(
+                "empty read target: a symbol name or a path was expected (an unexpanded shell \
+                 variable produces this). Nothing was read."
+                    .into(),
+            ));
+        }
+    }
+    if lines.is_some() && subjects.len() > 1 {
+        return Err(Error::Invalid(format!(
+            "--lines names one range in one file, but {} targets were given; read them \
+             separately, or drop --lines",
+            subjects.len()
+        )));
+    }
+    Ok(ReadPlan {
+        subjects,
+        forced_symbol,
+        lines: lines.map(str::to_string),
+    })
+}
+
+/// `read S [S …]` / `read PATH [PATH …]` — every target is read in one call,
+/// and one target that cannot be read refuses the whole call: three files that
+/// worked plus a silently dropped fourth looks like success.
+fn dispatch_read_multi(plan: &ReadPlan, with_handle: bool, json: bool, root: Option<&str>) -> Result<i32> {
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+
+    enum Subject {
+        File(String),
+        Symbol(greppy_store::Node),
+    }
+    let mut subjects = Vec::with_capacity(plan.subjects.len());
+    let mut missing: Vec<String> = Vec::new();
+    for raw in &plan.subjects {
+        // `file.rs::Symbol` is a qualified SYMBOL, not a slash-containing path.
+        let path_qualified = split_path_qualified(raw).is_some();
+        if !plan.forced_symbol && !path_qualified && read_subject_is_path(raw, root)? {
+            subjects.push(Subject::File(raw.clone()));
+            continue;
+        }
+        if !plan.forced_symbol && !path_qualified && looks_like_path(raw) {
+            missing.push(format!("`{raw}` is not a file in this repository"));
+            continue;
+        }
+        let ids = resolve_symbol_nodes(&store, Some(raw.as_str()))?;
+        let mut node = None;
+        for id in &ids {
+            if let Some(candidate) = store.get_node(*id)? {
+                if !candidate.file_path.is_empty() && candidate.start_line >= 1 {
+                    node = Some(candidate);
+                    break;
+                }
+            }
+        }
+        match node {
+            Some(node) => subjects.push(Subject::Symbol(node)),
+            None => missing.push(format!("`{raw}` is not a definition in this repository")),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(Error::Invalid(format!(
+            "read: {} — nothing was read for the other targets either.",
+            missing.join("; ")
+        )));
+    }
+
+    let mut hits = Vec::with_capacity(subjects.len());
+    let mut text = String::new();
+    for (index, subject) in subjects.iter().enumerate() {
+        let (shown_path, start, end, source, content) = match subject {
+            Subject::File(raw) => {
+                let candidate = read_file_candidate(&root_path, raw);
+                let canonical = candidate.canonicalize().map_err(|source| Error::Io {
+                    context: format!("canonicalize {}", candidate.display()),
+                    source,
+                })?;
+                let relative = canonical.strip_prefix(&canonical_root).map_err(|_| {
+                    Error::Invalid(format!("read path `{raw}` resolves outside the workspace"))
+                })?;
+                let shown = relative.to_string_lossy().replace('\\', "/");
+                let content = std::fs::read(&canonical).map_err(|source| Error::Io {
+                    context: format!("read {}", canonical.display()),
+                    source,
+                })?;
+                let body = String::from_utf8_lossy(&content).into_owned();
+                let lines = body.lines().count().max(1);
+                (shown, 1i64, lines as i64, body, content)
+            }
+            Subject::Symbol(node) => {
+                let absolute = root_path.join(&node.file_path);
+                let content = std::fs::read(&absolute).map_err(|source| Error::Io {
+                    context: format!("read {}", absolute.display()),
+                    source,
+                })?;
+                let Some(span) = read_span_with_meta(
+                    &root_path,
+                    &node.file_path,
+                    node.start_line,
+                    node.end_line,
+                    usize::MAX,
+                    false,
+                ) else {
+                    return Err(Error::Invalid(format!(
+                        "read: definition span for `{}` is stale; re-index and retry",
+                        node.qualified_name
+                    )));
+                };
+                (
+                    node.file_path.clone(),
+                    node.start_line,
+                    span.end_line,
+                    span.text,
+                    content,
+                )
+            }
+        };
+        let (byte_start, byte_end) =
+            line_range_to_bytes(&content, start.max(1) as usize, end.max(start) as usize);
+        let handle_token = if with_handle {
+            Some(
+                greppy_edit::EditHandle::for_range(
+                    &root_path,
+                    std::path::Path::new(&shown_path),
+                    &content,
+                    byte_start,
+                    byte_end,
+                )?
+                .encode(),
+            )
+        } else {
+            None
+        };
+        let target = &plan.subjects[index.min(plan.subjects.len() - 1)];
+        hits.push(serde_json::json!({
+            "target": target,
+            "qualified_name": match subject {
+                Subject::Symbol(node) => node.qualified_name.clone(),
+                Subject::File(_) => shown_path.clone(),
+            },
+            "file": &shown_path,
+            "line": start,
+            "path": &shown_path,
+            "file_path": &shown_path,
+            "start_line": start,
+            "end_line": end,
+            "lines": format!("{start}:{end}"),
+            "source": &source,
+            "handle": handle_token,
+        }));
+        text.push_str(&format!("{shown_path}:{start}-{end}\n"));
+        text.push_str(&source);
+        if !source.ends_with('\n') {
+            text.push('\n');
+        }
+        if let Some(token) = &handle_token {
+            text.push_str(&format!("handle: {token}\n"));
+        }
+    }
+    if json {
+        let value = serde_json::json!({
+            "schema_version": "greppy.read.v1",
+            "command": "read",
+            "status": "ok",
+            "total_exact": hits.len(),
+            "shown": hits.len(),
+            "hits": hits,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
+        );
+    } else {
+        print!("{text}");
+    }
+    Ok(0)
+}
+
+/// `search-symbols A B` — one lookup per name, each result attributed.
+fn dispatch_search_symbols_multi(
+    targets: &[String],
+    paths: &[String],
+    kind: Option<&str>,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    if targets.len() <= 1 {
+        return dispatch_search_symbols(
+            targets.first().map(String::as_str),
+            paths,
+            kind,
+            json,
+            root,
+        );
+    }
+    let path_filters = prepare_query_path_filters(root, "search-symbols", "", paths)?;
+    let mut store = open_default_store(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    let mut entries = Vec::with_capacity(targets.len());
+    let mut hits = Vec::new();
+    for query in targets {
+        let mut found = greppy_search::search_symbols_in_project(&store, &project, query, 10_000)?;
+        if let Some(want) = kind.map(|k| k.to_ascii_lowercase()) {
+            found.retain(|hit| {
+                store
+                    .get_node(hit.node_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|node| node.label.to_ascii_lowercase() == want)
+            });
+        }
+        let mut rows = Vec::new();
+        for hit in &found {
+            let Some(node) = store.get_node(hit.node_id)? else {
+                continue;
+            };
+            if !path_filters.matches(&node.file_path) {
+                continue;
+            }
+            let mut value = node_hit_json(&node);
+            value["target"] = serde_json::json!(query);
+            value["label"] = serde_json::json!(&node.label);
+            value["name"] = serde_json::json!(&node.name);
+            rows.push(value);
+        }
+        entries.push(serde_json::json!({
+            "symbol": query,
+            "symbol_found": !rows.is_empty(),
+            "total_exact": rows.len(),
+        }));
+        hits.extend(rows);
+    }
+    let total = hits.len();
+    let end = cli_result_limit_raw().unwrap_or(usize::MAX).min(total);
+    let window = hits[..end].to_vec();
+    if json {
+        let value = serde_json::json!({
+            "command": "search-symbols",
+            "status": "ok",
+            "project": project,
+            "targets": entries,
+            "total_exact": total,
+            "shown": window.len(),
+            "hits": window,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::Invalid(format!("serialize search-symbols JSON: {e}")))?
+        );
+        return Ok(0);
+    }
+    for row in &window {
+        println!(
+            "{} {} {}:{}",
+            row["label"].as_str().unwrap_or(""),
+            row["qualified_name"].as_str().unwrap_or(""),
+            row["file"].as_str().unwrap_or(""),
+            row["line"].as_i64().unwrap_or(0)
+        );
+    }
+    Ok(0)
+}
+
 fn dispatch_who_calls(
     symbol: Option<&str>,
     paths: &[String],
@@ -9840,6 +15669,9 @@ fn dispatch_who_calls(
     // the name + a primary label (e.g. a Struct and its Impl) so callers
     // are not lost to a name resolving to the wrong single node.
     let targets = resolve_symbol_nodes(&store, symbol)?;
+    if let Some(symbol) = symbol {
+        ensure_unambiguous_target(&store, symbol, &targets)?;
+    }
     if targets.is_empty() {
         if json {
             let project = project_for(root)?;
@@ -10177,6 +16009,9 @@ fn dispatch_callees(
         return Ok(code);
     }
     let sources = resolve_symbol_nodes(&store, symbol)?;
+    if let Some(symbol) = symbol {
+        ensure_unambiguous_target(&store, symbol, &sources)?;
+    }
     if sources.is_empty() {
         if json {
             let project = project_for(root)?;
@@ -10363,6 +16198,9 @@ fn dispatch_find_usages(
     // `USAGE` label (the former `TYPE_REF` + `USES` passes), so one query
     // covers both type and value references.
     let targets = resolve_symbol_nodes(&store, symbol)?;
+    if let Some(symbol) = symbol {
+        ensure_unambiguous_target(&store, symbol, &targets)?;
+    }
     if targets.is_empty() {
         if json {
             let project = project_for(root)?;
@@ -10389,9 +16227,16 @@ fn dispatch_find_usages(
     // — the agent then burned three extra calls distrusting the tool.
     // Aggregate all reference-class edges; each output row is already
     // labelled with its edge type, so the answer stays honest.
+    let self_ids = self_reference_ids(&store, &project, &targets)?;
     for target in &targets {
         for &et in greppy_search::REFERENCE_EDGE_TYPES {
-            edges.extend(store.incoming_edges(*target, Some(et), 1024)?);
+            edges.extend(
+                store
+                    .incoming_edges(*target, Some(et), 1024)?
+                    .into_iter()
+                    // A definition is not a reference to itself.
+                    .filter(|edge| !self_ids.contains(&edge.source_id)),
+            );
         }
     }
     if edges.is_empty() {
@@ -10487,6 +16332,8 @@ fn dispatch_find_usages(
                 serde_json::json!({
                     "edge_type": edge_type,
                     "qualified_name": &n.qualified_name,
+                    "file": &n.file_path,
+                    "line": n.start_line,
                     "file_path": &n.file_path,
                     "start_line": n.start_line,
                     "end_line": n.end_line,
@@ -11148,8 +16995,9 @@ fn dispatch_path(
             Ok(0)
         }
         None => {
-            println!("(no path from {from} to {to} via {edge_upper})");
-            Ok(1)
+            // AGENTS.md: "A command that finds nothing prints nothing and
+            // exits 0." A missing chain is an answer, not a failure.
+            Ok(0)
         }
     }
 }
@@ -11256,9 +17104,12 @@ fn dispatch_search_symbols(
         return Ok(if hits.is_empty() { 1 } else { 0 });
     }
     if hits.is_empty() {
-        if path_filters.is_empty() {
-            println!("(no matches)");
-        } else {
+        // A name that matches no definition is an empty answer, not a failure:
+        // `AGENTS.md` says such a question prints nothing and exits 0, and a
+        // caller that pipes `search-symbols` into `read -` must not receive a
+        // line of prose where it expects results. The path filter is the one
+        // thing worth saying, because it can be the reason the answer is empty.
+        if !path_filters.is_empty() {
             println!("(no matches under path filter: {})", path_filters.shown());
         }
     } else {
@@ -11307,9 +17158,12 @@ fn search_symbols_json(
             Some(n) => rows.push(serde_json::json!({
                 "node_id": h.node_id,
                 "rank": h.rank,
+                "target": query,
                 "label": n.label,
                 "name": n.name,
                 "qualified_name": n.qualified_name,
+                "file": n.file_path,
+                "line": n.start_line,
                 "file_path": n.file_path,
                 "start_line": n.start_line,
                 "end_line": n.end_line,
@@ -11350,26 +17204,307 @@ fn search_symbols_json(
     Ok(())
 }
 
-fn print_search_code_no_matches(query: &str, path_filters: &QueryPathFilters) {
+fn print_search_code_no_matches(query: &str, fixed: bool, path_filters: &QueryPathFilters) {
     println!("(no matches)");
-    println!("query_interpreted_as: literal");
+    println!(
+        "query_interpreted_as: {}",
+        if fixed { "literal" } else { "regex" }
+    );
     if path_filters.is_empty() {
         println!("path_filters: <none>");
     } else {
         println!("path_filters: {}", path_filters.shown());
     }
-    if query
-        .chars()
-        .any(|character| ".^$*+?()[]{}|\\".contains(character))
+    if fixed
+        && query
+            .chars()
+            .any(|character| ".^$*+?()[]{}|\\".contains(character))
     {
-        println!("hint: regex metacharacters are literal in search-code");
-        let mut retry = format!("greppy rg {}", shell_example_arg(query));
+        println!("hint: regex metacharacters are literal because --fixed was supplied");
+        let mut retry = format!("greppy search-code {}", shell_example_arg(query));
         for filter in &path_filters.filters {
             retry.push(' ');
             retry.push_str(&shell_example_arg(&filter.shown));
         }
-        println!("try: {retry}");
+        println!("try without --fixed: {retry}");
     }
+}
+
+#[derive(Debug, Clone)]
+struct SearchCodeMatchLine {
+    location: String,
+    file: String,
+    line: i64,
+    text: String,
+}
+
+#[derive(Debug)]
+struct SearchCodeDefinitionEntry {
+    node_id: i64,
+    qualified_name: String,
+    file: String,
+    start_line: i64,
+    end_line: i64,
+    source: String,
+    handle: String,
+    matches: Vec<SearchCodeMatchLine>,
+}
+
+#[derive(Debug)]
+enum SearchCodeEntry {
+    Definition(SearchCodeDefinitionEntry),
+    Unenclosed(SearchCodeMatchLine),
+}
+
+fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMatchLine> {
+    let (file, line) = hit.location.rsplit_once(':')?;
+    Some(SearchCodeMatchLine {
+        location: hit.location.clone(),
+        file: file.to_string(),
+        line: line.parse().ok()?,
+        text: hit.snippet.clone(),
+    })
+}
+
+fn search_code_definition_entry(
+    root_path: &std::path::Path,
+    row: &greppy_search::graph::SearchGraphRow,
+) -> Result<Option<SearchCodeDefinitionEntry>> {
+    if row.start_line < 1 || is_synthetic_file_anchor(&row.label, &row.name, &row.qualified_name) {
+        return Ok(None);
+    }
+    let absolute = root_path.join(&row.file_path);
+    let content = match std::fs::read(&absolute) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::Io {
+                context: format!("read {}", absolute.display()),
+                source,
+            });
+        }
+    };
+    let Some(span) = read_span_with_meta(
+        root_path,
+        &row.file_path,
+        row.start_line,
+        row.end_line,
+        usize::MAX,
+        false,
+    ) else {
+        return Ok(None);
+    };
+    let (byte_start, byte_end) =
+        line_range_to_bytes(&content, row.start_line as usize, span.end_line as usize);
+    let mut handle = greppy_edit::EditHandle::for_range(
+        root_path,
+        std::path::Path::new(&row.file_path),
+        &content,
+        byte_start,
+        byte_end,
+    )?;
+    let language = greppy_edit::language_for_path(std::path::Path::new(&row.file_path));
+    handle.signature_fingerprint =
+        greppy_edit::verbs::signature_fingerprint(language, &content, (byte_start, byte_end));
+    handle.grammar_id = Some(format!("{language:?}"));
+    handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    Ok(Some(SearchCodeDefinitionEntry {
+        node_id: row.id,
+        qualified_name: row.qualified_name.clone(),
+        file: row.file_path.clone(),
+        start_line: row.start_line,
+        end_line: span.end_line,
+        source: span.text,
+        handle: handle.encode(),
+        matches: Vec::new(),
+    }))
+}
+
+fn search_code_entries(
+    store: &greppy_store::Store,
+    project: &str,
+    root_path: &std::path::Path,
+    hits: &[greppy_search::CodeHit],
+    resolve_definitions: bool,
+) -> Result<Vec<SearchCodeEntry>> {
+    let mut entries = Vec::new();
+    let mut definition_entries = std::collections::HashMap::<i64, usize>::new();
+    for hit in hits {
+        let Some(match_line) = parse_search_code_match(hit) else {
+            continue;
+        };
+        let row = if resolve_definitions {
+            greppy_search::definition_at(store, Some(project), &match_line.file, match_line.line)?
+        } else {
+            None
+        };
+        let Some(row) = row else {
+            entries.push(SearchCodeEntry::Unenclosed(match_line));
+            continue;
+        };
+        if let Some(index) = definition_entries.get(&row.id).copied() {
+            if let SearchCodeEntry::Definition(definition) = &mut entries[index] {
+                definition.matches.push(match_line);
+            }
+            continue;
+        }
+        let Some(mut definition) = search_code_definition_entry(root_path, &row)? else {
+            entries.push(SearchCodeEntry::Unenclosed(match_line));
+            continue;
+        };
+        definition.matches.push(match_line);
+        let index = entries.len();
+        definition_entries.insert(definition.node_id, index);
+        entries.push(SearchCodeEntry::Definition(definition));
+    }
+    Ok(entries)
+}
+
+fn print_search_code_entries(entries: &[SearchCodeEntry]) {
+    for entry in entries {
+        match entry {
+            SearchCodeEntry::Unenclosed(hit) => {
+                println!("{}  {}", hit.location, clamp_snippet(&hit.text));
+            }
+            SearchCodeEntry::Definition(definition) => {
+                println!(
+                    "{} {}:{}-{}",
+                    definition.qualified_name,
+                    definition.file,
+                    definition.start_line,
+                    definition.end_line
+                );
+                let width = definition.end_line.to_string().len();
+                for (offset, line) in definition.source.lines().enumerate() {
+                    println!(
+                        "  {:>width$} | {line}",
+                        definition.start_line + offset as i64
+                    );
+                }
+                println!("  handle: {}", definition.handle);
+            }
+        }
+    }
+}
+
+fn search_code_entry_json(entry: &SearchCodeEntry) -> serde_json::Value {
+    match entry {
+        SearchCodeEntry::Definition(definition) => serde_json::json!({
+            "qualified_name": &definition.qualified_name,
+            "file": &definition.file,
+            "span": {
+                "start_line": definition.start_line,
+                "end_line": definition.end_line,
+            },
+            "source": &definition.source,
+            "handle": &definition.handle,
+            "matches": definition.matches.iter().map(|hit| serde_json::json!({
+                "location": &hit.location,
+                "line": hit.line,
+                "text": &hit.text,
+            })).collect::<Vec<_>>(),
+        }),
+        SearchCodeEntry::Unenclosed(hit) => serde_json::json!({
+            "qualified_name": serde_json::Value::Null,
+            "file": &hit.file,
+            "span": {
+                "start_line": hit.line,
+                "end_line": hit.line,
+            },
+            "source": serde_json::Value::Null,
+            "handle": serde_json::Value::Null,
+            "matches": [{
+                "location": &hit.location,
+                "line": hit.line,
+                "text": &hit.text,
+            }],
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_search_code_results_with_format(
+    store: &greppy_store::Store,
+    query: &str,
+    project: &str,
+    status: &str,
+    index_freshness: Option<&serde_json::Value>,
+    total_exact: usize,
+    hits: &[greppy_search::CodeHit],
+    path_filters: &QueryPathFilters,
+    root_path: &std::path::Path,
+    json: bool,
+    no_code: bool,
+    fixed: bool,
+    resolve_definitions: bool,
+) -> Result<()> {
+    if !json {
+        if hits.is_empty() {
+            print_search_code_no_matches(query, fixed, path_filters);
+        } else if no_code {
+            for hit in hits {
+                println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
+            }
+        } else {
+            let entries =
+                search_code_entries(store, project, root_path, hits, resolve_definitions)?;
+            print_search_code_entries(&entries);
+        }
+        return Ok(());
+    }
+
+    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let shown = hits.len();
+    let omitted = total_exact.saturating_sub(shown);
+    let rows = if no_code {
+        hits.iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "location": hit.location,
+                    "rank": hit.rank,
+                    "snippet": clamp_snippet(&hit.snippet).as_ref(),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        search_code_entries(store, project, root_path, hits, resolve_definitions)?
+            .iter()
+            .map(search_code_entry_json)
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "command": "search-code",
+            "status": status,
+            "query": query,
+            "pattern_mode": if fixed { "fixed" } else { "regex" },
+            "project": project,
+            "path_filters": path_filters.json_value(),
+            "backend": "live-filesystem",
+            "fresh": true,
+            "freshness": if resolve_definitions {
+                index_freshness.cloned().unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            },
+            "index_freshness": if resolve_definitions {
+                serde_json::Value::Null
+            } else {
+                index_freshness.cloned().unwrap_or(serde_json::Value::Null)
+            },
+            "provider_complete": incomplete_providers.is_empty(),
+            "incomplete_provider_count": incomplete_providers.len(),
+            "incomplete_providers": incomplete_providers,
+            "total_exact": total_exact,
+            "shown": shown,
+            "omitted": omitted,
+            "truncated": omitted > 0,
+            "hits": rows,
+        }))
+        .map_err(|error| Error::Invalid(format!("serialize search-code JSON: {error}")))?
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11381,6 +17516,8 @@ fn dispatch_search_code(
     since: Option<&str>,
     base: Option<&str>,
     json: bool,
+    no_code: bool,
+    fixed: bool,
     root: Option<&str>,
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
@@ -11398,177 +17535,68 @@ fn dispatch_search_code(
         ));
     }
     if changed {
-        return dispatch_search_code_changed(q, json, root, &path_filters);
+        return dispatch_search_code_changed(q, json, fixed, root, &path_filters);
     }
     if staged {
-        return dispatch_search_code_staged(q, json, root, &path_filters);
+        return dispatch_search_code_staged(q, json, fixed, root, &path_filters);
     }
     if let Some(rev) = since {
-        return dispatch_search_code_since(q, rev, json, root, &path_filters);
+        return dispatch_search_code_since(q, rev, json, fixed, root, &path_filters);
     }
     if let Some(rev) = base {
-        return dispatch_search_code_base(q, rev, json, root, &path_filters);
+        return dispatch_search_code_base(q, rev, json, fixed, root, &path_filters);
     }
+
     let store = open_default_store(root)?;
-    // Project identity is derived from the
-    // canonical repo root (or `--root` when supplied), not from the
-    // cwd basename. Index + search-code + semantic must agree on
-    // this value so a search after an index hits the right rows.
     let project = project_for(root)?;
-    // A stale/unknown content index is never queried. Search-code has a
-    // correctness-preserving live filesystem backend, so both text and JSON
-    // use it while an atomic refresh runs.
+    let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
-    match &decision {
-        FreshnessServe::Refuse(freshness) => {
-            if !json {
-                eprintln!(
-                    "{}; falling back to live grep",
-                    indexed_stale_skip_message("search-code", freshness)
-                );
-            }
-            if path_filters.is_empty() {
-                return live_grep_search_code(q, root, json, Some(freshness));
-            }
-            return live_grep_search_code_filtered(q, root, json, Some(freshness), &path_filters);
+    let resolve_definitions = matches!(decision, FreshnessServe::Fresh(_));
+    let status = if resolve_definitions {
+        "ok"
+    } else {
+        "live-fallback"
+    };
+    if let FreshnessServe::Refuse(freshness) = &decision {
+        if !json {
+            eprintln!(
+                "{}; falling back to live grep",
+                indexed_stale_skip_message("search-code", freshness)
+            );
         }
-        FreshnessServe::Fresh(_) => {}
     }
-    let freshness = decision.freshness().clone();
-    if !path_filters.is_empty() {
-        let all_hits = live_grep_code_hits_filtered(q, &resolve_root(root)?, &path_filters)?;
-        let shown_hits = all_hits
-            .iter()
-            .take(cli_result_limit(SEARCH_CODE_LIMIT))
-            .cloned()
-            .collect::<Vec<_>>();
-        if json {
-            search_code_json(
-                &store,
-                q,
-                &project,
-                "ok",
-                Some(&freshness),
-                all_hits.len(),
-                &shown_hits,
-                &path_filters,
-            )?;
-        } else if shown_hits.is_empty() {
-            print_search_code_no_matches(q, &path_filters);
-        } else {
-            for hit in &shown_hits {
-                println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
-            }
-        }
-        return Ok(if all_hits.is_empty() { 1 } else { 0 });
-    }
-
-    let indexed_hits =
-        greppy_search::search_code(&store, &project, q, cli_result_limit(SEARCH_CODE_LIMIT))?;
-    if indexed_hits.is_empty() {
-        // The product index intentionally does not duplicate full source text
-        // into SQLite. Use the authoritative live worktree for both text and
-        // JSON, preserving exact totals and avoiding an empty JSON-only path.
-        let live_hits = live_grep_code_hits(q, &resolve_root(root)?)?;
-        let shown_hits = live_hits
-            .iter()
-            .take(cli_result_limit(SEARCH_CODE_LIMIT))
-            .cloned()
-            .collect::<Vec<_>>();
-        if json {
-            search_code_json(
-                &store,
-                q,
-                &project,
-                "ok",
-                Some(&freshness),
-                live_hits.len(),
-                &shown_hits,
-                &path_filters,
-            )?;
-        } else if shown_hits.is_empty() {
-            print_search_code_no_matches(q, &path_filters);
-        } else {
-            for hit in &shown_hits {
-                println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
-            }
-        }
-        return Ok(if live_hits.is_empty() { 1 } else { 0 });
-    }
-    if json {
-        let total_exact = store.count_file_content_matches(&project, q)?;
-        search_code_json(
-            &store,
-            q,
-            &project,
-            "ok",
-            Some(&freshness),
-            total_exact,
-            &indexed_hits,
-            &path_filters,
-        )?;
-        return Ok(if total_exact == 0 { 1 } else { 0 });
-    }
-    for h in &indexed_hits {
-        println!("{}  {}", h.location, clamp_snippet(&h.snippet));
-    }
-    Ok(0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn search_code_json(
-    store: &greppy_store::Store,
-    query: &str,
-    project: &str,
-    status: &str,
-    freshness: Option<&serde_json::Value>,
-    total_exact: usize,
-    hits: &[greppy_search::CodeHit],
-    path_filters: &QueryPathFilters,
-) -> Result<()> {
-    let incomplete_providers = incomplete_provider_json(store, project)?;
-    let shown = hits.len();
-    let omitted = total_exact.saturating_sub(shown);
-    let rows = hits
+    let all_hits = if path_filters.is_empty() {
+        live_grep_code_hits_pattern(q, &root_path, fixed)?
+    } else {
+        live_grep_code_hits_filtered_pattern(q, &root_path, &path_filters, fixed)?
+    };
+    let shown_hits = all_hits
         .iter()
-        .map(|h| {
-            serde_json::json!({
-                "location": h.location,
-                "rank": h.rank,
-                "snippet": clamp_snippet(&h.snippet).as_ref(),
-            })
-        })
+        .take(cli_result_limit(SEARCH_CODE_LIMIT))
+        .cloned()
         .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-code",
-            "status": status,
-            "query": query,
-            "project": project,
-            "path_filters": path_filters.json_value(),
-            "fresh": freshness
-                .and_then(|v| v.get("fresh"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            "freshness": freshness.cloned().unwrap_or(serde_json::Value::Null),
-            "provider_complete": incomplete_providers.is_empty(),
-            "incomplete_provider_count": incomplete_providers.len(),
-            "incomplete_providers": incomplete_providers,
-            "total_exact": total_exact,
-            "shown": shown,
-            "omitted": omitted,
-            "truncated": omitted > 0,
-            "hits": rows,
-        }))
-        .map_err(|e| Error::Invalid(format!("serialize search-code JSON: {e}")))?
-    );
-    Ok(())
+    emit_search_code_results_with_format(
+        &store,
+        q,
+        &project,
+        status,
+        Some(decision.freshness()),
+        all_hits.len(),
+        &shown_hits,
+        &path_filters,
+        &root_path,
+        json,
+        no_code,
+        fixed,
+        resolve_definitions,
+    )?;
+    Ok(if all_hits.is_empty() { 1 } else { 0 })
 }
 
 fn dispatch_search_code_changed(
     query: &str,
     json: bool,
+    fixed: bool,
     root: Option<&str>,
     path_filters: &QueryPathFilters,
 ) -> Result<i32> {
@@ -11576,7 +17604,7 @@ fn dispatch_search_code_changed(
     let project = workspace_locator::project_identity(&root_path);
     let mut changed_files = git_changed_files(&root_path)?;
     changed_files.retain(|path| path_filters.matches(path));
-    let all_hits = live_grep_search_code_paths(query, &root_path, &changed_files)?;
+    let all_hits = live_grep_search_code_paths_pattern(query, &root_path, &changed_files, fixed)?;
     let shown_hits = all_hits
         .iter()
         .take(cli_result_limit(SEARCH_CODE_LIMIT))
@@ -11596,7 +17624,7 @@ fn dispatch_search_code_changed(
     }
 
     if shown_hits.is_empty() {
-        print_search_code_no_matches(query, path_filters);
+        print_search_code_no_matches(query, fixed, path_filters);
         return Ok(0);
     }
     for h in &shown_hits {
@@ -11652,6 +17680,7 @@ fn search_code_changed_json(
 fn dispatch_search_code_staged(
     query: &str,
     json: bool,
+    fixed: bool,
     root: Option<&str>,
     path_filters: &QueryPathFilters,
 ) -> Result<i32> {
@@ -11659,7 +17688,7 @@ fn dispatch_search_code_staged(
     let project = workspace_locator::project_identity(&root_path);
     let mut staged_files = git_staged_files(&root_path)?;
     staged_files.retain(|path| path_filters.matches(path));
-    let all_hits = grep_staged_git_blobs(query, &root_path, &staged_files)?;
+    let all_hits = grep_staged_git_blobs_pattern(query, &root_path, &staged_files, fixed)?;
     let shown_hits = all_hits
         .iter()
         .take(cli_result_limit(SEARCH_CODE_LIMIT))
@@ -11678,7 +17707,7 @@ fn dispatch_search_code_staged(
     }
 
     if shown_hits.is_empty() {
-        print_search_code_no_matches(query, path_filters);
+        print_search_code_no_matches(query, fixed, path_filters);
         return Ok(0);
     }
     for h in &shown_hits {
@@ -11733,6 +17762,7 @@ fn dispatch_search_code_since(
     query: &str,
     rev: &str,
     json: bool,
+    fixed: bool,
     root: Option<&str>,
     path_filters: &QueryPathFilters,
 ) -> Result<i32> {
@@ -11740,6 +17770,7 @@ fn dispatch_search_code_since(
         query,
         DiffSearchScope::Since { rev },
         json,
+        fixed,
         root,
         path_filters,
     )
@@ -11749,6 +17780,7 @@ fn dispatch_search_code_base(
     query: &str,
     base: &str,
     json: bool,
+    fixed: bool,
     root: Option<&str>,
     path_filters: &QueryPathFilters,
 ) -> Result<i32> {
@@ -11756,6 +17788,7 @@ fn dispatch_search_code_base(
         query,
         DiffSearchScope::Base { base },
         json,
+        fixed,
         root,
         path_filters,
     )
@@ -11777,6 +17810,7 @@ fn dispatch_search_code_diff_scope(
     query: &str,
     scope: DiffSearchScope<'_>,
     json: bool,
+    fixed: bool,
     root: Option<&str>,
     path_filters: &QueryPathFilters,
 ) -> Result<i32> {
@@ -11784,7 +17818,7 @@ fn dispatch_search_code_diff_scope(
     let project = workspace_locator::project_identity(&root_path);
     let mut spec = git_diff_search_spec(&root_path, scope)?;
     spec.files.retain(|path| path_filters.matches(path));
-    let all_hits = live_grep_search_code_paths(query, &root_path, &spec.files)?;
+    let all_hits = live_grep_search_code_paths_pattern(query, &root_path, &spec.files, fixed)?;
     let shown_hits = all_hits
         .iter()
         .take(cli_result_limit(SEARCH_CODE_LIMIT))
@@ -11797,7 +17831,7 @@ fn dispatch_search_code_diff_scope(
     }
 
     if shown_hits.is_empty() {
-        print_search_code_no_matches(query, path_filters);
+        print_search_code_no_matches(query, fixed, path_filters);
         return Ok(0);
     }
     for h in &shown_hits {
@@ -12891,105 +18925,17 @@ fn dispatch_plus(
 /// Live `grep -rnI` over the resolved repo root, used as the `search-code`
 /// fallback when the content-FTS index is empty. Output mirrors the FTS
 /// form (`relpath:line  snippet`) so an agent sees a consistent shape.
-fn live_grep_search_code(
-    query: &str,
-    root: Option<&str>,
-    json: bool,
-    index_freshness: Option<&serde_json::Value>,
-) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let hits = live_grep_code_hits(query, &root_path)?;
-    let shown = hits.len().min(cli_result_limit(SEARCH_CODE_LIMIT));
-    if json {
-        let rows = hits[..shown]
-            .iter()
-            .map(|hit| {
-                serde_json::json!({
-                    "location": hit.location,
-                    "rank": hit.rank,
-                    "snippet": clamp_snippet(&hit.snippet).as_ref(),
-                })
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "command": "search-code",
-                "status": "live-fallback",
-                "backend": "live-filesystem",
-                "query": query,
-                "fresh": true,
-                "index_freshness": index_freshness,
-                "total_exact": hits.len(),
-                "shown": shown,
-                "omitted": hits.len().saturating_sub(shown),
-                "truncated": hits.len() > shown,
-                "hits": rows,
-            }))
-            .map_err(|error| Error::Invalid(format!("serialize live search-code JSON: {error}")))?
-        );
-    } else if shown == 0 {
-        print_search_code_no_matches(query, &QueryPathFilters::default());
-    } else {
-        for hit in &hits[..shown] {
-            println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
-        }
-    }
-    Ok(if hits.is_empty() { 1 } else { 0 })
-}
-
-fn live_grep_search_code_filtered(
-    query: &str,
-    root: Option<&str>,
-    json: bool,
-    index_freshness: Option<&serde_json::Value>,
-    path_filters: &QueryPathFilters,
-) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let hits = live_grep_code_hits_filtered(query, &root_path, path_filters)?;
-    let shown = hits.len().min(cli_result_limit(SEARCH_CODE_LIMIT));
-    if json {
-        let rows = hits[..shown]
-            .iter()
-            .map(|hit| {
-                serde_json::json!({
-                    "location": hit.location,
-                    "rank": hit.rank,
-                    "snippet": clamp_snippet(&hit.snippet).as_ref(),
-                })
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "command": "search-code",
-                "status": "live-fallback",
-                "backend": "live-filesystem",
-                "query": query,
-                "path_filters": path_filters.json_value(),
-                "fresh": true,
-                "index_freshness": index_freshness,
-                "total_exact": hits.len(),
-                "shown": shown,
-                "omitted": hits.len().saturating_sub(shown),
-                "truncated": hits.len() > shown,
-                "hits": rows,
-            }))
-            .map_err(|error| Error::Invalid(format!("serialize live search-code JSON: {error}")))?
-        );
-    } else if shown == 0 {
-        print_search_code_no_matches(query, path_filters);
-    } else {
-        for hit in &hits[..shown] {
-            println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
-        }
-    }
-    Ok(if hits.is_empty() { 1 } else { 0 })
-}
-
 fn live_grep_code_hits(
     query: &str,
     root_path: &std::path::Path,
+) -> Result<Vec<greppy_search::CodeHit>> {
+    live_grep_code_hits_pattern(query, root_path, true)
+}
+
+fn live_grep_code_hits_pattern(
+    query: &str,
+    root_path: &std::path::Path,
+    fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     let overrides = discover_overrides_from_env()?;
     let entries = greppy_discover::walk_with_policy_and_overrides(
@@ -13001,15 +18947,16 @@ fn live_grep_code_hits(
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect::<Vec<_>>();
-    live_grep_search_code_paths(query, root_path, &paths)
+    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed)
 }
 
-fn live_grep_code_hits_filtered(
+fn live_grep_code_hits_filtered_pattern(
     query: &str,
     root_path: &std::path::Path,
     path_filters: &QueryPathFilters,
+    fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
-    let mut hits = live_grep_code_hits(query, root_path)?;
+    let mut hits = live_grep_code_hits_pattern(query, root_path, fixed)?;
     hits.retain(|hit| {
         hit.location
             .rsplit_once(':')
@@ -13278,26 +19225,38 @@ fn parse_git_diff_new_range(hunk: &str) -> Option<(i64, i64)> {
     Some((start, count))
 }
 
-fn live_grep_search_code_paths(
+fn live_grep_search_code_paths_pattern(
     query: &str,
     root_path: &std::path::Path,
     paths: &[String],
+    fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
 
+    let grep_args = if fixed {
+        ["-HnIF", "--", query]
+    } else {
+        ["-HnIE", "--", query]
+    };
     let mut hits = Vec::new();
     for chunk in paths.chunks(128) {
         let out = std::process::Command::new("grep")
-            .args(["-HnIF", "--", query])
+            .args(grep_args)
             .args(chunk)
             .current_dir(root_path)
             .output();
         let out = match out {
             Ok(out) => out,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed => {
                 return internal_literal_search_code_paths(query, root_path, paths);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Invalid(
+                    "search-code regex mode requires `grep`; retry with --fixed on this host"
+                        .into(),
+                ));
             }
             Err(error) => {
                 return Err(Error::io("spawn grep for search-code source scan", error));
@@ -13351,13 +19310,19 @@ fn internal_literal_search_code_paths(
     Ok(hits)
 }
 
-fn grep_staged_git_blobs(
+fn grep_staged_git_blobs_pattern(
     query: &str,
     root_path: &std::path::Path,
     paths: &[String],
+    fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     use std::io::Write;
 
+    let grep_args = if fixed {
+        ["-nIF", "--", query]
+    } else {
+        ["-nIE", "--", query]
+    };
     let mut hits = Vec::new();
     for path in paths {
         let blob_spec = format!(":{path}");
@@ -13371,12 +19336,18 @@ fn grep_staged_git_blobs(
         }
 
         let mut child = match std::process::Command::new("grep")
-            .args(["-nIF", "--", query])
+            .args(grep_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !fixed => {
+                return Err(Error::Invalid(
+                    "search-code regex mode requires `grep`; retry with --fixed on this host"
+                        .into(),
+                ));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if greppy_discover::is_binary_bytes(&blob.stdout) {
                     continue;
@@ -16471,20 +22442,161 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
 /// wrote `greppy grep …`) is handled by the pre-clap router, which
 /// only routes here for the *bare* form — but we still strip a leading
 /// `grep`/`egrep`/… token defensively to match [`dispatch_grep`].
+/// Remove greppy's own global flags before handing the line to real grep.
+///
+/// `--root`, `--device` and `--no-gpu` are greppy's, and the shipped agent guide
+/// tells agents to pass `--root .` on every command. Forwarding them made real
+/// grep answer `unrecognized option '--root'`, which cost the agent a turn every
+/// time it searched — measured at 2.3 wasted turns per task, and zero in an arm
+/// that just calls grep directly. `--root DIR` also carries intent: when no path
+/// operand is present we append DIR so the search still covers what was asked.
+fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+    const VALUE_FLAGS: [&str; 2] = ["--root", "--device"];
+    const BARE_FLAGS: [&str; 1] = ["--no-gpu"];
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
+    let mut root: Option<std::ffi::OsString> = None;
+    let mut removed = false;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_str().unwrap_or_default();
+        if let Some(flag) = VALUE_FLAGS.iter().find(|flag| text == **flag) {
+            if let Some(value) = args.get(index + 1) {
+                if *flag == "--root" {
+                    root = Some(value.clone());
+                }
+                index += 2;
+                removed = true;
+                continue;
+            }
+            index += 1;
+            removed = true;
+            continue;
+        }
+        if let Some(flag) = VALUE_FLAGS
+            .iter()
+            .find(|flag| text.starts_with(&format!("{flag}=")))
+        {
+            if *flag == "--root" {
+                root = Some(std::ffi::OsString::from(&text[flag.len() + 1..]));
+            }
+            index += 1;
+            removed = true;
+            continue;
+        }
+        if BARE_FLAGS.contains(&text) {
+            index += 1;
+            removed = true;
+            continue;
+        }
+        out.push(args[index].clone());
+        index += 1;
+    }
+    if !removed {
+        return None;
+    }
+    // A bare `--root DIR` with no path operand still means "search DIR". The
+    // first non-flag argument is the PATTERN, so a path operand only exists from
+    // the second one on — counting the pattern as a path silently searched the
+    // wrong place.
+    if let Some(root) = root {
+        let non_flags = out
+            .iter()
+            .skip(1)
+            .filter(|arg| !arg.to_str().unwrap_or_default().starts_with('-'))
+            .count();
+        if non_flags <= 1 {
+            out.push(root);
+        }
+    }
+    Some(out)
+}
+
+/// Greppy-only flags, with the subcommand that owns each one.
+///
+/// An argv carrying one of these is a mistyped greppy command, not a grep
+/// invocation: real grep rejects it with its own usage dump, which says nothing
+/// about which greppy subcommand the caller actually wanted. No name here
+/// collides with a real grep long option.
+/// Flags shared by the navigation commands, which no single subcommand owns.
+const NAV_OWNER: &str = "";
+
+const GREPPY_ONLY_FLAGS: &[(&str, &str)] = &[
+    ("--target", "edit"),
+    ("--expect", "edit"),
+    ("--content", "edit"),
+    ("--content-file", "edit"),
+    ("--source-file", "edit"),
+    ("--old", "edit"),
+    ("--old-file", "edit"),
+    ("--new-file", "edit"),
+    ("--pattern", "edit"),
+    ("--body", "edit"),
+    ("--patch-file", "edit"),
+    ("--dry-run", "edit"),
+    ("--verify", "edit"),
+    ("--plan", "edit apply"),
+    ("--spec", "edit"),
+    ("--module", "edit ensure-import"),
+    ("--annotation", "edit ensure-annotation"),
+    ("--arg", "edit ensure-argument"),
+    ("--value-json", "edit data"),
+    ("--call", "edit rename"),
+    ("--to", "edit rename"),
+    ("--symbol", "read"),
+    ("--lines", "read"),
+    ("--handle", "read"),
+    ("--kind", "search-symbols"),
+    ("--depth", "impact"),
+    ("--direction", "impact"),
+    ("--from", "path"),
+    ("--base", "changes"),
+    ("--report", "changes"),
+    ("--path", NAV_OWNER),
+    // These four were the ones actually seen reaching grep in the traces. The
+    // rg branch returns earlier, so `--json` here is never ripgrep's.
+    ("--all", NAV_OWNER),
+    ("--code", NAV_OWNER),
+    ("--json", NAV_OWNER),
+    ("--offset", "read"),
+];
+
+/// The first greppy-only flag in `args`, with its owning subcommand.
+fn greppy_only_flag(args: &[std::ffi::OsString]) -> Option<(&'static str, &'static str)> {
+    let mut options = true;
+    for argument in args {
+        if argument == "--" {
+            options = false;
+            continue;
+        }
+        if !options {
+            continue;
+        }
+        let Some(text) = argument.to_str() else {
+            continue;
+        };
+        let name = text.split_once('=').map_or(text, |(name, _)| name);
+        if let Some(hit) = GREPPY_ONLY_FLAGS.iter().find(|(flag, _)| *flag == name) {
+            return Some(*hit);
+        }
+    }
+    None
+}
+
 fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // full[0] is the "greppy" placeholder. Strip a leading
     // grep-family (or rg-family) placeholder in full[1] if present so
     // `greppy grep -R foo .`, `greppy rg -S foo` and `greppy -R foo .`
     // all agree.
-    let args: &[std::ffi::OsString] = &full[1..];
-    let (stripped, named_rg, named_grep): (&[std::ffi::OsString], bool, bool) =
-        match args.first().and_then(|s| s.to_str()) {
-            Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => {
-                (&args[1..], false, true)
-            }
-            Some("rg") | Some("ripgrep") => (&args[1..], true, false),
-            _ => (args, false, false),
-        };
+    let cleaned = strip_greppy_globals(&full[1..]);
+    let args: &[std::ffi::OsString] = cleaned.as_deref().unwrap_or(&full[1..]);
+    let (stripped, named_rg, named_grep): (&[std::ffi::OsString], bool, bool) = match args
+        .first()
+        .and_then(|s| s.to_str())
+    {
+        Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => (&args[1..], false, true),
+        Some("rg") | Some("ripgrep") => (&args[1..], true, false),
+        _ => (args, false, false),
+    };
 
     // rg-style invocations (named, or carrying rg-only flags such as
     // --smart-case / -t / --glob) get their own routing: real ripgrep if
@@ -16500,12 +22612,23 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // Preserve byte-exact passthrough for ordinary invocations, but add the
     // conventional recursive default when we can prove that a file operand is
     // an existing directory and no recursive mode was requested explicitly.
-    let recursive_args = if named_grep {
-        grep_args_with_implicit_recursion(stripped)
-    } else {
-        None
-    };
+    // This applies to the bare form (`greppy PATTERN dir/`) as much as to the
+    // named one: real grep answers both with "Is a directory", so nothing that
+    // previously produced results changes meaning.
+    let _ = named_grep;
+    let recursive_args = grep_args_with_implicit_recursion(stripped);
     let grep_args = recursive_args.as_deref().unwrap_or(stripped);
+    if let Some((flag, owner)) = greppy_only_flag(grep_args) {
+        let guidance = if owner.is_empty() {
+            "it belongs to greppy's navigation commands. Drop it, or name the command it goes with"
+                .to_string()
+        } else {
+            format!("it belongs to `greppy {owner}`. Drop it, or run `greppy {owner} ...` instead")
+        };
+        return Err(Error::Invalid(format!(
+            "`{flag}` is a greppy flag, not a grep flag - {guidance}."
+        )));
+    }
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend_from_slice(grep_args);
@@ -16517,13 +22640,27 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
 fn grep_args_with_implicit_recursion(
     args: &[std::ffi::OsString],
 ) -> Option<Vec<std::ffi::OsString>> {
-    if grep_has_recursive_option(args) || !grep_has_directory_operand(args) {
+    if grep_has_recursive_option(args)
+        || grep_requests_files_without_match(args)
+        || !grep_has_directory_operand(args)
+    {
         return None;
     }
     let mut adjusted = Vec::with_capacity(args.len() + 1);
     adjusted.push(std::ffi::OsString::from("-r"));
     adjusted.extend_from_slice(args);
     Some(adjusted)
+}
+
+fn grep_requests_files_without_match(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|argument| {
+        argument == "--files-without-match"
+            || argument.to_str().is_some_and(|text| {
+                text.strip_prefix('-')
+                    .filter(|cluster| !cluster.starts_with('-'))
+                    .is_some_and(|cluster| cluster.contains('L'))
+            })
+    })
 }
 
 fn grep_has_recursive_option(args: &[std::ffi::OsString]) -> bool {
@@ -16560,7 +22697,10 @@ fn grep_has_recursive_option(args: &[std::ffi::OsString]) -> bool {
 }
 
 fn grep_short_option_has_recursive_flag(option: &str) -> bool {
-    let Some(cluster) = option.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+    let Some(cluster) = option
+        .strip_prefix('-')
+        .filter(|rest| !rest.starts_with('-'))
+    else {
         return false;
     };
     for flag in cluster.chars() {
@@ -16593,7 +22733,8 @@ fn grep_has_directory_operand(args: &[std::ffi::OsString]) -> bool {
             {
                 let (takes_value, supplies_pattern) = grep_option_value_mode(text);
                 explicit_pattern |= supplies_pattern;
-                if takes_value && !text.contains('=') && !grep_short_option_has_attached_value(text) {
+                if takes_value && !text.contains('=') && !grep_short_option_has_attached_value(text)
+                {
                     index += 2;
                     continue;
                 }
@@ -16646,7 +22787,10 @@ fn grep_option_value_mode(option: &str) -> (bool, bool) {
 }
 
 fn grep_short_option_has_attached_value(option: &str) -> bool {
-    let Some(cluster) = option.strip_prefix('-').filter(|rest| !rest.starts_with('-')) else {
+    let Some(cluster) = option
+        .strip_prefix('-')
+        .filter(|rest| !rest.starts_with('-'))
+    else {
         return false;
     };
     cluster.char_indices().any(|(index, flag)| {
@@ -18009,8 +24153,39 @@ struct OutputBudgetSpec {
     offset: usize,
 }
 
+const DEFAULT_READ_FILE_MAX_BYTES: usize = 16 * 1024;
+
+fn read_uses_default_file_budget(cli: &Cli) -> bool {
+    let Some(Command::Read {
+        targets,
+        symbol_opts,
+        path_opts,
+        lines,
+        json,
+        all,
+        ..
+    }) = cli.command.as_ref()
+    else {
+        return false;
+    };
+    if *json || *all || lines.is_some() || !symbol_opts.is_empty() {
+        return false;
+    }
+    if targets.len() + path_opts.len() != 1 {
+        return false;
+    }
+    if targets.is_empty() {
+        return true;
+    }
+    targets.first().is_some_and(|subject| {
+        split_path_qualified(subject).is_none()
+            && read_subject_is_path(subject, cli.root.as_deref()).unwrap_or(false)
+    })
+}
+
 fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
-    if cli.max_bytes.is_none() && cli.offset == 0 {
+    let default_read_budget = read_uses_default_file_budget(cli);
+    if cli.max_bytes.is_none() && cli.offset == 0 && !default_read_budget {
         return None;
     }
     let (command, json) = match cli.command.as_ref()? {
@@ -18038,7 +24213,9 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
     Some(OutputBudgetSpec {
         command,
         json,
-        max_bytes: cli.max_bytes,
+        max_bytes: cli
+            .max_bytes
+            .or(default_read_budget.then_some(DEFAULT_READ_FILE_MAX_BYTES)),
         offset: cli.offset,
     })
 }
@@ -18299,6 +24476,28 @@ fn error_exit_code(error: &Error) -> u8 {
     }
 }
 
+#[cfg(feature = "agent")]
+/// Environment-keyed refusal used at the CLI entry; mirrors the guard inside
+/// `greppy_agent::run_agent` so neither entry point can be bypassed.
+fn agent_refuse_nested_invocation() -> std::result::Result<(), String> {
+    let depth = std::env::var(greppy_agent::ENV_AGENT_DEPTH)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let run_id = std::env::var(greppy_agent::ENV_AGENT_RUN_ID)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if depth == 0 && run_id.is_none() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to start a nested agent run: this process is already inside an agent run ({}={}, {}={depth}). Use greppy's navigation and edit commands directly instead of invoking the agent recursively.",
+        greppy_agent::ENV_AGENT_RUN_ID,
+        run_id.as_deref().unwrap_or("<unset>"),
+        greppy_agent::ENV_AGENT_DEPTH,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18426,13 +24625,24 @@ mod tests {
             drop(store);
 
             let code = dispatch_edit(
-                EditCommand::ReplaceBody {
+                EditCommand::Replace {
+                    file: None,
+                    old: None,
+                    old_file: None,
+                    pattern: None,
+                    lines: None,
                     symbol: Some("computeTotal".into()),
+                    body: true,
                     target: None,
-                    content_file: replacement_path.to_string_lossy().into_owned(),
+                    content: None,
+                    content_file: Some(replacement_path.to_string_lossy().into_owned()),
+                    expect: None,
+                    path: None,
                     dry_run: true,
+                    verify: false,
                     report: None,
                 },
+                false,
                 root.to_str(),
             )
             .unwrap();
@@ -18875,8 +25085,8 @@ mod tests {
         let cli =
             Cli::try_parse_from(["greppy", "semantic-search", "--json", "retry handler"]).unwrap();
         match cli.command {
-            Some(Command::Semantic { query, json, .. }) => {
-                assert_eq!(query.as_deref(), Some("retry handler"));
+            Some(Command::Semantic { queries, json, .. }) => {
+                assert_eq!(queries, vec!["retry handler".to_string()]);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -18897,8 +25107,8 @@ mod tests {
 
         let cli = Cli::try_parse_from(["greppy", "semantic", "retry handler"]).unwrap();
         match cli.command {
-            Some(Command::Semantic { query, .. }) => {
-                assert_eq!(query.as_deref(), Some("retry handler"));
+            Some(Command::Semantic { queries, .. }) => {
+                assert_eq!(queries, vec!["retry handler".to_string()]);
             }
             other => panic!("unexpected command for semantic alias: {other:?}"),
         }
@@ -18912,32 +25122,34 @@ mod tests {
 
     #[test]
     fn parse_path_disambiguation_and_hyphen_values() {
-        // brief/read accept a disambiguating file both positionally and via --path.
-        for (posp, flagp) in [
-            (Some("src/flask/testing.py"), None),
-            (None, Some("src/flask/testing.py")),
-        ] {
-            let mut argv = vec!["greppy", "brief", "open"];
-            if let Some(p) = posp {
-                argv.push(p);
+        // Rebuild #2, CLI-SPEC rule 2: the path filter is spelled `--path` and
+        // nothing else. A positional argument is a further SYMBOL.
+        match Cli::try_parse_from([
+            "greppy",
+            "brief",
+            "open",
+            "--path",
+            "src/flask/testing.py",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Command::Brief {
+                symbols, path_opts, ..
+            }) => {
+                assert_eq!(symbols, vec!["open".to_string()]);
+                assert_eq!(path_opts, vec!["src/flask/testing.py".to_string()]);
             }
-            if let Some(p) = flagp {
-                argv.push("--path");
-                argv.push(p);
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from(["greppy", "brief", "open", "close"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Brief { symbols, .. }) => {
+                assert_eq!(symbols, vec!["open".to_string(), "close".to_string()]);
             }
-            match Cli::try_parse_from(argv).unwrap().command {
-                Some(Command::Brief {
-                    symbol,
-                    paths,
-                    path_opt,
-                    ..
-                }) => {
-                    assert_eq!(symbol.as_deref(), Some("open"));
-                    let scope = paths.first().map(String::as_str).or(path_opt.as_deref());
-                    assert_eq!(scope, Some("src/flask/testing.py"));
-                }
-                other => panic!("unexpected: {other:?}"),
-            }
+            other => panic!("unexpected: {other:?}"),
         }
 
         // read carries the nav commands' --code flag as an accepted no-op.
@@ -18951,28 +25163,28 @@ mod tests {
         // A non-file path (no extension) is not folded into an unresolvable query.
         assert_eq!(qualify_symbol_with_path(Some("open"), Some("src")), None);
 
-        // text-cas / regex-cas accept values beginning with '-' (real diff/RST lines).
+        // Selector and content values may begin with '-' (real diff/RST lines).
         assert!(Cli::try_parse_from([
             "greppy",
             "edit",
-            "text-cas",
+            "replace",
             "--file",
             "CHANGES.rst",
             "--old",
             "-   Fix how",
-            "--new",
+            "--content",
             "-   Fix what",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
             "greppy",
             "edit",
-            "regex-cas",
+            "replace",
             "--file",
             "f.py",
             "--pattern",
             "-x",
-            "--replacement",
+            "--content",
             "-y",
         ])
         .is_ok());
@@ -19033,8 +25245,8 @@ mod tests {
         assert_eq!(cli.device.as_deref(), Some("cuda"));
         assert!(!cli.no_gpu);
         match cli.command {
-            Some(Command::Semantic { query, .. }) => {
-                assert_eq!(query.as_deref(), Some("refund workflow"));
+            Some(Command::Semantic { queries, .. }) => {
+                assert_eq!(queries, vec!["refund workflow".to_string()]);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -19586,6 +25798,8 @@ where
                 since,
                 base,
                 json,
+                no_code: _,
+                fixed: _,
                 code: _,
                 all: _,
                 paths: _,
@@ -19614,6 +25828,8 @@ where
                 since,
                 base,
                 json,
+                no_code: _,
+                fixed: _,
                 code: _,
                 all: _,
                 paths: _,
@@ -19649,6 +25865,8 @@ where
                 since,
                 base,
                 json,
+                no_code: _,
+                fixed: _,
                 code: _,
                 all: _,
                 paths: _,
@@ -19684,6 +25902,8 @@ where
                 since,
                 base,
                 json,
+                no_code: _,
+                fixed: _,
                 code: _,
                 all: _,
                 paths: _,
@@ -19804,7 +26024,8 @@ where
         .unwrap();
         match cli.command {
             Some(Command::Impact {
-                symbol,
+                symbols,
+                path_opts: _,
                 code: _,
                 direction,
                 edge,
@@ -19814,7 +26035,7 @@ where
                 all,
                 json,
             }) => {
-                assert!(symbol.is_none());
+                assert!(symbols.is_empty());
                 assert_eq!(direction, "outgoing");
                 assert!(edge.is_none());
                 assert_eq!(depth, 6);
@@ -19840,13 +26061,21 @@ where
         let cli = Cli::try_parse_from(["greppy", "who-calls", "do_it"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::WhoCalls { symbol: Some(ref s), code: false, all: false, json: false, paths, path_opts }) if s == "do_it" && paths.is_empty() && path_opts.is_empty()
+            Some(Command::WhoCalls { ref symbols, code: false, all: false, json: false, ref path_opts }) if symbols == &["do_it".to_string()] && path_opts.is_empty()
+        ));
+
+        // Rebuild #2: every further positional is another SYMBOL, never a path.
+        let cli = Cli::try_parse_from(["greppy", "who-calls", "do_it", "other"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::WhoCalls { ref symbols, .. })
+                if symbols == &["do_it".to_string(), "other".to_string()]
         ));
 
         let cli = Cli::try_parse_from(["greppy", "find-usages", "Widget"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::FindUsages { symbol: Some(ref s), code: false, all: false, json: false, paths, path_opts }) if s == "Widget" && paths.is_empty() && path_opts.is_empty()
+            Some(Command::FindUsages { ref symbols, code: false, all: false, json: false, ref path_opts }) if symbols == &["Widget".to_string()] && path_opts.is_empty()
         ));
 
         let cli = Cli::try_parse_from(["greppy", "references", "Widget"]).unwrap();
@@ -20039,6 +26268,34 @@ where
             ])),
             mk(&["-R", "foo", "."])
         );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn agent_router_reserves_prompt_but_not_explicit_grep() {
+        let argv = ["greppy", "-p", "fix it"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert!(is_agent_invocation(&argv));
+        assert!(!is_grep_passthrough(&argv));
+
+        let grep = ["greppy", "grep", "-p", "pattern"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!is_agent_invocation(&grep));
+        assert!(!is_grep_passthrough(&grep));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn agent_arguments_accept_apply_result_without_provider_flags() {
+        let args =
+            AgentInvocation::try_parse_from(["greppy", "--apply-result", "deadbeef-00000000"])
+                .unwrap();
+        assert_eq!(args.apply_result.as_deref(), Some("deadbeef-00000000"));
+        assert!(args.prompt.is_none());
     }
 
     // a non-UTF-8 first token can never be a subcommand
@@ -20428,8 +26685,8 @@ where
     fn impact_all_flag_bypasses_limit() {
         let cli = Cli::try_parse_from(["greppy", "impact", "JsonReader", "--all"]).unwrap();
         match cli.command {
-            Some(Command::Impact { symbol, all, .. }) => {
-                assert_eq!(symbol.as_deref(), Some("JsonReader"));
+            Some(Command::Impact { symbols, all, .. }) => {
+                assert_eq!(symbols, vec!["JsonReader".to_string()]);
                 assert!(all, "--all must parse to all=true");
             }
             other => panic!("expected Impact, got {other:?}"),

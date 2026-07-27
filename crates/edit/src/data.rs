@@ -208,6 +208,174 @@ pub fn data_set(
     )
 }
 
+/// Remove the entry a data path points at.
+///
+/// Deleting is not "replace the value with nothing": the key and the punctuation
+/// that joins the entry to its neighbours have to go too, or the document is left
+/// malformed. The span from `*_value_spans` covers only the value, so it is widened
+/// to the whole entry here, and the projected document is parsed before anything is
+/// written — the same guard `data_set` uses, for the same reason.
+pub fn data_delete(
+    workspace_root: &Path,
+    file: &Path,
+    path: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal_for(
+        workspace_root,
+        &snapshot,
+        options,
+        SelectorEngine::DataPath,
+        SelectorClass::StructuredData,
+    ) {
+        return Ok(certificate);
+    }
+    let segs = parse_path(path)?;
+
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let value_spans = match ext.as_str() {
+        "json" => {
+            serde_json::from_slice::<serde_json::Value>(&snapshot.content)
+                .map_err(|e| Error::Parse(format!("JSON parse: {e}")))?;
+            json_value_spans(&snapshot.content, &segs)
+        }
+        "toml" => {
+            std::str::from_utf8(&snapshot.content)
+                .map_err(|e| Error::Parse(format!("TOML is not UTF-8: {e}")))?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| Error::Parse(format!("TOML parse: {e}")))?;
+            toml_value_spans(&snapshot.content, &segs)
+        }
+        "yaml" | "yml" => yaml_scalar_spans(&snapshot.content, &segs),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "data edits support .json, .yaml/.yml, and .toml files; got {}",
+                file.display()
+            )))
+        }
+    };
+
+    let (start, end) = match value_spans.as_slice() {
+        [] => {
+            return Ok(single_refusal_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::DataPath,
+                SelectorClass::StructuredData,
+                Status::NotFound,
+                options,
+            ))
+        }
+        [(start, end)] => (*start, *end),
+        many => {
+            return Ok(single_status_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::DataPath,
+                SelectorClass::StructuredData,
+                Status::Ambiguous,
+                many.len(),
+                options,
+            ))
+        }
+    };
+
+    let (start, end) = widen_to_entry(&snapshot.content, start, end, &ext);
+    let ops = vec![PlannedOp {
+        id: "data-delete".into(),
+        range: (start, end),
+        replacement: Vec::new(),
+    }];
+
+    let projected = crate::txn::apply_in_memory(&snapshot, &ops)?;
+    match ext.as_str() {
+        "json" => {
+            serde_json::from_slice::<serde_json::Value>(&projected.content).map_err(|e| {
+                Error::Invalid(format!("data delete would produce invalid JSON: {e}"))
+            })?;
+        }
+        "toml" => {
+            std::str::from_utf8(&projected.content)
+                .map_err(|e| {
+                    Error::Invalid(format!("data delete would produce non-UTF-8 TOML: {e}"))
+                })?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| {
+                    Error::Invalid(format!("data delete would produce invalid TOML: {e}"))
+                })?;
+        }
+        _ => {}
+    }
+
+    run_pipeline_public(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::DataPath,
+        SelectorClass::StructuredData,
+        None,
+        options,
+    )
+}
+
+/// Widen a value span to the whole entry that holds it.
+///
+/// JSON and TOML: take the key in front of the value, then one separator — a
+/// trailing comma if there is one, otherwise a leading one, so the neighbours stay
+/// joined. YAML: take the line, since an entry there is a line.
+fn widen_to_entry(content: &[u8], start: usize, end: usize, ext: &str) -> (usize, usize) {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return (start, end);
+    };
+    if ext == "yaml" || ext == "yml" {
+        let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_end = text[end..]
+            .find('\n')
+            .map(|i| end + i + 1)
+            .unwrap_or(text.len());
+        return (line_start, line_end);
+    }
+
+    // Walk back over the separator and the key to the start of the entry.
+    let mut key_start = start;
+    for (index, ch) in text[..start].char_indices().rev() {
+        if matches!(ch, '{' | '[' | ',' | '\n') {
+            key_start = index + ch.len_utf8();
+            break;
+        }
+        key_start = index;
+    }
+    let entry_start = text[..key_start]
+        .rfind(|c: char| !c.is_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(key_start)
+        .min(key_start);
+
+    // Prefer the trailing comma; fall back to the leading one so the document does
+    // not end up with two separators in a row.
+    let after = text[end..]
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, c)| (end + i, c));
+    if let Some((index, ',')) = after {
+        return (entry_start, index + 1);
+    }
+    let before = text[..entry_start]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, c)| (i, c));
+    if let Some((index, ',')) = before {
+        return (index, end);
+    }
+    (entry_start, end)
+}
+
 fn classify_spans(spans: Vec<(usize, usize)>, replacement: String) -> PathLookup {
     match spans.as_slice() {
         [] => PathLookup::Missing,

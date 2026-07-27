@@ -252,6 +252,13 @@ impl Certificate {
         serde_json::to_string_pretty(&value)
     }
 
+    /// The diagnosis alone. A failed edit states its cause and stops: a hard-wired
+    /// next step does not know the task, and in the measured traces one handed
+    /// `search-symbols` a file path — a query that cannot match by construction.
+    pub fn compact_failure_diagnosis(&self) -> Option<String> {
+        self.failure_guidance().map(|(diagnosis, _, _)| diagnosis)
+    }
+
     fn failure_guidance(&self) -> Option<(String, serde_json::Value, Vec<String>)> {
         if !matches!(
             self.status,
