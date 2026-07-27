@@ -1816,11 +1816,7 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     }
     let mut message = format!("unrecognized command `{verb}`");
     if let Some(replacement) = replacement {
-        message.push_str(&format!("\n{replacement} does that work"));
-        message.push_str(&format!(
-            "\nusage: {}",
-            subcommand_usage("edit").unwrap_or_default()
-        ));
+        message.push_str(&format!("\n{verb} was replaced by: {replacement}"));
     } else {
         message.push_str(
             "\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
@@ -1978,15 +1974,18 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // `greppy edit text-cas …`: clap can only say the subcommand is
             // unknown. The caller's intent is known exactly, so name the
             // spelling that does the work.
-            if let Some(replacement) = grep_passthrough_args(&argv)
+            if let Some((verb, replacement)) = grep_passthrough_args(&argv)
                 .get(1)
                 .and_then(|token| token.to_str())
-                .and_then(retired_edit_verb)
+                .and_then(|verb| retired_edit_verb(verb).map(|replacement| (verb, replacement)))
             {
-                println!("{replacement} does that work");
+                // The fact, then stop: the usage block below would be a lecture
+                // appended to an answer that is already complete (spec law 6).
+                println!("{verb} was replaced by: {replacement}");
+                return EXIT_USAGE;
             }
             if let Some(corrected) = closest_valid_invocation(&argv, sub, &msg) {
-                println!("try: {corrected}");
+                println!("{corrected}");
             }
             if let Some(usage) = subcommand_usage(sub) {
                 println!("usage: {usage}");
@@ -10179,7 +10178,7 @@ fn edit_check_cardinality(located: &Located, expect: Option<usize>) -> EditResul
         // The count alone does not let a caller decide between "pass --expect N"
         // and "I anchored on the wrong text", so the refusal names what was
         // searched for and where every match sits.
-        let subject = located
+        let _subject = located
             .needle
             .as_deref()
             .map_or_else(|| located.kind.name().to_string(), |text| format!("`{text}`"));
@@ -10189,14 +10188,36 @@ fn edit_check_cardinality(located: &Located, expect: Option<usize>) -> EditResul
             .take(20)
             .map(|(start, _)| {
                 format!(
-                    "{}:{}",
+                    "{}:{}:{}: {}",
                     located.rel,
-                    edit_line_of_offset(&located.content, *start)
+                    edit_line_of_offset(&located.content, *start),
+                    {
+                        let ls = located.content[..*start]
+                            .iter()
+                            .rposition(|&b| b == b'\n')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        *start - ls + 1
+                    },
+                    {
+                        let ls = located.content[..*start]
+                            .iter()
+                            .rposition(|&b| b == b'\n')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        let le = located.content[*start..]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map(|i| *start + i)
+                            .unwrap_or(located.content.len());
+                        one_line_truncated(&String::from_utf8_lossy(&located.content[ls..le]), 200)
+                    }
                 )
             })
             .collect();
+        // The needle is not echoed — the caller has it in context (law 5).
         let mut message = format!(
-            "{subject} matched {} time(s), expected {expect}; nothing was written",
+            "matched {} times, expected {expect} — nothing written",
             located.ranges.len()
         );
         for site in &sites {
@@ -11899,17 +11920,17 @@ fn emit_edit_outcome(
             } else {
                 for (index, file) in record.files.iter().enumerate() {
                     match record.span {
-                        // `file:line` is how every greppy answer addresses a
-                        // place; an edit report is no exception.
+                        // Success is one bare line: verb and address. The text
+                        // that landed is the text the caller sent (CAS), and
+                        // handles appear only where the spec orders them —
+                        // echoing either re-bills known bytes every turn.
+                        Some((first, last)) if index == 0 && first == last => {
+                            println!("applied {file}:{first}");
+                        }
                         Some((first, last)) if index == 0 => {
                             println!("applied {file}:{first}-{last}");
                         }
                         _ => println!("applied {file}"),
-                    }
-                }
-                if let Some(text) = &record.text {
-                    if !text.is_empty() {
-                        println!("{text}");
                     }
                 }
                 for note in &record.notes {
@@ -11917,11 +11938,8 @@ fn emit_edit_outcome(
                 }
                 if let Some(diagnostics) = &record.diagnostics {
                     for diagnostic in diagnostics {
-                        println!("diagnostic: {diagnostic}");
+                        println!("{diagnostic}");
                     }
-                }
-                if let Some(handle) = &record.handle {
-                    println!("handle: {handle}");
                 }
             }
             Ok(0)
@@ -12363,32 +12381,17 @@ fn render_compact_edit_certificate(
     for operation in &certificate.operations {
         let path = edit_operation_path(operation, root_path);
         let (start, end) = edit_operation_line_span(operation, root_path);
-        let matches = operation.target_matches;
-        println!(
-            "{status} {path}:{start}-{end}  {matches} match{}",
-            if matches == 1 { "" } else { "es" }
-        );
-        // Echo the written state on every applied operation. Without it the
-        // agent does not trust the receipt and issues a confirming `read`:
-        // measured on a 41-task run, 130 of 269 successful edits were followed
-        // immediately by a re-read. One truncated line here costs ~160 bytes
-        // and saves a whole turn, and a turn re-bills the entire conversation.
-        if let Some(result_span) = operation.node_after.as_deref() {
-            if !result_span.trim().is_empty() {
-                let label = if operation.formatter_expanded_change_scope {
-                    "formatter widened the change; written"
-                } else {
-                    "written"
-                };
-                println!("  {label}: {}", one_line_truncated(result_span, 160));
-            }
+        // One bare line per operation (spec v8). The written-state echo that
+        // used to follow carried a measured justification (130/269 edits were
+        // re-read without it, on an older output regime); the frozen spec
+        // removes it on the CAS argument. The post-edit re-read rate is the
+        // first metric to check on the next bench — if it climbs, revisit
+        // here, with data.
+        if start == end {
+            println!("{status} {path}:{start}");
+        } else {
+            println!("{status} {path}:{start}-{end}");
         }
-    }
-    if certificate.status == greppy_edit::Status::Applied && certificate.operations.len() > 1 {
-        println!(
-            "applied {} operations atomically",
-            certificate.operations.len()
-        );
     }
 }
 
@@ -12655,9 +12658,6 @@ fn finish_edit(
         );
     } else {
         render_compact_edit_certificate(&certificate, root_path);
-        if expand.is_some() {
-            println!("Expand: greppy expand {}", certificate.transaction_id);
-        }
     }
     Ok(certificate.exit_code())
 }
