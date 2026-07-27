@@ -1816,7 +1816,10 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     }
     let mut message = format!("unrecognized command `{verb}`");
     if let Some(replacement) = replacement {
-        message.push_str(&format!("\n{verb} was replaced by: {replacement}"));
+        // A retired verb is just an unknown subcommand. Naming its successor
+        // would keep a table of dead names alive (owner decision: no relics,
+        // not even in error messages) to serve a caller that measurably does
+        // not exist — zero retired-verb calls in 1072 benchmarked turns.
     } else {
         message.push_str(
             "\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
@@ -1974,16 +1977,6 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // `greppy edit text-cas …`: clap can only say the subcommand is
             // unknown. The caller's intent is known exactly, so name the
             // spelling that does the work.
-            if let Some((verb, replacement)) = grep_passthrough_args(&argv)
-                .get(1)
-                .and_then(|token| token.to_str())
-                .and_then(|verb| retired_edit_verb(verb).map(|replacement| (verb, replacement)))
-            {
-                // The fact, then stop: the usage block below would be a lecture
-                // appended to an answer that is already complete (spec law 6).
-                println!("{verb} was replaced by: {replacement}");
-                return EXIT_USAGE;
-            }
             if let Some(corrected) = closest_valid_invocation(&argv, sub, &msg) {
                 println!("{corrected}");
             }
