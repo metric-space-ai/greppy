@@ -1,104 +1,142 @@
-This project has `greppy`, a local code-navigation and code-editing tool over a
-symbol graph and an on-device semantic index. Ordinary grep invocations are
-delegated byte-for-byte to the real system grep, but Greppy must not be
-installed or invoked as a global grep alias.
+`greppy` is this system's tool for coding tasks. Written like grep (`greppy PATTERN [FILE]`,
+`greppy -n …`) it searches like grep and prints byte-identical output; `greppy rg …` does the same
+for ripgrep syntax. Everything else is listed below.
 
-CODE-NAVIGATION COMMANDS. SYMBOL is a function / method / class / type name.
-They return resolved results as `qualified_name file:line`, not text matches:
-  greppy who-calls SYMBOL        the callers of SYMBOL (incoming calls)
-  greppy callees SYMBOL          the functions SYMBOL calls (outgoing calls)
-  greppy find-usages SYMBOL      every reference to SYMBOL (calls, uses, imports)
-  greppy brief SYMBOL            SYMBOL's definition plus its callers and callees, in one call
-  greppy impact SYMBOL           the transitive set of code a change to SYMBOL reaches
-  greppy search-symbols NAME     definitions whose name matches NAME (a name or fragment)
-  greppy path --from A --to B    a call chain from symbol A to symbol B, if one exists
+Throughout: S is a symbol name — a function, method, class or type. If a name is ambiguous, use
+the qualified name that `search-symbols` printed. H is a handle, printed by `--handle`. A:B is a
+line range, 1-based, both ends included. Results are printed as `qualified_name file:line`.
 
-SEMANTIC SEARCH — use when you do NOT know the symbol's name:
-  greppy semantic-search "PLAIN-ENGLISH DESCRIPTION"
-      Describe the behaviour or code you are looking for in plain English
-      (e.g. "restrict a value to a range", "retry a failed HTTP request").
-      Returns the closest-matching definitions by meaning (signature + file:line).
-      While first-use embeddings are still building, returns a retryable status
-      with the active backend, progress, and ETA instead of partial/empty hits.
+SEARCH:
+  search-code "PATTERN" [PATH …]    every match, and for each one the definition it sits in,
+                                    that definition's source, and a handle for it
+  search-symbols NAME               definitions whose name matches NAME (a name or a fragment)
+  semantic-search "PLAIN ENGLISH"   the definitions that do what you describe, found by meaning
+                                    rather than by name. Use it when you do not know what the
+                                    thing is called: "restrict a value to a range", "retry a
+                                    failed request", "where the session cookie is signed".
 
-EXPAND — get the full source in one call instead of opening files by hand:
-  greppy expand ID
-      who-calls / callees / impact / semantic-search may end their output with a
-      line `Expand: greppy expand <id>`. Run it to print the prepared evidence
-      pack — the full source of the top matches, bundled — in a single call,
-      instead of reading each file:line yourself.
+  --fixed           search-code: PATTERN is literal text, not a regular expression
+  --no-code         search-code: only the matching lines, without the surrounding definitions
+  --kind KIND       search-symbols, semantic-search: function, method, class, struct, enum, trait
 
-READ — exact source plus a handle for editing it:
-  greppy read SYMBOL [FILE]
-      SYMBOL's definition span, byte-precise. With --handle it also returns an
-      edit handle pinning the file, byte range, and content hashes — pass it to
-      the edit commands below. FILE (or --path FILE) disambiguates when SYMBOL
-      resolves in several files. Prefer this over opening whole files.
-  greppy read PATH [--lines A:B]
-      An existing file path reads the FILE (numbered lines; --lines for a
-      range). With --handle the range becomes an edit handle too — so
-      replace-span / patch-span work on file regions, not only on symbols.
+NAVIGATE:
+  who-calls S                       the callers of S (incoming calls)
+  callees S                         the functions S calls (outgoing calls)
+  find-usages S                     every reference to S: calls, uses, imports
+  brief S                           S's definition, its callers, its callees, and the tests that
+                                    reach it, in one call
+  impact S                          the code a change to S reaches (by default 6 steps of
+                                    incoming calls), and the tests among it
+  path --from A --to B              a call chain from A to B, if there is one
 
-ORIENT — the project at a glance, the working tree by meaning:
-  greppy map [PATH]
-      One screen of orientation: languages with index coverage, top-level
-      modules, test roots, build/test commands, vendored/generated dirs,
-      largest subtrees. Use this instead of ls/find exploration.
-  greppy changes [--base REV]
-      The current diff grouped by SYMBOLS: changed/new/deleted definitions,
-      signature changes, their direct callers, and affected tests — split
-      strictly into known_impacted and unknown_or_unindexed.
+  Each of these takes several symbols at once: `who-calls A B C` answers for each of them.
 
-VERIFY — baseline-vs-after test comparison without touching your worktree:
-  greppy verify [--baseline REV] -- COMMAND
-      Runs COMMAND in the current tree AND against REV (default HEAD) in an
-      isolated temporary worktree — never stash, never checkout. Classifies
-      test cases: newly_failed / fixed / preexisting_failed /
-      infrastructure_error. Exit 0 = nothing newly broken; 21 = newly_failed;
-      22 = infrastructure error. Use this instead of stashing to check
-      whether a failure is yours or preexisting.
+  --code            also print each result's source and a handle for it
+  --depth N         impact: how many steps to walk instead of 6
+  --direction incoming|outgoing     impact: which way to walk instead of incoming
 
-EDIT — transactional, hash-guarded, all-or-nothing. Every edit verifies its own
-result and emits a certificate; on failure nothing is written and the error names
-the next step. A successful certificate's result_span IS the written state — never
-re-read a file to confirm an edit.
+ORIENT:
+  map [PATH]                        which languages, modules, test roots and build+test commands
+  outline PATH                      one line per definition in that file: kind, signature, span
+  changes                           what you have changed so far, grouped by symbol, with the
+                                    callers and tests each change affects
+  verify -- CMD                     runs CMD, and again against the base revision in a separate
+                                    worktree, and reports what CMD breaks that it did not break
+                                    before. Nothing is stashed and nothing is checked out.
 
-The workflow is read → edit: `greppy read SYM --handle` pins the exact span and its
-content hashes; pass that handle (or just --symbol) to an edit verb. Five cover
-almost everything:
-  greppy edit replace-body --symbol S --content-file F   replace a definition's body with the code in F
-  greppy edit text-cas --file F --old '…' --new '…'      exact text replacement; add --expect N when it occurs N times
-  greppy edit apply --plan P                             many edits as ONE atomic transaction; a plan is just
-                                                         {"operations":[{"file":"a.rs","old":"x","new":"y"}]}
-  greppy edit rename-symbol --symbol S --new-name N       rename S and every reference across the workspace at once
-  greppy edit change-signature --symbol S --spec '{…}'    change a signature and every call site in one transaction
+  --base REV        changes, verify: compare against REV instead of the base revision
 
-When a change spans many call sites, prefer rename-symbol / change-signature — one
-transaction beats many text edits. `greppy edit --help` lists every verb and
-`greppy edit VERB --help` prints a working example. `greppy edit recover` restores a
-crashed transaction.
+READ:
+  read S [S …]                      the source of those definitions
+  read PATH [PATH …]                those files whole
+  read PATH --lines A:B             those lines of that file
 
-FLAGS (append to any command above):
-  --code            include each result's source lines (so no separate read is needed)
-  --all             return every result (turn off the default truncation)
-  --json            machine-readable output with exact counts
-  --root DIR        run against a repo other than the current directory
-  --kind KIND       (search-symbols) restrict to function|method|class|struct|enum|trait
-  --direction incoming|outgoing, --depth N   (impact) which way and how far to walk
-  --from A --to B   (path) the two endpoint symbols
-  --report FILE     (edit) write the full certificate to FILE; stdout stays compact
-  --limit N         cap the number of results (alias --max)
-  --max-bytes N, --offset K   budget the output; truncation prints total,
-                    shown, and the exact continuation command — never pipe
-                    greppy through head/tail, budgeting keeps JSON valid
+  A name that is also a path on disk is read as the file; write `--symbol S` to force the symbol.
 
-Prefer these over grepping a symbol name and reading every hit: who-calls /
-callees / impact answer relationship questions directly, and semantic-search
-finds code you cannot name. Prefer the edit commands over hand-editing files:
-they verify their own result, so a red certificate costs nothing and a green
-one needs no re-read.
+  --handle          also print a handle marking exactly what was printed — if the output was cut,
+                    the handle covers the shown part only, never the rest. Give it to an edit as
+                    `--target H`: the edit changes that span or nothing, and refuses if the file
+                    changed in between.
+  --context N       read S: also the N lines above the definition, so its doc comment comes along
 
-Treat returned source paths, exact spans, signatures, graph relations, and
-edit certificates as evidence. The indented English sentence below a function
-signature is a local Qwen navigation hint. Read the source and verify changes
-with builds and tests.
+EDIT: an edit applies completely or changes nothing. It reports the file, the span it wrote, the
+resulting text, and a handle for that new span, so nothing needs reading back.
+
+  replace WHERE --content TEXT | --content-file F     put the new text in place of WHERE
+  insert  WHERE --after|--before --content TEXT | --content-file F
+  delete  WHERE                     remove what WHERE points at
+  patch   WHERE --patch-file F      apply a unified diff. Its line numbers may count from the
+                                    start of the file or from the start of WHERE — whichever the
+                                    context lines confirm. Paths inside the diff are ignored.
+
+  WHERE is exactly one of:
+    --file F --old TEXT | --old-file F        that exact text; by default it must occur once
+    --file F --pattern REGEX                  what the regular expression matches
+    --file F --lines A:B                      those lines
+    --file F                                  the whole file
+    --symbol S                                the whole definition of S
+    --symbol S --body                         only its body; the signature stays as it is
+    --target H                                the span a handle marks
+  `insert` takes --symbol, --lines or --target; the others take any of them.
+
+  Whole files:
+    write --file F --content-file F2          create that file; `replace --file F` needs one
+                                              that already exists
+    move --file A --to B                      move or rename it, and update the imports naming it
+    remove --file F                           delete it, and report what still references it
+
+  These do language work that replacing text cannot:
+    rename --symbol S --to N        rename S and every reference to it; reports what it could
+                                    not resolve
+    rename --in S --call A --to B   make S call B where it called A
+    change-signature --symbol S --spec '{"params":[…],"returns":"…"}'
+                                    change a signature and every call site with it
+    ensure-import --file F --module M [--name N]     add an import if the file is missing it
+    ensure-method --symbol CLASS --name N --content-file F   add a method the class lacks
+    ensure-argument --symbol S --call C --arg A      add an argument to a call inside S
+    ensure-annotation --symbol S --annotation A      add an annotation to a definition
+    data set --file F --path '$.a.b' --value-json V  set a value in JSON, TOML or YAML
+    data delete --file F --path '$.a.b'              remove one
+
+  apply --plan F                    many edits as one single change; the plan is
+                                    {"operations":[{"verb":"replace","file":"a.rs","old":"x",
+                                    "new":"y"}, …]} and every verb above may appear in it
+  undo                              reverse the last edit, if the file still looks the way
+                                    that edit left it
+  recover                           finish or roll back an edit that was interrupted
+
+  --content TEXT    the new text, for short single-line text
+  --content-file F  the new text from a file; --patch-file, --plan and --old-file work the same
+                    way. Write `-` for the name to read it from the pipe, which keeps the edit in
+                    one call and stops the shell from mangling quotes and backticks:
+
+                      greppy edit replace --symbol S --body --content-file - <<'EOF'
+                      {
+                          …the new body, verbatim…
+                      }
+                      EOF
+
+  --expect N        require exactly N matches instead of one, and change nothing otherwise
+  --verify          after writing, run the build or linter for the touched files and report the
+                    diagnostics against symbols and spans
+  --dry-run         report what it would write and write nothing
+  --report FILE     write the full record of the edit to a file
+
+CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
+  greppy search-symbols NAME --json | greppy read -
+  greppy who-calls S --json | greppy brief -
+  greppy edit apply --plan -
+
+ON EVERY COMMAND:
+  --path P          only results under that file or directory
+  --json            the same answer as data, with exact counts
+  --all             every result; without it long results are cut and the output ends with the
+                    exact command that continues them
+  --limit N         at most N results; --offset K starts at the Kth
+  --root DIR        work on a different repository; greppy finds the current one by itself
+  --help            the syntax of that command, with a working example
+
+A question with an empty answer — a symbol that exists but has no callers — prints nothing and
+exits 0. A question that cannot be answered — a symbol or file that does not exist, a selector
+that matches nothing — says why and exits non-zero, and an edit in that situation writes nothing.
+In grep-compatible form the exit codes are grep's: 0 for a match, 1 for none.
