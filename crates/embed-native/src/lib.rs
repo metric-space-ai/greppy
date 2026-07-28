@@ -48,6 +48,16 @@ pub use metal::model::{MetalEmbeddingModel, MetalForwardProfile};
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 pub use cuda::model::{CudaEmbeddingModel, CudaForwardProfile};
 
+/// Whether this build carries a GPU backend for the current target. Callers
+/// assert on it at compile time: a CPU-only binary is twenty times slower at
+/// exactly the work greppy does on every query, and nothing fails when it is
+/// missing — it just gets slow, which is why it has to be caught by the
+/// compiler rather than noticed later.
+pub const HAS_GPU_BACKEND: bool = cfg!(any(
+    all(feature = "metal", target_os = "macos"),
+    all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
+));
+
 /// Embedding dimension produced by EmbeddingGemma after the two
 /// SentenceTransformer dense projections.
 pub const EMBEDDING_DIM: usize = 768;

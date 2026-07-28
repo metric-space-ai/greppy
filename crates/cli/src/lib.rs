@@ -19,6 +19,21 @@
 #[cfg(all(feature = "ci-test-assets", not(debug_assertions)))]
 compile_error!("ci-test-assets is forbidden outside debug/test builds");
 
+/// A binary without a GPU backend is not buildable, the same way a binary
+/// without the embedded models is not buildable. Nothing fails at runtime when
+/// the backend is missing — the work just takes twenty times longer, measured
+/// on this repo at 7.5 s against 0.3 s for one navigation summary — so the
+/// mistake is invisible unless the compiler refuses it. Building on a platform
+/// that has no backend, or measuring against the CPU path, is
+/// `--features cpu-only`.
+#[cfg(not(feature = "cpu-only"))]
+const _: () = assert!(
+    greppy_embed_native::HAS_GPU_BACKEND,
+    "no GPU backend for this target. Metal is enabled for macOS and CUDA for \
+     Linux/Windows in crates/cli/Cargo.toml; if this target genuinely has \
+     neither, build with --features cpu-only."
+);
+
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
 use greppy_core::workspace as workspace_locator;

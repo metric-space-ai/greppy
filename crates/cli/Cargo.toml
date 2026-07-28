@@ -54,14 +54,33 @@ default = []
 # Release builds reject this feature at compile time; product builds always use
 # both real embedded models.
 ci-test-assets = []
-# GPU inference for EmbeddingGemma. Selected per platform at BUILD time (the
-# per-platform release binaries enable it; the runtime auto-detects and uses
-# the GPU with no `--device` flag). On macOS per-invocation Metal init can cost
-# more than it saves for a single one-shot query, so it stays build-opt-in:
-# `cargo build --release --features metal` (Linux/Windows CUDA: `--features cuda`).
+# GPU inference for both embedded models. It is NOT opt-in: the target sections
+# below enable the platform backend on every build, because a CPU-only binary is
+# not a slower greppy, it is a different product -- measured on this repo, one
+# navigation summary costs 7.5 s on CPU and 0.3 s on the GPU, and nothing fails
+# when the backend is missing, so an accidental CPU build is invisible until
+# someone wonders why everything crawls. `lib.rs` asserts the backend at compile
+# time; the only way out is `--features cpu-only`, which says so out loud.
 metal = ["greppy-embed-native/metal", "greppy-indexer/metal", "greppy-qwen35-native/metal"]
 accelerate = []
 cuda = ["greppy-embed-native/cuda", "greppy-indexer/cuda", "greppy-qwen35-native/cuda"]
+# Deliberately building without a GPU backend. Only for platforms that have
+# none, and for measuring against the CPU path.
+cpu-only = []
+
+# Cargo cannot make `default` depend on the target, so the platform backend is
+# enabled through the dependency instead: features are additive, so these
+# declarations union with the ones above and every macOS build gets Metal, every
+# Linux/Windows build gets CUDA, with no flag to remember and none to forget.
+[target.'cfg(target_os = "macos")'.dependencies]
+greppy-embed-native = { path = "../embed-native", features = ["metal"] }
+greppy-indexer = { path = "../indexer", features = ["metal"] }
+greppy-qwen35-native = { path = "../qwen35-native", features = ["metal"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+greppy-embed-native = { path = "../embed-native", features = ["cuda"] }
+greppy-indexer = { path = "../indexer", features = ["cuda"] }
+greppy-qwen35-native = { path = "../qwen35-native", features = ["cuda"] }
 
 [build-dependencies]
 sha2 = { workspace = true }
