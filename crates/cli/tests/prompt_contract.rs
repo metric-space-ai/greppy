@@ -139,3 +139,25 @@ fn search_is_one_family_on_one_axis() {
         "grep-compatible output is the passthrough, not a search flag"
     );
 }
+
+#[test]
+fn footer_flags_hold_for_every_command_in_their_section() {
+    // A flag in a section footer applies to every command of the section; an
+    // option one command needs is part of that command's syntax, spelled in
+    // the command column like `path --from A --to B`. A footer line naming a
+    // command with a colon is the scope-prefix notation coming back.
+    let text = prompt();
+    for section in [navigate_section(&text), search_section(&text)] {
+        for line in section.lines().filter(|l| l.starts_with("  --")) {
+            for verb in [
+                "search:", "search-symbol:", "search-pattern:", "who-calls:",
+                "callees:", "brief:", "impact:", "path:",
+            ] {
+                assert!(
+                    !line.contains(verb),
+                    "footer flag scoped to one command: {line}"
+                );
+            }
+        }
+    }
+}

@@ -289,7 +289,7 @@ fn callees_reports_missing_symbol() {
 }
 
 // ---------------------------------------------------------------------------
-// path — shortest path between two symbols over CALLS edges.
+// path — every simple path as one tree of editable edge sites.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -302,19 +302,9 @@ fn path_finds_multi_hop_chain() {
         code, 0,
         "path entry->leaf should exist and exit 0; stderr={err}\nstdout={out}"
     );
-    // All three steps present, in order, each with actionable file:line.
-    let entry_idx = out.find("entry").expect("path must include start `entry`");
-    let middle_idx = out
-        .find("middle")
-        .expect("path must include the intermediate `middle`");
-    let leaf_idx = out.find("leaf").expect("path must include goal `leaf`");
-    assert!(
-        entry_idx < middle_idx && middle_idx < leaf_idx,
-        "steps must be ordered entry -> middle -> leaf; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:") && out.contains("src/mid.rs:") && out.contains("src/leaf.rs:"),
-        "each step must carry its file:line; got: {out:?}"
+    assert_eq!(
+        out, "src/lib.rs:5  entry\n  src/lib.rs:6  middle\n    src/mid.rs:5  leaf\n",
+        "the root is a definition; every indented address is the call site in its parent"
     );
 }
 
@@ -487,11 +477,8 @@ fn path_reports_no_path_when_unreachable() {
     let (repo, store) = index_fixture("path-none");
     // Reverse direction has no CALLS path: leaf does not call entry.
     let (code, out, _err) = run(&["path", "--from", "leaf", "--to", "entry"], &repo, &store);
-    assert_eq!(code, 1, "no reverse path -> exit 1; got out={out:?}");
-    assert!(
-        out.contains("(no path"),
-        "unreachable goal must report no path; got: {out:?}"
-    );
+    assert_eq!(code, 0, "no reverse path is an answer; got out={out:?}");
+    assert_eq!(out, "no path from leaf to entry\n");
 }
 
 #[test]
@@ -530,15 +517,43 @@ fn path_requires_both_endpoints() {
 }
 
 #[test]
-fn path_trivial_self_path_is_single_step() {
+fn path_self_query_requires_a_real_cycle() {
     let (repo, store) = index_fixture("path-self");
     let (code, out, err) = run(&["path", "--from", "entry", "--to", "entry"], &repo, &store);
     assert_eq!(
         code, 0,
-        "from==to is a length-0 path and exits 0; stderr={err}\nstdout={out}"
+        "a self query without a call cycle is a no-path answer; stderr={err}\nstdout={out}"
     );
+    assert_eq!(out, "no path from entry to entry\n");
+}
+
+#[test]
+fn path_help_uses_stored_edge_names_and_has_no_code_flag() {
+    let root = fresh_dir("path-help");
+    let store = root.join("store");
+    let (code, out, err) = run(&["path", "--help"], &root, &store);
+    assert_eq!(code, 0, "path --help failed; stderr={err}");
+    assert!(out.contains("CALLS, USAGE, TYPE_ASSIGN, IMPORTS"), "{out}");
     assert!(
-        out.contains("entry") && out.contains("src/lib.rs:"),
-        "self path must print the single node; got: {out:?}"
+        !out.contains("--code"),
+        "path must not advertise --code: {out}"
     );
+}
+
+#[test]
+fn path_rejects_edge_names_the_store_does_not_use() {
+    let root = fresh_dir("path-edge-values");
+    let store = root.join("store");
+    for edge in ["USES", "TYPE_REF"] {
+        let (code, out, err) = run(
+            &["path", "--from", "entry", "--to", "leaf", "--edge", edge],
+            &root,
+            &store,
+        );
+        assert_eq!(
+            code, 64,
+            "invalid --edge {edge}; stdout={out}\nstderr={err}"
+        );
+        assert!(err.contains("invalid value"), "stderr={err:?}");
+    }
 }

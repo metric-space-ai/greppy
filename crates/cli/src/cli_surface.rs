@@ -389,10 +389,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Find a path between two symbols, if one exists. Prints the ordered
-    /// list of `qualified_name file:line` steps from `--from` to `--to`,
-    /// following `--edge` edges (default CALLS). Backed by the search
-    /// `path_query` helper.
+    /// Show every call chain between two symbols as one tree of call sites.
+    /// The start is printed at its definition; each indented child is the
+    /// editable site in its parent that calls the named symbol.
     Path {
         /// Source symbol (the path start).
         #[arg(long)]
@@ -400,14 +399,18 @@ pub enum Command {
         /// Destination symbol (the path goal).
         #[arg(long)]
         to: Option<String>,
-        /// Edge type to follow (CALLS, USES, TYPE_REF, IMPORTS).
-        #[arg(long, default_value = "CALLS")]
+        /// Stored edge type to follow (CALLS, USAGE, TYPE_ASSIGN, IMPORTS).
+        #[arg(
+            long,
+            default_value = "CALLS",
+            value_parser = ["CALLS", "USAGE", "TYPE_ASSIGN", "IMPORTS"],
+            ignore_case = true
+        )]
         edge: String,
         /// Emit machine-readable JSON with exact shortest-path metadata.
         #[arg(long)]
         json: bool,
-        /// Accepted for agent ergonomics — no-op.
-        #[arg(long)]
+        #[arg(skip)]
         code: bool,
         /// Accepted for agent ergonomics — no-op.
         #[arg(long)]

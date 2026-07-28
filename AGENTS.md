@@ -8,16 +8,16 @@ than once, qualify it with its file: `edit-src/data.rs::run`. H is a handle, pri
 `file:line  name`; a result that lives in a test carries a trailing `test`.
 
 SEARCH:
-  search "WHAT IT DOES"             definitions that do what you describe, found by meaning —
-                                    for when you do not know the name: "restrict a value to a
-                                    range", "retry a failed request"
-  search-symbol NAME                definitions whose name contains NAME, with their kind
-  search-pattern REGEX              every text occurrence, comments and strings included, with
-                                    the definition it sits in
+  search "WHAT IT DOES"             the definitions that do what you describe: "restrict a
+                                    value to a range", "retry a failed request"
+  search-symbol NAME                the definitions whose name contains NAME
+  search-pattern REGEX [--fixed]    every place REGEX matches — comments, strings and config
+                                    included — and the definition each match sits in;
+                                    --fixed takes it as literal text
 
-  --fixed           search-pattern: the argument is literal text, not a regular expression
-  --kind KIND       search, search-symbol: function, method, class, struct, enum, trait
-  --code            also print the source at each reported location
+  --kind K          only function, method, class, struct, enum or trait results; a text match
+                    counts by the definition it sits in
+  --code            also print the source at each result
   --all             every result instead of the first few
 
 NAVIGATE:
@@ -26,17 +26,17 @@ NAVIGATE:
   brief S                           what S does in one sentence, its signature, then its body
                                     sketched: one line per step with the symbol used there and
                                     what happens
-  impact S                          how far a change to S reaches, as a tree of callers, each
-                                    with what it does, tests marked
+  impact S [--depth N] [--direction outgoing]
+                                    how far a change to S reaches, as a tree of callers, each
+                                    with what it does, tests marked; --direction outgoing
+                                    walks what S reaches instead of who reaches S
   path --from A --to B              every call chain from A to B, as a tree of the call sites
                                     they hang on
 
   who-calls and callees answer for several symbols at once: `who-calls A B C`.
 
-  --code            also print the source at each reported location
+  --code            also print the source at each result
   --all             every result instead of the first few
-  --depth N         impact: how many steps to walk instead of 6
-  --direction incoming|outgoing     impact: which way to walk instead of incoming
 
 ORIENT:
   map [PATH]                        which languages, modules, test roots and build+test commands

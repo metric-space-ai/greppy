@@ -413,7 +413,15 @@ pub(crate) fn print_impact_tree(
             }
         }
         if let Some(next) = children.get(&id) {
-            print_impact_tree(repo_root, children, nodes, next, sources, printed, depth + 1);
+            print_impact_tree(
+                repo_root,
+                children,
+                nodes,
+                next,
+                sources,
+                printed,
+                depth + 1,
+            );
         }
     }
 }
@@ -1321,8 +1329,7 @@ pub(crate) fn nav_refuse_ambiguous(
 /// the statement, and it says the repository does not know this name.
 pub(crate) fn nav_report_missing(store: &greppy_store::Store, project: &str, query: &str) {
     println!("no symbol `{query}`");
-    let normalise =
-        |name: &str| name.to_ascii_lowercase().replace('_', "").replace('-', "");
+    let normalise = |name: &str| name.to_ascii_lowercase().replace('_', "").replace('-', "");
     let wanted = normalise(query);
     let mut near: Vec<(String, String, i64)> = Vec::new();
     for name in symbol_miss_suggestions(store, project, query) {
@@ -1334,7 +1341,10 @@ pub(crate) fn nav_report_missing(store: &greppy_store::Store, project: &str, que
         let Ok(ids) = resolve_symbol_nodes(store, Some(&name)) else {
             continue;
         };
-        let Some(node) = ids.first().and_then(|id| store.get_node(*id).ok().flatten()) else {
+        let Some(node) = ids
+            .first()
+            .and_then(|id| store.get_node(*id).ok().flatten())
+        else {
             continue;
         };
         near.push((name, node.file_path.clone(), node.start_line.max(1)));
@@ -1486,9 +1496,13 @@ pub(crate) fn dispatch_who_calls(
             ensure_unambiguous_target(&store, symbol, &targets)?;
         } else {
             let repo_root = resolve_root(root)?;
-            if let Some(code) =
-                nav_refuse_non_callable(&store, &repo_root, symbol, &targets, NavDirection::Incoming)?
-            {
+            if let Some(code) = nav_refuse_non_callable(
+                &store,
+                &repo_root,
+                symbol,
+                &targets,
+                NavDirection::Incoming,
+            )? {
                 return Ok(code);
             }
             if let Some(code) = nav_refuse_ambiguous(&store, symbol, &targets)? {
@@ -1710,9 +1724,13 @@ pub(crate) fn dispatch_callees(
             ensure_unambiguous_target(&store, symbol, &sources)?;
         } else {
             let repo_root = resolve_root(root)?;
-            if let Some(code) =
-                nav_refuse_non_callable(&store, &repo_root, symbol, &sources, NavDirection::Outgoing)?
-            {
+            if let Some(code) = nav_refuse_non_callable(
+                &store,
+                &repo_root,
+                symbol,
+                &sources,
+                NavDirection::Outgoing,
+            )? {
                 return Ok(code);
             }
             if let Some(code) = nav_refuse_ambiguous(&store, symbol, &sources)? {
@@ -1850,19 +1868,196 @@ pub(crate) fn dispatch_callees(
     Ok(0)
 }
 
-/// `greppy path --from A --to B [--edge CALLS]` — print a shortest path
-/// between two symbols, if one exists, as an ordered list of
-/// `qualified_name file:line` steps from `A` to `B`. Backed by the search
-/// `path_query` helper (deterministic shortest path over `--edge` edges).
-///
-/// Both `--from` and `--to` are required; each is resolved to a single
-/// node via the same label-ranked resolution the navigation commands use
-/// (a type/def-like label beats an Impl/EnumVariant/Call site sharing the
-/// name). Exit codes:
-/// * 0 — a path was found (printed).
-/// * 1 — both endpoints resolved but no path exists within bounds, or an
-///   endpoint symbol could not be resolved.
-/// * 64 — usage error (missing `--from`/`--to`).
+/// One edge in a concrete `path` answer. The source definition supplies the
+/// file and the edge supplies the line: together they name the editable call
+/// site. The target supplies the short name printed beside that address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NavPathStep {
+    source_id: i64,
+    target_id: i64,
+    file: String,
+    line: u32,
+    name: String,
+}
+
+/// A prefix tree made from concrete simple paths. Converged suffixes remain in
+/// each branch because only prefixes are merged.
+#[derive(Debug)]
+pub(crate) struct NavPathBranch {
+    step: NavPathStep,
+    children: Vec<NavPathBranch>,
+}
+
+/// Minimum outgoing distance from every discovered predecessor to `target`.
+/// The text walk uses this only to discard branches that cannot end at the
+/// requested target; it never changes or filters graph edges that do reach it.
+pub(crate) fn nav_path_distances_to(
+    store: &greppy_store::Store,
+    target: i64,
+    edge_type: &str,
+    max_hops: usize,
+) -> Result<std::collections::HashMap<i64, usize>> {
+    let mut distances = std::collections::HashMap::new();
+    distances.insert(target, 0);
+    let mut frontier = std::collections::VecDeque::from([(target, 0usize)]);
+    while let Some((node, hops)) = frontier.pop_front() {
+        if hops >= max_hops {
+            continue;
+        }
+        for edge in store.incoming_edges(node, Some(edge_type), 1024)? {
+            if let std::collections::hash_map::Entry::Vacant(slot) = distances.entry(edge.source_id)
+            {
+                slot.insert(hops + 1);
+                frontier.push_back((edge.source_id, hops + 1));
+            }
+        }
+    }
+    Ok(distances)
+}
+
+/// Collect at most eight simple paths in deterministic call-site order. The
+/// endpoint is accepted even when it is already on the current stack, which is
+/// what makes `--from A --to A` ask for a real cycle instead of inventing the
+/// zero-edge path returned by the lower-level shortest-path query.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn nav_collect_paths(
+    store: &greppy_store::Store,
+    current: i64,
+    target: i64,
+    edge_type: &str,
+    max_hops: usize,
+    distances: &std::collections::HashMap<i64, usize>,
+    nodes: &mut std::collections::HashMap<i64, greppy_store::Node>,
+    stack: &mut std::collections::HashSet<i64>,
+    path: &mut Vec<NavPathStep>,
+    paths: &mut Vec<Vec<NavPathStep>>,
+    capped: &mut bool,
+) -> Result<()> {
+    const PATH_LIMIT: usize = 8;
+    if path.len() >= max_hops || paths.len() >= PATH_LIMIT {
+        *capped |= paths.len() >= PATH_LIMIT;
+        return Ok(());
+    }
+    let source = match nodes.get(&current) {
+        Some(source) => source.clone(),
+        None => {
+            let Some(source) = store.get_node(current)? else {
+                return Ok(());
+            };
+            nodes.insert(current, source.clone());
+            source
+        }
+    };
+
+    let mut next_steps = Vec::new();
+    for edge in store.outgoing_edges(current, Some(edge_type), 1024)? {
+        let Some(target_node) = store.get_node(edge.target_id)? else {
+            continue;
+        };
+        let line = edge
+            .properties
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .map(|line| line as u32)
+            .unwrap_or_else(|| source.start_line.max(1) as u32);
+        nodes
+            .entry(edge.target_id)
+            .or_insert_with(|| target_node.clone());
+        next_steps.push(NavPathStep {
+            source_id: edge.source_id,
+            target_id: edge.target_id,
+            file: source.file_path.clone(),
+            line,
+            name: nav_short_name(&target_node),
+        });
+    }
+    next_steps.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.target_id.cmp(&right.target_id))
+    });
+
+    for step in next_steps {
+        if paths.len() >= PATH_LIMIT {
+            *capped = true;
+            break;
+        }
+        let next_hops = path.len() + 1;
+        if step.target_id != target {
+            if stack.contains(&step.target_id) {
+                continue;
+            }
+            let Some(remaining) = distances.get(&step.target_id) else {
+                continue;
+            };
+            if next_hops + remaining > max_hops {
+                continue;
+            }
+        }
+        path.push(step.clone());
+        if step.target_id == target {
+            paths.push(path.clone());
+            if paths.len() >= PATH_LIMIT {
+                *capped = true;
+            }
+        } else {
+            stack.insert(step.target_id);
+            nav_collect_paths(
+                store,
+                step.target_id,
+                target,
+                edge_type,
+                max_hops,
+                distances,
+                nodes,
+                stack,
+                path,
+                paths,
+                capped,
+            )?;
+            stack.remove(&step.target_id);
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
+pub(crate) fn nav_insert_path(tree: &mut Vec<NavPathBranch>, path: &[NavPathStep]) {
+    let Some((step, rest)) = path.split_first() else {
+        return;
+    };
+    let index = match tree.iter().position(|branch| branch.step == *step) {
+        Some(index) => index,
+        None => {
+            tree.push(NavPathBranch {
+                step: step.clone(),
+                children: Vec::new(),
+            });
+            tree.len() - 1
+        }
+    };
+    nav_insert_path(&mut tree[index].children, rest);
+}
+
+pub(crate) fn nav_print_path_tree(branches: &[NavPathBranch], depth: usize) {
+    for branch in branches {
+        println!(
+            "{}{}:{}  {}",
+            "  ".repeat(depth),
+            branch.step.file,
+            branch.step.line,
+            branch.step.name
+        );
+        nav_print_path_tree(&branch.children, depth + 1);
+    }
+}
+
+/// `greppy path --from A --to B [--edge CALLS]` — print every simple path
+/// between two unambiguous symbols as one prefix tree. The root is `A` at its
+/// definition. Every other row is an edge: the call site inside its parent and
+/// the short name of what is called there.
 pub(crate) fn dispatch_path(
     from: Option<&str>,
     to: Option<&str>,
@@ -1932,10 +2127,14 @@ pub(crate) fn dispatch_path(
     )? {
         return Ok(code);
     }
-    let from_id = resolve_symbol_id(&store, Some(from))?;
-    let to_id = resolve_symbol_id(&store, Some(to))?;
-    let Some(from_id) = from_id else {
-        if json {
+
+    // JSON remains the existing single-shortest-path contract. The text surface
+    // below is deliberately separate so changing its edge-oriented shape cannot
+    // alter any field in path's stable machine-readable response.
+    if json {
+        let from_id = resolve_symbol_id(&store, Some(from))?;
+        let to_id = resolve_symbol_id(&store, Some(to))?;
+        let Some(from_id) = from_id else {
             path_counts_json(
                 &store,
                 root,
@@ -1952,12 +2151,8 @@ pub(crate) fn dispatch_path(
                 },
             )?;
             return Ok(1);
-        }
-        println!("(symbol not found: {from})");
-        return Ok(1);
-    };
-    let Some(to_id) = to_id else {
-        if json {
+        };
+        let Some(to_id) = to_id else {
             path_counts_json(
                 &store,
                 root,
@@ -1974,20 +2169,15 @@ pub(crate) fn dispatch_path(
                 },
             )?;
             return Ok(1);
-        }
-        println!("(symbol not found: {to})");
-        return Ok(1);
-    };
-
-    let path = greppy_search::path_query(
-        &store,
-        from_id,
-        to_id,
-        greppy_search::ReachDirection::Outgoing,
-        &edge_upper,
-        max_hops,
-    )?;
-    if json {
+        };
+        let path = greppy_search::path_query(
+            &store,
+            from_id,
+            to_id,
+            greppy_search::ReachDirection::Outgoing,
+            &edge_upper,
+            max_hops,
+        )?;
         let reason = if path.is_some() {
             None
         } else {
@@ -2010,22 +2200,90 @@ pub(crate) fn dispatch_path(
         )?;
         return Ok(if path.is_some() { 0 } else { 1 });
     }
-    match path {
-        Some(p) => {
-            for row in &p.rows {
-                println!(
-                    "{} {}:{}",
-                    display_row_name(row),
-                    row.file_path,
-                    row.start_line
-                );
-            }
-            Ok(0)
-        }
-        None => {
-            // AGENTS.md: "A command that finds nothing prints nothing and
-            // exits 0." A missing chain is an answer, not a failure.
-            Ok(0)
-        }
+
+    let repo_root = resolve_root(root)?;
+    let from_nodes = resolve_symbol_nodes(&store, Some(from))?;
+    if let Some(code) = nav_refuse_non_callable(
+        &store,
+        &repo_root,
+        from,
+        &from_nodes,
+        NavDirection::Incoming,
+    )? {
+        return Ok(code);
     }
+    if let Some(code) = nav_refuse_ambiguous(&store, from, &from_nodes)? {
+        return Ok(code);
+    }
+    if from_nodes.is_empty() {
+        nav_report_missing(&store, &project, from);
+        return Ok(1);
+    }
+
+    let to_nodes = resolve_symbol_nodes(&store, Some(to))?;
+    if let Some(code) =
+        nav_refuse_non_callable(&store, &repo_root, to, &to_nodes, NavDirection::Incoming)?
+    {
+        return Ok(code);
+    }
+    if let Some(code) = nav_refuse_ambiguous(&store, to, &to_nodes)? {
+        return Ok(code);
+    }
+    if to_nodes.is_empty() {
+        nav_report_missing(&store, &project, to);
+        return Ok(1);
+    }
+
+    let Some(from_id) = resolve_symbol_id(&store, Some(from))? else {
+        nav_report_missing(&store, &project, from);
+        return Ok(1);
+    };
+    let Some(to_id) = resolve_symbol_id(&store, Some(to))? else {
+        nav_report_missing(&store, &project, to);
+        return Ok(1);
+    };
+    let Some(start) = store.get_node(from_id)? else {
+        nav_report_missing(&store, &project, from);
+        return Ok(1);
+    };
+
+    let distances = nav_path_distances_to(&store, to_id, &edge_upper, max_hops)?;
+    let mut nodes = std::collections::HashMap::from([(from_id, start.clone())]);
+    let mut stack = std::collections::HashSet::from([from_id]);
+    let mut current_path = Vec::new();
+    let mut paths = Vec::new();
+    let mut capped = false;
+    nav_collect_paths(
+        &store,
+        from_id,
+        to_id,
+        &edge_upper,
+        max_hops,
+        &distances,
+        &mut nodes,
+        &mut stack,
+        &mut current_path,
+        &mut paths,
+        &mut capped,
+    )?;
+    if paths.is_empty() {
+        println!("no path from {from} to {to}");
+        return Ok(0);
+    }
+
+    println!(
+        "{}:{}  {}",
+        start.file_path,
+        start.start_line.max(1),
+        nav_short_name(&start)
+    );
+    let mut tree = Vec::new();
+    for path in &paths {
+        nav_insert_path(&mut tree, path);
+    }
+    nav_print_path_tree(&tree, 1);
+    if capped {
+        println!("at least 8 paths shown");
+    }
+    Ok(0)
 }
