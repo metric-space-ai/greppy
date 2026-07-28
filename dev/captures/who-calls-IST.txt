@@ -1,0 +1,349 @@
+# who-calls — real output, binary built from 45cace0 (pre-rewrite)
+
+$ greppy who-calls parse_path
+edit-src/data.rs::Function::data_set edit-src/data.rs:81-209
+  edit-src/data.rs:99: let segs = parse_path(path)?;
+edit-src/data.rs::Function::data_delete edit-src/data.rs:218-324
+  edit-src/data.rs:234: let segs = parse_path(path)?;
+— 2 callers
+Expand: greppy expand 887b3801b5107fbe  (prepared evidence: 2 spans, 2 callsites)
+[exit 0]
+
+$ greppy who-calls data_set
+cli-src/lib.rs::Function::dispatch_edit_inner cli-src/lib.rs:8827-9443
+  cli-src/lib.rs:9206: greppy_edit::data::data_set(
+edit-src/data.rs::Function::json_set_preserves_formatting edit-src/data.rs:764-787
+  edit-src/data.rs:772: let cert = data_set(
+edit-src/data.rs::Function::json_missing_path_refuses edit-src/data.rs:790-796
+  edit-src/data.rs:794: let cert = data_set(dir.path(), &f, "$.b", "2", false, &VerbOptions::default()).unwrap();
+edit-src/data.rs::Function::json_array_index edit-src/data.rs:799-814
+  edit-src/data.rs:803: let cert = data_set(
+edit-src/data.rs::Function::ensure_is_idempotent edit-src/data.rs:817-831
+  edit-src/data.rs:821: let cert = data_set(
+edit-src/data.rs::Function::toml_set_scalar edit-src/data.rs:834-851
+  edit-src/data.rs:838: let cert = data_set(
+edit-src/data.rs::Function::yaml_scalar_set edit-src/data.rs:854-871
+  edit-src/data.rs:858: let cert = data_set(
+— 7 callers
+Expand: greppy expand 89d2a4ba585861b4  (prepared evidence: 7 spans, 7 callsites)
+[exit 0]
+
+$ greppy who-calls data_set --code
+cli-src/lib.rs::Function::dispatch_edit_inner cli-src/lib.rs:8827-9443
+  cli-src/lib.rs:9206: greppy_edit::data::data_set(
+    fn dispatch_edit_inner(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
+        let root_path = resolve_root(root)?;
+        // The four operations of the new grammar, the whole-file verbs and `undo`
+        // answer with an edit record - file, span, resulting text, handle - rather
+        // than a certificate, so they are dispatched before the certificate verbs.
+        let command = match dispatch_edit_grammar(command, json, root, &root_path)? {
+            GrammarDispatch::Handled(code) => return Ok(code),
+            GrammarDispatch::Passthrough(command) => *command,
+        };
+        fn resolved_options(
+            dry_run: bool,
+            range: (usize, usize),
+            planned_file_sha256: String,
+            planned_target_sha256: String,
+        ) -> greppy_edit::verbs::VerbOptions {
+            greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+                planned_file_sha256: Some(planned_file_sha256),
+                planned_target_sha256: Some(planned_target_sha256),
+                planned_target_range: Some(range),
+                ..Default::default()
+            }
+        }
+        let (certificate, report_path) = match command {
+    … (truncated, 592 more line(s))
+edit-src/data.rs::Function::json_set_preserves_formatting edit-src/data.rs:764-787
+  edit-src/data.rs:772: let cert = data_set(
+        fn json_set_preserves_formatting() {
+            let dir = ws();
+            let f = dir.path().join("config.json");
+            std::fs::write(
+                &f,
+                b"{\n  \"server\": {\n    \"port\": 9000,\n    \"host\": \"x\"\n  }\n}\n",
+            )
+            .unwrap();
+            let cert = data_set(
+                dir.path(),
+                &f,
+                "$.server.port",
+                "8080",
+                false,
+                &VerbOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(cert.status, Status::Applied);
+            let out = std::fs::read_to_string(&f).unwrap();
+            assert!(out.contains("\"port\": 8080"), "{out}");
+            assert!(out.contains("\"host\": \"x\""), "{out}");
+            // byte-preserving: same shape, only the value changed
+            assert!(out.starts_with("{\n  \"server\": {\n"), "{out}");
+        }
+edit-src/data.rs::Function::json_missing_path_refuses edit-src/data.rs:790-796
+  edit-src/data.rs:794: let cert = data_set(dir.path(), &f, "$.b", "2", false, &VerbOptions::default()).unwrap();
+        fn json_missing_path_refuses() {
+            let dir = ws();
+            let f = dir.path().join("c.json");
+            std::fs::write(&f, b"{\"a\": 1}\n").unwrap();
+            let cert = data_set(dir.path(), &f, "$.b", "2", false, &VerbOptions::default()).unwrap();
+            assert_eq!(cert.status, Status::NotFound);
+        }
+edit-src/data.rs::Function::json_array_index edit-src/data.rs:799-814
+  edit-src/data.rs:803: let cert = data_set(
+        fn json_array_index() {
+            let dir = ws();
+            let f = dir.path().join("c.json");
+            std::fs::write(&f, b"{\"items\": [1, 2, 3]}\n").unwrap();
+            let cert = data_set(
+                dir.path(),
+                &f,
+                "$.items[1]",
+                "99",
+                false,
+                &VerbOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(cert.status, Status::Applied);
+            assert!(std::fs::read_to_string(&f).unwrap().contains("[1, 99, 3]"));
+        }
+edit-src/data.rs::Function::ensure_is_idempotent edit-src/data.rs:817-831
+  edit-src/data.rs:821: let cert = data_set(
+        fn ensure_is_idempotent() {
+            let dir = ws();
+            let f = dir.path().join("c.json");
+            std::fs::write(&f, b"{\"port\": 8080}\n").unwrap();
+            let cert = data_set(
+                dir.path(),
+                &f,
+                "$.port",
+                "8080",
+                true,
+                &VerbOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(cert.status, Status::AlreadySatisfied);
+        }
+edit-src/data.rs::Function::toml_set_scalar edit-src/data.rs:834-851
+  edit-src/data.rs:838: let cert = data_set(
+        fn toml_set_scalar() {
+            let dir = ws();
+            let f = dir.path().join("Cargo.toml");
+            std::fs::write(&f, b"[package]\nname = \"x\"\nversion = \"0.1.0\"\n").unwrap();
+            let cert = data_set(
+                dir.path(),
+                &f,
+                "$.package.version",
+                "\"0.2.0\"",
+                false,
+                &VerbOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(cert.status, Status::Applied);
+            let out = std::fs::read_to_string(&f).unwrap();
+            assert!(out.contains("version = \"0.2.0\""), "{out}");
+            assert!(out.contains("name = \"x\""), "{out}");
+        }
+… and 1 more (6 shown of 7 total — this sample usually answers the question; pass --all only if you truly need every site)
+[exit 0]
+
+$ greppy who-calls parse_path path
+edit-src/data.rs::Function::data_set edit-src/data.rs:81
+edit-src/data.rs::Function::data_delete edit-src/data.rs:218
+[exit 0]
+
+$ greppy who-calls parse_path zzz_nix
+greppy: invalid request: symbol not found: `zzz_nix` — no results were printed for the other targets either.
+[exit 64]
+
+$ greppy who-calls run
+greppy: invalid request: `run` is defined in 5 files, so the answer would be for one of them or for a merge of both. Name the definition: `cli-src/changes.rs::run`, `cli-src/main.rs::run`, `cli-src/map.rs::run`, `cli-src/trial.rs::run`, `cli-src/verify.rs::run`
+[exit 64]
+
+$ greppy who-calls Snapshot
+(no callers)
+— 0 callers
+[exit 0]
+
+$ greppy who-calls planned_target_range
+(no callers)
+— 0 callers
+[exit 0]
+
+$ greppy who-calls dataSet
+symbol not found: `dataSet`
+suggestion: `data_set`
+suggestion: `Data`
+suggestion: `data`
+try: greppy search-symbols dataSet
+try: greppy semantic-search dataSet
+[exit 1]
+
+$ greppy who-calls println
+(`println` is not a graph symbol; 50 source match(es) (would-be callers):)
+cli-src/changes.rs:200          println!(
+cli-src/changes.rs:764      println!(
+cli-src/changes.rs:769          println!("(no changes)");
+cli-src/changes.rs:772          println!("\n{} {}", file.status.marker(), file.path);
+cli-src/changes.rs:779              println!("  {note}");
+cli-src/changes.rs:786              println!(
+cli-src/changes.rs:794                  println!(
+cli-src/changes.rs:803      println!("\ncallsite impact (direct callers):");
+cli-src/changes.rs:805          println!("  (none known)");
+cli-src/changes.rs:808              println!(
+cli-src/changes.rs:815      println!("\ntests (CALLS graph, depth <= 2):");
+cli-src/changes.rs:816      println!("  known_impacted:");
+cli-src/changes.rs:818          println!("    (none known)");
+cli-src/changes.rs:821              println!(
+cli-src/changes.rs:827      println!("  unknown_or_unindexed:");
+cli-src/changes.rs:829          println!("    (none)");
+cli-src/changes.rs:832              println!("    {}: {}", impact.path, impact.reason);
+cli-src/inference_daemon.rs:640                  eprintln!("{log_prefix}: model evicted after {model_idle:?} idle");
+cli-src/inference_daemon.rs:1106                      eprintln!(
+cli-src/lib.rs:46  macro_rules! println {
+cli-src/lib.rs:1873                  println!("{msg}");
+cli-src/lib.rs:1877                  println!("{other}");
+cli-src/lib.rs:1894              eprintln!("greppy: {error}");
+cli-src/lib.rs:1901                  eprintln!("greppy: {error}");
+cli-src/lib.rs:1907          println!("{message}");
+cli-src/lib.rs:1926                  println!("{msg}");
+cli-src/lib.rs:1930                  println!("{other}");
+cli-src/lib.rs:1958              println!("{first}");
+cli-src/lib.rs:1963                  println!(
+cli-src/lib.rs:1986                  println!("{replacement} does that work");
+cli-src/lib.rs:1989                  println!("try: {corrected}");
+cli-src/lib.rs:1992                  println!("usage: {usage}");
+cli-src/lib.rs:1994                  println!(
+cli-src/lib.rs:2071              println!(
+cli-src/lib.rs:2077              println!(
+cli-src/lib.rs:2083              println!(
+cli-src/lib.rs:2178                  eprintln!("greppy -p: {name}");
+cli-src/lib.rs:2185          println!(
+cli-src/lib.rs:2191          println!("{}", result.message);
+cli-src/lib.rs:2192          println!();
+cli-src/lib.rs:2193          println!("Run: {}", result.run_id);
+cli-src/lib.rs:2194          println!("Changes: {}", result.changeset.changes.len());
+cli-src/lib.rs:2196              println!("Artifact: {}", path.display());
+cli-src/lib.rs:2199              println!(
+cli-src/lib.rs:2653      eprintln!("{message}");
+cli-src/lib.rs:2733          println!(
+cli-src/lib.rs:2741          println!(
+cli-src/lib.rs:2748          println!("{}", retry_with_offset("outline", end));
+cli-src/lib.rs:2820      println!(
+cli-src/lib.rs:2826      println!("tests: {known_tests} known_impacted, {unknown_tests} unknown_or_unindexed");
+suggestion: `print`
+try: greppy search-symbols println
+try: greppy semantic-search println
+[exit 0]
+
+$ greppy who-calls data
+(no callers)
+— 0 callers
+unresolved textual candidates: 15
+  cli-src/inference_daemon.rs:435: .metadata()
+  cli-src/inference_daemon.rs:1155: let metadata = std::fs::symlink_metadata(path)?;
+  cli-src/inference_daemon.rs:1163: let secured = std::fs::symlink_metadata(path)?;
+  cli-src/inference_daemon.rs:1742: .metadata()
+  cli-src/inference_daemon.rs:1749: .metadata()
+  cli-src/inference_daemon.rs:1886: assert!(std::fs::symlink_metadata(endpoint.address())
+  cli-src/lib.rs:6467: if !greppy_freshness::refresh_fingerprint_metadata(
+  cli-src/lib.rs:6569: match std::fs::metadata(root.join(path)) {
+  cli-src/lib.rs:7071: let model_bytes = std::fs::metadata(gguf)
+  cli-src/lib.rs:9838: if std::fs::symlink_metadata(&abs).is_err() {
+  … and 5 more candidates
+[exit 0]
+
+$ greppy who-calls xyzzy_frobnicate
+symbol not found: `xyzzy_frobnicate`
+try: greppy search-symbols xyzzy_frobnicate
+try: greppy semantic-search xyzzy_frobnicate
+[exit 1]
+
+$ greppy who-calls resolve_root
+cli-src/changes.rs::Function::run cli-src/changes.rs:146-217
+  cli-src/changes.rs:147: let workspace = super::resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_agent_invocation cli-src/lib.rs:2037-2218
+  cli-src/lib.rs:2102: let root = resolve_root(args.root.as_deref())?;
+cli-src/lib.rs::Function::maybe_run_store_cleanup cli-src/lib.rs:2484-2494
+  cli-src/lib.rs:2485: let effective = resolve_root(root).ok();
+cli-src/lib.rs::Function::dispatch_outline cli-src/lib.rs:2659-2751
+  cli-src/lib.rs:2660: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_changes cli-src/lib.rs:2753-2883
+  cli-src/lib.rs:2761: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_cache cli-src/lib.rs:2885-3066
+  cli-src/lib.rs:3040: Some(resolve_root(Some(raw))?)
+cli-src/lib.rs::Function::insert_nav_expand_pack cli-src/lib.rs:5015-5076
+  cli-src/lib.rs:5027: let root_path = resolve_root(root).ok()?;
+cli-src/lib.rs::Function::insert_semantic_vector_expand_pack cli-src/lib.rs:5078-5156
+  cli-src/lib.rs:5089: let root_path = resolve_root(root).ok()?;
+cli-src/lib.rs::Function::nav_freshness_json cli-src/lib.rs:6150-6240
+  cli-src/lib.rs:6172: let root_path = match resolve_root(root) {
+cli-src/lib.rs::Function::wait_for_active_index_refresh cli-src/lib.rs:6333-6344
+  cli-src/lib.rs:6334: let Ok(effective_root) = resolve_root(root) else {
+cli-src/lib.rs::Function::try_refresh_metadata_only_fingerprint cli-src/lib.rs:6452-6484
+  cli-src/lib.rs:6459: let effective_root = resolve_root(root).ok()?;
+cli-src/lib.rs::Function::freshness_changed_bytes cli-src/lib.rs:6563-6576
+  cli-src/lib.rs:6564: let root = resolve_root(root).ok()?;
+cli-src/lib.rs::Function::workspace_writer_active cli-src/lib.rs:6600-6613
+  cli-src/lib.rs:6601: let Ok(root) = resolve_root(root) else {
+cli-src/lib.rs::Function::try_auto_reindex_inline cli-src/lib.rs:6618-6681
+  cli-src/lib.rs:6619: let Ok(effective_root) = resolve_root(root) else {
+cli-src/lib.rs::Function::spawn_background_job cli-src/lib.rs:7109-7212
+  cli-src/lib.rs:7115: let Ok(root) = resolve_root(root) else {
+cli-src/lib.rs::Function::dispatch_trace cli-src/lib.rs:7591-7729
+  cli-src/lib.rs:7699: Some(resolve_root(root)?)
+cli-src/lib.rs::Function::dispatch_impact_diff_scope cli-src/lib.rs:8036-8209
+  cli-src/lib.rs:8098: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::read_subject_is_path cli-src/lib.rs:8254-8310
+  cli-src/lib.rs:8255: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_read_file cli-src/lib.rs:8393-8511
+  cli-src/lib.rs:8401: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_read cli-src/lib.rs:8517-8758
+  cli-src/lib.rs:8549: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_edit_inner cli-src/lib.rs:8827-9443
+  cli-src/lib.rs:8828: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_brief cli-src/lib.rs:12988-13218
+  cli-src/lib.rs:13065: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::expand_alias_path cli-src/lib.rs:13395-13406
+  cli-src/lib.rs:13403: let root_path = resolve_root(root).ok()?;
+cli-src/lib.rs::Function::dispatch_index_health cli-src/lib.rs:13920-14260
+  cli-src/lib.rs:13921: let effective_root = resolve_root(root)?;
+cli-src/lib.rs::Function::content_fallback cli-src/lib.rs:14295-14341
+  cli-src/lib.rs:14310: hits = live_grep_code_hits(symbol, &resolve_root(root)?)?;
+cli-src/lib.rs::Function::validate_path_filters cli-src/lib.rs:14528-14565
+  cli-src/lib.rs:14532: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_nav_multi cli-src/lib.rs:14804-14972
+  cli-src/lib.rs:14894: let root_path = resolve_root(req.root)?;
+cli-src/lib.rs::Function::dispatch_brief_multi cli-src/lib.rs:15144-15300
+  cli-src/lib.rs:15190: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_read_multi cli-src/lib.rs:15381-15538
+  cli-src/lib.rs:15382: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_who_calls cli-src/lib.rs:15627-15853
+  cli-src/lib.rs:15812: let repo_root = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_callees cli-src/lib.rs:15970-16146
+  cli-src/lib.rs:16077: Some(resolve_root(root)?)
+cli-src/lib.rs::Function::dispatch_find_usages cli-src/lib.rs:16151-16396
+  cli-src/lib.rs:16358: let repo_root = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_references cli-src/lib.rs:16402-16560
+  cli-src/lib.rs:16538: Some(resolve_root(root)?)
+cli-src/lib.rs::Function::normalize_graph_location_file cli-src/lib.rs:16702-16713
+  cli-src/lib.rs:16707: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_search_code cli-src/lib.rs:17531-17614
+  cli-src/lib.rs:17572: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_search_code_changed cli-src/lib.rs:17616-17654
+  cli-src/lib.rs:17623: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_search_code_staged cli-src/lib.rs:17700-17737
+  cli-src/lib.rs:17707: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_search_code_diff_scope cli-src/lib.rs:17829-17861
+  cli-src/lib.rs:17837: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_plus cli-src/lib.rs:18522-18943
+  cli-src/lib.rs:18539: let root_path = resolve_root(root)?;
+cli-src/lib.rs::Function::dispatch_semantic cli-src/lib.rs:19433-19651
+  cli-src/lib.rs:19523: let root_path = resolve_root(root)?;
+… and 11 more (40 shown of 51 total — this sample usually answers the question; pass --all only if you truly need every site)
+Expand: greppy expand 00f58d78576a0aa0  (prepared evidence: 51 spans, 51 callsites)
+[exit 0]
+

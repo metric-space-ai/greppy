@@ -1,0 +1,152 @@
+# who-calls / callees — real output after the rewrite
+
+$ greppy who-calls parse_path
+edit-src/data.rs:99  data_set
+edit-src/data.rs:234  data_delete
+[exit 0]
+
+$ greppy who-calls data_set
+cli-src/lib.rs:9206  dispatch_edit_inner
+edit-src/data.rs:772  json_set_preserves_formatting  test
+edit-src/data.rs:794  json_missing_path_refuses  test
+edit-src/data.rs:803  json_array_index  test
+edit-src/data.rs:821  ensure_is_idempotent  test
+edit-src/data.rs:838  toml_set_scalar  test
+edit-src/data.rs:858  yaml_scalar_set  test
+[exit 0]
+
+$ greppy who-calls data_set --code
+cli-src/lib.rs:9206-9213  dispatch_edit_inner
+                greppy_edit::data::data_set(
+                    &root_path,
+                    &target,
+                    &path,
+                    &value_json,
+                    mode == "ensure",
+                    &options,
+                )?
+
+edit-src/data.rs:772-780  json_set_preserves_formatting  test
+        let cert = data_set(
+            dir.path(),
+            &f,
+            "$.server.port",
+            "8080",
+            false,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+edit-src/data.rs:794  json_missing_path_refuses  test
+        let cert = data_set(dir.path(), &f, "$.b", "2", false, &VerbOptions::default()).unwrap();
+
+edit-src/data.rs:803-811  json_array_index  test
+        let cert = data_set(
+            dir.path(),
+            &f,
+            "$.items[1]",
+            "99",
+            false,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+edit-src/data.rs:821-829  ensure_is_idempotent  test
+        let cert = data_set(
+            dir.path(),
+            &f,
+            "$.port",
+            "8080",
+            true,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+edit-src/data.rs:838-846  toml_set_scalar  test
+        let cert = data_set(
+            dir.path(),
+            &f,
+            "$.package.version",
+            "\"0.2.0\"",
+            false,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+edit-src/data.rs:858-866  yaml_scalar_set  test
+        let cert = data_set(
+            dir.path(),
+            &f,
+            "$.server.port",
+            "8080",
+            false,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+[exit 0]
+
+$ greppy who-calls resolve_root
+51 callers: cli-src/changes.rs 1, cli-src/map.rs 1, cli-src/lib.rs 49
+
+cli-src/changes.rs:147  run
+cli-src/map.rs:48  run
+cli-src/lib.rs:2102  dispatch_agent_invocation
+cli-src/lib.rs:2485  maybe_run_store_cleanup
+cli-src/lib.rs:2660  dispatch_outline
+[exit 0]
+
+$ greppy who-calls Snapshot
+`Snapshot` is a struct, not a function  edit-src/txn.rs:25
+[exit 1]
+
+$ greppy who-calls planned_target_range
+`planned_target_range` is a field, not a function  edit-src/verbs.rs:46
+[exit 1]
+
+$ greppy who-calls data
+`data` is a module, not a function  edit-src/data.rs:1
+[exit 1]
+
+$ greppy who-calls run
+`run` is 5 definitions
+cli-src/changes.rs:146
+cli-src/main.rs:25
+cli-src/map.rs:47
+cli-src/trial.rs:168
+cli-src/verify.rs:665
+[exit 1]
+
+$ greppy who-calls dataSet
+no symbol `dataSet`
+
+similar names:
+edit-src/data.rs:81  data_set
+[exit 1]
+
+$ greppy who-calls xyzzy_frobnicate
+no symbol `xyzzy_frobnicate`
+[exit 1]
+
+$ greppy callees parse_path
+no callees
+[exit 0]
+
+$ greppy callees data_set
+edit-src/txn.rs:66  apply_in_memory
+edit-src/verbs.rs:88  planned_precondition_refusal_for
+edit-src/verbs.rs:2204  run_pipeline_public
+edit-src/verbs.rs:2227  single_refusal_certificate
+edit-src/verbs.rs:2238  single_status_certificate
+edit-src/data.rs:29  parse_path
+edit-src/data.rs:379  classify_spans
+edit-src/data.rs:387  json_to_toml
+edit-src/data.rs:406  toml_value_spans
+edit-src/data.rs:521  yaml_scalar
+edit-src/data.rs:530  yaml_scalar_spans
+edit-src/data.rs:587  json_value_spans
+[exit 0]
+
+$ greppy callees Snapshot
+edit-src/lib.rs:23  sha256_hex
+[exit 0]
+

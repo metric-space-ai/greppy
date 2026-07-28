@@ -50,17 +50,16 @@ ORIENT:
   --base REV        changes, verify: compare against REV instead of the base revision
 
 READ:
-  read S [S …]                      the source of those definitions
-  read PATH [PATH …]                those files whole
-  read PATH --lines A:B             those lines of that file
+  read S [S …]              the source code of S; --head M and --tail N for only its
+                            first M and last N lines
+  read-smart S [S …]        the source code of S, nested blocks below --depth N folded
+                            into one-line semantic descriptions; default 1
+  read-file PATH [PATH …]   the files; paginated at 400 lines unless --lines A:B or --all
 
-  A name that is also a path on disk is read as the file; write `--symbol S` to force the symbol.
-
-  --handle          also print a handle marking exactly what was printed — if the output was cut,
-                    the handle covers the shown part only, never the rest. Give it to an edit as
-                    `--target H`: the edit changes that span or nothing, and refuses if the file
-                    changed in between.
-  --context N       read S: also the N lines above the definition, so its doc comment comes along
+  --handle          also print a handle naming exactly the span that was printed — if the
+                    output was cut, it covers the shown part only. Give it to an edit as
+                    `--target H`: the edit changes that span or nothing, and refuses if the
+                    file changed in between.
 
 EDIT: an edit applies completely or changes nothing. It reports the file, the span it wrote, the
 resulting text, and a handle for that new span, so nothing needs reading back.

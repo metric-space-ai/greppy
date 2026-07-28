@@ -1,0 +1,23 @@
+# path — real output before the rewrite
+
+$ greppy path --from data_set --to parse_path
+edit-src/data.rs::Function::data_set edit-src/data.rs:81
+edit-src/data.rs::Function::parse_path edit-src/data.rs:29
+[exit 0]
+
+$ greppy path --from dispatch_edit_inner --to sha256_hex
+cli-src/lib.rs::Function::dispatch_edit_inner cli-src/lib.rs:8827
+edit-src/handle.rs::EditHandle::for_range edit-src/handle.rs:37
+edit-src/lib.rs::Function::sha256_hex edit-src/lib.rs:23
+[exit 0]
+
+$ greppy path --from parse_path --to data_set
+[exit 0]
+
+$ greppy path --from data_set --to xyzzy_frobnicate
+(symbol not found: xyzzy_frobnicate)
+[exit 1]
+
+$ greppy path --from run --to parse_path
+[exit 0]
+

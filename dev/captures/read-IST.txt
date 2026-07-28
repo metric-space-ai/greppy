@@ -1,0 +1,296 @@
+# read — real output before the rewrite
+
+$ greppy read parse_path
+edit-src/data.rs::Function::parse_path edit-src/data.rs:29-71
+fn parse_path(path: &str) -> Result<Vec<Seg>> {
+    let body = path
+        .strip_prefix("$.")
+        .ok_or_else(|| Error::Invalid(format!("data path must start with `$.`: {path}")))?;
+    if body.is_empty() || body.ends_with('.') || body.contains("..") {
+        return Err(Error::Invalid(format!("invalid data path: {path}")));
+    }
+    let mut out = Vec::new();
+    for raw in body.split('.') {
+        if raw.is_empty() {
+            return Err(Error::Invalid(format!("invalid data path: {path}")));
+        }
+        let mut rest = raw;
+        if let Some(idx) = rest.find('[') {
+            let (key, brackets) = rest.split_at(idx);
+            if key.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "missing key before index in path: {path}"
+                )));
+            }
+            out.push(Seg::Key(key.to_string()));
+            rest = brackets;
+            while let Some(inner) = rest.strip_prefix('[') {
+                let end = inner
+                    .find(']')
+                    .ok_or_else(|| Error::Invalid(format!("unclosed index in path: {path}")))?;
+                let n: usize = inner[..end]
+                    .parse()
+                    .map_err(|_| Error::Invalid(format!("non-numeric index in path: {path}")))?;
+                out.push(Seg::Index(n));
+                rest = &inner[end + 1..];
+            }
+            if !rest.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "invalid index suffix in path: {path}"
+                )));
+            }
+        } else {
+            out.push(Seg::Key(rest.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+[exit 0]
+
+$ greppy read parse_path --handle
+edit-src/data.rs::Function::parse_path edit-src/data.rs:29-71
+fn parse_path(path: &str) -> Result<Vec<Seg>> {
+    let body = path
+        .strip_prefix("$.")
+        .ok_or_else(|| Error::Invalid(format!("data path must start with `$.`: {path}")))?;
+    if body.is_empty() || body.ends_with('.') || body.contains("..") {
+        return Err(Error::Invalid(format!("invalid data path: {path}")));
+    }
+    let mut out = Vec::new();
+    for raw in body.split('.') {
+        if raw.is_empty() {
+            return Err(Error::Invalid(format!("invalid data path: {path}")));
+        }
+        let mut rest = raw;
+        if let Some(idx) = rest.find('[') {
+            let (key, brackets) = rest.split_at(idx);
+            if key.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "missing key before index in path: {path}"
+                )));
+            }
+            out.push(Seg::Key(key.to_string()));
+            rest = brackets;
+            while let Some(inner) = rest.strip_prefix('[') {
+                let end = inner
+                    .find(']')
+                    .ok_or_else(|| Error::Invalid(format!("unclosed index in path: {path}")))?;
+                let n: usize = inner[..end]
+                    .parse()
+                    .map_err(|_| Error::Invalid(format!("non-numeric index in path: {path}")))?;
+                out.push(Seg::Index(n));
+                rest = &inner[end + 1..];
+            }
+            if !rest.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "invalid index suffix in path: {path}"
+                )));
+            }
+        } else {
+            out.push(Seg::Key(rest.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+handle: geh1:eyJ3b3Jrc3BhY2Vfcm9vdCI6Ii9Wb2x1bWVzL3RtcC9vdXRwdXRzLXJlcG8iLCJwYXRoIjoiZWRpdC1zcmMvZGF0YS5ycyIsImZpbGVfc2hhMjU2IjoiOTJmMWJmNDBlMzQzMTc1NTZhZTMwMzA1YTliYTM4NDBjYjc1ODFiOTk0ODA4MWUxZmM5YjdlMjQ4NTIwZTRmOCIsImJ5dGVfc3RhcnQiOjEwOTcsImJ5dGVfZW5kIjoyNzYzLCJ0YXJnZXRfc2hhMjU2IjoiZjhkZTVlZmQ3NTdiNDgzNzVkZWU2NWUyZjZmZjI5OGJiYzFhZTIzMTM0ODcwNjU4YTVmMWIzZDczNWY5ODRlNiIsInNpZ25hdHVyZV9maW5nZXJwcmludCI6ImUzZTMzNWYzZWNkNmRkYmMiLCJncmFtbWFyX2lkIjoiUnVzdCIsImdyYW1tYXJfdmVyc2lvbiI6IjAuMi4xIn0
+[exit 0]
+
+$ greppy read edit-src/data.rs --lines 29:40
+edit-src/data.rs:29-40
+fn parse_path(path: &str) -> Result<Vec<Seg>> {
+    let body = path
+        .strip_prefix("$.")
+        .ok_or_else(|| Error::Invalid(format!("data path must start with `$.`: {path}")))?;
+    if body.is_empty() || body.ends_with('.') || body.contains("..") {
+        return Err(Error::Invalid(format!("invalid data path: {path}")));
+    }
+    let mut out = Vec::new();
+    for raw in body.split('.') {
+        if raw.is_empty() {
+            return Err(Error::Invalid(format!("invalid data path: {path}")));
+        }
+[exit 0]
+
+$ greppy read zzz_nix
+read: no definition found for `zzz_nix`
+[exit 10]
+
+$ greppy read data_set parse_path
+edit-src/data.rs:81-209
+pub fn data_set(
+    workspace_root: &Path,
+    file: &Path,
+    path: &str,
+    value_json: &str,
+    _ensure: bool,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    if let Some(certificate) = planned_precondition_refusal_for(
+        workspace_root,
+        &snapshot,
+        options,
+        SelectorEngine::DataPath,
+        SelectorClass::StructuredData,
+    ) {
+        return Ok(certificate);
+    }
+    let segs = parse_path(path)?;
+    let new_value: serde_json::Value = serde_json::from_str(value_json)
+        .map_err(|e| Error::Invalid(format!("--value-json is not valid JSON: {e}")))?;
+
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let lookup = match ext.as_str() {
+        "json" => {
+            serde_json::from_slice::<serde_json::Value>(&snapshot.content)
+                .map_err(|e| Error::Parse(format!("JSON parse: {e}")))?;
+            classify_spans(
+                json_value_spans(&snapshot.content, &segs),
+                value_json.trim().to_string(),
+            )
+        }
+        "toml" => {
+            // Parse first so malformed input is never treated as a path miss.
+            std::str::from_utf8(&snapshot.content)
+                .map_err(|e| Error::Parse(format!("TOML is not UTF-8: {e}")))?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| Error::Parse(format!("TOML parse: {e}")))?;
+            classify_spans(
+                toml_value_spans(&snapshot.content, &segs),
+                json_to_toml(&new_value)?.to_string(),
+            )
+        }
+        "yaml" | "yml" => classify_spans(
+            yaml_scalar_spans(&snapshot.content, &segs),
+            yaml_scalar(&new_value),
+        ),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "data edits support .json, .yaml/.yml, and .toml files; got {}",
+                file.display()
+            )))
+        }
+    };
+
+    let (start, end, new_text) = match lookup {
+        PathLookup::Missing => {
+            return Ok(single_refusal_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::DataPath,
+                SelectorClass::StructuredData,
+                Status::NotFound,
+                options,
+            ))
+        }
+        PathLookup::Ambiguous(matches) => {
+            return Ok(single_status_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::DataPath,
+                SelectorClass::StructuredData,
+                Status::Ambiguous,
+                matches,
+                options,
+            ))
+        }
+        PathLookup::Unique(start, end, replacement) => (start, end, replacement),
+    };
+
+    if snapshot.content[start..end] == *new_text.as_bytes() {
+        return Ok(single_status_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::DataPath,
+            SelectorClass::StructuredData,
+            Status::AlreadySatisfied,
+            1,
+            options,
+        ));
+    }
+    let ops = vec![PlannedOp {
+        id: "data-set".into(),
+        range: (start, end),
+        replacement: new_text.into_bytes(),
+    }];
+
+    // Validate the projected document before publication. Data parsers are not
+    // tree-sitter postconditions, so this check must happen before the shared
+    // pipeline writes anything.
+    let projected = crate::txn::apply_in_memory(&snapshot, &ops)?;
+    match ext.as_str() {
+        "json" => {
+            serde_json::from_slice::<serde_json::Value>(&projected.content)
+                .map_err(|e| Error::Invalid(format!("data set would produce invalid JSON: {e}")))?;
+        }
+        "toml" => {
+            std::str::from_utf8(&projected.content)
+                .map_err(|e| Error::Invalid(format!("data set would produce non-UTF-8 TOML: {e}")))?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| Error::Invalid(format!("data set would produce invalid TOML: {e}")))?;
+        }
+        _ => {}
+    }
+
+    run_pipeline_public(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::DataPath,
+        SelectorClass::StructuredData,
+        None,
+        options,
+    )
+}
+edit-src/data.rs:29-71
+fn parse_path(path: &str) -> Result<Vec<Seg>> {
+    let body = path
+        .strip_prefix("$.")
+        .ok_or_else(|| Error::Invalid(format!("data path must start with `$.`: {path}")))?;
+    if body.is_empty() || body.ends_with('.') || body.contains("..") {
+        return Err(Error::Invalid(format!("invalid data path: {path}")));
+    }
+    let mut out = Vec::new();
+    for raw in body.split('.') {
+        if raw.is_empty() {
+            return Err(Error::Invalid(format!("invalid data path: {path}")));
+        }
+        let mut rest = raw;
+        if let Some(idx) = rest.find('[') {
+            let (key, brackets) = rest.split_at(idx);
+            if key.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "missing key before index in path: {path}"
+                )));
+            }
+            out.push(Seg::Key(key.to_string()));
+            rest = brackets;
+            while let Some(inner) = rest.strip_prefix('[') {
+                let end = inner
+                    .find(']')
+                    .ok_or_else(|| Error::Invalid(format!("unclosed index in path: {path}")))?;
+                let n: usize = inner[..end]
+                    .parse()
+                    .map_err(|_| Error::Invalid(format!("non-numeric index in path: {path}")))?;
+                out.push(Seg::Index(n));
+                rest = &inner[end + 1..];
+            }
+            if !rest.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "invalid index suffix in path: {path}"
+                )));
+            }
+        } else {
+            out.push(Seg::Key(rest.to_string()));
+        }
+    }
+    Ok(out)
+}
+[exit 0]
+
