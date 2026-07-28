@@ -40,7 +40,14 @@ fn a_removed_command_is_not_advertised() {
 #[test]
 fn navigate_lists_exactly_the_five_commands() {
     let section = navigate_section(&prompt());
-    for verb in ["who-calls S", "callees S", "brief S", "impact S", "path --from A --to B"] {
+    for verb in [
+        "where-am-i",
+        "who-calls S",
+        "callees S",
+        "brief S",
+        "impact S",
+        "path --from A --to B",
+    ] {
         assert!(
             section.contains(verb),
             "NAVIGATE must describe `{verb}`; section was:\n{section}"
@@ -52,8 +59,8 @@ fn navigate_lists_exactly_the_five_commands() {
         .filter(|line| !line.trim().is_empty())
         .count();
     assert_eq!(
-        described, 6,
-        "NAVIGATE has five commands plus the multi-symbol note; got {described} entries:\n{section}"
+        described, 7,
+        "NAVIGATE has six commands plus the multi-symbol note; got {described} entries:\n{section}"
     );
 }
 
@@ -72,6 +79,11 @@ fn the_result_shape_is_the_one_the_commands_print() {
     assert!(
         text.contains("trailing `test`"),
         "the test marker appears in output, so it belongs in the prompt once"
+    );
+    assert!(
+        text.contains("generated hint, not source"),
+        "sentences after an em dash are generated; the one trust boundary the \
+         agent cannot discover belongs in the prompt"
     );
 }
 
@@ -222,5 +234,88 @@ fn read_is_bytes_and_the_lossy_view_is_its_own_verb() {
     assert!(
         !section.contains("--context"),
         "--context's documented purpose is default behaviour now"
+    );
+}
+
+#[test]
+fn orient_is_dissolved() {
+    let text = prompt();
+    assert!(
+        !text.contains("ORIENT:"),
+        "ORIENT dissolved into NAVIGATE; the section must not return"
+    );
+    for dead in ["map [PATH]", "outline PATH", "verify -- CMD", "\n  changes "] {
+        assert!(
+            !text.contains(dead),
+            "`{dead}` died with ORIENT and must not be advertised"
+        );
+    }
+}
+
+/// Everything from `EDIT:` up to the next section heading.
+fn edit_section(text: &str) -> String {
+    fn is_heading(line: &str) -> bool {
+        line.split(':').next().is_some_and(|head| {
+            !head.is_empty()
+                && line.contains(':')
+                && head.chars().all(|c| c.is_ascii_uppercase() || c == ' ')
+        })
+    }
+    let mut lines = text.lines().skip_while(|line| *line != "EDIT:");
+    let heading = lines.next().expect("AGENTS.md must have an EDIT section");
+    let body = lines.take_while(|line| !is_heading(line));
+    std::iter::once(heading)
+        .chain(body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn edit_is_eleven_verbs_with_visible_signatures() {
+    let text = prompt();
+    let section = edit_section(&text);
+    for verb in [
+        "replace S [NEW]",
+        "replace-text F OLD [NEW]",
+        "replace-lines F A:B [NEW]",
+        "replace-span H [NEW]",
+        "insert-lines F N [NEW]",
+        "delete S",
+        "delete-lines F A:B",
+        "patch [DIFF]",
+        "write PATH [NEW]",
+        "rename S NAME",
+        "undo [ID]",
+    ] {
+        assert!(
+            section.contains(verb),
+            "EDIT must carry `{verb}` with its signature visible; section:\n{section}"
+        );
+    }
+    // The zoo stays dead, the trained vocabulary stays: no invented flags, no
+    // nested `edit` prefix, no JSON plans, and no prose addressed at the agent.
+    for dead in [
+        "ensure-", "change-signature", "apply --plan", "recover", "--content",
+        "--target", "--old-file", "greppy edit ", "WHERE", "must occur",
+        "data set", "move --file", "remove --file",
+    ] {
+        assert!(
+            !section.contains(dead),
+            "`{dead}` must not return to the EDIT section:\n{section}"
+        );
+    }
+}
+
+#[test]
+fn the_header_leads_with_the_product() {
+    let text = prompt();
+    let header: String = text.lines().take(4).collect::<Vec<_>>().join(" ");
+    assert!(
+        header.contains("holds this repository as a graph"),
+        "the identity line names the product, not the fallback; header: {header}"
+    );
+    assert!(
+        header.contains("byte-identical output") && header.contains("grep's exit codes"),
+        "the grep promise is stated exactly once, in the header: {header}"
     );
 }
