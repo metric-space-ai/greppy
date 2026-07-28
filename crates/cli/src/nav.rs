@@ -20,6 +20,9 @@ pub(crate) fn dispatch_impact(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
+    // The tree's per-node hints reach the Qwen daemon; start its async model
+    // load now so the walk below overlaps the cold start.
+    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "impact", symbol.unwrap_or(""), paths)?;
     let dir = match direction.to_ascii_lowercase().as_str() {
         "incoming" | "in" | "callers" => greppy_search::ReachDirection::Incoming,
@@ -429,7 +432,7 @@ pub(crate) fn impact_node_sentence(
         CONTEXT_SPAN_CAP,
         false,
     )?;
-    let sentence = summarize_definition_span(&node.file_path, &span.text)?
+    let sentence = summarize_definition_span(repo_root, &node.file_path, &span.text)?
         .into_iter()
         .next()?;
     let sentence = sentence.trim().to_string();
@@ -623,6 +626,9 @@ pub(crate) fn dispatch_brief(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
+    // brief always summarizes its definition span; overlap the model load
+    // with resolution and store open.
+    prewarm_summary_daemon();
     let query_symbol = symbol.unwrap_or("");
     let path_filters = prepare_query_path_filters(root, "brief", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
@@ -741,7 +747,9 @@ pub(crate) fn dispatch_brief(
                     header_end_line
                 );
                 if let Some(span) = span {
-                    if let Some(summary) = summarize_definition_span(&n.file_path, &span.text) {
+                    if let Some(summary) =
+                        summarize_definition_span(&root_path, &n.file_path, &span.text)
+                    {
                         for bullet in summary {
                             println!("  - {bullet}");
                         }
@@ -889,7 +897,8 @@ pub(crate) fn dispatch_brief_json(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .or_else(|| semantic_signature_from_span(source));
-        let summary = summarize_definition_span(&node.file_path, source).unwrap_or_default();
+        let summary =
+            summarize_definition_span(root_path, &node.file_path, source).unwrap_or_default();
         let summary_prompt_version = if summary.is_empty() {
             serde_json::Value::Null
         } else {

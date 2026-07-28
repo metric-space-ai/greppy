@@ -980,6 +980,9 @@ pub(crate) fn dispatch_semantic(
     if q.is_empty() {
         return Err(Error::Invalid("semantic-search requires a query".into()));
     }
+    // Result purposes reach the Qwen daemon; overlap its model load with the
+    // embedding query and vector search.
+    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
 
     let mut store = open_default_store_query_writer(root)?;
@@ -1203,8 +1206,6 @@ pub(crate) fn semantic_vector_purposes(
         Err(_) => return Ok(None),
     };
     #[cfg(any(unix, windows))]
-    let summary_store_dir = workspace_locator::store_dir(&root_path);
-    #[cfg(any(unix, windows))]
     let summary_runtime = if summarize {
         qwen_summary_config_optional().ok().flatten()
     } else {
@@ -1213,6 +1214,11 @@ pub(crate) fn semantic_vector_purposes(
     .map(|cfg| {
         let model_key = qwen_summary_model_key(&cfg);
         (cfg, model_key)
+    });
+    // One cache connection for every purpose span of this command.
+    #[cfg(any(unix, windows))]
+    let summary_cache = summary_runtime.as_ref().and_then(|_| {
+        greppy_store::SummaryCache::open(&workspace_locator::store_dir(&root_path)).ok()
     });
     let mut purposes = Vec::new();
     for hit in hits {
@@ -1257,14 +1263,9 @@ pub(crate) fn semantic_vector_purposes(
         {
             if let Some((cfg, model_key)) = summary_runtime.as_ref() {
                 let code = cap_semantic_purpose_span(&span.text);
-                bullets = summarize_source_cached(
-                    cfg,
-                    model_key,
-                    Some(&summary_store_dir),
-                    file_path,
-                    &code,
-                )
-                .unwrap_or_default();
+                bullets =
+                    summarize_source_cached(cfg, model_key, summary_cache.as_ref(), file_path, &code)
+                        .unwrap_or_default();
             }
         }
         purposes.push(SemanticVectorPurpose {

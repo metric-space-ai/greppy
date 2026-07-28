@@ -5381,6 +5381,12 @@ fn dispatch_trace(
 /// NAV_LIMIT because a briefing is a summary, not an exhaustive listing.
 const BRIEF_LIMIT: usize = 15;
 
+/// Folded into the summary-cache key only (not the daemon identity):
+/// bump when generation behavior changes without a prompt-version bump,
+/// so cached summaries cannot outlive the code that produced them.
+#[cfg(any(unix, windows))]
+const SUMMARY_CACHE_GENERATION: &str = "sc1";
+
 /// Summary generations are cached by (model identity, path+span content):
 /// a hit skips the daemon entirely, a miss generates and stores best-effort.
 /// Cache problems are cache misses — they can never fail the command.
@@ -5388,46 +5394,56 @@ const BRIEF_LIMIT: usize = 15;
 fn summarize_source_cached(
     cfg: &QwenSummaryConfig,
     model_key: &str,
-    store_dir: Option<&std::path::Path>,
+    cache: Option<&greppy_store::SummaryCache>,
     file_path: &str,
     source: &str,
 ) -> Option<Vec<String>> {
+    let cache_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
     let hash = greppy_store::span_hash(file_path, source);
-    let cache = store_dir.and_then(|dir| greppy_store::SummaryCache::open(dir).ok());
-    if let Some(cache) = &cache {
-        if let Ok(Some(bullets)) = cache.get(model_key, &hash) {
+    if let Some(cache) = cache {
+        if let Ok(Some(bullets)) = cache.get(&cache_key, &hash) {
             return Some(bullets);
         }
     }
     let bullets = summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, source)
         .filter(|bullets| !bullets.is_empty())?;
-    if let Some(cache) = &cache {
-        let _ = cache.put(model_key, &hash, &bullets);
+    if let Some(cache) = cache {
+        let _ = cache.put(&cache_key, &hash, &bullets);
     }
     Some(bullets)
 }
 
+/// Async nudge for the Qwen daemon, called ONLY from the dispatches that
+/// actually emit summaries (brief, the impact tree, semantic purposes).
+/// Deterministic nav commands must never hold a summary model in memory.
+#[cfg(any(unix, windows))]
+pub(crate) fn prewarm_summary_daemon() {
+    if let Ok(Some(cfg)) = qwen_summary_config_optional() {
+        summarize_daemon::prewarm_from_env(&cfg);
+    }
+}
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn prewarm_summary_daemon() {}
+
 /// `file_path` is the repo-relative path of the definition's file; the brief
 /// prompt contract feeds it to the model alongside the source span.
-fn summarize_definition_span(file_path: &str, source_span: &str) -> Option<Vec<String>> {
+/// `root_path` locates the workspace's summary cache — the command's resolved
+/// root, so `--root` invocations hit the right cache.
+fn summarize_definition_span(
+    root_path: &std::path::Path,
+    file_path: &str,
+    source_span: &str,
+) -> Option<Vec<String>> {
     #[cfg(any(unix, windows))]
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
-        let store_dir = resolve_root(None)
-            .ok()
-            .map(|root| workspace_locator::store_dir(&root));
-        summarize_source_cached(
-            &cfg,
-            &model_key,
-            store_dir.as_deref(),
-            file_path,
-            source_span,
-        )
+        let cache = greppy_store::SummaryCache::open(&workspace_locator::store_dir(root_path)).ok();
+        summarize_source_cached(&cfg, &model_key, cache.as_ref(), file_path, source_span)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (file_path, source_span);
+        let _ = (root_path, file_path, source_span);
         None
     }
 }

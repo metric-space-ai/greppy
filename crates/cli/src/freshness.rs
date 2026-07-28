@@ -579,13 +579,6 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
                 embed_daemon::prewarm_from_env(&cfg, &key);
             }
         }
-        // Same nudge for the Qwen summary daemon: brief, semantic purposes,
-        // and the impact tree all reach it, and its cold start (model load
-        // plus kernel warmup) is what the first summary of a session pays.
-        // The 300 s model TTL bounds the cost of a prewarm nobody uses.
-        if let Ok(Some(cfg)) = qwen_summary_config_optional() {
-            summarize_daemon::prewarm_from_env(&cfg);
-        }
     }
     Ok(store)
 }
