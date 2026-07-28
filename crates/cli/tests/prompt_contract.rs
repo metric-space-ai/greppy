@@ -147,11 +147,16 @@ fn footer_flags_hold_for_every_command_in_their_section() {
     // the command column like `path --from A --to B`. A footer line naming a
     // command with a colon is the scope-prefix notation coming back.
     let text = prompt();
-    for section in [navigate_section(&text), search_section(&text)] {
+    for section in [
+        navigate_section(&text),
+        search_section(&text),
+        read_section(&text),
+    ] {
         for line in section.lines().filter(|l| l.starts_with("  --")) {
             for verb in [
                 "search:", "search-symbol:", "search-pattern:", "who-calls:",
-                "callees:", "brief:", "impact:", "path:",
+                "callees:", "brief:", "impact:", "path:", "read:", "read-smart:",
+                "read-file:",
             ] {
                 assert!(
                     !line.contains(verb),
@@ -160,4 +165,62 @@ fn footer_flags_hold_for_every_command_in_their_section() {
             }
         }
     }
+}
+
+/// Everything from `READ:` up to the next section heading.
+fn read_section(text: &str) -> String {
+    // The EDIT heading carries prose on the same line ("EDIT: an edit applies
+    // completely…"), so the boundary is: column 0, and everything before the
+    // first colon is upper case.
+    fn is_heading(line: &str) -> bool {
+        line.split(':').next().is_some_and(|head| {
+            !head.is_empty()
+                && line.contains(':')
+                && head.chars().all(|c| c.is_ascii_uppercase() || c == ' ')
+        })
+    }
+    let mut lines = text.lines().skip_while(|line| *line != "READ:");
+    let heading = lines.next().expect("AGENTS.md must have a READ section");
+    let body = lines.take_while(|line| !is_heading(line));
+    std::iter::once(heading)
+        .chain(body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn read_is_bytes_and_the_lossy_view_is_its_own_verb() {
+    let text = prompt();
+    let section = read_section(&text);
+    for verb in ["read S", "read-smart S", "read-file PATH"] {
+        assert!(
+            section.contains(verb),
+            "READ must describe `{verb}`; section was:\n{section}"
+        );
+    }
+    // The bare read is unconditional. Words that would announce truncation,
+    // folding or summarizing on it belong to read-smart and read-file only.
+    let read_line_block: String = section
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("read S"))
+        .take_while(|l| !l.trim_start().starts_with("read-smart"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for word in ["fold", "paginat", "summar", "semantic"] {
+        assert!(
+            !read_line_block.contains(word),
+            "the bare read must not advertise lossy behaviour ({word}): {read_line_block}"
+        );
+    }
+    // The guess heuristic and its repair flag are dead: read takes symbols,
+    // read-file takes paths, nothing is resolved by luck.
+    assert!(
+        !text.contains("also a path on disk") && !section.contains("--symbol"),
+        "the name-vs-path guess heuristic must not come back"
+    );
+    // --context died with automatic documentation inclusion.
+    assert!(
+        !section.contains("--context"),
+        "--context's documented purpose is default behaviour now"
+    );
 }
