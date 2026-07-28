@@ -15640,6 +15640,235 @@ fn dispatch_search_symbols_multi(
     Ok(0)
 }
 
+/// One answer line of `who-calls` / `callees`: an address, the symbol, and
+/// whether it lives in a test. The path appears once, inside the address — the
+/// name never repeats it, and no kind prefix is printed, because the command
+/// has already said which relation this is.
+struct NavAnswerRow {
+    file: String,
+    /// What the agent acts on: the call site for `who-calls`, the definition
+    /// for `callees`.
+    line: u32,
+    /// What `--code` prints. Collapses to `line` when it is a single line.
+    span: (u32, u32),
+    name: String,
+    test: bool,
+}
+
+/// The symbol without the file path in front of it. A qualified name carries
+/// the file and usually a kind segment — `edit-src/data.rs::Function::data_set`
+/// — and both are noise beside an address that already names the file.
+fn nav_short_name(node: &greppy_store::Node) -> String {
+    let qualified = node.qualified_name.as_str();
+    let tail = qualified
+        .split_once("::")
+        .map(|(_, rest)| rest)
+        .unwrap_or(qualified);
+    let name = tail
+        .split_once("::")
+        .and_then(|(head, rest)| {
+            matches!(
+                head,
+                "Function"
+                    | "Method"
+                    | "Class"
+                    | "Struct"
+                    | "Enum"
+                    | "Trait"
+                    | "Interface"
+                    | "EnumVariant"
+                    | "Field"
+                    | "Variable"
+                    | "Constant"
+                    | "Module"
+            )
+            .then_some(rest)
+        })
+        .unwrap_or(tail);
+    if name.is_empty() {
+        node.name.clone()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Net `(`/`[` nesting a line leaves open. Braces are deliberately not counted:
+/// a call inside `if let Some(x) = f( … ) {` balances its parentheses on the
+/// very line that opens the block, and counting the brace would drag the whole
+/// block in. Text inside double quotes and after `//` is ignored; a lone `'`
+/// is left alone so Rust lifetimes do not read as an unterminated string.
+fn nav_bracket_delta(text: &str) -> i32 {
+    let chars: Vec<char> = text.chars().collect();
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, c) in chars.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *c == '\\' {
+                escaped = true;
+            } else if *c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '/' if chars.get(index + 1) == Some(&'/') => break,
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// The statement containing `line`, as it stands in the file. Follows the
+/// line's own bracket nesting downwards and keeps a trailing `.`/`?`
+/// continuation with it, so a call a formatter broke across ten lines arrives
+/// whole. It never reformats and never rewrites: the caller prints exactly the
+/// range returned here, so the address above the source is always true.
+fn nav_statement_span(lines: &[String], line: u32) -> (u32, u32) {
+    const MAX_LINES: usize = 60;
+    let start = (line as usize).saturating_sub(1);
+    if start >= lines.len() {
+        return (line, line);
+    }
+    let mut depth = 0;
+    let mut end = start;
+    for (offset, text) in lines[start..].iter().enumerate().take(MAX_LINES) {
+        depth += nav_bracket_delta(text);
+        end = start + offset;
+        if depth > 0 {
+            continue;
+        }
+        match lines.get(end + 1).map(|next| next.trim_start()) {
+            Some(next) if next.starts_with('.') || next.starts_with('?') => depth = 0,
+            _ => break,
+        }
+    }
+    ((start + 1) as u32, (end + 1) as u32)
+}
+
+/// Whether a node is a test. `is_test_node` decides on the path and the name,
+/// which misses the most common Rust shape by far: a `#[test]` function with an
+/// ordinary name inside an inline `mod tests`. Six of `data_set`'s seven callers
+/// are exactly that, and calling them production code overstates the blast
+/// radius of a change. So the attribute directly above the definition is
+/// consulted too — the same line a human reads to decide.
+fn nav_is_test(lines: Option<&Vec<String>>, node: &greppy_store::Node) -> bool {
+    if is_test_node(node) {
+        return true;
+    }
+    let Some(lines) = lines else {
+        return false;
+    };
+    let definition = node.start_line.max(1) as usize;
+    let first = definition.saturating_sub(4);
+    lines
+        .get(first..definition.saturating_sub(1))
+        .into_iter()
+        .flatten()
+        .map(|line| line.trim())
+        .any(|line| {
+            line.starts_with("#[test]")
+                || line.starts_with("#[tokio::test")
+                || line.starts_with("#[rstest")
+                || line.starts_with("#[test_case")
+                || line.starts_with("@Test")
+                || line.starts_with("@pytest.mark")
+        })
+}
+
+fn nav_file_lines(root: &std::path::Path, file: &str) -> Option<Vec<String>> {
+    std::fs::read_to_string(root.join(file))
+        .ok()
+        .map(|text| text.lines().map(str::to_string).collect())
+}
+
+/// Prints the answer of `who-calls` / `callees`.
+///
+/// A short result is printed whole — a count beneath lines the reader can count
+/// is packaging. Past `NAV_FULL_LIMIT` the shape leads instead: how many, and
+/// across which files. On a skewed result that distribution *is* the answer,
+/// and the rows below it are an example. Files with the fewest rows come first,
+/// so the outliers are not buried under a hub file.
+fn print_nav_rows(
+    repo_root: &std::path::Path,
+    noun: &str,
+    rows: &mut [NavAnswerRow],
+    code: bool,
+    all: bool,
+) {
+    const NAV_FULL_LIMIT: usize = 25;
+    const NAV_SUMMARY_ROWS: usize = 5;
+
+    let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
+    for row in rows.iter() {
+        *per_file.entry(row.file.clone()).or_insert(0) += 1;
+    }
+    rows.sort_by(|a, b| {
+        let left = per_file.get(&a.file).copied().unwrap_or(0);
+        let right = per_file.get(&b.file).copied().unwrap_or(0);
+        left.cmp(&right)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let total = rows.len();
+    let summarize = !all && total > NAV_FULL_LIMIT;
+    if summarize {
+        let mut spread: Vec<(&String, &usize)> = per_file.iter().collect();
+        spread.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+        let spread = spread
+            .iter()
+            .map(|(file, count)| format!("{file} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{total} {noun}: {spread}");
+        println!();
+    }
+    let shown = if summarize {
+        NAV_SUMMARY_ROWS.min(total)
+    } else {
+        total
+    };
+    let mut cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    for (index, row) in rows.iter().take(shown).enumerate() {
+        let marker = if row.test { "  test" } else { "" };
+        if !code {
+            println!("{}:{}  {}{}", row.file, row.line, row.name, marker);
+            continue;
+        }
+        if index > 0 {
+            println!();
+        }
+        let source = cache
+            .entry(row.file.clone())
+            .or_insert_with(|| nav_file_lines(repo_root, &row.file));
+        let (start, mut end) = row.span;
+        if let Some(lines) = source.as_ref() {
+            end = end.min(lines.len() as u32).max(start);
+        }
+        if start == end {
+            println!("{}:{}  {}{}", row.file, start, row.name, marker);
+        } else {
+            println!("{}:{}-{}  {}{}", row.file, start, end, row.name, marker);
+        }
+        if let Some(lines) = source.as_ref() {
+            for line in lines
+                .iter()
+                .take(end as usize)
+                .skip(start.saturating_sub(1) as usize)
+            {
+                println!("{line}");
+            }
+        }
+    }
+}
+
 fn dispatch_who_calls(
     symbol: Option<&str>,
     paths: &[String],
@@ -15731,31 +15960,15 @@ fn dispatch_who_calls(
             )?;
             return Ok(0);
         }
+        // Nobody calls it. That is an answer, and it needs no packaging and no
+        // textual consolation prize.
         if path_filters.is_empty() {
-            println!("(no callers)");
+            println!("no callers");
         } else {
-            println!("(no callers under path filter: {})", path_filters.shown());
+            println!("no callers under path filter: {}", path_filters.shown());
         }
-        print_zero_nav_footer(&store, &project, "caller", &targets, "calls")?;
-        // O6: zero RESOLVED callers on a defined symbol is exactly where
-        // dynamic dispatch hides — offer the textual candidates so the
-        // agent doesn't re-derive them with its own grep rounds.
-        print_textual_call_candidates(
-            &store,
-            &project,
-            query_symbol,
-            &targets,
-            &[],
-            &path_filters,
-        )?;
         return Ok(0);
     }
-    // `--code` reads spans from disk relative to the resolved repo root.
-    let span_root = if code {
-        Some(resolve_root(root)?)
-    } else {
-        None
-    };
     // Deterministic, de-duplicated output across the aggregated targets.
     // First collect the unique caller nodes so we know the true total, then
     // print at most NAV_LIMIT (F1: cap the token-bomb) unless `--all`.
@@ -15779,13 +15992,16 @@ fn dispatch_who_calls(
     }
     nodes.retain(|node| path_filters.matches(&node.file_path));
     if nodes.is_empty() && !path_filters.is_empty() && !json {
-        println!("(no callers under path filter: {})", path_filters.shown());
+        println!("no callers under path filter: {}", path_filters.shown());
         return Ok(0);
     }
     let total = nodes.len();
     let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let shown = total.min(cap);
-    let expand = if !all && !code {
+    // The expand pack exists only for the JSON consumer now: in text mode
+    // everything the pack could carry is one flag away, so offering it would be
+    // a second spelling of `--all` plus a handle to remember.
+    let expand = if json && !all && !code {
         let rows = nodes
             .iter()
             .map(|n| ExpandEvidenceNode {
@@ -15826,154 +16042,33 @@ fn dispatch_who_calls(
         return Ok(0);
     }
     let repo_root = resolve_root(root)?;
-    for n in &nodes[..shown] {
-        println!("{} {}", display_node_name(n), node_line_span(n));
-        if let Some(lines) = sites.get(&n.id) {
-            let mut lines = lines.clone();
-            lines.sort_unstable();
-            lines.dedup();
-            for l in lines.iter().take(3) {
-                if let Some(text) = read_source_line(&repo_root, &n.file_path, *l) {
-                    println!("  {}:{}: {}", n.file_path, l, text);
-                }
-            }
-        }
-        // Track A: with `--code`, print the caller's body so the agent
-        // sees the call site's enclosing symbol without a separate Read.
-        if let Some(root_path) = span_root.as_deref() {
-            print_code_span(root_path, n, CODE_SPAN_CAP);
-        }
+    // The caller's name answers "who"; the call site answers "where the
+    // dependency sits". Both fit one line, and nothing else belongs on it.
+    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut rows = Vec::with_capacity(nodes.len());
+    for n in &nodes {
+        let site = sorted_site_lines(sites.get(&n.id))
+            .first()
+            .copied()
+            .unwrap_or_else(|| n.start_line.max(1) as u32);
+        let lines = sources
+            .entry(n.file_path.clone())
+            .or_insert_with(|| nav_file_lines(&repo_root, &n.file_path));
+        let span = match lines.as_ref() {
+            Some(lines) if code => nav_statement_span(lines, site),
+            _ => (site, site),
+        };
+        rows.push(NavAnswerRow {
+            file: n.file_path.clone(),
+            line: site,
+            span,
+            name: nav_short_name(n),
+            test: nav_is_test(lines.as_ref(), n),
+        });
     }
-    let row_refs: Vec<&greppy_store::Node> = nodes.iter().collect();
-    let (provider_incomplete, _) =
-        nav_target_provider_incomplete(&store, &project, &row_refs, "calls")?;
-    NavFooter {
-        noun: "caller",
-        total,
-        shown,
-        provider_incomplete,
-    }
-    .print();
-    print_textual_call_candidates(
-        &store,
-        &project,
-        query_symbol,
-        &targets,
-        &nodes,
-        &path_filters,
-    )?;
-    if let Some(expand) = &expand {
-        println!("{}", expand.text_line());
-    }
+    print_nav_rows(&repo_root, "callers", &mut rows, code, all);
     Ok(0)
 }
-
-/// O6 (django forensics, r044: 26-call grep spiral): the never-guess
-/// resolver deliberately does not link dynamic `obj.method()` dispatch, so
-/// on dynamic code `who-calls` under-reports and the agent re-derives the
-/// rest with its own grep rounds. This prints ONE honestly-labelled section
-/// of TEXTUAL call-site candidates from the authoritative worktree — the graph
-/// section above stays the authority; this section only saves the agent its
-/// own text search.
-///
-/// Noise control: candidates are only shown for files that do NOT already
-/// contain a resolved caller — on statically-resolved code (java/rust) the
-/// text sites live in resolved-caller files, so the section stays silent
-/// and costs zero tokens; on dynamic code the unresolved files are exactly
-/// what is missing. Definition-looking lines are excluded.
-fn print_textual_call_candidates(
-    store: &greppy_store::Store,
-    project: &str,
-    symbol: &str,
-    target_ids: &[i64],
-    resolved: &[greppy_store::Node],
-    path_filters: &QueryPathFilters,
-) -> Result<()> {
-    const CANDIDATE_CAP: usize = 10;
-    let name = symbol
-        .rsplit(['.', ':', '#'])
-        .next()
-        .unwrap_or(symbol)
-        .trim();
-    // Too-short names text-match half the repo; not worth the noise.
-    if name.len() < 4 {
-        return Ok(());
-    }
-    let call_pat = format!("{name}(");
-    let resolved_files: std::collections::BTreeSet<&str> =
-        resolved.iter().map(|n| n.file_path.as_str()).collect();
-    let mut def_locs = std::collections::BTreeSet::new();
-    for id in target_ids {
-        if let Some(n) = store.get_node(*id)? {
-            def_locs.insert(format!("{}:{}", n.file_path, n.start_line));
-        }
-    }
-    let mut hits = match greppy_search::search_code(store, project, name, 80) {
-        Ok(h) => h,
-        Err(_) => return Ok(()), // candidates are best-effort, never an error
-    };
-    if hits.is_empty() {
-        let Some(root_path) = store
-            .get_project(project)
-            .ok()
-            .flatten()
-            .map(|project| std::path::PathBuf::from(project.root_path))
-        else {
-            return Ok(());
-        };
-        hits = live_grep_code_hits(name, &root_path)
-            .unwrap_or_default()
-            .into_iter()
-            .take(80)
-            .collect();
-    }
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for h in hits {
-        let snippet = h.snippet.trim();
-        if !snippet.contains(&call_pat) {
-            continue;
-        }
-        // Skip definition-shaped lines (`fn name(`, `def name(`, …) and the
-        // definition locations themselves.
-        let is_def = ["fn ", "def ", "function ", "class ", "async def "]
-            .iter()
-            .any(|kw| snippet.contains(&format!("{kw}{name}")));
-        if is_def || def_locs.contains(&h.location) {
-            continue;
-        }
-        let file = h.location.rsplit_once(':').map(|(f, _)| f).unwrap_or("");
-        if !path_filters.matches(file) {
-            continue;
-        }
-        if resolved_files.contains(file) {
-            continue; // already represented by a resolved caller
-        }
-        if !seen.insert(h.location.clone()) {
-            continue;
-        }
-        let mut line = snippet.to_string();
-        if line.len() > 120 {
-            line.truncate(120);
-            line.push('…');
-        }
-        out.push((h.location, line));
-    }
-    if out.is_empty() {
-        return Ok(());
-    }
-    let total = out.len();
-    let shown = total.min(CANDIDATE_CAP);
-    println!("unresolved textual candidates: {total}");
-    for (loc, snippet) in out.iter().take(shown) {
-        println!("  {loc}: {snippet}");
-    }
-    if total > shown {
-        println!("  … and {} more candidates", total - shown);
-    }
-    Ok(())
-}
-
 /// `greppy callees S` — what `S` calls: every node reached by a direct
 /// outgoing CALLS edge from `S`. Printed as `qualified_name file:line` so
 /// an agent can jump straight to each callee's definition. Backed by the
@@ -16081,23 +16176,16 @@ fn dispatch_callees(
             return Ok(0);
         }
         if path_filters.is_empty() {
-            println!("(no callees)");
+            println!("no callees");
         } else {
-            println!("(no callees under path filter: {})", path_filters.shown());
+            println!("no callees under path filter: {}", path_filters.shown());
         }
-        print_zero_nav_footer(&store, &project, "callee", &sources, "calls")?;
         return Ok(0);
     }
-    // `--code` reads spans from disk relative to the resolved repo root.
-    let span_root = if code {
-        Some(resolve_root(root)?)
-    } else {
-        None
-    };
     let total = callees.len();
     let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let shown = total.min(cap);
-    let expand = if !all && !code {
+    let expand = if json && !all && !code {
         let rows = callees
             .values()
             .map(|n| ExpandEvidenceNode {
@@ -16137,27 +16225,28 @@ fn dispatch_callees(
         )?;
         return Ok(0);
     }
-    for n in callees.values().take(shown) {
-        println!("{} {}", display_node_name(n), node_line_span(n));
-        // Track A: with `--code`, print the callee's body so the agent
-        // sees the callee definition without a separate Read.
-        if let Some(root_path) = span_root.as_deref() {
-            print_code_span(root_path, n, CODE_SPAN_CAP);
-        }
+    // Mirror image of `who-calls`: the caller is known, so the new information
+    // is where the callee lives — its definition, which is also what `--code`
+    // prints.
+    let repo_root = resolve_root(root)?;
+    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut rows = Vec::with_capacity(callees.len());
+    for n in callees.values() {
+        let lines = sources
+            .entry(n.file_path.clone())
+            .or_insert_with(|| nav_file_lines(&repo_root, &n.file_path));
+        rows.push(NavAnswerRow {
+            file: n.file_path.clone(),
+            line: n.start_line.max(1) as u32,
+            span: (
+                n.start_line.max(1) as u32,
+                n.end_line.max(n.start_line).max(1) as u32,
+            ),
+            name: nav_short_name(n),
+            test: nav_is_test(lines.as_ref(), n),
+        });
     }
-    let row_refs: Vec<&greppy_store::Node> = callees.values().collect();
-    let (provider_incomplete, _) =
-        nav_target_provider_incomplete(&store, &project, &row_refs, "calls")?;
-    NavFooter {
-        noun: "callee",
-        total,
-        shown,
-        provider_incomplete,
-    }
-    .print();
-    if let Some(expand) = &expand {
-        println!("{}", expand.text_line());
-    }
+    print_nav_rows(&repo_root, "callees", &mut rows, code, all);
     Ok(0)
 }
 

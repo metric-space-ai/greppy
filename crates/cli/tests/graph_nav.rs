@@ -270,25 +270,28 @@ fn who_calls_prints_line_span_and_expand_pack_round_trips() {
         code, 0,
         "who-calls should exit 0; stderr={err}\nstdout={out}"
     );
+    // An answer line is an address and a name, nothing else: the call site the
+    // agent acts on, and who makes the call.
     let caller_line = out
         .lines()
-        .find(|line| line.contains("caller") && line.contains("src/lib.rs:"))
+        .find(|line| line.contains("src/lib.rs:"))
         .unwrap_or_else(|| panic!("missing caller line in stdout: {out:?}"));
+    let mut fields = caller_line.split_whitespace();
+    let address = fields.next().unwrap_or_default();
     assert!(
-        caller_line.contains('-'),
-        "caller line must include start-end span, got: {caller_line:?}"
-    );
-    let id = expand_id_from_stdout(&out)
-        .unwrap_or_else(|| panic!("missing Expand line in stdout: {out:?}"));
-
-    let (code, expanded, err) = run(&["expand", &id], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "expand should exit 0; stderr={err}\nstdout={expanded}"
+        address.starts_with("src/lib.rs:") && !address.contains('-'),
+        "the address names the call site, not a span, got: {caller_line:?}"
     );
     assert!(
-        expanded.contains("helper::do_it()") && expanded.contains("source:"),
-        "expand pack must include prepared source evidence, got: {expanded:?}"
+        fields.next().is_some_and(|name| !name.contains("::")
+            && !name.contains("src/")
+            && !name.contains("Function")),
+        "the name is the bare symbol, with no path and no kind, got: {caller_line:?}"
+    );
+    // Nothing is hidden here, so nothing is counted and nothing is offered.
+    assert!(
+        !out.contains("Expand:") && !out.contains(" callers:"),
+        "a complete answer carries no count and no expand offer, got: {out:?}"
     );
 }
 
@@ -310,9 +313,9 @@ fn who_calls_reports_no_callers_for_uncalled_symbol() {
     // `Widget` is a struct — nothing CALLS it.
     let (code, out, _err) = run(&["who-calls", "Widget"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
-        "an uncalled symbol must report no callers; got: {out:?}"
+    assert_eq!(
+        out, "no callers\n",
+        "an uncalled symbol must report no callers and nothing else"
     );
 }
 
@@ -1237,41 +1240,26 @@ fn who_calls_caps_output_and_all_lifts_it() {
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
-    // Default: capped at NAV_LIMIT (40) result rows + a "more" footer.
+    // Past 25 rows the shape leads and five rows follow as an example: on a
+    // long result the distribution over files is the answer, not the roll call.
     let (code, out, err) = run(&["who-calls", "hub"], &repo, &store);
     assert_eq!(code, 0, "who-calls should exit 0; stderr={err}");
-    // Row lines start at column 0; the grep-shaped call-site evidence
-    // lines (P4) are indented and do not count against the row cap.
     let caller_lines = out
         .lines()
         .filter(|l| l.contains("caller_") && !l.starts_with(' '))
         .count();
     assert_eq!(
-        caller_lines, 40,
-        "default who-calls must cap at 40 caller rows; got {caller_lines}\n{out}"
+        caller_lines, 5,
+        "a long result shows five rows below the shape line; got {caller_lines}\n{out}"
+    );
+    let shape = out.lines().next().unwrap_or_default();
+    assert!(
+        shape.starts_with("60 callers: ") && shape.contains(".rs "),
+        "the first line states how many and across which files; got: {shape:?}"
     );
     assert!(
-        out.contains("40 shown of 60 total"),
-        "capped output must carry the 'N more' footer; got: {out}"
-    );
-
-    // `--code` uses the much tighter CODE_NAV_LIMIT (6): each row carries a
-    // ~25-line body, so the default 40 would be a ~1000-line token bomb.
-    let (code, out, err) = run(&["who-calls", "hub", "--code"], &repo, &store);
-    assert_eq!(code, 0, "who-calls --code should exit 0; stderr={err}");
-    // With --code each row is a header line + a body line, both mention the
-    // caller name; count only the `qualified_name file:line` header rows.
-    let header_rows = out
-        .lines()
-        .filter(|l| l.contains("::Function::caller_"))
-        .count();
-    assert_eq!(
-        header_rows, 6,
-        "who-calls --code must cap at 6 rows (bodies are large); got {header_rows}\n{out}"
-    );
-    assert!(
-        out.contains("6 shown of 60 total"),
-        "--code capped output must still carry the footer; got: {out}"
+        !out.contains("shown of") && !out.contains("--all"),
+        "the count says something is missing; the output never argues for a flag: {out}"
     );
 
     // `--all` lifts the cap: all 60 callers, no footer.
