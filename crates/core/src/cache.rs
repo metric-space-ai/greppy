@@ -17,6 +17,7 @@ pub const DEFAULT_STORE_TTL_DAYS: u64 = 14;
 pub const DEFAULT_STORE_MAX_GIB: u64 = 10;
 pub const DEFAULT_GC_INTERVAL_SECS: u64 = 10 * 60;
 pub const DEFAULT_QUERY_CACHE_MAX_MIB: u64 = 64;
+pub const DEFAULT_SUMMARY_CACHE_MAX_MIB: u64 = 32;
 pub const ORPHAN_GRACE_SECS: u64 = 24 * 60 * 60;
 
 const STORE_MANIFEST_MAGIC: &str = "greppy-workspace-store";

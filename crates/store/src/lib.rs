@@ -48,6 +48,7 @@ pub mod query_cache;
 pub mod raw_edge;
 pub mod schema;
 pub mod stats;
+pub mod summary_cache;
 pub mod store;
 pub mod store_error;
 pub mod vector_embedding;
@@ -67,6 +68,7 @@ pub use provider_state::ProviderState;
 pub use query_cache::{normalize_query_text, QueryEmbeddingCache, QUERY_CACHE_DB_FILE};
 pub use raw_edge::{NewRawEdge, RawEdge};
 pub use stats::{EdgeTypeCount, GraphStats, LabelCount};
+pub use summary_cache::{span_hash, SummaryCache, SUMMARY_CACHE_DB_FILE};
 pub use store::{OpenOptions, Store};
 pub use store_error::{Error, Result};
 pub use vector_embedding::{

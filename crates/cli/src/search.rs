@@ -1203,6 +1203,8 @@ pub(crate) fn semantic_vector_purposes(
         Err(_) => return Ok(None),
     };
     #[cfg(any(unix, windows))]
+    let summary_store_dir = workspace_locator::store_dir(&root_path);
+    #[cfg(any(unix, windows))]
     let summary_runtime = if summarize {
         qwen_summary_config_optional().ok().flatten()
     } else {
@@ -1255,9 +1257,14 @@ pub(crate) fn semantic_vector_purposes(
         {
             if let Some((cfg, model_key)) = summary_runtime.as_ref() {
                 let code = cap_semantic_purpose_span(&span.text);
-                bullets =
-                    summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, &code)
-                        .unwrap_or_default();
+                bullets = summarize_source_cached(
+                    cfg,
+                    model_key,
+                    Some(&summary_store_dir),
+                    file_path,
+                    &code,
+                )
+                .unwrap_or_default();
             }
         }
         purposes.push(SemanticVectorPurpose {

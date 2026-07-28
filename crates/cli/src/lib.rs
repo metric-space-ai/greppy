@@ -5381,6 +5381,32 @@ fn dispatch_trace(
 /// NAV_LIMIT because a briefing is a summary, not an exhaustive listing.
 const BRIEF_LIMIT: usize = 15;
 
+/// Summary generations are cached by (model identity, path+span content):
+/// a hit skips the daemon entirely, a miss generates and stores best-effort.
+/// Cache problems are cache misses — they can never fail the command.
+#[cfg(any(unix, windows))]
+fn summarize_source_cached(
+    cfg: &QwenSummaryConfig,
+    model_key: &str,
+    store_dir: Option<&std::path::Path>,
+    file_path: &str,
+    source: &str,
+) -> Option<Vec<String>> {
+    let hash = greppy_store::span_hash(file_path, source);
+    let cache = store_dir.and_then(|dir| greppy_store::SummaryCache::open(dir).ok());
+    if let Some(cache) = &cache {
+        if let Ok(Some(bullets)) = cache.get(model_key, &hash) {
+            return Some(bullets);
+        }
+    }
+    let bullets = summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, source)
+        .filter(|bullets| !bullets.is_empty())?;
+    if let Some(cache) = &cache {
+        let _ = cache.put(model_key, &hash, &bullets);
+    }
+    Some(bullets)
+}
+
 /// `file_path` is the repo-relative path of the definition's file; the brief
 /// prompt contract feeds it to the model alongside the source span.
 fn summarize_definition_span(file_path: &str, source_span: &str) -> Option<Vec<String>> {
@@ -5388,8 +5414,16 @@ fn summarize_definition_span(file_path: &str, source_span: &str) -> Option<Vec<S
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
-        summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, file_path, source_span)
-            .filter(|bullets| !bullets.is_empty())
+        let store_dir = resolve_root(None)
+            .ok()
+            .map(|root| workspace_locator::store_dir(&root));
+        summarize_source_cached(
+            &cfg,
+            &model_key,
+            store_dir.as_deref(),
+            file_path,
+            source_span,
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {

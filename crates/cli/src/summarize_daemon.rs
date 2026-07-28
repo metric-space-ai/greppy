@@ -51,6 +51,24 @@ pub(super) fn status(model_key: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({"state": "unsupported"}))
 }
 
+/// Session prewarm: nudge the daemon into an async model load so the first
+/// summary of a session does not pay the cold start. Mirrors
+/// `embed_daemon::prewarm_from_env`; a live daemon is left untouched.
+pub(super) fn prewarm_from_env(cfg: &super::QwenSummaryConfig) {
+    let model_key = super::qwen_summary_model_key(cfg);
+    let Some(endpoint) = endpoint(&model_key) else {
+        return;
+    };
+    let ping = serde_json::json!({"op": "ping"});
+    if matches!(
+        inference_daemon::request(&endpoint, ping, Duration::from_secs(1), 4096, 4096),
+        RequestOutcome::Response(_)
+    ) {
+        return;
+    }
+    let _ = inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, true));
+}
+
 /// `path` is the repo-relative file path of the source span; it is part of
 /// the trained prompt contract and a mandatory protocol field.
 pub(super) fn summarize_source_via_daemon(
