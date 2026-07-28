@@ -117,7 +117,7 @@ eval anchor  the breakage farm: clone top repos, injure them deliberately
 
 No license screening (owner decision: technical tool output and LLM chat
 content carry no copyright in the EU). Secrets scrubbing applies ONLY where
-training is generative: a classifier head outputs seven numbers and cannot
+training is generative: a classifier head outputs six numbers and cannot
 reproduce anything, so head training needs no scrub — but a next-token
 fine-tune on walls feeds the SAME model that writes hint sentences, and only
 there could a memorized key ever resurface. If surprisal works without a
@@ -132,7 +132,7 @@ Sol     one extractor per harness schema (Claude Code, Codex, Hermes, Pi) —
 script  mass extraction on gpu3: wall + following agent turn — zero tokens
 script  behaviour labels for free: wall lines that reappear in the agent's
         next turn were acted upon
-M3      7-class + continuation line labels, wall-by-wall, with the agent's
+M3      6-class + continuation line labels, wall-by-wall, with the agent's
         continuation as context; "unclear" is a permitted answer
 Kimi    5% double-label sample; disagreement adjudicated or dropped; an
         agreement rate under ~95% means a class definition is mushy and gets
