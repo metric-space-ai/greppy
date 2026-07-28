@@ -1,0 +1,174 @@
+<title>greppy 0.3.0 — Nav-Umbau</title>
+<style>
+  :root {
+    --paper: #f3f4f6; --card: #ffffff; --ink: #16181c; --ink-2: #3c4148;
+    --muted: #6b727d; --rule: #dcdfe4; --accent: #a8503a; --done: #3f7059;
+    --work: #9a7420; --open: #6b727d;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --paper:#0f1114; --card:#17191e; --ink:#e8eaed; --ink-2:#b9bec6;
+      --muted:#858c97; --rule:#2a2e35; --accent:#d4735a; --done:#6aa98a;
+      --work:#c79c3c; --open:#858c97; }
+  }
+  :root[data-theme="dark"] { --paper:#0f1114; --card:#17191e; --ink:#e8eaed; --ink-2:#b9bec6;
+    --muted:#858c97; --rule:#2a2e35; --accent:#d4735a; --done:#6aa98a; --work:#c79c3c; --open:#858c97; }
+  :root[data-theme="light"] { --paper:#f3f4f6; --card:#ffffff; --ink:#16181c; --ink-2:#3c4148;
+    --muted:#6b727d; --rule:#dcdfe4; --accent:#a8503a; --done:#3f7059; --work:#9a7420; --open:#6b727d; }
+
+  body { background: var(--paper); color: var(--ink); font-family: var(--sans);
+         line-height: 1.55; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 62rem; margin: 0 auto; padding: 3rem 1.5rem 5rem;
+          display: flex; flex-direction: column; gap: 2.5rem; }
+  header { display: flex; flex-direction: column; gap: .9rem; }
+  .eyebrow { font-family: var(--mono); font-size: .72rem; letter-spacing: .14em;
+             text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: var(--mono); font-size: clamp(1.5rem, 3.6vw, 2.1rem);
+       font-weight: 600; letter-spacing: -.02em; text-wrap: balance; margin: 0; }
+  .lede { color: var(--ink-2); max-width: 62ch; }
+
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+             gap: 1px; background: var(--rule); border: 1px solid var(--rule);
+             border-radius: 3px; overflow: hidden; }
+  .metric { background: var(--card); padding: .95rem 1.1rem; }
+  .metric dt { font-family: var(--mono); font-size: .68rem; letter-spacing: .1em;
+               text-transform: uppercase; color: var(--muted); }
+  .metric dd { margin: .3rem 0 0; font-family: var(--mono); font-size: 1.35rem;
+               font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .metric dd small { font-size: .78rem; color: var(--muted); letter-spacing: 0; }
+
+  h2 { font-family: var(--mono); font-size: .78rem; letter-spacing: .14em;
+       text-transform: uppercase; color: var(--muted); font-weight: 600;
+       margin: 0 0 .9rem; padding-bottom: .5rem; border-bottom: 1px solid var(--rule); }
+
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; background: var(--card); }
+  th, td { text-align: left; padding: .6rem .9rem; border-bottom: 1px solid var(--rule);
+           vertical-align: top; }
+  th { font-family: var(--mono); font-size: .68rem; letter-spacing: .1em;
+       text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td code { font-family: var(--mono); font-size: .86rem; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  .state { font-family: var(--mono); font-size: .68rem; letter-spacing: .08em;
+           text-transform: uppercase; padding: .16rem .45rem; border-radius: 2px;
+           border: 1px solid currentColor; white-space: nowrap; }
+  .s-done { color: var(--done); } .s-work { color: var(--work); } .s-open { color: var(--open); }
+
+  .findings { display: flex; flex-direction: column; gap: .9rem; }
+  .finding { background: var(--card); border: 1px solid var(--rule);
+             border-left: 3px solid var(--accent); border-radius: 3px; padding: .85rem 1.1rem; }
+  .finding h3 { margin: 0 0 .3rem; font-size: .95rem; font-weight: 600; }
+  .finding p { margin: 0; color: var(--ink-2); font-size: .92rem; max-width: 70ch; }
+  .finding code, td code { font-family: var(--mono); font-size: .85rem; }
+
+  .log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .55rem; }
+  .log li { display: grid; grid-template-columns: 5.5rem 1fr; gap: 1rem; align-items: baseline; }
+  .log time { font-family: var(--mono); font-size: .78rem; color: var(--muted);
+              font-variant-numeric: tabular-nums; }
+  .log span { color: var(--ink-2); font-size: .93rem; }
+  footer { color: var(--muted); font-size: .82rem; font-family: var(--mono); }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">greppy 0.3.0 · CLI-Umbau</div>
+    <h1>Jede Zeile eine Antwort, keine Verpackung</h1>
+    <p class="lede">Alle Arme werden auf eine Grammatik gebracht: nacktes Verb für den
+      Normalfall, benannte Spezialisten mit dem Trade-off im Namen, Fußflags nur wenn sie
+      für jede Zeile der Sektion gelten. Acht Wächter-Tests halten den System-Prompt.</p>
+  </header>
+
+  <dl class="metrics">
+    <div class="metric"><dt>0.2.1 gemessen</dt><dd>0,46×<small> Baseline</small></dd></div>
+    <div class="metric"><dt>0.3.0 Ziel</dt><dd>&lt;0,30×<small> Baseline</small></dd></div>
+    <div class="metric"><dt>lib.rs</dt><dd>26k→10k<small> Zeilen</small></dd></div>
+    <div class="metric"><dt>Prompt-Wächter</dt><dd>8<small> Tests grün</small></dd></div>
+  </dl>
+
+  <section>
+    <h2>Arme — Design und Umsetzung</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Arm</th><th>Design</th><th>Umsetzung</th><th>Offen</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>NAVIGATE</code><br>who-calls · callees · brief · impact · path</td>
+            <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
+            <td>who-calls ✓ · callees ✓ · impact ✓ (committet) · find-usages entfernt ✓ ·
+                path implementiert, <em>unverifiziert im Baum</em> · brief nur Spec</td>
+            <td>path-Abnahme, brief-Bau, Mehrfachsymbole</td>
+          </tr>
+          <tr>
+            <td><code>SEARCH</code><br>search · search-symbol · search-pattern</td>
+            <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
+            <td>Worker-Stand im Baum (Clap + 795 Zeilen search.rs, compiliert),
+                <em>unverifiziert, uncommittet</em> — Binary-Build für Abnahme läuft</td>
+            <td>Abnahmefälle, Kaskade prüfen, No-op-<code>--all</code> an path raus, Commit</td>
+          </tr>
+          <tr>
+            <td><code>READ</code><br>read · read-smart · read-file</td>
+            <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
+            <td><span class="state s-open">nicht begonnen</span> — Auftrag liegt bereit,
+                startet nach dem search/path-Commit (Dateiüberschneidung)</td>
+            <td>kompletter Bau: --head/--tail, Tiefenfaltung, Seiten, Format-C-Handle</td>
+          </tr>
+          <tr>
+            <td><code>ORIENT</code><br>map · outline · changes · verify</td>
+            <td><span class="state s-work">in Klärung</span> — Daseinsberechtigung je Tool
+                geklärt, Empfehlung: impact verliert --since/--base an changes</td>
+            <td><span class="state s-open">alt</span> — IST aufgenommen</td>
+            <td>Flag-Umzug entscheiden, dann Ausgabeformate</td>
+          </tr>
+          <tr>
+            <td><code>EDIT</code></td>
+            <td><span class="state s-work">Stufe A + v8 eingefroren</span></td>
+            <td>Quittungen/Refusals gebaut (Stufe A) · Grammatik komplett</td>
+            <td>Abgleich gegen alle neuen Regeln, Escape-Asymmetrie, Stufe B/C</td>
+          </tr>
+          <tr>
+            <td><code>expand</code> · CHAIN · ON&nbsp;EVERY&nbsp;COMMAND</td>
+            <td><span class="state s-open">offen</span></td>
+            <td>expand trägt read-smart/read-file/path/brief, ohne eigenen Vertrag</td>
+            <td>Pack-Ausgabe, Drift-Verweigerung, Id-Format; Pipe-Beispiele unter Wächter</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Befunde unterhalb der Ausgaben</h2>
+    <div class="findings">
+      <div class="finding"><h3>13 % der Aufrufkanten sind geraten</h3>
+        <p>314 von 2401 <code>CALLS</code>-Kanten zeigen auf mehrdeutige Namen; alle 11
+        Selbstkanten sind Fehlauflösungen. Trifft who-calls, callees, impact, path.</p></div>
+      <div class="finding"><h3>Gruppen-Importe halb extrahiert</h3>
+        <p><code>use crate::txn::{PlannedOp, Snapshot}</code> → Kante nur für den ersten Namen.</p></div>
+      <div class="finding"><h3>Worker-Briefe schickten alle Worker in den Hauptcheckout</h3>
+        <p>„Work in ~/greppy-030" statt „your current directory" — Ursache der Tages-Verluste;
+        alle Briefe korrigiert, als Memory gesichert.</p></div>
+      <div class="finding"><h3>GPU war Build-Opt-in</h3>
+        <p><code>default = []</code> erzeugte CPU-Binaries (7,5 s statt 0,3 s je Satz).
+        Jetzt Plattform-Default + <code>compile_error!</code>-Wächter, Ausweg <code>cpu-only</code>.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Entscheidungen</h2>
+    <ul class="log">
+      <li><time>28.07.</time><span>Fußflags gelten für jede Zeile ihrer Sektion; Kommando-Optionen stehen beim Kommando. Als Wächter-Test.</span></li>
+      <li><time>28.07.</time><span>Suchfamilie: <code>search</code> (Bedeutung, Default) · <code>search-symbol</code> · <code>search-pattern</code>; greps Exit-Codes; kein <code>--grep</code>.</span></li>
+      <li><time>28.07.</time><span>READ: <code>read</code> ist bytes und bedingungslos; <code>read-smart</code> faltet strukturell unter <code>--depth</code> (Default 1); <code>read-file</code> paginiert bei 400. <code>--context</code>, Rate-Heuristik, exit 10 tot.</span></li>
+      <li><time>28.07.</time><span>Expand nur als Differenzlieferung oder wo kein Flag hinreicht; Angebote nennen das vollständige Kommando und den Umfang.</span></li>
+      <li><time>28.07.</time><span><code>dev/</code>-Spezifikationen und Aufnahmen sind versioniert — waren gitignoriert und nur auf Platte.</span></li>
+      <li><time>28.07.</time><span>dev-0.3.0 wird nach jedem gelandeten Schritt per fast-forward nachgezogen.</span></li>
+    </ul>
+  </section>
+
+  <footer>Stand 28.07.2026 abends · Zweig recovery/cli-umbau, gepusht · Zahlen aus dev/captures/</footer>
+
+</div>
