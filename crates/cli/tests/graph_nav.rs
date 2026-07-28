@@ -1,5 +1,5 @@
 //! Integration tests for the Track-A graph-navigation commands:
-//! `who-calls`, `find-usages`, and the extended `trace` (incoming
+//! `who-calls` and the extended `trace` (incoming
 //! direction + edge filter + depth).
 //!
 //! These spawn the real `greppy` binary against a multi-file fixture
@@ -168,13 +168,6 @@ fn run_with_env(
     )
 }
 
-fn expand_id_from_stdout(out: &str) -> Option<String> {
-    out.lines()
-        .find(|line| line.starts_with("Expand: greppy expand "))
-        .and_then(|line| line.split_whitespace().nth(3))
-        .map(str::to_string)
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -308,75 +301,21 @@ fn expand_missing_id_reports_clear_message() {
 }
 
 #[test]
-fn who_calls_names_the_kind_of_an_uncallable_symbol() {
-    let (repo, store) = index_fixture("whocalls-none");
-    // `Widget` is a struct. "no callers" would be literally true and would
-    // read as "unused", so the answer names what it actually is instead.
-    let (code, out, _err) = run(&["who-calls", "Widget"], &repo, &store);
-    assert_eq!(code, 1, "a question that does not apply is not an answer");
-    assert!(
-        out.starts_with("`Widget` is a struct, not a function  "),
-        "the refusal names the kind and where it is; got: {out:?}"
-    );
-    assert!(
-        !out.contains("no callers"),
-        "a struct must not be reported as uncalled; got: {out:?}"
-    );
-}
+fn who_calls_lists_usage_references_into_a_struct() {
+    let (repo, store) = index_fixture("whocalls-struct-usage");
 
-// ---------------------------------------------------------------------------
-// find-usages — incoming USES + TYPE_REF edges, with the edge kind shown.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn find_usages_lists_type_ref_into_struct() {
-    let (repo, store) = index_fixture("usages-typeref");
-
-    // `Widget`'s type is used by `render`'s parameter (TYPE_REF).
-    let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
+    let (code, out, err) = run(&["who-calls", "Widget"], &repo, &store);
     assert_eq!(
         code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
+        "who-calls on a referenced struct should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
-        // Type references are persisted under the unified C-reference USAGE
-        // label (formerly the separate TYPE_REF pass).
-        out.contains("USAGE"),
-        "find-usages Widget must label the edge kind USAGE; got: {out:?}"
+        out.contains("src/lib.rs:") && out.contains("render"),
+        "who-calls Widget must print its USAGE referrer in the normal row format; got: {out:?}"
     );
     assert!(
-        out.contains("render"),
-        "find-usages Widget must list `render` as the referrer; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:"),
-        "find-usages must print the referrer's file:line; got: {out:?}"
-    );
-}
-
-#[test]
-fn find_usages_lists_uses_into_struct() {
-    let (repo, store) = index_fixture("usages-uses");
-
-    // `Marker` is referenced (USES) from `build`/`make` in lib.rs.
-    let (code, out, err) = run(&["find-usages", "Marker"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        // Value references are persisted under the unified C-reference USAGE
-        // label (formerly the separate USES pass).
-        out.contains("USAGE"),
-        "find-usages Marker must show a USAGE reference edge; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:"),
-        "find-usages must print the referrer's file:line; got: {out:?}"
-    );
-    assert!(
-        !out.contains("(no usages)"),
-        "Marker is referenced cross-file, so usages must be non-empty; got: {out:?}"
+        !out.contains("not a function") && !out.contains("no callers"),
+        "a referenced struct must produce rows, not a refusal or empty answer; got: {out:?}"
     );
 }
 
@@ -416,7 +355,7 @@ fn direct_navigation_json_reports_exact_counts() {
     let cases = [
         ("who-calls", "do_it", "caller", None),
         ("callees", "caller", "do_it", None),
-        ("find-usages", "Widget", "render", Some("USAGE")),
+        ("who-calls", "Widget", "render", None),
         ("references", "do_it", "caller", Some("CALLS")),
     ];
 
@@ -1045,11 +984,6 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
             "steps",
         ),
         (vec!["who-calls", "do_it", "--json"], "who-calls", "hits"),
-        (
-            vec!["find-usages", "Widget", "--json"],
-            "find-usages",
-            "hits",
-        ),
         (vec!["references", "Widget", "--json"], "references", "hits"),
         (
             vec!["graph-locate", "src/lib.rs:6", "--json"],
@@ -1188,7 +1122,6 @@ fn navigation_commands_report_missing_symbol() {
 
     for cmd in [
         vec!["who-calls", "does_not_exist_xyz"],
-        vec!["find-usages", "does_not_exist_xyz"],
         vec!["references", "does_not_exist_xyz"],
         vec!["trace", "--symbol", "does_not_exist_xyz"],
     ] {
@@ -1647,22 +1580,6 @@ fn class_navigation_is_first_class_for_callees_brief_imports_and_search_symbols(
     assert!(
         !out.contains("__file__"),
         "brief must not leak synthetic file qnames; got: {out}"
-    );
-
-    let (code, out, err) = run(&["find-usages", "RunnerFilter"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages RunnerFilter should exit 0; stderr={err}"
-    );
-    assert!(
-        out.contains("CALLS")
-            && out.contains("build_filter")
-            && out.contains("IMPORTS Module checkov/cloudformation/runner.py"),
-        "find-usages on a class must include constructor calls and import dependents; got: {out}"
-    );
-    assert!(
-        !out.contains("__file__"),
-        "find-usages must not leak synthetic file qnames; got: {out}"
     );
 
     let (code, out, err) = run(&["impact", "RunnerFilter"], &repo, &store);

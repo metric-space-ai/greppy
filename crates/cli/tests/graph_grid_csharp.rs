@@ -240,34 +240,6 @@ fn graph_grid_csharp_callees_lists_cross_file_target() {
 }
 
 #[test]
-fn graph_grid_csharp_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("usages-call-import");
-    // The alias import targets the HelperTools class, while `new HelperTools()`
-    // targets its constructor Method. Name aggregation must expose both kinds.
-    let (code, out, err) = run(&["find-usages", "HelperTools"], &repo, &store);
-    assert_eq!(code, 0, "find-usages failed; stderr={err}\nstdout={out}");
-    assert!(
-        out.contains("CALLS") && out.contains("caller"),
-        "find-usages HelperTools must include the constructor call; got: {out:?}"
-    );
-    assert!(
-        out.contains("IMPORTS") && out.contains("src/Main.cs"),
-        "find-usages HelperTools must include Main.cs's alias import; got: {out:?}"
-    );
-}
-
-#[test]
-fn graph_grid_csharp_find_usages_type_reference() {
-    let (repo, store) = index_fixture("usages-type-ref");
-    let (code, out, err) = run(&["find-usages", "Payload"], &repo, &store);
-    assert_eq!(code, 0, "find-usages failed; stderr={err}\nstdout={out}");
-    assert!(
-        out.contains("USAGE") && out.contains("caller"),
-        "Payload's cross-file return type in caller must resolve as a type-reference USAGE; got: {out:?}"
-    );
-}
-
-#[test]
 fn graph_grid_csharp_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
     let (code, value, err) = run_json(
@@ -377,11 +349,6 @@ fn graph_grid_csharp_graph_survives_reindex() {
         "stats before reindex failed; stderr={stats_err}"
     );
     let calls_before = nav_hit_signature(&["callees", "caller", "--json"], &repo, &store);
-    let refs_before = nav_hit_signature(
-        &["find-usages", "HelperTools", "--json"],
-        &repo,
-        &store,
-    );
 
     // Required second index run over unchanged source. Incremental reporting is
     // allowed to say zero files changed; the graph itself must remain intact.
@@ -393,11 +360,6 @@ fn graph_grid_csharp_graph_survives_reindex() {
         "stats after reindex failed; stderr={stats_err}"
     );
     let calls_after = nav_hit_signature(&["callees", "caller", "--json"], &repo, &store);
-    let refs_after = nav_hit_signature(
-        &["find-usages", "HelperTools", "--json"],
-        &repo,
-        &store,
-    );
 
     assert_eq!(
         stats_before, stats_after,
@@ -407,13 +369,9 @@ fn graph_grid_csharp_graph_survives_reindex() {
         calls_before, calls_after,
         "second C# index must preserve CALLS endpoints"
     );
-    assert_eq!(
-        refs_before, refs_after,
-        "second C# index must preserve CALLS/IMPORTS reference endpoints"
-    );
     assert!(
-        !calls_after.is_empty() && refs_after.len() >= 2,
-        "reindex comparison must cover real CALLS and IMPORTS edges"
+        !calls_after.is_empty(),
+        "reindex comparison must cover real CALLS edges"
     );
 }
 
@@ -501,14 +459,14 @@ fn graph_grid_csharp_declarative_or_edge_case() {
     let (repo, store) = index_fixture("enum-constant-usage");
     // C#-specific edge case: an enum member is a named constant declaration,
     // and a qualified `HelperCode.Seed` read in another file is a value usage.
-    let (code, out, err) = run(&["find-usages", "Seed"], &repo, &store);
-    assert_eq!(code, 0, "find-usages Seed failed; stderr={err}\nstdout={out}");
+    let (code, out, err) = run(&["who-calls", "Seed"], &repo, &store);
+    assert_eq!(code, 0, "who-calls Seed failed; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("USAGE") && out.contains("caller") && out.contains("src/Main.cs:"),
+        out.contains("caller") && out.contains("src/Main.cs:"),
         "qualified cross-file use of C# enum constant Seed must resolve to caller; got: {out:?}"
     );
     assert!(
-        !out.contains("(no usages)"),
-        "HelperCode.Seed is read cross-file and must not look unused; got: {out:?}"
+        !out.contains("not a function") && !out.contains("no callers"),
+        "HelperCode.Seed is read cross-file and must produce an incoming row; got: {out:?}"
     );
 }

@@ -170,33 +170,6 @@ fn hit_names(value: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn has_reference(value: &Value, edge_type: &str, name: &str) -> bool {
-    hits(value).iter().any(|hit| {
-        hit["edge_type"] == edge_type
-            && (hit["name"] == name
-                || hit["qualified_name"]
-                    .as_str()
-                    .is_some_and(|qname| qname.contains(name)))
-    })
-}
-
-fn reference_signatures(value: &Value) -> Vec<String> {
-    let mut signatures = hits(value)
-        .iter()
-        .map(|hit| {
-            format!(
-                "{}|{}|{}|{}",
-                hit["edge_type"].as_str().unwrap_or(""),
-                hit["name"].as_str().unwrap_or(""),
-                hit["qualified_name"].as_str().unwrap_or(""),
-                hit["file_path"].as_str().unwrap_or("")
-            )
-        })
-        .collect::<Vec<_>>();
-    signatures.sort();
-    signatures
-}
-
 #[test]
 fn graph_grid_swift_who_calls_finds_cross_file_caller() {
     let (repo, store) = index_fixture("who-calls");
@@ -254,65 +227,6 @@ fn graph_grid_swift_callees_lists_cross_file_target() {
                 && hit["file_path"] == "src/Helpers.swift"
         }),
         "Swift caller must have the cross-file helperFunction callee; graph={value}"
-    );
-}
-
-#[test]
-fn graph_grid_swift_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("usages-call-import");
-    let (code, helper_refs, out, err) = run_json(
-        &["find-usages", "helperFunction", "--json"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "find-usages helperFunction must succeed; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        has_reference(&helper_refs, "CALLS", "caller"),
-        "helperFunction usages must include caller's CALLS edge; graph={helper_refs}"
-    );
-    assert!(
-        hits(&helper_refs).iter().any(|hit| {
-            hit["edge_type"] == "IMPORTS" && hit["file_path"] == "src/Main.swift"
-        }),
-        "helperFunction usages must include Main.swift's Swift import; graph={helper_refs}"
-    );
-
-    let (code, constant_refs, out, err) = run_json(
-        &["find-usages", "sharedConstant", "--json"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "find-usages sharedConstant must succeed; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        has_reference(&constant_refs, "USAGE", "caller"),
-        "the cross-file USES relation for sharedConstant must surface as USAGE from caller; graph={constant_refs}"
-    );
-}
-
-#[test]
-fn graph_grid_swift_find_usages_type_reference() {
-    let (repo, store) = index_fixture("usages-type-ref");
-    let (code, value, out, err) =
-        run_json(&["find-usages", "Payload", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages Payload must succeed; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        has_reference(&value, "USAGE", "caller"),
-        "caller's cross-file Payload type reference must surface as USAGE; graph={value}"
-    );
-    assert!(
-        hits(&value).iter().any(|hit| {
-            hit["edge_type"] == "IMPORTS" && hit["file_path"] == "src/Main.swift"
-        }),
-        "Payload usages must retain the independent Swift import relation; graph={value}"
     );
 }
 
@@ -414,63 +328,6 @@ fn graph_grid_swift_path_connects_caller_to_helper() {
         names,
         vec!["caller", "helperFunction"],
         "Swift path must cross Main.swift -> Helpers.swift; graph={value}"
-    );
-}
-
-#[test]
-fn graph_grid_swift_graph_survives_reindex() {
-    let (repo, store) = index_fixture("reindex");
-
-    let (code, helper_before, out, err) = run_json(
-        &["find-usages", "helperFunction", "--json"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "pre-reindex helper query failed; stderr={err}\nstdout={out}"
-    );
-    let (code, payload_before, out, err) =
-        run_json(&["find-usages", "Payload", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "pre-reindex type query failed; stderr={err}\nstdout={out}"
-    );
-    let before = (
-        reference_signatures(&helper_before),
-        reference_signatures(&payload_before),
-    );
-    assert!(
-        before.0.iter().any(|edge| edge.starts_with("CALLS|"))
-            && before.0.iter().any(|edge| edge.starts_with("IMPORTS|"))
-            && before.1.iter().any(|edge| edge.starts_with("USAGE|")),
-        "precondition: initial Swift graph must contain call, import, and type-reference evidence; graph={before:?}"
-    );
-
-    assert_index_succeeds(&repo, &store);
-
-    let (code, helper_after, out, err) = run_json(
-        &["find-usages", "helperFunction", "--json"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "post-reindex helper query failed; stderr={err}\nstdout={out}"
-    );
-    let (code, payload_after, out, err) =
-        run_json(&["find-usages", "Payload", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "post-reindex type query failed; stderr={err}\nstdout={out}"
-    );
-    let after = (
-        reference_signatures(&helper_after),
-        reference_signatures(&payload_after),
-    );
-    assert_eq!(
-        after, before,
-        "a no-op second Swift index run must preserve the query-visible edge set"
     );
 }
 

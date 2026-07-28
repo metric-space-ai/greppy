@@ -233,80 +233,6 @@ fn graph_grid_lua_callees_lists_cross_file_target() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4 — find-usages: covers CALLS edge (dotted-target lookup is the expected gap).
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_lua_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("usages-call-import");
-
-    // (a) Both the provider-preserved full name and its naked leaf resolve to
-    // the same dotted Function node and therefore the same CALLS edge.
-    for symbol in ["do_it", "helper.do_it"] {
-        let (code, calls, err) = run(&["find-usages", symbol], &repo, &store);
-        assert_eq!(
-            code, 0,
-            "find-usages {symbol} should exit 0; stderr={err}\nstdout={calls}"
-        );
-        assert!(
-            calls.contains("CALLS") && calls.contains("caller"),
-            "find-usages {symbol} must show CALLS edge from caller; got: {calls:?}"
-        );
-    }
-
-    // (b) `find-usages helper` — the IMPORTS target name. The IMPORTS edge
-    // lives on `helper` (an importable Function in helper.lua).
-    let (code, imports, err) = run(&["find-usages", "helper"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages helper should exit 0; stderr={err}\nstdout={imports}"
-    );
-    assert!(
-        imports.contains("IMPORTS") && imports.contains("src/main.lua"),
-        "find-usages helper must show IMPORTS edge from src/main.lua; got: {imports:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 5 — find-usages: cross-file USAGE on a type-like Variable.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_lua_find_usages_type_reference() {
-    let (repo, store) = index_fixture("usages-type");
-
-    // `Widget` is the receiver of `local widget = Widget` in `render`.
-    // The Lua extractor emits a USAGE edge (C-reference parity for both
-    // type-refs and uses) with ref_name "Widget"; the indexer's name
-    // resolver must land it on `types.lua::Variable::Widget`.
-    let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("USAGE"),
-        "find-usages Widget must label the edge kind USAGE; got: {out:?}"
-    );
-    assert!(
-        out.contains("render"),
-        "find-usages Widget must list `render` as the type-like referrer; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/main.lua:"),
-        "find-usages must print the referrer's file:line; got: {out:?}"
-    );
-    assert!(
-        !out.contains("(no usages)"),
-        "Widget is referenced cross-file; usages must be non-empty; got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 6 — impact: transitive blast radius reaches the cross-file caller.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn graph_grid_lua_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
@@ -510,7 +436,7 @@ local LIMIT = 99
 // (referenziert im Body von `caller()`) auf `helper.lua::Variable::LIMIT`
 // auflöst — also der name-basierte USAGE-Pfad für eine *Modul-Variable* in
 // einem anderen File funktioniert. Außerdem verifiziert er, dass
-// `find-usages LIMIT` die `USAGE`-Kante zurück nach `caller` zurück-
+// `who-calls LIMIT` die `USAGE`-Kante zurück nach `caller` zurück-
 // attributed (also die `lua_enclosing_func_qname`-Walk die Quelle korrekt
 // zuweist) — und dass keine `CALLS`-Kante verloren geht, da `LIMIT` keine
 // aufrufbare Funktion ist.
@@ -521,29 +447,21 @@ fn graph_grid_lua_declarative_or_edge_case() {
     let (repo, store) = index_fixture("limit-usage");
 
     // (a) `LIMIT` is the receiver of `v + LIMIT` in `caller()`.
-    let (code, out, err) = run(&["find-usages", "LIMIT"], &repo, &store);
+    let (code, out, err) = run(&["who-calls", "LIMIT"], &repo, &store);
     assert_eq!(
         code, 0,
-        "find-usages LIMIT should exit 0; stderr={err}\nstdout={out}"
+        "who-calls LIMIT should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
-        out.contains("USAGE") && out.contains("caller"),
-        "find-usages LIMIT must show USAGE from caller (cross-file Variable); got: {out:?}"
+        out.contains("caller"),
+        "who-calls LIMIT must show caller for the cross-file variable usage; got: {out:?}"
     );
     assert!(
         out.contains("src/main.lua:"),
-        "find-usages LIMIT must print the referrer's file:line (src/main.lua); got: {out:?}"
+        "who-calls LIMIT must print the referrer's file:line (src/main.lua); got: {out:?}"
     );
     assert!(
-        !out.contains("(no usages)"),
-        "LIMIT is referenced cross-file; usages must be non-empty; got: {out:?}"
-    );
-
-    // (b) `LIMIT` is a Module Variable — no one CALLS it.
-    let (code, out, _err) = run(&["who-calls", "LIMIT"], &repo, &store);
-    assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
-        "who-calls LIMIT must report no callers (LIMIT is not a function); got: {out:?}"
+        !out.contains("not a function") && !out.contains("no callers"),
+        "LIMIT is referenced cross-file and must produce an incoming row; got: {out:?}"
     );
 }

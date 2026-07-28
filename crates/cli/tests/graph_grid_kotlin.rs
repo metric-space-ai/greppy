@@ -191,57 +191,6 @@ fn graph_grid_kotlin_callees_lists_cross_file_target() {
 }
 
 #[test]
-fn graph_grid_kotlin_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("find-usages-call-import");
-    let (code, out, err) = run(
-        &["find-usages", "helperFunction", "--json"],
-        &repo,
-        &store,
-    );
-    assert_eq!(code, 0, "find-usages should succeed; stderr={err}\nstdout={out}");
-    let value = json(&out, "find-usages helperFunction");
-    assert!(
-        has_hit(&value, Some("CALLS"), "caller"),
-        "helperFunction usages must include the cross-file CALLS referrer: {value}"
-    );
-    assert!(
-        has_hit(&value, Some("IMPORTS"), "src/main.kt"),
-        "helperFunction usages must include main.kt's IMPORTS referrer: {value}"
-    );
-
-    // The same cell also certifies the required helper constant relation.  A
-    // Kotlin provider that collapses this into USAGE is deliberately red.
-    let (code, out, err) = run(
-        &["find-usages", "HELPER_VALUE", "--json"],
-        &repo,
-        &store,
-    );
-    assert_eq!(code, 0, "find-usages HELPER_VALUE should succeed; stderr={err}\nstdout={out}");
-    let value = json(&out, "find-usages HELPER_VALUE");
-    assert!(
-        has_hit(&value, Some("USES"), "caller"),
-        "HELPER_VALUE use from caller must be reported as USES: {value}"
-    );
-}
-
-#[test]
-fn graph_grid_kotlin_find_usages_type_reference() {
-    let (repo, store) = index_fixture("find-usages-type");
-    let (code, out, err) = run(&["find-usages", "Payload", "--json"], &repo, &store);
-    assert_eq!(code, 0, "find-usages Payload should succeed; stderr={err}\nstdout={out}");
-    let value = json(&out, "find-usages Payload");
-    assert!(
-        has_hit(&value, Some("TYPE_REF"), "caller")
-            || has_hit(&value, Some("TYPE_REF"), "render"),
-        "Payload type references must be reported as TYPE_REF: {value}"
-    );
-    assert!(
-        has_hit(&value, Some("IMPORTS"), "src/main.kt"),
-        "Payload's import must be visible as an IMPORTS referrer: {value}"
-    );
-}
-
-#[test]
 fn graph_grid_kotlin_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
     let (code, out, err) = run(&["impact", "helperFunction", "--json"], &repo, &store);

@@ -206,65 +206,6 @@ fn graph_grid_cpp_callees_lists_cross_file_target() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4 — find-usages: covers both CALLS and IMPORTS reference edges.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_cpp_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("find-usages-call-import");
-    // `find-usages` aggregates REFERENCE_EDGE_TYPES = [CALLS, USAGE, USES,
-    // TYPE_REF, IMPORTS] per incoming target. The CALLS leg should list
-    // `caller` (caller-of-do_it); the IMPORTS leg should be visible via the
-    // file basename (`helper.hpp` -> the File node for src/helper.hpp).
-    let (code, out, err) = run(&["find-usages", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("CALLS"),
-        "find-usages do_it must show the CALLS edge kind; got: {out:?}"
-    );
-    assert!(
-        out.contains("caller"),
-        "find-usages do_it must list `caller` as a CALLS referrer; got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 5 — find-usages: TYPE_REF-equivalent (USAGE for type references) works.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_cpp_find_usages_type_reference() {
-    let (repo, store) = index_fixture("find-usages-type-ref");
-    // `Widget` is referenced as a parameter type in `render(::Widget w)`.
-    // The C++ usage pass emits a USAGE edge from `render` keyed on ref_name
-    // "Widget"; the persisted label is USAGE (the unified reference label).
-    let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("USAGE"),
-        "find-usages Widget must label the edge kind USAGE (TYPE_REF parity); got: {out:?}"
-    );
-    assert!(
-        out.contains("render"),
-        "find-usages Widget must list `render` as the type referrer; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/main.cpp:"),
-        "find-usages must print the referrer's file:line (src/main.cpp); got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 6 — impact: transitive blast radius reaches the cross-file caller.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn graph_grid_cpp_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact-transitive");

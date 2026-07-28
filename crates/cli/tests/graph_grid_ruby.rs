@@ -208,70 +208,6 @@ fn graph_grid_ruby_callees_lists_cross_file_target() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4. find-usages covers both CALLS and IMPORTS edges.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_ruby_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("usages-call");
-
-    // The qualified call resolves to the singleton method definition.
-    let (code, calls, err) = run(&["find-usages", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages do_it should exit 0; stderr={err}\nstdout={calls}"
-    );
-    assert!(
-        calls.contains("CALLS") && calls.contains("caller"),
-        "find-usages do_it must show CALLS edge from caller; got: {calls:?}"
-    );
-
-    // `require_relative 'helper'` loads the helper file, represented by its
-    // per-file Module node named `helper`.
-    let (code, imports, err) = run(&["find-usages", "helper"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages helper should exit 0; stderr={err}\nstdout={imports}"
-    );
-    assert!(
-        imports.contains("IMPORTS") && imports.contains("app.rb"),
-        "find-usages helper must show IMPORTS edge from app.rb; got: {imports:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 5. find-usages surfaces TYPE_REF / USAGE into the cross-file type.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_ruby_find_usages_type_reference() {
-    let (repo, store) = index_fixture("usages-type");
-
-    // `Widget` is the statically named receiver of `Widget.new` in `render`.
-    let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("TYPE_REF") && out.contains("render"),
-        "find-usages Widget must include the TYPE_REF referrer `render`; got: {out:?}"
-    );
-    assert!(
-        out.contains("app.rb:"),
-        "find-usages must print the referrer's file:line; got: {out:?}"
-    );
-    assert!(
-        !out.contains("(no usages)"),
-        "Widget is referenced cross-file; usages must be non-empty; got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 6. impact transitive reaches the cross-file caller.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn graph_grid_ruby_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
@@ -459,20 +395,5 @@ fn graph_grid_ruby_declarative_or_edge_case() {
         "search-symbols do_it must find the singleton method definition in helper.rb; got: {out:?}"
     );
 
-    // The constant `LIMIT` (referenced as `Helper::LIMIT` from app.rb) is
-    // a Ruby module-level assignment. find-usages should surface that
-    // cross-file USAGE edge from `report_limit` in app.rb.
-    let (code, out, err) = run(&["find-usages", "LIMIT"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages LIMIT should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("USES") && out.contains("report_limit"),
-        "find-usages LIMIT must show USES from report_limit (cross-file); got: {out:?}"
-    );
-    assert!(
-        out.contains("app.rb:"),
-        "find-usages LIMIT must print the referrer's file:line (app.rb); got: {out:?}"
-    );
+
 }

@@ -22,7 +22,6 @@ SEARCH:
 NAVIGATE:
   who-calls S                       the callers of S (incoming calls)
   callees S                         the functions S calls (outgoing calls)
-  find-usages S                     every reference to S: calls, uses, imports
   brief S                           S's definition, its callers, its callees, and the tests that
                                     reach it, in one call
   impact S                          the code a change to S reaches (by default 6 steps of

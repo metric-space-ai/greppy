@@ -117,25 +117,6 @@ fn graph_grid_ocaml_callees_lists_cross_file_target() {
     assert!(o.contains("do_it") && o.contains("src/helper.ml:"), "{o}");
 }
 #[test]
-fn graph_grid_ocaml_find_usages_covers_call_and_import() {
-    let (r, s) = index_fixture("usage-call");
-    let (c, o, e) = run(&["find-usages", "do_it"], &r, &s);
-    assert_eq!(c, 0, "{e}");
-    assert!(o.contains("CALLS") && o.contains("caller"), "{o}");
-    let (c, o, e) = run(&["find-usages", "Helper"], &r, &s);
-    assert_eq!(c, 0, "{e}");
-    assert!(o.contains("IMPORTS") && o.contains("src/main.ml"), "{o}");
-}
-#[test]
-fn graph_grid_ocaml_find_usages_type_reference() {
-    let (r, s) = index_fixture("type-ref");
-    let (c, o, e) = run(&["find-usages", "widget"], &r, &s);
-    assert_eq!(c, 0, "{e}");
-    // `find-usages` presents the extractor's TYPE_REF through the persisted
-    // compatibility USAGE label, matching the certified Elixir grid.
-    assert!(o.contains("USAGE") && o.contains("render"), "{o}");
-}
-#[test]
 fn graph_grid_ocaml_impact_transitive_reaches_caller() {
     let (r, s) = index_fixture("impact");
     let (c, o, e) = run(&["impact", "do_it"], &r, &s);

@@ -3,7 +3,7 @@
 //! * `greppy context <query>` returns the ACTUAL source span of the
 //!   most relevant definitions (not just a `file:line` pointer), so an
 //!   agent reads the code directly from greppy output.
-//! * The `--code` flag on `who-calls` / `callees` / `find-usages` /
+//! * The `--code` flag on `who-calls` / `callees` /
 //!   `trace` appends each result node's source body to the usual
 //!   `file:line` line.
 //!
@@ -852,26 +852,6 @@ fn callees_code_includes_callee_body() {
     assert!(
         out.contains("DO_IT_BODY_MARKER"),
         "callees --code must include the callee's source body; got: {out:?}"
-    );
-}
-
-#[test]
-fn find_usages_code_includes_referrer_body() {
-    let (repo, store) = index_fixture("usages-code");
-
-    // `Widget`'s type is referenced by `render`. find-usages --code must
-    // include the referrer's body.
-    let (code, out, err) = run(&["find-usages", "Widget", "--code"], &repo, &store);
-    assert_eq!(code, 0, "find-usages --code should exit 0; stderr={err}");
-    assert!(
-        out.contains("render") && out.contains("src/lib.rs:"),
-        "find-usages --code must still print the referrer file:line; got: {out:?}"
-    );
-    // `render`'s body contains the `w.w` access; assert the source line is
-    // present (the body, not just the pointer).
-    assert!(
-        out.contains("fn render"),
-        "find-usages --code must include the referrer's source body; got: {out:?}"
     );
 }
 

@@ -137,35 +137,6 @@ fn graph_grid_elixir_callees_lists_cross_file_target() {
 }
 
 #[test]
-fn graph_grid_elixir_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("usages-call-import");
-    let (code, calls, err) = run(&["find-usages", "do_it"], &repo, &store);
-    assert_eq!(code, 0, "stderr={err}\nstdout={calls}");
-    assert!(
-        calls.contains("CALLS") && calls.contains("caller"),
-        "{calls}"
-    );
-
-    let (code, imports, err) = run(&["find-usages", "Helper"], &repo, &store);
-    assert_eq!(code, 0, "stderr={err}\nstdout={imports}");
-    assert!(
-        imports.contains("IMPORTS") && imports.contains("lib/main.ex:"),
-        "{imports}"
-    );
-}
-
-#[test]
-fn graph_grid_elixir_find_usages_type_reference() {
-    let (repo, store) = index_fixture("type-ref");
-    let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
-    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
-    // `find-usages` presents TYPE_REF through its unified USAGE label, matching
-    // the certified language grids while preserving the underlying edge kind.
-    assert!(out.contains("USAGE") && out.contains("render"), "{out}");
-    assert!(out.contains("lib/main.ex:"), "{out}");
-}
-
-#[test]
 fn graph_grid_elixir_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
     let (code, out, err) = run(&["impact", "do_it"], &repo, &store);

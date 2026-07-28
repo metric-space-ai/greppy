@@ -214,67 +214,6 @@ fn graph_grid_dart_callees_lists_cross_file_target() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4 — find-usages: covers both CALLS and IMPORTS reference edges.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_dart_find_usages_covers_call_and_import() {
-    let (repo, store) = index_fixture("find-usages-call-import");
-    // `find-usages do_it` should aggregate CALLS (caller) AND IMPORTS
-    // (main.dart's import of helper.dart).
-    let (code, out, err) = run(&["find-usages", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("CALLS"),
-        "find-usages do_it must show the CALLS edge kind; got: {out:?}"
-    );
-    assert!(
-        out.contains("caller"),
-        "find-usages do_it must list `caller` as a CALLS referrer; got: {out:?}"
-    );
-    assert!(
-        out.contains("IMPORTS"),
-        "find-usages do_it must surface the IMPORTS edge from main.dart; got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 5 — find-usages: TYPE_REF-equivalent (USAGE for type references) works.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn graph_grid_dart_find_usages_type_reference() {
-    let (repo, store) = index_fixture("find-usages-type-ref");
-    // `Widget` is referenced as a parameter type in `render(Widget w)` and
-    // as a return type / constructor in `caller()`. The DART USAGE pass
-    // emits USAGE edges; the unified C-reference label is USAGE.
-    let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("USAGE"),
-        "find-usages Widget must label the edge kind USAGE (TYPE_REF parity); got: {out:?}"
-    );
-    assert!(
-        out.contains("render") && out.contains("caller"),
-        "find-usages Widget must list both `render` and `caller` as type referrers; got: {out:?}"
-    );
-    assert!(
-        out.contains("lib/main.dart:"),
-        "find-usages must print the referrer's file:line (lib/main.dart); got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 6 — impact: transitive blast radius reaches the cross-file caller.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn graph_grid_dart_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact-transitive");
@@ -458,7 +397,7 @@ int do_it_renamed() {
 // cross-file USAGE in einer Class-Methode muss daher unter dem
 // qualifizierten Class-Methoden-Qualifier source-attributiert sein, nicht
 // unter dem per-file `Module`-Knoten. Dieser Test verifiziert, dass
-// `find-usages HELPER_VALUE` (referenziert im Body von `caller()`, einer
+// `who-calls HELPER_VALUE` (referenziert im Body von `caller()`, einer
 // top-level Function) den Quellknoten `caller` als USAGE-Referrer
 // auflistet — und damit die `dart_enclosing_qname`-Attribution für
 // free-standing Funktionen korrekt durchschlägt.
@@ -469,23 +408,23 @@ fn graph_grid_dart_declarative_or_edge_case() {
     let (repo, store) = index_fixture("ns-qualified-call");
     // `HELPER_VALUE` is read inside `caller()` — a free-standing top-level
     // function. The DART USAGE pass must attribute the reference to the
-    // function's qname (`{file}::Function::caller`) and find-usages must
+    // function's qname (`{file}::Function::caller`) and who-calls must
     // surface that USAGE edge back to `caller`.
-    let (code, out, err) = run(&["find-usages", "HELPER_VALUE"], &repo, &store);
+    let (code, out, err) = run(&["who-calls", "HELPER_VALUE"], &repo, &store);
     assert_eq!(
         code, 0,
-        "find-usages HELPER_VALUE should exit 0; stderr={err}\nstdout={out}"
+        "who-calls HELPER_VALUE should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
-        out.contains("USAGE") && out.contains("caller"),
-        "find-usages HELPER_VALUE must show USAGE from caller (free function attribution); got: {out:?}"
+        out.contains("caller"),
+        "who-calls HELPER_VALUE must show its free-function referrer; got: {out:?}"
     );
     assert!(
         out.contains("lib/main.dart:"),
-        "find-usages HELPER_VALUE must print the referrer's file:line (lib/main.dart); got: {out:?}"
+        "who-calls HELPER_VALUE must print the referrer's file:line (lib/main.dart); got: {out:?}"
     );
     assert!(
-        !out.contains("(no usages)"),
-        "HELPER_VALUE is read cross-file; usages must be non-empty; got: {out:?}"
+        !out.contains("not a function") && !out.contains("no callers"),
+        "HELPER_VALUE is read cross-file and must produce an incoming row; got: {out:?}"
     );
 }

@@ -184,7 +184,6 @@ fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
     for (command, query, path) in [
         ("who-calls", "target", "src/inside"),
         ("callees", "caller_inside", "src/api.rs"),
-        ("find-usages", "target", "src/inside"),
         ("search-code", "target", "src/inside"),
         ("search-symbols", "target", "src/api.rs"),
     ] {

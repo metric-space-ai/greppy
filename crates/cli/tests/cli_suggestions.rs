@@ -167,7 +167,7 @@ fn stage_4_accepts_a_two_edit_transposition() {
     commit_all(&repo, "base");
     index(&repo, &store);
 
-    let result = run(&repo, &store, &["find-usages", "laodConfig"], &[]);
+    let result = run(&repo, &store, &["who-calls", "laodConfig"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
     assert!(text.contains("loadConfig"), "{text}");
@@ -248,7 +248,7 @@ fn suggestions_are_capped_at_three() {
     commit_all(&repo, "base");
     index(&repo, &store);
 
-    let result = run(&repo, &store, &["find-usages", "Config"], &[]);
+    let result = run(&repo, &store, &["who-calls", "Config"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
     assert_eq!(suggestion_rows(&text).len(), 3, "{text}");

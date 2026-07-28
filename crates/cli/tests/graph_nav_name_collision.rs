@@ -1,22 +1,7 @@
-//! Regression: //! `resolve_symbol_id` used to pick the FIRST node named `S` among all
-//! graph nodes, landing on the WRONG one when a name is shared:
-//!
-//!   * `find-usages Store`     resolved to the `EnumVariant`
-//!     `Kind::Store` (which has no incoming usages) instead of the
-//!     `Store` struct that IS referenced — printing "(no usages)".
-//!   * `find-usages IndexReport` resolved to `Impl::IndexReport`
-//!     instead of the `IndexReport` struct, again missing the usages.
-//!
-//! The fix (1) ranks candidates so a type/def-like label
-//! (Struct/Enum/Trait/Function/Method/TypeAlias) wins over
-//! Impl/EnumVariant/AssocConst/AssocType/Module/Call/Import, and (2) for
-//! who-calls/find-usages aggregates incoming edges across ALL nodes that
-//! share the exact name + a primary label (so a Struct and its Impl both
-//! contribute), deterministically.
+//! Regression coverage for exact-name graph symbol collisions.
 //!
 //! These tests index a real fixture end-to-end and drive the shipped
-//! `greppy` binary, so they reproduce the bug exactly as an agent
-//! would have hit it (they fail before the fix, pass after).
+//! `greppy` binary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -125,70 +110,6 @@ fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
     );
     (repo, store)
 }
-
-// ---------------------------------------------------------------------------
-// find-usages: a name shared by a Struct and its Impl resolves to (and
-// aggregates across) the Struct so the real usages are reported.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn find_usages_struct_with_impl_same_name_returns_usages() {
-    let (repo, store) = index_fixture("usages-impl-collision");
-
-    // `IndexReport` is both a Struct and an `impl IndexReport`. Before
-    // the fix this resolved to the Impl node and printed "(no usages)".
-    let (code, out, err) = run(&["find-usages", "IndexReport"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        !out.contains("(no usages)"),
-        "IndexReport IS referenced by summarise(); resolving to its Impl \
-         must not hide the usages; got: {out:?}"
-    );
-    assert!(
-        out.contains("summarise"),
-        "find-usages IndexReport must list the referrer `summarise`; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:"),
-        "find-usages must print the referrer's file:line; got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// find-usages: a struct whose name is ALSO an unrelated EnumVariant
-// resolves to the struct, not the variant.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn find_usages_struct_sharing_name_with_enum_variant_targets_struct() {
-    let (repo, store) = index_fixture("usages-variant-collision");
-
-    // `Store` is a struct referenced by persist(), and ALSO an unrelated
-    // `Kind::Store` enum variant. Before the fix `find-usages Store`
-    // could resolve to the EnumVariant (no usages) and miss the struct.
-    let (code, out, err) = run(&["find-usages", "Store"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        !out.contains("(no usages)"),
-        "the `Store` struct is referenced by persist(); the shared \
-         EnumVariant name must not steal resolution; got: {out:?}"
-    );
-    assert!(
-        out.contains("persist"),
-        "find-usages Store must list the referrer `persist`; got: {out:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// who-calls: a method defined under an impl whose type shares the struct
-// name. Aggregating across the Struct + Impl finds the method's callers.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn who_calls_method_on_struct_with_shared_impl_name_finds_caller() {

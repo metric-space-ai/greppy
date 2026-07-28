@@ -4,7 +4,7 @@
 //! - grep-compatible passthrough — delegates ordinary invocations to real grep.
 //! - `index`        — index a repo.
 //! - `search-graph` — graph search.
-//! - `who-calls` / `callees` / `find-usages` / `impact` / `brief` — graph navigation.
+//! - `who-calls` / `callees` / `impact` / `brief` — graph navigation.
 //! - `semantic-search` (`semantic`) — meaning-based code search.
 //! - `search-code` / `search-symbols` — current-source and indexed symbol search.
 //! - `trial`        — isolated own-project baseline/Greppy observation.
@@ -892,7 +892,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Who calls `S` — incoming CALLS edges (the callers of `S`),
+    /// Who calls or uses `S` — incoming CALLS and USAGE edges,
     /// printed as `qualified_name file:line`. With `--code`, also prints
     /// each caller's source span so the agent reads the body without a
     /// separate file Read.
@@ -938,31 +938,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Where `S` is referenced — all incoming references, printed as
-    /// `KIND qualified_name file:line`. With `--code`, also prints each
-    /// referencing node's source span.
-    FindUsages {
-        /// The symbols to answer for. Several are answered in one call:
-        /// `greppy find-usages A B C`. `-` reads them from the pipe.
-        #[arg(value_name = "SYMBOL")]
-        symbols: Vec<String>,
-        /// Restrict returned usage sites to these files or directory subtrees.
-        /// Repeatable; this is the only path filter.
-        #[arg(long = "path", value_name = "PATH")]
-        path_opts: Vec<String>,
-        /// Also print the source code span of each result node.
-        #[arg(long)]
-        code: bool,
-        /// Print every usage site (lift the default NAV_LIMIT cap).
-        #[arg(long)]
-        all: bool,
-        /// Emit machine-readable JSON with exact count metadata.
-        #[arg(long)]
-        json: bool,
-    },
     /// Every incoming graph reference to `S` across calls, usages, type refs,
-    /// and imports. This is broader than `find-usages`: it answers "who
-    /// depends on S?" without mixing in content-search fallback noise.
+    /// and imports. Answers "who depends on S?" without mixing in
+    /// content-search fallback noise.
     References {
         symbol: Option<String>,
         /// Also print the source code span of each referencing node.
@@ -1757,7 +1735,6 @@ const SUBCOMMANDS: &[&str] = &[
     "edit",
     "who-calls",
     "callees",
-    "find-usages",
     "references",
     "fan-in",
     "fan-out",
@@ -1800,13 +1777,15 @@ fn retired_edit_verb(name: &str) -> Option<&'static str> {
         .map(|(_, replacement)| *replacement)
 }
 
-/// An argv that carries a greppy flag, or names a verb the grammar retired, is
-/// a greppy command whose verb is unknown. Answer with the verb that does the
-/// work instead of letting the passthrough turn the verb's own name into a
-/// search pattern — that is the same silent reinterpretation rule 1 forbids.
+/// An argv that carries a greppy flag, or names a verb removed from the
+/// grammar, is a greppy command whose verb is unknown. Refuse it instead of
+/// letting the passthrough reinterpret the verb itself as a search pattern.
 fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     let rest = grep_passthrough_args(argv);
     let verb = rest.first()?.to_str()?;
+    if verb == "find-usages" {
+        return Some("error: unrecognized subcommand 'find-usages'".to_string());
+    }
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
         return None;
     }
@@ -1823,7 +1802,7 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     } else {
         message.push_str(
             "\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
-             find-usages, impact, brief, semantic-search, search-code, search-symbols, path, \
+             impact, brief, semantic-search, search-code, search-symbols, path, \
              read, edit)",
         );
     }
@@ -1985,7 +1964,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             } else {
                 println!(
                     "usage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
-                     find-usages, impact, brief, semantic-search, search-code, search-symbols, \
+                     impact, brief, semantic-search, search-code, search-symbols, \
                      path, index status)"
                 );
             }
@@ -2302,7 +2281,7 @@ fn closest_valid_invocation(
     };
     candidates.extend(match subcommand {
         "read" => vec!["--symbol", "--path", "--handle", "--lines", "--line"],
-        "who-calls" | "callees" | "find-usages" | "brief" | "semantic-search" | "semantic" => {
+        "who-calls" | "callees" | "brief" | "semantic-search" | "semantic" => {
             vec!["--path"]
         }
         "search-code" => vec![
@@ -2421,9 +2400,6 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "callees" => {
             "greppy callees SYMBOL [SYMBOL ...] [--path PATH] [--code] [--json] [--all] [--root DIR]"
-        }
-        "find-usages" => {
-            "greppy find-usages SYMBOL [SYMBOL ...] [--path PATH] [--code] [--json] [--all] [--root DIR]"
         }
         "references" => "greppy references SYMBOL [--code|--json] [--all] [--root DIR]",
         "impact" => {
@@ -3263,7 +3239,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     // token bombs teach nothing (P3). `--help` still prints everything.
     println!("usage: greppy PATTERN [FILES..]        (real-grep passthrough)");
     println!("   or: greppy <command> [--root DIR]   commands:");
-    println!("       index PATH  who-calls S   callees S   find-usages S");
+    println!("       index PATH  who-calls S   callees S");
     println!("       trial --root DIR --question Q --check who-calls --symbol S ...");
     println!("       references S (who depends on S)   impact S [--direction incoming|outgoing]");
     println!("       brief S   semantic-search \"QUERY\"");
@@ -3545,22 +3521,6 @@ fn dispatch_subcommand(
             json,
             root,
         ),
-        Command::FindUsages {
-            symbols,
-            path_opts,
-            code,
-            all,
-            json,
-        } => dispatch_nav(
-            "find-usages",
-            NavKind::FindUsages,
-            &symbols,
-            &path_opts,
-            code,
-            all,
-            json,
-            root,
-        ),
         Command::References {
             symbol,
             code,
@@ -3783,7 +3743,7 @@ fn dispatch_search_graph(
 ///
 /// `resolve_symbol_id` previously
 /// picked the FIRST node named `S`, landing on the wrong one when a name
-/// is shared — e.g. `find-usages Store` resolved to the `EnumVariant`
+/// is shared — e.g. `Store` resolved to the `EnumVariant`
 /// `Error::Store`, and `IndexReport` resolved to the `Impl::IndexReport`
 /// instead of the `Struct`. We now rank candidates so a type/def-like
 /// label (Class/Interface/Type/Struct/Enum/Trait/Function/Method/TypeAlias)
@@ -3809,8 +3769,8 @@ fn label_rank(label: &str) -> u8 {
 
 /// True for the "primary" definition labels — the type/def-like kinds we
 /// prefer for resolution and that we aggregate incoming edges across
-/// (so a `Struct` and its `Impl` both contribute to find-usages /
-/// who-calls). See [`resolve_symbol_nodes`].
+/// (so a `Struct` and its `Impl` both contribute to incoming
+/// navigation). See [`resolve_symbol_nodes`].
 fn is_primary_label(label: &str) -> bool {
     label_rank(label) <= 1
 }
@@ -4048,7 +4008,7 @@ fn symbol_candidate_rows(
 }
 
 /// Resolve a symbol to the set of node ids whose incoming edges should
-/// be aggregated for who-calls / find-usages / trace-incoming.
+/// be aggregated for who-calls / trace-incoming.
 ///
 /// a name like `IndexReport` is
 /// split across a `Struct` node and one or more `Impl` nodes; the real
@@ -4529,12 +4489,12 @@ const CONTEXT_SPAN_CAP: usize = 60;
 
 /// Default cap (in lines) for the per-node source span printed by the
 /// `--code` flag on the navigation commands (who-calls / callees /
-/// find-usages / trace). Tighter than `context` because these commands
+/// trace). Tighter than `context` because these commands
 /// can emit many nodes.
 const CODE_SPAN_CAP: usize = 25;
 
 /// Default cap on the number of result rows printed by the navigation
-/// commands (who-calls / callees / find-usages). Forensics finding F1: a
+/// commands (who-calls / callees). Forensics finding F1: a
 /// hot symbol like `Store` has hundreds of incoming edges, so an uncapped
 /// dump emits hundreds of lines — *more* tokens than a `grep` an agent
 /// would otherwise run, defeating the whole point. We print the first
@@ -4584,217 +4544,6 @@ fn clamp_snippet(snippet: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{head}… (+{} chars)", count - SNIPPET_WIDTH))
 }
 
-/// Per-target-node incoming-edge LIMIT used by who-calls / find-usages
-/// (`incoming_edges(.., 1024)`). When a single target hits this cap the
-/// aggregated `total` is a FLOOR, not an exact count, so the completeness
-/// footer must never claim "complete" at or above it (H2 / D1).
-const NAV_EDGE_LIMIT: usize = 1024;
-
-/// Pluralize a singular edge-class noun ("caller"/"callee"/"usage") by count:
-/// `1` keeps the singular, any other count appends `s`. Keeps the H2 footer
-/// grammatical ("1 caller (complete)" vs "6 callers found …").
-fn pluralize_count<'a>(singular: &'a str, n: usize) -> std::borrow::Cow<'a, str> {
-    if n == 1 {
-        std::borrow::Cow::Borrowed(singular)
-    } else {
-        std::borrow::Cow::Owned(format!("{singular}s"))
-    }
-}
-
-/// Completeness state of a navigation result, driving the unconditional
-/// footer the text nav commands (who-calls / callees / find-usages) print.
-/// The JSON path already surfaces every field this encodes
-/// (`provider_complete`, `truncated`, `total_exact`); this only mirrors it
-/// into the human footer so low-count answers (1–2 rows) still carry an
-/// explicit count + completeness marker and the agent does not re-iterate to
-/// manufacture the number.
-struct NavFooter<'a> {
-    /// Singular noun for the edge class: "caller" / "callee" / "usage".
-    /// Pluralized by count so "1 caller" / "6 callers" both read naturally.
-    noun: &'a str,
-    /// True unique total across the aggregated target nodes.
-    total: usize,
-    /// Rows actually printed (capped unless `--all`).
-    shown: usize,
-    /// True when the provider for the TARGET language is known-incomplete for
-    /// this project (partial / parity-candidate / unsupported code provider),
-    /// so the call-graph recall may undercount real edges.
-    provider_incomplete: bool,
-}
-
-impl NavFooter<'_> {
-    /// Render the H2 unconditional stop-signal footer to a string.
-    ///
-    /// Honesty (D1): the word "complete" appears ONLY when the provider is
-    /// complete AND the result is not truncated AND the total is a true count
-    /// (strictly below the per-node [`NAV_EDGE_LIMIT`] floor). Otherwise the
-    /// footer hedges (provider-partial note) or reports the truncation total.
-    /// Pure (reads only its fields + the passed `stale` flag) so it is unit
-    /// testable without capturing stdout.
-    fn render(&self, stale: bool) -> String {
-        let stale_note = if stale { " (as of last index)" } else { "" };
-        let truncated = self.total > self.shown;
-        // A total at/above the per-node edge LIMIT is a floor, never exact,
-        // so "complete" is dishonest even when nothing was truncated for print.
-        let total_is_exact = self.total < NAV_EDGE_LIMIT;
-        let noun = pluralize_count(self.noun, self.total);
-
-        if truncated {
-            // Existing >NAV_LIMIT case: report the true total and the escape
-            // hatch. Kept byte-for-byte compatible with the prior footer.
-            return format!(
-                "… and {} more ({} shown of {} total{stale_note} — this sample usually answers the question; pass --all only if you truly need every site)",
-                self.total - self.shown,
-                self.shown,
-                self.total
-            );
-        }
-        // Stop-signal = the COUNT (what the agent over-iterated to manufacture),
-        // kept MINIMAL. P2-iterC showed a verbose honest hedge (~22 tokens of
-        // "recall is partial … may undercount") DOUBLED low-count outputs and
-        // even triggered extra queries — pure overhead once qualified-name
-        // already collapsed graph-nav to one round. So: bare count, and a
-        // 1-char `+` (never "complete") when the count is a floor — honest
-        // (may be more) and cheap.
-        let floor = self.provider_incomplete || !total_is_exact;
-        let plus = if floor { "+" } else { "" };
-        format!("— {}{plus} {noun}{stale_note}", self.total)
-    }
-
-    /// Print the H2 unconditional stop-signal footer.
-    fn print(&self) {
-        println!("{}", self.render(serving_stale()));
-    }
-}
-
-/// Map a file path's extension to the provider `language` name used in
-/// `provider_state` (matching `greppy_parser::Language::name`). Returns the
-/// display name for a supported code language, or `None` for extensions that
-/// map to an unsupported/non-code provider. Kept in sync with
-/// `crates/parser/src/language.rs::language_for_path`; only the supported set
-/// matters here because the footer only hedges on a code language's provider.
-fn code_language_for_ext(path: &str) -> Option<&'static str> {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|s| s.to_str())?;
-    Some(match ext {
-        "rs" => "rust",
-        "py" => "python",
-        "js" | "jsx" | "mjs" | "cjs" => "javascript",
-        "ts" => "typescript",
-        "tsx" => "tsx",
-        "go" => "go",
-        "rb" => "ruby",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
-        "cs" => "c-sharp",
-        "php" => "php",
-        "sh" | "bash" => "bash",
-        "lua" => "lua",
-        "kt" | "kts" => "kotlin",
-        "scala" | "sc" => "scala",
-        "swift" => "swift",
-        "zig" => "zig",
-        "r" | "R" => "r",
-        _ => return None,
-    })
-}
-
-/// Decide whether the target symbol's language provider is known-incomplete,
-/// and its display name, for the H2 completeness footer. Reads the SAME
-/// incomplete-provider set the JSON path emits (`incomplete_provider_json`) so
-/// the footer and `provider_complete` never disagree. The target language is
-/// derived from the result nodes' file extensions (all rows into/out of a
-/// symbol share its language); the first row whose *code* language provider is
-/// incomplete wins the hedge.
-fn nav_target_provider_incomplete(
-    store: &greppy_store::Store,
-    project: &str,
-    rows: &[&greppy_store::Node],
-    edge_class: &str,
-) -> Result<(bool, &'static str)> {
-    // Languages whose provider does NOT emit `edge_class` for this project.
-    // The hedge is scoped to the QUERIED edge class, not the provider's overall
-    // completeness (H2 fix): a provider that supports CALLS but omits exotic
-    // classes (k8s, gitdiff, …) is complete FOR A who-calls query, so its
-    // footer must report an exact count with no `+` floor marker — otherwise
-    // the marker triggers a redundant `--all` re-query + grep fallback. We only
-    // consider CODE languages: an unsupported non-code file type (.stderr,
-    // .snap, …) has no call edges to miss, so it must not trigger a hedge.
-    let lacking: std::collections::BTreeSet<String> = store
-        .list_provider_states(project)?
-        .into_iter()
-        .filter(|p| !p.supports_edge_class(edge_class))
-        .map(|p| p.language)
-        .collect();
-    for node in rows {
-        if let Some(lang) = code_language_for_ext(&node.file_path) {
-            if lacking.contains(lang) {
-                return Ok((true, lang));
-            }
-        }
-    }
-    Ok((false, ""))
-}
-
-/// Same completeness decision as [`nav_target_provider_incomplete`], but keyed
-/// on the resolved TARGET node ids — used by the zero-result footer branches,
-/// where there are no result rows to read a language from, so the hedge must
-/// come from the queried symbol's own language.
-fn nav_target_ids_provider_incomplete(
-    store: &greppy_store::Store,
-    project: &str,
-    target_ids: &[i64],
-    edge_class: &str,
-) -> Result<(bool, &'static str)> {
-    let mut nodes = Vec::new();
-    for id in target_ids {
-        if let Some(n) = store.get_node(*id)? {
-            nodes.push(n);
-        }
-    }
-    let refs: Vec<&greppy_store::Node> = nodes.iter().collect();
-    nav_target_provider_incomplete(store, project, &refs, edge_class)
-}
-
-/// Render the H2 completeness footer for a ZERO-result navigation answer:
-/// `— 0 <noun> (complete)` when the target language's provider is complete, or
-/// `— 0 <noun> found (<lang> recall partial)` when it is known-incomplete.
-/// Pure so it is unit testable.
-fn render_zero_nav_footer(
-    noun: &str,
-    provider_incomplete: bool,
-    lang: &str,
-    stale: bool,
-) -> String {
-    let stale_note = if stale { " (as of last index)" } else { "" };
-    let noun = pluralize_count(noun, 0);
-    let _ = lang;
-    // Minimal (see NavFooter::render): a 0-count is a definite stop signal; the
-    // `+` marks a floor when the provider is known-incomplete (0 found, may be
-    // more), else a bare exact 0.
-    let plus = if provider_incomplete { "+" } else { "" };
-    format!("— 0{plus} {noun}{stale_note}")
-}
-
-/// Print the H2 completeness footer for a ZERO-result navigation answer.
-fn print_zero_nav_footer(
-    store: &greppy_store::Store,
-    project: &str,
-    noun: &str,
-    target_ids: &[i64],
-    edge_class: &str,
-) -> Result<()> {
-    let (provider_incomplete, lang) =
-        nav_target_ids_provider_incomplete(store, project, target_ids, edge_class)?;
-    println!(
-        "{}",
-        render_zero_nav_footer(noun, provider_incomplete, lang, serving_stale())
-    );
-    Ok(())
-}
-
 /// Sample-priority rank for CAPPED navigation output. Lower ranks first:
 /// named definitions before `__file__` file anchors, product code before
 /// test code. Used only to pick WHICH rows land inside the printed sample
@@ -4814,8 +4563,7 @@ fn nav_sample_rank(file_path: &str, name: &str) -> (u8, u8) {
 }
 
 /// Emit a truncation footer for the navigation commands when more results
-/// exist than were printed. Centralised so who-calls / callees /
-/// find-usages word it identically.
+/// exist than were printed. Centralised so navigation commands word it identically.
 fn print_nav_more_footer(total: usize, shown: usize) {
     if total > shown {
         // Report the TRUE total so the agent can answer "how many" from this
@@ -14297,17 +14045,16 @@ fn cache_path_bytes(path: &std::path::Path) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
-/// `greppy who-calls S` — the callers of `S`: every node with an
-/// incoming CALLS edge into `S`. Printed as `qualified_name file:line`
+/// `greppy who-calls S` — the callers and users of `S`: every node with an
+/// incoming CALLS or USAGE edge into `S`. Printed as `qualified_name file:line`
 /// so an agent can jump straight to each call site's enclosing symbol.
-/// Content-search fallback for who-calls / find-usages when the call/usage
+/// Content-search fallback for who-calls when the call/usage
 /// GRAPH has no edges for `symbol` (e.g. a weakly-connected single-file symbol,
 /// a macro, or a name that is not a graph node at all). Runs the indexed
 /// live source search on the name so the agent still gets `file:line` hits from ONE
 /// greppy call — instead of finding nothing and falling back to a grep loop.
-/// This was the token-efficiency benchmark's only case where greppy lost to
-/// grep (`find-usages GraphIndex`): now greppy is never worse than grep for a
-/// name query, since it always returns source matches.
+/// This fallback keeps name queries from losing to a plain source search when
+/// the graph has no corresponding symbol.
 fn content_fallback(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -14662,37 +14409,6 @@ fn ensure_unambiguous_target(
 /// A definition is not a reference to itself: the target nodes, the members the
 /// target owns, and the synthetic anchor of the file the target is defined in
 /// are all part of the definition. Import anchors of OTHER files stay — they
-/// are how an import dependency is represented.
-fn self_reference_ids(
-    store: &greppy_store::Store,
-    project: &str,
-    target_ids: &[i64],
-) -> Result<std::collections::HashSet<i64>> {
-    let mut ids: std::collections::HashSet<i64> = target_ids.iter().copied().collect();
-    let mut own_files = std::collections::BTreeSet::new();
-    for id in target_ids {
-        let Some(node) = store.get_node(*id)? else {
-            continue;
-        };
-        own_files.insert(node.file_path.clone());
-        for owned in owned_callable_ids_for_type(store, project, &node)? {
-            ids.insert(owned);
-        }
-    }
-    for file in &own_files {
-        for candidate in store.list_nodes(project, "", file, 0, 10_000)? {
-            if is_synthetic_file_anchor(
-                &candidate.label,
-                &candidate.name,
-                &candidate.qualified_name,
-            ) {
-                ids.insert(candidate.id);
-            }
-        }
-    }
-    Ok(ids)
-}
-
 /// A definition that only exists to exercise other code. `brief` reports "the
 /// tests that reach it" and `impact` "the tests among it"; both mean the
 /// callable test functions, never the synthetic per-file anchors.
@@ -14755,7 +14471,6 @@ fn node_source_and_handle(
 enum NavKind {
     WhoCalls,
     Callees,
-    FindUsages,
     Impact,
 }
 
@@ -14812,7 +14527,6 @@ fn dispatch_nav(
     match kind {
         NavKind::WhoCalls => dispatch_who_calls(symbol, paths, code, all, json, root),
         NavKind::Callees => dispatch_callees(symbol, paths, code, all, json, root),
-        NavKind::FindUsages => dispatch_find_usages(symbol, paths, code, all, json, root),
         NavKind::Impact => Err(Error::Invalid("impact has its own dispatch arm".into())),
     }
 }
@@ -14999,15 +14713,31 @@ fn nav_rows_for_target(
     depth: usize,
 ) -> Result<Vec<NavRow>> {
     let out = match kind {
-        NavKind::WhoCalls => incoming_call_nodes_for_targets(store, ids)?
-            .into_iter()
-            .map(|node| NavRow {
-                target: index,
-                node,
-                edge_type: None,
-                hops: None,
-            })
-            .collect(),
+        NavKind::WhoCalls => {
+            let mut nodes = std::collections::BTreeMap::new();
+            for id in ids {
+                for edge_type in ["CALLS", "USAGE"] {
+                    for edge in store.incoming_edges(*id, Some(edge_type), 1024)? {
+                        if let std::collections::btree_map::Entry::Vacant(slot) =
+                            nodes.entry(edge.source_id)
+                        {
+                            if let Some(node) = store.get_node(edge.source_id)? {
+                                slot.insert(node);
+                            }
+                        }
+                    }
+                }
+            }
+            nodes
+                .into_values()
+                .map(|node| NavRow {
+                    target: index,
+                    node,
+                    edge_type: None,
+                    hops: None,
+                })
+                .collect()
+        }
         NavKind::Callees => {
             let mut callees: std::collections::BTreeMap<i64, greppy_store::Node> =
                 std::collections::BTreeMap::new();
@@ -15027,32 +14757,6 @@ fn nav_rows_for_target(
                     hops: None,
                 })
                 .collect()
-        }
-        NavKind::FindUsages => {
-            let self_ids = self_reference_ids(store, project, ids)?;
-            let mut seen = std::collections::BTreeSet::new();
-            let mut out = Vec::new();
-            for id in ids {
-                for &edge_type in greppy_search::REFERENCE_EDGE_TYPES {
-                    for edge in store.incoming_edges(*id, Some(edge_type), 1024)? {
-                        if self_ids.contains(&edge.source_id) {
-                            continue;
-                        }
-                        if !seen.insert((edge.edge_type.clone(), edge.source_id)) {
-                            continue;
-                        }
-                        if let Some(node) = store.get_node(edge.source_id)? {
-                            out.push(NavRow {
-                                target: index,
-                                node,
-                                edge_type: Some(edge.edge_type.clone()),
-                                hops: None,
-                            });
-                        }
-                    }
-                }
-            }
-            out
         }
         NavKind::Impact => {
             let start_ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
@@ -15825,11 +15529,10 @@ fn nav_kind_word(lines: Option<&Vec<String>>, node: &greppy_store::Node) -> Stri
     }
 }
 
-/// Which kinds a direction can answer for. The two are deliberately not the
-/// same set: a struct is never *called*, so `who-calls` on it can only mislead
-/// — but its impl block does call things, so `callees` on it is a real
-/// question. Only definitions that cannot hold code at all — a field, a
-/// variable, a constant, an enum variant — are unanswerable in both directions.
+/// Which kinds a direction can answer for. Incoming navigation follows both
+/// calls and usages, so every real definition can be referenced. Outgoing
+/// navigation still requires a definition that can hold code. Synthetic file
+/// anchors are handled separately by `nav_refuse_non_callable`.
 #[derive(Clone, Copy)]
 enum NavDirection {
     Incoming,
@@ -15839,10 +15542,7 @@ enum NavDirection {
 impl NavDirection {
     fn answerable(self, label: &str) -> bool {
         match self {
-            NavDirection::Incoming => matches!(
-                label,
-                "Function" | "Method" | "Constructor" | "Macro" | "Interface"
-            ),
+            NavDirection::Incoming => true,
             NavDirection::Outgoing => !matches!(
                 label,
                 "Field" | "Variable" | "Constant" | "EnumVariant" | "Property"
@@ -15851,9 +15551,9 @@ impl NavDirection {
     }
 }
 
-/// A definition the direction cannot answer for. "no callers" on a struct is
-/// literally true and practically a lie — the agent reads a successful answer
-/// and concludes the definition is unused. Name the kind instead and refuse.
+/// A definition the direction cannot answer for. Incoming references apply to
+/// every real definition; outgoing calls still refuse definitions that cannot
+/// hold code. Synthetic file anchors are not referenceable definitions.
 fn nav_refuse_non_callable(
     store: &greppy_store::Store,
     repo_root: &std::path::Path,
@@ -15868,9 +15568,8 @@ fn nav_refuse_non_callable(
             continue;
         };
         if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
-            // A file anchor is the module, not a definition inside it. It is
-            // the only thing `data` resolves to, and answering "no callers" for
-            // a module is the same false negative as answering it for a struct.
+            // A file anchor is the module, not a referenceable definition
+            // inside it, so neither navigation direction can answer for it.
             anchors.push(node);
             continue;
         }
@@ -16087,13 +15786,12 @@ fn dispatch_who_calls(
     )? {
         return Ok(code);
     }
-    // aggregate incoming CALLS across ALL nodes sharing
-    // the name + a primary label (e.g. a Struct and its Impl) so callers
-    // are not lost to a name resolving to the wrong single node.
+    // Aggregate incoming CALLS and USAGE across ALL nodes sharing the name + a
+    // primary label (e.g. a Struct and its Impl), so references are not lost
+    // to a name resolving to the wrong single node.
     let targets = resolve_symbol_nodes(&store, symbol)?;
-    // The kind is checked before the ambiguity: two definitions that are both
-    // enum variants are not a choice the agent has to make, they are a question
-    // that does not apply.
+    // Synthetic file anchors are rejected before ambiguity; every real
+    // definition can have incoming CALLS or USAGE references.
     if let Some(symbol) = symbol {
         if json {
             ensure_unambiguous_target(&store, symbol, &targets)?;
@@ -16131,7 +15829,9 @@ fn dispatch_who_calls(
     }
     let mut edges = Vec::new();
     for target in &targets {
-        edges.extend(store.incoming_edges(*target, Some("CALLS"), 1024)?);
+        for edge_type in ["CALLS", "USAGE"] {
+            edges.extend(store.incoming_edges(*target, Some(edge_type), 1024)?);
+        }
     }
     if edges.is_empty() {
         // The symbol IS a defined graph node but has no callers — that is a
@@ -16167,10 +15867,8 @@ fn dispatch_who_calls(
     // print at most NAV_LIMIT (F1: cap the token-bomb) unless `--all`.
     let mut seen = std::collections::BTreeSet::new();
     let mut nodes = Vec::new();
-    // P4: collect each caller's CALL-SITE lines (persisted in the edge
-    // properties). Printed grep-shaped below so one who-calls answer
-    // carries the evidence — the spot forensics showed agents re-reading
-    // files after who-calls just to see HOW the call is made.
+    // Collect each reference-site line persisted in the edge properties. The
+    // line locates the statement that `--code` prints for the answer row.
     let mut sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
     for e in &edges {
         if let Some(l) = e.properties.get("line").and_then(|v| v.as_u64()) {
@@ -16240,6 +15938,11 @@ fn dispatch_who_calls(
     let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut rows = Vec::with_capacity(nodes.len());
     for n in &nodes {
+        // A file anchor is greppy's own bookkeeping, not a symbol. `__file__`
+        // in a result list is a name the agent cannot carry anywhere.
+        if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+            continue;
+        }
         let site = sorted_site_lines(sites.get(&n.id))
             .first()
             .copied()
@@ -16437,6 +16140,9 @@ fn dispatch_callees(
     let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut rows = Vec::with_capacity(callees.len());
     for n in callees.values() {
+        if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+            continue;
+        }
         let lines = sources
             .entry(n.file_path.clone())
             .or_insert_with(|| nav_file_lines(&repo_root, &n.file_path));
@@ -16455,259 +16161,9 @@ fn dispatch_callees(
     Ok(0)
 }
 
-/// `greppy find-usages S` — where `S` is referenced: every node with an
-/// incoming reference edge into `S`. Printed as `KIND qualified_name
-/// file:line` so the edge kind is visible.
-fn dispatch_find_usages(
-    symbol: Option<&str>,
-    paths: &[String],
-    code: bool,
-    all: bool,
-    json: bool,
-    root: Option<&str>,
-) -> Result<i32> {
-    ensure_nav_json_mode(code, json)?;
-    let query_symbol = symbol.unwrap_or("");
-    let path_filters = prepare_query_path_filters(root, "find-usages", query_symbol, paths)?;
-    let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-    let project = project_for(root)?;
-    let graph_gate_extra = serde_json::json!({
-        "symbol": query_symbol,
-        "symbol_found": false,
-        "all": all,
-    });
-    if let Some(code) = graph_stale_gate(
-        &store,
-        root,
-        &project,
-        "find-usages",
-        json,
-        graph_gate_extra.clone(),
-        "hits",
-    )? {
-        return Ok(code);
-    }
-    if let Some(code) = provider_policy_graph_gate(
-        &store,
-        root,
-        &project,
-        "find-usages",
-        json,
-        graph_gate_extra,
-        "hits",
-    )? {
-        return Ok(code);
-    }
-    // aggregate incoming USAGE across ALL nodes sharing the
-    // name + a primary label (e.g. a Class and its Impl). Previously the name
-    // resolved to the first node found (often the wrong one — `Store` ->
-    // EnumVariant `Error::Store`, `IndexReport` -> `Impl::IndexReport`), so
-    // real usages were reported as "(no usages)". The graph now persists every
-    // non-call, non-import identifier reference under the single unified
-    // `USAGE` label (the former `TYPE_REF` + `USES` passes), so one query
-    // covers both type and value references.
-    let targets = resolve_symbol_nodes(&store, symbol)?;
-    if let Some(symbol) = symbol {
-        ensure_unambiguous_target(&store, symbol, &targets)?;
-    }
-    if targets.is_empty() {
-        if json {
-            let project = project_for(root)?;
-            nav_counts_json(
-                &store,
-                root,
-                "find-usages",
-                query_symbol,
-                &project,
-                false,
-                0,
-                0,
-                all,
-                Vec::new(),
-            )?;
-            return Ok(1);
-        }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "usages", &path_filters);
-    }
-    let mut edges = Vec::new();
-    // P10: "usages" to an agent means EVERY reference. A function whose
-    // only references are calls returned a confidently wrong "(no usages)"
-    // while who-calls listed its 2 callers (spot forensics, wrap_in_const)
-    // — the agent then burned three extra calls distrusting the tool.
-    // Aggregate all reference-class edges; each output row is already
-    // labelled with its edge type, so the answer stays honest.
-    let self_ids = self_reference_ids(&store, &project, &targets)?;
-    for target in &targets {
-        for &et in greppy_search::REFERENCE_EDGE_TYPES {
-            edges.extend(
-                store
-                    .incoming_edges(*target, Some(et), 1024)?
-                    .into_iter()
-                    // A definition is not a reference to itself.
-                    .filter(|edge| !self_ids.contains(&edge.source_id)),
-            );
-        }
-    }
-    if edges.is_empty() {
-        // Resolved graph node with no usages — a valid answer; no content noise.
-        if json {
-            let project = project_for(root)?;
-            nav_counts_json(
-                &store,
-                root,
-                "find-usages",
-                query_symbol,
-                &project,
-                true,
-                0,
-                0,
-                all,
-                Vec::new(),
-            )?;
-            return Ok(0);
-        }
-        if path_filters.is_empty() {
-            println!("(no usages)");
-        } else {
-            println!("(no usages under path filter: {})", path_filters.shown());
-        }
-        print_zero_nav_footer(&store, &project, "usage", &targets, "usages")?;
-        return Ok(0);
-    }
-    // `--code` reads spans from disk relative to the resolved repo root.
-    let span_root = if code {
-        Some(resolve_root(root)?)
-    } else {
-        None
-    };
-    // Deterministic, de-duplicated output keyed on (edge_type, source).
-    // Collect first so we know the true total, then cap at NAV_LIMIT (F1)
-    // unless `--all`.
-    let mut seen = std::collections::BTreeSet::new();
-    let mut rows: Vec<(String, greppy_store::Node)> = Vec::new();
-    // P4: collect the reference-site lines per (edge_type, source) so the
-    // usage answer prints grep-shaped ' file:line: code' evidence.
-    let mut sites: std::collections::HashMap<(String, i64), Vec<u32>> =
-        std::collections::HashMap::new();
-    for e in &edges {
-        if let Some(l) = e.properties.get("line").and_then(|v| v.as_u64()) {
-            sites
-                .entry((e.edge_type.clone(), e.source_id))
-                .or_default()
-                .push(l as u32);
-        }
-        if !seen.insert((e.edge_type.clone(), e.source_id)) {
-            continue;
-        }
-        if let Some(n) = store.get_node(e.source_id)? {
-            rows.push((e.edge_type.clone(), n));
-        }
-    }
-    rows.retain(|(_, node)| path_filters.matches(&node.file_path));
-    if rows.is_empty() && !path_filters.is_empty() && !json {
-        println!("(no usages under path filter: {})", path_filters.shown());
-        return Ok(0);
-    }
-    let total = rows.len();
-    let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
-    let shown = total.min(cap);
-    let expand = if !all && !code {
-        let evidence_rows = rows
-            .iter()
-            .map(|(edge_type, n)| ExpandEvidenceNode {
-                title: format!("{edge_type} {}", display_node_name(n)),
-                node: n,
-                site_lines: sorted_site_lines(sites.get(&(edge_type.clone(), n.id))),
-                extra_json: serde_json::json!({"edge_type": edge_type}),
-            })
-            .collect::<Vec<_>>();
-        insert_nav_expand_pack(
-            &store,
-            root,
-            &project,
-            "find-usages",
-            query_symbol,
-            total,
-            &evidence_rows,
-        )
-    } else {
-        None
-    };
-    if json {
-        let project = project_for(root)?;
-        let hits = rows[..shown]
-            .iter()
-            .map(|(edge_type, n)| {
-                serde_json::json!({
-                    "edge_type": edge_type,
-                    "qualified_name": &n.qualified_name,
-                    "file": &n.file_path,
-                    "line": n.start_line,
-                    "file_path": &n.file_path,
-                    "start_line": n.start_line,
-                    "end_line": n.end_line,
-                })
-            })
-            .collect();
-        nav_counts_json_with_expand(
-            &store,
-            root,
-            "find-usages",
-            query_symbol,
-            &project,
-            true,
-            total,
-            shown,
-            all,
-            hits,
-            expand.as_ref(),
-        )?;
-        return Ok(0);
-    }
-    let repo_root = resolve_root(root)?;
-    for (edge_type, n) in &rows[..shown] {
-        println!(
-            "{} {} {}",
-            edge_type,
-            display_node_name(n),
-            node_line_span(n)
-        );
-        if let Some(lines) = sites.get(&(edge_type.clone(), n.id)) {
-            let mut lines = lines.clone();
-            lines.sort_unstable();
-            lines.dedup();
-            for l in lines.iter().take(3) {
-                if let Some(text) = read_source_line(&repo_root, &n.file_path, *l) {
-                    println!("  {}:{}: {}", n.file_path, l, text);
-                }
-            }
-        }
-        // Track A: with `--code`, print the referencing node's body so
-        // the agent sees the usage site without a separate Read.
-        if let Some(root_path) = span_root.as_deref() {
-            print_code_span(root_path, n, CODE_SPAN_CAP);
-        }
-    }
-    let row_refs: Vec<&greppy_store::Node> = rows.iter().map(|(_, n)| n).collect();
-    let (provider_incomplete, _) =
-        nav_target_provider_incomplete(&store, &project, &row_refs, "usages")?;
-    NavFooter {
-        noun: "usage",
-        total,
-        shown,
-        provider_incomplete,
-    }
-    .print();
-    if let Some(expand) = &expand {
-        println!("{}", expand.text_line());
-    }
-    Ok(0)
-}
-
 /// `greppy references S` — every incoming graph reference to `S` across
-/// CALLS, USAGE, legacy USES/TYPE_REF, and IMPORTS. Unlike find-usages, this
-/// intentionally has no content fallback: a "references" answer must stay a
+/// CALLS, USAGE, legacy USES/TYPE_REF, and IMPORTS. This intentionally
+/// has no content fallback: a "references" answer must stay a
 /// graph answer so agents can trust the edge kind and exact count metadata.
 fn dispatch_references(
     symbol: Option<&str>,
@@ -22582,7 +22038,7 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     //
     // Feature A (auto-index on first use): rather than erroring, build a
     // GRAPH index (no embeddings) inline on first use so the graph nav
-    // commands (who-calls / callees / find-usages / references / impact /
+    // commands (who-calls / callees / references / impact /
     // path / brief / fan-in / fan-out / trace) Just Work on a fresh repo.
     // Gated behind the same kill switch as the inline auto-reindex
     // (`GREPPY_AUTO_REINDEX=0` restores the old hard error). If the
@@ -22626,7 +22082,7 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     // Query commands are READ-ONLY: open read-only so they skip both
     // `migrate()` and the O(db-size) `integrity_check` that a read-write open
     // runs. Those belong on the writer (`greppy index`); paying them on every
-    // query open made who-calls/find-usages/search take seconds on a real repo
+    // query open made who-calls/search take seconds on a real repo
     // (the token-efficiency benchmark's latency culprit). Readers tolerate
     // whatever schema the DB has.
     let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?;
@@ -24507,7 +23963,6 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
-        Command::FindUsages { json, .. } => ("find-usages", *json),
         Command::References { json, .. } => ("references", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
         Command::FanOut { json, .. } => ("fan-out", *json),
@@ -26367,7 +25822,7 @@ where
     }
 
     #[test]
-    fn who_calls_and_find_usages_parse_positional_symbol() {
+    fn navigation_commands_parse_positional_symbol() {
         let cli = Cli::try_parse_from(["greppy", "who-calls", "do_it"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -26380,12 +25835,6 @@ where
             cli.command,
             Some(Command::WhoCalls { ref symbols, .. })
                 if symbols == &["do_it".to_string(), "other".to_string()]
-        ));
-
-        let cli = Cli::try_parse_from(["greppy", "find-usages", "Widget"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::FindUsages { ref symbols, code: false, all: false, json: false, ref path_opts }) if symbols == &["Widget".to_string()] && path_opts.is_empty()
         ));
 
         let cli = Cli::try_parse_from(["greppy", "references", "Widget"]).unwrap();
@@ -26540,7 +25989,6 @@ where
         // Structured subcommands → NOT passthrough.
         assert!(!is_grep_passthrough(&mk(&["greppy", "index", "."])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "doctor"])));
-        assert!(!is_grep_passthrough(&mk(&["greppy", "find-usages", "Foo"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "references", "Foo"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "fan-in"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "fan-out"])));
@@ -26858,135 +26306,6 @@ where
                 updated_at: "2026-07-02T00:00:00Z".into(),
             })
             .unwrap();
-    }
-
-    /// H2 / D1: a full, low-count, non-truncated result from a COMPLETE
-    /// provider carries the honest "(complete)" marker — the signal that lets
-    /// a 1-caller answer stop the agent iterating to re-derive the count.
-    #[test]
-    fn footer_prints_complete_for_full_low_count() {
-        let footer = NavFooter {
-            noun: "caller",
-            total: 1,
-            shown: 1,
-            provider_incomplete: false,
-        };
-        // Singular noun for a 1-count answer (the prompt's canonical example).
-        // Slim form (P2-iterC): bare count, no "(complete)" prose; a complete
-        // provider carries no `+` floor marker.
-        assert_eq!(footer.render(false), "— 1 caller");
-        // Stale index appends the labeled note.
-        assert_eq!(footer.render(true), "— 1 caller (as of last index)");
-        // A multi-count complete answer pluralizes.
-        let many = NavFooter {
-            noun: "caller",
-            total: 3,
-            shown: 3,
-            provider_incomplete: false,
-        };
-        assert_eq!(many.render(false), "— 3 callers");
-        // D1: a per-node edge LIMIT floor is marked with `+`, never "complete".
-        let floored = NavFooter {
-            noun: "caller",
-            total: NAV_EDGE_LIMIT,
-            shown: NAV_EDGE_LIMIT,
-            provider_incomplete: false,
-        };
-        assert!(!floored.render(false).contains("complete"));
-        assert!(floored.render(false).contains('+'));
-    }
-
-    /// H2 / D1: when the provider for this language is known-incomplete, the
-    /// count carries a `+` floor marker (may be more) and "complete" never
-    /// appears — honest under partial call-graph recall, at 1 char (P2-iterC:
-    /// the old ~22-token hedge prose was net-negative overhead).
-    #[test]
-    fn footer_hedges_when_provider_incomplete() {
-        let footer = NavFooter {
-            noun: "caller",
-            total: 6,
-            shown: 6,
-            provider_incomplete: true,
-        };
-        let out = footer.render(false);
-        assert_eq!(out, "— 6+ callers");
-        assert!(!out.contains("complete"), "{out}");
-        // Zero-result floor form for the same partial provider.
-        assert_eq!(
-            render_zero_nav_footer("caller", true, "java", false),
-            "— 0+ callers"
-        );
-        // Zero-result exact form (complete provider).
-        assert_eq!(
-            render_zero_nav_footer("usage", false, "", false),
-            "— 0 usages"
-        );
-
-        // The provider-incompleteness decision reads the same source the JSON
-        // path uses: a partial Java provider marks Java rows incomplete, while
-        // a non-code (.stderr) provider does not.
-        let mut store = store_with_defs(&[("Method", "src/A.java", "A", "m")]);
-        seed_provider(&mut store, "java", "partial", &["calls"]);
-        seed_provider(
-            &mut store,
-            "file extension .stderr",
-            "unsupported",
-            &["calls"],
-        );
-        let node = store
-            .get_node(id_of(&store, "src/A.java", "A", "m"))
-            .unwrap()
-            .unwrap();
-        let (incomplete, lang) =
-            nav_target_provider_incomplete(&store, "p", &[&node], "calls").unwrap();
-        assert!(incomplete);
-        assert_eq!(lang, "java");
-    }
-
-    /// P2-N regression: a provider that is `is_incomplete()` ONLY because it
-    /// omits exotic edge classes (k8s, gitdiff, semantic, …) but fully supports
-    /// CALLS must NOT hedge a who-calls footer. This is the real Rust/serde
-    /// shape: status "partial", `calls` supported, only irrelevant classes
-    /// unsupported. Before the fix every such footer carried a `+` floor marker
-    /// that pushed the agent into a redundant `--all` + grep spiral.
-    #[test]
-    fn footer_does_not_hedge_when_queried_class_is_supported() {
-        let mut store = store_with_defs(&[("Function", "src/a.rs", "", "f")]);
-        // Mirrors the indexer's real Rust provider_state: partial (parity gate),
-        // but `calls` is a SUPPORTED class — only exotic classes are missing.
-        seed_provider(
-            &mut store,
-            "rust",
-            "partial",
-            &["tests", "k8s", "gitdiff", "semantic"],
-        );
-        let node = store
-            .get_node(id_of(&store, "src/a.rs", "", "f"))
-            .unwrap()
-            .unwrap();
-        // The blanket completeness check still reports the provider incomplete…
-        let states = store.list_provider_states("p").unwrap();
-        let rust = states.iter().find(|p| p.language == "rust").unwrap();
-        assert!(
-            rust.is_incomplete(),
-            "exotic-class gaps keep is_incomplete true"
-        );
-        assert!(rust.supports_edge_class("calls"), "but calls is supported");
-        // …yet a CALLS-scoped nav query must NOT hedge (no `+` in the footer).
-        let (incomplete, _lang) =
-            nav_target_provider_incomplete(&store, "p", &[&node], "calls").unwrap();
-        assert!(
-            !incomplete,
-            "who-calls must not hedge when calls is supported"
-        );
-        // A query for a class this provider genuinely lacks still hedges.
-        seed_provider(&mut store, "rust", "partial", &["usages", "k8s"]);
-        let (usage_incomplete, _l) =
-            nav_target_provider_incomplete(&store, "p", &[&node], "usages").unwrap();
-        assert!(
-            usage_incomplete,
-            "find-usages hedges when usages unsupported"
-        );
     }
 
     /// LEVER 2a: `impact --all` parses (previously clap ERRORED — no such
