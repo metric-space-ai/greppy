@@ -320,31 +320,24 @@ fn who_calls_lists_usage_references_into_a_struct() {
 }
 
 #[test]
-fn references_lists_calls_and_usages_with_edge_kind() {
+fn who_calls_covers_calls_and_usages_without_naming_the_edge() {
     let (repo, store) = index_fixture("references");
 
-    let (code, out, err) = run(&["references", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "references should exit 0; stderr={err}\nstdout={out}"
-    );
+    // A call site and a type reference are both "places that use S". The edge
+    // kind is how the graph stores them, not something the agent acts on, so it
+    // is not printed -- the answer is the address and the symbol.
+    let (code, out, err) = run(&["who-calls", "do_it"], &repo, &store);
+    assert_eq!(code, 0, "who-calls should exit 0; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("CALLS"),
-        "references do_it must show the CALLS edge kind; got: {out:?}"
-    );
-    assert!(
-        out.contains("caller"),
-        "references do_it must list the caller `caller`; got: {out:?}"
+        out.contains("caller") && !out.contains("CALLS"),
+        "the caller is named, the edge kind is not; got: {out:?}"
     );
 
-    let (code, out, err) = run(&["references", "Widget"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "references Widget should exit 0; stderr={err}\nstdout={out}"
-    );
+    let (code, out, err) = run(&["who-calls", "Widget"], &repo, &store);
+    assert_eq!(code, 0, "who-calls should exit 0; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("USAGE") && out.contains("render"),
-        "references Widget must include the USAGE referrer `render`; got: {out:?}"
+        out.contains("render") && !out.contains("USAGE"),
+        "a struct's referrers are listed the same way as callers; got: {out:?}"
     );
 }
 
@@ -352,11 +345,11 @@ fn references_lists_calls_and_usages_with_edge_kind() {
 fn direct_navigation_json_reports_exact_counts() {
     let (repo, store) = index_fixture("nav-json");
 
-    let cases = [
+    // The edge kind is no longer part of any answer, so no case asserts one.
+    let cases: [(&str, &str, &str, Option<&str>); 3] = [
         ("who-calls", "do_it", "caller", None),
         ("callees", "caller", "do_it", None),
         ("who-calls", "Widget", "render", None),
-        ("references", "do_it", "caller", Some("CALLS")),
     ];
 
     for (cmd, symbol, expected_qname, expected_edge) in cases {
@@ -984,7 +977,7 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
             "steps",
         ),
         (vec!["who-calls", "do_it", "--json"], "who-calls", "hits"),
-        (vec!["references", "Widget", "--json"], "references", "hits"),
+        (vec!["who-calls", "Widget", "--json"], "who-calls", "hits"),
         (
             vec!["graph-locate", "src/lib.rs:6", "--json"],
             "graph-locate",
@@ -1122,7 +1115,7 @@ fn navigation_commands_report_missing_symbol() {
 
     for cmd in [
         vec!["who-calls", "does_not_exist_xyz"],
-        vec!["references", "does_not_exist_xyz"],
+        vec!["who-calls", "does_not_exist_xyz"],
         vec!["trace", "--symbol", "does_not_exist_xyz"],
     ] {
         let (code, out, _err) = run(&cmd, &repo, &store);

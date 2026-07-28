@@ -938,21 +938,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Every incoming graph reference to `S` across calls, usages, type refs,
-    /// and imports. Answers "who depends on S?" without mixing in
-    /// content-search fallback noise.
-    References {
-        symbol: Option<String>,
-        /// Also print the source code span of each referencing node.
-        #[arg(long)]
-        code: bool,
-        /// Print every reference site (lift the default NAV_LIMIT cap).
-        #[arg(long)]
-        all: bool,
-        /// Emit machine-readable JSON with exact count metadata.
-        #[arg(long)]
-        json: bool,
-    },
     /// Top symbols by incoming edge degree. Default edge type is CALLS, so this
     /// shows the most-called symbols in the current project.
     FanIn {
@@ -1735,7 +1720,6 @@ const SUBCOMMANDS: &[&str] = &[
     "edit",
     "who-calls",
     "callees",
-    "references",
     "fan-in",
     "fan-out",
     "graph-locate",
@@ -2401,7 +2385,6 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "callees" => {
             "greppy callees SYMBOL [SYMBOL ...] [--path PATH] [--code] [--json] [--all] [--root DIR]"
         }
-        "references" => "greppy references SYMBOL [--code|--json] [--all] [--root DIR]",
         "impact" => {
             "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
@@ -3521,12 +3504,6 @@ fn dispatch_subcommand(
             json,
             root,
         ),
-        Command::References {
-            symbol,
-            code,
-            all,
-            json,
-        } => dispatch_references(symbol.as_deref(), code, all, json, root),
         Command::FanIn { edge, json } => dispatch_fan_degree(
             "fan-in",
             "incoming",
@@ -16161,170 +16138,6 @@ fn dispatch_callees(
     Ok(0)
 }
 
-/// `greppy references S` — every incoming graph reference to `S` across
-/// CALLS, USAGE, legacy USES/TYPE_REF, and IMPORTS. This intentionally
-/// has no content fallback: a "references" answer must stay a
-/// graph answer so agents can trust the edge kind and exact count metadata.
-fn dispatch_references(
-    symbol: Option<&str>,
-    code: bool,
-    all: bool,
-    json: bool,
-    root: Option<&str>,
-) -> Result<i32> {
-    ensure_nav_json_mode(code, json)?;
-    let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-    let query_symbol = symbol.unwrap_or("");
-    let project = project_for(root)?;
-    let graph_gate_extra = serde_json::json!({
-        "symbol": query_symbol,
-        "symbol_found": false,
-        "all": all,
-    });
-    if let Some(code) = graph_stale_gate(
-        &store,
-        root,
-        &project,
-        "references",
-        json,
-        graph_gate_extra.clone(),
-        "hits",
-    )? {
-        return Ok(code);
-    }
-    if let Some(code) = provider_policy_graph_gate(
-        &store,
-        root,
-        &project,
-        "references",
-        json,
-        graph_gate_extra,
-        "hits",
-    )? {
-        return Ok(code);
-    }
-    let targets = resolve_symbol_nodes(&store, symbol)?;
-    if targets.is_empty() {
-        if json {
-            nav_counts_json(
-                &store,
-                root,
-                "references",
-                query_symbol,
-                &project,
-                false,
-                0,
-                0,
-                all,
-                Vec::new(),
-            )?;
-            return Ok(1);
-        }
-        print_symbol_miss_guidance(&store, &project, query_symbol);
-        return Ok(1);
-    }
-
-    let total = greppy_search::count_references_to_any(&store, &project, &targets)?;
-    let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
-    let fetch_limit = if all {
-        greppy_search::MAX_REACH_RESULTS
-    } else {
-        EXPAND_NAV_EVIDENCE_LIMIT.max(cap)
-    };
-    let refs = greppy_search::find_references_to_any(&store, &targets, fetch_limit)?;
-    let shown = refs.len().min(cap);
-    let expand = if !all && !code {
-        let mut nodes = Vec::new();
-        for r in &refs {
-            if let Some(node) = store.get_node(r.node.id)? {
-                nodes.push((r.edge_type.clone(), node));
-            }
-        }
-        let evidence_rows = nodes
-            .iter()
-            .map(|(edge_type, node)| ExpandEvidenceNode {
-                title: format!("{edge_type} {}", display_node_name(node)),
-                node,
-                site_lines: Vec::new(),
-                extra_json: serde_json::json!({"edge_type": edge_type}),
-            })
-            .collect::<Vec<_>>();
-        insert_nav_expand_pack(
-            &store,
-            root,
-            &project,
-            "references",
-            query_symbol,
-            total,
-            &evidence_rows,
-        )
-    } else {
-        None
-    };
-
-    if json {
-        let hits = refs[..shown]
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "edge_type": &r.edge_type,
-                    "node_id": r.node.id,
-                    "qualified_name": &r.node.qualified_name,
-                    "name": &r.node.name,
-                    "label": &r.node.label,
-                    "file_path": &r.node.file_path,
-                    "start_line": r.node.start_line,
-                    "end_line": r.node.end_line,
-                })
-            })
-            .collect();
-        nav_counts_json_with_expand(
-            &store,
-            root,
-            "references",
-            query_symbol,
-            &project,
-            true,
-            total,
-            shown,
-            all,
-            hits,
-            expand.as_ref(),
-        )?;
-        return Ok(0);
-    }
-
-    if refs.is_empty() {
-        println!("(no references)");
-        return Ok(0);
-    }
-
-    let span_root = if code {
-        Some(resolve_root(root)?)
-    } else {
-        None
-    };
-    for r in &refs[..shown] {
-        println!(
-            "{} {} {}",
-            r.edge_type,
-            display_row_name(&r.node),
-            line_span(&r.node.file_path, r.node.start_line, r.node.end_line)
-        );
-        if let Some(root_path) = span_root.as_deref() {
-            if let Some(node) = store.get_node(r.node.id)? {
-                print_code_span(root_path, &node, CODE_SPAN_CAP);
-            }
-        }
-    }
-    print_nav_more_footer(total, shown);
-    if let Some(expand) = &expand {
-        println!("{}", expand.text_line());
-    }
-    Ok(0)
-}
-
 /// `greppy fan-in` / `greppy fan-out` — project-wide degree rankings over
 /// one edge type. These answer hotspot questions in one bounded command:
 /// "what is most called/referenced?" and "which symbols call the most?".
@@ -23963,7 +23776,6 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
-        Command::References { json, .. } => ("references", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
         Command::FanOut { json, .. } => ("fan-out", *json),
         Command::GraphLocate { json, .. } => ("graph-locate", *json),

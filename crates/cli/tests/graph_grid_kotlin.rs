@@ -290,7 +290,7 @@ fn graph_grid_kotlin_graph_survives_reindex() {
     );
 
     let (code, first_out, first_err) = run(
-        &["references", "helperFunction", "--json"],
+        &["who-calls", "helperFunction", "--json"],
         &repo,
         &store,
     );
@@ -304,7 +304,7 @@ fn graph_grid_kotlin_graph_survives_reindex() {
         "third Kotlin index should succeed; stderr={second_index_err}\nstdout={second_index_out}"
     );
     let (code, second_out, second_err) = run(
-        &["references", "helperFunction", "--json"],
+        &["who-calls", "helperFunction", "--json"],
         &repo,
         &store,
     );
