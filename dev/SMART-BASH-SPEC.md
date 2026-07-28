@@ -58,6 +58,34 @@ select, never invent. Failure modes are all graceful: a missed line costs
 comfort (skeleton + expand remain complete), a wrong pick costs noise, an
 invention is dropped before display. Daemon cold → skeleton alone.
 
+## Streaming (cargo & friends write continuously)
+
+The consumer is an agent, not a human at a terminal: it receives tool output
+only when the command ends, so the delivery unit is the COMPLETED output and
+the four layers run exactly once, at exit. There is no live display to feed —
+but continuous writers still dictate the capture mechanics:
+
+- **Drain and spool.** Both streams are drained continuously and spooled
+  incrementally to the pack store — never buffered in RAM. An undrained pipe
+  blocks the child at 64 KB and fakes a hang. The store has a size cap with
+  head-and-tail retention and an explicit gap marker; silent truncation is
+  exactly the harness behaviour this tool exists to end.
+- **No TTY, by design.** Under pipes most tools switch to line output
+  themselves. Residual `\r` rewrites count as rewrites of ONE line for
+  skeleton and collapse (else a progress bar is "a thousand lines"); the
+  stored bytes stay untouched — the byte gate refers to the store.
+- **Kill/timeout is a first-class outcome.** A killed command (cargo watch, a
+  hung test) delivers the full skeleton of the partial output plus the expand
+  id, the signal stated as such, an unterminated last line marked. Everything
+  accumulated until the kill is in the store — nothing is lost anymore.
+- **Per-line timestamps, layer 1.** Streaming yields the time of every line
+  for free; recorded as pack metadata. The line before the largest gap is
+  lifted on timeout walls — "where it hung" is the first thing the agent
+  needs.
+- **Interleaving is approximate.** stdout and stderr are captured separately
+  (stderr verbatim is a file-descriptor fact); relative order between the two
+  streams is therefore approximate and stated as such, not faked.
+
 Out of the box: model and head ship in the binary like everything else. No
 telemetry, no runtime learning, no state — identical behaviour everywhere.
 
