@@ -1,4 +1,4 @@
-# bash-smart — output specification and training annex (0.4.0)
+# bash-smart — output specification and training annex
 
 Owner-approved design, 2026-07-28/29. The shared laws of `dev/NAV-OUTPUT-SPEC.md`
 apply. Output is English.
@@ -108,7 +108,13 @@ lifted block must name the injected cause. The surprisal net needs no labels
 at all; its training is plain next-token loss on walls, and possibly the
 existing model suffices unmodified — measure before training.
 
-**Sequencing (owner decision):** 0.4.0, so that 0.3.0 does not wait for it.
+**Sequencing (owner decision, revised):** 0.3.0 never waits for bash-smart —
+in either direction. The training-free v1 (skeleton, collapse, expand,
+embedding-novelty lift, byte gate) is built as the fifth work order behind
+EDIT; whatever is fully accepted by the time the REST of 0.3.0 is production
+ready, ships with it — the rest ships 0.4.0. The trained classifier head is
+0.4.0 regardless: it hangs on the data pipeline. The prompt line enters
+AGENTS.md only when the shipped binary holds it.
 e2b therefore benches 0.3.0 without bash-smart; the ~40 shell-fallback burst
 turns of e2a stay visible in e2b and become the before-number for the 0.4.0
 measurement. The data work (M3 sighting, Sol extractors) may start any time —
