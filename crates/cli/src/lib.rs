@@ -9503,6 +9503,10 @@ struct EditOperation {
 /// text, and a handle for that new span.
 #[derive(Default)]
 struct EditRecord {
+    /// A verb-specific first line (`moved a -> b`). When set it replaces the
+    /// generic `applied file:span` line — the lifecycle verbs owe the caller
+    /// their own word, not a borrowed one.
+    headline: Option<String>,
     files: Vec<String>,
     span: Option<(usize, usize)>,
     text: Option<String>,
@@ -10871,6 +10875,12 @@ fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditResult<EditR
         })
         .unwrap_or_default();
     let mut record = EditRecord {
+        headline: Some(match (files.len(), dry_run) {
+            (1, false) => format!("reversed {}", files[0]),
+            (n, false) => format!("reversed {n} files"),
+            (1, true) => format!("would reverse {}", files[0]),
+            (n, true) => format!("would reverse {n} files"),
+        }),
         files,
         published: !dry_run,
         ..EditRecord::default()
@@ -10885,9 +10895,6 @@ fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditResult<EditR
         &dir.join(EDIT_JOURNAL_STACK),
         &serde_json::json!({ "transactions": stack }),
     );
-    record
-        .notes
-        .push(format!("reversed {} file(s)", record.files.len()));
     record
         .extra
         .push(("restored", serde_json::json!(restored)));
@@ -11474,6 +11481,11 @@ fn run_edit_move(
         .map(|reference| reference.file.clone())
         .collect();
     let mut record = EditRecord {
+        headline: Some(if dry_run {
+            format!("would move {rel} -> {new_rel}")
+        } else {
+            format!("moved {rel} -> {new_rel}")
+        }),
         files: std::iter::once(new_rel.clone())
             .chain(rewrote.iter().cloned())
             .collect(),
@@ -11585,6 +11597,11 @@ fn run_edit_remove(
         );
     }
     let mut record = EditRecord {
+        headline: Some(if dry_run {
+            format!("would remove {rel}")
+        } else {
+            format!("removed {rel}")
+        }),
         files: vec![rel.clone()],
         published: !dry_run,
         extra: vec![("references", serde_json::json!(references))],
@@ -11911,19 +11928,25 @@ fn emit_edit_outcome(
                         .map_err(|error| Error::Invalid(format!("serialize edit record: {error}")))?
                 );
             } else {
-                for (index, file) in record.files.iter().enumerate() {
-                    match record.span {
-                        // Success is one bare line: verb and address. The text
-                        // that landed is the text the caller sent (CAS), and
-                        // handles appear only where the spec orders them —
-                        // echoing either re-bills known bytes every turn.
-                        Some((first, last)) if index == 0 && first == last => {
-                            println!("applied {file}:{first}");
+                // Success is one bare line: verb and address. The text that
+                // landed is the text the caller sent (CAS); handles appear only
+                // where the spec orders them. A dry run must not say "applied"
+                // — it wrote nothing, and a receipt that overstates is the
+                // worst output this tool can produce.
+                let word = if record.published { "applied" } else { "would apply" };
+                if let Some(headline) = &record.headline {
+                    println!("{headline}");
+                } else {
+                    for (index, file) in record.files.iter().enumerate() {
+                        match record.span {
+                            Some((first, last)) if index == 0 && first == last => {
+                                println!("{word} {file}:{first}");
+                            }
+                            Some((first, last)) if index == 0 => {
+                                println!("{word} {file}:{first}-{last}");
+                            }
+                            _ => println!("{word} {file}"),
                         }
-                        Some((first, last)) if index == 0 => {
-                            println!("applied {file}:{first}-{last}");
-                        }
-                        _ => println!("applied {file}"),
                     }
                 }
                 for note in &record.notes {
