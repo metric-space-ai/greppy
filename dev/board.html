@@ -77,16 +77,18 @@
   <header>
     <div class="eyebrow">greppy 0.3.0 · CLI-Umbau</div>
     <h1>Jede Zeile eine Antwort, keine Verpackung</h1>
-    <p class="lede">Alle Arme werden auf eine Grammatik gebracht: nacktes Verb für den
-      Normalfall, benannte Spezialisten mit dem Trade-off im Namen, Fußflags nur wenn sie
-      für jede Zeile der Sektion gelten. Acht Wächter-Tests halten den System-Prompt.</p>
+    <p class="lede">Alle Arme auf einer Grammatik: nacktes Verb für den Normalfall,
+      Spezialisten mit dem Trade-off im Namen, Fußflags nur wenn sie für jede Zeile der
+      Sektion gelten. Der System-Prompt ist fertig und steht unter Wächter-Tests;
+      die Binärseite zieht Arm für Arm nach.</p>
   </header>
 
   <dl class="metrics">
     <div class="metric"><dt>0.2.1 gemessen</dt><dd>0,46×<small> Baseline</small></dd></div>
     <div class="metric"><dt>0.3.0 Ziel</dt><dd>&lt;0,30×<small> Baseline</small></dd></div>
-    <div class="metric"><dt>lib.rs</dt><dd>26k→10k<small> Zeilen</small></dd></div>
-    <div class="metric"><dt>Prompt-Wächter</dt><dd>8<small> Tests grün</small></dd></div>
+    <div class="metric"><dt>lib.rs</dt><dd>26k→10,5k<small> Zeilen · 13 Module</small></dd></div>
+    <div class="metric"><dt>Prompt-Wächter</dt><dd>11<small> Tests grün</small></dd></div>
+    <div class="metric"><dt>Trace-Sichtung</dt><dd>254<small> / 332 nutzbar</small></dd></div>
   </dl>
 
   <section>
@@ -96,44 +98,89 @@
         <thead><tr><th>Arm</th><th>Design</th><th>Umsetzung</th><th>Offen</th></tr></thead>
         <tbody>
           <tr>
-            <td><code>NAVIGATE</code><br>who-calls · callees · brief · impact · path</td>
-            <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
-            <td>who-calls ✓ · callees ✓ · impact ✓ (committet) · find-usages entfernt ✓ ·
-                path implementiert, <em>unverifiziert im Baum</em> · brief nur Spec</td>
-            <td>path-Abnahme, brief-Bau, Mehrfachsymbole</td>
-          </tr>
-          <tr>
             <td><code>SEARCH</code><br>search · search-symbol · search-pattern</td>
             <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
-            <td>Worker-Stand im Baum (Clap + 795 Zeilen search.rs, compiliert),
-                <em>unverifiziert, uncommittet</em> — Binary-Build für Abnahme läuft</td>
-            <td>Abnahmefälle, Kaskade prüfen, No-op-<code>--all</code> an path raus, Commit</td>
+            <td><span class="state s-done">gelandet</span> — Abnahme grün inkl.
+                Fehlschlag-Kaskade; Zähler-Bug (falsche Menge gezählt) behoben</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td><code>NAVIGATE</code><br>where-am-i · who-calls · callees · brief · impact · path</td>
+            <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
+            <td>who-calls ✓ · callees ✓ · impact ✓ (BFS-Baum, <code>(above)</code>) ·
+                path ✓ (Aufrufstellen-Baum, abgenommen) · find-usages restlos entfernt ✓ ·
+                <em>where-am-i: Sol baut</em> · brief: Spec fertig, Auftrag liegt bereit</td>
+            <td>where-am-i-Abnahme, brief-Bau, Mehrfachsymbole</td>
           </tr>
           <tr>
             <td><code>READ</code><br>read · read-smart · read-file</td>
             <td><span class="state s-done">Spec + Prompt + Wächter</span></td>
-            <td><span class="state s-open">nicht begonnen</span> — Auftrag liegt bereit,
-                startet nach dem search/path-Commit (Dateiüberschneidung)</td>
-            <td>kompletter Bau: --head/--tail, Tiefenfaltung, Seiten, Format-C-Handle</td>
+            <td><span class="state s-open">wartet</span> — Auftrag fertig, startet sobald
+                <code>cli_surface.rs</code> frei ist (Hotspot-seriell)</td>
+            <td>kompletter Bau: --head/--tail, Tiefenfaltung, Seiten, Lücken-Zeilen</td>
           </tr>
           <tr>
-            <td><code>ORIENT</code><br>map · outline · changes · verify</td>
-            <td><span class="state s-work">in Klärung</span> — Daseinsberechtigung je Tool
-                geklärt, Empfehlung: impact verliert --since/--base an changes</td>
-            <td><span class="state s-open">alt</span> — IST aufgenommen</td>
-            <td>Flag-Umzug entscheiden, dann Ausgabeformate</td>
+            <td><code>EDIT</code><br>11 Verben: replace-Familie · insert/delete · patch · write · rename · undo</td>
+            <td><span class="state s-done">Spec + Prompt + Wächter</span> — aus
+                Trace-Zählungen begründet (526 replace, 40 undo, Zoo = 0)</td>
+            <td><span class="state s-open">wartet</span> — Auftrag in 5 grünen Scheiben,
+                nach READ</td>
+            <td>alle 5 Scheiben; Quittungen <code>applied file:span id</code></td>
           </tr>
           <tr>
-            <td><code>EDIT</code></td>
-            <td><span class="state s-work">Stufe A + v8 eingefroren</span></td>
-            <td>Quittungen/Refusals gebaut (Stufe A) · Grammatik komplett</td>
-            <td>Abgleich gegen alle neuen Regeln, Escape-Asymmetrie, Stufe B/C</td>
+            <td><code>ORIENT</code></td>
+            <td><span class="state s-done">aufgelöst</span></td>
+            <td>map/outline/changes/verify gestrichen; Erbe: <code>where-am-i</code> als
+                Hub mit fraktaler Inventur (Repo→Modul→Datei), im Bau</td>
+            <td>—</td>
           </tr>
           <tr>
-            <td><code>expand</code> · CHAIN · ON&nbsp;EVERY&nbsp;COMMAND</td>
-            <td><span class="state s-open">offen</span></td>
-            <td>expand trägt read-smart/read-file/path/brief, ohne eigenen Vertrag</td>
-            <td>Pack-Ausgabe, Drift-Verweigerung, Id-Format; Pipe-Beispiele unter Wächter</td>
+            <td><code>bash-smart</code> (v1, trainingsfrei)</td>
+            <td><span class="state s-done">Spec</span> — Skelett · Wiederholungs-Kollaps ·
+                Novelty-Lift · Byte-Gate · expand</td>
+            <td><em>Sol baut</em> — 0.3.0 wartet nicht darauf, in keiner Richtung</td>
+            <td>Abnahme; Prompt-Zeile erst wenn das Binary sie hält</td>
+          </tr>
+          <tr>
+            <td>System-Prompt (AGENTS.md)</td>
+            <td><span class="state s-done">SOLL komplett</span></td>
+            <td><span class="state s-done">96 Zeilen, 11 Wächter</span> — Header, alle
+                Sektionen, Exit-Konventionen entschieden</td>
+            <td>Smoke-Pass Prompt ↔ Binary vor dem Bench</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Nebenschauplätze</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Strang</th><th>Stand</th><th>Nächster Schritt</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Daten-Pipeline (0.4.0-Klassifikator)</td>
+            <td><span class="state s-done">Sichtung komplett</span> — 345 HF-Datensätze:
+                332 erreichbar, deterministisch platziert (102 claude-code · 95 codex ·
+                55 pi · 2 hermes · 78 Müll), <strong>null Modell-Tokens</strong>;
+                Extraktoren (Sol) mit Fixtures 20/20 grün</td>
+            <td>Massenziehung auf gpu3 (Roh → NAS, Extraktion → NVMe), dann
+                200-Wall-Pilot mit M3-Labels + Kimi-5%-QA</td>
+          </tr>
+          <tr>
+            <td>Workjet-Härtung</td>
+            <td>Postmortem (10 Probleme, grep-belegt) + Umbau-Spec gepusht;
+                <em>Sol baut den Wrapper um</em> (--brief, Präambel-Injektion,
+                wip-Salvage, PID/Heartbeat, doctor)</td>
+            <td>Abnahme gegen Stub-Worker-Suite</td>
+          </tr>
+          <tr>
+            <td>e2b-Bench</td>
+            <td><span class="state s-open">gated</span> — läuft erst, wenn jede
+                Prompt-Zeile im Binary nachweisbar ist</td>
+            <td>Build CUDA-Default auf gpu3 · Vorindexieren · Daemon-Prewarm ·
+                RB1–8 + Reasoning · Kosten-Eval</td>
           </tr>
         </tbody>
       </table>
@@ -145,12 +192,16 @@
     <div class="findings">
       <div class="finding"><h3>13 % der Aufrufkanten sind geraten</h3>
         <p>314 von 2401 <code>CALLS</code>-Kanten zeigen auf mehrdeutige Namen; alle 11
-        Selbstkanten sind Fehlauflösungen. Trifft who-calls, callees, impact, path.</p></div>
-      <div class="finding"><h3>Gruppen-Importe halb extrahiert</h3>
-        <p><code>use crate::txn::{PlannedOp, Snapshot}</code> → Kante nur für den ersten Namen.</p></div>
+        Selbstkanten sind Fehlauflösungen. Trifft who-calls, callees, impact, path.
+        Resolver-Arbeit, nach 0.3.0 priorisiert.</p></div>
+      <div class="finding"><h3>Die first-rows-API sabotiert den Schema-Sniffer</h3>
+        <p>Lange message-Strings werden serverseitig gekappt → JSON-Parse scheitert genau
+        bei den inhaltsreichsten Datensätzen. Lösung: das selbstdeklarierte
+        <code>harness</code>-Feld; die Vollabzüge auf gpu3 sniffen wieder strukturell.</p></div>
       <div class="finding"><h3>Worker-Briefe schickten alle Worker in den Hauptcheckout</h3>
-        <p>„Work in ~/greppy-030" statt „your current directory" — Ursache der Tages-Verluste;
-        alle Briefe korrigiert, als Memory gesichert.</p></div>
+        <p>„Work in ~/greppy-030" statt „your current directory" — Ursache der
+        Tages-Verluste; alle Briefe korrigiert, Wrapper-Fix in Arbeit (Präambel +
+        Manipulationsprüfung), als Memory gesichert.</p></div>
       <div class="finding"><h3>GPU war Build-Opt-in</h3>
         <p><code>default = []</code> erzeugte CPU-Binaries (7,5 s statt 0,3 s je Satz).
         Jetzt Plattform-Default + <code>compile_error!</code>-Wächter, Ausweg <code>cpu-only</code>.</p></div>
@@ -160,15 +211,16 @@
   <section>
     <h2>Entscheidungen</h2>
     <ul class="log">
+      <li><time>29.07.</time><span>Sichtung deterministisch statt per M3-Flotte: Struktur-Sniff + <code>harness</code>-Selbstdeklaration + Event-Shape platzieren 325/332; 7 von Hand. M3-Kontingent bleibt für die Zeilen-Labels.</span></li>
+      <li><time>28.07.</time><span>bash-smart: v1 trainingsfrei hinter EDIT; fährt mit 0.3.0 nur wenn fertig, wenn der Rest fertig ist. Klassifikator-Kopf auf dem Embedding-Backbone (frozen) ist 0.4.0.</span></li>
+      <li><time>28.07.</time><span>Keine Lizenz-Prüfung der Trainingsdaten (Owner: technischer Tool-Output und LLM-Chats sind in der EU nicht schutzfähig). Secrets-Scrub nur falls generativ nachtrainiert wird.</span></li>
+      <li><time>28.07.</time><span>EDIT: 11 Verben, stdin-Default für NEW/DIFF, Verweigerung statt Bevormundung (<code>--expect N</code>), patch landet ganz oder gar nicht.</span></li>
       <li><time>28.07.</time><span>Fußflags gelten für jede Zeile ihrer Sektion; Kommando-Optionen stehen beim Kommando. Als Wächter-Test.</span></li>
-      <li><time>28.07.</time><span>Suchfamilie: <code>search</code> (Bedeutung, Default) · <code>search-symbol</code> · <code>search-pattern</code>; greps Exit-Codes; kein <code>--grep</code>.</span></li>
-      <li><time>28.07.</time><span>READ: <code>read</code> ist bytes und bedingungslos; <code>read-smart</code> faltet strukturell unter <code>--depth</code> (Default 1); <code>read-file</code> paginiert bei 400. <code>--context</code>, Rate-Heuristik, exit 10 tot.</span></li>
-      <li><time>28.07.</time><span>Expand nur als Differenzlieferung oder wo kein Flag hinreicht; Angebote nennen das vollständige Kommando und den Umfang.</span></li>
-      <li><time>28.07.</time><span><code>dev/</code>-Spezifikationen und Aufnahmen sind versioniert — waren gitignoriert und nur auf Platte.</span></li>
+      <li><time>28.07.</time><span>Expand nur als Differenzlieferung oder wo kein Flag hinreicht; Angebote nennen das vollständige Kommando und den Umfang; fraktales Größengesetz.</span></li>
       <li><time>28.07.</time><span>dev-0.3.0 wird nach jedem gelandeten Schritt per fast-forward nachgezogen.</span></li>
     </ul>
   </section>
 
-  <footer>Stand 28.07.2026 abends · Zweig recovery/cli-umbau, gepusht · Zahlen aus dev/captures/</footer>
+  <footer>Stand 29.07.2026 früh · 3 Sol-Läufe aktiv (where-am-i · bash-smart v1 · Wrapper-Umbau) · Zweig recovery/cli-umbau · Zahlen aus dev/captures/ und data/sighting/</footer>
 
 </div>
