@@ -2,9 +2,10 @@
 `greppy -n …`) it searches like grep and prints byte-identical output; `greppy rg …` does the same
 for ripgrep syntax. Everything else is listed below.
 
-Throughout: S is a symbol name — a function, method, class or type. If a name is ambiguous, use
-the qualified name that `search-symbols` printed. H is a handle, printed by `--handle`. A:B is a
-line range, 1-based, both ends included. Results are printed as `qualified_name file:line`.
+Throughout: S is a symbol name — a function, method, class or type. Where a name is defined more
+than once, qualify it with its file: `edit-src/data.rs::run`. H is a handle, printed by
+`--handle`. A:B is a line range, 1-based, both ends included. A result is printed as
+`file:line  name`; a result that lives in a test carries a trailing `test`.
 
 SEARCH:
   search-code "PATTERN" [PATH …]    every match, and for each one the definition it sits in,
@@ -20,17 +21,20 @@ SEARCH:
   --kind KIND       search-symbols, semantic-search: function, method, class, struct, enum, trait
 
 NAVIGATE:
-  who-calls S                       the callers of S (incoming calls)
-  callees S                         the functions S calls (outgoing calls)
-  brief S                           S's definition, its callers, its callees, and the tests that
-                                    reach it, in one call
-  impact S                          the code a change to S reaches (by default 6 steps of
-                                    incoming calls), and the tests among it
-  path --from A --to B              a call chain from A to B, if there is one
+  who-calls S                       every place that uses S: calls, imports, type references
+  callees S                         what S uses, and where those are defined
+  brief S                           what S does in one sentence, its signature, then its body
+                                    sketched: one line per step with the symbol used there and
+                                    what happens
+  impact S                          how far a change to S reaches, as a tree of callers, each
+                                    with what it does, tests marked
+  path --from A --to B              every call chain from A to B, as a tree of the call sites
+                                    they hang on
 
-  Each of these takes several symbols at once: `who-calls A B C` answers for each of them.
+  who-calls and callees answer for several symbols at once: `who-calls A B C`.
 
-  --code            also print each result's source and a handle for it
+  --code            also print the source at each reported location
+  --all             every result instead of the first few
   --depth N         impact: how many steps to walk instead of 6
   --direction incoming|outgoing     impact: which way to walk instead of incoming
 
