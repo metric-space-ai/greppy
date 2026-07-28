@@ -137,9 +137,13 @@
           <tr>
             <td><code>bash-smart</code> (v1, trainingsfrei)</td>
             <td><span class="state s-done">Spec</span> — Skelett · Wiederholungs-Kollaps ·
-                Novelty-Lift · Byte-Gate · expand</td>
-            <td><em>Sol baut</em> — 0.3.0 wartet nicht darauf, in keiner Richtung</td>
-            <td>Abnahme; Prompt-Zeile erst wenn das Binary sie hält</td>
+                Novelty-Lift · Byte-Gate · expand · <strong>Streaming</strong>
+                (Drain+Spool, kein TTY, Kill als vollwertiges Ergebnis,
+                Zeilen-Zeitstempel)</td>
+            <td><span class="state s-work">wip 1d1f203</span> — 39 Dateien, +3.340 Zeilen
+                gesichert; Lauf starb am Token</td>
+            <td>Whitelist-Prüfung (fasst parser/store an), Streaming-Abnahme;
+                Prompt-Zeile erst wenn das Binary sie hält</td>
           </tr>
           <tr>
             <td>System-Prompt (AGENTS.md)</td>
@@ -161,12 +165,22 @@
         <tbody>
           <tr>
             <td>Daten-Pipeline (0.4.0-Klassifikator)</td>
-            <td><span class="state s-done">Sichtung komplett</span> — 345 HF-Datensätze:
-                332 erreichbar, deterministisch platziert (102 claude-code · 95 codex ·
-                55 pi · 2 hermes · 78 Müll), <strong>null Modell-Tokens</strong>;
-                Extraktoren (Sol) mit Fixtures 20/20 grün</td>
-            <td>Massenziehung auf gpu3 (Roh → NAS, Extraktion → NVMe), dann
-                200-Wall-Pilot mit M3-Labels + Kimi-5%-QA</td>
+            <td><span class="state s-done">Sichtung + Pilot</span> — 332 Datensätze
+                platziert (254 nutzbar), <strong>null Modell-Tokens</strong>;
+                <strong>47.702 Walls</strong> aus 61 Datensätzen extrahiert;
+                Pilot: 178 Walls / 7.539 M3-gelabelte Zeilen;
+                Kimi-QA hob die Klassendefinitionen von 94,5 % → 57,6 % → 94,2 %
+                (jede Runde kostet 10 Walls, nicht 100k)</td>
+            <td>Envelope-Runde 2 (Kimi) für die 10 Null-Emit-Ursachen; danach
+                Seltenklassen-Vorfilter + M3-Massenlauf</td>
+          </tr>
+          <tr>
+            <td>Klassen-Schieflage (Owner-Direktive)</td>
+            <td>Pilot misst 68 % info / 25 % result / 1 % error — Gleichverteilung
+                braucht gezielte Akquise statt blindem Skalieren</td>
+            <td>Regex-Vorfilter routet Seltenklassen-Kandidaten bevorzugt in die
+                M3-Queue; GH-Actions-Failure-Logs + Breakage-Farm liefern die
+                Fehlerklassen-Masse; Rest via gewichtetem Loss</td>
           </tr>
           <tr>
             <td>Workjet-Härtung</td>
@@ -198,6 +212,14 @@
         <p>Lange message-Strings werden serverseitig gekappt → JSON-Parse scheitert genau
         bei den inhaltsreichsten Datensätzen. Lösung: das selbstdeklarierte
         <code>harness</code>-Feld; die Vollabzüge auf gpu3 sniffen wieder strukturell.</p></div>
+      <div class="finding"><h3>Selbstdeklaration lügt — Struktur schlägt Hint</h3>
+        <p>Datensätze mit <code>harness: codex</code> enthalten Pi-Eventströme: 40k Zeilen
+        liefen in den falschen Extraktor und emittierten null. Seither sniffed die
+        Extraktion strukturell und nutzt den Sichtungs-Hint nur als Rückfall.</p></div>
+      <div class="finding"><h3>Wächter-Tests greifen erst nach dem Modell-Guard</h3>
+        <p>Worker-Worktrees haben keine Modell-Assets (LFS-Gate im build.rs) — jede
+        Verifikation scheiterte am Build, nicht am Code. Assets werden jetzt in den
+        Worktree gespiegelt, bevor abgenommen wird.</p></div>
       <div class="finding"><h3>Worker-Briefe schickten alle Worker in den Hauptcheckout</h3>
         <p>„Work in ~/greppy-030" statt „your current directory" — Ursache der
         Tages-Verluste; alle Briefe korrigiert, Wrapper-Fix in Arbeit (Präambel +
@@ -221,6 +243,9 @@
     </ul>
   </section>
 
-  <footer>Stand 29.07.2026 früh · 3 Sol-Läufe aktiv (where-am-i · bash-smart v1 · Wrapper-Umbau) · Zweig recovery/cli-umbau · Zahlen aus dev/captures/ und data/sighting/</footer>
+  <footer>Stand 29.07.2026, 02 Uhr · Sol-Token abgelaufen: alle drei Läufe als wip
+    gesichert (79205ba where-am-i · 1d1f203 bash-smart · e6f12c3 Wrapper), warten auf
+    <code>cliproxyapi -codex-login</code> · Kimi trägt derweil die Pipeline ·
+    Zweig recovery/cli-umbau · Zahlen aus dev/captures/ und data/sighting/</footer>
 
 </div>
