@@ -36,15 +36,27 @@ overlap; a small head reads the hidden state at each line-end token — one
 prediction per line, ONE forward pass per window. Classes:
 
 ```
-error / warning / result / artifact / question / progress / info
+error / warning / question / artifact / progress / text
 + a continuation bit ("this line continues the previous one")
 ```
 
 The continuation bit lifts BLOCKS: a rust error is five lines, a traceback
 twenty — the engineer quotes the block, so the head must too. Display policy
-is derived, not judged: error, result, question and artifact blocks are lifted
-verbatim with line numbers; warnings are counted and sampled; progress stays
-collapsed; info stays in the pack.
+is derived, not judged: error, question and artifact blocks are lifted verbatim
+with line numbers; warnings are counted and sampled; progress stays collapsed;
+text stays in the pack unless layer 4 surfaces it.
+
+**Six classes, not seven — measured, 2026-07-29.** The original scheme split
+the remainder into `result` (the answer) and `info` (context). A 4-round
+double-labeling QA (M3 vs Kimi, ~470 lines per round) put the five specific
+classes near 100% agreement and made result/info oscillate 99 → 98 → 46 → 48
+with every wording change, in exact anti-phase with info: the boundary is a
+judgment call, not a definition gap. Deriving it from behaviour instead
+(lines reappearing in the agent's next turn) failed on the same data — 1 of 76
+error lines, 160 of 186 walls empty — because agents paraphrase rather than
+quote. So the tool never asks which prose line is "the answer": what the head
+cannot label reliably, the mechanics carry. Full evidence:
+`greppy-data-pipeline/docs/CLASS-SCHEME-DECISION.md`.
 
 **4. Surprisal net — for what no class catches.** In the same pass, per-line
 perplexity under the model; the most surprising unclassified lines are lifted
