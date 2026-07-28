@@ -76,9 +76,12 @@ eval anchor  the breakage farm: clone top repos, injure them deliberately
 ```
 
 No license screening (owner decision: technical tool output and LLM chat
-content carry no copyright in the EU). One technical scrub stays: secrets
-(API keys, tokens, credentialed URLs) are regex-scrubbed before any LM
-training — an embedded model must not memorize strangers' keys.
+content carry no copyright in the EU). Secrets scrubbing applies ONLY where
+training is generative: a classifier head outputs seven numbers and cannot
+reproduce anything, so head training needs no scrub — but a next-token
+fine-tune on walls feeds the SAME model that writes hint sentences, and only
+there could a memorized key ever resurface. If surprisal works without a
+fine-tune (measure first), the scrub is moot entirely.
 
 **Pipeline and fleet roles:**
 
