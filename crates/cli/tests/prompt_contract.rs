@@ -101,3 +101,41 @@ fn multi_symbol_is_promised_only_where_it_holds() {
         "path takes exactly one --from and one --to; got: {note}"
     );
 }
+
+/// Everything from `SEARCH:` up to the next section heading, same boundary rule
+/// as `navigate_section`.
+fn search_section(text: &str) -> String {
+    let mut lines = text.lines().skip_while(|line| *line != "SEARCH:");
+    let heading = lines.next().expect("AGENTS.md must have a SEARCH section");
+    let body = lines.take_while(|line| {
+        !(line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_uppercase()))
+    });
+    std::iter::once(heading)
+        .chain(body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn search_is_one_family_on_one_axis() {
+    let text = prompt();
+    for old in ["search-code", "search-symbols", "semantic-search"] {
+        assert!(
+            !text.contains(old),
+            "`{old}` was renamed in 0.3.0; the prompt must not resurrect it"
+        );
+    }
+    let section = search_section(&text);
+    for verb in ["search \"", "search-symbol NAME", "search-pattern REGEX"] {
+        assert!(
+            section.contains(verb),
+            "SEARCH must describe `{verb}`; section was:\n{section}"
+        );
+    }
+    // grep compatibility has a spelling already: grep's own, via the
+    // passthrough. A --grep flag would be a second spelling of it.
+    assert!(
+        !section.contains("--grep"),
+        "grep-compatible output is the passthrough, not a search flag"
+    );
+}

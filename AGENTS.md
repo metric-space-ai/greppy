@@ -8,17 +8,17 @@ than once, qualify it with its file: `edit-src/data.rs::run`. H is a handle, pri
 `file:line  name`; a result that lives in a test carries a trailing `test`.
 
 SEARCH:
-  search-code "PATTERN" [PATH …]    every match, and for each one the definition it sits in,
-                                    that definition's source, and a handle for it
-  search-symbols NAME               definitions whose name matches NAME (a name or a fragment)
-  semantic-search "PLAIN ENGLISH"   the definitions that do what you describe, found by meaning
-                                    rather than by name. Use it when you do not know what the
-                                    thing is called: "restrict a value to a range", "retry a
-                                    failed request", "where the session cookie is signed".
+  search "WHAT IT DOES"             definitions that do what you describe, found by meaning —
+                                    for when you do not know the name: "restrict a value to a
+                                    range", "retry a failed request"
+  search-symbol NAME                definitions whose name contains NAME, with their kind
+  search-pattern REGEX              every text occurrence, comments and strings included, with
+                                    the definition it sits in
 
-  --fixed           search-code: PATTERN is literal text, not a regular expression
-  --no-code         search-code: only the matching lines, without the surrounding definitions
-  --kind KIND       search-symbols, semantic-search: function, method, class, struct, enum, trait
+  --fixed           search-pattern: the argument is literal text, not a regular expression
+  --kind KIND       search, search-symbol: function, method, class, struct, enum, trait
+  --code            also print the source at each reported location
+  --all             every result instead of the first few
 
 NAVIGATE:
   who-calls S                       every place that uses S: calls, imports, type references
@@ -126,7 +126,7 @@ resulting text, and a handle for that new span, so nothing needs reading back.
   --report FILE     write the full record of the edit to a file
 
 CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
-  greppy search-symbols NAME --json | greppy read -
+  greppy search-symbol NAME --json | greppy read -
   greppy who-calls S --json | greppy brief -
   greppy edit apply --plan -
 
