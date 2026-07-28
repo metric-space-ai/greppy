@@ -1915,6 +1915,36 @@ pub(crate) fn nav_path_distances_to(
     Ok(distances)
 }
 
+/// Resolved edges collapse repeated calls from one definition to one target,
+/// so their `line` property is only the last occurrence inserted. Raw edges
+/// retain every occurrence. Path names one editable site per graph edge and
+/// consistently chooses the first call in source order.
+pub(crate) fn nav_path_first_sites(
+    store: &greppy_store::Store,
+    project: &str,
+    edge_type: &str,
+) -> Result<std::collections::HashMap<(String, String), u32>> {
+    let mut sites = std::collections::HashMap::new();
+    for edge in store.list_raw_edges(project)? {
+        if edge.edge_type != edge_type {
+            continue;
+        }
+        let Some(line) = edge
+            .properties
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .map(|line| line as u32)
+        else {
+            continue;
+        };
+        sites
+            .entry((edge.source_qname, edge.target_qname))
+            .and_modify(|first: &mut u32| *first = (*first).min(line))
+            .or_insert(line);
+    }
+    Ok(sites)
+}
+
 /// Collect at most eight simple paths in deterministic call-site order. The
 /// endpoint is accepted even when it is already on the current stack, which is
 /// what makes `--from A --to A` ask for a real cycle instead of inventing the
@@ -1927,6 +1957,7 @@ pub(crate) fn nav_collect_paths(
     edge_type: &str,
     max_hops: usize,
     distances: &std::collections::HashMap<i64, usize>,
+    first_sites: &std::collections::HashMap<(String, String), u32>,
     nodes: &mut std::collections::HashMap<i64, greppy_store::Node>,
     stack: &mut std::collections::HashSet<i64>,
     path: &mut Vec<NavPathStep>,
@@ -1954,11 +1985,18 @@ pub(crate) fn nav_collect_paths(
         let Some(target_node) = store.get_node(edge.target_id)? else {
             continue;
         };
-        let line = edge
-            .properties
-            .get("line")
-            .and_then(serde_json::Value::as_u64)
-            .map(|line| line as u32)
+        let line = first_sites
+            .get(&(
+                source.qualified_name.clone(),
+                target_node.qualified_name.clone(),
+            ))
+            .copied()
+            .or_else(|| {
+                edge.properties
+                    .get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|line| line as u32)
+            })
             .unwrap_or_else(|| source.start_line.max(1) as u32);
         nodes
             .entry(edge.target_id)
@@ -2011,6 +2049,7 @@ pub(crate) fn nav_collect_paths(
                 edge_type,
                 max_hops,
                 distances,
+                first_sites,
                 nodes,
                 stack,
                 path,
@@ -2248,6 +2287,7 @@ pub(crate) fn dispatch_path(
     };
 
     let distances = nav_path_distances_to(&store, to_id, &edge_upper, max_hops)?;
+    let first_sites = nav_path_first_sites(&store, &project, &edge_upper)?;
     let mut nodes = std::collections::HashMap::from([(from_id, start.clone())]);
     let mut stack = std::collections::HashSet::from([from_id]);
     let mut current_path = Vec::new();
@@ -2260,6 +2300,7 @@ pub(crate) fn dispatch_path(
         &edge_upper,
         max_hops,
         &distances,
+        &first_sites,
         &mut nodes,
         &mut stack,
         &mut current_path,

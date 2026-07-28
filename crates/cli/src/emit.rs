@@ -597,55 +597,59 @@ pub(crate) fn print_inference_daemons(daemons: &serde_json::Value) {
     }
 }
 
-pub(crate) fn print_search_code_no_matches(query: &str, fixed: bool, path_filters: &QueryPathFilters) {
-    println!("(no matches)");
-    println!(
-        "query_interpreted_as: {}",
-        if fixed { "literal" } else { "regex" }
-    );
-    if path_filters.is_empty() {
-        println!("path_filters: <none>");
-    } else {
-        println!("path_filters: {}", path_filters.shown());
-    }
-    if fixed
-        && query
-            .chars()
-            .any(|character| ".^$*+?()[]{}|\\".contains(character))
-    {
-        println!("hint: regex metacharacters are literal because --fixed was supplied");
-        let mut retry = format!("greppy search-code {}", shell_example_arg(query));
-        for filter in &path_filters.filters {
-            retry.push(' ');
-            retry.push_str(&shell_example_arg(&filter.shown));
+pub(crate) enum SearchRowDetail<'a> {
+    Sentence(&'a str),
+    Kind(&'a str),
+}
+
+/// The shared search-family row: one address, one short name, and only the
+/// command-specific fact the caller asked for.
+pub(crate) fn print_search_row(
+    file: &str,
+    line: i64,
+    name: &str,
+    detail: Option<SearchRowDetail<'_>>,
+    test: bool,
+) {
+    print!("{file}:{}  {name}", line.max(1));
+    match detail {
+        Some(SearchRowDetail::Sentence(sentence)) if !sentence.is_empty() => {
+            print!(" — {sentence}");
         }
-        println!("try without --fixed: {retry}");
+        Some(SearchRowDetail::Kind(kind)) if !kind.is_empty() => print!("  {kind}"),
+        _ => {}
     }
+    if test {
+        print!("  test");
+    }
+    println!();
+}
+
+pub(crate) fn print_search_source(source: &str) {
+    for line in source.lines() {
+        println!("{line}");
+    }
+}
+
+pub(crate) fn print_search_code_no_matches(
+    _query: &str,
+    _fixed: bool,
+    _path_filters: &QueryPathFilters,
+) {
+    println!("no matches");
 }
 
 pub(crate) fn print_search_code_entries(entries: &[SearchCodeEntry]) {
     for entry in entries {
         match entry {
-            SearchCodeEntry::Unenclosed(hit) => {
-                println!("{}  {}", hit.location, clamp_snippet(&hit.text));
-            }
-            SearchCodeEntry::Definition(definition) => {
-                println!(
-                    "{} {}:{}-{}",
-                    definition.qualified_name,
-                    definition.file,
-                    definition.start_line,
-                    definition.end_line
-                );
-                let width = definition.end_line.to_string().len();
-                for (offset, line) in definition.source.lines().enumerate() {
-                    println!(
-                        "  {:>width$} | {line}",
-                        definition.start_line + offset as i64
-                    );
-                }
-                println!("  handle: {}", definition.handle);
-            }
+            SearchCodeEntry::Unenclosed(hit) => println!("{}", hit.location),
+            SearchCodeEntry::Definition(definition) => print_search_row(
+                &definition.file,
+                definition.start_line,
+                definition.qualified_name.rsplit("::").next().unwrap_or(&definition.qualified_name),
+                None,
+                false,
+            ),
         }
     }
 }

@@ -579,43 +579,34 @@
     }
 
     #[test]
-    fn parse_semantic_search_flags() {
-        let cli =
-            Cli::try_parse_from(["greppy", "semantic-search", "--json", "retry handler"]).unwrap();
+    fn parse_search_family_surface_and_joinable_query() {
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "search",
+            "--json",
+            "retry",
+            "a",
+            "failed",
+            "request",
+        ])
+        .unwrap();
         match cli.command {
-            Some(Command::Semantic { queries, json, .. }) => {
-                assert_eq!(queries, vec!["retry handler".to_string()]);
+            Some(Command::Search {
+                query_parts, json, ..
+            }) => {
+                assert_eq!(query_parts, ["retry", "a", "failed", "request"]);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
 
-        assert!(
-            Cli::try_parse_from(["greppy", "semantic-search", "--vectors", "retry handler"])
-                .is_err()
-        );
-        assert!(Cli::try_parse_from([
-            "greppy",
-            "semantic-search",
-            "--embedding-model-dir",
-            "/models/embeddinggemma",
-            "retry handler"
-        ])
-        .is_err());
-
-        let cli = Cli::try_parse_from(["greppy", "semantic", "retry handler"]).unwrap();
-        match cli.command {
-            Some(Command::Semantic { queries, .. }) => {
-                assert_eq!(queries, vec!["retry handler".to_string()]);
-            }
-            other => panic!("unexpected command for semantic alias: {other:?}"),
+        for old in ["semantic-search", "semantic", "search-symbols", "search-code"] {
+            let parsed = Cli::try_parse_from(["greppy", old, "needle"]).unwrap();
+            assert!(parsed.command.is_none(), "{old}");
+            assert_eq!(parsed.passthrough.first().map(String::as_str), Some(old));
         }
-
-        // Postel: --path is an advisory no-op on semantic-search, not a parse error.
-        assert!(
-            Cli::try_parse_from(["greppy", "semantic-search", "merge", "--path", "src/x.ts"])
-                .is_ok()
-        );
+        assert!(Cli::try_parse_from(["greppy", "search-symbol", "retry_handler"]).is_ok());
+        assert!(Cli::try_parse_from(["greppy", "search-pattern", "retry.*handler"]).is_ok());
     }
 
     #[test]
@@ -717,7 +708,7 @@
         // OWNER HARD RULE (regression guard): embeddings must ALWAYS work by
         // default. With no --embedding-* flag/env, the resolver MUST fall back
         // to the baked-in EmbeddingGemma (never the "model required" error).
-        // This locks the fix for the regression where semantic-search silently
+        // This locks the fix for the regression where search silently
         // ran on the lexical/algorithmic path with no vectors at all.
         let cfg = embedding_config_required(EmbeddingCliArgs {
             device: None,
@@ -734,7 +725,7 @@
     fn cli_device_flags_parse_on_embedding_commands() {
         let cli = Cli::try_parse_from([
             "grep",
-            "semantic-search",
+            "search",
             "--device",
             "cuda",
             "refund workflow",
@@ -743,14 +734,14 @@
         assert_eq!(cli.device.as_deref(), Some("cuda"));
         assert!(!cli.no_gpu);
         match cli.command {
-            Some(Command::Semantic { queries, .. }) => {
-                assert_eq!(queries, vec!["refund workflow".to_string()]);
+            Some(Command::Search { query_parts, .. }) => {
+                assert_eq!(query_parts, vec!["refund workflow".to_string()]);
             }
             other => panic!("unexpected command: {other:?}"),
         }
         assert!(Cli::try_parse_from([
             "grep",
-            "semantic-search",
+            "search",
             "--device",
             "cuda",
             "--no-gpu",
@@ -1269,14 +1260,14 @@ where
         // RV-006: `--root` is a global flag, accepted on either side of
         // the subcommand. Both spellings must land in `cli.root`.
         let before =
-            Cli::try_parse_from(["greppy", "--root", "/repo", "search-code", "foo"]).unwrap();
+            Cli::try_parse_from(["greppy", "--root", "/repo", "search-pattern", "foo"]).unwrap();
         assert_eq!(before.root.as_deref(), Some("/repo"));
-        assert!(matches!(before.command, Some(Command::SearchCode { .. })));
+        assert!(matches!(before.command, Some(Command::SearchPattern { .. })));
 
         let after =
-            Cli::try_parse_from(["greppy", "search-code", "--root", "/repo", "foo"]).unwrap();
+            Cli::try_parse_from(["greppy", "search-pattern", "--root", "/repo", "foo"]).unwrap();
         assert_eq!(after.root.as_deref(), Some("/repo"));
-        assert!(matches!(after.command, Some(Command::SearchCode { .. })));
+        assert!(matches!(after.command, Some(Command::SearchPattern { .. })));
 
         // And it is honoured by `index` too.
         let idx = Cli::try_parse_from(["greppy", "--root", "/repo", "index", "."]).unwrap();
@@ -1285,136 +1276,14 @@ where
     }
 
     #[test]
-    fn search_code_changed_parses_as_explicit_scope() {
-        let cli = Cli::try_parse_from(["greppy", "search-code", "--changed", "--json", "needle"])
-            .unwrap();
-        match cli.command {
-            Some(Command::SearchCode {
-                query,
-                changed,
-                staged,
-                since,
-                base,
-                json,
-                no_code: _,
-                fixed: _,
-                code: _,
-                all: _,
-                paths: _,
-                path_opts: _,
-            }) => {
-                assert_eq!(query.as_deref(), Some("needle"));
-                assert!(changed);
-                assert!(!staged);
-                assert!(since.is_none());
-                assert!(base.is_none());
-                assert!(json);
+    fn search_pattern_rejects_removed_scope_flags() {
+        for flag in ["--changed", "--staged", "--since", "--base", "--no-code"] {
+            let mut argv = vec!["greppy", "search-pattern", flag];
+            if matches!(flag, "--since" | "--base") {
+                argv.push("HEAD");
             }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn search_code_staged_parses_as_explicit_scope() {
-        let cli =
-            Cli::try_parse_from(["greppy", "search-code", "--staged", "--json", "needle"]).unwrap();
-        match cli.command {
-            Some(Command::SearchCode {
-                query,
-                changed,
-                staged,
-                since,
-                base,
-                json,
-                no_code: _,
-                fixed: _,
-                code: _,
-                all: _,
-                paths: _,
-                path_opts: _,
-            }) => {
-                assert_eq!(query.as_deref(), Some("needle"));
-                assert!(!changed);
-                assert!(staged);
-                assert!(since.is_none());
-                assert!(base.is_none());
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn search_code_since_parses_as_explicit_scope() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "search-code",
-            "--since",
-            "HEAD~1",
-            "--json",
-            "needle",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::SearchCode {
-                query,
-                changed,
-                staged,
-                since,
-                base,
-                json,
-                no_code: _,
-                fixed: _,
-                code: _,
-                all: _,
-                paths: _,
-                path_opts: _,
-            }) => {
-                assert_eq!(query.as_deref(), Some("needle"));
-                assert!(!changed);
-                assert!(!staged);
-                assert_eq!(since.as_deref(), Some("HEAD~1"));
-                assert!(base.is_none());
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn search_code_base_parses_as_explicit_scope() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "search-code",
-            "--base",
-            "main",
-            "--json",
-            "needle",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::SearchCode {
-                query,
-                changed,
-                staged,
-                since,
-                base,
-                json,
-                no_code: _,
-                fixed: _,
-                code: _,
-                all: _,
-                paths: _,
-                path_opts: _,
-            }) => {
-                assert_eq!(query.as_deref(), Some("needle"));
-                assert!(!changed);
-                assert!(!staged);
-                assert!(since.is_none());
-                assert_eq!(base.as_deref(), Some("main"));
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
+            argv.push("needle");
+            assert!(Cli::try_parse_from(argv).is_err(), "{flag}");
         }
     }
 
@@ -1750,7 +1619,7 @@ where
             "greppy",
             "--root",
             "/repo",
-            "search-code",
+            "search-pattern",
             "q"
         ])));
         // Global --root before grep args is still a passthrough.

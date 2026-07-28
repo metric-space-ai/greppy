@@ -186,109 +186,166 @@ pub(crate) fn semantic_queries(raw: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// `search-symbols A B` — one lookup per name, each result attributed.
-pub(crate) fn dispatch_search_symbols_multi(
-    targets: &[String],
-    paths: &[String],
+fn search_all_nodes(
+    store: &greppy_store::Store,
+    project: &str,
+) -> Result<Vec<greppy_store::Node>> {
+    const PAGE: usize = 4096;
+    let mut nodes = Vec::new();
+    loop {
+        let page = store.list_nodes(project, "", "", nodes.len(), PAGE)?;
+        let done = page.len() < PAGE;
+        nodes.extend(page);
+        if done {
+            break;
+        }
+    }
+    nodes.retain(|node| {
+        !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+    });
+    Ok(nodes)
+}
+
+fn search_kind_matches(
+    root_path: &std::path::Path,
+    node: &greppy_store::Node,
     kind: Option<&str>,
-    json: bool,
-    root: Option<&str>,
-) -> Result<i32> {
-    if targets.len() <= 1 {
-        return dispatch_search_symbols(
-            targets.first().map(String::as_str),
-            paths,
-            kind,
-            json,
-            root,
-        );
+) -> bool {
+    let Some(kind) = kind else {
+        return true;
+    };
+    let lines = nav_file_lines(root_path, &node.file_path);
+    nav_kind_word(lines.as_ref(), node).eq_ignore_ascii_case(kind)
+}
+
+fn search_name_normalized(name: &str) -> String {
+    name.chars()
+        .filter(|character| *character != '_' && *character != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn search_identifier_words(name: &str) -> std::collections::BTreeSet<String> {
+    greppy_store::fts::camel_split(name)
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn search_sort_name_rows(query: &str, nodes: &mut [greppy_store::Node]) {
+    nodes.sort_by(|left, right| {
+        (left.name != query)
+            .cmp(&(right.name != query))
+            .then_with(|| left.name.chars().count().cmp(&right.name.chars().count()))
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+fn search_print_node_source(root_path: &std::path::Path, node: &greppy_store::Node) {
+    if let Some(span) = read_span_with_meta(
+        root_path,
+        &node.file_path,
+        node.start_line,
+        node.end_line,
+        usize::MAX,
+        false,
+    ) {
+        print_search_source(&span.text);
     }
-    let path_filters = prepare_query_path_filters(root, "search-symbols", "", paths)?;
-    let mut store = open_default_store(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-    let project = project_for(root)?;
-    let mut entries = Vec::with_capacity(targets.len());
-    let mut hits = Vec::new();
-    for query in targets {
-        let mut found = greppy_search::search_symbols_in_project(&store, &project, query, 10_000)?;
-        if let Some(want) = kind.map(|k| k.to_ascii_lowercase()) {
-            found.retain(|hit| {
-                store
-                    .get_node(hit.node_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|node| node.label.to_ascii_lowercase() == want)
-            });
-        }
-        let mut rows = Vec::new();
-        for hit in &found {
-            let Some(node) = store.get_node(hit.node_id)? else {
-                continue;
-            };
-            if !path_filters.matches(&node.file_path) {
-                continue;
+}
+
+fn search_print_symbol_rows(
+    root_path: &std::path::Path,
+    nodes: &[greppy_store::Node],
+    code: bool,
+) {
+    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    for (index, node) in nodes.iter().enumerate() {
+        let lines = source_cache
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+        let kind = nav_kind_word(lines.as_ref(), node);
+        let test = nav_is_test(lines.as_ref(), node);
+        print_search_row(
+            &node.file_path,
+            node.start_line,
+            &nav_short_name(node),
+            Some(SearchRowDetail::Kind(&kind)),
+            test,
+        );
+        if code {
+            search_print_node_source(root_path, node);
+            if index + 1 < nodes.len() {
+                println!();
             }
-            let mut value = node_hit_json(&node);
-            value["target"] = serde_json::json!(query);
-            value["label"] = serde_json::json!(&node.label);
-            value["name"] = serde_json::json!(&node.name);
-            rows.push(value);
         }
-        entries.push(serde_json::json!({
-            "symbol": query,
-            "symbol_found": !rows.is_empty(),
-            "total_exact": rows.len(),
-        }));
-        hits.extend(rows);
     }
-    let total = hits.len();
-    let end = cli_result_limit_raw().unwrap_or(usize::MAX).min(total);
-    let window = hits[..end].to_vec();
-    if json {
-        let value = serde_json::json!({
-            "command": "search-symbols",
-            "status": "ok",
-            "project": project,
-            "targets": entries,
-            "total_exact": total,
-            "shown": window.len(),
-            "hits": window,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|e| Error::Invalid(format!("serialize search-symbols JSON: {e}")))?
-        );
-        return Ok(0);
+}
+
+fn search_symbol_meaning_hits(
+    store: &greppy_store::Store,
+    project: &str,
+    root: Option<&str>,
+    root_path: &std::path::Path,
+    query: &str,
+    kind: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Vec<greppy_store::VectorSearchHit> {
+    const MEANING_FLOOR: f32 = 0.45;
+    let Ok(cfg) = embedding_config_for_required_use(embedding_args) else {
+        return Vec::new();
+    };
+    let Ok(generation) = current_graph_generation(store, root) else {
+        return Vec::new();
+    };
+    if !embedding_generation_complete(store, project, generation, &cfg.model_id) {
+        return Vec::new();
     }
-    for row in &window {
-        println!(
-            "{} {} {}:{}",
-            row["label"].as_str().unwrap_or(""),
-            row["qualified_name"].as_str().unwrap_or(""),
-            row["file"].as_str().unwrap_or(""),
-            row["line"].as_i64().unwrap_or(0)
-        );
-    }
-    Ok(0)
+    let Ok(query_vector) = embed_query_cached(&cfg, root, query) else {
+        return Vec::new();
+    };
+    let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
+        project,
+        &cfg.model_id,
+        Some(generation),
+        SEMANTIC_VECTOR_CANDIDATE_LIMIT,
+    );
+    scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
+    let Ok(candidates) = greppy_search::vector_search_exact(store, &query_vector, &scope) else {
+        return Vec::new();
+    };
+    dedupe_semantic_vector_hits(candidates, 8)
+        .into_iter()
+        .filter(|hit| hit.score >= MEANING_FLOOR)
+        .filter(|hit| {
+            hit.embedding
+                .node_id
+                .and_then(|id| store.get_node(id).ok().flatten())
+                .is_some_and(|node| search_kind_matches(root_path, &node, kind))
+        })
+        .collect()
 }
 
 pub(crate) fn dispatch_search_symbols(
     query: Option<&str>,
-    paths: &[String],
     kind: Option<&str>,
+    code: bool,
+    all: bool,
     json: bool,
+    embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
-        return Err(Error::Invalid("search-symbols requires a query".into()));
+        return Err(Error::Invalid("search-symbol requires a name".into()));
     }
-    let path_filters = prepare_query_path_filters(root, "search-symbols", q, paths)?;
+    let path_filters = QueryPathFilters::default();
     let mut store = open_default_store(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
-    // Symbol rows are visible only from a freshness-proven snapshot.
+    let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
     if let FreshnessServe::Refuse(freshness) = &decision {
         if json {
@@ -303,12 +360,9 @@ pub(crate) fn dispatch_search_symbols(
                 Some(0),
             )?;
         } else {
-            println!(
-                "{}",
-                indexed_stale_skip_message("search-symbols", freshness)
-            );
+            println!("{}", indexed_stale_skip_message("search-symbol", freshness));
         }
-        return Ok(freshness_refusal_exit(freshness));
+        return Ok(1);
     }
     let freshness = decision.freshness().clone();
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
@@ -327,41 +381,26 @@ pub(crate) fn dispatch_search_symbols(
         } else {
             println!(
                 "{}",
-                provider_incomplete_skip_message("search-symbols", incomplete_providers.len())
+                provider_incomplete_skip_message("search-symbol", incomplete_providers.len())
             );
         }
         return Ok(1);
     }
 
-    // Path/kind filters are post-query result filters: fetch broadly, then
-    // narrow on node metadata without changing symbol ranking/resolution.
-    let fetch = if kind.is_some() || !path_filters.is_empty() {
-        10_000
-    } else {
-        cli_result_limit(20)
-    };
-    let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
-    if let Some(k) = kind {
-        let want = k.to_ascii_lowercase();
-        hits.retain(|h| {
+    if json {
+        let fetch = if kind.is_some() { 10_000 } else { cli_result_limit(20) };
+        let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
+        hits.retain(|hit| {
             store
-                .get_node(h.node_id)
+                .get_node(hit.node_id)
                 .ok()
                 .flatten()
-                .map(|n| n.label.to_ascii_lowercase() == want)
-                .unwrap_or(false)
+                .is_some_and(|node| {
+                    node.name.contains(q) && search_kind_matches(&root_path, &node, kind)
+                })
         });
-    }
-    hits.retain(|hit| {
-        store
-            .get_node(hit.node_id)
-            .ok()
-            .flatten()
-            .is_some_and(|node| path_filters.matches(&node.file_path))
-    });
-    let total_filtered = hits.len() as i64;
-    hits.truncate(cli_result_limit(20));
-    if json {
+        let total_filtered = hits.len() as i64;
+        hits.truncate(cli_result_limit_unless_all(20, all));
         search_symbols_json(
             &store,
             q,
@@ -370,37 +409,88 @@ pub(crate) fn dispatch_search_symbols(
             Some(&freshness),
             &hits,
             &path_filters,
-            (!path_filters.is_empty() || kind.is_some()).then_some(total_filtered),
+            // The containment filter shapes `hits` on every run, so the total
+            // must count the same set on every run — a count from before the
+            // filter is a false number (measured: total_exact 2 beside 1 hit).
+            Some(total_filtered),
         )?;
         return Ok(if hits.is_empty() { 1 } else { 0 });
     }
-    if hits.is_empty() {
-        // A name that matches no definition is an empty answer, not a failure:
-        // `AGENTS.md` says such a question prints nothing and exits 0, and a
-        // caller that pipes `search-symbols` into `read -` must not receive a
-        // line of prose where it expects results. The path filter is the one
-        // thing worth saying, because it can be the reason the answer is empty.
-        if !path_filters.is_empty() {
-            println!("(no matches under path filter: {})", path_filters.shown());
-        }
-    } else {
-        for h in &hits {
-            // Resolve each FTS hit to its node so we can print the
-            // actionable label + qualified_name + file:line instead of
-            // a bare node id (matches the other query commands' output).
-            match store.get_node(h.node_id)? {
-                Some(n) => println!(
-                    "{} {} {}:{}",
-                    n.label,
-                    display_node_name(&n),
-                    n.file_path,
-                    n.start_line
-                ),
-                None => println!("node={}", h.node_id),
-            }
+
+    let mut nodes = search_all_nodes(&store, &project)?;
+    nodes.retain(|node| search_kind_matches(&root_path, node, kind));
+    let mut contained = nodes
+        .iter()
+        .filter(|node| node.name.contains(q))
+        .cloned()
+        .collect::<Vec<_>>();
+    search_sort_name_rows(q, &mut contained);
+    if !contained.is_empty() {
+        contained.truncate(cli_result_limit_unless_all(20, all));
+        search_print_symbol_rows(&root_path, &contained, code);
+        return Ok(0);
+    }
+
+    println!("no definition named `{q}`");
+
+    let wanted_normalized = search_name_normalized(q);
+    let mut similar = nodes
+        .iter()
+        .filter(|node| search_name_normalized(&node.name) == wanted_normalized)
+        .cloned()
+        .collect::<Vec<_>>();
+    if similar.is_empty() {
+        similar = nodes
+            .iter()
+            .filter(|node| levenshtein(&node.name.to_ascii_lowercase(), &q.to_ascii_lowercase()) <= 2)
+            .cloned()
+            .collect::<Vec<_>>();
+    }
+    if similar.is_empty() {
+        let wanted_words = search_identifier_words(q);
+        let best = nodes
+            .iter()
+            .map(|node| search_identifier_words(&node.name).intersection(&wanted_words).count())
+            .max()
+            .unwrap_or(0);
+        if best > 0 {
+            similar = nodes
+                .iter()
+                .filter(|node| {
+                    search_identifier_words(&node.name)
+                        .intersection(&wanted_words)
+                        .count()
+                        == best
+                })
+                .cloned()
+                .collect();
         }
     }
-    Ok(0)
+    if !similar.is_empty() {
+        search_sort_name_rows(q, &mut similar);
+        similar.truncate(cli_result_limit_unless_all(20, all));
+        println!();
+        println!("similar names:");
+        search_print_symbol_rows(&root_path, &similar, code);
+        return Ok(1);
+    }
+
+    let meaning = search_symbol_meaning_hits(
+        &store,
+        &project,
+        root,
+        &root_path,
+        q,
+        kind,
+        embedding_args,
+    );
+    if !meaning.is_empty() {
+        println!();
+        println!("closest by meaning:");
+        let purposes = semantic_vector_purposes(&store, root, &meaning, true)?;
+        print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), code)?;
+    }
+    Ok(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -604,90 +694,216 @@ pub(crate) fn search_code_entry_json(entry: &SearchCodeEntry) -> serde_json::Val
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug)]
+struct SearchPatternRow {
+    hit: SearchCodeMatchLine,
+    node: Option<greppy_store::Node>,
+    test: bool,
+}
+
+fn search_pattern_case_insensitive_hits(
+    query: &str,
+    root_path: &std::path::Path,
+    fixed: bool,
+) -> Result<Vec<greppy_search::CodeHit>> {
+    let overrides = discover_overrides_from_env()?;
+    let entries = greppy_discover::walk_with_policy_and_overrides(
+        root_path,
+        &greppy_discover::SkipPolicy::walk_default(),
+        &overrides,
+    )?;
+    let paths = entries
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for chunk in paths.chunks(128) {
+        let mut command = std::process::Command::new("grep");
+        command.args(["-H", "-n", "-I", "-i"]);
+        command.arg(if fixed { "-F" } else { "-E" });
+        command.arg("--").arg(query).args(chunk).current_dir(root_path);
+        let output = command
+            .output()
+            .map_err(|error| Error::io("spawn grep for case-insensitive search-pattern", error))?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(Error::Invalid(format!(
+                "grep source scan failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        hits.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(parse_grep_code_hit),
+        );
+    }
+    Ok(hits)
+}
+
+fn search_pattern_rows(
+    store: &greppy_store::Store,
+    project: &str,
+    root_path: &std::path::Path,
+    hits: &[greppy_search::CodeHit],
+    resolve_definitions: bool,
+    kind: Option<&str>,
+) -> Result<Vec<SearchPatternRow>> {
+    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut rows = Vec::new();
+    for hit in hits {
+        let Some(match_line) = parse_search_code_match(hit) else {
+            continue;
+        };
+        let node = if resolve_definitions {
+            greppy_search::definition_at(store, Some(project), &match_line.file, match_line.line)?
+                .and_then(|row| store.get_node(row.id).ok().flatten())
+        } else {
+            None
+        };
+        if kind.is_some()
+            && node
+                .as_ref()
+                .is_none_or(|node| !search_kind_matches(root_path, node, kind))
+        {
+            continue;
+        }
+        let test = node.as_ref().is_some_and(|node| {
+            let lines = source_cache
+                .entry(node.file_path.clone())
+                .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+            nav_is_test(lines.as_ref(), node)
+        });
+        rows.push(SearchPatternRow {
+            hit: match_line,
+            node,
+            test,
+        });
+    }
+    let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
+    for row in &rows {
+        *per_file.entry(row.hit.file.clone()).or_insert(0) += 1;
+    }
+    rows.sort_by(|left, right| {
+        per_file[&left.hit.file]
+            .cmp(&per_file[&right.hit.file])
+            .then_with(|| left.hit.file.cmp(&right.hit.file))
+            .then_with(|| left.hit.line.cmp(&right.hit.line))
+    });
+    Ok(rows)
+}
+
+fn print_search_pattern_rows(rows: &[SearchPatternRow], code: bool, all: bool) {
+    const FULL_LIMIT: usize = 25;
+    const SUMMARY_ROWS: usize = 5;
+    let mut per_file: std::collections::BTreeMap<&str, usize> = Default::default();
+    for row in rows {
+        *per_file.entry(&row.hit.file).or_insert(0) += 1;
+    }
+    let summarize = !all && rows.len() > FULL_LIMIT;
+    if summarize {
+        let mut spread = per_file.into_iter().collect::<Vec<_>>();
+        spread.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+        println!(
+            "{} matches: {}",
+            rows.len(),
+            spread
+                .into_iter()
+                .map(|(file, count)| format!("{file} {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!();
+    }
+    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
+    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
+    for (index, row) in rows.iter().take(shown).enumerate() {
+        if let Some(node) = &row.node {
+            print_search_row(
+                &row.hit.file,
+                row.hit.line,
+                &nav_short_name(node),
+                None,
+                row.test,
+            );
+        } else {
+            println!("{}:{}", row.hit.file, row.hit.line.max(1));
+        }
+        if code {
+            println!("{}", row.hit.text);
+            if index + 1 < shown {
+                println!();
+            }
+        }
+    }
+}
+
 pub(crate) fn dispatch_search_code(
     query: Option<&str>,
-    paths: &[String],
-    changed: bool,
-    staged: bool,
-    since: Option<&str>,
-    base: Option<&str>,
+    kind: Option<&str>,
+    code: bool,
+    all: bool,
     json: bool,
-    no_code: bool,
     fixed: bool,
     root: Option<&str>,
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
-        return Err(Error::Invalid("search-code requires a query".into()));
+        return Err(Error::Invalid("search-pattern requires a regular expression".into()));
     }
-    let path_filters = prepare_query_path_filters(root, "search-code", q, paths)?;
-    let git_scope_count = usize::from(changed)
-        + usize::from(staged)
-        + usize::from(since.is_some())
-        + usize::from(base.is_some());
-    if git_scope_count > 1 {
-        return Err(Error::Invalid(
-            "search-code accepts only one git scope flag at a time".into(),
-        ));
-    }
-    if changed {
-        return dispatch_search_code_changed(q, json, fixed, root, &path_filters);
-    }
-    if staged {
-        return dispatch_search_code_staged(q, json, fixed, root, &path_filters);
-    }
-    if let Some(rev) = since {
-        return dispatch_search_code_since(q, rev, json, fixed, root, &path_filters);
-    }
-    if let Some(rev) = base {
-        return dispatch_search_code_base(q, rev, json, fixed, root, &path_filters);
-    }
-
+    let path_filters = QueryPathFilters::default();
     let store = open_default_store(root)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
     let resolve_definitions = matches!(decision, FreshnessServe::Fresh(_));
-    let status = if resolve_definitions {
-        "ok"
-    } else {
-        "live-fallback"
-    };
-    if let FreshnessServe::Refuse(freshness) = &decision {
-        if !json {
-            eprintln!(
-                "{}; falling back to live grep",
-                indexed_stale_skip_message("search-code", freshness)
-            );
-        }
+    let status = if resolve_definitions { "ok" } else { "live-fallback" };
+    let all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
+
+    if json {
+        let shown_hits = all_hits
+            .iter()
+            .take(cli_result_limit(SEARCH_CODE_LIMIT))
+            .cloned()
+            .collect::<Vec<_>>();
+        emit_search_code_results_with_format(
+            &store,
+            q,
+            &project,
+            status,
+            Some(decision.freshness()),
+            all_hits.len(),
+            &shown_hits,
+            &path_filters,
+            &root_path,
+            true,
+            false,
+            fixed,
+            resolve_definitions,
+        )?;
+        return Ok(if all_hits.is_empty() { 1 } else { 0 });
     }
-    let all_hits = if path_filters.is_empty() {
-        live_grep_code_hits_pattern(q, &root_path, fixed)?
-    } else {
-        live_grep_code_hits_filtered_pattern(q, &root_path, &path_filters, fixed)?
-    };
-    let shown_hits = all_hits
-        .iter()
-        .take(cli_result_limit(SEARCH_CODE_LIMIT))
-        .cloned()
-        .collect::<Vec<_>>();
-    emit_search_code_results_with_format(
+
+    let rows = search_pattern_rows(
         &store,
-        q,
         &project,
-        status,
-        Some(decision.freshness()),
-        all_hits.len(),
-        &shown_hits,
-        &path_filters,
         &root_path,
-        json,
-        no_code,
-        fixed,
+        &all_hits,
         resolve_definitions,
+        kind,
     )?;
-    Ok(if all_hits.is_empty() { 1 } else { 0 })
+    if rows.is_empty() {
+        println!("no matches");
+        let insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
+        if !insensitive.is_empty() {
+            println!("case-insensitive: {} matches", insensitive.len());
+        }
+        return Ok(1);
+    }
+    print_search_pattern_rows(&rows, code, all);
+    Ok(0)
 }
 
 pub(crate) fn dispatch_search_code_changed(
@@ -969,16 +1185,95 @@ pub(crate) fn search_code_diff_scope_json(
     Ok(())
 }
 
+fn search_sentence(raw: &str) -> Option<String> {
+    let sentence = raw.trim().trim_end_matches('.').trim();
+    if sentence.is_empty() {
+        return None;
+    }
+    let mut chars = sentence.chars();
+    let first = chars.next()?.to_lowercase().to_string();
+    Some(format!("{first}{}", chars.as_str()))
+}
+
+fn print_search_meaning_rows(
+    store: &greppy_store::Store,
+    root_path: &std::path::Path,
+    hits: &[greppy_store::VectorSearchHit],
+    purposes: Option<&[SemanticVectorPurpose]>,
+    code: bool,
+) -> Result<()> {
+    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    for (index, hit) in hits.iter().enumerate() {
+        let node = hit
+            .embedding
+            .node_id
+            .and_then(|id| store.get_node(id).ok().flatten());
+        let purpose = vector_purpose_for_hit(purposes, hit);
+        let sentence = purpose
+            .and_then(|purpose| purpose.bullets.first())
+            .and_then(|sentence| search_sentence(sentence));
+        if let Some(node) = node.as_ref() {
+            let lines = source_cache
+                .entry(node.file_path.clone())
+                .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+            let test = nav_is_test(lines.as_ref(), node);
+            print_search_row(
+                &node.file_path,
+                node.start_line,
+                &nav_short_name(node),
+                sentence.as_deref().map(SearchRowDetail::Sentence),
+                test,
+            );
+            if code {
+                search_print_node_source(root_path, node);
+            }
+        } else {
+            let name = hit
+                .embedding
+                .qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(&hit.embedding.qualified_name);
+            print_search_row(
+                &hit.embedding.file_path,
+                hit.embedding.start_line,
+                name,
+                sentence.as_deref().map(SearchRowDetail::Sentence),
+                false,
+            );
+            if code {
+                if let Some(span) = read_span_with_meta(
+                    root_path,
+                    &hit.embedding.file_path,
+                    hit.embedding.start_line,
+                    hit.embedding.end_line,
+                    usize::MAX,
+                    false,
+                ) {
+                    print_search_source(&span.text);
+                }
+            }
+        }
+        if code && index + 1 < hits.len() {
+            println!();
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn dispatch_semantic(
     query: Option<&str>,
     paths: &[String],
+    kind: Option<&str>,
+    code: bool,
+    _all: bool,
     json: bool,
     embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
-        return Err(Error::Invalid("semantic-search requires a query".into()));
+        return Err(Error::Invalid("search requires a plain-English query".into()));
     }
     // Result purposes reach the Qwen daemon; overlap its model load with the
     // embedding query and vector search.
@@ -1017,15 +1312,19 @@ pub(crate) fn dispatch_semantic(
     let cfg = match embedding_config_for_required_use(embedding_args) {
         Ok(cfg) => cfg,
         Err(error) if embedding_asset_missing_error(&error) => {
-            emit_semantic_backend_unavailable(
-                &project,
-                q,
-                paths,
-                root,
-                json,
-                "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
-            )?;
-            return Ok(i32::from(EXIT_NOT_IMPLEMENTED));
+            if json {
+                emit_semantic_backend_unavailable(
+                    &project,
+                    q,
+                    paths,
+                    root,
+                    true,
+                    "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
+                )?;
+            } else {
+                println!("semantic index unavailable — embedding assets could not be resolved");
+            }
+            return Ok(1);
         }
         Err(error) => return Err(error),
     };
@@ -1080,9 +1379,8 @@ pub(crate) fn dispatch_semantic(
                 )?;
             } else {
                 println!("{}", embedding_progress_text(&progress));
-                print_semantic_fallback_commands(q, paths, root);
             }
-            return Ok(i32::from(EXIT_TEMPFAIL));
+            return Ok(1);
         }
         let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
             &project,
@@ -1109,7 +1407,6 @@ pub(crate) fn dispatch_semantic(
                     "semantic index unavailable — 0 indexed spans for model {}",
                     cfg.model_id
                 );
-                print_semantic_fallback_commands(q, paths, root);
             }
             return Ok(freshness_refusal_exit(&freshness));
         }
@@ -1140,26 +1437,39 @@ pub(crate) fn dispatch_semantic(
                 scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
                 let mut candidates =
                     greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
-                candidates.retain(|hit| path_filters.matches(&hit.embedding.file_path));
-                let hits = dedupe_semantic_vector_hits(
-                    candidates,
-                    cli_result_limit(SEMANTIC_VECTOR_RESULT_LIMIT),
-                );
-                let shown = hits
-                    .len()
-                    .min(cli_result_limit(SEMANTIC_VECTOR_DISPLAY_LIMIT));
-                let display_hits = hits[..shown].to_vec();
-                let further_hits = &hits[shown..];
-                let purposes = semantic_vector_purposes(&store, root, &display_hits, true)?;
-                let expand = insert_semantic_vector_expand_pack(
-                    &store,
-                    root,
-                    &project,
-                    q,
-                    generation,
-                    further_hits,
-                );
+                let root_path = resolve_root(root)?;
+                candidates.retain(|hit| {
+                    path_filters.matches(&hit.embedding.file_path)
+                        && kind.is_none_or(|kind| {
+                            hit.embedding
+                                .node_id
+                                .and_then(|id| store.get_node(id).ok().flatten())
+                                .is_some_and(|node| {
+                                    search_kind_matches(&root_path, &node, Some(kind))
+                                })
+                        })
+                });
+                let result_limit = if json {
+                    cli_result_limit(SEMANTIC_VECTOR_RESULT_LIMIT)
+                } else {
+                    cli_result_limit(8).min(8)
+                };
+                let hits = dedupe_semantic_vector_hits(candidates, result_limit);
                 if json {
+                    let shown = hits
+                        .len()
+                        .min(cli_result_limit(SEMANTIC_VECTOR_DISPLAY_LIMIT));
+                    let display_hits = hits[..shown].to_vec();
+                    let further_hits = &hits[shown..];
+                    let purposes = semantic_vector_purposes(&store, root, &display_hits, true)?;
+                    let expand = insert_semantic_vector_expand_pack(
+                        &store,
+                        root,
+                        &project,
+                        q,
+                        generation,
+                        further_hits,
+                    );
                     semantic_vector_json_with_expand(
                         &store,
                         &project,
@@ -1175,15 +1485,17 @@ pub(crate) fn dispatch_semantic(
                         expand.as_ref(),
                     )?;
                 } else if hits.is_empty() {
-                    println!("(no vector matches)");
+                    println!("no matches");
                     return Ok(1);
                 } else {
-                    for h in &display_hits {
-                        print_semantic_vector_hit(h, purposes.as_deref());
-                    }
-                    if let Some(expand) = &expand {
-                        println!("{}", expand.semantic_text_line());
-                    }
+                    let purposes = semantic_vector_purposes(&store, root, &hits, true)?;
+                    print_search_meaning_rows(
+                        &store,
+                        &root_path,
+                        &hits,
+                        purposes.as_deref(),
+                        code,
+                    )?;
                 }
                 Ok(if hits.is_empty() { 1 } else { 0 })
             }

@@ -767,23 +767,20 @@ fn trace_depth_zero_returns_only_start() {
 fn search_symbols_prints_label_and_file_line() {
     let (repo, store) = index_fixture("symbols");
 
-    let (code, out, err) = run(&["search-symbols", "Widget"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "Widget"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
-        out.contains("Widget"),
-        "search-symbols must find the Widget symbol; got: {out:?}"
+        out.contains("src/types.rs:") && out.contains("Widget"),
+        "search-symbol prints file:line and the name; got: {out:?}"
     );
     assert!(
-        out.contains("src/types.rs:"),
-        "search-symbols must print the symbol's file:line; got: {out:?}"
-    );
-    assert!(
-        // Rust struct defs are labeled `Class` (C-reference parity).
-        out.contains("Class"),
-        "search-symbols must print the node label (Class); got: {out:?}"
+        // The kind is the declaring keyword in the source, in the language's
+        // own words — a Rust struct is a struct, not the index label `Class`.
+        out.contains("struct") && !out.contains("Class"),
+        "search-symbol prints the source kind; got: {out:?}"
     );
 }
 
@@ -791,10 +788,10 @@ fn search_symbols_prints_label_and_file_line() {
 fn search_symbols_json_reports_exact_counts_and_metadata() {
     let (repo, store) = index_fixture("symbols-json");
 
-    let (code, out, err) = run(&["search-symbols", "Widget", "--json"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "Widget", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols --json should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol --json should exit 0; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -1305,18 +1302,13 @@ fn impact_incoming_reports_transitive_callers_in_one_call() {
 
     let (code, out, err) = run(&["impact", "hub"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}");
-    let hop_rows = out.lines().filter(|l| l.starts_with("hop ")).count();
-    assert_eq!(
-        hop_rows, 40,
-        "impact must cap at NAV_LIMIT rows; got {hop_rows}\n{out}"
-    );
+    // The answer is a tree: one row per reached caller, indentation is the
+    // route. No `hop N` prefixes, no truncation footer, no expand offer.
+    let rows = out.lines().filter(|l| l.contains("caller_")).count();
+    assert_eq!(rows, 60, "impact reaches all 60 callers; got {rows}\n{out}");
     assert!(
-        out.contains("hop 1") && out.contains("caller_"),
-        "impact must report transitive callers at their hop distance; got: {out}"
-    );
-    assert!(
-        out.contains("40 shown of 60 total"),
-        "impact must carry the truncation footer with the true total; got: {out}"
+        !out.contains("hop ") && !out.contains("shown of") && !out.contains("Expand:"),
+        "the flat hop list is gone; got: {out}"
     );
 }
 
@@ -1577,27 +1569,30 @@ fn class_navigation_is_first_class_for_callees_brief_imports_and_search_symbols(
 
     let (code, out, err) = run(&["impact", "RunnerFilter"], &repo, &store);
     assert_eq!(code, 0, "impact RunnerFilter should exit 0; stderr={err}");
+    // The tree lists the functions a change reaches. Module rows were file
+    // anchors wearing a kind — bookkeeping, not symbols an agent can act on —
+    // and they are filtered like `__file__` everywhere else.
     assert!(
-        out.contains("build_filter") && out.contains("Module checkov/cloudformation/runner.py"),
-        "impact on a class must include CALLS and IMPORTS dependents; got: {out}"
+        out.contains("build_filter") && out.contains("use_filter") && !out.contains("Module "),
+        "impact on a class reaches its instantiating functions; got: {out}"
     );
     assert!(
         !out.contains("__file__"),
         "impact must not leak synthetic file qnames; got: {out}"
     );
 
-    let (code, out, err) = run(&["search-symbols", "RunnerFilter"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "RunnerFilter"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols RunnerFilter should exit 0; stderr={err}"
+        "search-symbol RunnerFilter should exit 0; stderr={err}"
     );
     assert!(
-        out.contains("Class") && out.contains("RunnerFilter"),
-        "search-symbols must still find the class definition; got: {out}"
+        out.contains("RunnerFilter") && out.contains("class"),
+        "search-symbol finds the class with its source kind; got: {out}"
     );
     assert!(
         !out.contains("__file__") && !out.contains(":0") && !out.contains("File "),
-        "search-symbols must suppress synthetic file anchors; got: {out}"
+        "search-symbol must suppress synthetic file anchors; got: {out}"
     );
 }
 

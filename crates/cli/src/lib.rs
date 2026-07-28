@@ -1182,11 +1182,10 @@ const SUBCOMMANDS: &[&str] = &[
     "fan-out",
     "graph-locate",
     "path",
-    "search-code",
-    "search-symbols",
+    "search",
+    "search-symbol",
+    "search-pattern",
     "plus",
-    "semantic-search",
-    "semantic",
     "context",
     "install",
     "uninstall",
@@ -1230,7 +1229,15 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     // called "Snapshot" -- measured: exit 2, "No such file or directory". The
     // list names no successor and never will; it exists so a verb that was
     // removed cannot come back as a search pattern.
-    if matches!(verb, "find-usages" | "references") {
+    if matches!(
+        verb,
+        "find-usages"
+            | "references"
+            | "semantic-search"
+            | "semantic"
+            | "search-symbols"
+            | "search-code"
+    ) {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
     }
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
@@ -1249,7 +1256,7 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     } else {
         message.push_str(
             "\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
-             impact, brief, semantic-search, search-code, search-symbols, path, \
+             impact, brief, search, search-symbol, search-pattern, path, \
              read, edit)",
         );
     }
@@ -1411,7 +1418,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             } else {
                 println!(
                     "usage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
-                     impact, brief, semantic-search, search-code, search-symbols, \
+                     impact, brief, search, search-symbol, search-pattern, \
                      path, index status)"
                 );
             }
@@ -1718,15 +1725,15 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
              change-signature|ensure-import|data|apply|undo|recover> --help"
         }
         "expand" => "greppy expand ID [--json] [--root DIR]",
-        "semantic-search" | "semantic" => {
-            "greppy semantic-search \"QUERY\" [--path PATH] [--json] [--root DIR]"
+        "search" => {
+            "greppy search WHAT IT DOES [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
         }
         "context" => "greppy context \"QUERY\" [--root DIR]",
-        "search-code" => {
-            "greppy search-code PATTERN [PATH ...] [--no-code] [--fixed] [--json] [--root DIR]"
+        "search-pattern" => {
+            "greppy search-pattern REGEX [--fixed] [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
         }
-        "search-symbols" => {
-            "greppy search-symbols NAME [NAME ...] [--path PATH] [--kind function|method|struct|class] [--json] [--root DIR]"
+        "search-symbol" => {
+            "greppy search-symbol NAME [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
@@ -2515,8 +2522,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     println!("       index PATH  who-calls S   callees S");
     println!("       trial --root DIR --question Q --check who-calls --symbol S ...");
     println!("       references S (who depends on S)   impact S [--direction incoming|outgoing]");
-    println!("       brief S   semantic-search \"QUERY\"");
-    println!("       search-code Q   search-symbols NAME [--kind function|method|struct|class]");
+    println!("       brief S   search WHAT IT DOES");
+    println!("       search-symbol NAME   search-pattern REGEX");
     println!("       index status   (--help for full details)");
     Ok(EXIT_USAGE as i32)
 }
@@ -2814,53 +2821,37 @@ fn dispatch_subcommand(
             code: _,
             all: _,
         } => dispatch_path(from.as_deref(), to.as_deref(), &edge, json, root),
-        Command::SearchCode {
+        Command::SearchPattern {
             query,
-            mut paths,
-            path_opts,
-            changed,
-            staged,
-            since,
-            base,
             json,
-            no_code,
             fixed,
-            code: _,
-            all: _,
-        } => {
-            // `AGENTS.md` keeps `search-code "PATTERN" [PATH …]`: the grep-shaped
-            // verb is the one place where a positional path is the convention,
-            // not a filter smuggled in behind a target. Rule 1 still applies to
-            // it — a path that is not there cannot narrow anything, so it is a
-            // mistake, never an empty scope.
-            validate_path_filters(root, &paths, "path")?;
-            validate_path_filters(root, &path_opts, "--path")?;
-            paths.extend(path_opts);
-            dispatch_search_code(
-                query.as_deref(),
-                &paths,
-                changed,
-                staged,
-                since.as_deref(),
-                base.as_deref(),
-                json,
-                no_code,
-                fixed,
-                root,
-            )
-        }
-        Command::SearchSymbols {
-            queries,
-            path_opts,
+            kind,
+            code,
+            all,
+        } => dispatch_search_code(
+            query.as_deref(),
+            kind.as_deref(),
+            code,
+            all,
+            json,
+            fixed,
+            root,
+        ),
+        Command::SearchSymbol {
+            query,
             kind,
             json,
-            code: _,
-            all: _,
-        } => {
-            let targets = nav_targets(&queries)?;
-            validate_path_filters(root, &path_opts, "--path")?;
-            dispatch_search_symbols_multi(&targets, &path_opts, kind.as_deref(), json, root)
-        }
+            code,
+            all,
+        } => dispatch_search_symbols(
+            query.as_deref(),
+            kind.as_deref(),
+            code,
+            all,
+            json,
+            EmbeddingCliArgs { device, no_gpu },
+            root,
+        ),
         Command::Plus {
             query,
             k,
@@ -2876,33 +2867,24 @@ fn dispatch_subcommand(
             EmbeddingCliArgs { device, no_gpu },
             root,
         ),
-        Command::Semantic {
-            queries,
-            path_opts,
+        Command::Search {
+            query_parts,
+            kind,
             json,
+            code,
+            all,
         } => {
-            validate_path_filters(root, &path_opts, "--path")?;
-            let queries = semantic_queries(&queries)?;
-            let mut last = 0;
-            for query in &queries {
-                last = dispatch_semantic(
-                    Some(query.as_str()),
-                    &path_opts,
-                    json,
-                    EmbeddingCliArgs { device, no_gpu },
-                    root,
-                )?;
-            }
-            if queries.is_empty() {
-                last = dispatch_semantic(
-                    None,
-                    &path_opts,
-                    json,
-                    EmbeddingCliArgs { device, no_gpu },
-                    root,
-                )?;
-            }
-            Ok(last)
+            let query = query_parts.join(" ");
+            dispatch_semantic(
+                (!query.trim().is_empty()).then_some(query.as_str()),
+                &[],
+                kind.as_deref(),
+                code,
+                all,
+                json,
+                EmbeddingCliArgs { device, no_gpu },
+                root,
+            )
         }
         Command::Context {
             query,
@@ -10258,10 +10240,10 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::FanOut { json, .. } => ("fan-out", *json),
         Command::GraphLocate { json, .. } => ("graph-locate", *json),
         Command::Path { json, .. } => ("path", *json),
-        Command::SearchCode { json, .. } => ("search-code", *json),
-        Command::SearchSymbols { json, .. } => ("search-symbols", *json),
+        Command::SearchPattern { json, .. } => ("search-pattern", *json),
+        Command::SearchSymbol { json, .. } => ("search-symbol", *json),
         Command::Plus { json, .. } => ("plus", *json),
-        Command::Semantic { json, .. } => ("semantic-search", *json),
+        Command::Search { json, .. } => ("search", *json),
         Command::Context { json, .. } => ("context", *json),
         _ => return None,
     };

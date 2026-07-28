@@ -20,13 +20,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 )]
 pub struct Cli {
     /// Explicit repository root (RV-006). When set, `index` and every
-    /// query subcommand (search-graph / trace / search-code /
-    /// search-symbols / semantic-search) key the on-disk store and the project
+    /// query subcommand (search-graph / trace / search-pattern /
+    /// search-symbol / search) key the on-disk store and the project
     /// identity on this path instead of detecting the repo root by
     /// walking up from the current directory. `global = true` lets it be
     /// passed either before or after the subcommand:
-    ///   grep --root /repo search-code foo
-    ///   grep search-code --root /repo foo
+    ///   grep --root /repo search-pattern foo
+    ///   grep search-pattern --root /repo foo
     #[arg(long, global = true)]
     pub root: Option<String>,
 
@@ -86,7 +86,7 @@ pub enum Command {
     /// One line per definition in that file: kind, signature, span.
     #[command(
         after_help = "Example:\n  greppy outline src/lib.rs\n\n\
-                      `search-symbols` looks a name up across the repository; `outline` answers\n\
+                      `search-symbol` looks a name up across the repository; `outline` answers\n\
                       what stands in THIS file, in the order it stands there."
     )]
     Outline {
@@ -204,7 +204,7 @@ pub enum Command {
     /// One-call briefing for a symbol: its definition (with source), its direct
     /// callers, and its direct callees — everything an agent needs to answer
     /// "how does S work / what is its role / what depends on it" in a SINGLE
-    /// call, instead of iterating semantic-search + who-calls + callees separately.
+    /// call, instead of iterating search + who-calls + callees separately.
     Brief {
         /// The symbols to brief. Several are briefed in one call:
         /// `greppy brief A B C`. `-` reads them from the pipe.
@@ -412,70 +412,51 @@ pub enum Command {
         json: bool,
         #[arg(skip)]
         code: bool,
-        /// Accepted for agent ergonomics — no-op.
-        #[arg(long)]
+        #[arg(skip)]
         all: bool,
     },
-    /// Code search.
-    SearchCode {
+    /// Every source line matching a regular expression.
+    SearchPattern {
+        /// The regular expression (or literal text with `--fixed`) to find.
+        #[arg(value_name = "REGEX")]
         query: Option<String>,
-        /// Restrict returned matches to these files or directory subtrees.
-        #[arg(value_name = "PATH")]
-        paths: Vec<String>,
-        /// Flag spelling for an additional result-path filter.
-        #[arg(long = "path", value_name = "FILE")]
-        path_opts: Vec<String>,
-        /// Restrict search to files changed in the current git worktree.
-        #[arg(long)]
-        changed: bool,
-        /// Restrict search to blobs staged in the git index.
-        #[arg(long)]
-        staged: bool,
-        /// Restrict search to files changed since REV, then live-grep current files.
-        #[arg(long)]
-        since: Option<String>,
-        /// Restrict search to files changed since merge-base(BASE, HEAD).
-        #[arg(long)]
-        base: Option<String>,
-        /// Emit machine-readable JSON with exact count/truncation metadata.
+        /// Emit machine-readable JSON with the existing stable shape.
         #[arg(long)]
         json: bool,
-        /// Keep the legacy grep-shaped `file:line  text` output without
-        /// resolving matches to enclosing definitions or creating handles.
-        #[arg(long)]
-        no_code: bool,
-        /// Treat PATTERN as literal text instead of a regular expression.
+        /// Treat REGEX as literal text instead of a regular expression.
         #[arg(long)]
         fixed: bool,
-        /// Accepted for agent ergonomics — no-op.
+        /// Restrict matches by the enclosing definition's kind.
+        #[arg(
+            long,
+            value_parser = ["function", "method", "class", "struct", "enum", "trait"]
+        )]
+        kind: Option<String>,
+        /// Also print each matched source line verbatim.
         #[arg(long)]
         code: bool,
-        /// Accepted for agent ergonomics — no-op.
+        /// Print every result instead of the five-row distribution sample.
         #[arg(long)]
         all: bool,
     },
-    /// Symbol-only search (search-symbols alias).
-    SearchSymbols {
-        /// The names (or fragments) to look up. Several are answered in one
-        /// call: `greppy search-symbols A B`. `-` reads them from the pipe.
+    /// Definitions whose name contains NAME.
+    SearchSymbol {
+        /// The name or name fragment to look up.
         #[arg(value_name = "NAME")]
-        queries: Vec<String>,
-        /// Restrict returned symbols to these files or directory subtrees.
-        /// Repeatable; this is the only path filter.
-        #[arg(long = "path", value_name = "PATH")]
-        path_opts: Vec<String>,
-        /// Restrict to one node kind (Function, Method, Struct, Class, …).
-        /// Matches the label case-insensitively; agents guess this flag,
-        /// so it is real (P3 forensics).
-        #[arg(long)]
+        query: Option<String>,
+        /// Restrict matches to one definition kind.
+        #[arg(
+            long,
+            value_parser = ["function", "method", "class", "struct", "enum", "trait"]
+        )]
         kind: Option<String>,
-        /// Emit machine-readable JSON with exact count/truncation metadata.
+        /// Emit machine-readable JSON with the existing stable shape.
         #[arg(long)]
         json: bool,
-        /// Accepted for agent ergonomics — no-op.
+        /// Also print each definition's source.
         #[arg(long)]
         code: bool,
-        /// Accepted for agent ergonomics — no-op.
+        /// Print every matching definition.
         #[arg(long)]
         all: bool,
     },
@@ -498,23 +479,29 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Semantic query using EmbeddingGemma vectors with Qwen purpose hints.
-    #[command(name = "semantic-search", alias = "semantic")]
-    Semantic {
-        /// The plain-English descriptions to search for. Several are answered
-        /// in one call. `-` reads them from the pipe.
-        #[arg(value_name = "QUERY")]
-        queries: Vec<String>,
-        /// Restrict returned semantic hits to these files or directory
-        /// subtrees. Repeatable; this is the only path filter.
-        #[arg(long = "path", value_name = "PATH")]
-        path_opts: Vec<String>,
-        /// Emit machine-readable JSON.
+    /// Definitions that do what a plain-English query describes.
+    Search {
+        /// Everything after the verb is joined into one meaning query.
+        #[arg(value_name = "WHAT IT DOES")]
+        query_parts: Vec<String>,
+        /// Restrict matches to one definition kind.
+        #[arg(
+            long,
+            value_parser = ["function", "method", "class", "struct", "enum", "trait"]
+        )]
+        kind: Option<String>,
+        /// Emit machine-readable JSON with the existing stable shape.
         #[arg(long)]
         json: bool,
+        /// Also print each definition's source.
+        #[arg(long)]
+        code: bool,
+        /// Accepted for family consistency; meaning search remains ranked to eight hits.
+        #[arg(long)]
+        all: bool,
     },
     /// Legacy compatibility command for resolving definitions. Prefer
-    /// `semantic-search` for meaning-based search and `brief` for a compact
+    /// `search` for meaning-based search and `brief` for a compact
     /// structural digest.
     ///
     /// Resolve the most relevant definitions for `<query>` and print their
