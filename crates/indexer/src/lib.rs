@@ -1905,8 +1905,7 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
                         .values()
                         .filter(|node| {
                             node.file_path == target_file
-                                && greppy_resolver::IMPORTABLE_LABELS
-                                    .contains(&node.label.as_str())
+                                && greppy_resolver::IMPORTABLE_LABELS.contains(&node.label.as_str())
                         })
                         .map(|node| node.id),
                 );
@@ -1988,8 +1987,8 @@ struct NodeLite {
 /// real edge can appear unreachable to `path`.
 fn navigation_label_rank(label: &str) -> u8 {
     match label {
-        "Class" | "Interface" | "Type" | "Struct" | "Enum" | "Trait" | "Function"
-        | "Method" | "TypeAlias" => 0,
+        "Class" | "Interface" | "Type" | "Struct" | "Enum" | "Trait" | "Function" | "Method"
+        | "TypeAlias" => 0,
         "Impl" | "EnumVariant" | "AssocConst" | "AssocType" | "Module" => 1,
         "Call" | "Import" => 3,
         _ => 2,
@@ -3066,11 +3065,7 @@ mod tests {
             "import 'nested/helper.dart';\nint caller() => do_it() + HELPER_VALUE;\n",
         )
         .unwrap();
-        fs::write(
-            repo.join("lib/helper.dart"),
-            "int do_it() => 1;\n",
-        )
-        .unwrap();
+        fs::write(repo.join("lib/helper.dart"), "int do_it() => 1;\n").unwrap();
         fs::write(
             repo.join("lib/nested/helper.dart"),
             "const int HELPER_VALUE = 7;\nint do_it() => 2;\n",
@@ -3091,9 +3086,13 @@ mod tests {
             .get_node_by_qname("test", "lib/main.dart::__file__")
             .unwrap()
             .expect("main Module");
-        let imports = store.outgoing_edges(source.id, Some("IMPORTS"), 10).unwrap();
+        let imports = store
+            .outgoing_edges(source.id, Some("IMPORTS"), 10)
+            .unwrap();
         assert!(
-            imports.iter().any(|edge| edge.target_id == nested_module.id),
+            imports
+                .iter()
+                .any(|edge| edge.target_id == nested_module.id),
             "relative import must target exact nested Module: {imports:?}"
         );
         assert!(

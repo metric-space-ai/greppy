@@ -46,11 +46,7 @@ fn apply_schema_error_prints_the_complete_embedded_plan_example() {
     let (repo, store) = fresh_workspace("plan");
     std::fs::write(repo.join("plan.json"), "{}\n").unwrap();
 
-    let (code, stdout, stderr) = run(
-        &repo,
-        &store,
-        &["edit", "apply", "--plan", "plan.json"],
-    );
+    let (code, stdout, stderr) = run(&repo, &store, &["edit", "apply", "--plan", "plan.json"]);
 
     assert_eq!(code, 20, "stdout={stdout}\nstderr={stderr}");
     assert!(stderr.contains("plan invalid:"), "{stderr}");

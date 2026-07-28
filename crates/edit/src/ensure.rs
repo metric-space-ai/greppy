@@ -519,8 +519,8 @@ fn method_state_and_insertion(
     let mut reached_body = false;
     while !reached_body {
         let node = cursor.node();
-        let is_method = node != body
-            && (node.kind().contains("function") || node.kind().contains("method"));
+        let is_method =
+            node != body && (node.kind().contains("function") || node.kind().contains("method"));
         if is_method
             && node.child_by_field_name("name").is_some_and(|name| {
                 &content[name.start_byte()..name.end_byte()] == method_name.as_bytes()

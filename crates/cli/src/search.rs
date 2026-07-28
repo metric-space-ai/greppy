@@ -186,10 +186,7 @@ pub(crate) fn semantic_queries(raw: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn search_all_nodes(
-    store: &greppy_store::Store,
-    project: &str,
-) -> Result<Vec<greppy_store::Node>> {
+fn search_all_nodes(store: &greppy_store::Store, project: &str) -> Result<Vec<greppy_store::Node>> {
     const PAGE: usize = 4096;
     let mut nodes = Vec::new();
     loop {
@@ -200,9 +197,7 @@ fn search_all_nodes(
             break;
         }
     }
-    nodes.retain(|node| {
-        !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
-    });
+    nodes.retain(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name));
     Ok(nodes)
 }
 
@@ -256,12 +251,9 @@ fn search_print_node_source(root_path: &std::path::Path, node: &greppy_store::No
     }
 }
 
-fn search_print_symbol_rows(
-    root_path: &std::path::Path,
-    nodes: &[greppy_store::Node],
-    code: bool,
-) {
-    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+fn search_print_symbol_rows(root_path: &std::path::Path, nodes: &[greppy_store::Node], code: bool) {
+    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> =
+        Default::default();
     for (index, node) in nodes.iter().enumerate() {
         let lines = source_cache
             .entry(node.file_path.clone())
@@ -388,7 +380,11 @@ pub(crate) fn dispatch_search_symbols(
     }
 
     if json {
-        let fetch = if kind.is_some() { 10_000 } else { cli_result_limit(20) };
+        let fetch = if kind.is_some() {
+            10_000
+        } else {
+            cli_result_limit(20)
+        };
         let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
         hits.retain(|hit| {
             store
@@ -442,7 +438,9 @@ pub(crate) fn dispatch_search_symbols(
     if similar.is_empty() {
         similar = nodes
             .iter()
-            .filter(|node| levenshtein(&node.name.to_ascii_lowercase(), &q.to_ascii_lowercase()) <= 2)
+            .filter(|node| {
+                levenshtein(&node.name.to_ascii_lowercase(), &q.to_ascii_lowercase()) <= 2
+            })
             .cloned()
             .collect::<Vec<_>>();
     }
@@ -450,7 +448,11 @@ pub(crate) fn dispatch_search_symbols(
         let wanted_words = search_identifier_words(q);
         let best = nodes
             .iter()
-            .map(|node| search_identifier_words(&node.name).intersection(&wanted_words).count())
+            .map(|node| {
+                search_identifier_words(&node.name)
+                    .intersection(&wanted_words)
+                    .count()
+            })
             .max()
             .unwrap_or(0);
         if best > 0 {
@@ -475,15 +477,8 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(1);
     }
 
-    let meaning = search_symbol_meaning_hits(
-        &store,
-        &project,
-        root,
-        &root_path,
-        q,
-        kind,
-        embedding_args,
-    );
+    let meaning =
+        search_symbol_meaning_hits(&store, &project, root, &root_path, q, kind, embedding_args);
     if !meaning.is_empty() {
         println!();
         println!("closest by meaning:");
@@ -724,7 +719,11 @@ fn search_pattern_case_insensitive_hits(
         let mut command = std::process::Command::new("grep");
         command.args(["-H", "-n", "-I", "-i"]);
         command.arg(if fixed { "-F" } else { "-E" });
-        command.arg("--").arg(query).args(chunk).current_dir(root_path);
+        command
+            .arg("--")
+            .arg(query)
+            .args(chunk)
+            .current_dir(root_path);
         let output = command
             .output()
             .map_err(|error| Error::io("spawn grep for case-insensitive search-pattern", error))?;
@@ -751,7 +750,8 @@ fn search_pattern_rows(
     resolve_definitions: bool,
     kind: Option<&str>,
 ) -> Result<Vec<SearchPatternRow>> {
-    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> =
+        Default::default();
     let mut rows = Vec::new();
     for hit in hits {
         let Some(match_line) = parse_search_code_match(hit) else {
@@ -851,7 +851,9 @@ pub(crate) fn dispatch_search_code(
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
-        return Err(Error::Invalid("search-pattern requires a regular expression".into()));
+        return Err(Error::Invalid(
+            "search-pattern requires a regular expression".into(),
+        ));
     }
     let path_filters = QueryPathFilters::default();
     let store = open_default_store(root)?;
@@ -859,7 +861,11 @@ pub(crate) fn dispatch_search_code(
     let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
     let resolve_definitions = matches!(decision, FreshnessServe::Fresh(_));
-    let status = if resolve_definitions { "ok" } else { "live-fallback" };
+    let status = if resolve_definitions {
+        "ok"
+    } else {
+        "live-fallback"
+    };
     let all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
 
     if json {
@@ -1202,7 +1208,8 @@ fn print_search_meaning_rows(
     purposes: Option<&[SemanticVectorPurpose]>,
     code: bool,
 ) -> Result<()> {
-    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> =
+        Default::default();
     for (index, hit) in hits.iter().enumerate() {
         let node = hit
             .embedding
@@ -1273,7 +1280,9 @@ pub(crate) fn dispatch_semantic(
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
-        return Err(Error::Invalid("search requires a plain-English query".into()));
+        return Err(Error::Invalid(
+            "search requires a plain-English query".into(),
+        ));
     }
     // Result purposes reach the Qwen daemon; overlap its model load with the
     // embedding query and vector search.
@@ -1575,9 +1584,14 @@ pub(crate) fn semantic_vector_purposes(
         {
             if let Some((cfg, model_key)) = summary_runtime.as_ref() {
                 let code = cap_semantic_purpose_span(&span.text);
-                bullets =
-                    summarize_source_cached(cfg, model_key, summary_cache.as_ref(), file_path, &code)
-                        .unwrap_or_default();
+                bullets = summarize_source_cached(
+                    cfg,
+                    model_key,
+                    summary_cache.as_ref(),
+                    file_path,
+                    &code,
+                )
+                .unwrap_or_default();
             }
         }
         purposes.push(SemanticVectorPurpose {
@@ -1962,7 +1976,11 @@ pub(crate) fn semantic_fallback_tokens(query: &str) -> Vec<String> {
     selected
 }
 
-pub(crate) fn semantic_fallback_commands(query: &str, paths: &[String], root: Option<&str>) -> Vec<String> {
+pub(crate) fn semantic_fallback_commands(
+    query: &str,
+    paths: &[String],
+    root: Option<&str>,
+) -> Vec<String> {
     let tokens = semantic_fallback_tokens(query);
     let mut commands = Vec::new();
     if let Some(symbol_token) = tokens.last() {

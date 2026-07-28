@@ -14283,11 +14283,7 @@ fn zig_module_basename(path: &str) -> &str {
 /// Emit the current source file's importable namespace. The shared resolver
 /// intentionally excludes synthetic Module nodes, so Zig uses the same
 /// importable-Class technique as other language-specific module passes.
-fn emit_zig_file_namespace(
-    root: Node<'_>,
-    file_path: &str,
-    result: &mut ExtractionResult,
-) {
+fn emit_zig_file_namespace(root: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
     let module_name = zig_module_basename(file_path);
     if module_name.is_empty() {
         return;

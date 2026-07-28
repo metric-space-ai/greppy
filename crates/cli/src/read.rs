@@ -15,7 +15,11 @@ pub(crate) fn read_background_job(path: &std::path::Path) -> Option<serde_json::
 /// nav commands print (P4). Missing/unreadable files or out-of-range lines
 /// return None — the row is skipped, never an error. Trimmed and capped so
 /// a pathological line cannot flood the agent's context.
-pub(crate) fn read_source_line(root: &std::path::Path, file_path: &str, line: u32) -> Option<String> {
+pub(crate) fn read_source_line(
+    root: &std::path::Path,
+    file_path: &str,
+    line: u32,
+) -> Option<String> {
     if line == 0 {
         return None;
     }
@@ -136,7 +140,10 @@ pub(crate) fn read_span_with_meta(
     })
 }
 
-pub(crate) fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
+pub(crate) fn read_file_candidate(
+    root_path: &std::path::Path,
+    subject: &str,
+) -> std::path::PathBuf {
     let supplied = std::path::Path::new(subject);
     if supplied.is_absolute() {
         return supplied.to_path_buf();
@@ -669,7 +676,12 @@ pub(crate) fn read_plan(
 /// `read S [S …]` / `read PATH [PATH …]` — every target is read in one call,
 /// and one target that cannot be read refuses the whole call: three files that
 /// worked plus a silently dropped fourth looks like success.
-pub(crate) fn dispatch_read_multi(plan: &ReadPlan, with_handle: bool, json: bool, root: Option<&str>) -> Result<i32> {
+pub(crate) fn dispatch_read_multi(
+    plan: &ReadPlan,
+    with_handle: bool,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let canonical_root = root_path
         .canonicalize()

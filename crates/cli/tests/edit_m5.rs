@@ -264,8 +264,14 @@ fn replace_body_ignores_stdin_when_content_file_given() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let src = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
     // content file "2" became the body; the stdin body "{ 3 }" was never applied.
-    assert!(src.contains("{2") || src.contains("{ 2"), "content file must be used: {src}");
-    assert!(!src.contains("{ 3 }") && !src.contains("{3"), "stdin must be ignored: {src}");
+    assert!(
+        src.contains("{2") || src.contains("{ 2"),
+        "content file must be used: {src}"
+    );
+    assert!(
+        !src.contains("{ 3 }") && !src.contains("{3"),
+        "stdin must be ignored: {src}"
+    );
 }
 
 #[test]

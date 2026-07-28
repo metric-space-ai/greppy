@@ -582,8 +582,12 @@ pub enum InsertPosition {
 }
 
 fn outer_brace_offsets(content: &[u8]) -> Option<(usize, usize)> {
-    let open = content.iter().position(|byte| !byte.is_ascii_whitespace())?;
-    let close = content.iter().rposition(|byte| !byte.is_ascii_whitespace())?;
+    let open = content
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())?;
+    let close = content
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())?;
     (content[open] == b'{' && content[close] == b'}').then_some((open, close))
 }
 
@@ -594,7 +598,8 @@ fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8])
     let Some((open, close)) = outer_brace_offsets(current_body) else {
         return requested.to_vec();
     };
-    let mut replacement = Vec::with_capacity(open + 1 + requested.len() + current_body.len() - close);
+    let mut replacement =
+        Vec::with_capacity(open + 1 + requested.len() + current_body.len() - close);
     replacement.extend_from_slice(&current_body[..=open]);
     replacement.extend_from_slice(requested);
     replacement.extend_from_slice(&current_body[close..]);

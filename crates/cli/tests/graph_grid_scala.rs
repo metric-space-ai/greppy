@@ -281,11 +281,7 @@ fn graph_grid_scala_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     // `path --from caller --to doIt` over CALLS must find the single-hop
     // path caller -> doIt.
-    let (code, out, err) = run(
-        &["path", "--from", "caller", "--to", "doIt"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["path", "--from", "caller", "--to", "doIt"], &repo, &store);
     assert_eq!(
         code, 0,
         "path caller->doIt should exist and exit 0; stderr={err}\nstdout={out}"
@@ -412,9 +408,7 @@ fn graph_grid_scala_declarative_object_labelled_as_class() {
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid search-symbols json: {e}; stdout={out:?}"));
-    let hits = v["hits"]
-        .as_array()
-        .expect("search-symbols hits array");
+    let hits = v["hits"].as_array().expect("search-symbols hits array");
     assert!(
         hits.iter().any(|hit| {
             hit["label"] == "Class"

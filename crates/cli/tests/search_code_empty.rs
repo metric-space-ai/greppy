@@ -43,11 +43,7 @@ fn empty_literal_search_names_interpretation_and_path_filters() {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
 
-    let (code, stdout, stderr) = run(
-        &repo,
-        &store,
-        &["search-code", "absent_value", "src"],
-    );
+    let (code, stdout, stderr) = run(&repo, &store, &["search-code", "absent_value", "src"]);
 
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("(no matches)"), "{stdout}");
@@ -61,11 +57,7 @@ fn empty_metacharacter_search_teaches_the_regex_retry() {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
 
-    let (code, stdout, stderr) = run(
-        &repo,
-        &store,
-        &["search-code", "absent.*value", "src"],
-    );
+    let (code, stdout, stderr) = run(&repo, &store, &["search-code", "absent.*value", "src"]);
 
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(

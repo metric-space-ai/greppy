@@ -55,7 +55,10 @@ pub use cuda::model::{CudaEmbeddingModel, CudaForwardProfile};
 /// compiler rather than noticed later.
 pub const HAS_GPU_BACKEND: bool = cfg!(any(
     all(feature = "metal", target_os = "macos"),
-    all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
+    all(
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    )
 ));
 
 /// Embedding dimension produced by EmbeddingGemma after the two

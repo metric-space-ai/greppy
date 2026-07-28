@@ -18,7 +18,9 @@ fn prompt() -> String {
 /// — the blank line inside the section before the flags is not one.
 fn navigate_section(text: &str) -> String {
     let mut lines = text.lines().skip_while(|line| *line != "NAVIGATE:");
-    let heading = lines.next().expect("AGENTS.md must have a NAVIGATE section");
+    let heading = lines
+        .next()
+        .expect("AGENTS.md must have a NAVIGATE section");
     let body = lines.take_while(|line| {
         !(line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_uppercase()))
     });
@@ -55,7 +57,9 @@ fn navigate_lists_exactly_the_five_commands() {
     }
     let described = section
         .lines()
-        .filter(|line| line.starts_with("  ") && !line.starts_with("    ") && !line.starts_with("  --"))
+        .filter(|line| {
+            line.starts_with("  ") && !line.starts_with("    ") && !line.starts_with("  --")
+        })
         .filter(|line| !line.trim().is_empty())
         .count();
     assert_eq!(
@@ -166,8 +170,16 @@ fn footer_flags_hold_for_every_command_in_their_section() {
     ] {
         for line in section.lines().filter(|l| l.starts_with("  --")) {
             for verb in [
-                "search:", "search-symbol:", "search-pattern:", "who-calls:",
-                "callees:", "brief:", "impact:", "path:", "read:", "read-smart:",
+                "search:",
+                "search-symbol:",
+                "search-pattern:",
+                "who-calls:",
+                "callees:",
+                "brief:",
+                "impact:",
+                "path:",
+                "read:",
+                "read-smart:",
                 "read-file:",
             ] {
                 assert!(
@@ -244,7 +256,12 @@ fn orient_is_dissolved() {
         !text.contains("ORIENT:"),
         "ORIENT dissolved into NAVIGATE; the section must not return"
     );
-    for dead in ["map [PATH]", "outline PATH", "verify -- CMD", "\n  changes "] {
+    for dead in [
+        "map [PATH]",
+        "outline PATH",
+        "verify -- CMD",
+        "\n  changes ",
+    ] {
         assert!(
             !text.contains(dead),
             "`{dead}` died with ORIENT and must not be advertised"
@@ -295,9 +312,19 @@ fn edit_is_eleven_verbs_with_visible_signatures() {
     // The zoo stays dead, the trained vocabulary stays: no invented flags, no
     // nested `edit` prefix, no JSON plans, and no prose addressed at the agent.
     for dead in [
-        "ensure-", "change-signature", "apply --plan", "recover", "--content",
-        "--target", "--old-file", "greppy edit ", "WHERE", "must occur",
-        "data set", "move --file", "remove --file",
+        "ensure-",
+        "change-signature",
+        "apply --plan",
+        "recover",
+        "--content",
+        "--target",
+        "--old-file",
+        "greppy edit ",
+        "WHERE",
+        "must occur",
+        "data set",
+        "move --file",
+        "remove --file",
     ] {
         assert!(
             !section.contains(dead),

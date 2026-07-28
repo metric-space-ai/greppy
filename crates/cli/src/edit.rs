@@ -16,7 +16,11 @@ pub(crate) fn dispatch_edit(command: EditCommand, json: bool, root: Option<&str>
     }
 }
 
-pub(crate) fn dispatch_edit_inner(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
+pub(crate) fn dispatch_edit_inner(
+    command: EditCommand,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
     let root_path = resolve_root(root)?;
     // The four operations of the new grammar, the whole-file verbs and `undo`
     // answer with an edit record - file, span, resulting text, handle - rather
@@ -53,102 +57,110 @@ pub(crate) fn dispatch_edit_inner(command: EditCommand, json: bool, root: Option
         } => match (symbol, r#in, call) {
             (Some(symbol), None, None) => {
                 let new_name = to;
-            let store = open_default_store_query_writer(root)?;
-            let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
-            let mut def_nodes = Vec::new();
-            for id in &ids {
-                if let Some(node) = store.get_node(*id)? {
-                    if !node.file_path.is_empty() && node.start_line >= 1 {
-                        def_nodes.push(node);
-                    }
-                }
-            }
-            if def_nodes.is_empty() {
-                println!("no symbol `{symbol}`");
-                return Ok(10);
-            }
-            let short_name = def_nodes[0].name.clone();
-            // collect per-file scopes: definition files fully (definition,
-            // same-file usages, imports), and every referencing node's span
-            use std::collections::BTreeMap;
-            let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-            for def in &def_nodes {
-                scopes
-                    .entry(def.file_path.clone())
-                    .or_default()
-                    .push((0, usize::MAX));
-                for edge in store.incoming_edges(def.id, None, 100_000)? {
-                    if let Some(src) = store.get_node(edge.source_id)? {
-                        if src.file_path.is_empty() || src.start_line < 1 {
-                            continue;
+                let store = open_default_store_query_writer(root)?;
+                let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
+                let mut def_nodes = Vec::new();
+                for id in &ids {
+                    if let Some(node) = store.get_node(*id)? {
+                        if !node.file_path.is_empty() && node.start_line >= 1 {
+                            def_nodes.push(node);
                         }
-                        let abs = root_path.join(&src.file_path);
-                        let Ok(content) = std::fs::read(&abs) else {
-                            continue;
-                        };
-                        let Some(span) = read_span_with_meta(
-                            &root_path,
-                            &src.file_path,
-                            src.start_line,
-                            src.end_line,
-                            usize::MAX,
-                            false,
-                        ) else {
-                            continue;
-                        };
-                        let range = line_range_to_bytes(
-                            &content,
-                            src.start_line as usize,
-                            span.end_line as usize,
-                        );
-                        scopes.entry(src.file_path.clone()).or_default().push(range);
                     }
                 }
-            }
-            // import lines in every affected file: cover the whole file for
-            // files that already have narrower spans is wasteful, so add a
-            // full-file span only where imports may bind the name
-            let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
-                .into_iter()
-                .map(|(rel_path, spans)| greppy_edit::verbs::RenameFileScope { rel_path, spans })
-                .collect();
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                expect_residual: Some(expect_residual),
-                ..Default::default()
-            };
-            (
-                greppy_edit::verbs::rename_symbol_files(
-                    &root_path,
-                    &scope_vec,
-                    &short_name,
-                    &new_name,
-                    &options,
-                )?,
-                report,
-            )
-            }
-            (None, Some(in_symbol), Some(from)) => {
-                match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
-            EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
-                let abs = root_path.join(&rel_path);
-                let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options =
-                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
+                if def_nodes.is_empty() {
+                    println!("no symbol `{symbol}`");
+                    return Ok(10);
+                }
+                let short_name = def_nodes[0].name.clone();
+                // collect per-file scopes: definition files fully (definition,
+                // same-file usages, imports), and every referencing node's span
+                use std::collections::BTreeMap;
+                let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+                for def in &def_nodes {
+                    scopes
+                        .entry(def.file_path.clone())
+                        .or_default()
+                        .push((0, usize::MAX));
+                    for edge in store.incoming_edges(def.id, None, 100_000)? {
+                        if let Some(src) = store.get_node(edge.source_id)? {
+                            if src.file_path.is_empty() || src.start_line < 1 {
+                                continue;
+                            }
+                            let abs = root_path.join(&src.file_path);
+                            let Ok(content) = std::fs::read(&abs) else {
+                                continue;
+                            };
+                            let Some(span) = read_span_with_meta(
+                                &root_path,
+                                &src.file_path,
+                                src.start_line,
+                                src.end_line,
+                                usize::MAX,
+                                false,
+                            ) else {
+                                continue;
+                            };
+                            let range = line_range_to_bytes(
+                                &content,
+                                src.start_line as usize,
+                                span.end_line as usize,
+                            );
+                            scopes.entry(src.file_path.clone()).or_default().push(range);
+                        }
+                    }
+                }
+                // import lines in every affected file: cover the whole file for
+                // files that already have narrower spans is wasteful, so add a
+                // full-file span only where imports may bind the name
+                let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
+                    .into_iter()
+                    .map(|(rel_path, spans)| greppy_edit::verbs::RenameFileScope {
+                        rel_path,
+                        spans,
+                    })
+                    .collect();
+                let options = greppy_edit::verbs::VerbOptions {
+                    dry_run,
+                    with_diff: true,
+                    expect_residual: Some(expect_residual),
+                    ..Default::default()
+                };
                 (
-                    greppy_edit::verbs::rename_in_span(
-                        &root_path, &abs, range, &from, &to, expect, language, &options,
+                    greppy_edit::verbs::rename_symbol_files(
+                        &root_path,
+                        &scope_vec,
+                        &short_name,
+                        &new_name,
+                        &options,
                     )?,
                     report,
                 )
             }
+            (None, Some(in_symbol), Some(from)) => {
+                match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
+                    EditTarget::Refusal(cert) => (*cert, report),
+                    EditTarget::Resolved {
+                        rel_path,
+                        range,
+                        planned_file_sha256,
+                        planned_target_sha256,
+                    } => {
+                        let abs = root_path.join(&rel_path);
+                        let language =
+                            greppy_edit::language_for_path(std::path::Path::new(&rel_path));
+                        let options = resolved_options(
+                            dry_run,
+                            range,
+                            planned_file_sha256,
+                            planned_target_sha256,
+                        );
+                        (
+                            greppy_edit::verbs::rename_in_span(
+                                &root_path, &abs, range, &from, &to, expect, language, &options,
+                            )?,
+                            report,
+                        )
+                    }
                 }
             }
             _ => {
@@ -392,9 +404,8 @@ pub(crate) fn dispatch_edit_inner(command: EditCommand, json: bool, root: Option
             let certificate = if mode == "delete" {
                 greppy_edit::data::data_delete(&root_path, &target, &path, &options)?
             } else {
-                let value_json = value_json.ok_or_else(|| {
-                    Error::Invalid("data set needs --value-json VALUE".into())
-                })?;
+                let value_json = value_json
+                    .ok_or_else(|| Error::Invalid("data set needs --value-json VALUE".into()))?;
                 greppy_edit::data::data_set(
                     &root_path,
                     &target,
@@ -782,7 +793,10 @@ pub(crate) fn edit_splice(
 
 /// Refuse a path that leaves the repository, whether by climbing out of it or
 /// through a symlink that points out.
-pub(crate) fn edit_guard_path(root_path: &std::path::Path, abs: &std::path::Path) -> EditResult<()> {
+pub(crate) fn edit_guard_path(
+    root_path: &std::path::Path,
+    abs: &std::path::Path,
+) -> EditResult<()> {
     match greppy_edit::publish::require_inside_workspace(root_path, abs) {
         Ok(_) => Ok(()),
         Err(Error::Io { .. }) => Err(EditRefusal::new(
@@ -833,10 +847,18 @@ pub(crate) fn edit_resolve_symbol(
     want_body: bool,
 ) -> EditResult<ResolvedSpan> {
     let store = open_default_store_query_writer(root).map_err(|error| {
-        EditRefusal::new("symbol_not_found", format!("no symbol `{name}`: {error}"), 10)
+        EditRefusal::new(
+            "symbol_not_found",
+            format!("no symbol `{name}`: {error}"),
+            10,
+        )
     })?;
     let ids = resolve_symbol_nodes(&store, Some(name)).map_err(|error| {
-        EditRefusal::new("symbol_not_found", format!("no symbol `{name}`: {error}"), 10)
+        EditRefusal::new(
+            "symbol_not_found",
+            format!("no symbol `{name}`: {error}"),
+            10,
+        )
     })?;
     let mut nodes = Vec::new();
     for id in &ids {
@@ -893,7 +915,12 @@ pub(crate) fn edit_resolve_symbol(
             .collect();
         let listed = nodes
             .iter()
-            .map(|node| format!("  {} {}:{}", node.qualified_name, node.file_path, node.start_line))
+            .map(|node| {
+                format!(
+                    "  {} {}:{}",
+                    node.qualified_name, node.file_path, node.start_line
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         return Err(EditRefusal::new(
@@ -920,12 +947,10 @@ pub(crate) fn edit_resolve_symbol(
     let mut range = edit_strip_trailing_newline(&content, range);
     if want_body {
         let Some(body) = greppy_edit::verbs::body_range_within(language, &content, range) else {
-            return Err(EditRefusal::new(
-                "no_body",
-                format!("`{name}` has no body"),
-                13,
-            )
-            .with("symbol", serde_json::json!(name)));
+            return Err(
+                EditRefusal::new("no_body", format!("`{name}` has no body"), 13)
+                    .with("symbol", serde_json::json!(name)),
+            );
         };
         range = edit_strip_trailing_newline(&content, body);
     }
@@ -1002,7 +1027,11 @@ pub(crate) fn edit_locate(
         SelectorKind::Target => {
             let token = spec.target.as_deref().unwrap_or_default();
             let handle = greppy_edit::EditHandle::decode(token).map_err(|error| {
-                EditRefusal::new("invalid_handle", format!("not a usable handle: {error}"), 20)
+                EditRefusal::new(
+                    "invalid_handle",
+                    format!("not a usable handle: {error}"),
+                    20,
+                )
             })?;
             let handle_root = std::path::Path::new(&handle.workspace_root)
                 .canonicalize()
@@ -1061,9 +1090,8 @@ pub(crate) fn edit_locate(
                     (rel, abs, content, vec![(0, length)], None, None)
                 }
                 SelectorKind::Lines => {
-                    let (first, last) = edit_parse_line_range(
-                        spec.lines.as_deref().unwrap_or_default(),
-                    )?;
+                    let (first, last) =
+                        edit_parse_line_range(spec.lines.as_deref().unwrap_or_default())?;
                     let (rel, abs, content) = edit_read_file(root_path, file)?;
                     let total = edit_line_count(&content);
                     if last > total || first > total {
@@ -1115,7 +1143,14 @@ pub(crate) fn edit_locate(
                         .find_iter(&content)
                         .map(|found| (found.start(), found.end()))
                         .collect();
-                    (rel, abs, content, ranges, Some(regex), Some(pattern.to_string()))
+                    (
+                        rel,
+                        abs,
+                        content,
+                        ranges,
+                        Some(regex),
+                        Some(pattern.to_string()),
+                    )
                 }
                 SelectorKind::Symbol | SelectorKind::Target => unreachable!(),
             };
@@ -1144,10 +1179,10 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
         // The count alone does not let a caller decide between "pass --expect N"
         // and "I anchored on the wrong text", so the refusal names what was
         // searched for and where every match sits.
-        let _subject = located
-            .needle
-            .as_deref()
-            .map_or_else(|| located.kind.name().to_string(), |text| format!("`{text}`"));
+        let _subject = located.needle.as_deref().map_or_else(
+            || located.kind.name().to_string(),
+            |text| format!("`{text}`"),
+        );
         let sites: Vec<String> = located
             .ranges
             .iter()
@@ -1299,7 +1334,11 @@ pub(crate) fn edit_publish(
         result_span: Some(text.clone()),
         sha_before: Some(edit_sha256_hex(&located.content)),
         sha_after: Some(edit_sha256_hex(&new_content)),
-        diff: Some(edit_unified_diff(&located.rel, &located.content, &new_content)),
+        diff: Some(edit_unified_diff(
+            &located.rel,
+            &located.content,
+            &new_content,
+        )),
         ..EditOperation::default()
     };
     let mut record = EditRecord {
@@ -1482,7 +1521,8 @@ pub(crate) fn edit_op_patch(located: &Located, patch: &[u8]) -> EditResult<Edite
     };
     let (span_start, span_end) = located.ranges[0];
     let span_first_line = edit_line_of_offset(&located.content, span_start);
-    let span_last_line = edit_line_of_offset(&located.content, span_end.saturating_sub(1).max(span_start));
+    let span_last_line =
+        edit_line_of_offset(&located.content, span_end.saturating_sub(1).max(span_start));
 
     let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     for (declared, old_lines, new_lines) in &hunks {
@@ -1532,10 +1572,7 @@ pub(crate) fn edit_op_patch(located: &Located, patch: &[u8]) -> EditResult<Edite
                 .unwrap_or(located.content.len());
             (at, at)
         } else {
-            (
-                lines[first - 1].0,
-                lines[first + old_lines.len() - 2].1,
-            )
+            (lines[first - 1].0, lines[first + old_lines.len() - 2].1)
         };
         let ending = if located.content[start..end].ends_with(b"\r\n") {
             "\r\n"
@@ -1569,10 +1606,19 @@ pub(crate) fn edit_op_patch(located: &Located, patch: &[u8]) -> EditResult<Edite
 
 /// The compiler or linter for the touched files, when the workspace declares
 /// one. No tests: a test run is too long for a single edit call.
-pub(crate) fn edit_verify_diagnostics(root_path: &std::path::Path, files: &[String]) -> Vec<String> {
+pub(crate) fn edit_verify_diagnostics(
+    root_path: &std::path::Path,
+    files: &[String],
+) -> Vec<String> {
     let mut argv: Option<Vec<&str>> = None;
     if root_path.join("Cargo.toml").is_file() {
-        argv = Some(vec!["cargo", "check", "--message-format", "short", "--quiet"]);
+        argv = Some(vec![
+            "cargo",
+            "check",
+            "--message-format",
+            "short",
+            "--quiet",
+        ]);
     } else if root_path.join("go.mod").is_file() {
         argv = Some(vec!["go", "build", "./..."]);
     } else if files.iter().any(|file| file.ends_with(".py"))
@@ -1615,7 +1661,10 @@ pub(crate) fn edit_journal_write(path: &std::path::Path, value: &serde_json::Val
 /// Record the pre-images and open a transaction. Anything that dies between
 /// here and [`edit_journal_close`] leaves `pending.json` behind — which is
 /// exactly what `recover` looks for.
-pub(crate) fn edit_journal_open(root_path: &std::path::Path, before: &[UndoBefore]) -> Option<String> {
+pub(crate) fn edit_journal_open(
+    root_path: &std::path::Path,
+    before: &[UndoBefore],
+) -> Option<String> {
     if before.is_empty() {
         return None;
     }
@@ -1753,15 +1802,14 @@ pub(crate) fn edit_journal_restore(
         let abs = root_path.join(&rel);
         match entry["blob"].as_str() {
             Some(blob) => {
-                let bytes = std::fs::read(dir.join(EDIT_JOURNAL_BLOBS).join(blob)).map_err(
-                    |error| {
+                let bytes =
+                    std::fs::read(dir.join(EDIT_JOURNAL_BLOBS).join(blob)).map_err(|error| {
                         EditRefusal::new(
                             "nothing_to_undo",
                             format!("{rel}: the pre-image is gone ({error})"),
                             10,
                         )
-                    },
-                )?;
+                    })?;
                 if let Some(parent) = abs.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -1823,9 +1871,7 @@ pub(crate) fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditR
         &dir.join(EDIT_JOURNAL_STACK),
         &serde_json::json!({ "transactions": stack }),
     );
-    record
-        .extra
-        .push(("restored", serde_json::json!(restored)));
+    record.extra.push(("restored", serde_json::json!(restored)));
     Ok(record)
 }
 
@@ -1922,7 +1968,12 @@ pub(crate) fn edit_ident_byte(byte: u8) -> bool {
 /// bounded by something that is not part of a name — so `crate::helper` never
 /// matches inside `crate::helper_answer`, and `pkg.helper` never matches inside
 /// `pkg.helpers`.
-pub(crate) fn edit_replace_in_code(text: &str, mask: &[bool], from: &str, to: &str) -> (String, usize) {
+pub(crate) fn edit_replace_in_code(
+    text: &str,
+    mask: &[bool],
+    from: &str,
+    to: &str,
+) -> (String, usize) {
     let bytes = text.as_bytes();
     let boundary = |offset: usize, delta: isize| -> bool {
         let probe = if delta < 0 {
@@ -2413,9 +2464,9 @@ pub(crate) fn run_edit_move(
         Ok(())
     })();
     if let Err(error) = publish {
-        if let Some(record) = edit_journal_read(
-            &edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING),
-        ) {
+        if let Some(record) =
+            edit_journal_read(&edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING))
+        {
             let _ = edit_journal_restore(root_path, &record, false);
         }
         edit_journal_abort(root_path);
@@ -2461,14 +2512,12 @@ pub(crate) fn run_edit_remove(
             .iter()
             .map(|file| format!("\n  {file}"))
             .collect::<String>();
-        return Err(
-            EditRefusal::new(
-                "still_referenced",
-                format!("{rel} is still referenced by:{listed}"),
-                13,
-            )
-            .with("references", serde_json::json!(references)),
-        );
+        return Err(EditRefusal::new(
+            "still_referenced",
+            format!("{rel} is still referenced by:{listed}"),
+            13,
+        )
+        .with("references", serde_json::json!(references)));
     }
     let mut record = EditRecord {
         headline: Some(if dry_run {
@@ -2645,7 +2694,10 @@ pub(crate) fn edit_record_json(
     report_path: Option<&str>,
 ) -> serde_json::Value {
     let mut value = serde_json::Map::new();
-    value.insert("schema_version".into(), serde_json::json!(EDIT_RECORD_SCHEMA));
+    value.insert(
+        "schema_version".into(),
+        serde_json::json!(EDIT_RECORD_SCHEMA),
+    );
     value.insert(
         "status".into(),
         serde_json::json!(if record.published {
@@ -2727,7 +2779,10 @@ pub(crate) fn edit_record_json(
 /// A refusal is an answer too: the same shape, with the cause named. Without
 /// `published` and `exit_code` a caller that asked for `--json` cannot tell a
 /// refusal from a success without re-reading the process exit code.
-pub(crate) fn edit_refusal_json(refusal: &EditRefusal, report_path: Option<&str>) -> serde_json::Value {
+pub(crate) fn edit_refusal_json(
+    refusal: &EditRefusal,
+    report_path: Option<&str>,
+) -> serde_json::Value {
     let mut error = serde_json::Map::new();
     error.insert("code".into(), serde_json::json!(refusal.code));
     error.insert("message".into(), serde_json::json!(refusal.message));
@@ -2735,7 +2790,10 @@ pub(crate) fn edit_refusal_json(refusal: &EditRefusal, report_path: Option<&str>
         error.insert((*key).into(), value.clone());
     }
     let mut value = serde_json::Map::new();
-    value.insert("schema_version".into(), serde_json::json!(EDIT_RECORD_SCHEMA));
+    value.insert(
+        "schema_version".into(),
+        serde_json::json!(EDIT_RECORD_SCHEMA),
+    );
     value.insert("status".into(), serde_json::json!("refused"));
     value.insert("published".into(), serde_json::json!(false));
     value.insert("exit_code".into(), serde_json::json!(refusal.exit));
