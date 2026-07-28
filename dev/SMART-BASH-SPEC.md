@@ -1,4 +1,4 @@
-# bash-smart — output specification and training annex (0.3.x)
+# bash-smart — output specification and training annex (0.4.0)
 
 Owner-approved design, 2026-07-28/29. The shared laws of `dev/NAV-OUTPUT-SPEC.md`
 apply. Output is English.
@@ -108,6 +108,8 @@ lifted block must name the injected cause. The surprisal net needs no labels
 at all; its training is plain next-token loss on walls, and possibly the
 existing model suffices unmodified — measure before training.
 
-**Sequencing:** fourth work order, behind the EDIT family. Wired into the e2b
-bench harness so the effect is measured where it was motivated: the ~40
-shell-fallback burst turns in e2a.
+**Sequencing (owner decision):** 0.4.0, so that 0.3.0 does not wait for it.
+e2b therefore benches 0.3.0 without bash-smart; the ~40 shell-fallback burst
+turns of e2a stay visible in e2b and become the before-number for the 0.4.0
+measurement. The data work (M3 sighting, Sol extractors) may start any time —
+it touches no 0.3.0 code.
