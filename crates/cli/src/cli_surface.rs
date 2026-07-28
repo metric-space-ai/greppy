@@ -75,40 +75,8 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show a one-screen project map from VCS, index, and build metadata.
-    Map {
-        /// Directory to orient within (default: workspace root).
-        path: Option<String>,
-        /// Emit the complete stable JSON shape.
-        #[arg(long)]
-        json: bool,
-    },
-    /// One line per definition in that file: kind, signature, span.
-    #[command(
-        after_help = "Example:\n  greppy outline src/lib.rs\n\n\
-                      `search-symbol` looks a name up across the repository; `outline` answers\n\
-                      what stands in THIS file, in the order it stands there."
-    )]
-    Outline {
-        /// The file to outline.
-        #[arg(value_name = "PATH")]
-        path: String,
-        /// Emit machine-readable JSON.
-        #[arg(long)]
-        json: bool,
-        /// Return every definition instead of the first page.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Group working-tree changes by definitions and graph impact.
-    Changes {
-        /// Compare the working tree with this commit (default: HEAD).
-        #[arg(long, value_name = "REV")]
-        base: Option<String>,
-        /// Emit the complete stable JSON shape.
-        #[arg(long)]
-        json: bool,
-    },
+    /// The repository at one glance: layout, languages, entry points, test roots.
+    WhereAmI,
     /// Inspect or safely reclaim Greppy-managed cache data.
     Cache {
         #[command(subcommand)]
@@ -118,11 +86,6 @@ pub enum Command {
     Trial {
         #[command(flatten)]
         args: trial::TrialArgs,
-    },
-    /// Compare current-tree tests with an isolated committed baseline.
-    Verify {
-        #[command(flatten)]
-        args: verify::VerifyArgs,
     },
     /// Structured graph search.
     SearchGraph {
@@ -187,12 +150,6 @@ pub enum Command {
         /// Maximum transitive hop distance.
         #[arg(long, default_value_t = 6)]
         depth: usize,
-        /// Compute impact from symbols touched by `git diff REV --`.
-        #[arg(long)]
-        since: Option<String>,
-        /// Compute impact from symbols touched since merge-base(BASE, HEAD).
-        #[arg(long)]
-        base: Option<String>,
         /// Print every reached node (lift the default NAV_LIMIT cap) so the
         /// full transitive set is inspectable without a second query.
         #[arg(long)]

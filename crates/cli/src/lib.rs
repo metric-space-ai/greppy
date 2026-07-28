@@ -67,16 +67,13 @@ use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
 use greppy_core::workspace as workspace_locator;
 
-mod changes;
 #[cfg(any(unix, windows))]
 mod embed_daemon;
 #[cfg(any(unix, windows))]
 mod inference_daemon;
-mod map;
 #[cfg(any(unix, windows))]
 mod summarize_daemon;
 mod trial;
-mod verify;
 
 // Route this module's stdout through one optional collector. Query commands
 // activate it for --max-bytes/--offset, and whole-file reads also activate a
@@ -467,7 +464,6 @@ pub const EXIT_TEMPFAIL: u8 = 75;
 
 /// Cap on test names listed per bucket in `changes` text output; the full
 /// lists remain in `--json`.
-const CHANGES_TEST_LIST_CAP: usize = 10;
 
 const DEFAULT_EMBEDDINGGEMMA_MODEL_ID: &str = "google/embeddinggemma-300m";
 const ENV_DEVICE: &str = "GREPPY_DEVICE";
@@ -1160,12 +1156,9 @@ impl Cli {
 const SUBCOMMANDS: &[&str] = &[
     "grep",
     "index",
-    "map",
-    "outline",
-    "changes",
+    "where-am-i",
     "cache",
     "trial",
-    "verify",
     "stats",
     "diagnostics",
     "doctor",
@@ -1233,6 +1226,10 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
         verb,
         "find-usages"
             | "references"
+            | "map"
+            | "outline"
+            | "changes"
+            | "verify"
             | "semantic-search"
             | "semantic"
             | "search-symbols"
@@ -1737,14 +1734,10 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
-        "map" => "greppy map [PATH] [--json] [--root DIR]",
-        "changes" => "greppy changes [--base REV] [--json] [--root DIR]",
+        "where-am-i" => "greppy where-am-i [--root DIR]",
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
-        }
-        "verify" => {
-            "greppy verify [--baseline REV] [--timeout SECONDS] [--json] [--no-cache] -- <test-command...>"
         }
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
         _ => return None,
@@ -1801,363 +1794,6 @@ fn prune_expired_evidence_packs() {
         };
         let _ = store.prune_expired_expand_packs();
     }
-}
-
-// ---------------------------------------------------------------------------
-// outline — what stands in THIS file
-//
-// `search-symbols` looks a name up across the repository; `outline` answers the
-// other question, "what is in this file", which today costs a whole `read`. The
-// symbol graph already holds every definition of a file with its span, so the
-// answer is a projection of the graph, not a second parse.
-// ---------------------------------------------------------------------------
-
-/// One row of an outline.
-struct OutlineRow {
-    name: String,
-    qualified_name: String,
-    kind: String,
-    signature: String,
-    start: i64,
-    end: i64,
-}
-
-/// Definitions only. The graph also carries fields, parameters, imports and
-/// call sites; an outline that listed them would be the file again, in a worse
-/// order.
-fn outline_label_is_definition(label: &str) -> bool {
-    matches!(
-        label.to_ascii_lowercase().as_str(),
-        "function"
-            | "method"
-            | "class"
-            | "struct"
-            | "enum"
-            | "trait"
-            | "interface"
-            | "protocol"
-            | "record"
-            | "union"
-            | "module"
-            | "constructor"
-            | "typealias"
-    )
-}
-
-fn outline_label_is_callable(label: &str) -> bool {
-    matches!(
-        label.to_ascii_lowercase().as_str(),
-        "function" | "method" | "constructor"
-    )
-}
-
-/// The keyword a type-like definition is introduced with. The graph labels a
-/// Rust `struct`, a Go `type … struct` and a Python `class` all as `Class`,
-/// because they occupy the same place in the graph — but an outline reports the
-/// kind the caller reads in the file, so the declaration decides.
-fn outline_declared_keyword(first_line: &str) -> Option<&'static str> {
-    for word in first_line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-        let kind = match word {
-            "struct" => "struct",
-            "enum" => "enum",
-            "trait" => "trait",
-            "interface" => "interface",
-            "protocol" => "protocol",
-            "union" => "union",
-            "record" => "record",
-            "class" => "class",
-            _ => continue,
-        };
-        return Some(kind);
-    }
-    None
-}
-
-fn outline_rows(nodes: &[greppy_store::Node], source: &str) -> Vec<OutlineRow> {
-    let lines: Vec<&str> = source.lines().collect();
-    let line_text = |line: i64| -> &str {
-        usize::try_from(line)
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|n| lines.get(n).copied())
-            .unwrap_or("")
-    };
-    let mut ordered: Vec<&greppy_store::Node> = nodes
-        .iter()
-        .filter(|node| outline_label_is_definition(&node.label))
-        .collect();
-    ordered.sort_by_key(|node| (node.start_line, node.end_line, node.id));
-    ordered
-        .iter()
-        .map(|node| {
-            // The innermost definition that encloses this one. A definition
-            // inside a *callable* is a local function, whatever the graph calls
-            // it — the graph names it after the type that owns the outer
-            // method, which is true of the method and not of the closure.
-            let parent = ordered
-                .iter()
-                .filter(|other| {
-                    other.id != node.id
-                        && other.start_line <= node.start_line
-                        && other.end_line >= node.end_line
-                        && (other.start_line, other.end_line) != (node.start_line, node.end_line)
-                })
-                .min_by_key(|other| other.end_line - other.start_line);
-            let signature = line_text(node.start_line).trim().to_string();
-            let kind = if parent.is_some_and(|parent| outline_label_is_callable(&parent.label)) {
-                "function".to_string()
-            } else if outline_label_is_callable(&node.label) {
-                node.label.to_ascii_lowercase()
-            } else {
-                outline_declared_keyword(&signature)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| node.label.to_ascii_lowercase())
-            };
-            OutlineRow {
-                name: node.name.clone(),
-                qualified_name: node.qualified_name.clone(),
-                kind,
-                signature,
-                start: node.start_line,
-                end: node.end_line,
-            }
-        })
-        .collect()
-}
-
-/// Refusals print the cause on stderr and exit 1, like every other command that
-/// cannot answer the question it was asked.
-fn outline_refusal(message: String) -> Result<i32> {
-    eprintln!("{message}");
-    Ok(1)
-}
-
-const OUTLINE_PAGE: usize = 50;
-
-fn dispatch_outline(path: &str, json: bool, all: bool, root: Option<&str>) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let candidate = std::path::Path::new(path);
-    let abs = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        root_path.join(candidate)
-    };
-    if !abs.exists() {
-        return outline_refusal(format!("no file {path}"));
-    }
-    if abs.is_dir() {
-        return outline_refusal(format!("{path} is a directory, not a file"));
-    }
-    let bytes = std::fs::read(&abs).map_err(|error| Error::io(format!("read {path}"), error))?;
-    let Ok(source) = String::from_utf8(bytes) else {
-        return outline_refusal(format!("{path} is not text; it has no definitions to outline"));
-    };
-    let rel = abs
-        .strip_prefix(&root_path)
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| path.to_string());
-
-    let mut store = open_default_store(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-    let project = project_for(root)?;
-    let nodes = store
-        .list_nodes(&project, "", &rel, 0, 100_000)
-        .map_err(|error| Error::Invalid(format!("read the outline of {rel}: {error}")))?;
-    let rows = outline_rows(&nodes, &source);
-    if rows.is_empty() && !greppy_discover::detect_language(&abs).is_detected() {
-        // Silence here would read as "this file has no definitions", which is a
-        // different answer from "greppy has no parser for this language".
-        return outline_refusal(format!("{path}: no language greppy parses"));
-    }
-
-    let total = rows.len();
-    let offset = cli_result_offset().min(total);
-    let limit = if all {
-        usize::MAX
-    } else {
-        cli_result_limit_raw().unwrap_or(OUTLINE_PAGE)
-    };
-    let end = offset.saturating_add(limit).min(total);
-    let window = &rows[offset..end];
-
-    if json {
-        let definitions: Vec<serde_json::Value> = window
-            .iter()
-            .map(|row| {
-                serde_json::json!({
-                    "name": row.name,
-                    "qualified_name": row.qualified_name,
-                    "kind": row.kind,
-                    "signature": row.signature,
-                    "file": rel,
-                    "start": row.start,
-                    "end": row.end,
-                    "span": format!("{}:{}", row.start, row.end),
-                })
-            })
-            .collect();
-        let mut value = serde_json::json!({
-            "command": "outline",
-            "file": rel,
-            "total": total,
-            "offset": offset,
-            "shown": definitions.len(),
-            "truncated": end < total,
-            "definitions": definitions,
-        });
-        if end < total {
-            value["try"] = serde_json::json!(retry_with_offset("outline", end));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|error| Error::Invalid(format!("serialize outline JSON: {error}")))?
-        );
-        return Ok(0);
-    }
-    for row in window {
-        println!(
-            "{}  {}  {}:{}-{}",
-            row.kind, row.signature, rel, row.start, row.end
-        );
-    }
-    if end < total {
-        // The continuation is the command itself, so it can be run verbatim.
-        println!("{}", retry_with_offset("outline", end));
-    }
-    Ok(0)
-}
-
-fn dispatch_changes(base: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
-    if json {
-        return changes::run(base, true, root);
-    }
-
-    // Keep the stable JSON producer in `changes` as the single source of
-    // truth. The default renderer consumes that complete record, prints only
-    // counts plus changed symbols, and stores the original behind expand.
-    let root_path = resolve_root(root)?;
-    let mut command = std::process::Command::new(
-        std::env::current_exe().map_err(|error| Error::io("locate greppy executable", error))?,
-    );
-    command.arg("--root").arg(&root_path).arg("changes");
-    if let Some(base) = base {
-        command.arg("--base").arg(base);
-    }
-    let output = command
-        .arg("--json")
-        .output()
-        .map_err(|error| Error::io("run changes JSON renderer", error))?;
-    if !output.status.success() {
-        let diagnosis = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(Error::Invalid(if diagnosis.is_empty() {
-            "changes JSON renderer failed".into()
-        } else {
-            diagnosis
-        }));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| Error::Parse(format!("parse changes JSON: {error}")))?;
-    let files = value["files"].as_array().cloned().unwrap_or_default();
-    let callsites = value["callsite_impact"].as_array().map_or(0, Vec::len);
-    let known_tests = value["tests"]["known_impacted"]
-        .as_array()
-        .map_or(0, Vec::len);
-    let unknown_tests = value["tests"]["unknown_or_unindexed"]
-        .as_array()
-        .map_or(0, Vec::len);
-    let mut symbols = Vec::new();
-    for file in &files {
-        let path = file["path"].as_str().unwrap_or("?");
-        for change in ["modified", "added", "deleted"] {
-            for symbol in file["definitions"][change].as_array().into_iter().flatten() {
-                let kind = symbol["kind"].as_str().unwrap_or("Symbol");
-                let qualified = symbol["qualified_name"].as_str().unwrap_or("?");
-                let span = symbol["after_span"]
-                    .as_object()
-                    .or_else(|| symbol["before_span"].as_object());
-                let location = span.map_or_else(
-                    || path.to_string(),
-                    |span| {
-                        format!(
-                            "{}:{}-{}",
-                            path,
-                            span.get("start_line")
-                                .and_then(serde_json::Value::as_i64)
-                                .unwrap_or(1),
-                            span.get("end_line")
-                                .and_then(serde_json::Value::as_i64)
-                                .unwrap_or(1)
-                        )
-                    },
-                );
-                symbols.push(format!("{change} {kind} {qualified} {location}"));
-            }
-        }
-    }
-    println!(
-        "changes: {} files, {} changed symbols, {} direct callsites",
-        files.len(),
-        symbols.len(),
-        callsites
-    );
-    println!("tests: {known_tests} known_impacted, {unknown_tests} unknown_or_unindexed");
-    // The strict known/unknown split is a contract, and the agent needs the NAMES
-    // to decide what to run — counts alone are not actionable. Keep both headings
-    // and their entries, capped; the full lists stay in --json and the evidence pack.
-    for (heading, key) in [
-        ("known_impacted", "known_impacted"),
-        ("unknown_or_unindexed", "unknown_or_unindexed"),
-    ] {
-        let entries = value["tests"][key].as_array().cloned().unwrap_or_default();
-        println!("  {heading}:");
-        for entry in entries.iter().take(CHANGES_TEST_LIST_CAP) {
-            let name = entry
-                .get("test_symbol")
-                .or_else(|| entry.get("path"))
-                .or_else(|| entry.get("file"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_else(|| entry.as_str().unwrap_or("?"));
-            println!("    {name}");
-        }
-        if entries.len() > CHANGES_TEST_LIST_CAP {
-            println!(
-                "    … {} more (use --json)",
-                entries.len() - CHANGES_TEST_LIST_CAP
-            );
-        }
-    }
-    for symbol in &symbols {
-        println!("{symbol}");
-    }
-
-    let payload_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let requested_base = base.unwrap_or("HEAD");
-    if let (Ok(store), Ok(project)) = (open_default_store_query_writer(root), project_for(root)) {
-        let summary = serde_json::json!({
-            "text": format!(
-                "{} changed symbols, {} callsites, {} known tests, {} unknown tests",
-                symbols.len(), callsites, known_tests, unknown_tests
-            ),
-            "changed_symbols": symbols.len(),
-            "callsites": callsites,
-            "known_impacted": known_tests,
-            "unknown_or_unindexed": unknown_tests,
-        });
-        if let Some(expand) = insert_expand_pack_best_effort(
-            &store,
-            &project,
-            "changes",
-            requested_base,
-            current_graph_generation_or_zero(&store, root),
-            summary,
-            payload_text,
-            Some(value),
-        ) {
-            println!("Expand: greppy expand {}", expand.id);
-        }
-    }
-    Ok(0)
 }
 
 fn dispatch_cache(command: CacheCommand, root: Option<&str>) -> Result<i32> {
@@ -2601,12 +2237,9 @@ fn dispatch_subcommand(
                 dispatch_index(path.as_deref(), root, EmbeddingCliArgs { device, no_gpu })
             }
         }
-        Command::Map { path, json } => map::run(path.as_deref(), json, root),
-        Command::Outline { path, json, all } => dispatch_outline(&path, json, all, root),
-        Command::Changes { base, json } => dispatch_changes(base.as_deref(), json, root),
+        Command::WhereAmI => dispatch_where_am_i(root),
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Trial { args } => trial::run(args, root),
-        Command::Verify { args } => Ok(verify::run(args, root)),
         Command::SearchGraph { name, json } => {
             let mut q = greppy_search::GraphQuery::any().with_limit(cli_result_limit(50));
             let name_filter = name.as_deref();
@@ -2638,8 +2271,6 @@ fn dispatch_subcommand(
             direction,
             edge,
             depth,
-            since,
-            base,
             all,
             json,
         } => {
@@ -2666,8 +2297,6 @@ fn dispatch_subcommand(
                 &direction,
                 edge.as_deref(),
                 depth,
-                since.as_deref(),
-                base.as_deref(),
                 all,
                 json,
                 root,
@@ -3973,182 +3602,6 @@ fn impact_counts_json_with_expand(
             .map_err(|e| Error::Invalid(format!("serialize impact JSON: {e}")))?
     );
     Ok(())
-}
-
-#[derive(Clone)]
-struct DiffImpactSource {
-    row: greppy_search::graph::SearchGraphRow,
-}
-
-struct DiffImpactHit {
-    node: greppy_search::graph::SearchGraphRow,
-    hops: usize,
-    sources: Vec<greppy_search::graph::SearchGraphRow>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn impact_diff_counts_json(
-    store: &greppy_store::Store,
-    root: Option<&str>,
-    project: &str,
-    spec: &DiffSearchSpec,
-    direction: &str,
-    edge_type: &str,
-    edge_types: &[&str],
-    max_hops: usize,
-    sources_total: usize,
-    sources_shown: usize,
-    total_exact: usize,
-    shown: usize,
-    hits: Vec<serde_json::Value>,
-    source_rows: Vec<serde_json::Value>,
-) -> Result<()> {
-    let freshness = nav_freshness_json(store, root, project);
-    let fresh = freshness
-        .get("fresh")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    // Exclude non-code snapshot/fixture providers from impact completeness.
-    let incomplete_providers = code_incomplete_provider_json(store, project)?;
-    let v = serde_json::json!({
-        "command": "impact",
-        "status": "ok",
-        "project": project,
-        "fresh": fresh,
-        "freshness": freshness,
-        "provider_complete": incomplete_providers.is_empty(),
-        "incomplete_provider_count": incomplete_providers.len(),
-        "incomplete_providers": incomplete_providers,
-        "scope": "diff",
-        "diff_scope": spec.scope,
-        "backend": "git_diff_graph",
-        "diff_rev": &spec.diff_rev,
-        "merge_base": spec.merge_base.as_deref(),
-        "diff_files_total": spec.files.len(),
-        "direction": direction,
-        "edge_type": edge_type,
-        "edge_types": edge_types,
-        "max_hops": max_hops,
-        "source_total": sources_total,
-        "source_shown": sources_shown,
-        "source_omitted": sources_total.saturating_sub(sources_shown),
-        "source_symbols": source_rows,
-        "total_exact": total_exact,
-        "shown": shown,
-        "omitted": total_exact.saturating_sub(shown),
-        "truncated": total_exact > shown,
-        "all": false,
-        "hits": hits,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&v)
-            .map_err(|e| Error::Invalid(format!("serialize impact diff JSON: {e}")))?
-    );
-    Ok(())
-}
-
-fn graph_impact_source_row(row: &greppy_search::graph::SearchGraphRow) -> bool {
-    !matches!(row.label.as_str(), "Module" | "Import" | "Call")
-        && !row.qualified_name.ends_with("::__file__")
-}
-
-fn diff_impact_sources(
-    store: &greppy_store::Store,
-    project: &str,
-    changed_lines: &std::collections::BTreeMap<String, std::collections::BTreeSet<i64>>,
-) -> Result<Vec<DiffImpactSource>> {
-    let mut by_id: std::collections::BTreeMap<i64, greppy_search::graph::SearchGraphRow> =
-        std::collections::BTreeMap::new();
-    for (file, lines) in changed_lines {
-        for line in lines {
-            if let Some(row) = greppy_search::definition_at(store, Some(project), file, *line)? {
-                if graph_impact_source_row(&row) {
-                    by_id.entry(row.id).or_insert(row);
-                }
-            }
-        }
-    }
-    let mut sources = by_id
-        .into_values()
-        .map(|row| DiffImpactSource { row })
-        .collect::<Vec<_>>();
-    sources.sort_by(|a, b| {
-        a.row
-            .file_path
-            .cmp(&b.row.file_path)
-            .then_with(|| a.row.start_line.cmp(&b.row.start_line))
-            .then_with(|| a.row.qualified_name.cmp(&b.row.qualified_name))
-            .then_with(|| a.row.id.cmp(&b.row.id))
-    });
-    Ok(sources)
-}
-
-fn diff_impact_hits(
-    store: &greppy_store::Store,
-    sources: &[DiffImpactSource],
-    direction: greppy_search::ReachDirection,
-    edge_types: &[&str],
-    max_hops: usize,
-) -> Result<Vec<DiffImpactHit>> {
-    let source_by_id = sources
-        .iter()
-        .map(|source| (source.row.id, source.row.clone()))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut hits: std::collections::BTreeMap<
-        i64,
-        (
-            usize,
-            greppy_search::graph::SearchGraphRow,
-            std::collections::BTreeSet<i64>,
-        ),
-    > = std::collections::BTreeMap::new();
-
-    for source in sources {
-        for hit in greppy_search::impact_radius_any_edge_type(
-            store,
-            source.row.id,
-            direction,
-            edge_types,
-            max_hops,
-            4096,
-        )? {
-            let entry = hits.entry(hit.node.id).or_insert_with(|| {
-                (
-                    hit.hops,
-                    hit.node.clone(),
-                    std::collections::BTreeSet::new(),
-                )
-            });
-            if hit.hops < entry.0 {
-                entry.0 = hit.hops;
-                entry.1 = hit.node.clone();
-            }
-            entry.2.insert(source.row.id);
-        }
-    }
-
-    let mut out = hits
-        .into_iter()
-        .map(|(_id, (hops, node, source_ids))| {
-            let sources = source_ids
-                .into_iter()
-                .filter_map(|id| source_by_id.get(&id).cloned())
-                .collect::<Vec<_>>();
-            DiffImpactHit {
-                node,
-                hops,
-                sources,
-            }
-        })
-        .collect::<Vec<_>>();
-    out.sort_by(|a, b| {
-        a.hops
-            .cmp(&b.hops)
-            .then_with(|| a.node.qualified_name.cmp(&b.node.qualified_name))
-            .then_with(|| a.node.id.cmp(&b.node.id))
-    });
-    Ok(out)
 }
 
 struct TraceJsonMeta<'a> {
@@ -6298,6 +5751,24 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
         println!("expand: id not found or expired: {id}");
         return Ok(1);
     };
+    let mut payload_text = pack.payload_text.clone();
+    let mut payload_json = pack.payload_json.clone();
+    if pack.command == "where-am-i" {
+        let Some(metadata) = payload_json.as_ref() else {
+            println!("expand: invalid where-am-i inventory pack");
+            return Ok(1);
+        };
+        match where_inventory_expand_payload(&store, root, &pack.project, metadata)? {
+            Ok((text, value)) => {
+                payload_text = text;
+                payload_json = Some(value);
+            }
+            Err(message) => {
+                println!("{message}");
+                return Ok(1);
+            }
+        }
+    }
     if json {
         let v = serde_json::json!({
             "id": pack.id,
@@ -6308,8 +5779,8 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
             "created_at": pack.created_at,
             "expires_at": pack.expires_at,
             "summary": pack.summary_json,
-            "payload_text": pack.payload_text,
-            "payload_json": pack.payload_json,
+            "payload_text": payload_text,
+            "payload_json": payload_json,
         });
         println!(
             "{}",
@@ -6317,8 +5788,8 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
                 .map_err(|e| Error::Invalid(format!("serialize expand JSON: {e}")))?
         );
     } else {
-        print!("{}", pack.payload_text);
-        if !pack.payload_text.ends_with('\n') {
+        print!("{payload_text}");
+        if !payload_text.ends_with('\n') {
             println!();
         }
     }
@@ -9338,8 +8809,7 @@ const GREPPY_ONLY_FLAGS: &[(&str, &str)] = &[
     ("--depth", "impact"),
     ("--direction", "impact"),
     ("--from", "path"),
-    ("--base", "changes"),
-    ("--report", "changes"),
+    ("--report", "edit"),
     ("--path", NAV_OWNER),
     // These four were the ones actually seen reaching grep in the traces. The
     // rg branch returns earlier, so `--json` here is never ripgrep's.
