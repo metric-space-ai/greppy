@@ -308,14 +308,19 @@ fn expand_missing_id_reports_clear_message() {
 }
 
 #[test]
-fn who_calls_reports_no_callers_for_uncalled_symbol() {
+fn who_calls_names_the_kind_of_an_uncallable_symbol() {
     let (repo, store) = index_fixture("whocalls-none");
-    // `Widget` is a struct — nothing CALLS it.
+    // `Widget` is a struct. "no callers" would be literally true and would
+    // read as "unused", so the answer names what it actually is instead.
     let (code, out, _err) = run(&["who-calls", "Widget"], &repo, &store);
-    assert_eq!(code, 0);
-    assert_eq!(
-        out, "no callers\n",
-        "an uncalled symbol must report no callers and nothing else"
+    assert_eq!(code, 1, "a question that does not apply is not an answer");
+    assert!(
+        out.starts_with("`Widget` is a struct, not a function  "),
+        "the refusal names the kind and where it is; got: {out:?}"
+    );
+    assert!(
+        !out.contains("no callers"),
+        "a struct must not be reported as uncalled; got: {out:?}"
     );
 }
 
@@ -1193,7 +1198,7 @@ fn navigation_commands_report_missing_symbol() {
             "missing symbol must exit 1 for {cmd:?}; got out={out:?}"
         );
         assert!(
-            out.contains("symbol not found"),
+            out.contains("symbol not found") || out.contains("no symbol `"),
             "missing symbol must report not-found for {cmd:?}; got: {out:?}"
         );
     }

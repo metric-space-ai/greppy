@@ -15787,6 +15787,183 @@ fn nav_file_lines(root: &std::path::Path, file: &str) -> Option<Vec<String>> {
         .map(|text| text.lines().map(str::to_string).collect())
 }
 
+/// What a reader would call this definition. The index label is a poor source:
+/// it says `Class` for a Rust struct, so the refusal would name a thing the
+/// language does not have. The declaring keyword in the source says it exactly,
+/// in the words of the language the agent is reading, and the label is only the
+/// fallback for a file that cannot be read.
+fn nav_kind_word(lines: Option<&Vec<String>>, node: &greppy_store::Node) -> String {
+    const KEYWORDS: [&str; 14] = [
+        "struct",
+        "enum",
+        "trait",
+        "class",
+        "interface",
+        "record",
+        "union",
+        "type",
+        "const",
+        "static",
+        "protocol",
+        "object",
+        "module",
+        "package",
+    ];
+    if let Some(lines) = lines {
+        if let Some(line) = lines.get((node.start_line.max(1) as usize).saturating_sub(1)) {
+            for word in line.split_whitespace() {
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+                if KEYWORDS.contains(&word) {
+                    return word.to_string();
+                }
+            }
+        }
+    }
+    match node.label.as_str() {
+        "EnumVariant" => "enum variant".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+/// Which kinds a direction can answer for. The two are deliberately not the
+/// same set: a struct is never *called*, so `who-calls` on it can only mislead
+/// — but its impl block does call things, so `callees` on it is a real
+/// question. Only definitions that cannot hold code at all — a field, a
+/// variable, a constant, an enum variant — are unanswerable in both directions.
+#[derive(Clone, Copy)]
+enum NavDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl NavDirection {
+    fn answerable(self, label: &str) -> bool {
+        match self {
+            NavDirection::Incoming => matches!(
+                label,
+                "Function" | "Method" | "Constructor" | "Macro" | "Interface"
+            ),
+            NavDirection::Outgoing => !matches!(
+                label,
+                "Field" | "Variable" | "Constant" | "EnumVariant" | "Property"
+            ),
+        }
+    }
+}
+
+/// A definition the direction cannot answer for. "no callers" on a struct is
+/// literally true and practically a lie — the agent reads a successful answer
+/// and concludes the definition is unused. Name the kind instead and refuse.
+fn nav_refuse_non_callable(
+    store: &greppy_store::Store,
+    repo_root: &std::path::Path,
+    target: &str,
+    ids: &[i64],
+    direction: NavDirection,
+) -> Result<Option<i32>> {
+    let mut nodes = Vec::new();
+    let mut anchors = Vec::new();
+    for id in ids {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+            // A file anchor is the module, not a definition inside it. It is
+            // the only thing `data` resolves to, and answering "no callers" for
+            // a module is the same false negative as answering it for a struct.
+            anchors.push(node);
+            continue;
+        }
+        if direction.answerable(&node.label) {
+            return Ok(None);
+        }
+        nodes.push(node);
+    }
+    let Some(node) = nodes.first().or_else(|| anchors.first()) else {
+        return Ok(None);
+    };
+    let lines = nav_file_lines(repo_root, &node.file_path);
+    println!(
+        "`{target}` is a {}, not a function  {}:{}",
+        nav_kind_word(lines.as_ref(), node),
+        node.file_path,
+        node.start_line.max(1)
+    );
+    Ok(Some(1))
+}
+
+/// A bare name that names several callable definitions selects none of them.
+/// Answering for one, or merging them, is the reinterpretation the resolver
+/// exists to prevent. The candidates carry no name because it is the same for
+/// all of them — what separates them is the file, and the address holds it.
+fn nav_refuse_ambiguous(
+    store: &greppy_store::Store,
+    target: &str,
+    ids: &[i64],
+) -> Result<Option<i32>> {
+    if ids.len() < 2 || split_path_qualified(target).is_some() {
+        return Ok(None);
+    }
+    let mut sites: Vec<(String, i64)> = Vec::new();
+    for id in ids {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+            continue;
+        }
+        if !sites.iter().any(|(file, _)| file == &node.file_path) {
+            sites.push((node.file_path.clone(), node.start_line.max(1)));
+        }
+    }
+    if sites.len() < 2 {
+        return Ok(None);
+    }
+    sites.sort();
+    println!("`{target}` is {} definitions", sites.len());
+    for (file, line) in &sites {
+        println!("{file}:{line}");
+    }
+    Ok(Some(1))
+}
+
+/// The name does not resolve. Say so, and add only what the agent could not get
+/// with one command of its own: names close enough to be the one it meant, with
+/// where they are. Nothing close enough means no block at all — the absence is
+/// the statement, and it says the repository does not know this name.
+fn nav_report_missing(store: &greppy_store::Store, project: &str, query: &str) {
+    println!("no symbol `{query}`");
+    let normalise =
+        |name: &str| name.to_ascii_lowercase().replace('_', "").replace('-', "");
+    let wanted = normalise(query);
+    let mut near: Vec<(String, String, i64)> = Vec::new();
+    for name in symbol_miss_suggestions(store, project, query) {
+        let close = normalise(&name) == wanted
+            || symbol_name_distance(&name, &suggestion_needles(query)) <= 2;
+        if !close {
+            continue;
+        }
+        let Ok(ids) = resolve_symbol_nodes(store, Some(&name)) else {
+            continue;
+        };
+        let Some(node) = ids.first().and_then(|id| store.get_node(*id).ok().flatten()) else {
+            continue;
+        };
+        near.push((name, node.file_path.clone(), node.start_line.max(1)));
+        if near.len() == 3 {
+            break;
+        }
+    }
+    if near.is_empty() {
+        return;
+    }
+    println!();
+    println!("similar names:");
+    for (name, file, line) in near {
+        println!("{file}:{line}  {name}");
+    }
+}
+
 /// Prints the answer of `who-calls` / `callees`.
 ///
 /// A short result is printed whole — a count beneath lines the reader can count
@@ -15914,8 +16091,23 @@ fn dispatch_who_calls(
     // the name + a primary label (e.g. a Struct and its Impl) so callers
     // are not lost to a name resolving to the wrong single node.
     let targets = resolve_symbol_nodes(&store, symbol)?;
+    // The kind is checked before the ambiguity: two definitions that are both
+    // enum variants are not a choice the agent has to make, they are a question
+    // that does not apply.
     if let Some(symbol) = symbol {
-        ensure_unambiguous_target(&store, symbol, &targets)?;
+        if json {
+            ensure_unambiguous_target(&store, symbol, &targets)?;
+        } else {
+            let repo_root = resolve_root(root)?;
+            if let Some(code) =
+                nav_refuse_non_callable(&store, &repo_root, symbol, &targets, NavDirection::Incoming)?
+            {
+                return Ok(code);
+            }
+            if let Some(code) = nav_refuse_ambiguous(&store, symbol, &targets)? {
+                return Ok(code);
+            }
+        }
     }
     if targets.is_empty() {
         if json {
@@ -15934,7 +16126,8 @@ fn dispatch_who_calls(
             )?;
             return Ok(1);
         }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "callers", &path_filters);
+        nav_report_missing(&store, &project, query_symbol);
+        return Ok(1);
     }
     let mut edges = Vec::new();
     for target in &targets {
@@ -16121,7 +16314,19 @@ fn dispatch_callees(
     }
     let sources = resolve_symbol_nodes(&store, symbol)?;
     if let Some(symbol) = symbol {
-        ensure_unambiguous_target(&store, symbol, &sources)?;
+        if json {
+            ensure_unambiguous_target(&store, symbol, &sources)?;
+        } else {
+            let repo_root = resolve_root(root)?;
+            if let Some(code) =
+                nav_refuse_non_callable(&store, &repo_root, symbol, &sources, NavDirection::Outgoing)?
+            {
+                return Ok(code);
+            }
+            if let Some(code) = nav_refuse_ambiguous(&store, symbol, &sources)? {
+                return Ok(code);
+            }
+        }
     }
     if sources.is_empty() {
         if json {
@@ -16140,7 +16345,7 @@ fn dispatch_callees(
             )?;
             return Ok(1);
         }
-        print_symbol_miss_guidance(&store, &project, query_symbol);
+        nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
     // Aggregate direct callees across the resolved source nodes, keyed on
