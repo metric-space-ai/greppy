@@ -147,7 +147,8 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     // short. Normal short output remains exactly byte-for-byte output only.
     if short && !interrupted {
         if let Some(store) = store.as_ref() {
-            let _ = insert_pack(store, &project, &query, &raw, "stdout", 1);
+            let ranges = full_line_range(&stdout_lines);
+            let _ = insert_pack(store, &project, &query, &raw, "stdout", &ranges);
         }
         write_stream(false, &raw.stdout);
         write_stream(true, &raw.stderr);
@@ -170,14 +171,14 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     push_line_lift(&mut lifted_stdout, &stdout_lines, timeout_stdout_line);
     push_line_lift(&mut lifted_stderr, &stderr_lines, timeout_stderr_line);
 
-    let stdout_start = first_hidden_line(&stdout_lines, exit_code, &lifted_stdout).unwrap_or(1);
-    let stderr_start = first_hidden_line(&stderr_lines, exit_code, &lifted_stderr).unwrap_or(1);
-    let stdout_id = store
-        .as_ref()
-        .and_then(|store| insert_pack(store, &project, &query, &raw, "stdout", stdout_start).ok());
+    let stdout_ranges = expansion_ranges(&stdout_lines, exit_code, &lifted_stdout);
+    let stderr_ranges = expansion_ranges(&stderr_lines, exit_code, &lifted_stderr);
+    let stdout_id = store.as_ref().and_then(|store| {
+        insert_pack(store, &project, &query, &raw, "stdout", &stdout_ranges).ok()
+    });
     let stderr_id = if stderr_folded {
         store.as_ref().and_then(|store| {
-            insert_pack(store, &project, &query, &raw, "stderr", stderr_start).ok()
+            insert_pack(store, &project, &query, &raw, "stderr", &stderr_ranges).ok()
         })
     } else {
         None
@@ -257,32 +258,28 @@ pub(crate) fn expand(
         .get("stream")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("stdout");
-    let start = pack
-        .summary_json
-        .get("start_line")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|line| usize::try_from(line).ok())
-        .unwrap_or(1)
-        .max(1);
     let bytes = if stream == "stderr" {
         &raw.stderr
     } else {
         &raw.stdout
     };
     let lines = split_lines(bytes);
-    let begin = start.saturating_sub(1).min(lines.len());
-    let end = begin.saturating_add(EXPAND_PAGE_LINES).min(lines.len());
-    let next_line = end + 1;
+    let ranges = pack_line_ranges(&pack, lines.len());
+    let (page_ranges, remaining_ranges) = take_range_page(&ranges, EXPAND_PAGE_LINES);
+    let start = page_ranges.first().map(|(start, _)| *start).unwrap_or(1);
+    let end_line = page_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let next_line = remaining_ranges.first().map(|(start, _)| *start);
 
-    let next = if end < lines.len() {
-        insert_continuation_pack(store, &pack, &raw, stream, next_line).ok()
-    } else {
+    let next = if remaining_ranges.is_empty() {
         None
+    } else {
+        insert_continuation_pack(store, &pack, &raw, stream, &remaining_ranges).ok()
     };
 
     if json {
-        let page = lines[begin..end]
+        let page = page_ranges
             .iter()
+            .flat_map(|(start, end)| lines[start - 1..*end].iter())
             .map(|line| hex_encode(line.raw))
             .collect::<Vec<_>>();
         println!(
@@ -293,12 +290,12 @@ pub(crate) fn expand(
                 "stream": stream,
                 "content_sha256": raw.content_sha256,
                 "start_line": start,
-                "end_line": end,
+                "end_line": end_line,
                 "line_count": lines.len(),
                 "raw_line_hex": page,
-                "next": next.as_ref().map(|id| serde_json::json!({
+                "next": next.as_ref().zip(next_line).map(|(id, line)| serde_json::json!({
                     "id": id,
-                    "line": next_line,
+                    "line": line,
                     "command": format!("greppy expand {id}"),
                 })),
             }))
@@ -308,15 +305,15 @@ pub(crate) fn expand(
     }
 
     let mut stdout = std::io::stdout().lock();
-    for line in &lines[begin..end] {
-        let _ = stdout.write_all(line.raw);
+    write_line_ranges(&mut stdout, &lines, &page_ranges);
+    if let Some((_, end)) = page_ranges.last() {
+        if !lines[*end - 1].raw.ends_with(b"\n") {
+            let _ = stdout.write_all(b"\n");
+        }
     }
-    if end > begin && !lines[end - 1].raw.ends_with(b"\n") {
-        let _ = stdout.write_all(b"\n");
-    }
-    if end < lines.len() {
-        if let Some(next_id) = next {
-            let remaining = lines.len() - end;
+    if !remaining_ranges.is_empty() {
+        if let (Some(next_id), Some(next_line)) = (next, next_line) {
+            let remaining = range_line_count(&remaining_ranges);
             let _ = writeln!(
                 stdout,
                 "… {remaining} lines — greppy expand {next_id} continues at {next_line}"
@@ -324,9 +321,7 @@ pub(crate) fn expand(
         } else {
             // If allocating the next page fails, deliver it now rather than
             // leave a continuation that cannot be opened.
-            for line in &lines[end..] {
-                let _ = stdout.write_all(line.raw);
-            }
+            write_line_ranges(&mut stdout, &lines, &remaining_ranges);
         }
     }
     Ok(0)
@@ -648,13 +643,15 @@ fn insert_pack(
     query: &str,
     raw: &StoredRaw,
     stream: &str,
-    start_line: usize,
+    line_ranges: &[(usize, usize)],
 ) -> std::result::Result<String, greppy_store::Error> {
+    let start_line = line_ranges.first().map(|(start, _)| *start).unwrap_or(1);
     let summary = serde_json::json!({
         "text": format!("bash-smart {stream} raw output"),
         "kind": "bash-smart",
         "stream": stream,
         "start_line": start_line,
+        "line_ranges": line_ranges,
         "content_sha256": raw.content_sha256,
     });
     store.insert_expand_pack(&greppy_store::NewExpandPack {
@@ -677,8 +674,9 @@ fn insert_continuation_pack(
     previous: &greppy_store::ExpandPack,
     raw: &StoredRaw,
     stream: &str,
-    start_line: usize,
+    line_ranges: &[(usize, usize)],
 ) -> std::result::Result<String, greppy_store::Error> {
+    let start_line = line_ranges.first().map(|(start, _)| *start).unwrap_or(1);
     store.insert_expand_pack(&greppy_store::NewExpandPack {
         project: previous.project.clone(),
         command: "bash-smart".into(),
@@ -689,6 +687,7 @@ fn insert_continuation_pack(
             "kind": "bash-smart",
             "stream": stream,
             "start_line": start_line,
+            "line_ranges": line_ranges,
             "content_sha256": raw.content_sha256,
         }),
         payload_text: format!(
@@ -845,16 +844,93 @@ fn hidden_middle_ranges(
     ranges
 }
 
-fn first_hidden_line(
+fn full_line_range(lines: &[RawLine<'_>]) -> Vec<(usize, usize)> {
+    (!lines.is_empty())
+        .then_some((1, lines.len()))
+        .into_iter()
+        .collect()
+}
+
+fn expansion_ranges(
     lines: &[RawLine<'_>],
     exit_code: i32,
     lifted: &[LiftedLine],
-) -> Option<usize> {
+) -> Vec<(usize, usize)> {
     let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
     let displayed = displayed_middle_lines(lines, exit_code, lifted);
-    hidden_middle_ranges(head_end, tail_start, &displayed)
-        .first()
-        .map(|(start, _)| *start)
+    let hidden = hidden_middle_ranges(head_end, tail_start, &displayed);
+    if hidden.is_empty() {
+        full_line_range(lines)
+    } else {
+        hidden
+    }
+}
+
+fn pack_line_ranges(pack: &greppy_store::ExpandPack, line_count: usize) -> Vec<(usize, usize)> {
+    if let Some(raw_ranges) = pack
+        .summary_json
+        .get("line_ranges")
+        .and_then(serde_json::Value::as_array)
+    {
+        return raw_ranges
+            .iter()
+            .filter_map(|range| {
+                let range = range.as_array()?;
+                let start = usize::try_from(range.first()?.as_u64()?).ok()?.max(1);
+                let end = usize::try_from(range.get(1)?.as_u64()?)
+                    .ok()?
+                    .min(line_count);
+                (start <= end).then_some((start, end))
+            })
+            .collect();
+    }
+
+    let start = pack
+        .summary_json
+        .get("start_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| usize::try_from(line).ok())
+        .unwrap_or(1)
+        .max(1);
+    (start <= line_count)
+        .then_some((start, line_count))
+        .into_iter()
+        .collect()
+}
+
+fn take_range_page(
+    ranges: &[(usize, usize)],
+    page_lines: usize,
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut page = Vec::new();
+    let mut remaining = Vec::new();
+    let mut available = page_lines;
+    for &(start, end) in ranges {
+        let count = end - start + 1;
+        if available == 0 {
+            remaining.push((start, end));
+        } else if count <= available {
+            page.push((start, end));
+            available -= count;
+        } else {
+            page.push((start, start + available - 1));
+            remaining.push((start + available, end));
+            available = 0;
+        }
+    }
+    (page, remaining)
+}
+
+fn range_line_count(ranges: &[(usize, usize)]) -> usize {
+    ranges.iter().map(|(start, end)| end - start + 1).sum()
+}
+
+fn write_line_ranges(writer: &mut dyn Write, lines: &[RawLine<'_>], ranges: &[(usize, usize)]) {
+    for &(start, end) in ranges {
+        for line in &lines[start - 1..end] {
+            let _ = writer.write_all(line.raw);
+        }
+    }
 }
 
 fn display_line_ranges(ranges: &[(usize, usize)]) -> String {

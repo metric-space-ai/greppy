@@ -120,10 +120,11 @@ fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
     let expanded = run(&workspace, &["expand", id]);
     assert_eq!(expanded.status.code(), Some(0));
     assert!(expanded.stderr.is_empty(), "{}", text(&expanded.stderr));
-    let expected_expanded = (22..=200)
+    let expected_expanded = (22..=170)
         .map(|line| format!("line {line}\n"))
         .collect::<String>();
     assert_eq!(expanded.stdout, expected_expanded.as_bytes());
+    assert_eq!(text(&expanded.stdout).lines().count(), 149);
 }
 
 #[test]
@@ -154,7 +155,8 @@ fn repeated_middle_is_collapsed_arithmetically() {
     let expanded = run(&workspace, &["expand", id]);
     assert_eq!(expanded.status.code(), Some(0));
     assert!(expanded.stderr.is_empty(), "{}", text(&expanded.stderr));
-    assert_eq!(expanded.stdout, "hello\n".repeat(279).as_bytes());
+    assert_eq!(expanded.stdout, "hello\n".repeat(249).as_bytes());
+    assert_eq!(text(&expanded.stdout).lines().count(), 249);
 }
 
 #[test]
