@@ -124,21 +124,11 @@
 
             let code = dispatch_edit(
                 EditCommand::Replace {
-                    file: None,
-                    old: None,
-                    old_file: None,
-                    pattern: None,
-                    lines: None,
-                    symbol: Some("computeTotal".into()),
+                    symbol: "computeTotal".into(),
+                    new: Some(std::fs::read_to_string(&replacement_path).unwrap()),
                     body: true,
-                    target: None,
-                    content: None,
-                    content_file: Some(replacement_path.to_string_lossy().into_owned()),
-                    expect: None,
-                    path: None,
                     dry_run: true,
                     verify: false,
-                    report: None,
                 },
                 false,
                 root.to_str(),

@@ -654,491 +654,44 @@ pub enum CacheCommand {
     },
 }
 
-/// Subcommands of `greppy edit`. Exit codes are the registered contract
-/// (docs/contracts/EDIT_CONTRACT.md): 0 applied/already-satisfied,
-/// 10 not found, 11 ambiguous, 12 stale, 13 syntax/postcondition,
-/// 14 validator, 15 concurrent change, 16 publish, 17 unsafe path,
-/// 20 invalid spec.
-#[derive(clap::Subcommand, Debug)]
+/// The trained edit operations. Clap exposes each variant as a top-level verb;
+/// this enum is only the small internal dispatch envelope shared by them.
+#[derive(Debug)]
 pub enum EditCommand {
-    /// Put new text in place of WHERE.
-    #[command(
-        name = "replace",
-        about = "Put new text in place of the selected span.",
-        after_help = "WHERE is exactly one of:\n  \
-                      --file F --old TEXT | --old-file F2   that exact text (once by default)\n  \
-                      --file F --pattern REGEX              what the regular expression matches\n  \
-                      --file F --lines A:B                  those lines, both ends included\n  \
-                      --file F                              the whole file\n  \
-                      --symbol S                            the whole definition of S\n  \
-                      --symbol S --body                     only its body\n  \
-                      --target H                            the span a handle marks\n\n\
-                      Example:\n  greppy edit replace --symbol greet --content-file body.rs"
-    )]
     Replace {
-        #[arg(long)]
-        file: Option<String>,
-        /// The exact text to look for.
-        #[arg(long, allow_hyphen_values = true)]
-        old: Option<String>,
-        /// The exact text to look for, from a file (`-` reads the pipe).
-        #[arg(long = "old-file")]
-        old_file: Option<String>,
-        /// A regular expression selecting the span.
-        #[arg(long, allow_hyphen_values = true)]
-        pattern: Option<String>,
-        /// A line range A:B, 1-based, both ends included.
-        #[arg(long)]
-        lines: Option<String>,
-        /// A definition, resolved like `read`.
-        #[arg(long)]
-        symbol: Option<String>,
-        /// Only the definition's body; the signature stays as it is.
-        #[arg(long)]
+        symbol: String,
+        new: Option<String>,
         body: bool,
-        /// The span a handle marks.
-        #[arg(long)]
-        target: Option<String>,
-        /// The new text, for short single-line text.
-        #[arg(long, allow_hyphen_values = true)]
-        content: Option<String>,
-        /// The new text from a file; `-` reads it from the pipe.
-        #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: Option<String>,
-        /// Require exactly N matches instead of one.
-        #[arg(long)]
+        dry_run: bool,
+        verify: bool,
+    },
+    ReplaceText {
+        file: String,
+        old: String,
+        new: Option<String>,
         expect: Option<usize>,
-        /// Only results under that file or directory.
-        #[arg(long)]
-        path: Option<String>,
-        /// Report what it would write and write nothing.
-        #[arg(long = "dry-run")]
+        regex: bool,
         dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
         verify: bool,
-        /// Write the full record of the edit to a file.
-        #[arg(long)]
-        report: Option<String>,
     },
-    /// Put new text next to WHERE, on the side `--before`/`--after` names.
-    #[command(
-        name = "insert",
-        about = "Put new text next to the selected span.",
-        after_help = "WHERE is exactly one of --symbol S, --file F --lines A:B, or --target H;\n\
-                      a text or regex match has no defined side to land on.\n\n\
-                      Example:\n  greppy edit insert --symbol greet --after --content-file block.rs"
-    )]
-    Insert {
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        old: Option<String>,
-        #[arg(long = "old-file")]
-        old_file: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        pattern: Option<String>,
-        /// A line range A:B, 1-based, both ends included.
-        #[arg(long)]
-        lines: Option<String>,
-        /// A definition, resolved like `read`.
-        #[arg(long)]
-        symbol: Option<String>,
-        /// Anchor on the definition's body instead of the whole definition.
-        #[arg(long)]
-        body: bool,
-        /// The span a handle marks.
-        #[arg(long)]
-        target: Option<String>,
-        /// Land on the side above the anchor.
-        #[arg(long)]
-        before: bool,
-        /// Land on the side below the anchor.
-        #[arg(long)]
-        after: bool,
-        /// The new text, for short single-line text.
-        #[arg(long, allow_hyphen_values = true)]
-        content: Option<String>,
-        /// The new text from a file; `-` reads it from the pipe.
-        #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: Option<String>,
-        /// Only results under that file or directory.
-        #[arg(long)]
-        path: Option<String>,
-        /// Report what it would write and write nothing.
-        #[arg(long = "dry-run")]
+    ReplaceLines {
+        file: String,
+        lines: String,
+        new: Option<String>,
         dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
         verify: bool,
-        /// Write the full record of the edit to a file.
-        #[arg(long)]
-        report: Option<String>,
     },
-    /// Remove what WHERE points at.
-    #[command(
-        name = "delete",
-        about = "Remove what the selector points at.",
-        after_help = "WHERE is exactly one of:\n  \
-                      --file F --old TEXT | --old-file F2   that exact text (once by default)\n  \
-                      --file F --pattern REGEX              what the regular expression matches\n  \
-                      --file F --lines A:B                  those lines, both ends included\n  \
-                      --file F                              the whole file's contents\n  \
-                      --symbol S                            the whole definition of S\n  \
-                      --target H                            the span a handle marks\n\n\
-                      Example:\n  greppy edit delete --symbol obsolete"
-    )]
-    Delete {
-        #[arg(long)]
-        file: Option<String>,
-        /// The exact text to look for.
-        #[arg(long, allow_hyphen_values = true)]
-        old: Option<String>,
-        /// The exact text to look for, from a file (`-` reads the pipe).
-        #[arg(long = "old-file")]
-        old_file: Option<String>,
-        /// A regular expression selecting the span.
-        #[arg(long, allow_hyphen_values = true)]
-        pattern: Option<String>,
-        /// A line range A:B, 1-based, both ends included.
-        #[arg(long)]
-        lines: Option<String>,
-        /// A definition, resolved like `read`.
-        #[arg(long)]
-        symbol: Option<String>,
-        /// Only the definition's body.
-        #[arg(long)]
-        body: bool,
-        /// The span a handle marks.
-        #[arg(long)]
-        target: Option<String>,
-        /// Require exactly N matches instead of one.
-        #[arg(long)]
-        expect: Option<usize>,
-        /// Only results under that file or directory.
-        #[arg(long)]
-        path: Option<String>,
-        /// Report what it would write and write nothing.
-        #[arg(long = "dry-run")]
+    ReplaceSpan {
+        handle: String,
+        new: Option<String>,
         dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
         verify: bool,
-        /// Write the full record of the edit to a file.
-        #[arg(long)]
-        report: Option<String>,
     },
-    /// Apply a unified diff inside WHERE. The diff's line numbers may count
-    /// from the start of the file or from the start of WHERE — whichever the
-    /// context lines confirm. Paths inside the diff are ignored.
-    #[command(
-        name = "patch",
-        about = "Apply a unified diff inside the selected span.",
-        after_help = "WHERE is exactly one of --symbol S, --file F --lines A:B, --file F, or\n\
-                      --target H; a text or regex match gives the hunks nothing to count from.\n\n\
-                      Example:\n  greppy edit patch --symbol greet --patch-file greet.diff"
-    )]
-    Patch {
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        old: Option<String>,
-        #[arg(long = "old-file")]
-        old_file: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        pattern: Option<String>,
-        /// A line range A:B, 1-based, both ends included.
-        #[arg(long)]
-        lines: Option<String>,
-        /// A definition, resolved like `read`.
-        #[arg(long)]
-        symbol: Option<String>,
-        /// Anchor on the definition's body instead of the whole definition.
-        #[arg(long)]
-        body: bool,
-        /// The span a handle marks.
-        #[arg(long)]
-        target: Option<String>,
-        /// The unified diff to apply; `-` reads it from the pipe.
-        #[arg(long = "patch-file")]
-        patch_file: Option<String>,
-        /// Only results under that file or directory.
-        #[arg(long)]
-        path: Option<String>,
-        /// Report what it would write and write nothing.
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
-        verify: bool,
-        /// Write the full record of the edit to a file.
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Create a file. `replace --file F` needs one that already exists.
-    #[command(
-        name = "write",
-        about = "Create a file from the given content.",
-        after_help = "Example:\n  greppy edit write --file src/new.rs --content-file new.rs"
-    )]
     Write {
-        #[arg(long)]
-        file: String,
-        /// The new text, for short single-line text.
-        #[arg(long, allow_hyphen_values = true)]
-        content: Option<String>,
-        /// The new text from a file; `-` reads it from the pipe.
-        #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: Option<String>,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
-        verify: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Move or rename a file, and update the declarations naming it.
-    #[command(
-        name = "move",
-        about = "Move or rename a file and update what names it.",
-        after_help = "Example:\n  greppy edit move --file src/old.rs --to src/new.rs"
-    )]
-    Move {
-        #[arg(long)]
-        file: String,
-        /// The new path.
-        #[arg(long)]
-        to: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
-        verify: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Delete a file, and report what still references it. Refuses while
-    /// something still points at it; `--force` overrides that.
-    #[command(
-        name = "remove",
-        about = "Delete a file; refuses while something still references it.",
-        after_help = "Example:\n  greppy edit remove --file src/obsolete.rs\n  \
-                      greppy edit remove --file src/obsolete.rs --force"
-    )]
-    Remove {
-        #[arg(long)]
-        file: String,
-        /// Delete it even though something still references it.
-        #[arg(long)]
-        force: bool,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// After writing, run the build or linter for the touched files.
-        #[arg(long)]
-        verify: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Rename a definition and every reference to it (`--symbol S --to N`),
-    /// or make one definition call something else (`--in S --call A --to B`).
-    #[command(
-        name = "rename",
-        about = "Rename a definition, or redirect a call inside one definition.",
-        after_help = "Example:\n  greppy edit rename --symbol combine --to merge\n  \
-                      greppy edit rename --in caller --call combine --to merge"
-    )]
-    Rename {
-        /// The definition to rename.
-        #[arg(long)]
-        symbol: Option<String>,
-        /// The definition whose calls are redirected.
-        #[arg(long = "in")]
-        r#in: Option<String>,
-        /// The callee to redirect.
-        #[arg(long)]
-        call: Option<String>,
-        /// The new name.
-        #[arg(long)]
-        to: String,
-        /// Require exactly N redirected calls.
-        #[arg(long)]
-        expect: Option<usize>,
-        /// Accepted old-name occurrences left over after a workspace rename.
-        #[arg(long = "expect-residual", default_value_t = 0)]
-        expect_residual: usize,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Change a definition signature and every graph-resolved call site in one
-    /// transaction, using the old/new parameter lists and call cardinality in
-    /// a JSON specification.
-    #[command(
-        name = "change-signature",
-        about = "Change a signature and all graph-resolved call sites.",
-        after_help = r#"Example:
-  greppy edit change-signature --symbol combine --spec '{"old_parameters":"(a: i32, b: i32)","new_parameters":"(b: i32, a: i32)","expect_call_sites":1}'"#
-    )]
-    ChangeSignature {
-        #[arg(long)]
-        symbol: String,
-        /// Inline JSON, or a JSON file containing old_parameters,
-        /// new_parameters, added_arguments, and expect_call_sites.
-        #[arg(long)]
-        spec: String,
-        /// graph (default) uses the resolved store; lsp is unavailable in this build.
-        #[arg(long, default_value = "graph", value_parser = ["graph", "lsp"])]
-        backend: String,
-        #[arg(long = "expect-residual", default_value_t = 0)]
-        expect_residual: usize,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Add an import if the file is missing it.
-    #[command(
-        name = "ensure-import",
-        about = "Insert an import once at the canonical position.",
-        after_help = "Example:\n  greppy edit ensure-import --file src/lib.rs --module std::collections --name HashMap"
-    )]
-    EnsureImport {
-        #[arg(long)]
-        file: String,
-        #[arg(long)]
-        module: String,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Within one definition, append an argument to every call of NAME
-    /// that does not already carry it (idempotent).
-    #[command(
-        name = "ensure-argument",
-        about = "Append a missing argument to matching calls in one definition.",
-        after_help = "Example:\n  greppy edit ensure-argument --symbol caller --call combine --arg 3"
-    )]
-    EnsureArgument {
-        #[arg(long)]
-        symbol: String,
-        /// The callee whose calls get the argument.
-        #[arg(long)]
-        call: String,
-        /// Argument text, e.g. "timeout=30".
-        #[arg(long)]
-        arg: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Add a method a class lacks.
-    #[command(
-        name = "ensure-method",
-        about = "Append a method to a class when it is absent.",
-        after_help = "Example:\n  greppy edit ensure-method --symbol Greeter --name greet --content-file greet_method.py"
-    )]
-    EnsureMethod {
-        /// The class (resolved like read).
-        #[arg(long)]
-        symbol: String,
-        /// The new method's name (idempotency key).
-        #[arg(long)]
-        name: String,
-        /// File containing the full method source, indented for the class body.
-        #[arg(long = "content-file", aliases = ["source-file", "source"])]
-        content_file: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Add an annotation to a definition, once.
-    #[command(
-        name = "ensure-annotation",
-        about = "Add a decorator or attribute above a definition once.",
-        after_help = "Example:\n  greppy edit ensure-annotation --symbol greet --annotation '#[inline]'"
-    )]
-    EnsureAnnotation {
-        #[arg(long)]
-        symbol: String,
-        #[arg(long)]
-        annotation: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Set or remove a value in JSON, TOML or YAML by path.
-    #[command(
-        name = "data",
-        about = "Set or remove a value in JSON, TOML, or YAML.",
-        after_help = "Example:\n  greppy edit data set --file config.json --path '$.server.port' --value-json 8080\n  \
-                      greppy edit data delete --file config.json --path '$.server.port'"
-    )]
-    Data {
-        /// set (write the value), ensure (idempotent), or delete (remove it)
-        #[arg(value_parser = ["set", "ensure", "delete"])]
-        mode: String,
-        #[arg(long)]
-        file: String,
-        /// Path like $.server.port or $.items[2].name
-        #[arg(long)]
         path: String,
-        /// New value as JSON (strings quoted: '"text"'); not used by delete.
-        #[arg(long = "value-json")]
-        value_json: Option<String>,
-        #[arg(long = "dry-run")]
+        new: Option<String>,
         dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Execute a multi-operation plan file (schema greppy.edit-plan.v1) as one
-    /// single change: all files or none. `-` reads the plan from the pipe.
-    #[command(
-        name = "apply",
-        about = "Execute a multi-operation edit plan transactionally.",
-        after_help = r#"Example:
-  greppy edit apply --plan <(printf '%s\n' '{"operations":[{"file":"notes.txt","old":"before","new":"after","expect":1}]}')"#
-    )]
-    Apply {
-        #[arg(long)]
-        plan: String,
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-        /// Write the unified diff to FILE (patch mode).
-        #[arg(long)]
-        diff: Option<String>,
-    },
-    /// Reverse the last edit, if the file still looks the way that edit left it.
-    #[command(
-        name = "undo",
-        about = "Reverse the last edit in this workspace.",
-        after_help = "Example:\n  greppy edit undo"
-    )]
-    Undo {
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        #[arg(long)]
-        report: Option<String>,
-    },
-    /// Finish or roll back an edit that was interrupted.
-    #[command(
-        name = "recover",
-        about = "Restore pre-images from an interrupted journal transaction.",
-        after_help = "Example:\n  greppy edit recover --report recovery.json"
-    )]
-    Recover {
-        /// Write the full recovery report as JSON to FILE.
-        #[arg(long)]
-        report: Option<String>,
+        verify: bool,
     },
 }
 
@@ -1169,6 +722,11 @@ const SUBCOMMANDS: &[&str] = &[
     "expand",
     "read",
     "edit",
+    "replace",
+    "replace-text",
+    "replace-lines",
+    "replace-span",
+    "write",
     "who-calls",
     "callees",
     "fan-in",
@@ -1717,10 +1275,11 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy read SYMBOL [--path FILE] [--handle] [--json] [--root DIR]  \
              or: greppy read FILE [--line N[:M]] [--handle] [--json] [--root DIR]"
         }
-        "edit" => {
-            "greppy edit <replace|insert|delete|patch|write|move|remove|rename|\
-             change-signature|ensure-import|data|apply|undo|recover> --help"
-        }
+        "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
+        "replace-text" => "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]",
+        "replace-lines" => "greppy replace-lines F A:B [NEW] [--dry-run] [--verify]",
+        "replace-span" => "greppy replace-span H [NEW] [--dry-run] [--verify]",
+        "write" => "greppy write PATH [NEW] [--dry-run] [--verify]",
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "search" => {
             "greppy search WHAT IT DOES [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
@@ -2384,7 +1943,21 @@ fn dispatch_subcommand(
             }
             dispatch_read(subject.as_deref(), handle, json, root)
         }
-        Command::Edit { command, json } => dispatch_edit(command, json, root),
+        Command::Replace { symbol, new, body, dry_run, verify, json } => dispatch_edit(
+            EditCommand::Replace { symbol, new, body, dry_run, verify }, json, root,
+        ),
+        Command::ReplaceText { file, old, new, expect, regex, dry_run, verify, json } => dispatch_edit(
+            EditCommand::ReplaceText { file, old, new, expect, regex, dry_run, verify }, json, root,
+        ),
+        Command::ReplaceLines { file, lines, new, dry_run, verify, json } => dispatch_edit(
+            EditCommand::ReplaceLines { file, lines, new, dry_run, verify }, json, root,
+        ),
+        Command::ReplaceSpan { handle, new, dry_run, verify, json } => dispatch_edit(
+            EditCommand::ReplaceSpan { handle, new, dry_run, verify }, json, root,
+        ),
+        Command::Write { path, new, dry_run, verify, json } => dispatch_edit(
+            EditCommand::Write { path, new, dry_run, verify }, json, root,
+        ),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
@@ -5066,6 +4639,10 @@ struct EditRecord {
     extra: Vec<(&'static str, serde_json::Value)>,
     /// False for `--dry-run`: the record says what would be written.
     published: bool,
+    /// The journal transaction that made the CAS visible.
+    transaction_id: Option<String>,
+    /// The requested bytes were already present, so no write was necessary.
+    already_as_sent: bool,
 }
 
 

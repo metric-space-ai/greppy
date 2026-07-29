@@ -240,15 +240,81 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Transactional, hash-guarded, all-or-nothing edits. Every command
-    /// verifies its own result and emits a certificate; on failure nothing
-    /// is written and the error names the next step.
-    #[command(after_help = "Run `greppy edit VERB --help` for a working example.")]
-    Edit {
-        #[command(subcommand)]
-        command: EditCommand,
-        /// Emit the complete edit certificate JSON on stdout.
-        #[arg(long, global = true)]
+    /// Replace a definition with NEW; without NEW, read it from stdin.
+    Replace {
+        #[arg(value_name = "S", allow_hyphen_values = true)]
+        symbol: String,
+        #[arg(value_name = "NEW", allow_hyphen_values = true)]
+        new: Option<String>,
+        /// Replace only the definition body.
+        #[arg(long)]
+        body: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace OLD in F; OLD must occur exactly once unless --expect says otherwise.
+    ReplaceText {
+        #[arg(value_name = "F", allow_hyphen_values = true)]
+        file: String,
+        #[arg(value_name = "OLD", allow_hyphen_values = true)]
+        old: String,
+        #[arg(value_name = "NEW", allow_hyphen_values = true)]
+        new: Option<String>,
+        #[arg(long)]
+        expect: Option<usize>,
+        /// Treat OLD as a regular expression.
+        #[arg(long)]
+        regex: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace inclusive 1-based lines A:B in F.
+    ReplaceLines {
+        #[arg(value_name = "F", allow_hyphen_values = true)]
+        file: String,
+        #[arg(value_name = "A:B", allow_hyphen_values = true)]
+        lines: String,
+        #[arg(value_name = "NEW", allow_hyphen_values = true)]
+        new: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the byte-exact span named by H.
+    ReplaceSpan {
+        #[arg(value_name = "H", allow_hyphen_values = true)]
+        handle: String,
+        #[arg(value_name = "NEW", allow_hyphen_values = true)]
+        new: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or overwrite PATH with NEW.
+    Write {
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: String,
+        #[arg(value_name = "NEW", allow_hyphen_values = true)]
+        new: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
         json: bool,
     },
     /// Print deterministic graph statistics for the workspace project:

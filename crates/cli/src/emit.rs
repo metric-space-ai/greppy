@@ -344,15 +344,26 @@ pub(crate) fn emit_edit_outcome(
                 if let Some(headline) = &record.headline {
                     println!("{headline}");
                 } else {
+                    let short_id = record
+                        .transaction_id
+                        .as_deref()
+                        .map(|id| &id[..id.len().min(6)]);
                     for (index, file) in record.files.iter().enumerate() {
-                        match record.span {
+                        let address = match record.span {
                             Some((first, last)) if index == 0 && first == last => {
-                                println!("{word} {file}:{first}");
+                                format!("{file}:{first}")
                             }
                             Some((first, last)) if index == 0 => {
-                                println!("{word} {file}:{first}-{last}");
+                                format!("{file}:{first}-{last}")
                             }
-                            _ => println!("{word} {file}"),
+                            _ => file.clone(),
+                        };
+                        if record.already_as_sent {
+                            println!("applied, already as sent  {address}");
+                        } else if let Some(id) = short_id.filter(|_| record.published) {
+                            println!("{word} {address}  {id}");
+                        } else {
+                            println!("{word} {address}");
                         }
                     }
                 }

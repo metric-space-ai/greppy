@@ -16,622 +16,16 @@ pub(crate) fn dispatch_edit(command: EditCommand, json: bool, root: Option<&str>
     }
 }
 
-pub(crate) fn dispatch_edit_inner(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
+pub(crate) fn dispatch_edit_inner(
+    command: EditCommand,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
     let root_path = resolve_root(root)?;
-    // The four operations of the new grammar, the whole-file verbs and `undo`
-    // answer with an edit record - file, span, resulting text, handle - rather
-    // than a certificate, so they are dispatched before the certificate verbs.
-    let command = match dispatch_edit_grammar(command, json, root, &root_path)? {
-        GrammarDispatch::Handled(code) => return Ok(code),
-        GrammarDispatch::Passthrough(command) => *command,
-    };
-    fn resolved_options(
-        dry_run: bool,
-        range: (usize, usize),
-        planned_file_sha256: String,
-        planned_target_sha256: String,
-    ) -> greppy_edit::verbs::VerbOptions {
-        greppy_edit::verbs::VerbOptions {
-            dry_run,
-            with_diff: true,
-            planned_file_sha256: Some(planned_file_sha256),
-            planned_target_sha256: Some(planned_target_sha256),
-            planned_target_range: Some(range),
-            ..Default::default()
-        }
+    match dispatch_edit_grammar(command, json, root, &root_path)? {
+        GrammarDispatch::Handled(code) => Ok(code),
+        GrammarDispatch::Passthrough(_) => unreachable!("every trained edit verb is handled"),
     }
-    let (certificate, report_path) = match command {
-        EditCommand::Rename {
-            symbol,
-            r#in,
-            call,
-            to,
-            expect,
-            expect_residual,
-            dry_run,
-            report,
-        } => match (symbol, r#in, call) {
-            (Some(symbol), None, None) => {
-                let new_name = to;
-            let store = open_default_store_query_writer(root)?;
-            let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
-            let mut def_nodes = Vec::new();
-            for id in &ids {
-                if let Some(node) = store.get_node(*id)? {
-                    if !node.file_path.is_empty() && node.start_line >= 1 {
-                        def_nodes.push(node);
-                    }
-                }
-            }
-            if def_nodes.is_empty() {
-                println!("no symbol `{symbol}`");
-                return Ok(10);
-            }
-            let short_name = def_nodes[0].name.clone();
-            // collect per-file scopes: definition files fully (definition,
-            // same-file usages, imports), and every referencing node's span
-            use std::collections::BTreeMap;
-            let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-            for def in &def_nodes {
-                scopes
-                    .entry(def.file_path.clone())
-                    .or_default()
-                    .push((0, usize::MAX));
-                for edge in store.incoming_edges(def.id, None, 100_000)? {
-                    if let Some(src) = store.get_node(edge.source_id)? {
-                        if src.file_path.is_empty() || src.start_line < 1 {
-                            continue;
-                        }
-                        let abs = root_path.join(&src.file_path);
-                        let Ok(content) = std::fs::read(&abs) else {
-                            continue;
-                        };
-                        let Some(span) = read_span_with_meta(
-                            &root_path,
-                            &src.file_path,
-                            src.start_line,
-                            src.end_line,
-                            usize::MAX,
-                            false,
-                        ) else {
-                            continue;
-                        };
-                        let range = line_range_to_bytes(
-                            &content,
-                            src.start_line as usize,
-                            span.end_line as usize,
-                        );
-                        scopes.entry(src.file_path.clone()).or_default().push(range);
-                    }
-                }
-            }
-            // import lines in every affected file: cover the whole file for
-            // files that already have narrower spans is wasteful, so add a
-            // full-file span only where imports may bind the name
-            let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
-                .into_iter()
-                .map(|(rel_path, spans)| greppy_edit::verbs::RenameFileScope { rel_path, spans })
-                .collect();
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                expect_residual: Some(expect_residual),
-                ..Default::default()
-            };
-            (
-                greppy_edit::verbs::rename_symbol_files(
-                    &root_path,
-                    &scope_vec,
-                    &short_name,
-                    &new_name,
-                    &options,
-                )?,
-                report,
-            )
-            }
-            (None, Some(in_symbol), Some(from)) => {
-                match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
-            EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
-                let abs = root_path.join(&rel_path);
-                let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                let options =
-                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
-                (
-                    greppy_edit::verbs::rename_in_span(
-                        &root_path, &abs, range, &from, &to, expect, language, &options,
-                    )?,
-                    report,
-                )
-            }
-                }
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "rename takes --symbol S --to N, or --in S --call A --to B".into(),
-                ))
-            }
-        },
-        EditCommand::ChangeSignature {
-            symbol,
-            spec,
-            backend,
-            expect_residual,
-            dry_run,
-            report,
-        } => {
-            greppy_edit::verbs::require_semantic_backend(&backend)?;
-            let spec_bytes = if spec.trim_start().starts_with('{') {
-                spec.as_bytes().to_vec()
-            } else {
-                std::fs::read(&spec).map_err(|source| Error::Io {
-                    context: format!("read change-signature spec {spec}"),
-                    source,
-                })?
-            };
-            let spec: greppy_edit::verbs::ChangeSignatureSpec = serde_json::from_slice(&spec_bytes)
-                .map_err(|error| {
-                    Error::Invalid(format!(
-                        "change-signature --spec {spec} is invalid: {error}\nminimal complete example:\n{}",
-                        MINIMAL_CHANGE_SIGNATURE_EXAMPLE.trim()
-                    ))
-                })?;
-            match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
-                EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved {
-                    rel_path,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                } => {
-                    let store = open_default_store_query_writer(root)?;
-                    let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
-                    let mut short_name = None;
-                    let mut scopes =
-                        std::collections::BTreeMap::<String, Vec<(usize, usize)>>::new();
-                    for id in &ids {
-                        if let Some(definition) = store.get_node(*id)? {
-                            short_name.get_or_insert(definition.name);
-                        }
-                        for edge in store.incoming_edges(*id, None, 100_000)? {
-                            let Some(source) = store.get_node(edge.source_id)? else {
-                                continue;
-                            };
-                            if source.file_path.is_empty() || source.start_line < 1 {
-                                continue;
-                            }
-                            let content = std::fs::read(root_path.join(&source.file_path))
-                                .map_err(|error| {
-                                    Error::io(format!("read {}", source.file_path), error)
-                                })?;
-                            let Some(span) = read_span_with_meta(
-                                &root_path,
-                                &source.file_path,
-                                source.start_line,
-                                source.end_line,
-                                usize::MAX,
-                                false,
-                            ) else {
-                                continue;
-                            };
-                            scopes
-                                .entry(source.file_path)
-                                .or_default()
-                                .push(line_range_to_bytes(
-                                    &content,
-                                    source.start_line as usize,
-                                    span.end_line as usize,
-                                ));
-                        }
-                    }
-                    let short_name = short_name.ok_or_else(|| {
-                        Error::Invalid(format!(
-                            "change-signature could not resolve the name of `{symbol}`"
-                        ))
-                    })?;
-                    let call_scopes: Vec<greppy_edit::verbs::RenameFileScope> = scopes
-                        .into_iter()
-                        .map(|(rel_path, mut spans)| {
-                            spans.sort_unstable();
-                            spans.dedup();
-                            greppy_edit::verbs::RenameFileScope { rel_path, spans }
-                        })
-                        .collect();
-                    let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
-                    let mut options = resolved_options(
-                        dry_run,
-                        range,
-                        planned_file_sha256,
-                        planned_target_sha256,
-                    );
-                    options.expect_residual = Some(expect_residual);
-                    (
-                        greppy_edit::verbs::change_signature_files(
-                            &root_path,
-                            &greppy_edit::verbs::SignatureDefinition { rel_path, range },
-                            &call_scopes,
-                            &short_name,
-                            &spec,
-                            language,
-                            &options,
-                        )?,
-                        report,
-                    )
-                }
-            }
-        }
-        EditCommand::EnsureArgument {
-            symbol,
-            call,
-            arg,
-            dry_run,
-            report,
-        } => match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
-            EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
-                let abs = root_path.join(&rel_path);
-                let options =
-                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
-                (
-                    greppy_edit::ensure::ensure_argument(
-                        &root_path, &abs, range, &call, &arg, &options,
-                    )?,
-                    report,
-                )
-            }
-        },
-        EditCommand::EnsureMethod {
-            symbol,
-            name,
-            content_file,
-            dry_run,
-            report,
-        } => {
-            let source = String::from_utf8_lossy(&read_source_arg(&content_file)?).into_owned();
-            match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
-                EditTarget::Refusal(cert) => (*cert, report),
-                EditTarget::Resolved {
-                    rel_path,
-                    range,
-                    planned_file_sha256,
-                    planned_target_sha256,
-                } => {
-                    let abs = root_path.join(&rel_path);
-                    // Rust keeps a type and its methods apart: `struct Greeter;`
-                    // has no body at all and the methods live in `impl Greeter`.
-                    // `--symbol Greeter` names the type, so a definition without
-                    // a body is followed to its inherent impl block instead of
-                    // being reported as a class with nowhere to add a method.
-                    let (range, planned_target_sha256) = std::fs::read(&abs)
-                        .ok()
-                        .filter(|content| {
-                            !content[range.0.min(content.len())..range.1.min(content.len())]
-                                .contains(&b'{')
-                        })
-                        .and_then(|content| {
-                            let block = rust_inherent_impl_range(&content, &symbol)?;
-                            let planned = greppy_edit::EditHandle::for_range(
-                                &root_path,
-                                std::path::Path::new(&rel_path),
-                                &content,
-                                block.0,
-                                block.1,
-                            )
-                            .ok()?;
-                            Some((block, planned.target_sha256))
-                        })
-                        .unwrap_or((range, planned_target_sha256));
-                    let options = resolved_options(
-                        dry_run,
-                        range,
-                        planned_file_sha256,
-                        planned_target_sha256,
-                    );
-                    (
-                        greppy_edit::ensure::ensure_method(
-                            &root_path, &abs, range, &name, &source, &options,
-                        )?,
-                        report,
-                    )
-                }
-            }
-        }
-        EditCommand::EnsureAnnotation {
-            symbol,
-            annotation,
-            dry_run,
-            report,
-        } => match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
-            EditTarget::Refusal(cert) => (*cert, report),
-            EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
-                let abs = root_path.join(&rel_path);
-                let options =
-                    resolved_options(dry_run, range, planned_file_sha256, planned_target_sha256);
-                (
-                    greppy_edit::ensure::ensure_annotation(
-                        &root_path,
-                        &abs,
-                        range,
-                        &annotation,
-                        &options,
-                    )?,
-                    report,
-                )
-            }
-        },
-        EditCommand::Data {
-            mode,
-            file,
-            path,
-            value_json,
-            dry_run,
-            report,
-        } => {
-            let target = resolve_edit_file(&root_path, &file);
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                ..Default::default()
-            };
-            let before = std::fs::read(&target).ok();
-            let certificate = if mode == "delete" {
-                greppy_edit::data::data_delete(&root_path, &target, &path, &options)?
-            } else {
-                let value_json = value_json.ok_or_else(|| {
-                    Error::Invalid("data set needs --value-json VALUE".into())
-                })?;
-                greppy_edit::data::data_set(
-                    &root_path,
-                    &target,
-                    &path,
-                    &value_json,
-                    mode == "ensure",
-                    &options,
-                )?
-            };
-            if certificate.published {
-                let rel = target
-                    .strip_prefix(&root_path)
-                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| file.clone());
-                record_edit_undo(
-                    &root_path,
-                    &[UndoBefore {
-                        rel,
-                        content: before,
-                    }],
-                );
-            }
-            (certificate, report)
-        }
-        EditCommand::Apply {
-            plan,
-            dry_run,
-            report,
-            diff: _,
-        } => {
-            // `-` means stdin here as it does for every other file argument.
-            // Without it a multi-edit plan needs a temporary file first, which
-            // turns the one transaction this verb exists for into two turns.
-            let text = if plan == "-" {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|source| Error::Io {
-                        context: "read edit plan from stdin".into(),
-                        source,
-                    })?;
-                buf
-            } else {
-                std::fs::read_to_string(&plan).map_err(|source| Error::Io {
-                    context: format!("read {plan}"),
-                    source,
-                })?
-            };
-            // A plan that could not be read is a refused edit, not a usage
-            // error: the caller asked for `--json` and must get an answer as
-            // data, not a bare line of prose on stderr.
-            if text.trim().is_empty() {
-                return emit_edit_outcome(
-                    Err(EditRefusal::new(
-                        "plan_empty",
-                        format!(
-                            "--plan {plan}: the plan is empty; the command that was to \
-                             produce it printed nothing"
-                        ),
-                        20,
-                    )),
-                    json,
-                    report,
-                );
-            }
-            // A plan written in the whole-file verbs is executed by the verbs
-            // themselves: `write`, `move` and `remove` are not spans in a file,
-            // so the span planner has nothing to say about them.
-            if let Some(operations) = plan_is_whole_file(&text) {
-                return emit_edit_outcome(
-                    run_edit_plan_whole_file(&root_path, &operations, dry_run, false),
-                    json,
-                    report,
-                );
-            }
-            let loaded = match greppy_edit::plan::load_plan(&text, &root_path) {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    return emit_edit_outcome(
-                        Err(EditRefusal::new(
-                            "invalid_plan",
-                            format!("--plan {plan}: {error}"),
-                            20,
-                        )),
-                        json,
-                        report,
-                    );
-                }
-            };
-            let plan_root = std::path::PathBuf::from(loaded.workspace_root());
-            let plan_root_arg = plan_root.to_string_lossy().into_owned();
-            let parsed = loaded.into_plan(|shortcut| {
-                let resolved = resolve_edit_target(
-                    Some(&shortcut.symbol),
-                    None,
-                    Some(&plan_root_arg),
-                    &plan_root,
-                )?;
-                let EditTarget::Resolved {
-                    rel_path,
-                    range,
-                    ..
-                } = resolved
-                else {
-                    let EditTarget::Refusal(certificate) = resolved else {
-                        unreachable!()
-                    };
-                    return Err(Error::Invalid(format!(
-                        "replace-body operation `{}` could not resolve symbol `{}` (status {:?})",
-                        shortcut.id, shortcut.symbol, certificate.status
-                    )));
-                };
-
-                let declared_file = resolve_edit_file(&plan_root, &shortcut.file);
-                let resolved_file = plan_root.join(&rel_path);
-                let declared_canonical = declared_file.canonicalize().map_err(|source| Error::Io {
-                    context: format!("canonicalize {}", declared_file.display()),
-                    source,
-                })?;
-                let resolved_canonical = resolved_file.canonicalize().map_err(|source| Error::Io {
-                    context: format!("canonicalize {}", resolved_file.display()),
-                    source,
-                })?;
-                if declared_canonical != resolved_canonical {
-                    return Err(Error::Invalid(format!(
-                        "replace-body operation `{}` declares file `{}` but symbol `{}` resolves to `{}`",
-                        shortcut.id, shortcut.file, shortcut.symbol, rel_path
-                    )));
-                }
-
-                let new_body = match &shortcut.body {
-                    greppy_edit::plan::ReplaceBodySource::Inline(body) => body.clone(),
-                    greppy_edit::plan::ReplaceBodySource::File(source_file) => {
-                        let source_path = resolve_edit_file(&plan_root, source_file);
-                        std::fs::read_to_string(&source_path).map_err(|source| Error::Io {
-                            context: format!("read {}", source_path.display()),
-                            source,
-                        })?
-                    }
-                };
-                let file_content = std::fs::read(&resolved_file).map_err(|source| Error::Io {
-                    context: format!("read {}", resolved_file.display()),
-                    source,
-                })?;
-                greppy_edit::plan::resolve_replace_body_operation(
-                    shortcut,
-                    rel_path,
-                    range,
-                    &file_content,
-                    &new_body,
-                )
-            })?;
-            let undo_before = plan_undo_snapshot(&root_path, &text);
-            let mut certificate = greppy_edit::plan::apply_plan(&parsed, dry_run)?;
-            if certificate.published {
-                record_edit_undo(&root_path, &undo_before);
-            } else {
-                annotate_plan_refusal(&mut certificate, &text);
-            }
-            (certificate, report)
-        }
-        EditCommand::Recover { report } => {
-            // The grammar verbs journal into the workspace store, so their
-            // interrupted transactions are the ones to look for first.
-            match run_edit_recover(&root_path) {
-                Ok(Some(restored)) => {
-                    println!("rolled back an interrupted edit: {restored} file(s) restored");
-                    return Ok(0);
-                }
-                Ok(None) => {}
-                Err(refusal) => {
-                    eprintln!("{}", refusal.message);
-                    return Ok(refusal.exit);
-                }
-            }
-            let outcome = greppy_edit::journal::recover_with_report(&root_path)?;
-            let msg = match outcome.action {
-                greppy_edit::journal::RecoveryAction::NothingToRecover => {
-                    "nothing to recover".to_string()
-                }
-                greppy_edit::journal::RecoveryAction::RolledBack => format!(
-                    "rolled back transaction {}: {} file(s) restored",
-                    outcome.transaction_id.as_deref().unwrap_or_default(),
-                    outcome.files_restored
-                ),
-                greppy_edit::journal::RecoveryAction::DiscardedUncommitted => {
-                    "discarded uncommitted journal; nothing had been published".to_string()
-                }
-            };
-            if let Some(path) = report {
-                let json = serde_json::to_string_pretty(&outcome)
-                    .map_err(|e| Error::Invalid(format!("serialize recovery report: {e}")))?;
-                std::fs::write(&path, json).map_err(|source| Error::Io {
-                    context: format!("write {path}"),
-                    source,
-                })?;
-            }
-            println!("{msg}");
-            return Ok(0);
-        }
-        EditCommand::EnsureImport {
-            file,
-            module,
-            name,
-            dry_run,
-            report,
-        } => {
-            let target = resolve_edit_file(&root_path, &file);
-            let options = greppy_edit::verbs::VerbOptions {
-                dry_run,
-                with_diff: true,
-                ..Default::default()
-            };
-            (
-                greppy_edit::ensure::ensure_import(
-                    &root_path,
-                    &target,
-                    &module,
-                    name.as_deref(),
-                    &options,
-                )?,
-                report,
-            )
-        }
-        EditCommand::Replace { .. }
-        | EditCommand::Insert { .. }
-        | EditCommand::Delete { .. }
-        | EditCommand::Patch { .. }
-        | EditCommand::Write { .. }
-        | EditCommand::Move { .. }
-        | EditCommand::Remove { .. }
-        | EditCommand::Undo { .. } => {
-            unreachable!("the grammar verbs answered before the certificate verbs")
-        }
-    };
-    finish_edit(certificate, report_path, json, root, &root_path)
 }
 
 pub(crate) fn edit_sha256_hex(data: &[u8]) -> String {
@@ -1182,10 +576,17 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
             })
             .collect();
         // The needle is not echoed — the caller has it in context (law 5).
-        let mut message = format!(
-            "matched {} times, expected {expect} — nothing written",
-            located.ranges.len()
-        );
+        let mut message = match located.kind {
+            SelectorKind::Text => format!(
+                "OLD occurs {} times — nothing written",
+                located.ranges.len()
+            ),
+            SelectorKind::Pattern => format!(
+                "the pattern occurs {} times, expected {expect} — nothing written",
+                located.ranges.len()
+            ),
+            _ => unreachable!(),
+        };
         for site in &sites {
             message.push_str("\n  ");
             message.push_str(site);
@@ -1230,6 +631,35 @@ pub(crate) fn edit_guard_single_stdin(flags: &[(&'static str, Option<&str>)]) ->
         .with("flags", serde_json::json!(asking)));
     }
     Ok(())
+}
+
+pub(crate) fn edit_positional_payload(
+    payload: Option<String>,
+    name: &'static str,
+) -> EditResult<Vec<u8>> {
+    if let Some(payload) = payload {
+        return Ok(payload.into_bytes());
+    }
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Err(EditRefusal::new(
+            "content_missing",
+            format!("no {name}: pass it as the final positional or pipe it on stdin"),
+            20,
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes).map_err(|error| {
+        EditRefusal::new("content_unreadable", format!("read {name} from stdin: {error}"), 20)
+    })?;
+    if bytes.is_empty() {
+        return Err(EditRefusal::new(
+            "content_missing",
+            format!("no {name}: stdin was empty"),
+            20,
+        ));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn edit_content_bytes(
@@ -1309,6 +739,26 @@ pub(crate) fn edit_publish(
         published: !dry_run,
         ..EditRecord::default()
     };
+    if new_content == located.content {
+        record.already_as_sent = true;
+        record.operations = vec![operation];
+        return Ok(record);
+    }
+    let language = greppy_edit::language_for_path(std::path::Path::new(&located.rel));
+    if language.is_supported() {
+        if let (Some(before), Some(after)) = (
+            greppy_edit::txn::syntax_counts(language, &located.content),
+            greppy_edit::txn::syntax_counts(language, &new_content),
+        ) {
+            if after.errors > before.errors || after.missing > before.missing {
+                return Err(EditRefusal::new(
+                    "invalid_result",
+                    "refused: the edit would break the file's syntax — nothing written",
+                    13,
+                ));
+            }
+        }
+    }
     if dry_run {
         // A handle addresses bytes on disk. A dry run wrote none, so handing
         // one back would hand back an address that is already stale.
@@ -1334,6 +784,7 @@ pub(crate) fn edit_publish(
     }
     if let Some(id) = transaction {
         edit_journal_close(root_path, &id);
+        record.transaction_id = Some(id);
     }
     let handle = greppy_edit::EditHandle::for_range(
         root_path,
@@ -1621,7 +1072,7 @@ pub(crate) fn edit_journal_open(root_path: &std::path::Path, before: &[UndoBefor
     }
     let dir = edit_journal_dir(root_path);
     std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).ok()?;
-    let id = format!(
+    let seed = format!(
         "{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -1629,6 +1080,7 @@ pub(crate) fn edit_journal_open(root_path: &std::path::Path, before: &[UndoBefor
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default()
     );
+    let id = edit_sha256_hex(seed.as_bytes());
     let mut entries = Vec::new();
     for (index, item) in before.iter().enumerate() {
         let blob = match &item.content {
@@ -2747,7 +2199,110 @@ pub(crate) fn edit_refusal_json(refusal: &EditRefusal, report_path: Option<&str>
     serde_json::Value::Object(value)
 }
 
-#[allow(clippy::too_many_lines)]
+pub(crate) fn run_trained_write(
+    root_path: &std::path::Path,
+    path: &str,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    let (rel, abs) = edit_resolve_new_path(root_path, path)?;
+    if abs.is_dir() {
+        return Err(EditRefusal::new(
+            "file_exists",
+            format!("{path} is a directory, not a file"),
+            13,
+        ));
+    }
+    let before = std::fs::read(&abs).ok();
+    if abs.exists() {
+        edit_guard_path(root_path, &abs)?;
+    } else if let Some(parent) = abs.parent() {
+        let root = root_path.canonicalize().unwrap_or_else(|_| root_path.to_path_buf());
+        let mut existing = parent;
+        while !existing.exists() {
+            let Some(next) = existing.parent() else { break };
+            existing = next;
+        }
+        let canonical = existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf());
+        if !canonical.starts_with(&root) {
+            return Err(EditRefusal::new(
+                "path_outside_repo",
+                format!("{path} is outside {}", root.display()),
+                17,
+            ));
+        }
+    }
+    let old = before.as_deref().unwrap_or_default();
+    let language = greppy_edit::language_for_path(std::path::Path::new(&rel));
+    if language.is_supported() {
+        if let (Some(before_counts), Some(after_counts)) = (
+            greppy_edit::txn::syntax_counts(language, old),
+            greppy_edit::txn::syntax_counts(language, &bytes),
+        ) {
+            if after_counts.errors > before_counts.errors
+                || after_counts.missing > before_counts.missing
+            {
+                return Err(EditRefusal::new(
+                    "invalid_result",
+                    "refused: the edit would break the file's syntax — nothing written",
+                    13,
+                ));
+            }
+        }
+    }
+    let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
+    if before.as_deref() == Some(bytes.as_slice()) {
+        record.already_as_sent = true;
+        return Ok(record);
+    }
+    if dry_run {
+        return Ok(record);
+    }
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            EditRefusal::new(
+                "publish_failed",
+                format!("create {}: {error}", parent.display()),
+                16,
+            )
+        })?;
+    }
+    let transaction = edit_journal_open(
+        root_path,
+        &[UndoBefore {
+            rel: rel.clone(),
+            content: before.clone(),
+        }],
+    );
+    edit_journal_crash_hook()?;
+    let publish = if let Some(old) = &before {
+        greppy_edit::publish::publish_atomic(root_path, &abs, &bytes, &edit_sha256_hex(old))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs)
+            .and_then(|mut file| file.write_all(&bytes))
+            .map_err(|error| error.to_string())
+    };
+    if let Err(error) = publish {
+        edit_journal_abort(root_path);
+        return Err(EditRefusal::new("publish_failed", format!("{path}: {error}"), 16));
+    }
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+        record.transaction_id = Some(id);
+    }
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
 pub(crate) fn dispatch_edit_grammar(
     command: EditCommand,
     json: bool,
@@ -2756,246 +2311,123 @@ pub(crate) fn dispatch_edit_grammar(
 ) -> Result<GrammarDispatch> {
     let code = match command {
         EditCommand::Replace {
-            file,
-            old,
-            old_file,
-            pattern,
-            lines,
             symbol,
+            new,
             body,
-            target,
-            content,
-            content_file,
-            expect,
-            path,
             dry_run,
             verify,
-            report,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
-                edit_guard_single_stdin(&[
-                    ("--old-file", old_file.as_deref()),
-                    ("--content-file", content_file.as_deref()),
-                ])?;
-                let new_bytes = edit_content_bytes(content, content_file)?;
+                let new_bytes = edit_positional_payload(new, "NEW")?;
                 let spec = WhereSpec {
-                    file,
-                    old,
-                    old_file,
-                    pattern,
-                    lines,
-                    symbol,
+                    file: None,
+                    old: None,
+                    old_file: None,
+                    pattern: None,
+                    lines: None,
+                    symbol: Some(symbol),
                     body,
-                    target,
-                    path,
+                    target: None,
+                    path: None,
                 };
-                let kind = classify_selector(&spec)?;
+                let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path)?;
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, None)?
+        }
+        EditCommand::ReplaceText {
+            file,
+            old,
+            new,
+            expect,
+            regex,
+            dry_run,
+            verify,
+        } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                let new_bytes = edit_positional_payload(new, "NEW")?;
                 edit_expect_positive(expect)?;
+                let spec = WhereSpec {
+                    file: Some(file),
+                    old: (!regex).then_some(old.clone()),
+                    old_file: None,
+                    pattern: regex.then_some(old),
+                    lines: None,
+                    symbol: None,
+                    body: false,
+                    target: None,
+                    path: None,
+                };
+                let kind = if regex { SelectorKind::Pattern } else { SelectorKind::Text };
                 let located = edit_locate(&spec, kind, root, root_path)?;
                 edit_check_cardinality(&located, expect)?;
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, report)?
+            emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Insert {
+        EditCommand::ReplaceLines {
             file,
-            old,
-            old_file,
-            pattern,
             lines,
-            symbol,
-            body,
-            target,
-            before,
-            after,
-            content,
-            content_file,
-            path,
+            new,
             dry_run,
             verify,
-            report,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
-                edit_guard_single_stdin(&[
-                    ("--old-file", old_file.as_deref()),
-                    ("--content-file", content_file.as_deref()),
-                ])?;
-                let new_bytes = edit_content_bytes(content, content_file)?;
-                if before == after {
-                    return Err(EditRefusal::new(
-                        "side_missing",
-                        "insert lands on one side of the anchor: pass --before or --after",
-                        20,
-                    ));
-                }
+                let new_bytes = edit_positional_payload(new, "NEW")?;
                 let spec = WhereSpec {
-                    file,
-                    old,
-                    old_file,
-                    pattern,
-                    lines,
-                    symbol,
-                    body,
-                    target,
-                    path,
+                    file: Some(file),
+                    old: None,
+                    old_file: None,
+                    pattern: None,
+                    lines: Some(lines),
+                    symbol: None,
+                    body: false,
+                    target: None,
+                    path: None,
                 };
-                let kind = classify_selector(&spec)?;
-                if !matches!(
-                    kind,
-                    SelectorKind::Symbol | SelectorKind::Lines | SelectorKind::Target
-                ) {
-                    return Err(EditRefusal::new(
-                        "selector_not_supported",
-                        format!(
-                            "insert takes --symbol S, --file F --lines A:B or --target H; \
-                             {} has no side to land on",
-                            kind.name()
-                        ),
-                        20,
-                    ));
-                }
-                let located = edit_locate(&spec, kind, root, root_path)?;
-                let (new_content, changed) = edit_op_insert(&located, &new_bytes, before);
+                let located = edit_locate(&spec, SelectorKind::Lines, root, root_path)?;
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, report)?
+            emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Delete {
-            file,
-            old,
-            old_file,
-            pattern,
-            lines,
-            symbol,
-            body,
-            target,
-            expect,
-            path,
+        EditCommand::ReplaceSpan {
+            handle,
+            new,
             dry_run,
             verify,
-            report,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
+                let new_bytes = edit_positional_payload(new, "NEW")?;
                 let spec = WhereSpec {
-                    file,
-                    old,
-                    old_file,
-                    pattern,
-                    lines,
-                    symbol,
-                    body,
-                    target,
-                    path,
+                    file: None,
+                    old: None,
+                    old_file: None,
+                    pattern: None,
+                    lines: None,
+                    symbol: None,
+                    body: false,
+                    target: Some(handle),
+                    path: None,
                 };
-                let kind = classify_selector(&spec)?;
-                edit_expect_positive(expect)?;
-                let located = edit_locate(&spec, kind, root, root_path)?;
-                edit_check_cardinality(&located, expect)?;
-                let (new_content, changed) = edit_op_delete(&located);
+                let located = edit_locate(&spec, SelectorKind::Target, root, root_path)?;
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, report)?
-        }
-        EditCommand::Patch {
-            file,
-            old,
-            old_file,
-            pattern,
-            lines,
-            symbol,
-            body,
-            target,
-            patch_file,
-            path,
-            dry_run,
-            verify,
-            report,
-        } => {
-            let outcome = (|| -> EditResult<EditRecord> {
-                edit_guard_single_stdin(&[
-                    ("--old-file", old_file.as_deref()),
-                    ("--patch-file", patch_file.as_deref()),
-                ])?;
-                let Some(patch_file) = patch_file else {
-                    return Err(EditRefusal::new(
-                        "content_missing",
-                        "no diff: pass --patch-file FILE",
-                        20,
-                    ));
-                };
-                let patch = read_source_arg(&patch_file).map_err(|error| {
-                    EditRefusal::new(
-                        "invalid_patch",
-                        format!("--patch-file {patch_file}: {error}"),
-                        20,
-                    )
-                })?;
-                let spec = WhereSpec {
-                    file,
-                    old,
-                    old_file,
-                    pattern,
-                    lines,
-                    symbol,
-                    body,
-                    target,
-                    path,
-                };
-                let kind = classify_selector(&spec)?;
-                if matches!(kind, SelectorKind::Text | SelectorKind::Pattern) {
-                    return Err(EditRefusal::new(
-                        "selector_not_supported",
-                        format!(
-                            "patch takes --symbol S, --file F --lines A:B, --file F or --target H; \
-                             {} gives the hunks nothing to count from",
-                            kind.name()
-                        ),
-                        20,
-                    ));
-                }
-                let located = edit_locate(&spec, kind, root, root_path)?;
-                let (new_content, changed) = edit_op_patch(&located, &patch)?;
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
-            })();
-            emit_edit_outcome(outcome, json, report)?
+            emit_edit_outcome(outcome, json, None)?
         }
         EditCommand::Write {
-            file,
-            content,
-            content_file,
+            path,
+            new,
             dry_run,
             verify,
-            report,
         } => {
-            let outcome = run_edit_write(root_path, &file, content, content_file, dry_run, verify);
-            emit_edit_outcome(outcome, json, report)?
+            let outcome = edit_positional_payload(new, "NEW")
+                .and_then(|bytes| run_trained_write(root_path, &path, bytes, dry_run, verify));
+            emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Move {
-            file,
-            to,
-            dry_run,
-            verify,
-            report,
-        } => {
-            let outcome = run_edit_move(root_path, &file, &to, dry_run, verify);
-            emit_edit_outcome(outcome, json, report)?
-        }
-        EditCommand::Remove {
-            file,
-            force,
-            dry_run,
-            verify,
-            report,
-        } => {
-            let outcome = run_edit_remove(root_path, &file, force, dry_run, verify);
-            emit_edit_outcome(outcome, json, report)?
-        }
-        EditCommand::Undo { dry_run, report } => {
-            let outcome = run_edit_undo(root_path, dry_run);
-            emit_edit_outcome(outcome, json, report)?
-        }
-        other => return Ok(GrammarDispatch::Passthrough(Box::new(other))),
     };
     Ok(GrammarDispatch::Handled(code))
 }
