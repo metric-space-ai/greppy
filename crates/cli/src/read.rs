@@ -142,6 +142,7 @@ pub(crate) fn read_span_with_meta(
 
 const READ_FILE_PAGE_LINES: usize = 400;
 const READ_PACK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+const READ_SMART_PACK_KIND: &str = "greppy.read-smart.span.v1";
 const READ_FILE_PACK_KIND: &str = "greppy.read-file.page.v1";
 const READ_HANDLE_PACK_KIND: &str = "greppy.read.handle.v2";
 const COMPACT_HANDLE_PREFIX: &str = "geh2:";
@@ -152,6 +153,15 @@ struct DefinitionRead {
     content: String,
     start_line: usize,
     end_line: usize,
+}
+
+#[derive(Clone)]
+struct FoldGap {
+    start_line: usize,
+    end_line: usize,
+    indent: String,
+    sentence: String,
+    expand_id: String,
 }
 
 fn read_line_count(content: &str) -> usize {
@@ -768,6 +778,311 @@ pub(crate) fn dispatch_read_symbols(
     }
     Ok(if failed { 1 } else { 0 })
 }
+
+fn read_structural_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_expression"
+            | "if_statement"
+            | "else_clause"
+            | "for_expression"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_expression"
+            | "while_statement"
+            | "loop_expression"
+            | "match_expression"
+            | "match_statement"
+            | "switch_expression"
+            | "switch_statement"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "with_statement"
+            | "do_statement"
+            | "synchronized_statement"
+            | "async_block"
+            | "unsafe_block"
+            | "block"
+    )
+}
+
+fn read_node_end_line(row: usize, column: usize) -> usize {
+    row + usize::from(column > 0)
+}
+
+fn read_summary_sentence(root_path: &std::path::Path, file_path: &str, source: &str) -> String {
+    summarize_definition_span(root_path, file_path, source)
+        .into_iter()
+        .flatten()
+        .map(|sentence| sentence.split_whitespace().collect::<Vec<_>>().join(" "))
+        .find(|sentence| !sentence.is_empty())
+        .unwrap_or_else(|| "folded source block".to_string())
+}
+
+fn read_insert_smart_pack(
+    store: &greppy_store::Store,
+    project: &str,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    source: &str,
+    sentence: &str,
+) -> Result<String> {
+    let content_sha256 = read_sha256(source.as_bytes());
+    let metadata = serde_json::json!({
+        "kind": READ_SMART_PACK_KIND,
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "content_sha256": content_sha256,
+    });
+    store
+        .insert_expand_pack(&greppy_store::NewExpandPack {
+            project: project.to_string(),
+            command: "read-smart".into(),
+            query: format!("{path}:{start_line}-{end_line}"),
+            graph_generation: 0,
+            summary_json: serde_json::json!({
+                "text": sentence,
+                "content_sha256": content_sha256,
+            }),
+            payload_text: source.to_string(),
+            payload_json: Some(metadata),
+            ttl_secs: READ_PACK_TTL_SECS,
+        })
+        .map_err(Error::from)
+}
+
+/// Parse once, count structural blocks from the supplied root, and replace each
+/// first block at `depth` with one mechanically identifiable gap line.
+fn read_render_smart_source(
+    store: &greppy_store::Store,
+    project: &str,
+    root_path: &std::path::Path,
+    path: &str,
+    content: &str,
+    shown_start: usize,
+    shown_end: usize,
+    structural_start: usize,
+    structural_end: usize,
+    definition_root: bool,
+    depth: usize,
+) -> Result<String> {
+    let language = greppy_parser::language_for_path(std::path::Path::new(path));
+    if !language.is_supported() {
+        return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+    }
+    let Ok(tree) = greppy_parser::parse(language, content.as_bytes()) else {
+        return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+    };
+    let root_node = tree.root_node();
+    let mut selected = None;
+    let mut selected_width = usize::MAX;
+    let mut stack = vec![root_node];
+    while let Some(node) = stack.pop() {
+        let start = node.start_position().row + 1;
+        let end = read_node_end_line(node.end_position().row, node.end_position().column);
+        let suitable = if definition_root {
+            start == structural_start
+                && end >= structural_end
+                && node.child_by_field_name("body").is_some()
+        } else {
+            start == structural_start && end == structural_end && read_structural_kind(node.kind())
+        };
+        if suitable {
+            let width = node.end_byte().saturating_sub(node.start_byte());
+            if width < selected_width {
+                selected = Some(node);
+                selected_width = width;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_position().row + 1 <= structural_end
+                && read_node_end_line(child.end_position().row, child.end_position().column)
+                    >= structural_start
+            {
+                stack.push(child);
+            }
+        }
+    }
+    let Some(selected) = selected else {
+        return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+    };
+    let traversal_root = if definition_root {
+        let Some(body) = selected.child_by_field_name("body") else {
+            return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+        };
+        body
+    } else {
+        selected
+            .child_by_field_name("body")
+            .or_else(|| selected.child_by_field_name("consequence"))
+            .unwrap_or(selected)
+    };
+
+    let mut candidates = Vec::<(usize, usize)>::new();
+    let mut children = traversal_root.walk();
+    let mut stack = traversal_root
+        .named_children(&mut children)
+        .map(|node| (node, 0usize))
+        .collect::<Vec<_>>();
+    while let Some((node, parent_depth)) = stack.pop() {
+        let candidate = read_structural_kind(node.kind());
+        let node_depth = parent_depth + usize::from(candidate);
+        let start = node.start_position().row + 1;
+        let end = read_node_end_line(node.end_position().row, node.end_position().column);
+        if candidate
+            && node_depth >= depth
+            && start >= shown_start
+            && end <= shown_end
+            && end >= start
+        {
+            candidates.push((start, end));
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push((child, node_depth));
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut non_overlapping = Vec::new();
+    for range in candidates {
+        if non_overlapping.last().is_none_or(|(_, end)| range.0 > *end) {
+            non_overlapping.push(range);
+        }
+    }
+
+    let mut gaps = Vec::with_capacity(non_overlapping.len());
+    for (start_line, end_line) in non_overlapping {
+        let source = read_line_slice(content, start_line, end_line);
+        let sentence = read_summary_sentence(root_path, path, source);
+        let expand_id = read_insert_smart_pack(
+            store, project, path, start_line, end_line, source, &sentence,
+        )?;
+        let opening = content.lines().nth(start_line - 1).unwrap_or("");
+        let indent = opening
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        gaps.push(FoldGap {
+            start_line,
+            end_line,
+            indent,
+            sentence,
+            expand_id,
+        });
+    }
+
+    let mut out = String::new();
+    let mut line = shown_start;
+    for gap in gaps {
+        if line < gap.start_line {
+            out.push_str(read_line_slice(content, line, gap.start_line - 1));
+        }
+        out.push_str(&format!(
+            "{}… {}-{} {} — greppy expand {}\n",
+            gap.indent, gap.start_line, gap.end_line, gap.sentence, gap.expand_id
+        ));
+        line = gap.end_line + 1;
+    }
+    if line <= shown_end {
+        out.push_str(read_line_slice(content, line, shown_end));
+    }
+    Ok(out)
+}
+
+pub(crate) fn dispatch_read_smart(
+    symbols: &[String],
+    depth: usize,
+    with_handle: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    if depth == 0 {
+        return Err(Error::Invalid("read-smart --depth must be positive".into()));
+    }
+    prewarm_summary_daemon();
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    let root_path = resolve_root(root)?;
+    let mut failed = false;
+    let mut printed = false;
+    let mut previous_ended_with_newline = true;
+    for query in symbols {
+        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+        let ids = resolve_symbol_nodes(&store, Some(query))?;
+        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        }
+        let nodes = read_real_nodes(&store, &ids)?;
+        let Some(node) = nodes.first().cloned() else {
+            nav_report_missing(&store, &project, query);
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let Some(definition) = read_definition(&root_path, node)? else {
+            nav_report_missing(&store, &project, query);
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let mut group = format!(
+            "{}:{}-{}  {}\n",
+            definition.node.file_path,
+            definition.start_line,
+            definition.end_line,
+            nav_short_name(&definition.node)
+        );
+        let foldable = matches!(definition.node.label.as_str(), "Function" | "Method");
+        if foldable {
+            group.push_str(&read_render_smart_source(
+                &store,
+                &project,
+                &root_path,
+                &definition.node.file_path,
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+                definition.node.start_line.max(1) as usize,
+                definition.end_line,
+                true,
+                depth,
+            )?);
+        } else {
+            group.push_str(read_line_slice(
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+            ));
+        }
+        if with_handle {
+            if !group.ends_with('\n') {
+                group.push('\n');
+            }
+            let full = read_full_handle(
+                &root_path,
+                &definition.node.file_path,
+                definition.content.as_bytes(),
+                definition.start_line,
+                definition.end_line,
+            )?;
+            group.push_str("handle: ");
+            group.push_str(&read_compact_handle(&store, &project, full)?);
+            group.push('\n');
+        }
+        print!("{group}");
+        previous_ended_with_newline = group.ends_with('\n');
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
 fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
     let supplied = std::path::Path::new(subject);
     if supplied.is_absolute() {
@@ -973,6 +1288,67 @@ fn read_locate_file_pack(
     }
     Ok(matches.pop())
 }
+
+fn read_payload_line_count(payload: &str) -> usize {
+    let newlines = payload
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    newlines + usize::from(!payload.is_empty() && !payload.ends_with('\n'))
+}
+
+fn read_find_payload(content: &str, payload: &str) -> Vec<(usize, usize)> {
+    if payload.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let mut offset = 0usize;
+    while let Some(relative) = content[offset..].find(payload) {
+        let byte = offset + relative;
+        let start_line = content.as_bytes()[..byte]
+            .iter()
+            .filter(|value| **value == b'\n')
+            .count()
+            + 1;
+        let end_line = start_line + read_payload_line_count(payload).saturating_sub(1);
+        matches.push((start_line, end_line));
+        offset = byte + 1;
+    }
+    matches
+}
+
+fn read_locate_smart_pack(
+    store: &greppy_store::Store,
+    root_path: &std::path::Path,
+    project: &str,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    expected_hash: &str,
+    payload: &str,
+) -> Result<Option<(String, String, usize, usize)>> {
+    if let Ok(content) = std::fs::read_to_string(root_path.join(path)) {
+        let current = read_line_slice(&content, start_line, end_line);
+        if read_sha256(current.as_bytes()) == expected_hash && current == payload {
+            return Ok(Some((path.to_string(), content, start_line, end_line)));
+        }
+    }
+    let mut found = Vec::new();
+    for state in store.list_file_states(project)? {
+        let Ok(content) = std::fs::read_to_string(root_path.join(&state.rel_path)) else {
+            continue;
+        };
+        for (start, end) in read_find_payload(&content, payload) {
+            found.push((state.rel_path.clone(), content.clone(), start, end));
+            if found.len() > 1 {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(found.pop())
+}
+
 pub(crate) fn dispatch_read_expand(
     store: &greppy_store::Store,
     pack: &greppy_store::ExpandPack,
@@ -1038,6 +1414,62 @@ pub(crate) fn dispatch_read_expand(
                         "start_line": start,
                         "end_line": end,
                         "next_expand_id": next,
+                    }),
+                ))
+            }
+        }
+        "read-smart" => {
+            if metadata.get("kind").and_then(serde_json::Value::as_str)
+                != Some(READ_SMART_PACK_KIND)
+            {
+                None
+            } else {
+                let path = metadata
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let start = metadata
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                let end = metadata
+                    .get("end_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                let hash = metadata
+                    .get("content_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if read_sha256(pack.payload_text.as_bytes()) != hash {
+                    println!("expand: read-smart pack hash drift; refusing unverified source");
+                    return Ok(1);
+                }
+                let Some((path, content, start, end)) = read_locate_smart_pack(
+                    store,
+                    &root_path,
+                    project,
+                    path,
+                    start,
+                    end,
+                    hash,
+                    &pack.payload_text,
+                )?
+                else {
+                    println!("expand: read-smart span changed since this pack was created");
+                    return Ok(1);
+                };
+                let text = read_render_smart_source(
+                    store, project, &root_path, &path, &content, start, end, start, end, false, 1,
+                )?;
+                Some((
+                    text,
+                    serde_json::json!({
+                        "kind": READ_SMART_PACK_KIND,
+                        "path": path,
+                        "start_line": start,
+                        "end_line": end,
                     }),
                 ))
             }

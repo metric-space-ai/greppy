@@ -109,20 +109,38 @@ fn read_multi_delivers_successes_and_nav_failures() {
 }
 
 #[test]
-fn read_handle_is_compact_and_existing_json_shape_survives() {
-    let (repo, store) = fresh_workspace("handle");
-    std::fs::write(repo.join("lib.rs"), "pub fn target() {}\n").unwrap();
+fn read_smart_folds_by_structure_and_expand_chains() {
+    let (repo, store) = fresh_workspace("smart");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "fn target(xs: &[i32]) {\n    let mut n = 0;\n    for x in xs {\n        if *x > 0 {\n            n += x;\n        }\n    }\n    println!(\"{n}\");\n}\n",
+    )
+    .unwrap();
     index(&repo, &store);
 
-    let (code, stdout, stderr) = run(&repo, &store, &["read", "target", "--handle", "--json"]);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-smart", "target"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(value["schema_version"], "greppy.read.v1");
-    assert_eq!(value["status"], "ok");
-    let handle = value["handle"].as_str().expect("handle");
-    assert!(handle.starts_with("geh2:"), "{handle}");
-    assert!(handle.len() <= 70, "{}: {handle}", handle.len());
+    assert!(stdout.contains("    let mut n = 0;\n"), "{stdout}");
+    assert!(
+        stdout.contains("    … 3-7 folded source block — greppy expand "),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("        if *x > 0"), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .expect("gap id");
+
+    let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
+    assert!(expanded.starts_with("    for x in xs {\n"), "{expanded}");
+    assert!(
+        expanded.contains("        … 4-6 folded source block — greppy expand "),
+        "{expanded}"
+    );
+    assert!(expanded.ends_with("    }\n"), "{expanded}");
 }
+
 #[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
@@ -175,4 +193,20 @@ fn read_file_range_and_all_bypass_pagination() {
     let (all_code, all_out, all_err) = run(&repo, &store, &["read-file", "config.json", "--all"]);
     assert_eq!(all_code, 0, "stdout={all_out}\nstderr={all_err}");
     assert_eq!(all_out, "config.json:1-4\na\nb\nc\nd\n");
+}
+
+#[test]
+fn read_handle_is_compact_and_existing_json_shape_survives() {
+    let (repo, store) = fresh_workspace("handle");
+    std::fs::write(repo.join("lib.rs"), "pub fn target() {}\n").unwrap();
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "target", "--handle", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["schema_version"], "greppy.read.v1");
+    assert_eq!(value["status"], "ok");
+    let handle = value["handle"].as_str().expect("handle");
+    assert!(handle.starts_with("geh2:"), "{handle}");
+    assert!(handle.len() <= 70, "{}: {handle}", handle.len());
 }

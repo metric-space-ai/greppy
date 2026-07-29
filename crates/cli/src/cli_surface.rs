@@ -230,6 +230,20 @@ pub enum Command {
         #[arg(long, hide = true)]
         json: bool,
     },
+    /// Print symbol definitions with nested structural blocks folded into
+    /// semantic one-line gaps that can be expanded recursively.
+    #[command(name = "read-smart")]
+    ReadSmart {
+        /// Symbols to read, or `-` to take symbols from the pipe.
+        #[arg(value_name = "SYMBOL", required = true)]
+        symbols: Vec<String>,
+        /// Keep blocks above this structural depth raw; fold blocks at this depth.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        depth: usize,
+        /// Also print a compact edit handle for each definition span.
+        #[arg(long)]
+        handle: bool,
+    },
     /// Read files directly, in 400-line pages unless a range or all lines were requested.
     #[command(name = "read-file")]
     ReadFile {

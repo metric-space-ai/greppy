@@ -757,6 +757,7 @@ const SUBCOMMANDS: &[&str] = &[
     "bash-smart",
     "expand",
     "read",
+    "read-smart",
     "read-file",
     "replace",
     "replace-text",
@@ -1949,6 +1950,10 @@ fn dispatch_subcommand(
         Command::Read { symbols, head, tail, handle, json } => {
             let symbols = nav_targets(&symbols)?;
             dispatch_read_symbols(&symbols, head, tail, handle, json, root)
+        }
+        Command::ReadSmart { symbols, depth, handle } => {
+            let symbols = nav_targets(&symbols)?;
+            dispatch_read_smart(&symbols, depth, handle, root)
         }
         Command::ReadFile { paths, lines, all, handle } => {
             dispatch_read_files(&paths, lines.as_deref(), all, handle, root)
@@ -5359,7 +5364,7 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     if pack.command == "bash-smart" {
         return bash_smart::expand(&store, pack, json);
     }
-    if pack.command == "read-file" {
+    if matches!(pack.command.as_str(), "read-smart" | "read-file") {
         return dispatch_read_expand(&store, &pack, json, root);
     }
     let mut payload_text = pack.payload_text.clone();
