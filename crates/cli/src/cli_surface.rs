@@ -84,9 +84,11 @@ pub enum Command {
         json: bool,
     },
     /// One line per definition in that file: kind, signature, span.
-    #[command(after_help = "Example:\n  greppy outline src/lib.rs\n\n\
+    #[command(
+        after_help = "Example:\n  greppy outline src/lib.rs\n\n\
                       `search-symbol` looks a name up across the repository; `outline` answers\n\
-                      what stands in THIS file, in the order it stands there.")]
+                      what stands in THIS file, in the order it stands there."
+    )]
     Outline {
         /// The file to outline.
         #[arg(value_name = "PATH")]
@@ -231,7 +233,7 @@ pub enum Command {
     /// Run a command untouched and fold long output behind an expand id.
     #[command(name = "bash-smart")]
     BashSmart {
-        /// Command argv after `--`. A single string is run by the platform shell.
+        /// Command argv after `--`.
         #[arg(
             value_name = "CMD",
             required = true,

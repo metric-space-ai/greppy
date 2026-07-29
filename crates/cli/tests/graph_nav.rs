@@ -327,20 +327,14 @@ fn who_calls_covers_calls_and_usages_without_naming_the_edge() {
     // kind is how the graph stores them, not something the agent acts on, so it
     // is not printed -- the answer is the address and the symbol.
     let (code, out, err) = run(&["who-calls", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "who-calls should exit 0; stderr={err}\nstdout={out}"
-    );
+    assert_eq!(code, 0, "who-calls should exit 0; stderr={err}\nstdout={out}");
     assert!(
         out.contains("caller") && !out.contains("CALLS"),
         "the caller is named, the edge kind is not; got: {out:?}"
     );
 
     let (code, out, err) = run(&["who-calls", "Widget"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "who-calls should exit 0; stderr={err}\nstdout={out}"
-    );
+    assert_eq!(code, 0, "who-calls should exit 0; stderr={err}\nstdout={out}");
     assert!(
         out.contains("render") && !out.contains("USAGE"),
         "a struct's referrers are listed the same way as callers; got: {out:?}"
@@ -609,12 +603,8 @@ fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
         let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
-        let (code, out, err) = run_with_env(
-            &args,
-            &repo,
-            &store,
-            &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
-        );
+        let (code, out, err) =
+            run_with_env(&args, &repo, &store, &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")]);
         assert_eq!(
             code, 75,
             "refreshing {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
@@ -865,13 +855,11 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     assert_eq!(v["status"], "ok");
     assert_eq!(v["fresh"], true);
     assert!(
-        v["hits"]
-            .as_array()
-            .is_some_and(|hits| hits.iter().any(|hit| {
-                hit["qualified_name"]
-                    .as_str()
-                    .is_some_and(|name| name.contains("WidgetRenamed"))
-            })),
+        v["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+            hit["qualified_name"]
+                .as_str()
+                .is_some_and(|name| name.contains("WidgetRenamed"))
+        })),
         "healed symbol search must contain the edited definition: {v:?}"
     );
 

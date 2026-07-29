@@ -12,8 +12,10 @@ fn bin() -> &'static str {
 
 fn fresh_workspace() -> (PathBuf, PathBuf) {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let base =
-        std::env::temp_dir().join(format!("greppy-cli-edit-postel-{}-{n}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "greppy-cli-edit-postel-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&base);
     let repo = base.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -61,11 +63,7 @@ fn assert_applied(result: &(i32, String, String), label: &str) {
         "{label}\nstdout={}\nstderr={}",
         result.1, result.2
     );
-    assert!(
-        result.1.contains("\"status\": \"applied\""),
-        "{label}: {}",
-        result.1
-    );
+    assert!(result.1.contains("\"status\": \"applied\""), "{label}: {}", result.1);
 }
 
 #[test]
@@ -195,18 +193,9 @@ fn source_and_regex_old_new_aliases_are_accepted_end_to_end() {
     assert_applied(&regex, "regex-cas --old/--new");
 
     let unchanged = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
-    assert!(
-        unchanged.contains("pub const ANSWER: i32 = 42;"),
-        "{unchanged}"
-    );
-    assert!(
-        unchanged.contains("pub fn first() -> i32 {\n    1\n}"),
-        "{unchanged}"
-    );
-    assert!(
-        unchanged.contains("pub fn second() -> i32 {\n    2\n}"),
-        "{unchanged}"
-    );
+    assert!(unchanged.contains("pub const ANSWER: i32 = 42;"), "{unchanged}");
+    assert!(unchanged.contains("pub fn first() -> i32 {\n    1\n}"), "{unchanged}");
+    assert!(unchanged.contains("pub fn second() -> i32 {\n    2\n}"), "{unchanged}");
     assert!(!unchanged.contains("pub fn inserted()"), "{unchanged}");
     assert!(!unchanged.contains("pub fn before_third()"), "{unchanged}");
 }

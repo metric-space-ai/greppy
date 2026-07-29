@@ -21,7 +21,9 @@
 
 #![cfg(unix)]
 
-use greppy_edit::verbs::{delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions};
+use greppy_edit::verbs::{
+    delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions,
+};
 use greppy_edit::{Certificate, EditHandle, Language, Status};
 
 // ------------------------------------------------------------------ helpers
@@ -127,10 +129,7 @@ fn grid_go_replace_body_unique() {
     assert!(!out.contains("a + b"));
 
     let json = serde_json::to_value(&cert).unwrap();
-    assert_eq!(
-        json["schema_version"].as_str(),
-        Some("greppy.edit-certificate.v1")
-    );
+    assert_eq!(json["schema_version"].as_str(), Some("greppy.edit-certificate.v1"));
     assert_eq!(json["status"].as_str(), Some("applied"));
     let _: Certificate = serde_json::from_value(json).unwrap();
 

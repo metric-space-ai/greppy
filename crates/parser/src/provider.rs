@@ -557,13 +557,17 @@ mod tests {
         assert_eq!(manifest.status, ProviderStatus::Partial);
         assert!(manifest.supports(EdgeClass::Usages));
         assert!(manifest.supports(EdgeClass::TypeRefs));
-        assert!(manifest
-            .unsupported_edge_classes
-            .contains(&EdgeClass::TypeAssigns));
-        assert!(manifest
-            .notes
-            .iter()
-            .any(|note| note.contains("member-call coverage")));
+        assert!(
+            manifest
+                .unsupported_edge_classes
+                .contains(&EdgeClass::TypeAssigns)
+        );
+        assert!(
+            manifest
+                .notes
+                .iter()
+                .any(|note| note.contains("member-call coverage"))
+        );
         manifest.validate().unwrap();
     }
 

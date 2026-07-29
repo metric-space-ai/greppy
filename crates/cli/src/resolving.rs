@@ -173,10 +173,7 @@ pub(crate) fn resolve_qualified_ids(
 /// `qualified_name` match. When `symbol` is `None` the first node in the
 /// graph is used (preserves the historical no-arg `greppy trace`
 /// behaviour).
-pub(crate) fn resolve_symbol_id(
-    store: &greppy_store::Store,
-    symbol: Option<&str>,
-) -> Result<Option<i64>> {
+pub(crate) fn resolve_symbol_id(store: &greppy_store::Store, symbol: Option<&str>) -> Result<Option<i64>> {
     // Push the name filter into SQL. The old form loaded the first 10k
     // nodes of the project (ordered by qualified_name) and filtered in
     // memory — on a repo bigger than the cap (django: 56k nodes) every
@@ -248,10 +245,7 @@ pub(crate) fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
     looks_like_path.then(|| (head, &query[idx + 2..]))
 }
 
-pub(crate) fn resolve_symbol_nodes(
-    store: &greppy_store::Store,
-    symbol: Option<&str>,
-) -> Result<Vec<i64>> {
+pub(crate) fn resolve_symbol_nodes(store: &greppy_store::Store, symbol: Option<&str>) -> Result<Vec<i64>> {
     let Some(s) = symbol else {
         // No symbol: mirror resolve_symbol_id's "first node" behaviour.
         return Ok(resolve_symbol_id(store, None)?.into_iter().collect());
@@ -350,12 +344,7 @@ pub(crate) fn is_synthetic_file_anchor(label: &str, name: &str, qualified_name: 
         || (label == "File" && qualified_name.ends_with("__file__"))
 }
 
-pub(crate) fn display_symbol_name(
-    label: &str,
-    name: &str,
-    qualified_name: &str,
-    file_path: &str,
-) -> String {
+pub(crate) fn display_symbol_name(label: &str, name: &str, qualified_name: &str, file_path: &str) -> String {
     if is_synthetic_file_anchor(label, name, qualified_name) {
         if file_path.is_empty() {
             "Module <unknown>".to_string()
@@ -380,10 +369,7 @@ pub(crate) fn display_row_name(row: &greppy_search::graph::SearchGraphRow) -> St
     display_symbol_name(&row.label, &row.name, &row.qualified_name, &row.file_path)
 }
 
-pub(crate) fn closest_read_paths(
-    root_path: &std::path::Path,
-    subject: &str,
-) -> Result<Vec<String>> {
+pub(crate) fn closest_read_paths(root_path: &std::path::Path, subject: &str) -> Result<Vec<String>> {
     let overrides = discover_overrides_from_env()?;
     let entries = greppy_discover::walk_with_policy_and_overrides(
         root_path,

@@ -26,9 +26,7 @@ pub(crate) fn provider_policy_from_env() -> Result<ProviderPolicy> {
     }
 }
 
-pub(crate) fn provider_policy_blocks_query(
-    incomplete_providers: &[serde_json::Value],
-) -> Result<bool> {
+pub(crate) fn provider_policy_blocks_query(incomplete_providers: &[serde_json::Value]) -> Result<bool> {
     Ok(
         provider_policy_from_env()? == ProviderPolicy::RequireComplete
             && !incomplete_providers.is_empty(),
@@ -171,10 +169,7 @@ pub(crate) fn freshness_serve_decision(
 /// 2026-07-18). Genuinely un-reindexable states (cold/failed) are left for the
 /// stale gate to refuse. Best-effort: a failed reindex leaves the old store,
 /// and the gate then decides.
-pub(crate) fn maybe_reindex_stale(
-    store: &mut greppy_store::Store,
-    root: Option<&str>,
-) -> Result<()> {
+pub(crate) fn maybe_reindex_stale(store: &mut greppy_store::Store, root: Option<&str>) -> Result<()> {
     // An explicit auto-reindex opt-out must fall through to the fail-closed
     // stale gate. In particular, do not wait on an active writer that the
     // caller has said must not be joined for automatic healing.
@@ -367,10 +362,7 @@ pub(crate) fn freshness_serve_decision_with_policy(
     FreshnessServe::Refuse(freshness)
 }
 
-pub(crate) fn freshness_changed_bytes(
-    root: Option<&str>,
-    freshness: &serde_json::Value,
-) -> Option<u64> {
+pub(crate) fn freshness_changed_bytes(root: Option<&str>, freshness: &serde_json::Value) -> Option<u64> {
     let root = resolve_root(root).ok()?;
     let paths = freshness.get("changed_paths")?.as_array()?;
     let mut bytes = 0u64;
@@ -659,10 +651,7 @@ pub(crate) fn try_auto_index_inline(root: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
-pub(crate) fn cleanup_expired_legacy_entries(
-    current: Option<&std::path::Path>,
-    ttl: std::time::Duration,
-) {
+pub(crate) fn cleanup_expired_legacy_entries(current: Option<&std::path::Path>, ttl: std::time::Duration) {
     if ttl.is_zero() {
         return;
     }

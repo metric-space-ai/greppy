@@ -145,16 +145,14 @@ fn edge_keys(value: &serde_json::Value) -> Vec<(String, String, String)> {
 #[test]
 fn graph_grid_kotlin_who_calls_finds_cross_file_caller() {
     let (repo, store) = index_fixture("who-calls");
-    let (code, out, err) = run(&["who-calls", "helperFunction", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "who-calls should succeed; stderr={err}\nstdout={out}"
+    let (code, out, err) = run(
+        &["who-calls", "helperFunction", "--json"],
+        &repo,
+        &store,
     );
+    assert_eq!(code, 0, "who-calls should succeed; stderr={err}\nstdout={out}");
     let value = json(&out, "who-calls helperFunction");
-    assert_eq!(
-        value["symbol_found"], true,
-        "helperFunction must be indexed: {value}"
-    );
+    assert_eq!(value["symbol_found"], true, "helperFunction must be indexed: {value}");
     assert!(
         has_hit(&value, None, "caller") && has_hit(&value, None, "src/main.kt"),
         "CALLS incoming edge must identify caller in main.kt: {value}"
@@ -164,20 +162,15 @@ fn graph_grid_kotlin_who_calls_finds_cross_file_caller() {
 #[test]
 fn graph_grid_kotlin_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-empty");
-    let (code, out, err) = run(&["who-calls", "uncalledHelper", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "uncalled symbol should be a valid query; stderr={err}\nstdout={out}"
+    let (code, out, err) = run(
+        &["who-calls", "uncalledHelper", "--json"],
+        &repo,
+        &store,
     );
+    assert_eq!(code, 0, "uncalled symbol should be a valid query; stderr={err}\nstdout={out}");
     let value = json(&out, "who-calls uncalledHelper");
-    assert_eq!(
-        value["symbol_found"], true,
-        "uncalledHelper must be indexed: {value}"
-    );
-    assert_eq!(
-        value["total_exact"], 0,
-        "uncalledHelper must have no callers: {value}"
-    );
+    assert_eq!(value["symbol_found"], true, "uncalledHelper must be indexed: {value}");
+    assert_eq!(value["total_exact"], 0, "uncalledHelper must have no callers: {value}");
     assert!(
         value["hits"].as_array().is_some_and(Vec::is_empty),
         "uncalledHelper must return no caller rows: {value}"
@@ -188,15 +181,9 @@ fn graph_grid_kotlin_who_calls_empty_for_uncalled() {
 fn graph_grid_kotlin_callees_lists_cross_file_target() {
     let (repo, store) = index_fixture("callees");
     let (code, out, err) = run(&["callees", "caller", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "callees should succeed; stderr={err}\nstdout={out}"
-    );
+    assert_eq!(code, 0, "callees should succeed; stderr={err}\nstdout={out}");
     let value = json(&out, "callees caller");
-    assert_eq!(
-        value["symbol_found"], true,
-        "caller must be indexed: {value}"
-    );
+    assert_eq!(value["symbol_found"], true, "caller must be indexed: {value}");
     assert!(
         has_hit(&value, None, "helperFunction") && has_hit(&value, None, "src/helper.kt"),
         "caller must list helperFunction from helper.kt: {value}"
@@ -213,10 +200,7 @@ fn graph_grid_kotlin_impact_transitive_reaches_caller() {
         value["hits"]
             .as_array()
             .is_some_and(|hits| hits.iter().any(|hit| {
-                hit["qualified_name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("caller")
+                hit["qualified_name"].as_str().unwrap_or("").contains("caller")
             })),
         "impact on helperFunction must reach caller: {value}"
     );
@@ -242,14 +226,12 @@ fn graph_grid_kotlin_search_symbols_finds_all_definitions() {
         );
         let value = json(&out, &format!("search-symbols {symbol}"));
         assert!(
-            value["hits"]
-                .as_array()
-                .is_some_and(|hits| hits.iter().any(|hit| {
-                    hit["qualified_name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains(symbol)
-                })),
+            value["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+                hit["qualified_name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(symbol)
+            })),
             "search-symbols must find Kotlin definition {symbol}: {value}"
         );
     }
@@ -286,18 +268,12 @@ fn graph_grid_kotlin_path_connects_caller_to_helper() {
         &repo,
         &store,
     );
-    assert_eq!(
-        code, 0,
-        "path caller->helperFunction should exist; stderr={err}\nstdout={out}"
-    );
+    assert_eq!(code, 0, "path caller->helperFunction should exist; stderr={err}\nstdout={out}");
     let caller_at = out.find("caller").expect("path must include caller");
     let helper_at = out
         .find("helperFunction")
         .expect("path must include helperFunction");
-    assert!(
-        caller_at < helper_at,
-        "path must be ordered caller -> helper: {out}"
-    );
+    assert!(caller_at < helper_at, "path must be ordered caller -> helper: {out}");
     assert!(
         out.contains("src/main.kt:") && out.contains("src/helper.kt:"),
         "path steps must carry both Kotlin file locations: {out}"
@@ -313,12 +289,12 @@ fn graph_grid_kotlin_graph_survives_reindex() {
         "second Kotlin index should succeed; stderr={first_index_err}\nstdout={first_index_out}"
     );
 
-    let (code, first_out, first_err) =
-        run(&["who-calls", "helperFunction", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "references after reindex should succeed; stderr={first_err}"
+    let (code, first_out, first_err) = run(
+        &["who-calls", "helperFunction", "--json"],
+        &repo,
+        &store,
     );
+    assert_eq!(code, 0, "references after reindex should succeed; stderr={first_err}");
     let first = json(&first_out, "references helperFunction after reindex");
     let first_edges = edge_keys(&first);
 
@@ -327,16 +303,13 @@ fn graph_grid_kotlin_graph_survives_reindex() {
         code, 0,
         "third Kotlin index should succeed; stderr={second_index_err}\nstdout={second_index_out}"
     );
-    let (code, second_out, second_err) =
-        run(&["who-calls", "helperFunction", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "references after second reindex should succeed; stderr={second_err}"
+    let (code, second_out, second_err) = run(
+        &["who-calls", "helperFunction", "--json"],
+        &repo,
+        &store,
     );
-    let second = json(
-        &second_out,
-        "references helperFunction after second reindex",
-    );
+    assert_eq!(code, 0, "references after second reindex should succeed; stderr={second_err}");
+    let second = json(&second_out, "references helperFunction after second reindex");
     assert_eq!(
         first_edges,
         edge_keys(&second),
@@ -398,22 +371,17 @@ fn graph_grid_kotlin_declarative_or_edge_case() {
     // but it is still a named, importable type in the graph.  Certification
     // requires the definition to remain searchable as a Class node.
     let (code, out, err) = run(&["search-symbols", "KotlinMarker", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "Kotlin object search should succeed; stderr={err}\nstdout={out}"
-    );
+    assert_eq!(code, 0, "Kotlin object search should succeed; stderr={err}\nstdout={out}");
     let value = json(&out, "search-symbols KotlinMarker");
     assert!(
-        value["hits"]
-            .as_array()
-            .is_some_and(|hits| hits.iter().any(|hit| {
-                hit["label"] == "Class"
-                    && hit["file_path"] == "src/helper.kt"
-                    && hit["qualified_name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("KotlinMarker")
-            })),
+        value["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+            hit["label"] == "Class"
+                && hit["file_path"] == "src/helper.kt"
+                && hit["qualified_name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("KotlinMarker")
+        })),
         "Kotlin object declarations must be searchable as Class definitions: {value}"
     );
 }

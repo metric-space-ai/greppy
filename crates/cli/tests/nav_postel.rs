@@ -188,7 +188,11 @@ fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
         ("search-symbols", "target", "src/api.rs"),
     ] {
         let positional = without_expand_id(run(&[command, query, path], &repo, &store));
-        let flagged = without_expand_id(run(&[command, query, "--path", path], &repo, &store));
+        let flagged = without_expand_id(run(
+            &[command, query, "--path", path],
+            &repo,
+            &store,
+        ));
         assert_eq!(
             positional, flagged,
             "{command}: positional PATH and --path differ"

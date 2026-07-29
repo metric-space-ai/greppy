@@ -12,8 +12,10 @@ fn bin() -> &'static str {
 
 fn fresh_workspace() -> (PathBuf, PathBuf) {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let base =
-        std::env::temp_dir().join(format!("greppy-cli-grep-postel-{}-{n}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "greppy-cli-grep-postel-{}-{n}",
+        std::process::id()
+    ));
     let repo = base.join("repo");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(repo.join("tree/nested")).unwrap();

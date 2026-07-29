@@ -36,15 +36,40 @@ overlap; a small head reads the hidden state at each line-end token — one
 prediction per line, ONE forward pass per window. Classes:
 
 ```
-error / warning / result / artifact / question / progress / info
-+ a continuation bit ("this line continues the previous one")
+error / warning / progress / text
 ```
 
-The continuation bit lifts BLOCKS: a rust error is five lines, a traceback
-twenty — the engineer quotes the block, so the head must too. Display policy
-is derived, not judged: error, result, question and artifact blocks are lifted
-verbatim with line numbers; warnings are counted and sampled; progress stays
-collapsed; info stays in the pack.
+Labels are emitted as RANGES of consecutive lines sharing a class, so a block
+falls out of the labeling itself — a rust error is five lines, a traceback
+twenty, and the engineer quotes the block, so the head must too. No separate
+continuation bit: it was a second judgment call and measured 67% self-agreement.
+Display policy is derived, not judged: error blocks are lifted verbatim with
+line numbers; warnings are counted and sampled; progress stays collapsed; text
+stays in the pack unless layer 4 surfaces it.
+
+**Four classes — each survivor earned its place by measurement, 2026-07-29.**
+The scheme started at seven and shrank three times, every step forced by data
+from the prompt lab (`greppy-data-pipeline/prompt_lab.py`: the same prompt run
+twice over the same walls, self-agreement as the only criterion — a teacher
+that cannot agree with itself cannot teach):
+
+```
+result / info   dropped   the boundary is a judgment call: 4 QA rounds swung
+                          99 → 98 → 46 → 48 in anti-phase with info; deriving
+                          it from behaviour failed too (1 of 76 error lines —
+                          agents paraphrase, they do not quote)
+artifact        dropped   never stabilized in six measurements: 42 / 80 / 14 %
+question        dropped   vanishingly rare in agent traces (non-interactive);
+                          a waiting prompt is caught mechanically instead —
+                          a timeout with an unterminated last line
+continuation    dropped   67% self-agreement; ranges give blocks for free
+```
+
+The labeling prompt sees ONLY the numbered raw output lines — no command, no
+following agent turn, no dataset hint. Context the head cannot access at
+inference produces labels it cannot learn; an earlier prompt passed the agent's
+next turn and scored 86.7% self-agreement against the final 97.6%. Full
+evidence: `greppy-data-pipeline/docs/CLASS-SCHEME-DECISION.md`.
 
 **4. Surprisal net — for what no class catches.** In the same pass, per-line
 perplexity under the model; the most surprising unclassified lines are lifted
@@ -57,6 +82,34 @@ byte-identically at its claimed line in the stored output. The model can
 select, never invent. Failure modes are all graceful: a missed line costs
 comfort (skeleton + expand remain complete), a wrong pick costs noise, an
 invention is dropped before display. Daemon cold → skeleton alone.
+
+## Streaming (cargo & friends write continuously)
+
+The consumer is an agent, not a human at a terminal: it receives tool output
+only when the command ends, so the delivery unit is the COMPLETED output and
+the four layers run exactly once, at exit. There is no live display to feed —
+but continuous writers still dictate the capture mechanics:
+
+- **Drain and spool.** Both streams are drained continuously and spooled
+  incrementally to the pack store — never buffered in RAM. An undrained pipe
+  blocks the child at 64 KB and fakes a hang. The store has a size cap with
+  head-and-tail retention and an explicit gap marker; silent truncation is
+  exactly the harness behaviour this tool exists to end.
+- **No TTY, by design.** Under pipes most tools switch to line output
+  themselves. Residual `\r` rewrites count as rewrites of ONE line for
+  skeleton and collapse (else a progress bar is "a thousand lines"); the
+  stored bytes stay untouched — the byte gate refers to the store.
+- **Kill/timeout is a first-class outcome.** A killed command (cargo watch, a
+  hung test) delivers the full skeleton of the partial output plus the expand
+  id, the signal stated as such, an unterminated last line marked. Everything
+  accumulated until the kill is in the store — nothing is lost anymore.
+- **Per-line timestamps, layer 1.** Streaming yields the time of every line
+  for free; recorded as pack metadata. The line before the largest gap is
+  lifted on timeout walls — "where it hung" is the first thing the agent
+  needs.
+- **Interleaving is approximate.** stdout and stderr are captured separately
+  (stderr verbatim is a file-descriptor fact); relative order between the two
+  streams is therefore approximate and stated as such, not faked.
 
 Out of the box: model and head ship in the binary like everything else. No
 telemetry, no runtime learning, no state — identical behaviour everywhere.
@@ -77,7 +130,7 @@ eval anchor  the breakage farm: clone top repos, injure them deliberately
 
 No license screening (owner decision: technical tool output and LLM chat
 content carry no copyright in the EU). Secrets scrubbing applies ONLY where
-training is generative: a classifier head outputs seven numbers and cannot
+training is generative: a classifier head outputs six numbers and cannot
 reproduce anything, so head training needs no scrub — but a next-token
 fine-tune on walls feeds the SAME model that writes hint sentences, and only
 there could a memorized key ever resurface. If surprisal works without a
@@ -92,7 +145,7 @@ Sol     one extractor per harness schema (Claude Code, Codex, Hermes, Pi) —
 script  mass extraction on gpu3: wall + following agent turn — zero tokens
 script  behaviour labels for free: wall lines that reappear in the agent's
         next turn were acted upon
-M3      7-class + continuation line labels, wall-by-wall, with the agent's
+M3      6-class + continuation line labels, wall-by-wall, with the agent's
         continuation as context; "unclear" is a permitted answer
 Kimi    5% double-label sample; disagreement adjudicated or dropped; an
         agreement rate under ~95% means a class definition is mushy and gets

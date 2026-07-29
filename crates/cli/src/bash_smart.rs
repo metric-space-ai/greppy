@@ -4,7 +4,9 @@
 
 use super::*;
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 const SHORT_TOTAL_LINES: usize = 80;
 const STDERR_VERBATIM_LINES: usize = 40;
@@ -16,6 +18,8 @@ const EMBED_BATCH_LINES: usize = 16;
 const NOVELTY_TOP_K: usize = 3;
 const NOVELTY_DISTANCE_FLOOR: f32 = 0.12;
 const PACK_SCHEMA_VERSION: u64 = 1;
+const PACK_HEAD_BYTES: u64 = 32 * 1024 * 1024;
+const PACK_TAIL_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct RawLine<'a> {
@@ -58,9 +62,22 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         ));
     }
 
+    // Open the pack namespace before spawning: both pipe-drainer threads write
+    // straight into this directory while the child runs. The completed output
+    // is never accumulated by `Command::output`, and stdout cannot block stderr
+    // (or vice versa) at the kernel pipe limit.
+    let store = open_pack_store(root).ok();
+    let spool_dir = spool_dir(root)?;
+    let token = spool_token();
+    let stdout_path = spool_dir.join(format!("{token}.stdout"));
+    let stderr_path = spool_dir.join(format!("{token}.stderr"));
+    let stdout_times = spool_dir.join(format!("{token}.stdout.times"));
+    let stderr_times = spool_dir.join(format!("{token}.stderr.times"));
+
     let mut command = command_for_argv(argv);
-    let output = match command.output() {
-        Ok(output) => output,
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(error) => {
             let _ = writeln!(
                 std::io::stderr(),
@@ -74,19 +91,49 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
             });
         }
     };
-    let exit_code = child_exit_code(&output.status);
-    let raw = StoredRaw::new(output.stdout, output.stderr);
+    let stdout = child.stdout.take().expect("piped child stdout");
+    let stderr = child.stderr.take().expect("piped child stderr");
+    let stdout_thread = spawn_drain(stdout, stdout_path.clone(), stdout_times.clone());
+    let stderr_thread = spawn_drain(stderr, stderr_path.clone(), stderr_times.clone());
+
+    let timeout_ms = std::env::var("GREPPY_BASH_SMART_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    let started = std::time::Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None)
+                if timeout_ms
+                    .is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) =>
+            {
+                timed_out = true;
+                let _ = child.kill();
+                break child
+                    .wait()
+                    .map_err(|error| Error::io("wait for timed-out bash-smart command", error))?;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) => return Err(Error::io("wait for bash-smart command", error)),
+        }
+    };
+    let stdout_capture = join_drain(stdout_thread, "stdout")?;
+    let stderr_capture = join_drain(stderr_thread, "stderr")?;
+    let exit_code = child_exit_code(&status);
+    let raw = StoredRaw::from_capture(stdout_capture, stderr_capture)?;
     let stdout_lines = split_lines(&raw.stdout);
     let stderr_lines = split_lines(&raw.stderr);
 
-    // Every invocation is put in the expand economy, including short and empty
-    // output. Short output deliberately prints no id: storage is durability,
-    // not an invitation to spend another call.
-    let store = open_pack_store(root).ok();
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
+    let interrupted = timed_out || status.code().is_none();
+    let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
 
-    if stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES {
+    // Kills and timeouts always receive an id, even when the partial wall is
+    // short. Normal short output remains exactly byte-for-byte output only.
+    if short && !interrupted {
         if let Some(store) = store.as_ref() {
             let _ = insert_pack(store, &project, &query, &raw, "stdout", 1);
         }
@@ -95,8 +142,9 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         return Ok(exit_code);
     }
 
-    let stdout_folded = stdout_lines.len() > SHORT_TOTAL_LINES;
-    let stderr_folded = stderr_lines.len() > STDERR_VERBATIM_LINES;
+    let stdout_folded = !short || interrupted;
+    let stderr_folded =
+        stderr_lines.len() > STDERR_VERBATIM_LINES || (interrupted && !stderr_lines.is_empty());
     let stdout_id = store.as_ref().and_then(|store| {
         insert_pack(store, &project, &query, &raw, "stdout", HEAD_LINES + 1).ok()
     });
@@ -108,7 +156,7 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         None
     };
 
-    let lifted_stdout = if stdout_folded {
+    let lifted_stdout = if stdout_lines.len() > SHORT_TOTAL_LINES {
         novelty_lifts(&stdout_lines, root)
     } else {
         Vec::new()
@@ -124,7 +172,6 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
             let gated = byte_gate(store, id, "stdout", &lifted_stdout);
             render_folded(false, &stdout_lines, exit_code, id, &gated);
         } else {
-            // A missing pack must never turn truncation into data loss.
             write_stream(false, &raw.stdout);
         }
     } else {
@@ -140,6 +187,41 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         }
     } else {
         write_stream(true, &raw.stderr);
+    }
+
+    if interrupted
+        && ((!raw.stdout.is_empty() && !raw.stdout.ends_with(b"\n"))
+            || (!raw.stderr.is_empty() && !raw.stderr.ends_with(b"\n")))
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "bash-smart: partial output ends with an unterminated line"
+        );
+    }
+    if timed_out {
+        let _ = writeln!(
+            std::io::stderr(),
+            "bash-smart: timed out after {} ms; partial output stored as {}",
+            timeout_ms.unwrap_or_default(),
+            stdout_id.as_deref().unwrap_or("unavailable")
+        );
+    } else if status.code().is_none() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "bash-smart: terminated by signal {}; partial output stored as {}",
+                status.signal().unwrap_or_default(),
+                stdout_id.as_deref().unwrap_or("unavailable")
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = writeln!(
+            std::io::stderr(),
+            "bash-smart: terminated; partial output stored as {}",
+            stdout_id.as_deref().unwrap_or("unavailable")
+        );
     }
 
     Ok(exit_code)
@@ -234,6 +316,149 @@ pub(crate) fn expand(
     Ok(0)
 }
 
+struct CapturedStream {
+    path: PathBuf,
+    timestamps_path: PathBuf,
+    byte_len: u64,
+    line_count: usize,
+    sha256: String,
+}
+
+fn spool_dir(root: Option<&str>) -> Result<PathBuf> {
+    let dir = match resolve_root(root) {
+        Ok(root) => workspace_locator::store_dir(&root).join("bash-smart"),
+        Err(_) => std::env::temp_dir().join("greppy-bash-smart"),
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| Error::io("create bash-smart spool directory", error))?;
+    Ok(dir)
+}
+
+fn spool_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn spawn_drain<R>(
+    mut reader: R,
+    path: PathBuf,
+    timestamps_path: PathBuf,
+) -> std::thread::JoinHandle<std::io::Result<CapturedStream>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        use std::io::{Seek, SeekFrom};
+
+        let tail_path = path.with_extension("tail-ring");
+        let mut output = std::fs::File::create(&path)?;
+        let mut tail = std::fs::File::create(&tail_path)?;
+        let mut timestamps = std::fs::File::create(&timestamps_path)?;
+        let started = std::time::Instant::now();
+        let mut byte_len = 0u64;
+        let mut overflow_len = 0u64;
+        let mut line_count = 0usize;
+        let mut saw_bytes_since_newline = false;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let chunk = &buffer[..read];
+            let head_remaining = PACK_HEAD_BYTES.saturating_sub(byte_len);
+            let head_len = usize::try_from(head_remaining.min(read as u64)).unwrap_or(read);
+            if head_len > 0 {
+                output.write_all(&chunk[..head_len])?;
+            }
+            let mut rest = &chunk[head_len..];
+            while !rest.is_empty() {
+                let ring_at = overflow_len % PACK_TAIL_BYTES;
+                let room = usize::try_from(PACK_TAIL_BYTES - ring_at).unwrap_or(rest.len());
+                let take = room.min(rest.len());
+                tail.seek(SeekFrom::Start(ring_at))?;
+                tail.write_all(&rest[..take])?;
+                overflow_len += take as u64;
+                rest = &rest[take..];
+            }
+            byte_len = byte_len.saturating_add(read as u64);
+            for byte in chunk {
+                saw_bytes_since_newline = true;
+                if *byte == b'\n' {
+                    line_count += 1;
+                    writeln!(timestamps, "{}", started.elapsed().as_micros())?;
+                    saw_bytes_since_newline = false;
+                }
+            }
+        }
+        if saw_bytes_since_newline {
+            line_count += 1;
+            writeln!(timestamps, "{}", started.elapsed().as_micros())?;
+        }
+
+        if overflow_len > 0 {
+            tail.flush()?;
+            if overflow_len > PACK_TAIL_BYTES {
+                let omitted = overflow_len - PACK_TAIL_BYTES;
+                writeln!(
+                    output,
+                    "\n… bash-smart store gap: {omitted} bytes omitted by pack cap …"
+                )?;
+                let ring_at = overflow_len % PACK_TAIL_BYTES;
+                tail.seek(SeekFrom::Start(ring_at))?;
+                std::io::copy(
+                    &mut (&mut tail).take(PACK_TAIL_BYTES - ring_at),
+                    &mut output,
+                )?;
+                tail.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut (&mut tail).take(ring_at), &mut output)?;
+            } else {
+                tail.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut tail, &mut output)?;
+            }
+        }
+        output.flush()?;
+        timestamps.flush()?;
+        drop(output);
+        let _ = std::fs::remove_file(tail_path);
+        let sha256 = sha256_file(&path)?;
+        Ok(CapturedStream {
+            path,
+            timestamps_path,
+            byte_len,
+            line_count,
+            sha256,
+        })
+    })
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn join_drain(
+    handle: std::thread::JoinHandle<std::io::Result<CapturedStream>>,
+    stream: &str,
+) -> Result<CapturedStream> {
+    handle
+        .join()
+        .map_err(|_| Error::Invalid(format!("bash-smart {stream} drainer panicked")))?
+        .map_err(|error| Error::io(format!("spool bash-smart {stream}"), error))
+}
+
 fn command_for_argv(argv: &[String]) -> std::process::Command {
     if argv.len() == 1 {
         #[cfg(windows)]
@@ -271,33 +496,42 @@ fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
 }
 
 impl StoredRaw {
-    fn new(stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
-        let stdout_sha256 = sha256(&stdout);
-        let stderr_sha256 = sha256(&stderr);
-        let content_sha256 = combined_sha256(&stdout, &stderr);
+    fn from_capture(stdout: CapturedStream, stderr: CapturedStream) -> Result<Self> {
+        // Capture itself is always disk-backed. The bounded delivery pass reads
+        // the completed spool only after both child pipes have reached EOF.
+        let stdout_bytes = std::fs::read(&stdout.path)
+            .map_err(|error| Error::io("read captured bash-smart stdout", error))?;
+        let stderr_bytes = std::fs::read(&stderr.path)
+            .map_err(|error| Error::io("read captured bash-smart stderr", error))?;
+        let content_sha256 = combined_sha256(&stdout_bytes, &stderr_bytes);
         let payload = serde_json::json!({
             "schema_version": PACK_SCHEMA_VERSION,
             "kind": "bash-smart",
             "content_sha256": content_sha256,
             "stdout": {
-                "sha256": stdout_sha256,
-                "byte_len": stdout.len(),
-                "line_count": split_lines(&stdout).len(),
-                "hex": hex_encode(&stdout),
+                "sha256": stdout.sha256,
+                "byte_len": stdout.byte_len,
+                "line_count": stdout.line_count,
+                "path": stdout.path,
+                "timestamps_path": stdout.timestamps_path,
+                "timestamp_unit": "microseconds_since_capture_start",
             },
             "stderr": {
-                "sha256": stderr_sha256,
-                "byte_len": stderr.len(),
-                "line_count": split_lines(&stderr).len(),
-                "hex": hex_encode(&stderr),
+                "sha256": stderr.sha256,
+                "byte_len": stderr.byte_len,
+                "line_count": stderr.line_count,
+                "path": stderr.path,
+                "timestamps_path": stderr.timestamps_path,
+                "timestamp_unit": "microseconds_since_capture_start",
             },
+            "stream_order": "stdout and stderr captured separately; relative order approximate",
         });
-        Self {
-            stdout,
-            stderr,
+        Ok(Self {
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
             content_sha256,
             payload,
-        }
+        })
     }
 
     fn decode(payload: &serde_json::Value) -> Option<Self> {
@@ -306,16 +540,23 @@ impl StoredRaw {
         {
             return None;
         }
-        let stdout = hex_decode(payload.get("stdout")?.get("hex")?.as_str()?)?;
-        let stderr = hex_decode(payload.get("stderr")?.get("hex")?.as_str()?)?;
-        let decoded = Self::new(stdout, stderr);
+        let stdout_path = Path::new(payload.get("stdout")?.get("path")?.as_str()?);
+        let stderr_path = Path::new(payload.get("stderr")?.get("path")?.as_str()?);
+        let stdout = std::fs::read(stdout_path).ok()?;
+        let stderr = std::fs::read(stderr_path).ok()?;
+        let content_sha256 = combined_sha256(&stdout, &stderr);
         let claimed = payload.get("content_sha256")?.as_str()?;
         let stdout_claimed = payload.get("stdout")?.get("sha256")?.as_str()?;
         let stderr_claimed = payload.get("stderr")?.get("sha256")?.as_str()?;
-        (decoded.content_sha256 == claimed
-            && sha256(&decoded.stdout) == stdout_claimed
-            && sha256(&decoded.stderr) == stderr_claimed)
-            .then_some(decoded)
+        (content_sha256 == claimed
+            && sha256(&stdout) == stdout_claimed
+            && sha256(&stderr) == stderr_claimed)
+            .then_some(Self {
+                stdout,
+                stderr,
+                content_sha256,
+                payload: payload.clone(),
+            })
     }
 }
 
@@ -485,79 +726,59 @@ fn render_folded(
     } else {
         FAILURE_TAIL_LINES
     };
-    let groups = collapse_groups(lines);
-    let mut repeated_line = vec![false; lines.len()];
-    for group in groups.iter().filter(|group| group.count() > 1) {
-        for index in group.start - 1..group.end {
-            repeated_line[index] = true;
-        }
-    }
-
     let mut writer: Box<dyn Write> = if stderr {
         Box::new(std::io::stderr().lock())
     } else {
         Box::new(std::io::stdout().lock())
     };
     let head_end = HEAD_LINES.min(lines.len());
-    for index in 0..head_end {
-        if !repeated_line[index] {
-            let _ = writer.write_all(lines[index].raw);
-        }
-    }
-    ensure_newline_after_raw(
-        &mut writer,
-        lines,
-        (0..head_end).rev().find(|i| !repeated_line[*i]),
-    );
+    let tail_start = lines.len().saturating_sub(tail).max(head_end);
 
-    enum Block<'a> {
-        Collapse(&'a CollapseGroup),
-        Lift(&'a LiftedLine),
+    // Layer 1 is invariant: head and tail are literal raw bytes, even when a
+    // repeated middle block has the same shape.
+    for line in &lines[..head_end] {
+        let _ = writer.write_all(line.raw);
     }
-    let mut block = groups
-        .iter()
+    ensure_newline_after_raw(&mut writer, lines, head_end.checked_sub(1));
+
+    let middle = &lines[head_end..tail_start];
+    for group in collapse_groups(middle)
+        .into_iter()
         .filter(|group| group.count() > 1)
-        .map(|group| (group.start, Block::Collapse(group)))
-        .chain(lifted.iter().map(|line| (line.line, Block::Lift(line))))
-        .collect::<Vec<_>>();
-    block.sort_by_key(|(line, _)| *line);
-    block.dedup_by(|left, right| left.0 == right.0);
-    for (_, item) in block {
-        match item {
-            Block::Collapse(group) => {
-                let _ = writer.write_all(&group.representative);
-                if !group.representative.ends_with(b"\n") {
-                    let _ = writer.write_all(b"\n");
-                }
-                let _ = writeln!(
-                    writer,
-                    "… {} weitere `{}`-Zeilen",
-                    group.count() - 1,
-                    group.template
-                );
-            }
-            Block::Lift(line) => {
-                let _ = write!(writer, "{}:", line.line);
-                let _ = writer.write_all(&line.bytes);
-                let _ = writer.write_all(b"\n");
-            }
+    {
+        let _ = writer.write_all(&group.representative);
+        if !group.representative.ends_with(b"\n") {
+            let _ = writer.write_all(b"\n");
         }
-    }
-
-    let middle = lines.len().saturating_sub(HEAD_LINES + tail);
-    if middle > 0 {
         let _ = writeln!(
             writer,
-            "… {middle} lines — greppy expand {id} continues at {}",
-            HEAD_LINES + 1
+            "… {} weitere `{}`-Zeilen",
+            group.count() - 1,
+            group.template
         );
     }
+    for line in lifted
+        .iter()
+        .filter(|line| line.line > head_end && line.line <= tail_start)
+    {
+        let _ = write!(writer, "{}:", line.line);
+        let _ = writer.write_all(&line.bytes);
+        let _ = writer.write_all(b"\n");
+    }
 
-    let tail_start = lines.len().saturating_sub(tail).max(head_end);
-    for index in tail_start..lines.len() {
-        if !repeated_line[index] {
-            let _ = writer.write_all(lines[index].raw);
-        }
+    if !middle.is_empty() {
+        let _ = writeln!(
+            writer,
+            "… {} lines — greppy expand {id} continues at {}",
+            middle.len(),
+            HEAD_LINES + 1
+        );
+    } else {
+        let _ = writeln!(writer, "… partial output — greppy expand {id}");
+    }
+
+    for line in &lines[tail_start..] {
+        let _ = writer.write_all(line.raw);
     }
 }
 
@@ -780,20 +1001,37 @@ fn split_lines(bytes: &[u8]) -> Vec<RawLine<'_>> {
     let mut start = 0usize;
     for (index, byte) in bytes.iter().enumerate() {
         if *byte == b'\n' {
-            let mut content_end = index;
-            if content_end > start && bytes[content_end - 1] == b'\r' {
-                content_end -= 1;
-            }
+            let physical = &bytes[start..index];
+            // Carriage-return progress rewrites are one displayed line. Keep
+            // every stored byte in `raw`, but classify/collapse the final
+            // visible rewrite rather than counting each update as a line.
+            // A final CR is the CRLF terminator, not an empty rewrite.
+            let content_end = if physical.ends_with(b"\r") {
+                index - 1
+            } else {
+                index
+            };
+            let rewrite_start = bytes[start..content_end]
+                .iter()
+                .rposition(|byte| *byte == b'\r')
+                .map(|position| start + position + 1)
+                .unwrap_or(start);
             lines.push(RawLine {
-                content: &bytes[start..content_end],
+                content: &bytes[rewrite_start..content_end],
                 raw: &bytes[start..=index],
             });
             start = index + 1;
         }
     }
     if start < bytes.len() {
+        let physical = &bytes[start..];
+        let rewrite_start = physical
+            .iter()
+            .rposition(|byte| *byte == b'\r')
+            .map(|position| start + position + 1)
+            .unwrap_or(start);
         lines.push(RawLine {
-            content: &bytes[start..],
+            content: &bytes[rewrite_start..],
             raw: &bytes[start..],
         });
     }
@@ -831,30 +1069,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
-}
-
-fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
-        return None;
-    }
-    encoded
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_nibble(pair[0])?;
-            let low = hex_nibble(pair[1])?;
-            Some((high << 4) | low)
-        })
-        .collect()
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn argv_for_metadata(argv: &[String]) -> String {
@@ -899,5 +1113,46 @@ mod tests {
         assert_eq!(lines[0].content, b"a");
         assert_eq!(lines[0].raw, b"a\r\n");
         assert_eq!(lines[2].raw, b"last");
+    }
+
+    #[test]
+    fn carriage_return_rewrites_are_one_visible_line() {
+        let raw = b"building 10%\rbuilding 90%\r\ndone\n";
+        let lines = split_lines(raw);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].content, b"building 90%");
+        assert_eq!(lines[0].raw, b"building 10%\rbuilding 90%\r\n");
+    }
+
+    #[test]
+    fn drainer_spools_incrementally_and_records_line_timestamps() {
+        let dir = std::env::temp_dir().join(format!("greppy-bash-smart-test-{}", spool_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stdout");
+        let times = dir.join("stdout.times");
+        let capture = join_drain(
+            spawn_drain(
+                std::io::Cursor::new(b"one\ntwo\nlast".to_vec()),
+                path.clone(),
+                times.clone(),
+            ),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(capture.byte_len, 12);
+        assert_eq!(capture.line_count, 3);
+        assert_eq!(std::fs::read(path).unwrap(), b"one\ntwo\nlast");
+        assert_eq!(std::fs::read_to_string(times).unwrap().lines().count(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn child_signal_maps_to_shell_exit_code() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            let status = std::process::ExitStatus::from_raw(9);
+            assert_eq!(child_exit_code(&status), 137);
+        }
     }
 }

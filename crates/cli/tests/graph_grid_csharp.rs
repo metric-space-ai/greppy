@@ -170,9 +170,8 @@ fn index_existing(repo: &Path, store: &Path) -> String {
 
 fn run_json(args: &[&str], repo: &Path, store: &Path) -> (i32, serde_json::Value, String) {
     let (code, out, err) = run(args, repo, store);
-    let value = serde_json::from_str(&out).unwrap_or_else(|e| {
-        panic!("invalid JSON for {args:?}: {e}; stderr={err:?}; stdout={out:?}")
-    });
+    let value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("invalid JSON for {args:?}: {e}; stderr={err:?}; stdout={out:?}"));
     (code, value, err)
 }
 
@@ -308,7 +307,8 @@ fn graph_grid_csharp_brief_shows_definition_with_callers() {
     let (code, out, err) = run(&["brief", "helper"], &repo, &store);
     assert_eq!(code, 0, "brief failed; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("public static Payload helper(int value)") && out.contains("src/Helpers.cs:"),
+        out.contains("public static Payload helper(int value)")
+            && out.contains("src/Helpers.cs:"),
         "brief helper must include its C# definition source; got: {out:?}"
     );
     assert!(
@@ -321,7 +321,9 @@ fn graph_grid_csharp_brief_shows_definition_with_callers() {
 fn graph_grid_csharp_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     let (code, value, err) = run_json(
-        &["path", "--from", "caller", "--to", "helper", "--json"],
+        &[
+            "path", "--from", "caller", "--to", "helper", "--json",
+        ],
         &repo,
         &store,
     );
@@ -385,10 +387,7 @@ fn graph_grid_csharp_stale_edit_detected() {
         baseline_code, 0,
         "baseline who-calls failed; stderr={baseline_err}; json={baseline}"
     );
-    assert_eq!(
-        baseline["total_exact"], 1,
-        "baseline edge missing: {baseline}"
-    );
+    assert_eq!(baseline["total_exact"], 1, "baseline edge missing: {baseline}");
 
     // Remove the helper call after indexing. The implementation may report
     // drift or heal before answering, but it must never return the old caller.

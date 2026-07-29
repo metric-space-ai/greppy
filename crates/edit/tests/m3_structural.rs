@@ -406,8 +406,14 @@ fn ensure_import_rejects_syntax_breaking_projection() {
         b"package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc main() { fmt.Println(\"ok\") }\n";
     let file = write(ws.path(), "m.go", original);
 
-    let certificate =
-        ensure_import(ws.path(), &file, "bad\npath", None, &VerbOptions::default()).unwrap();
+    let certificate = ensure_import(
+        ws.path(),
+        &file,
+        "bad\npath",
+        None,
+        &VerbOptions::default(),
+    )
+    .unwrap();
 
     assert_eq!(certificate.status, Status::InvalidResult);
     assert_eq!(certificate.exit_code(), 13);

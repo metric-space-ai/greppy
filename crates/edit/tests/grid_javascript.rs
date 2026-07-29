@@ -21,7 +21,9 @@
 
 #![cfg(unix)]
 
-use greppy_edit::verbs::{delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions};
+use greppy_edit::verbs::{
+    delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions,
+};
 use greppy_edit::{Certificate, EditHandle, Language, Status};
 
 // ------------------------------------------------------------------ helpers
@@ -111,10 +113,7 @@ fn grid_javascript_replace_body_unique() {
     assert!(!out.contains("return a + b;"));
 
     let json = serde_json::to_value(&cert).unwrap();
-    assert_eq!(
-        json["schema_version"].as_str(),
-        Some("greppy.edit-certificate.v1")
-    );
+    assert_eq!(json["schema_version"].as_str(), Some("greppy.edit-certificate.v1"));
     assert_eq!(json["status"].as_str(), Some("applied"));
     let _: Certificate = serde_json::from_value(json).unwrap();
 
@@ -191,8 +190,7 @@ fn grid_javascript_insert_before_unique() {
 #[test]
 fn grid_javascript_delete_unique() {
     let ws = workspace();
-    let content =
-        b"import * as math from \"math\";\n\nfunction foo() {\n}\n\nfunction bar() {\n}\n";
+    let content = b"import * as math from \"math\";\n\nfunction foo() {\n}\n\nfunction bar() {\n}\n";
     let file = write(ws.path(), "m.js", content);
     let def_range = js_def_range(content, "foo");
 
@@ -224,10 +222,7 @@ fn grid_javascript_replace_body_ambiguous() {
     let ws = workspace();
     let content = b"// this is a leading comment, not a function body\n\nfunction foo() {\n}\n";
     let file = write(ws.path(), "m.js", content);
-    let def_start = std::str::from_utf8(content)
-        .unwrap()
-        .find("function foo")
-        .unwrap();
+    let def_start = std::str::from_utf8(content).unwrap().find("function foo").unwrap();
     let def_range = (0usize, def_start);
 
     let cert = replace_body(
@@ -401,8 +396,7 @@ fn grid_javascript_delete_stale() {
     let file = write(ws.path(), "m.js", content);
     let planned_range = js_def_range(content, "foo");
     let options = planned_options(ws.path(), content, planned_range);
-    let mutated =
-        b"function foo() {\n  // user edit between plan and apply\n}\n\nfunction bar() {\n}\n";
+    let mutated = b"function foo() {\n  // user edit between plan and apply\n}\n\nfunction bar() {\n}\n";
     std::fs::write(&file, mutated).unwrap();
 
     let cert = delete_span(

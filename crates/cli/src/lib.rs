@@ -1210,10 +1210,7 @@ const RETIRED_EDIT_VERBS: &[(&str, &str)] = &[
     ("patch-span", "greppy edit patch --file F --lines A:B"),
     ("insert-after", "greppy edit insert --symbol S --after"),
     ("insert-before", "greppy edit insert --symbol S --before"),
-    (
-        "remove-if-present",
-        "greppy edit delete --file F --old TEXT",
-    ),
+    ("remove-if-present", "greppy edit delete --file F --old TEXT"),
 ];
 
 fn retired_edit_verb(name: &str) -> Option<&'static str> {
@@ -1677,6 +1674,8 @@ fn normalize_global_output_flags(mut argv: Vec<std::ffi::OsString>) -> Vec<std::
     argv
 }
 
+
+
 fn levenshtein(left: &str, right: &str) -> usize {
     let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
     for (left_index, left_char) in left.chars().enumerate() {
@@ -1953,9 +1952,7 @@ fn dispatch_outline(path: &str, json: bool, all: bool, root: Option<&str>) -> Re
     }
     let bytes = std::fs::read(&abs).map_err(|error| Error::io(format!("read {path}"), error))?;
     let Ok(source) = String::from_utf8(bytes) else {
-        return outline_refusal(format!(
-            "{path} is not text; it has no definitions to outline"
-        ));
+        return outline_refusal(format!("{path} is not text; it has no definitions to outline"));
     };
     let rel = abs
         .strip_prefix(&root_path)
@@ -2374,6 +2371,7 @@ fn current_cache_freshness(root: Option<&std::path::Path>) -> &'static str {
     }
 }
 
+
 /// Best-effort peek of a leading global `--root <val>` / `--root=<val>`
 /// from raw argv, BEFORE clap parses it, so the store-eviction pass can
 /// protect the store this invocation is actually about to use. Non-UTF-8
@@ -2547,6 +2545,7 @@ fn configure_explicit_cuda_device(device: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
 
 fn dispatch_subcommand(
     cmd: Command,
@@ -2908,6 +2907,7 @@ fn dispatch_subcommand(
     }
 }
 
+
 /// Rank a node label for symbol resolution. Lower is better.
 ///
 /// `resolve_symbol_id` previously
@@ -3020,6 +3020,8 @@ fn bare_symbol_name_matches(node_name: &str, query: &str) -> bool {
         || (split_qualified(query).is_none()
             && verbatim_dotted_leaf(node_name).is_some_and(|leaf| leaf.eq_ignore_ascii_case(query)))
 }
+
+
 
 /// The candidate rows a symbol query resolves against, fetched with the
 /// filter pushed into SQL (never a capped whole-project scan):
@@ -3209,6 +3211,7 @@ fn symbol_miss_suggestions(store: &greppy_store::Store, project: &str, query: &s
     suggestions
 }
 
+
 fn symbol_miss_json(store: &greppy_store::Store, project: &str, query: &str) -> serde_json::Value {
     serde_json::json!({
         "suggestions": symbol_miss_suggestions(store, project, query),
@@ -3227,6 +3230,7 @@ fn has_case_variant_suggestion(suggestions: &[String], query: &str) -> bool {
         .iter()
         .any(|candidate| candidate != needle && candidate.eq_ignore_ascii_case(needle))
 }
+
 
 fn indexed_path_matches_query(indexed_path: &str, query_path: &str) -> bool {
     let normalized_query = query_path.replace('\\', "/");
@@ -3277,6 +3281,7 @@ fn qualify_symbol_with_path(symbol: Option<&str>, path: Option<&str>) -> Option<
     }
     Some(format!("{p}::{s}"))
 }
+
 
 fn is_callable_node_label(label: &str) -> bool {
     matches!(label, "Function" | "Method" | "Constructor")
@@ -3370,6 +3375,10 @@ fn incoming_call_nodes_for_targets(
     }
     Ok(nodes.into_values().collect())
 }
+
+
+
+
 
 /// Is `q` a single bare identifier — i.e. a "show me the definition of X"
 /// / find-definition query rather than a natural-language research query?
@@ -3471,6 +3480,7 @@ fn nav_sample_rank(file_path: &str, name: &str) -> (u8, u8) {
     (anchor, test)
 }
 
+
 #[derive(Debug, Clone)]
 struct ExpandHandle {
     id: String,
@@ -3516,6 +3526,7 @@ fn expand_ttl_secs() -> u64 {
         .filter(|v| *v > 0)
         .unwrap_or(greppy_store::DEFAULT_EXPAND_TTL_SECS)
 }
+
 
 fn expand_summary_text(summary: &serde_json::Value) -> String {
     summary
@@ -3603,6 +3614,8 @@ fn append_span_evidence(
     }
     out.push('\n');
 }
+
+
 
 fn current_graph_generation_or_zero(store: &greppy_store::Store, root: Option<&str>) -> u64 {
     current_graph_generation(store, root).unwrap_or(0)
@@ -3770,6 +3783,8 @@ enum ProviderPolicy {
     RequireComplete,
 }
 
+
+
 fn provider_incomplete_skip_message(command: &str, incomplete_count: usize) -> String {
     format!(
         "{command}: skipped indexed provider-dependent output because {incomplete_count} language provider(s) are incomplete; set {ENV_PROVIDER_POLICY}=metadata for metadata-only mode or re-index after provider acceptance"
@@ -3827,6 +3842,9 @@ fn provider_incomplete_skip_json(
     Ok(())
 }
 
+
+
+
 struct ImpactJsonMeta<'a> {
     direction: &'a str,
     edge_type: &'a str,
@@ -3859,6 +3877,7 @@ fn impact_edge_spec<'a>(
         },
     }
 }
+
 
 #[allow(clippy::too_many_arguments)]
 fn impact_counts_json(
@@ -4404,6 +4423,7 @@ fn path_counts_json(
     Ok(())
 }
 
+
 fn nav_freshness_json(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -4539,6 +4559,11 @@ fn serving_stale() -> bool {
     false
 }
 
+
+
+
+
+
 /// `allow_auto_reindex = false` for a surface that cannot guarantee its
 /// generation-scoped embeddings can be rebuilt in the same snapshot.
 /// True when the indexer-version drift is a pure VERSION bump (same
@@ -4600,6 +4625,9 @@ fn metadata_only_fingerprint_drift(freshness: &serde_json::Value) -> bool {
         })
 }
 
+
+
+
 fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json::Value {
     if let Some(object) = freshness.as_object_mut() {
         object.insert(
@@ -4611,6 +4639,9 @@ fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json:
     freshness
 }
 
+
+
+
 /// Whether the vector query path may self-heal a stale index via the
 /// atomic auto-reindex: only when the embedding model is resolvable, because
 /// an existing vector generation must be rebuilt as part of the snapshot.
@@ -4620,6 +4651,7 @@ fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
         Ok(None) | Err(_) => false,
     }
 }
+
 
 /// Atomically published status for the one allowed background index job.
 const BACKGROUND_JOB_FILE: &str = "index.job";
@@ -4666,6 +4698,7 @@ fn process_is_alive(pid: u32) -> bool {
         false
     }
 }
+
 
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
     use std::io::Write;
@@ -4987,6 +5020,7 @@ fn unix_now_secs_cli() -> u64 {
         .unwrap_or(0)
 }
 
+
 fn current_embedding_candidate_count(root: &std::path::Path) -> usize {
     let project = workspace_locator::project_identity(root);
     greppy_store::Store::open_with(
@@ -5117,6 +5151,8 @@ fn spawn_background_embed(root: Option<&str>, cfg: &EmbeddingModelConfig) -> boo
     spawn_background_job(root, "embedding-first-use", "embedding", Some(cfg))
 }
 
+
+
 fn format_embedding_eta(seconds: u64) -> String {
     let minutes = seconds / 60;
     let remainder = seconds % 60;
@@ -5129,6 +5165,7 @@ fn format_embedding_eta(seconds: u64) -> String {
     }
 }
 
+
 #[derive(Clone, Copy)]
 struct SemanticFallbackContext<'a> {
     query: &'a str,
@@ -5136,12 +5173,17 @@ struct SemanticFallbackContext<'a> {
     root: Option<&'a str>,
 }
 
+
+
+
 /// `--code` and `--json` compose: AGENTS.md gives `--code` as "also print each
 /// result's source and a handle for it" and `--json` as "the same answer as
 /// data", so the source and the handle belong ON the hit.
 fn ensure_nav_json_mode(_code: bool, _json: bool) -> Result<()> {
     Ok(())
 }
+
+
 
 /// Find the 0-based index of the line that ends the definition beginning
 /// at `start_idx`, by balancing `{}`/`()`/`[]` delimiters from the
@@ -5166,6 +5208,8 @@ fn definition_end_idx(lines: &[&str], start_idx: usize) -> usize {
     // prints) — single source of truth in greppy-core.
     greppy_core::spans::definition_end_idx(lines, start_idx)
 }
+
+
 
 fn dispatch_trace(
     symbol: Option<&str>,
@@ -5397,6 +5441,8 @@ fn summarize_definition_span(
 /// research-task iteration eating the token/time savings.
 const BRIEF_JSON_SCHEMA_VERSION: &str = "greppy.brief.v1";
 
+
+
 fn parse_read_line_range(raw: Option<&str>, line_count: usize) -> Result<(usize, usize)> {
     let Some(raw) = raw else {
         return Ok((1, line_count));
@@ -5425,6 +5471,7 @@ fn parse_read_line_range(raw: Option<&str>, line_count: usize) -> Result<(usize,
     Ok((start, end.min(line_count)))
 }
 
+
 /// Split a trailing `:START[-END]` (or `:START[:END]`) off a read subject.
 ///
 /// greppy prints spans as `path:120-160`, so that is what an agent hands back.
@@ -5449,6 +5496,8 @@ fn split_trailing_line_range(subject: &str) -> Option<(&str, String)> {
     }
     Some((path, format!("{start}:{end}")))
 }
+
+
 
 /// Byte offsets of an inclusive 1-based line range within `content`.
 fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (usize, usize) {
@@ -5483,6 +5532,9 @@ fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (u
 
 const MINIMAL_CHANGE_SIGNATURE_EXAMPLE: &str =
     include_str!("../../../docs/contracts/change-signature-spec.minimal.json");
+
+
+
 
 // ---------------------------------------------------------------------------
 // The new edit grammar: four operations over one WHERE selector.
@@ -5522,6 +5574,7 @@ impl EditRefusal {
 }
 
 type EditResult<T> = std::result::Result<T, EditRefusal>;
+
 
 /// The record schema every edit answers with, in the compact form on stdout
 /// and in the full form `--report` writes.
@@ -5565,6 +5618,7 @@ struct EditRecord {
     published: bool,
 }
 
+
 enum GrammarDispatch {
     Handled(i32),
     Passthrough(Box<EditCommand>),
@@ -5598,10 +5652,7 @@ impl SelectorKind {
     /// last one belongs to the file, not to the span: replacing a line with
     /// text that has no newline must not join it to the next one.
     fn line_oriented(self) -> bool {
-        matches!(
-            self,
-            SelectorKind::Lines | SelectorKind::Symbol | SelectorKind::Target
-        )
+        matches!(self, SelectorKind::Lines | SelectorKind::Symbol | SelectorKind::Target)
     }
 
     fn name(self) -> &'static str {
@@ -5714,17 +5765,40 @@ fn classify_selector(spec: &WhereSpec) -> EditResult<SelectorKind> {
     Ok(kind)
 }
 
+
+
+
+
+
+
+
+
+
 /// A resolved definition: its path relative to the root, its absolute path,
 /// the bytes of the file it lives in, and the byte range it occupies.
 type ResolvedSpan = (String, std::path::PathBuf, Vec<u8>, (usize, usize));
+
+
+
+
+
+
+
 
 /// An empty replacement is never an intention: it is a command substitution
 /// that produced nothing, a file that was created but never written, or a
 /// broken pipe. Writing it would delete working code and report success.
 const EMPTY_CONTENT_HINT: &str = "`delete` is the verb that removes a span";
 
+
+
 /// A rewritten file, and the byte ranges of it the edit wrote.
 type EditedContent = (Vec<u8>, Vec<(usize, usize)>);
+
+
+
+
+
 
 // --- the undo journal -------------------------------------------------------
 //
@@ -5758,6 +5832,16 @@ impl UndoBefore {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
 
 /// Record a transaction whose files are already on disk. The verbs that go
 /// through a certificate publish before they report, so there is nothing left
@@ -5796,6 +5880,9 @@ fn plan_undo_snapshot(root_path: &std::path::Path, plan_text: &str) -> Vec<UndoB
 // the importers behind produces a repository that does not build, and a delete
 // that leaves dangling imports turns one mistake into a broken build.
 
+
+
+
 /// How a language spells "the module this file is". Only the languages whose
 /// module identity greppy can state exactly are here; for anything else `move`
 /// moves the file and says it rewrote nothing, rather than guessing.
@@ -5806,6 +5893,9 @@ enum ModuleIdentity {
     Python { path: String },
 }
 
+
+
+
 /// One file that names the moved module, and — when a new path was given — the
 /// text it has to carry afterwards.
 struct ModuleReference {
@@ -5813,7 +5903,14 @@ struct ModuleReference {
     rewritten: Option<String>,
 }
 
+
+
+
+
+
+
 // --- a plan of whole-file verbs ---------------------------------------------
+
 
 /// Whether a plan is written in the whole-file verbs. A plan that mixes them
 /// with the span verbs is not silently split: it is refused by the executor
@@ -5835,7 +5932,10 @@ fn plan_is_whole_file(plan_text: &str) -> Option<Vec<serde_json::Value>> {
         .then_some(operations)
 }
 
+
 // --- reporting --------------------------------------------------------------
+
+
 
 /// Write the archival record. A refusal is the case where the evidence matters
 /// most, so `--report` is honoured there too.
@@ -5847,6 +5947,7 @@ fn write_edit_report(path: &str, value: &serde_json::Value) -> Result<()> {
         source,
     })
 }
+
 
 /// Map a certificate refusal onto the same `error.code` shape the grammar
 /// verbs use, so one caller-side branch covers every edit verb.
@@ -5874,6 +5975,9 @@ fn certificate_refusal_code(certificate: &greppy_edit::Certificate) -> &'static 
 
 // --- dispatch ---------------------------------------------------------------
 
+
+
+
 fn diff_after_line_span(diff: &str) -> Option<(usize, usize)> {
     let mut start = usize::MAX;
     let mut end = 0usize;
@@ -5898,6 +6002,7 @@ fn line_for_byte(content: &[u8], offset: usize) -> usize {
         .count()
         + 1
 }
+
 
 fn one_line_truncated(text: &str, max_chars: usize) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -6096,6 +6201,8 @@ fn certificate_refusal_message(certificate: &greppy_edit::Certificate) -> Option
     casualty
 }
 
+
+
 /// Resolve an edit target: either a `--target HANDLE` (verified against the
 /// live file) or a `--symbol` (resolved like `read`, against the live file).
 /// Returns the file path (workspace-relative), live content, and byte range —
@@ -6109,6 +6216,7 @@ enum EditTarget {
     },
     Refusal(Box<greppy_edit::Certificate>),
 }
+
 
 /// The byte range of `impl NAME { … }` — the type's own methods, not a trait
 /// implementation. Used only when the definition `--symbol NAME` resolved to
@@ -6146,6 +6254,7 @@ fn rust_inherent_impl_range(content: &[u8], name: &str) -> Option<(usize, usize)
     None
 }
 
+
 struct BriefJsonContext<'a> {
     root: Option<&'a str>,
     path_filters: &'a QueryPathFilters,
@@ -6164,6 +6273,7 @@ fn brief_semantic_backend_json(unavailable: Option<&str>) -> serde_json::Value {
     }
 }
 
+
 fn expand_alias_path(root: Option<&str>, alias: &str) -> Option<std::path::PathBuf> {
     if alias.is_empty()
         || !alias
@@ -6176,6 +6286,8 @@ fn expand_alias_path(root: Option<&str>, alias: &str) -> Option<std::path::PathB
     let store_path = workspace_locator::store_path(&root_path);
     Some(store_path.parent()?.join("expand-aliases").join(alias))
 }
+
+
 
 fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
     let id = id.unwrap_or("").trim();
@@ -6307,6 +6419,8 @@ fn dispatch_doctor(json: bool, root: Option<&str>) -> Result<i32> {
     dispatch_index_health("doctor", json, root)
 }
 
+
+
 fn combined_inference_gpu_memory() -> u64 {
     let embedding_args = EmbeddingCliArgs {
         device: None,
@@ -6339,6 +6453,10 @@ fn combined_inference_gpu_memory() -> u64 {
         .unwrap_or(0);
     embedding.saturating_add(summary)
 }
+
+
+
+
 
 #[derive(Default)]
 struct DirtyOverlay {
@@ -6478,6 +6596,8 @@ fn dirty_overlay(root_path: &std::path::Path) -> Result<DirtyOverlay> {
     overlay.clean = overlay.total == 0;
     Ok(overlay)
 }
+
+
 
 fn cache_path_bytes(path: &std::path::Path) -> u64 {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
@@ -6631,6 +6751,7 @@ fn nav_targets(raw: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+
 /// CHAIN: `greppy who-calls S --json | greppy brief -`. Result rows become the
 /// next command's targets; the previous call's `targets` echo does not — that
 /// is what it was asked, not what it answered.
@@ -6730,9 +6851,7 @@ fn validate_path_filters(root: Option<&str>, paths: &[String], label: &str) -> R
         return Ok(());
     }
     let root_path = resolve_root(root)?;
-    let canonical_root = root_path
-        .canonicalize()
-        .unwrap_or_else(|_| root_path.clone());
+    let canonical_root = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
     for raw in paths {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -6809,7 +6928,11 @@ fn unknown_targets_message(
 /// same reinterpretation rule 1 forbids — so refuse and print the qualified
 /// names that select each definition. Several nodes on one definition site (a
 /// struct and its impl) are not ambiguity.
-fn ensure_unambiguous_target(store: &greppy_store::Store, target: &str, ids: &[i64]) -> Result<()> {
+fn ensure_unambiguous_target(
+    store: &greppy_store::Store,
+    target: &str,
+    ids: &[i64],
+) -> Result<()> {
     if ids.len() < 2 || split_path_qualified(target).is_some() {
         return Ok(());
     }
@@ -7440,11 +7563,7 @@ fn dispatch_brief_multi(
             println!("{file}:{line}");
             print_code_span_text(source);
         }
-        for (label, key) in [
-            ("caller", "callers"),
-            ("callee", "callees"),
-            ("test", "tests"),
-        ] {
+        for (label, key) in [("caller", "callers"), ("callee", "callees"), ("test", "tests")] {
             for row in entry[key].as_array().into_iter().flatten() {
                 println!(
                     "{label} {} {}:{}",
@@ -7465,6 +7584,10 @@ struct ReadPlan {
     forced_symbol: bool,
     lines: Option<String>,
 }
+
+
+
+
 
 /// `greppy fan-in` / `greppy fan-out` — project-wide degree rankings over
 /// one edge type. These answer hotspot questions in one bounded command:
@@ -7729,6 +7852,10 @@ fn dispatch_graph_locate(
     }
 }
 
+
+
+
+
 #[derive(Debug, Clone)]
 struct SearchCodeMatchLine {
     location: String,
@@ -7765,6 +7892,18 @@ fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMat
     })
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
 enum DiffSearchScope<'a> {
     Since { rev: &'a str },
     Base { base: &'a str },
@@ -7776,6 +7915,8 @@ struct DiffSearchSpec {
     merge_base: Option<String>,
     files: Vec<String>,
 }
+
+
 
 #[derive(Debug, Clone)]
 struct PlusHit {
@@ -7850,6 +7991,33 @@ impl PlusHit {
     }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /// Live `grep -rnI` over the resolved repo root, used as the `search-code`
 /// fallback when the content-FTS index is empty. Output mirrors the FTS
 /// form (`relpath:line  snippet`) so an agent sees a consistent shape.
@@ -7915,6 +8083,13 @@ fn source_code_hits_ranked(
         })
         .collect())
 }
+
+
+
+
+
+
+
 
 fn parse_git_diff_new_range(hunk: &str) -> Option<(i64, i64)> {
     let token = hunk
@@ -8013,6 +8188,7 @@ fn internal_literal_search_code_paths(
     Ok(hits)
 }
 
+
 fn parse_grep_code_hit(line: &str) -> Option<greppy_search::CodeHit> {
     let cleaned = line.strip_prefix("./").unwrap_or(line);
     cleaned
@@ -8027,6 +8203,7 @@ fn parse_grep_code_hit(line: &str) -> Option<greppy_search::CodeHit> {
             rank: 0.0,
         })
 }
+
 
 const SEMANTIC_VECTOR_DISPLAY_LIMIT: usize = 3;
 const SEMANTIC_VECTOR_RESULT_LIMIT: usize = 6;
@@ -8077,6 +8254,7 @@ fn dedupe_semantic_vector_hits(
         .collect()
 }
 
+
 fn cap_semantic_purpose_span(code: &str) -> String {
     let mut out = code
         .lines()
@@ -8088,6 +8266,8 @@ fn cap_semantic_purpose_span(code: &str) -> String {
     }
     truncate_utf8_bytes(&out, SEMANTIC_PURPOSE_SPAN_MAX_BYTES)
 }
+
+
 
 fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -8111,6 +8291,8 @@ fn vector_purpose_for_hit<'a>(
         .find(|purpose| purpose.embedding_id == hit.embedding.id)
 }
 
+
+
 fn current_graph_generation(store: &greppy_store::Store, root: Option<&str>) -> Result<u64> {
     let root_path = resolve_root(root)?;
     let root_key = root_path.to_string_lossy().into_owned();
@@ -8123,6 +8305,10 @@ fn current_graph_generation(store: &greppy_store::Store, root: Option<&str>) -> 
     })?;
     Ok(state.graph_generation)
 }
+
+
+
+
 
 /// A definition resolved by `greppy context`, carried with the metadata
 /// needed to read and print its source span.
@@ -8137,6 +8323,7 @@ struct ContextDef {
     node_id: Option<i64>,
 }
 
+
 struct SpanRead {
     text: String,
     end_line: i64,
@@ -8145,6 +8332,7 @@ struct SpanRead {
     omitted_lines: usize,
     truncated: bool,
 }
+
 
 /// A definition resolved by the `context` vector fallback, carrying the node
 /// id (so the caller can dedup against the lexical union) and the span
@@ -8156,6 +8344,9 @@ struct ContextVectorDef {
     start_line: i64,
     end_line: i64,
 }
+
+
+
 
 /// How many vector-fallback hits the LEAN semantic-locator path emits. A
 /// conceptual "which function does X" question wants the LOCATION + signature
@@ -8185,6 +8376,10 @@ const CONTEXT_CONCEPTUAL_MIN_WORDS: usize = 3;
 /// convey the mechanism (what the function is built from) without re-inflating
 /// into a full dump.
 const CONTEXT_DIGEST_MAX_CALLEES: usize = 8;
+
+
+
+
 
 /// Canonicalize when the path exists; otherwise make it absolute
 /// lexically; a path we cannot even absolutize is returned as-is (the
@@ -8315,6 +8510,10 @@ fn shell_example_arg(value: &str) -> String {
     }
 }
 
+
+
+
+
 fn validate_query_root_usage(root: Option<&str>, command: &str, subject: &str) -> Result<()> {
     let Some(raw_root) = root else {
         return Ok(());
@@ -8344,6 +8543,9 @@ fn prepare_query_path_filters(
     validate_query_root_usage(root, command, subject)?;
     Ok(QueryPathFilters::from_args(&resolve_root(root)?, paths))
 }
+
+
+
 
 static EMBEDDED_ASSET_TMP_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -8763,6 +8965,8 @@ mod qwen35_assets {
     }
 }
 
+
+
 struct LoadedQwen35Summarizer {
     inner: greppy_qwen35_native::Qwen35Summarizer,
     _model_lease: Option<greppy_core::cache::FileLock>,
@@ -8789,6 +8993,10 @@ fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summari
         _model_lease: lease,
     })
 }
+
+
+
+
 
 /// Load the embedding model. `tokenizer_cache_dir` (normally the
 /// per-workspace store dir, honoring `GREPPY_STORE_DIR`) enables the
@@ -8826,6 +9034,7 @@ fn load_embedding_model(
     })
 }
 
+
 fn cached_model_digest(path: &std::path::Path) -> Option<String> {
     if !path.starts_with(greppy_core::cache::models_root()) {
         return None;
@@ -8851,6 +9060,7 @@ fn acquire_cached_model_lease(
     )
     .map_err(|e| Error::io(format!("acquire model lease for {}", path.display()), e))
 }
+
 
 /// Embed a code-retrieval query, consulting the store-level query cache
 /// first. On a hit the model is never loaded (saves the entire ~0.15-0.4s
@@ -8968,12 +9178,15 @@ fn vector_exact_scan_skip_message(command: &str, total: i64, limit: i64) -> Stri
     )
 }
 
+
 fn vector_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     format!(
         "{command}: vector search skipped because {}",
         stale_freshness_reason(freshness)
     )
 }
+
+
 
 fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     format!(
@@ -9001,6 +9214,9 @@ fn stale_freshness_reason(freshness: &serde_json::Value) -> String {
         .unwrap_or_else(|| "freshness check did not prove the index is current".into());
     format!("graph freshness is {state}: {reasons}")
 }
+
+
+
 
 fn dispatch_grep(argv: &[String]) -> Result<i32> {
     // clap's `trailing_var_arg` captures everything after `greppy`
@@ -9216,6 +9432,13 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     greppy_passthrough::run_grep_os(&real, &rebuilt)
 }
 
+
+
+
+
+
+
+
 /// Route a ripgrep-style invocation: byte-exact delegation to real
 /// ripgrep when one exists, otherwise translate the safe flag subset to a
 /// real-grep call, otherwise fail loudly naming the flag and the closest
@@ -9238,6 +9461,7 @@ fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
     let real = greppy_passthrough::discover_grep()?;
     greppy_passthrough::run_grep_os(&real, &rebuilt)
 }
+
 
 fn retire_verified_legacy_store(root: &std::path::Path) {
     let legacy = greppy_core::cache::legacy_workspace_store_dir(root);
@@ -9392,6 +9616,8 @@ fn verified_legacy_cache_entries() -> Vec<LegacyCacheEntry> {
     out
 }
 
+
+
 fn sqlite_header_is_valid(path: &std::path::Path) -> bool {
     let mut header = [0u8; 16];
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -9399,6 +9625,7 @@ fn sqlite_header_is_valid(path: &std::path::Path) -> bool {
     };
     std::io::Read::read_exact(&mut file, &mut header).is_ok() && &header == b"SQLite format 3\0"
 }
+
 
 fn remove_verified_legacy_entry(entry: &LegacyCacheEntry) -> bool {
     if entry.locked {
@@ -9441,6 +9668,8 @@ enum EmbeddingBuildOutcome {
     },
 }
 
+
+
 fn should_defer_embedding(cfg: &EmbeddingModelConfig, candidate_nodes: usize) -> bool {
     let configured = std::env::var(ENV_LAZY_EMBED_MIN_SPANS)
         .ok()
@@ -9456,6 +9685,8 @@ fn should_defer_embedding(cfg: &EmbeddingModelConfig, candidate_nodes: usize) ->
     });
     candidate_nodes >= threshold
 }
+
+
 
 fn publish_store_snapshot(
     temp_path: &std::path::Path,
@@ -9878,6 +10109,7 @@ fn ensure_copy_headroom(active_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+
 #[cfg(debug_assertions)]
 fn maybe_index_test_failpoint(name: &str, temp_path: &std::path::Path) -> Result<()> {
     match std::env::var(ENV_TEST_INDEX_FAILPOINT) {
@@ -9925,6 +10157,8 @@ fn sqlite_sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     os.push(suffix);
     std::path::PathBuf::from(os)
 }
+
+
 
 fn remove_file_if_exists(path: &std::path::Path) -> Result<()> {
     match std::fs::remove_file(path) {
@@ -9993,6 +10227,7 @@ struct OutputBudgetSpec {
 
 const DEFAULT_READ_FILE_MAX_BYTES: usize = 16 * 1024;
 
+
 fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
     let default_read_budget = read_uses_default_file_budget(cli);
     if cli.max_bytes.is_none() && cli.offset == 0 && !default_read_budget {
@@ -10031,6 +10266,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
 fn begin_output_capture() {
     OUTPUT_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
 }
+
 
 fn retry_with_offset(command: &str, offset: usize) -> String {
     let invocation = CLI_INVOCATION.with(|value| value.borrow().clone());

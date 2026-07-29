@@ -394,4 +394,6 @@ fn graph_grid_ruby_declarative_or_edge_case() {
         out.contains("helper.rb:"),
         "search-symbols do_it must find the singleton method definition in helper.rb; got: {out:?}"
     );
+
+
 }
