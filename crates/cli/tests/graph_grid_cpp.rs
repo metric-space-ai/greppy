@@ -171,18 +171,20 @@ fn graph_grid_cpp_who_calls_finds_cross_file_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// 2 — who-calls: an uncalled symbol reports "(no callers)".
+// 2 — who-calls: an uncalled symbol reports "no callers".
 // ---------------------------------------------------------------------------
 
 #[test]
 fn graph_grid_cpp_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-empty");
-    // `render` is defined in main.cpp but never called from anywhere.
+    // `render` is defined in main.cpp but never called from anywhere. The
+    // 0.3.0 empty answer is the bare sentence — the parenthesized form is
+    // deleted — and it is an answer: exit 0.
     let (code, out, _err) = run(&["who-calls", "render"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
-        "render is uncalled, who-calls must report no callers; got: {out:?}"
+    assert_eq!(
+        out, "no callers\n",
+        "render is uncalled, who-calls must say so; got: {out:?}"
     );
 }
 
@@ -211,42 +213,55 @@ fn graph_grid_cpp_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact-transitive");
     // `impact do_it` must report `caller` (and `other_caller`) as incoming
     // CALLS dependents — the single-command answer to "what breaks if I
-    // change do_it?".
+    // change do_it?". 0.3.0: the tree is the hop — one `<file>:<line>  <name>`
+    // row per reached caller, indentation carries the depth; the `hop N`
+    // prefixes, the `Function::` segments and the expand offer are deleted.
     let (code, out, err) = run(&["impact", "do_it"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}\nstdout={out}");
-    assert!(
-        out.contains("caller"),
-        "impact do_it must reach `caller` at hop 1; got: {out:?}"
+    assert_eq!(
+        out, "src/main.cpp:6  caller\nsrc/main.cpp:14  other_caller\n",
+        "impact do_it must reach both direct callers as plain rows at top level; got: {out:?}"
     );
     assert!(
-        out.contains("hop 1"),
-        "impact must report hop distance for direct callers; got: {out:?}"
+        !out.contains("hop ") && !out.contains("Function::") && !out.contains("Expand:"),
+        "hop prefixes, kind segments and expand offers are deleted; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 7 — search-symbols: finds all definitions of a symbol across the repo.
+// 7 — search-symbol: finds all definitions of a symbol across the repo.
+//     The retired plural `search-symbols` is an unknown subcommand.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_cpp_search_symbols_finds_all_definitions() {
+fn graph_grid_cpp_search_symbol_finds_all_definitions() {
     let (repo, store) = index_fixture("search-symbols");
+    // 0.3.0 deleted the plural verb with no alias and no deprecation line:
+    // it must be refused as an unknown subcommand, never passed through as a
+    // grep for "search-symbols" in a file called do_it.
     let (code, out, err) = run(&["search-symbols", "do_it"], &repo, &store);
     assert_eq!(
+        code, 64,
+        "the retired verb must be a usage error; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("unrecognized subcommand 'search-symbols'"),
+        "the refusal names the retired verb; got: {out:?}"
+    );
+    assert!(
+        !out.contains("do_it"),
+        "no grep passthrough for the retired verb; got: {out:?}"
+    );
+
+    // The surviving verb answers with the NAV row plus the kind word.
+    let (code, out, err) = run(&["search-symbol", "do_it"], &repo, &store);
+    assert_eq!(
         code, 0,
-        "search-symbols should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol should exit 0; stderr={err}\nstdout={out}"
     );
-    assert!(
-        out.contains("do_it"),
-        "search-symbols do_it must find the do_it symbol; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/helper.hpp:"),
-        "search-symbols must print the symbol's file:line (src/helper.hpp); got: {out:?}"
-    );
-    assert!(
-        out.contains("Function"),
-        "search-symbols must print the node label (Function for C++ defs); got: {out:?}"
+    assert_eq!(
+        out, "src/helper.hpp:7  do_it  function\n",
+        "search-symbol do_it must print the definition row with its kind; got: {out:?}"
     );
 }
 
@@ -277,7 +292,10 @@ fn graph_grid_cpp_brief_shows_definition_with_callers() {
 fn graph_grid_cpp_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     // `path --from caller --to do_it` over CALLS must find the single-hop
-    // path caller -> do_it.
+    // path caller -> do_it. 0.3.0: the answer is a tree of call sites — the
+    // start symbol at its definition, then one indented row per call whose
+    // address is the call site inside the parent. The callee's definition
+    // address (src/helper.hpp) is `callees`' answer, not `path`'s.
     let (code, out, err) = run(
         &["path", "--from", "caller", "--to", "do_it"],
         &repo,
@@ -287,17 +305,13 @@ fn graph_grid_cpp_path_connects_caller_to_helper() {
         code, 0,
         "path caller->do_it should exist and exit 0; stderr={err}\nstdout={out}"
     );
-    let caller_idx = out
-        .find("caller")
-        .expect("path must include start `caller`");
-    let callee_idx = out.find("do_it").expect("path must include goal `do_it`");
-    assert!(
-        caller_idx < callee_idx,
-        "path steps must be ordered caller -> do_it; got: {out:?}"
+    assert_eq!(
+        out, "src/main.cpp:6  caller\n  src/main.cpp:7  do_it\n",
+        "path steps must be ordered caller -> do_it, the call row indented one step; got: {out:?}"
     );
     assert!(
-        out.contains("src/main.cpp:") && out.contains("src/helper.hpp:"),
-        "path steps must carry file:line for both endpoints; got: {out:?}"
+        !out.contains("src/helper.hpp"),
+        "the address is the call site, not the callee definition; got: {out:?}"
     );
 }
 
