@@ -141,7 +141,7 @@ pub(crate) fn semantic_embedding_indexing_json(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
-            "command": "semantic-search",
+            "command": "search",
             "mode": "vector",
             "status": "indexing",
             "project": project,
@@ -556,7 +556,7 @@ pub(crate) fn search_symbols_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-symbols",
+            "command": "search-symbol",
             "status": status,
             "query": query,
             "project": project,
@@ -1001,7 +1001,7 @@ pub(crate) fn search_code_changed_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-code",
+            "command": "search-pattern",
             "status": if total_exact == 0 { "no_matches" } else { "ok" },
             "query": query,
             "project": project,
@@ -1083,7 +1083,7 @@ pub(crate) fn search_code_staged_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-code",
+            "command": "search-pattern",
             "status": if total_exact == 0 { "no_matches" } else { "ok" },
             "query": query,
             "project": project,
@@ -1195,7 +1195,7 @@ pub(crate) fn search_code_diff_scope_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-code",
+            "command": "search-pattern",
             "status": if total_exact == 0 { "no_matches" } else { "ok" },
             "query": query,
             "project": project,
@@ -1851,7 +1851,7 @@ pub(crate) fn semantic_vector_json_with_expand(
         semantic_vector_count_values(total, retrieved, rows.len());
     let mut v = serde_json::json!({
         "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
-        "command": "semantic-search",
+        "command": "search",
         "mode": "vector",
         "status": status,
         "project": project,
@@ -1919,7 +1919,7 @@ pub(crate) fn semantic_provider_incomplete_json(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
-            "command": "semantic-search",
+            "command": "search",
             "mode": mode,
             "status": "skipped_incomplete_provider",
             "project": project,

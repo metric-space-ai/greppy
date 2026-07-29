@@ -353,7 +353,7 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
     assert_eq!(code, 0, "search-code --json should exit 0; stderr={err}");
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["fresh"], true);
     assert_eq!(v["query"], "json_unique_marker");
@@ -412,7 +412,7 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "live-fallback");
     assert_eq!(v["fresh"], true, "live fallback itself is current: {v:?}");
     assert_eq!(v["total_exact"], 0);
@@ -464,7 +464,7 @@ fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "live-fallback");
     assert_eq!(v["fresh"], true);
     assert_eq!(v["index_freshness"]["state"], "drift");
@@ -498,7 +498,7 @@ fn provider_policy_require_complete_does_not_block_search_code_json() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["provider_complete"], false);
     assert_eq!(v["shown"], 1);
@@ -533,7 +533,7 @@ fn provider_policy_require_complete_blocks_search_symbols_json() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-symbols");
+    assert_eq!(v["command"], "search-symbol");
     assert_eq!(v["status"], "skipped_incomplete_provider");
     assert_eq!(v["provider_complete"], false);
     assert!(
@@ -610,7 +610,7 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "semantic-search");
+    assert_eq!(v["command"], "search");
     assert_eq!(v["mode"], "vector");
     assert_eq!(v["status"], "skipped_incomplete_provider");
     assert_eq!(v["provider_complete"], false);
@@ -854,7 +854,7 @@ fn search_code_changed_json_reports_live_scope_and_exact_counts() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["scope"], "changed");
     assert_eq!(v["backend"], "live_grep");
@@ -950,7 +950,7 @@ fn search_code_staged_json_reports_git_blob_scope_and_exact_counts() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["scope"], "staged");
     assert_eq!(v["backend"], "git_blob_grep");
@@ -1045,7 +1045,7 @@ fn search_code_since_text_and_json_live_grep_rev_diff_without_index() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["scope"], "since");
     assert_eq!(v["backend"], "git_diff_live_grep");
@@ -1116,7 +1116,7 @@ fn search_code_base_text_and_json_live_grep_merge_base_diff_without_index() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-code");
+    assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["scope"], "base");
     assert_eq!(v["backend"], "git_diff_live_grep");

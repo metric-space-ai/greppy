@@ -58,7 +58,7 @@ CASES = {
     # them across the families so a missing wire cannot hide again.
     "footer-path-search": (["search-symbol", "parse_path", "--path", "edit-src"], {0}, [r"parse_path"]),
     "footer-path-nav": (["who-calls", "parse_path", "--path", "edit-src"], {0}, [r"^\S+:\d+  \S+"]),
-    "footer-json-search": (["search-pattern", "fn parse_path", "--json"], {0}, [r"\{"]),
+    "footer-json-search": (["search-pattern", "fn parse_path", "--json"], {0}, [r'"command": "search-pattern"']),
     "footer-limit-nav": (["who-calls", "parse_path", "--limit", "1"], {0}, [r"^\S+:\d+  \S+"]),
     "footer-path-read": (["read", "parse_path", "--path", "edit-src"], {0}, []),
 }
@@ -83,7 +83,12 @@ def main() -> None:
         errors = []
         if code not in exits:
             errors.append(f"exit {code}, wanted {sorted(exits)}")
+        json_case = "--json" in tail
         for marker in FORBIDDEN_EVERYWHERE:
+            # a --json answer legitimately carries qualified names as data;
+            # the format markers bind text output, the language ban binds all
+            if json_case and marker in ("::Function::", "== "):
+                continue
             if marker in out:
                 errors.append(f"forbidden marker {marker!r}")
         for pattern in required:

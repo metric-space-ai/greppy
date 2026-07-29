@@ -227,7 +227,7 @@ pub(crate) fn insert_semantic_vector_expand_pack(
         "total": hits.len(),
     });
     let payload_json = serde_json::json!({
-        "command": "semantic-search",
+        "command": "search",
         "mode": "vector",
         "query": query,
         "further_hits": limit,
@@ -236,7 +236,7 @@ pub(crate) fn insert_semantic_vector_expand_pack(
     insert_expand_pack_best_effort(
         store,
         project,
-        "semantic-search",
+        "search",
         query,
         graph_generation,
         summary,
@@ -266,7 +266,7 @@ pub(crate) fn emit_semantic_backend_unavailable(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
-                "command": "semantic-search",
+                "command": "search",
                 "mode": "vector",
                 "status": "backend_unavailable",
                 "project": project,
@@ -578,7 +578,7 @@ pub(crate) fn emit_search_code_results_with_format(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-code",
+            "command": "search-pattern",
             "status": status,
             "query": query,
             "pattern_mode": if fixed { "fixed" } else { "regex" },
