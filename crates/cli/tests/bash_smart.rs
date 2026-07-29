@@ -100,29 +100,30 @@ fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
     let stderr = text(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "stderr={stderr}");
-    assert!(stdout.starts_with("line 1\nline 2\n"), "{stdout}");
-    assert!(stdout.contains("line 20\n"), "{stdout}");
-    assert!(stdout.contains("… 150 lines — greppy expand "), "{stdout}");
-    assert!(stdout.contains(" continues at 21\n"), "{stdout}");
-    assert!(stdout.contains("line 171\n"), "{stdout}");
-    assert!(stdout.ends_with("line 200\n"), "{stdout}");
-    assert!(!stdout.contains("line 170\n"), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
 
     let id = expand_id(&stdout);
+    let expected = (1..=21)
+        .map(|line| format!("line {line}\n"))
+        .chain(std::iter::once(format!(
+            "… lines 22-170 (149 collapsed `line …` repeats) — greppy expand {id}\n"
+        )))
+        .chain((171..=200).map(|line| format!("line {line}\n")))
+        .collect::<String>();
+    assert_eq!(stdout, expected);
+    assert_eq!(
+        stdout.lines().filter(|line| line.starts_with('…')).count(),
+        1,
+        "{stdout}"
+    );
+
     let expanded = run(&workspace, &["expand", id]);
     assert_eq!(expanded.status.code(), Some(0));
     assert!(expanded.stderr.is_empty(), "{}", text(&expanded.stderr));
-    assert!(expanded.stdout.starts_with(b"line 21\n"));
-    assert!(expanded.stdout.ends_with(b"line 200\n"));
-    assert_eq!(
-        expanded
-            .stdout
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count(),
-        180
-    );
+    let expected_expanded = (22..=200)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    assert_eq!(expanded.stdout, expected_expanded.as_bytes());
 }
 
 #[test]
@@ -135,11 +136,25 @@ fn repeated_middle_is_collapsed_arithmetically() {
     let stdout = text(&output.stdout);
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(
-        stdout.contains("… 249 weitere `hello`-Zeilen\n"),
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+
+    let id = expand_id(&stdout);
+    let expected = format!(
+        "{}… lines 22-270 (249 collapsed `hello` repeats) — greppy expand {id}\n{}",
+        "hello\n".repeat(21),
+        "hello\n".repeat(30)
+    );
+    assert_eq!(stdout, expected);
+    assert_eq!(
+        stdout.lines().filter(|line| line.starts_with('…')).count(),
+        1,
         "{stdout}"
     );
-    assert!(stdout.contains("… 250 lines — greppy expand "), "{stdout}");
+
+    let expanded = run(&workspace, &["expand", id]);
+    assert_eq!(expanded.status.code(), Some(0));
+    assert!(expanded.stderr.is_empty(), "{}", text(&expanded.stderr));
+    assert_eq!(expanded.stdout, "hello\n".repeat(279).as_bytes());
 }
 
 #[test]

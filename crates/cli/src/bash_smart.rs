@@ -157,17 +157,6 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     let stdout_folded = !short || interrupted;
     let stderr_folded =
         stderr_lines.len() > STDERR_VERBATIM_LINES || (interrupted && !stderr_lines.is_empty());
-    let stdout_id = store.as_ref().and_then(|store| {
-        insert_pack(store, &project, &query, &raw, "stdout", HEAD_LINES + 1).ok()
-    });
-    let stderr_id = if stderr_folded {
-        store.as_ref().and_then(|store| {
-            insert_pack(store, &project, &query, &raw, "stderr", HEAD_LINES + 1).ok()
-        })
-    } else {
-        None
-    };
-
     let mut lifted_stdout = if stdout_lines.len() > SHORT_TOTAL_LINES {
         novelty_lifts(&stdout_lines, root)
     } else {
@@ -180,6 +169,19 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     };
     push_line_lift(&mut lifted_stdout, &stdout_lines, timeout_stdout_line);
     push_line_lift(&mut lifted_stderr, &stderr_lines, timeout_stderr_line);
+
+    let stdout_start = first_hidden_line(&stdout_lines, exit_code, &lifted_stdout).unwrap_or(1);
+    let stderr_start = first_hidden_line(&stderr_lines, exit_code, &lifted_stderr).unwrap_or(1);
+    let stdout_id = store
+        .as_ref()
+        .and_then(|store| insert_pack(store, &project, &query, &raw, "stdout", stdout_start).ok());
+    let stderr_id = if stderr_folded {
+        store.as_ref().and_then(|store| {
+            insert_pack(store, &project, &query, &raw, "stderr", stderr_start).ok()
+        })
+    } else {
+        None
+    };
 
     if stdout_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stdout_id.as_deref()) {
@@ -787,6 +789,96 @@ fn gate_lifts(lines: &[RawLine<'_>], candidates: &[LiftedLine]) -> Vec<LiftedLin
         .collect()
 }
 
+fn folded_middle_bounds(lines: &[RawLine<'_>], exit_code: i32) -> (usize, usize) {
+    let tail = if exit_code == 0 {
+        SUCCESS_TAIL_LINES
+    } else {
+        FAILURE_TAIL_LINES
+    };
+    let head_end = HEAD_LINES.min(lines.len());
+    let tail_start = lines.len().saturating_sub(tail).max(head_end);
+    (head_end, tail_start)
+}
+
+fn displayed_middle_lines(
+    lines: &[RawLine<'_>],
+    exit_code: i32,
+    lifted: &[LiftedLine],
+) -> Vec<usize> {
+    let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
+    let middle = &lines[head_end..tail_start];
+    let mut displayed = collapse_groups(middle)
+        .into_iter()
+        .filter(|group| group.count() > 1)
+        .map(|group| head_end + group.start)
+        .collect::<Vec<_>>();
+    displayed.extend(
+        lifted
+            .iter()
+            .filter(|line| line.line > head_end && line.line <= tail_start)
+            .map(|line| line.line),
+    );
+    displayed.sort_unstable();
+    displayed.dedup();
+    displayed
+}
+
+fn hidden_middle_ranges(
+    head_end: usize,
+    tail_start: usize,
+    displayed: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut range_start = None;
+    for line in (head_end + 1)..=tail_start {
+        if displayed.binary_search(&line).is_ok() {
+            if let Some(start) = range_start.take() {
+                ranges.push((start, line - 1));
+            }
+        } else if range_start.is_none() {
+            range_start = Some(line);
+        }
+    }
+    if let Some(start) = range_start {
+        ranges.push((start, tail_start));
+    }
+    ranges
+}
+
+fn first_hidden_line(
+    lines: &[RawLine<'_>],
+    exit_code: i32,
+    lifted: &[LiftedLine],
+) -> Option<usize> {
+    let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
+    let displayed = displayed_middle_lines(lines, exit_code, lifted);
+    hidden_middle_ranges(head_end, tail_start, &displayed)
+        .first()
+        .map(|(start, _)| *start)
+}
+
+fn display_line_ranges(ranges: &[(usize, usize)]) -> String {
+    if ranges.len() == 1 {
+        let (start, end) = ranges[0];
+        if start == end {
+            return format!("line {start}");
+        }
+        return format!("lines {start}-{end}");
+    }
+    let joined = ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("lines {joined}")
+}
+
 fn render_folded(
     stderr: bool,
     lines: &[RawLine<'_>],
@@ -794,18 +886,12 @@ fn render_folded(
     id: &str,
     lifted: &[LiftedLine],
 ) {
-    let tail = if exit_code == 0 {
-        SUCCESS_TAIL_LINES
-    } else {
-        FAILURE_TAIL_LINES
-    };
     let mut writer: Box<dyn Write> = if stderr {
         Box::new(std::io::stderr().lock())
     } else {
         Box::new(std::io::stdout().lock())
     };
-    let head_end = HEAD_LINES.min(lines.len());
-    let tail_start = lines.len().saturating_sub(tail).max(head_end);
+    let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
 
     // Layer 1 is invariant: head and tail are literal raw bytes, even when a
     // repeated middle block has the same shape.
@@ -815,20 +901,12 @@ fn render_folded(
     ensure_newline_after_raw(&mut writer, lines, head_end.checked_sub(1));
 
     let middle = &lines[head_end..tail_start];
-    for group in collapse_groups(middle)
-        .into_iter()
-        .filter(|group| group.count() > 1)
-    {
+    let groups = collapse_groups(middle);
+    for group in groups.iter().filter(|group| group.count() > 1) {
         let _ = writer.write_all(&group.representative);
         if !group.representative.ends_with(b"\n") {
             let _ = writer.write_all(b"\n");
         }
-        let _ = writeln!(
-            writer,
-            "… {} weitere `{}`-Zeilen",
-            group.count() - 1,
-            group.template
-        );
     }
     for line in lifted
         .iter()
@@ -839,13 +917,32 @@ fn render_folded(
         let _ = writer.write_all(b"\n");
     }
 
-    if !middle.is_empty() {
-        let _ = writeln!(
-            writer,
-            "… {} lines — greppy expand {id} continues at {}",
-            middle.len(),
-            HEAD_LINES + 1
-        );
+    let displayed = displayed_middle_lines(lines, exit_code, lifted);
+    let hidden_ranges = hidden_middle_ranges(head_end, tail_start, &displayed);
+    if !hidden_ranges.is_empty() {
+        let hidden_count = hidden_ranges
+            .iter()
+            .map(|(start, end)| end - start + 1)
+            .sum::<usize>();
+        let range_text = display_line_ranges(&hidden_ranges);
+        if groups.len() == 1 && groups[0].count() > 1 {
+            let noun = if hidden_count == 1 {
+                "repeat"
+            } else {
+                "repeats"
+            };
+            let _ = writeln!(
+                writer,
+                "… {range_text} ({hidden_count} collapsed `{}` {noun}) — greppy expand {id}",
+                groups[0].template
+            );
+        } else {
+            let noun = if hidden_count == 1 { "line" } else { "lines" };
+            let _ = writeln!(
+                writer,
+                "… {range_text} ({hidden_count} collapsed {noun}) — greppy expand {id}"
+            );
+        }
     } else {
         let _ = writeln!(writer, "… partial output — greppy expand {id}");
     }
