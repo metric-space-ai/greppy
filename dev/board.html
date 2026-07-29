@@ -94,10 +94,10 @@
           durchgefallen (0-Definitionen-Zeilen mit Expand-Angebot, „most-used"-Trio zeigt
           Testfixtures statt referenzierter Symbole, Doku/Config-Zählungen blähen die
           Zahlen). <span class="state s-work">Sol behebt, Auftrag mit IST-Beleg</span></li>
-      <li><strong><code>brief</code> bauen</strong> — Spec fertig (Rumpf-Skizze, Hub),
-          Auftrag liegt bereit. <span class="state s-open">wartet auf freien Slot</span></li>
-      <li><strong>READ-Familie bauen</strong> — read / read-smart / read-file, Spec + Auftrag
-          fertig. <span class="state s-open">wartet, Hotspot cli_surface.rs</span></li>
+      <li><strong><code>brief</code> bauen</strong> — Rumpf-Skizze statt Dreierbündel.
+          <span class="state s-work">Kimi baut</span></li>
+      <li><strong>READ-Familie bauen</strong> — read / read-smart / read-file.
+          <span class="state s-work">Sol baut (gehärteter Wrapper)</span></li>
       <li><strong>EDIT bauen</strong> — 11 Verben in 5 grünen Scheiben, Auftrag fertig.
           Größter offener Posten. <span class="state s-open">nach READ</span></li>
       <li><strong>Mehrfachsymbole</strong> für who-calls/callees.
@@ -132,14 +132,19 @@
             <td>dev/captures/where-am-i-IST.txt · Fix-Auftrag läuft (Sol)</td>
           </tr>
           <tr>
-            <td><code>NAVIGATE</code> brief · Mehrfachsymbole</td>
-            <td><span class="state s-open">nicht gebaut</span></td>
-            <td>Spec + Auftrag fertig</td>
+            <td><code>NAVIGATE</code> brief</td>
+            <td><span class="state s-work">im Bau (Kimi)</span></td>
+            <td>NAV-OUTPUT-SPEC-BRIEF.md mit Referenzausgabe</td>
           </tr>
           <tr>
-            <td><code>READ</code> · <code>EDIT</code></td>
+            <td><code>READ</code></td>
+            <td><span class="state s-work">im Bau (Sol)</span></td>
+            <td>erster Lauf über den gehärteten claude-agent (Präambel, Journal, Salvage)</td>
+          </tr>
+          <tr>
+            <td><code>EDIT</code> · Mehrfachsymbole</td>
             <td><span class="state s-open">nicht gebaut</span></td>
-            <td>Specs + Aufträge fertig (EDIT: 5 Scheiben, Quittungen, --dry-run/--verify)</td>
+            <td>EDIT startet auf dem nächsten freien Sol-Slot (5 Scheiben, Aufträge fertig)</td>
           </tr>
           <tr>
             <td><code>bash-smart</code> v1 (trainingsfrei)</td>
@@ -220,6 +225,7 @@
   </section>
 
   <footer>Stand 29.07.2026 vormittags · Läufe: where-am-i-Fix (Sol) · bash-smart (Sol) ·
-    Wrapper (Sol) · Downloads Pass 2 (gpu3) · Zweig recovery/cli-umbau</footer>
+    READ (Sol) · brief (Kimi) · Downloads Pass 2 (gpu3) · Wrapper-Härtung GELANDET
+    (14 Stub-Tests grün, installiert) · Zweig recovery/cli-umbau</footer>
 
 </div>
