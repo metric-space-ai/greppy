@@ -356,6 +356,30 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Rename a definition and every graph-resolved reference.
+    Rename {
+        #[arg(value_name = "S", allow_hyphen_values = true)]
+        symbol: String,
+        #[arg(value_name = "NAME", allow_hyphen_values = true)]
+        name: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reverse an edit; without ID, reverse the latest one.
+    Undo {
+        #[arg(value_name = "ID", allow_hyphen_values = true)]
+        id: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print deterministic graph statistics for the workspace project:
     /// file count, node counts by label, edge counts by type, and the
     /// node/edge totals.

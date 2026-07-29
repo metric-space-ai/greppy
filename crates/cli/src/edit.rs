@@ -1233,19 +1233,58 @@ pub(crate) fn edit_journal_restore(
     Ok(restored)
 }
 
-pub(crate) fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditResult<EditRecord> {
+pub(crate) fn run_edit_undo(
+    root_path: &std::path::Path,
+    requested: Option<&str>,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
     let dir = edit_journal_dir(root_path);
     let mut stack = edit_journal_read(&dir.join(EDIT_JOURNAL_STACK))
         .and_then(|value| value["transactions"].as_array().cloned())
         .unwrap_or_default();
-    let Some(last) = stack.pop() else {
+    if stack.is_empty() {
         return Err(EditRefusal::new(
             "nothing_to_undo",
             "nothing to undo in this workspace",
             10,
         ));
+    }
+    let index = if let Some(requested) = requested {
+        let matches: Vec<usize> = stack
+            .iter()
+            .enumerate()
+            .filter(|(_, transaction)| {
+                transaction["id"]
+                    .as_str()
+                    .is_some_and(|id| id == requested || id.starts_with(requested))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        match matches.as_slice() {
+            [index] => *index,
+            [] => {
+                return Err(EditRefusal::new(
+                    "nothing_to_undo",
+                    format!("no edit transaction begins with {requested}"),
+                    10,
+                ))
+            }
+            _ => {
+                return Err(EditRefusal::new(
+                    "ambiguous_transaction",
+                    format!("{requested} names more than one edit transaction"),
+                    11,
+                ))
+            }
+        }
+    } else {
+        stack.len() - 1
     };
-    let files: Vec<String> = last["entries"]
+    let selected = stack[index].clone();
+    let id = selected["id"].as_str().unwrap_or_default().to_string();
+    let short_id = &id[..id.len().min(6)];
+    let files: Vec<String> = selected["entries"]
         .as_array()
         .map(|entries| {
             entries
@@ -1254,12 +1293,16 @@ pub(crate) fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditR
                 .collect()
         })
         .unwrap_or_default();
+    let subject = if files.len() == 1 {
+        files[0].clone()
+    } else {
+        format!("{} files", files.len())
+    };
     let mut record = EditRecord {
-        headline: Some(match (files.len(), dry_run) {
-            (1, false) => format!("reversed {}", files[0]),
-            (n, false) => format!("reversed {n} files"),
-            (1, true) => format!("would reverse {}", files[0]),
-            (n, true) => format!("would reverse {n} files"),
+        headline: Some(if dry_run {
+            format!("would reverse {short_id} {subject}")
+        } else {
+            format!("reversed {short_id} {subject}")
         }),
         files,
         published: !dry_run,
@@ -1268,16 +1311,16 @@ pub(crate) fn run_edit_undo(root_path: &std::path::Path, dry_run: bool) -> EditR
     if dry_run {
         return Ok(record);
     }
-    let restored = edit_journal_restore(root_path, &last, true)?;
-    // The entry is consumed, or every further call would restore the same
-    // snapshot and answer with a cheerful exit 0 while the repo stops moving.
+    let restored = edit_journal_restore(root_path, &selected, true)?;
+    stack.remove(index);
     edit_journal_write(
         &dir.join(EDIT_JOURNAL_STACK),
         &serde_json::json!({ "transactions": stack }),
     );
-    record
-        .extra
-        .push(("restored", serde_json::json!(restored)));
+    record.extra.push(("restored", serde_json::json!(restored)));
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
     Ok(record)
 }
 
@@ -2303,6 +2346,150 @@ pub(crate) fn run_trained_write(
     Ok(record)
 }
 
+pub(crate) fn run_trained_rename(
+    root_path: &std::path::Path,
+    root: Option<&str>,
+    symbol: &str,
+    new_name: &str,
+    dry_run: bool,
+    verify: bool,
+) -> Result<EditResult<EditRecord>> {
+    let store = open_default_store_query_writer(root)?;
+    let ids = match resolve_symbol_nodes(&store, Some(symbol)) {
+        Ok(ids) => ids,
+        Err(_) => {
+            return Ok(Err(EditRefusal::new(
+                "symbol_not_found",
+                format!("no symbol `{symbol}`"),
+                10,
+            )))
+        }
+    };
+    let mut def_nodes = Vec::new();
+    for id in &ids {
+        if let Some(node) = store.get_node(*id)? {
+            if !node.file_path.is_empty() && node.start_line >= 1 {
+                def_nodes.push(node);
+            }
+        }
+    }
+    if def_nodes.is_empty() {
+        return Ok(Err(EditRefusal::new(
+            "symbol_not_found",
+            format!("no symbol `{symbol}`"),
+            10,
+        )));
+    }
+    let short_name = def_nodes[0].name.clone();
+    use std::collections::BTreeMap;
+    let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for def in &def_nodes {
+        scopes
+            .entry(def.file_path.clone())
+            .or_default()
+            .push((0, usize::MAX));
+        for edge in store.incoming_edges(def.id, None, 100_000)? {
+            let Some(source) = store.get_node(edge.source_id)? else {
+                continue;
+            };
+            if source.file_path.is_empty() || source.start_line < 1 {
+                continue;
+            }
+            let Ok(content) = std::fs::read(root_path.join(&source.file_path)) else {
+                continue;
+            };
+            let Some(span) = read_span_with_meta(
+                root_path,
+                &source.file_path,
+                source.start_line,
+                source.end_line,
+                usize::MAX,
+                false,
+            ) else {
+                continue;
+            };
+            scopes.entry(source.file_path.clone()).or_default().push(
+                line_range_to_bytes(
+                    &content,
+                    source.start_line as usize,
+                    span.end_line as usize,
+                ),
+            );
+        }
+    }
+    let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
+        .into_iter()
+        .map(|(rel_path, mut spans)| {
+            spans.sort_unstable();
+            spans.dedup();
+            greppy_edit::verbs::RenameFileScope { rel_path, spans }
+        })
+        .collect();
+    let before: Vec<UndoBefore> = scope_vec
+        .iter()
+        .map(|scope| UndoBefore {
+            rel: scope.rel_path.clone(),
+            content: std::fs::read(root_path.join(&scope.rel_path)).ok(),
+        })
+        .collect();
+    let options = greppy_edit::verbs::VerbOptions {
+        dry_run,
+        with_diff: true,
+        expect_residual: Some(0),
+        ..Default::default()
+    };
+    let certificate = greppy_edit::verbs::rename_symbol_files(
+        root_path,
+        &scope_vec,
+        &short_name,
+        new_name,
+        &options,
+    )?;
+    if certificate.exit_code() != 0 {
+        let message = if certificate.status == greppy_edit::Status::InvalidResult {
+            "refused: the edit would break the file's syntax — nothing written".to_string()
+        } else {
+            certificate
+                .compact_failure_diagnosis()
+                .unwrap_or_else(|| format!("rename {} — nothing written", edit_status_name(certificate.status)))
+        };
+        return Ok(Err(EditRefusal::new(
+            certificate_refusal_code(&certificate),
+            message,
+            certificate.exit_code(),
+        )));
+    }
+    let mut files: Vec<String> = certificate
+        .operations
+        .iter()
+        .map(|operation| edit_operation_path(operation, root_path))
+        .collect();
+    files.sort();
+    files.dedup();
+    let span = certificate
+        .operations
+        .first()
+        .map(|operation| edit_operation_line_span(operation, root_path));
+    let already = certificate.status == greppy_edit::Status::AlreadySatisfied;
+    let mut record = EditRecord {
+        files,
+        span,
+        published: !dry_run,
+        already_as_sent: already,
+        ..EditRecord::default()
+    };
+    if certificate.published {
+        if let Some(id) = edit_journal_open(root_path, &before) {
+            edit_journal_close(root_path, &id);
+            record.transaction_id = Some(id);
+        }
+    }
+    if verify && certificate.published {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(Ok(record))
+}
+
 pub(crate) fn dispatch_edit_grammar(
     command: EditCommand,
     json: bool,
@@ -2509,6 +2696,14 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_splice(&located.content, &mut edits);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
+            emit_edit_outcome(outcome, json, None)?
+        }
+        EditCommand::Rename { symbol, name, dry_run, verify } => {
+            let outcome = run_trained_rename(root_path, root, &symbol, &name, dry_run, verify)?;
+            emit_edit_outcome(outcome, json, None)?
+        }
+        EditCommand::Undo { id, dry_run, verify } => {
+            let outcome = run_edit_undo(root_path, id.as_deref(), dry_run, verify);
             emit_edit_outcome(outcome, json, None)?
         }
     };
