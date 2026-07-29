@@ -200,7 +200,7 @@ pub enum Command {
     },
     /// Read a symbol's exact definition span (byte-precise source). With
     /// --handle, also returns an edit handle that pins the file, byte range,
-    /// and content hashes — pass it to `greppy edit` commands. File paths and
+    /// and content hashes — pass it to `greppy replace-span`. File paths and
     /// `--lines A:B` ranges produce the same directly consumable handle form.
     /// Prefer this
     /// over opening whole files: it returns exactly the code that matters.

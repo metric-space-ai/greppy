@@ -755,7 +755,6 @@ const SUBCOMMANDS: &[&str] = &[
     "brief",
     "expand",
     "read",
-    "edit",
     "replace",
     "replace-text",
     "replace-lines",
@@ -787,39 +786,55 @@ const SUBCOMMANDS: &[&str] = &[
     "summarize-daemon",
 ];
 
-/// The verbs the new edit grammar replaced, each with the invocation that now
-/// does its work. They are gone without an alias, so naming one is an error —
-/// and the error says which spelling does the job, because the caller's
-/// intent is known exactly.
-const RETIRED_EDIT_VERBS: &[(&str, &str)] = &[
-    ("text-cas", "greppy edit replace --file F --old TEXT"),
-    ("regex-cas", "greppy edit replace --file F --pattern REGEX"),
-    ("replace-body", "greppy edit replace --symbol S --body"),
-    ("replace-span", "greppy edit replace --file F --lines A:B"),
-    ("patch-span", "greppy edit patch --file F --lines A:B"),
-    ("insert-after", "greppy edit insert --symbol S --after"),
-    ("insert-before", "greppy edit insert --symbol S --before"),
-    ("remove-if-present", "greppy edit delete --file F --old TEXT"),
+/// Names removed from the edit surface are reserved forever: none may fall
+/// through to real grep and become a pattern by accident.
+const DEAD_EDIT_VERBS: &[&str] = &[
+    "edit",
+    "insert",
+    "move",
+    "remove",
+    "change-signature",
+    "data",
+    "apply",
+    "recover",
+    "ensure-import",
+    "ensure-argument",
+    "ensure-method",
+    "ensure-annotation",
+    "text-cas",
+    "regex-cas",
+    "replace-body",
+    "patch-span",
+    "insert-after",
+    "insert-before",
+    "remove-if-present",
 ];
 
-fn retired_edit_verb(name: &str) -> Option<&'static str> {
-    RETIRED_EDIT_VERBS
-        .iter()
-        .find(|(verb, _)| *verb == name)
-        .map(|(_, replacement)| *replacement)
-}
+const DEAD_EDIT_FLAGS: &[&str] = &[
+    "--content",
+    "--content-file",
+    "--old",
+    "--old-file",
+    "--new-file",
+    "--pattern",
+    "--target",
+    "--source-file",
+    "--patch-file",
+    "--plan",
+    "--spec",
+    "--report",
+    "--module",
+    "--annotation",
+    "--arg",
+    "--value-json",
+    "--call",
+];
 
-/// An argv that carries a greppy flag, or names a verb removed from the
-/// grammar, is a greppy command whose verb is unknown. Refuse it instead of
-/// letting the passthrough reinterpret the verb itself as a search pattern.
+/// An argv that names a removed command or flag is a Greppy invocation whose
+/// vocabulary is no longer valid. Refuse it before passthrough routing.
 fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     let rest = grep_passthrough_args(argv);
     let verb = rest.first()?.to_str()?;
-    // Both names the reference query ever had. Without this, `greppy references
-    // Snapshot` reaches the passthrough and greps for "references" in a file
-    // called "Snapshot" -- measured: exit 2, "No such file or directory". The
-    // list names no successor and never will; it exists so a verb that was
-    // removed cannot come back as a search pattern.
     if matches!(
         verb,
         "find-usages"
@@ -832,30 +847,30 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
             | "semantic"
             | "search-symbols"
             | "search-code"
-    ) {
+    ) || DEAD_EDIT_VERBS.contains(&verb)
+        || verb.starts_with("ensure-")
+    {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
+    }
+    if let Some(flag) = rest.iter().skip(1).find_map(|token| {
+        let token = token.to_str()?;
+        DEAD_EDIT_FLAGS
+            .iter()
+            .find(|flag| token == **flag || token.starts_with(&format!("{flag}=")))
+            .copied()
+    }) {
+        return Some(format!("error: unrecognized argument '{flag}'"));
     }
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
         return None;
     }
-    let replacement = retired_edit_verb(verb);
-    if replacement.is_none() && greppy_only_flag(&rest[1..]).is_none() {
+    if greppy_only_flag(&rest[1..]).is_none() {
         return None;
     }
-    let mut message = format!("unrecognized command `{verb}`");
-    if let Some(replacement) = replacement {
-        // A retired verb is just an unknown subcommand. Naming its successor
-        // would keep a table of dead names alive (owner decision: no relics,
-        // not even in error messages) to serve a caller that measurably does
-        // not exist — zero retired-verb calls in 1072 benchmarked turns.
-    } else {
-        message.push_str(
-            "\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
-             impact, brief, search, search-symbol, search-pattern, path, \
-             read, edit)",
-        );
-    }
-    Some(message)
+    Some(format!(
+        "unrecognized command `{verb}`\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
+         impact, brief, search, search-symbol, search-pattern, path, read, replace, patch)"
+    ))
 }
 
 /// Top-level entry point that captures argv as `OsString` BEFORE clap
@@ -4710,10 +4725,7 @@ struct EditRecord {
 }
 
 
-enum GrammarDispatch {
-    Handled(i32),
-    Passthrough(Box<EditCommand>),
-}
+struct GrammarDispatch(i32);
 
 /// Selector arguments, before they are read as a WHERE.
 struct WhereSpec {
@@ -8422,38 +8434,19 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsS
 const NAV_OWNER: &str = "";
 
 const GREPPY_ONLY_FLAGS: &[(&str, &str)] = &[
-    ("--target", "edit"),
-    ("--expect", "edit"),
-    ("--content", "edit"),
-    ("--content-file", "edit"),
-    ("--source-file", "edit"),
-    ("--old", "edit"),
-    ("--old-file", "edit"),
-    ("--new-file", "edit"),
-    ("--pattern", "edit"),
-    ("--body", "edit"),
-    ("--patch-file", "edit"),
-    ("--dry-run", "edit"),
-    ("--verify", "edit"),
-    ("--plan", "edit apply"),
-    ("--spec", "edit"),
-    ("--module", "edit ensure-import"),
-    ("--annotation", "edit ensure-annotation"),
-    ("--arg", "edit ensure-argument"),
-    ("--value-json", "edit data"),
-    ("--call", "edit rename"),
-    ("--to", "edit rename"),
+    ("--expect", "replace-text"),
+    ("--body", "replace"),
+    ("--dry-run", "replace"),
+    ("--verify", "replace"),
+    ("--to", "path"),
     ("--symbol", "read"),
     ("--lines", "read"),
     ("--handle", "read"),
-    ("--kind", "search-symbols"),
+    ("--kind", "search-symbol"),
     ("--depth", "impact"),
     ("--direction", "impact"),
     ("--from", "path"),
-    ("--report", "edit"),
     ("--path", NAV_OWNER),
-    // These four were the ones actually seen reaching grep in the traces. The
-    // rg branch returns earlier, so `--json` here is never ripgrep's.
     ("--all", NAV_OWNER),
     ("--code", NAV_OWNER),
     ("--json", NAV_OWNER),
