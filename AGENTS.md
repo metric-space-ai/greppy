@@ -81,7 +81,7 @@ EDIT:
 
 CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
   greppy search-symbol NAME --json | greppy read -
-  greppy who-calls S --json | greppy brief -
+  greppy callees S --json | greppy read -
 
 ON EVERY COMMAND:
   --path P          only results under that file or directory
