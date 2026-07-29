@@ -1,4 +1,6 @@
-//! Ordered missing-symbol suggestions and question-kind correction.
+//! The 0.3.0 missing-symbol answer: a bare `no symbol` line, then a
+//! `similar names:` block when (and only when) a name tier qualifies —
+//! no instructions, no meaning fallback on the navigation verbs.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -81,12 +83,17 @@ fn assert_factual_only(text: &str) {
     assert!(!lower.contains("\nretry:"), "{text}");
 }
 
-fn suggestion_rows(text: &str) -> Vec<&str> {
-    text.lines().filter(|line| line.starts_with("  ")).collect()
+/// The rows of the `similar names:` block — every non-empty line after the
+/// header. An absent block yields no rows: the absence is the statement.
+fn similar_name_rows(text: &str) -> Vec<&str> {
+    match text.split("similar names:\n").nth(1) {
+        Some(block) => block.lines().filter(|line| !line.is_empty()).collect(),
+        None => Vec::new(),
+    }
 }
 
 #[test]
-fn stage_1_normalizes_spelling_without_semantic_search() {
+fn miss_normalizes_case_and_underscores() {
     let (repo, store) = fresh_repo("normalized");
     std::fs::write(
         repo.join("src/lib.rs"),
@@ -95,50 +102,46 @@ fn stage_1_normalizes_spelling_without_semantic_search() {
     .unwrap();
     commit_all(&repo, "base");
     index(&repo, &store);
-    let marker = repo.parent().unwrap().join("semantic-marker");
 
-    let result = run(
-        &repo,
-        &store,
-        &["who-calls", "parse_config"],
-        &[("GREPPY_TEST_SUGGESTION_SEMANTIC_MARKER", &marker)],
-    );
+    let result = run(&repo, &store, &["who-calls", "parse_config"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
-    assert!(text.contains("no symbol `parse_config`"), "{text}");
-    assert!(text.contains("parseConfig"), "{text}");
-    assert_eq!(suggestion_rows(&text).len(), 1, "{text}");
-    assert!(!marker.exists(), "semantic stage ran for a stage-1 hit");
+    // Equal after lowercasing and removing underscores — the near-certain
+    // tier, one exact row and nothing else.
+    assert_eq!(
+        text,
+        "no symbol `parse_config`\n\nsimilar names:\nsrc/lib.rs:1  parseConfig\n",
+        "{text}"
+    );
+    assert_eq!(similar_name_rows(&text).len(), 1, "{text}");
     assert_factual_only(&text);
 }
 
 #[test]
-fn stage_2_reports_graph_proven_rename_and_commit() {
+fn miss_after_rename_offers_the_new_name() {
     let (repo, store) = fresh_repo("rename");
     std::fs::write(repo.join("src/lib.rs"), "pub fn fooBar() -> usize { 7 }\n").unwrap();
     commit_all(&repo, "old name");
     std::fs::write(repo.join("src/lib.rs"), "pub fn fooBaz() -> usize { 7 }\n").unwrap();
     commit_all(&repo, "rename symbol");
-    let head = Command::new("git")
-        .args(["rev-parse", "--short=7", "HEAD"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
     index(&repo, &store);
 
+    // No git provenance in the answer: the renamed-away name is a plain
+    // miss, the new name is an edit-distance-≤-2 similar name.
     let result = run(&repo, &store, &["callees", "fooBar"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
-    assert!(
-        text.contains(&format!("`fooBar` renamed to `fooBaz` in {head}")),
+    assert_eq!(
+        text,
+        "no symbol `fooBar`\n\nsimilar names:\nsrc/lib.rs:1  fooBaz\n",
         "{text}"
     );
+    assert_eq!(similar_name_rows(&text).len(), 1, "{text}");
     assert_factual_only(&text);
 }
 
 #[test]
-fn stage_3_returns_the_unique_corrected_address() {
+fn miss_on_qualified_name_offers_the_bare_definition() {
     let (repo, store) = fresh_repo("qualification");
     std::fs::write(
         repo.join("src/lib.rs"),
@@ -151,8 +154,12 @@ fn stage_3_returns_the_unique_corrected_address() {
     let result = run(&repo, &store, &["callees", "Foo::bar"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
-    assert!(text.contains("bar"), "{text}");
-    assert_eq!(suggestion_rows(&text).len(), 1, "{text}");
+    assert_eq!(
+        text,
+        "no symbol `Foo::bar`\n\nsimilar names:\nsrc/lib.rs:1  bar\n",
+        "{text}"
+    );
+    assert_eq!(similar_name_rows(&text).len(), 1, "{text}");
     assert_factual_only(&text);
 }
 
@@ -193,7 +200,7 @@ fn stage_5_matches_name_fragments() {
 }
 
 #[test]
-fn stage_6_runs_only_after_name_stages_are_empty() {
+fn nav_miss_has_no_meaning_fallback() {
     let (repo, store) = fresh_repo("semantic");
     std::fs::write(
         repo.join("src/lib.rs"),
@@ -202,41 +209,39 @@ fn stage_6_runs_only_after_name_stages_are_empty() {
     .unwrap();
     commit_all(&repo, "base");
     index(&repo, &store);
-    let marker = repo.parent().unwrap().join("semantic-marker");
 
-    let result = run(
-        &repo,
-        &store,
-        &["who-calls", "write login"],
-        &[("GREPPY_TEST_SUGGESTION_SEMANTIC_MARKER", &marker)],
-    );
+    // A prose query on a navigation verb is a bare miss: `search` IS the
+    // meaning stage now, so who-calls never falls through to it — when no
+    // name tier qualifies, no block follows and the absence is the statement.
+    let result = run(&repo, &store, &["who-calls", "write login"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
-    assert!(marker.exists(), "semantic stage did not run");
-    assert!(text.contains("write_login_record"), "{text}");
+    assert_eq!(text, "no symbol `write login`\n", "{text}");
+    assert!(similar_name_rows(&text).is_empty(), "{text}");
     assert_factual_only(&text);
 }
 
 #[test]
-fn stage_7_reports_the_actual_kind_for_who_calls() {
+fn who_calls_a_const_reports_no_callers() {
     let (repo, store) = fresh_repo("kind");
     std::fs::write(repo.join("src/lib.rs"), "pub const MAX_SIZE: usize = 64;\n").unwrap();
     commit_all(&repo, "base");
     index(&repo, &store);
 
+    // who-calls walks CALLS and USAGE, so the wrong-kind refusal no longer
+    // applies to it: an unreferenced const is a lawful query with an empty
+    // answer — said, without parentheses, at exit 0.
     let result = run(&repo, &store, &["who-calls", "MAX_SIZE"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 0, "{text}");
-    assert!(text.contains("MAX_SIZE"), "{text}");
-    assert!(text.contains("const"), "{text}");
-    assert!(text.contains("src/lib.rs:1"), "{text}");
-    assert!(!text.contains("not found"), "{text}");
-    assert!(!text.contains("no callers"), "{text}");
+    assert_eq!(text, "no callers\n", "{text}");
+    assert!(!text.contains("not a function"), "{text}");
+    assert!(!text.contains("is a const"), "{text}");
     assert_factual_only(&text);
 }
 
 #[test]
-fn suggestions_are_capped_at_three() {
+fn substring_fragments_are_never_suggested() {
     let (repo, store) = fresh_repo("cap");
     let mut source = String::new();
     for index in 0..20 {
@@ -248,9 +253,14 @@ fn suggestions_are_capped_at_three() {
     commit_all(&repo, "base");
     index(&repo, &store);
 
+    // Twenty names contain the fragment, and none qualifies: substring
+    // matches are never candidates (`data` must not suggest `metadata`).
+    // No cap is needed because no block follows — the absence is the
+    // statement.
     let result = run(&repo, &store, &["who-calls", "Config"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
-    assert_eq!(suggestion_rows(&text).len(), 3, "{text}");
+    assert_eq!(text, "no symbol `Config`\n", "{text}");
+    assert!(similar_name_rows(&text).is_empty(), "{text}");
     assert_factual_only(&text);
 }
