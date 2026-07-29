@@ -46,15 +46,20 @@ fn run(repo: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+// 0.3.0 contract (AGENTS.md, "ON EVERY COMMAND"): --limit caps the results
+// and --offset K starts at the Kth, on `search-pattern` (the replacement
+// for the retired `search-code`) exactly as on the navigation commands.
+// The stdout budget (--max-bytes) stays valid and the JSON envelope gains
+// `total` / `shown` / `offset` / `try` cursor keys.
 #[test]
-fn search_code_json_budget_is_valid_and_offset_continues_without_duplicates() {
+fn search_pattern_json_budget_is_valid_and_offset_continues_without_duplicates() {
     let (repo, store) = fixture();
     let budget = 1_000usize;
     let (code, stdout, stderr) = run(
         repo,
         store,
         &[
-            "search-code",
+            "search-pattern",
             "needle",
             "--json",
             "--limit",
@@ -78,7 +83,7 @@ fn search_code_json_budget_is_valid_and_offset_continues_without_duplicates() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|hit| hit["location"].as_str().unwrap().to_string())
+        .map(|hit| hit["matches"][0]["location"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(first_locations.len(), next_offset, "{stdout}");
     let next_offset_arg = next_offset.to_string();
@@ -87,7 +92,7 @@ fn search_code_json_budget_is_valid_and_offset_continues_without_duplicates() {
         repo,
         store,
         &[
-            "search-code",
+            "search-pattern",
             "needle",
             "--json",
             "--limit",
@@ -107,7 +112,7 @@ fn search_code_json_budget_is_valid_and_offset_continues_without_duplicates() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|hit| hit["location"].as_str().unwrap().to_string())
+        .map(|hit| hit["matches"][0]["location"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert!(!second_locations.is_empty(), "{stdout}");
     assert!(
@@ -121,7 +126,12 @@ fn search_code_json_budget_is_valid_and_offset_continues_without_duplicates() {
 #[test]
 fn who_calls_json_budget_keeps_structure_total_and_executable_retry() {
     let (repo, store) = fixture();
-    let budget = 950usize;
+    // The 0.3.0 JSON envelope (freshness, incomplete_providers, targets,
+    // expand) is larger than the pre-0.3.0 one: 950 bytes fit zero hits,
+    // 1050 fit at least one. The contract is unchanged: stdout stays within
+    // budget, `total` is the true number, and `try` is an executable retry
+    // whose --offset advances past the shown hits.
+    let budget = 1_050usize;
     let (code, stdout, stderr) = run(
         repo,
         store,
@@ -132,7 +142,7 @@ fn who_calls_json_budget_keeps_structure_total_and_executable_retry() {
             "--limit",
             "20",
             "--max-bytes",
-            "950",
+            "1050",
         ],
     );
 
@@ -142,10 +152,15 @@ fn who_calls_json_budget_keeps_structure_total_and_executable_retry() {
     assert_eq!(value["truncated"], true);
     assert_eq!(value["total"], 12);
     assert!(!value["hits"].as_array().unwrap().is_empty(), "{stdout}");
+    let shown = value["shown"].as_u64().unwrap();
+    assert!(shown > 0, "{stdout}");
     let retry = value["try"].as_str().unwrap();
     assert!(retry.starts_with("greppy "), "{retry}");
     assert!(retry.contains("who-calls target"), "{retry}");
-    assert!(retry.contains("--offset "), "{retry}");
+    assert!(
+        retry.contains(&format!("--offset {shown}")),
+        "the retry must make progress past the {shown} shown hits: {retry}"
+    );
 }
 
 #[test]
