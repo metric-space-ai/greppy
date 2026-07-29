@@ -84,7 +84,7 @@
     <div class="metric"><dt>0.2.1 gemessen</dt><dd>0,46×<small> Baseline</small></dd></div>
     <div class="metric"><dt>0.3.0 Ziel</dt><dd>&lt;0,30×<small> Baseline</small></dd></div>
     <div class="metric"><dt>Prompt (AGENTS.md)</dt><dd>fertig<small> · 11 Wächter grün</small></dd></div>
-    <div class="metric"><dt>Binary deckt Prompt</dt><dd>~75 %<small> der Kommandos</small></dd></div>
+    <div class="metric"><dt>Binary deckt Prompt</dt><dd>~85 %<small> · Gate 24/28</small></dd></div>
   </dl>
 
   <section>
@@ -95,16 +95,19 @@
           keine Leerzeilen-Angebote. Integriert, dev-0.3.0 nachgezogen.
           <span class="state s-done">fertig (427b055)</span> — Folgeposten: entry-points-Zeile
           ist noch eine 60-Pfade-Wand, Kompressionsauftrag in der Queue</li>
-      <li><strong><code>brief</code> bauen</strong> — Rumpf-Skizze statt Dreierbündel.
-          <span class="state s-work">Kimi baut</span></li>
-      <li><strong>READ-Familie bauen</strong> — read / read-smart / read-file.
+      <li><strong><code>brief</code></strong> — Rumpf-Skizze, Altlast-Bündel restlos entfernt.
+          <span class="state s-done">fertig, integriert</span></li>
+      <li><strong>EDIT</strong> — 11 Verben, Quittungen nennen jede Stelle, Verweigerungen
+          mit wahren Sätzen. <span class="state s-done">fertig, integriert</span></li>
+      <li><strong>READ-Familie</strong> — read / read-smart / read-file.
+          <span class="state s-work">Sol baut (3. Anlauf, von integrierter Basis)</span></li>
+      <li><strong>Mehrfachsymbole</strong> — der letzte ::Function::-Altpfad.
           <span class="state s-work">Sol baut</span></li>
-      <li><strong>EDIT bauen</strong> — 11 Verben in 5 grünen Scheiben.
-          <span class="state s-work">Sol baut (parallel)</span></li>
-      <li><strong>Mehrfachsymbole</strong> für who-calls/callees.
-          <span class="state s-open">klein</span></li>
-      <li><strong>Smoke-Pass</strong>: jede Prompt-Zeile gegen das Binary.
-          <span class="state s-open">Gate</span></li>
+      <li><strong>search --path</strong> — ON EVERY COMMAND galt nicht für die Suchfamilie
+          (Gate-Fund). <span class="state s-work">Kimi baut</span></li>
+      <li><strong>Smoke-Pass</strong>: dev/smoke_pass.py, 29 Fälle inkl. Fußflags und
+          Vokabular-Verweigerungen. <span class="state s-work">24 ok · 4 fail = exakt die
+          laufenden Bauposten</span></li>
       <li><strong>e2b-Bench</strong> auf gpu3: CUDA-Build, Vorindexieren bis „embedded
           N spans", Daemon-Prewarm + Wegwerf-Query, RB1–8 + Reasoning, Kosten-Eval.
           <span class="state s-open">Endpunkt</span></li>
@@ -231,8 +234,9 @@
     </ul>
   </section>
 
-  <footer>Stand 29.07.2026 mittags · gelandet heute: where-am-i · bash-smart v1 ·
-    Wrapper-Härtung · Läufe: EDIT (Sol) · brief (Kimi) · Downloads Pass 2 (gpu3) ·
-    READ auf dem nächsten freien Stream · recovery/cli-umbau 97b3660, dev-0.3.0 gleich</footer>
+  <footer>Stand 29.07.2026 nachmittags · heute gelandet: where-am-i · bash-smart v1 ·
+    brief · EDIT · Wrapper-Härtung · entry-points · Altschuld 25/25 grün · 2 Binary-Defekte
+    gefunden+1 gefixt (C++ no-callers) · Läufe: READ · Mehrfachsymbole (Sol) ·
+    search --path (Kimi) · recovery/cli-umbau f38c5e0</footer>
 
 </div>
