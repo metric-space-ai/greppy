@@ -27,7 +27,7 @@ blindly and the cut part is gone forever; here overflow becomes retrievable.
 
 **2. Repetition collapse — arithmetic, before any model.** Identical and
 template-identical consecutive lines collapse to one plus a count
-(`… 311 weitere \`Compiling …\`-Zeilen`). This typically shrinks a 5,000-line
+(`… 311 more `Compiling …` lines`). This typically shrinks a 5,000-line
 wall to a few hundred unique lines the model ever sees.
 
 **3. Line classification — the embedded model, windowed.** The collapsed
