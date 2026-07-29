@@ -2117,6 +2117,7 @@ fn dispatch_subcommand(
             kind,
             code,
             all,
+            path_opts,
         } => dispatch_search_code(
             query.as_deref(),
             kind.as_deref(),
@@ -2124,6 +2125,7 @@ fn dispatch_subcommand(
             all,
             json,
             fixed,
+            &path_opts,
             root,
         ),
         Command::SearchSymbol {
@@ -2132,12 +2134,14 @@ fn dispatch_subcommand(
             json,
             code,
             all,
+            path_opts,
         } => dispatch_search_symbols(
             query.as_deref(),
             kind.as_deref(),
             code,
             all,
             json,
+            &path_opts,
             EmbeddingCliArgs { device, no_gpu },
             root,
         ),
@@ -2162,11 +2166,12 @@ fn dispatch_subcommand(
             json,
             code,
             all,
+            path_opts,
         } => {
             let query = query_parts.join(" ");
             dispatch_semantic(
                 (!query.trim().is_empty()).then_some(query.as_str()),
-                &[],
+                &path_opts,
                 kind.as_deref(),
                 code,
                 all,

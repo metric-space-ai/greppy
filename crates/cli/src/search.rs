@@ -291,6 +291,7 @@ fn search_symbol_meaning_hits(
     root_path: &std::path::Path,
     query: &str,
     kind: Option<&str>,
+    path_filters: &QueryPathFilters,
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Vec<greppy_store::VectorSearchHit> {
     const MEANING_FLOOR: f32 = 0.45;
@@ -319,6 +320,7 @@ fn search_symbol_meaning_hits(
     dedupe_semantic_vector_hits(candidates, 8)
         .into_iter()
         .filter(|hit| hit.score >= MEANING_FLOOR)
+        .filter(|hit| path_filters.matches(&hit.embedding.file_path))
         .filter(|hit| {
             hit.embedding
                 .node_id
@@ -334,6 +336,7 @@ pub(crate) fn dispatch_search_symbols(
     code: bool,
     all: bool,
     json: bool,
+    paths: &[String],
     embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
 ) -> Result<i32> {
@@ -341,7 +344,7 @@ pub(crate) fn dispatch_search_symbols(
     if q.is_empty() {
         return Err(Error::Invalid("search-symbol requires a name".into()));
     }
-    let path_filters = QueryPathFilters::default();
+    let path_filters = prepare_query_path_filters(root, "search-symbol", q, paths)?;
     let mut store = open_default_store(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
@@ -396,7 +399,9 @@ pub(crate) fn dispatch_search_symbols(
                 .ok()
                 .flatten()
                 .is_some_and(|node| {
-                    node.name.contains(q) && search_kind_matches(&root_path, &node, kind)
+                    node.name.contains(q)
+                        && path_filters.matches(&node.file_path)
+                        && search_kind_matches(&root_path, &node, kind)
                 })
         });
         let total_filtered = hits.len() as i64;
@@ -418,7 +423,9 @@ pub(crate) fn dispatch_search_symbols(
     }
 
     let mut nodes = search_all_nodes(&store, &project)?;
-    nodes.retain(|node| search_kind_matches(&root_path, node, kind));
+    nodes.retain(|node| {
+        path_filters.matches(&node.file_path) && search_kind_matches(&root_path, node, kind)
+    });
     let mut contained = nodes
         .iter()
         .filter(|node| node.name.contains(q))
@@ -431,7 +438,14 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(0);
     }
 
-    println!("no definition named `{q}`");
+    if path_filters.is_empty() {
+        println!("no definition named `{q}`");
+    } else {
+        println!(
+            "no definition named `{q}` under path filter: {}",
+            path_filters.shown()
+        );
+    }
 
     let wanted_normalized = search_name_normalized(q);
     let mut similar = nodes
@@ -482,6 +496,7 @@ pub(crate) fn dispatch_search_symbols(
         &root_path,
         q,
         kind,
+        &path_filters,
         embedding_args,
     );
     if !meaning.is_empty() {
@@ -847,20 +862,28 @@ pub(crate) fn dispatch_search_code(
     all: bool,
     json: bool,
     fixed: bool,
+    paths: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
         return Err(Error::Invalid("search-pattern requires a regular expression".into()));
     }
-    let path_filters = QueryPathFilters::default();
+    let path_filters = prepare_query_path_filters(root, "search-pattern", q, paths)?;
     let store = open_default_store(root)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
     let resolve_definitions = matches!(decision, FreshnessServe::Fresh(_));
     let status = if resolve_definitions { "ok" } else { "live-fallback" };
-    let all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
+    let mut all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
+    // The path filter shapes the hit set BEFORE any count is taken — a count
+    // from before the filter is a false number (the --kind discipline).
+    all_hits.retain(|hit| {
+        hit.location
+            .rsplit_once(':')
+            .is_some_and(|(file, _)| path_filters.matches(file))
+    });
 
     if json {
         let shown_hits = all_hits
@@ -895,8 +918,17 @@ pub(crate) fn dispatch_search_code(
         kind,
     )?;
     if rows.is_empty() {
-        println!("no matches");
-        let insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
+        if path_filters.is_empty() {
+            println!("no matches");
+        } else {
+            println!("no matches under path filter: {}", path_filters.shown());
+        }
+        let mut insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
+        insensitive.retain(|hit| {
+            hit.location
+                .rsplit_once(':')
+                .is_some_and(|(file, _)| path_filters.matches(file))
+        });
         if !insensitive.is_empty() {
             println!("case-insensitive: {} matches", insensitive.len());
         }
@@ -1485,7 +1517,11 @@ pub(crate) fn dispatch_semantic(
                         expand.as_ref(),
                     )?;
                 } else if hits.is_empty() {
-                    println!("no matches");
+                    if path_filters.is_empty() {
+                        println!("no matches");
+                    } else {
+                        println!("no matches under path filter: {}", path_filters.shown());
+                    }
                     return Ok(1);
                 } else {
                     let purposes = semantic_vector_purposes(&store, root, &hits, true)?;
