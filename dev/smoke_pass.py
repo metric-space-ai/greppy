@@ -36,7 +36,9 @@ CASES = {
     "who-calls-missing": (["who-calls", "xyzzy_frobnicate"], {1}, [r"no symbol"]),
     "callees": (["callees", "data_set"], {0}, [r"^\S+:\d+  \S+"]),
     "brief": (["brief", "parse_path"], {0}, [r"^\S+:\d+$|^\S+\.rs:\d+"]),
-    "impact": (["impact", "parse_path"], {0}, [r"parse_path"]),
+    # impact prints the callers AS the tree (the start symbol is the question,
+    # not a row): require tree rows with hint sentences.
+    "impact": (["impact", "parse_path"], {0}, [r"^\S+:\d+  \S+ — "]),
     "path": (["path", "--from", "data_set", "--to", "parse_path"], {0}, [r"data_set"]),
     "search": (["search", "restrict a value to a range"], {0, 1}, []),
     "search-symbol": (["search-symbol", "parse_path"], {0}, [r"parse_path"]),
