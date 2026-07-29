@@ -191,6 +191,18 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run a command untouched and fold long output behind an expand id.
+    #[command(name = "bash-smart")]
+    BashSmart {
+        /// Command argv after `--`.
+        #[arg(
+            value_name = "CMD",
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        argv: Vec<String>,
+    },
     /// Print a prepared evidence pack created by a previous query command.
     Expand {
         id: Option<String>,

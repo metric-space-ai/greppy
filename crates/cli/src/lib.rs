@@ -60,6 +60,7 @@ mod indexing;
 use indexing::*;
 mod passthrough;
 use passthrough::*;
+mod bash_smart;
 mod context;
 use context::*;
 
@@ -1166,6 +1167,7 @@ const SUBCOMMANDS: &[&str] = &[
     "trace",
     "impact",
     "brief",
+    "bash-smart",
     "expand",
     "read",
     "edit",
@@ -2316,6 +2318,7 @@ fn dispatch_subcommand(
             }
             dispatch_brief(targets.first().map(String::as_str), &path_opts, json, root)
         }
+        Command::BashSmart { argv } => bash_smart::run(&argv, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             targets,
@@ -5751,6 +5754,9 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
         println!("expand: id not found or expired: {id}");
         return Ok(1);
     };
+    if pack.command == "bash-smart" {
+        return bash_smart::expand(&store, pack, json);
+    }
     let mut payload_text = pack.payload_text.clone();
     let mut payload_json = pack.payload_json.clone();
     if pack.command == "where-am-i" {
