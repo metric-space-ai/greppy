@@ -162,6 +162,12 @@ fn repeated_middle_is_collapsed_arithmetically() {
 #[test]
 fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
     let workspace = fresh_workspace("timeout");
+    // Warm the store first, unmeasured: a cold first run pays ~12s of
+    // initialization, which would drown the kill-promptness measurement.
+    let _ = command(&workspace)
+        .args(["bash-smart", "--", "true"])
+        .output()
+        .expect("warmup bash-smart");
     let started = Instant::now();
     let output = command(&workspace)
         .env("GREPPY_BASH_SMART_TIMEOUT_MS", "75")
@@ -171,12 +177,9 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
 
-    // The contract: the 75ms timeout fires instead of waiting out the child's
-    // 5s sleep. The bound must stay well under that sleep, but generous enough
-    // not to measure cold-store setup and machine load (a 2s bound failed on a
-    // first run while the same test passed suite-warm).
+    // The contract: the 75ms timeout preempts the child's 5s sleep.
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(2),
         "kill took {:?} — the timeout did not preempt the child's sleep",
         started.elapsed()
     );
