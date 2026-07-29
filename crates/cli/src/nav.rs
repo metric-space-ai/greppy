@@ -1,4 +1,4 @@
-//! The five navigation commands and the pieces only they use.
+//! Navigation commands and the pieces only they use.
 //!
 //! `lib.rs` had grown to 26,400 lines and 528 top-level functions, with these
 //! five scattered between line 7,473 and line 16,736 — so every change to one
@@ -8,14 +8,951 @@
 
 use super::*;
 
+const WHERE_INVENTORY_BUDGET: usize = 25;
+const WHERE_INVENTORY_KIND: &str = "greppy.where-am-i.inventory.v1";
+
+#[derive(Clone)]
+struct WhereInventoryEntry {
+    path: String,
+    is_file: bool,
+    files: Vec<greppy_store::FileState>,
+    definitions: Vec<greppy_store::Node>,
+    most_used: Vec<String>,
+}
+
+struct WhereInventory {
+    entries: Vec<WhereInventoryEntry>,
+    empty_files: usize,
+}
+
+fn where_is_definition(node: &greppy_store::Node) -> bool {
+    !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+        && !matches!(
+            node.label.as_str(),
+            "Import" | "Call" | "Parameter" | "Folder" | "Project"
+        )
+}
+
+fn where_nodes_for_files(
+    nodes: &[greppy_store::Node],
+    files: &[greppy_store::FileState],
+) -> Vec<greppy_store::Node> {
+    let paths = files
+        .iter()
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    nodes
+        .iter()
+        .filter(|node| where_is_definition(node) && paths.contains(node.file_path.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn where_is_hub_symbol(node: &greppy_store::Node) -> bool {
+    if matches!(
+        node.label.as_str(),
+        "Field" | "Variable" | "Parameter" | "EnumVariant" | "AssocConst" | "Property"
+    ) {
+        return false;
+    }
+    let name = node.name.trim().to_ascii_lowercase();
+    name.chars().count() > 1
+        && !matches!(
+            name.as_str(),
+            "out" | "result" | "options" | "block" | "err" | "value"
+        )
+}
+
+fn where_incoming_degrees(
+    store: &greppy_store::Store,
+    project: &str,
+) -> Result<std::collections::HashMap<i64, usize>> {
+    let mut degrees = std::collections::HashMap::new();
+    for edge_type in ["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"] {
+        for edge in store.list_edges_by_type(project, edge_type, i64::MAX as usize)? {
+            *degrees.entry(edge.target_id).or_default() += 1;
+        }
+    }
+    Ok(degrees)
+}
+
+fn where_most_used(
+    root_path: &std::path::Path,
+    incoming_degrees: &std::collections::HashMap<i64, usize>,
+    definitions: &[greppy_store::Node],
+) -> Vec<String> {
+    let mut ranked = Vec::with_capacity(definitions.len());
+    let mut sources = std::collections::HashMap::<String, Option<Vec<String>>>::new();
+    for node in definitions.iter().filter(|node| where_is_hub_symbol(node)) {
+        let lines = sources
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+        if nav_is_test(lines.as_ref(), node) {
+            continue;
+        }
+        let degree = incoming_degrees.get(&node.id).copied().unwrap_or(0);
+        if degree == 0 {
+            continue;
+        }
+        ranked.push((
+            degree,
+            nav_short_name(node),
+            node.file_path.clone(),
+            node.start_line,
+        ));
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let mut names = Vec::new();
+    for (_, name, _, _) in ranked {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+        if names.len() == 3 {
+            break;
+        }
+    }
+    names
+}
+
+fn where_join_path(scope: &str, child: &str) -> String {
+    if scope.is_empty() {
+        child.to_string()
+    } else {
+        format!("{scope}/{child}")
+    }
+}
+
+fn where_collapse_directory(mut path: String, files: &[greppy_store::FileState]) -> String {
+    loop {
+        let prefix = format!("{path}/");
+        let mut directories = std::collections::BTreeSet::new();
+        let mut direct_file = false;
+        for file in files {
+            let Some(rest) = file.rel_path.strip_prefix(&prefix) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                Some((directory, _)) => {
+                    directories.insert(directory.to_string());
+                }
+                None => direct_file = true,
+            }
+        }
+        if direct_file || directories.len() != 1 {
+            return path;
+        }
+        path.push('/');
+        path.push_str(directories.first().expect("one directory"));
+    }
+}
+
+fn where_inventory_entries(
+    root_path: &std::path::Path,
+    incoming_degrees: &std::collections::HashMap<i64, usize>,
+    scope: &str,
+    files: &[greppy_store::FileState],
+    nodes: &[greppy_store::Node],
+) -> Result<WhereInventory> {
+    let prefix = if scope.is_empty() {
+        String::new()
+    } else {
+        format!("{scope}/")
+    };
+    let mut direct_files =
+        std::collections::BTreeMap::<String, Vec<greppy_store::FileState>>::new();
+    let mut directories = std::collections::BTreeMap::<String, Vec<greppy_store::FileState>>::new();
+    for file in files {
+        let Some(rest) = file.rel_path.strip_prefix(&prefix) else {
+            continue;
+        };
+        match rest.split_once('/') {
+            Some((directory, _)) => directories
+                .entry(where_join_path(scope, directory))
+                .or_default()
+                .push(file.clone()),
+            None => direct_files
+                .entry(file.rel_path.clone())
+                .or_default()
+                .push(file.clone()),
+        }
+    }
+
+    let mut entries = Vec::new();
+    for (path, entry_files) in direct_files {
+        let definitions = where_nodes_for_files(nodes, &entry_files);
+        let most_used = where_most_used(root_path, incoming_degrees, &definitions);
+        entries.push(WhereInventoryEntry {
+            path,
+            is_file: true,
+            files: entry_files,
+            definitions,
+            most_used,
+        });
+    }
+    for (path, entry_files) in directories {
+        let path = where_collapse_directory(path, &entry_files);
+        let definitions = where_nodes_for_files(nodes, &entry_files);
+        let most_used = where_most_used(root_path, incoming_degrees, &definitions);
+        entries.push(WhereInventoryEntry {
+            path,
+            is_file: false,
+            files: entry_files,
+            definitions,
+            most_used,
+        });
+    }
+    let empty_files = entries
+        .iter()
+        .filter(|entry| entry.definitions.is_empty())
+        .map(|entry| entry.files.len())
+        .sum();
+    entries.retain(|entry| !entry.definitions.is_empty());
+    entries.sort_by(|left, right| {
+        right
+            .definitions
+            .len()
+            .cmp(&left.definitions.len())
+            .then_with(|| right.files.len().cmp(&left.files.len()))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(WhereInventory {
+        entries,
+        empty_files,
+    })
+}
+
+fn where_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
+}
+
+fn where_entry_display(entry: &WhereInventoryEntry) -> String {
+    if entry.is_file {
+        entry.path.clone()
+    } else {
+        format!("{}/", entry.path)
+    }
+}
+
+fn where_inventory_metadata(
+    path: &str,
+    is_file: bool,
+    page_offset: usize,
+    files: &[greppy_store::FileState],
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": WHERE_INVENTORY_KIND,
+        "scope_path": path,
+        "is_file": is_file,
+        "page_offset": page_offset,
+        "files": files.iter().map(|file| serde_json::json!({
+            "path": file.rel_path,
+            "sha256": file.sha256,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn insert_where_inventory_pack(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    path: &str,
+    is_file: bool,
+    page_offset: usize,
+    files: &[greppy_store::FileState],
+    definitions: usize,
+) -> Result<ExpandHandle> {
+    let display = if is_file {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    };
+    let summary = serde_json::json!({
+        "text": format!("{} definitions in {display}", definitions),
+        "definitions": definitions,
+        "files": files.len(),
+        "content_hashes": files.iter().map(|file| serde_json::json!({
+            "path": file.rel_path,
+            "sha256": file.sha256,
+        })).collect::<Vec<_>>(),
+    });
+    insert_expand_pack_best_effort(
+        store,
+        project,
+        "where-am-i",
+        &display,
+        current_graph_generation_or_zero(store, root),
+        summary,
+        format!("inventory {display}\n"),
+        Some(where_inventory_metadata(path, is_file, page_offset, files)),
+    )
+    .ok_or_else(|| Error::Invalid(format!("could not store inventory pack for {display}")))
+}
+
+fn where_entry_line(entry: &WhereInventoryEntry, id: &str, width: usize) -> String {
+    let name = where_entry_display(entry);
+    let file_word = if entry.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let def_word = if entry.definitions.len() == 1 {
+        "def"
+    } else {
+        "defs"
+    };
+    let mut line = format!(
+        "{name:<width$}  {} {file_word}  {} {def_word}",
+        where_count(entry.files.len()),
+        where_count(entry.definitions.len())
+    );
+    if !entry.most_used.is_empty() {
+        line.push_str(" — ");
+        line.push_str(&entry.most_used.join(", "));
+    }
+    line.push_str(" — greppy expand ");
+    line.push_str(id);
+    line
+}
+
+fn where_real_language(language: &str) -> bool {
+    !language.is_empty()
+        && language != "unknown"
+        && language != "no file extension"
+        && !language.starts_with("file extension .")
+}
+
+fn where_entry_points(nodes: &[greppy_store::Node]) -> Vec<String> {
+    let mut files = nodes
+        .iter()
+        .filter(|node| where_is_definition(node) && node.name == "main")
+        .map(|node| node.file_path.clone())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn where_test_tree_root(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        parts.push(part);
+        if matches!(
+            part.to_ascii_lowercase().as_str(),
+            "test" | "tests" | "spec" | "specs" | "__tests__"
+        ) {
+            return Some(format!("{}/", parts.join("/")));
+        }
+    }
+    None
+}
+
+fn where_test_roots(
+    root_path: &std::path::Path,
+    files: &[greppy_store::FileState],
+    nodes: &[greppy_store::Node],
+) -> Vec<String> {
+    let mut roots = files
+        .iter()
+        .filter_map(|file| where_test_tree_root(&file.rel_path))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut sources = std::collections::HashMap::<String, Option<Vec<String>>>::new();
+    let mut inline_attribute = false;
+    let mut inline_other = false;
+    for node in nodes.iter().filter(|node| where_is_definition(node)) {
+        if where_test_tree_root(&node.file_path).is_some() {
+            continue;
+        }
+        let lines = sources
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+        if !nav_is_test(lines.as_ref(), node) {
+            continue;
+        }
+        let definition = node.start_line.max(1) as usize;
+        let attributed = lines
+            .as_ref()
+            .and_then(|lines| lines.get(definition.saturating_sub(4)..definition.saturating_sub(1)))
+            .into_iter()
+            .flatten()
+            .any(|line| {
+                let line = line.trim();
+                line.starts_with("#[test]")
+                    || line.starts_with("#[tokio::test")
+                    || line.starts_with("#[rstest")
+                    || line.starts_with("#[test_case")
+            });
+        inline_attribute |= attributed;
+        inline_other |= !attributed;
+    }
+    if inline_attribute {
+        roots.insert("inline #[test] modules".into());
+    }
+    if inline_other {
+        roots.insert("inline test definitions".into());
+    }
+    roots.into_iter().collect()
+}
+
+fn where_is_documentation_file(file: &greppy_store::FileState) -> bool {
+    file.language == "markdown"
+}
+
+fn where_is_config_file(file: &greppy_store::FileState) -> bool {
+    matches!(file.language.as_str(), "json" | "toml" | "yaml")
+}
+
+fn where_code_nodes(
+    nodes: &[greppy_store::Node],
+    files: &[greppy_store::FileState],
+) -> Vec<greppy_store::Node> {
+    let non_code_paths = files
+        .iter()
+        .filter(|file| where_is_documentation_file(file) || where_is_config_file(file))
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    nodes
+        .iter()
+        .filter(|node| {
+            where_is_definition(node) && !non_code_paths.contains(node.file_path.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn dispatch_where_am_i(root: Option<&str>, json: bool) -> Result<i32> {
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    let root_path = resolve_root(root)?;
+    let files = store.list_file_states(&project)?;
+    let nodes = store.list_nodes(&project, "", "", 0, i64::MAX as usize)?;
+
+    let documentation_paths = files
+        .iter()
+        .filter(|file| where_is_documentation_file(file))
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let config_paths = files
+        .iter()
+        .filter(|file| where_is_config_file(file))
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let code_nodes = where_code_nodes(&nodes, &files);
+    let documentation_sections = nodes
+        .iter()
+        .filter(|node| {
+            where_is_definition(node) && documentation_paths.contains(node.file_path.as_str())
+        })
+        .count();
+    let config_keys = nodes
+        .iter()
+        .filter(|node| where_is_definition(node) && config_paths.contains(node.file_path.as_str()))
+        .count();
+
+    let mut language_counts = std::collections::BTreeMap::<String, usize>::new();
+    for file in &files {
+        if where_real_language(&file.language) {
+            *language_counts.entry(file.language.clone()).or_default() += 1;
+        }
+    }
+    let mut languages = language_counts.into_iter().collect::<Vec<_>>();
+    languages.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let language_text = languages
+        .iter()
+        .map(|(language, _)| language.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let incoming_degrees = where_incoming_degrees(&store, &project)?;
+    let inventory =
+        where_inventory_entries(&root_path, &incoming_degrees, "", &files, &code_nodes)?;
+    let width = inventory
+        .entries
+        .iter()
+        .map(where_entry_display)
+        .map(|name| name.len())
+        .max()
+        .unwrap_or(0);
+    let mut inventory_json = Vec::with_capacity(inventory.entries.len());
+    let mut inventory_text = Vec::with_capacity(inventory.entries.len());
+    for entry in &inventory.entries {
+        let handle = insert_where_inventory_pack(
+            &store,
+            root,
+            &project,
+            &entry.path,
+            entry.is_file,
+            0,
+            &entry.files,
+            entry.definitions.len(),
+        )?;
+        inventory_text.push(where_entry_line(entry, &handle.id, width));
+        inventory_json.push(serde_json::json!({
+            "path": where_entry_display(entry),
+            "files": entry.files.len(),
+            "definitions": entry.definitions.len(),
+            "most_used": entry.most_used,
+            "expand_id": handle.id,
+        }));
+    }
+
+    let entry_points = where_entry_points(&code_nodes);
+    let test_roots = where_test_roots(&root_path, &files, &code_nodes);
+    if json {
+        let value = serde_json::json!({
+            "schema_version": "greppy.where-am-i.v1",
+            "root": root_path.to_string_lossy(),
+            "census": {
+                "files": files.len(),
+                "definitions": code_nodes.len(),
+                "further_files_without_definitions": inventory.empty_files,
+                "documentation": {
+                    "files": documentation_paths.len(),
+                    "sections": documentation_sections,
+                },
+                "config": {
+                    "files": config_paths.len(),
+                    "keys": config_keys,
+                },
+            },
+            "inventory": inventory_json,
+            "languages": languages.iter().map(|(language, count)| serde_json::json!({
+                "language": language,
+                "files": count,
+            })).collect::<Vec<_>>(),
+            "orientation": {
+                "entry_points": entry_points,
+                "test_roots": test_roots,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| Error::Parse(format!("serialize where-am-i JSON: {error}")))?
+        );
+        return Ok(0);
+    }
+
+    if language_text.is_empty() {
+        println!(
+            "{} — {} files, {} definitions",
+            root_path.display(),
+            where_count(files.len()),
+            where_count(code_nodes.len())
+        );
+    } else {
+        println!(
+            "{} — {}, {} files, {} definitions",
+            root_path.display(),
+            language_text,
+            where_count(files.len()),
+            where_count(code_nodes.len())
+        );
+    }
+
+    if !inventory_text.is_empty()
+        || inventory.empty_files > 0
+        || !documentation_paths.is_empty()
+        || !config_paths.is_empty()
+    {
+        println!();
+    }
+    for line in inventory_text {
+        println!("{line}");
+    }
+    if inventory.empty_files > 0 {
+        println!(
+            "{} further {} hold no definitions",
+            where_count(inventory.empty_files),
+            if inventory.empty_files == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        );
+    }
+    let mut supplementary = Vec::new();
+    if !documentation_paths.is_empty() {
+        supplementary.push(format!(
+            "docs: {} {}, {} {}",
+            where_count(documentation_paths.len()),
+            if documentation_paths.len() == 1 {
+                "file"
+            } else {
+                "files"
+            },
+            where_count(documentation_sections),
+            if documentation_sections == 1 {
+                "section"
+            } else {
+                "sections"
+            }
+        ));
+    }
+    if !config_paths.is_empty() {
+        supplementary.push(format!(
+            "config: {} {}, {} {}",
+            where_count(config_paths.len()),
+            if config_paths.len() == 1 {
+                "file"
+            } else {
+                "files"
+            },
+            where_count(config_keys),
+            if config_keys == 1 { "key" } else { "keys" }
+        ));
+    }
+    if !supplementary.is_empty() {
+        println!("{}", supplementary.join(" · "));
+    }
+
+    if !entry_points.is_empty() || !test_roots.is_empty() {
+        println!();
+    }
+    if !entry_points.is_empty() {
+        println!("entry points: {}", entry_points.join(", "));
+    }
+    if !test_roots.is_empty() {
+        println!("tests: {}", test_roots.join(", "));
+    }
+    Ok(0)
+}
+
+#[derive(Clone)]
+struct WhereExpectedFile {
+    path: String,
+    sha256: String,
+}
+
+fn where_parse_inventory_metadata(
+    value: &serde_json::Value,
+) -> Option<(String, bool, usize, Vec<WhereExpectedFile>)> {
+    if value.get("kind")?.as_str()? != WHERE_INVENTORY_KIND {
+        return None;
+    }
+    let path = value.get("scope_path")?.as_str()?.to_string();
+    let is_file = value.get("is_file")?.as_bool()?;
+    let page_offset = value
+        .get("page_offset")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let files = value
+        .get("files")?
+        .as_array()?
+        .iter()
+        .map(|file| {
+            Some(WhereExpectedFile {
+                path: file.get("path")?.as_str()?.to_string(),
+                sha256: file.get("sha256")?.as_str()?.to_string(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((path, is_file, page_offset, files))
+}
+
+fn where_scope_states<'a>(
+    states: &'a [greppy_store::FileState],
+    scope: &str,
+    is_file: bool,
+) -> Vec<&'a greppy_store::FileState> {
+    if is_file {
+        states
+            .iter()
+            .filter(|file| file.rel_path == scope)
+            .collect()
+    } else {
+        let prefix = format!("{scope}/");
+        states
+            .iter()
+            .filter(|file| file.rel_path.starts_with(&prefix))
+            .collect()
+    }
+}
+
+fn where_live_inventory_files(
+    states: &[greppy_store::FileState],
+    scope: &str,
+    is_file: bool,
+    expected: &[WhereExpectedFile],
+) -> Option<(String, Vec<greppy_store::FileState>)> {
+    let exact = where_scope_states(states, scope, is_file);
+    if exact.len() == expected.len()
+        && expected.iter().all(|wanted| {
+            exact
+                .iter()
+                .any(|live| live.rel_path == wanted.path && live.sha256 == wanted.sha256)
+        })
+    {
+        return Some((scope.to_string(), exact.into_iter().cloned().collect()));
+    }
+
+    if is_file {
+        let wanted = expected.first()?;
+        let matches = states
+            .iter()
+            .filter(|live| live.sha256 == wanted.sha256)
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            let live = matches[0].clone();
+            return Some((live.rel_path.clone(), vec![live]));
+        }
+        return None;
+    }
+
+    let old_prefix = format!("{scope}/");
+    let first = expected.first()?;
+    let first_suffix = first.path.strip_prefix(&old_prefix)?;
+    let mut candidate_scopes = states
+        .iter()
+        .filter(|live| live.sha256 == first.sha256 && live.rel_path.ends_with(first_suffix))
+        .filter_map(|live| {
+            live.rel_path
+                .strip_suffix(first_suffix)
+                .map(|prefix| prefix.trim_end_matches('/').to_string())
+        })
+        .collect::<Vec<_>>();
+    candidate_scopes.sort();
+    candidate_scopes.dedup();
+    for candidate in candidate_scopes {
+        let mut relocated = Vec::new();
+        let mut complete = true;
+        for wanted in expected {
+            let Some(suffix) = wanted.path.strip_prefix(&old_prefix) else {
+                complete = false;
+                break;
+            };
+            let path = where_join_path(&candidate, suffix);
+            let Some(live) = states
+                .iter()
+                .find(|live| live.rel_path == path && live.sha256 == wanted.sha256)
+            else {
+                complete = false;
+                break;
+            };
+            relocated.push(live.clone());
+        }
+        if !complete {
+            continue;
+        }
+        let scoped = where_scope_states(states, &candidate, false);
+        if scoped.len() == relocated.len() {
+            return Some((candidate, relocated));
+        }
+    }
+    None
+}
+
+fn where_definition_rows(
+    root_path: &std::path::Path,
+    definitions: &[greppy_store::Node],
+) -> (String, Vec<serde_json::Value>) {
+    let mut rows = definitions.to_vec();
+    rows.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| nav_short_name(left).cmp(&nav_short_name(right)))
+    });
+    let mut text = String::new();
+    let mut json_rows = Vec::new();
+    let mut previous_file: Option<&str> = None;
+    let mut sources = std::collections::HashMap::<String, Option<Vec<String>>>::new();
+    for node in &rows {
+        if previous_file.is_some_and(|file| file != node.file_path) {
+            text.push('\n');
+        }
+        previous_file = Some(&node.file_path);
+        let lines = sources
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+        let name = nav_short_name(node);
+        let kind = nav_kind_word(lines.as_ref(), node);
+        let test = nav_is_test(lines.as_ref(), node);
+        text.push_str(&format!(
+            "{}:{}  {}  {}{}\n",
+            node.file_path,
+            node.start_line.max(1),
+            name,
+            kind,
+            if test { "  test" } else { "" }
+        ));
+        json_rows.push(serde_json::json!({
+            "file": node.file_path,
+            "line": node.start_line.max(1),
+            "name": name,
+            "kind": kind,
+            "test": test,
+        }));
+    }
+    (text, json_rows)
+}
+
+pub(crate) fn where_inventory_expand_payload(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    metadata: &serde_json::Value,
+) -> Result<std::result::Result<(String, serde_json::Value), String>> {
+    let Some((stored_scope, is_file, page_offset, expected)) =
+        where_parse_inventory_metadata(metadata)
+    else {
+        return Ok(Err("expand: invalid where-am-i inventory pack".into()));
+    };
+    let states = store.list_file_states(project)?;
+    let Some((scope, files)) =
+        where_live_inventory_files(&states, &stored_scope, is_file, &expected)
+    else {
+        return Ok(Err(
+            "expand: inventory changed since this pack was created".into()
+        ));
+    };
+    let root_path = resolve_root(root)?;
+    let nodes = store.list_nodes(project, "", "", 0, i64::MAX as usize)?;
+    let code_nodes = where_code_nodes(&nodes, &states);
+    let mut definitions = where_nodes_for_files(&code_nodes, &files);
+    definitions.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| nav_short_name(left).cmp(&nav_short_name(right)))
+    });
+
+    if definitions.len() <= WHERE_INVENTORY_BUDGET {
+        if definitions.is_empty() {
+            return Ok(Ok((
+                "no definitions\n".into(),
+                serde_json::json!({"kind": WHERE_INVENTORY_KIND, "scope_path": scope, "total": 0, "rows": []}),
+            )));
+        }
+        let (text, rows) = where_definition_rows(&root_path, &definitions);
+        return Ok(Ok((
+            text,
+            serde_json::json!({
+                "kind": WHERE_INVENTORY_KIND,
+                "scope_path": scope,
+                "total": definitions.len(),
+                "rows": rows,
+            }),
+        )));
+    }
+
+    if is_file {
+        let start = page_offset.min(definitions.len());
+        let end = start
+            .saturating_add(WHERE_INVENTORY_BUDGET)
+            .min(definitions.len());
+        let (mut text, rows) = where_definition_rows(&root_path, &definitions[start..end]);
+        let mut next_id = serde_json::Value::Null;
+        if end < definitions.len() {
+            let handle = insert_where_inventory_pack(
+                store,
+                root,
+                project,
+                &scope,
+                true,
+                end,
+                &files,
+                definitions.len(),
+            )?;
+            text.push_str(&format!(
+                "\n{} defs — greppy expand {}\n",
+                where_count(definitions.len() - end),
+                handle.id
+            ));
+            next_id = serde_json::json!(handle.id);
+        }
+        return Ok(Ok((
+            text,
+            serde_json::json!({
+                "kind": WHERE_INVENTORY_KIND,
+                "scope_path": scope,
+                "total": definitions.len(),
+                "offset": start,
+                "shown": end - start,
+                "rows": rows,
+                "next_expand_id": next_id,
+            }),
+        )));
+    }
+
+    let incoming_degrees = where_incoming_degrees(store, project)?;
+    let inventory =
+        where_inventory_entries(&root_path, &incoming_degrees, &scope, &files, &code_nodes)?;
+    let width = inventory
+        .entries
+        .iter()
+        .map(where_entry_display)
+        .map(|name| name.len())
+        .max()
+        .unwrap_or(0);
+    let mut text = String::new();
+    let mut children = Vec::new();
+    for entry in &inventory.entries {
+        let handle = insert_where_inventory_pack(
+            store,
+            root,
+            project,
+            &entry.path,
+            entry.is_file,
+            0,
+            &entry.files,
+            entry.definitions.len(),
+        )?;
+        text.push_str(&where_entry_line(entry, &handle.id, width));
+        text.push('\n');
+        children.push(serde_json::json!({
+            "path": where_entry_display(entry),
+            "files": entry.files.len(),
+            "definitions": entry.definitions.len(),
+            "most_used": entry.most_used,
+            "expand_id": handle.id,
+        }));
+    }
+    if inventory.empty_files > 0 {
+        text.push_str(&format!(
+            "{} further {} hold no definitions\n",
+            where_count(inventory.empty_files),
+            if inventory.empty_files == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        ));
+    }
+    Ok(Ok((
+        text,
+        serde_json::json!({
+            "kind": WHERE_INVENTORY_KIND,
+            "scope_path": scope,
+            "total": definitions.len(),
+            "children": children,
+            "further_files_without_definitions": inventory.empty_files,
+        }),
+    )))
+}
+
 pub(crate) fn dispatch_impact(
     symbol: Option<&str>,
     paths: &[String],
     direction: &str,
     edge: Option<&str>,
     depth: usize,
-    since: Option<&str>,
-    base: Option<&str>,
     all: bool,
     json: bool,
     root: Option<&str>,
@@ -38,37 +975,7 @@ pub(crate) fn dispatch_impact(
         greppy_search::ReachDirection::Outgoing => "outgoing",
     };
     let edge_upper = edge.map(|edge| edge.trim().to_ascii_uppercase());
-    if since.is_some() && base.is_some() {
-        return Err(Error::Invalid(
-            "impact accepts only one git diff scope at a time".into(),
-        ));
-    }
     let edge_spec = impact_edge_spec(dir, edge_upper.as_deref());
-    if since.is_some() || base.is_some() {
-        if symbol.map(str::trim).is_some_and(|s| !s.is_empty()) {
-            return Err(Error::Invalid(
-                "impact accepts either a symbol or a git diff scope, not both".into(),
-            ));
-        }
-        let scope = match (since, base) {
-            (Some(rev), None) => DiffSearchScope::Since { rev },
-            (None, Some(base)) => DiffSearchScope::Base { base },
-            _ => {
-                return Err(Error::Invalid(
-                    "impact accepts exactly one git diff scope".into(),
-                ));
-            }
-        };
-        return dispatch_impact_diff_scope(
-            scope,
-            dir,
-            direction_label,
-            &edge_spec,
-            depth,
-            json,
-            root,
-        );
-    }
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
@@ -451,181 +1358,6 @@ pub(crate) fn impact_node_sentence(
     let mut chars = sentence.chars();
     let first = chars.next()?.to_lowercase().to_string();
     Some(format!("{first}{}", chars.as_str()))
-}
-
-pub(crate) fn dispatch_impact_diff_scope(
-    scope: DiffSearchScope<'_>,
-    direction: greppy_search::ReachDirection,
-    direction_label: &str,
-    edge_spec: &ImpactEdgeSpec<'_>,
-    depth: usize,
-    json: bool,
-    root: Option<&str>,
-) -> Result<i32> {
-    let store = open_default_store(root)?;
-    let project = project_for(root)?;
-    // Never compute impact from a stale graph; trigger the bounded refresh
-    // policy and return a stable refusal payload.
-    if let FreshnessServe::Refuse(freshness) = freshness_serve_decision(&store, root, &project) {
-        let refusal_exit = freshness_refusal_exit(&freshness);
-        if json {
-            // Impact reports only real code providers (excludes .stderr/.snap).
-            let incomplete_providers = code_incomplete_provider_json(&store, &project)?;
-            let mut v = serde_json::json!({
-                "command": "impact",
-                "status": "skipped_stale_index",
-                "project": project,
-                "fresh": false,
-                "freshness": freshness,
-                "provider_complete": incomplete_providers.is_empty(),
-                "incomplete_provider_count": incomplete_providers.len(),
-                "incomplete_providers": incomplete_providers,
-                "scope": "diff",
-                "direction": direction_label,
-                "max_hops": depth,
-                "source_total": 0,
-                "total_exact": 0,
-                "shown": 0,
-                "hits": [],
-            });
-            insert_impact_edge_meta(&mut v, edge_spec);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&v)
-                    .map_err(|e| Error::Invalid(format!("serialize impact stale JSON: {e}")))?
-            );
-        } else {
-            println!("{}", indexed_stale_skip_message("impact diff", &freshness));
-        }
-        return Ok(refusal_exit);
-    }
-    let mut gate_extra = serde_json::json!({
-        "scope": "diff",
-        "direction": direction_label,
-        "max_hops": depth,
-        "source_total": 0,
-        "source_shown": 0,
-        "source_omitted": 0,
-        "all": false,
-    });
-    insert_impact_edge_meta(&mut gate_extra, edge_spec);
-    if let Some(code) =
-        provider_policy_graph_gate(&store, root, &project, "impact", json, gate_extra, "hits")?
-    {
-        return Ok(code);
-    }
-
-    let root_path = resolve_root(root)?;
-    let spec = git_diff_search_spec(&root_path, scope)?;
-    let diff_base = spec.merge_base.as_deref().unwrap_or(&spec.diff_rev);
-    let changed_lines = git_diff_changed_lines(&root_path, diff_base, "impact")?;
-    let sources = diff_impact_sources(&store, &project, &changed_lines)?;
-    let source_shown = sources.len().min(NAV_LIMIT);
-    let hits = diff_impact_hits(&store, &sources, direction, &edge_spec.edge_types, depth)?;
-    let shown = hits.len().min(NAV_LIMIT);
-
-    if json {
-        let source_rows = sources[..source_shown]
-            .iter()
-            .map(|source| {
-                serde_json::json!({
-                    "qualified_name": &source.row.qualified_name,
-                    "label": &source.row.label,
-                    "file_path": &source.row.file_path,
-                    "start_line": source.row.start_line,
-                    "end_line": source.row.end_line,
-                })
-            })
-            .collect::<Vec<_>>();
-        let hit_rows = hits[..shown]
-            .iter()
-            .map(|hit| {
-                let sources = hit
-                    .sources
-                    .iter()
-                    .take(8)
-                    .map(|source| {
-                        serde_json::json!({
-                            "qualified_name": &source.qualified_name,
-                            "file_path": &source.file_path,
-                            "start_line": source.start_line,
-                            "end_line": source.end_line,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                serde_json::json!({
-                    "hops": hit.hops,
-                    "qualified_name": &hit.node.qualified_name,
-                    "label": &hit.node.label,
-                    "file_path": &hit.node.file_path,
-                    "start_line": hit.node.start_line,
-                    "end_line": hit.node.end_line,
-                    "source_count": hit.sources.len(),
-                    "sources": sources,
-                })
-            })
-            .collect::<Vec<_>>();
-        impact_diff_counts_json(
-            &store,
-            root,
-            &project,
-            &spec,
-            direction_label,
-            edge_spec.mode,
-            &edge_spec.edge_types,
-            depth,
-            sources.len(),
-            source_shown,
-            hits.len(),
-            shown,
-            hit_rows,
-            source_rows,
-        )?;
-        return Ok(if sources.is_empty() { 1 } else { 0 });
-    }
-
-    if sources.is_empty() {
-        println!("(no indexed definitions touched by diff)");
-        return Ok(1);
-    }
-    println!(
-        "diff sources: {} shown of {} total",
-        source_shown,
-        sources.len()
-    );
-    for source in &sources[..source_shown] {
-        println!(
-            "source {} {}",
-            display_row_name(&source.row),
-            line_span(
-                &source.row.file_path,
-                source.row.start_line,
-                source.row.end_line
-            )
-        );
-    }
-    if hits.is_empty() {
-        println!("(no transitive impact from diff sources)");
-        return Ok(0);
-    }
-    for hit in &hits[..shown] {
-        let source_names = hit
-            .sources
-            .iter()
-            .take(3)
-            .map(display_row_name)
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(
-            "hop {} {} {} sources={}",
-            hit.hops,
-            display_row_name(&hit.node),
-            line_span(&hit.node.file_path, hit.node.start_line, hit.node.end_line),
-            source_names
-        );
-    }
-    print_nav_more_footer(hits.len(), shown);
-    Ok(0)
 }
 
 pub(crate) fn dispatch_brief(

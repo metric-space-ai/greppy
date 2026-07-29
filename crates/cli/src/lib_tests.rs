@@ -1378,40 +1378,12 @@ where
     }
 
     #[test]
-    fn impact_parses_diff_scopes_without_symbol() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "impact",
-            "--base",
-            "main",
-            "--direction",
-            "outgoing",
-            "--json",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Impact {
-                symbols,
-                path_opts: _,
-                code: _,
-                direction,
-                edge,
-                depth,
-                since,
-                base,
-                all,
-                json,
-            }) => {
-                assert!(symbols.is_empty());
-                assert_eq!(direction, "outgoing");
-                assert!(edge.is_none());
-                assert_eq!(depth, 6);
-                assert!(since.is_none());
-                assert_eq!(base.as_deref(), Some("main"));
-                assert!(!all);
-                assert!(json);
-            }
-            other => panic!("expected Impact, got {other:?}"),
+    fn impact_rejects_removed_git_scopes() {
+        for flag in ["--since", "--base"] {
+            assert!(
+                Cli::try_parse_from(["greppy", "impact", "hub", flag, "main"]).is_err(),
+                "{flag} must not remain on impact"
+            );
         }
 
         let cli = Cli::try_parse_from(["greppy", "impact", "hub", "--edge", "CALLS"]).unwrap();
@@ -1590,12 +1562,24 @@ where
         // Structured subcommands → NOT passthrough.
         assert!(!is_grep_passthrough(&mk(&["greppy", "index", "."])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "doctor"])));
-        // A removed verb is no longer a subcommand, so the routing sends it to
-        // the passthrough — and `unknown_verb_refusal` is what stops it there,
-        // before "references" can become a search pattern.
-        assert!(is_grep_passthrough(&mk(&["greppy", "references", "Foo"])));
-        assert!(unknown_verb_refusal(&mk(&["greppy", "references", "Foo"])).is_some());
-        assert!(unknown_verb_refusal(&mk(&["greppy", "find-usages", "Foo"])).is_some());
+        // Removed verbs are no longer subcommands. The routing would send them
+        // to passthrough, so `unknown_verb_refusal` must stop every one before
+        // its name can become a grep pattern.
+        for verb in [
+            "references",
+            "find-usages",
+            "map",
+            "outline",
+            "changes",
+            "verify",
+        ] {
+            assert!(is_grep_passthrough(&mk(&["greppy", verb, "Foo"])), "{verb}");
+            assert!(
+                unknown_verb_refusal(&mk(&["greppy", verb, "Foo"])).is_some(),
+                "{verb}"
+            );
+        }
+        assert!(!is_grep_passthrough(&mk(&["greppy", "where-am-i"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "fan-in"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "fan-out"])));
         assert!(!is_grep_passthrough(&mk(&[

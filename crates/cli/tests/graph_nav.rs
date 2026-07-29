@@ -193,38 +193,6 @@ fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
     (repo, store)
 }
 
-fn make_real_git_diff_impact_repo(tag: &str) -> (PathBuf, PathBuf) {
-    let root = fresh_dir(tag);
-    let repo = root.join("repo");
-    let src = repo.join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("lib.rs"), "mod hub;\nmod callers;\n").unwrap();
-    std::fs::write(src.join("hub.rs"), "pub fn hub() -> u32 { 7 }\n").unwrap();
-    std::fs::write(
-        src.join("callers.rs"),
-        r#"
-pub fn caller_a() -> u32 { crate::hub::hub() }
-pub fn caller_b() -> u32 { crate::hub::hub() }
-pub fn caller_c() -> u32 { crate::hub::hub() }
-"#,
-    )
-    .unwrap();
-
-    git(&repo, &["init"]);
-    git(&repo, &["config", "user.email", "greppy@example.invalid"]);
-    git(&repo, &["config", "user.name", "greppy test"]);
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-m", "baseline"]);
-    git(&repo, &["branch", "basepoint"]);
-
-    std::fs::write(src.join("hub.rs"), "pub fn hub() -> u32 { 8 }\n").unwrap();
-    git(&repo, &["add", "src/hub.rs"]);
-    git(&repo, &["commit", "-m", "change hub"]);
-
-    let store = root.join("store");
-    (repo, store)
-}
-
 // ---------------------------------------------------------------------------
 // who-calls — incoming CALLS edges resolve to the cross-file caller.
 // ---------------------------------------------------------------------------
@@ -1377,90 +1345,6 @@ fn impact_json_explicit_calls_edge_is_not_remapped_to_all_references() {
         .unwrap_or_else(|e| panic!("invalid impact json: {e}; stdout={out:?}"));
     assert_eq!(v["edge_type"], "CALLS");
     assert_eq!(v["edge_types"], serde_json::json!(["CALLS"]));
-}
-
-#[test]
-fn impact_since_json_maps_changed_hunk_to_symbol_and_transitive_callers() {
-    let (repo, store) = make_real_git_diff_impact_repo("impact-since-diff");
-    let (code, out, err) = run(&["index", "."], &repo, &store);
-    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
-
-    let (code, out, err) = run(&["impact", "--since", "HEAD~1", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "impact --since --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid impact diff json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "impact");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["scope"], "diff");
-    assert_eq!(v["diff_scope"], "since");
-    assert_eq!(v["backend"], "git_diff_graph");
-    assert_eq!(v["fresh"], true);
-    assert_eq!(v["direction"], "incoming");
-    assert_eq!(v["edge_type"], "all_references");
-    assert_eq!(
-        v["edge_types"],
-        serde_json::json!(["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"])
-    );
-    assert_eq!(v["diff_files_total"], 1);
-    assert_eq!(v["source_total"], 1);
-    assert_eq!(v["source_symbols"].as_array().unwrap().len(), 1);
-    assert!(
-        v["source_symbols"][0]["qualified_name"]
-            .as_str()
-            .unwrap_or("")
-            .contains("hub"),
-        "changed hunk should map to hub source symbol: {v:?}"
-    );
-    assert_eq!(v["total_exact"], 3);
-    let hits = v["hits"].as_array().expect("impact diff hits");
-    assert_eq!(hits.len(), 3);
-    assert!(
-        hits.iter().all(|hit| hit["qualified_name"]
-            .as_str()
-            .unwrap_or("")
-            .contains("caller_")),
-        "impact diff hits should be caller functions: {v:?}"
-    );
-    assert!(hits.iter().all(|hit| hit["source_count"] == 1));
-}
-
-#[test]
-fn impact_base_text_and_json_use_merge_base_diff_sources() {
-    let (repo, store) = make_real_git_diff_impact_repo("impact-base-diff");
-    let (code, out, err) = run(&["index", "."], &repo, &store);
-    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
-
-    let (code, out, err) = run(&["impact", "--base", "basepoint"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "impact --base text should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("diff sources: 1 shown of 1 total")
-            && out.contains("source")
-            && out.contains("hub")
-            && out.contains("caller_"),
-        "impact --base text should show source hub and impacted callers; got: {out}"
-    );
-
-    let (code, out, err) = run(&["impact", "--base", "basepoint", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "impact --base --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid impact base json: {e}; stdout={out:?}"));
-    assert_eq!(v["scope"], "diff");
-    assert_eq!(v["diff_scope"], "base");
-    assert_eq!(v["backend"], "git_diff_graph");
-    assert_eq!(v["source_total"], 1);
-    assert_eq!(v["total_exact"], 3);
-    assert_eq!(v["shown"], 3);
-    assert_eq!(v["merge_base"].as_str().unwrap_or("").len(), 40);
-    assert_eq!(v["hits"].as_array().unwrap().len(), 3);
 }
 
 #[test]
