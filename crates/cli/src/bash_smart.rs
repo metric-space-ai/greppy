@@ -76,6 +76,11 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
 
     let mut command = command_for_argv(argv);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -110,7 +115,7 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
                     .is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) =>
             {
                 timed_out = true;
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 break child
                     .wait()
                     .map_err(|error| Error::io("wait for timed-out bash-smart command", error))?;
@@ -119,8 +124,15 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
             Err(error) => return Err(Error::io("wait for bash-smart command", error)),
         }
     };
+    let capture_end_micros = started.elapsed().as_micros();
     let stdout_capture = join_drain(stdout_thread, "stdout")?;
     let stderr_capture = join_drain(stderr_thread, "stderr")?;
+    let timeout_stdout_line = timed_out
+        .then(|| line_before_largest_gap(&stdout_capture.timestamps_path, capture_end_micros))
+        .flatten();
+    let timeout_stderr_line = timed_out
+        .then(|| line_before_largest_gap(&stderr_capture.timestamps_path, capture_end_micros))
+        .flatten();
     let exit_code = child_exit_code(&status);
     let raw = StoredRaw::from_capture(stdout_capture, stderr_capture)?;
     let stdout_lines = split_lines(&raw.stdout);
@@ -156,16 +168,18 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         None
     };
 
-    let lifted_stdout = if stdout_lines.len() > SHORT_TOTAL_LINES {
+    let mut lifted_stdout = if stdout_lines.len() > SHORT_TOTAL_LINES {
         novelty_lifts(&stdout_lines, root)
     } else {
         Vec::new()
     };
-    let lifted_stderr = if stderr_folded {
+    let mut lifted_stderr = if stderr_folded {
         novelty_lifts(&stderr_lines, root)
     } else {
         Vec::new()
     };
+    push_line_lift(&mut lifted_stdout, &stdout_lines, timeout_stdout_line);
+    push_line_lift(&mut lifted_stderr, &stderr_lines, timeout_stderr_line);
 
     if stdout_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stdout_id.as_deref()) {
@@ -459,6 +473,48 @@ fn join_drain(
         .map_err(|error| Error::io(format!("spool bash-smart {stream}"), error))
 }
 
+fn line_before_largest_gap(path: &Path, capture_end_micros: u128) -> Option<usize> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let timestamps = raw
+        .lines()
+        .map(str::parse::<u128>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    let first = *timestamps.first()?;
+    let mut largest_gap = 0u128;
+    let mut line = 1usize;
+    let mut previous = first;
+    for (index, current) in timestamps.iter().copied().enumerate().skip(1) {
+        let gap = current.saturating_sub(previous);
+        if gap > largest_gap {
+            largest_gap = gap;
+            line = index;
+        }
+        previous = current;
+    }
+    let final_gap = capture_end_micros.saturating_sub(previous);
+    if final_gap >= largest_gap {
+        line = timestamps.len();
+    }
+    Some(line)
+}
+
+fn push_line_lift(lifts: &mut Vec<LiftedLine>, lines: &[RawLine<'_>], line: Option<usize>) {
+    let Some(line) = line.filter(|line| *line > 0) else {
+        return;
+    };
+    let Some(raw) = lines.get(line - 1) else {
+        return;
+    };
+    if lifts.iter().any(|lift| lift.line == line) {
+        return;
+    }
+    lifts.push(LiftedLine {
+        line,
+        bytes: raw.content.to_vec(),
+    });
+}
+
 fn command_for_argv(argv: &[String]) -> std::process::Command {
     if argv.len() == 1 {
         #[cfg(windows)]
@@ -478,6 +534,19 @@ fn command_for_argv(argv: &[String]) -> std::process::Command {
         command.args(&argv[1..]);
         command
     }
+}
+
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // The child starts a fresh process group, so descendants that inherited
+        // its pipes cannot keep the drainer threads alive after a timeout.
+        if unsafe { libc::kill(process_group, libc::SIGKILL) } == 0 {
+            return;
+        }
+    }
+    let _ = child.kill();
 }
 
 fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
@@ -702,6 +771,10 @@ fn byte_gate(
     } else {
         &raw.stdout
     });
+    gate_lifts(&lines, candidates)
+}
+
+fn gate_lifts(lines: &[RawLine<'_>], candidates: &[LiftedLine]) -> Vec<LiftedLine> {
     candidates
         .iter()
         .filter(|candidate| {
@@ -936,7 +1009,7 @@ fn rank_novelty(
         .take(NOVELTY_TOP_K)
         .map(|(group_index, _)| LiftedLine {
             line: groups[group_index].start,
-            bytes: groups[group_index].representative.clone(),
+            bytes: lines[groups[group_index].start - 1].content.to_vec(),
         })
         .collect()
 }
@@ -1144,6 +1217,34 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"one\ntwo\nlast");
         assert_eq!(std::fs::read_to_string(times).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn timeout_gap_names_the_line_before_the_longest_pause() {
+        let dir = std::env::temp_dir().join(format!("greppy-bash-smart-gap-{}", spool_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("times");
+        std::fs::write(&path, "10\n20\n900\n910\n").unwrap();
+        assert_eq!(line_before_largest_gap(&path, 1_000), Some(2));
+        std::fs::write(&path, "10\n20\n30\n").unwrap();
+        assert_eq!(line_before_largest_gap(&path, 1_000), Some(3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lifted_lines_hold_content_bytes_for_the_byte_gate() {
+        let raw = b"one\ntwo\n";
+        let lines = split_lines(raw);
+        let mut lifts = Vec::new();
+        push_line_lift(&mut lifts, &lines, Some(2));
+        lifts.push(LiftedLine {
+            line: 1,
+            bytes: b"invented".to_vec(),
+        });
+        let gated = gate_lifts(&lines, &lifts);
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].line, 2);
+        assert_eq!(gated[0].bytes, b"two");
     }
 
     #[test]
