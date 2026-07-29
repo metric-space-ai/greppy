@@ -140,7 +140,9 @@ pub(crate) fn read_span_with_meta(
     })
 }
 
+const READ_FILE_PAGE_LINES: usize = 400;
 const READ_PACK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+const READ_FILE_PACK_KIND: &str = "greppy.read-file.page.v1";
 const READ_HANDLE_PACK_KIND: &str = "greppy.read.handle.v2";
 const COMPACT_HANDLE_PREFIX: &str = "geh2:";
 
@@ -766,6 +768,312 @@ pub(crate) fn dispatch_read_symbols(
     }
     Ok(if failed { 1 } else { 0 })
 }
+fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
+    let supplied = std::path::Path::new(subject);
+    if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        root_path.join(supplied)
+    }
+}
+
+fn read_open_file(
+    root_path: &std::path::Path,
+    canonical_root: &std::path::Path,
+    subject: &str,
+) -> Option<(String, std::path::PathBuf, String)> {
+    let candidate = read_file_candidate(root_path, subject);
+    let canonical = candidate.canonicalize().ok()?;
+    if !canonical.starts_with(canonical_root) || !canonical.is_file() {
+        return None;
+    }
+    let relative = canonical.strip_prefix(canonical_root).ok()?;
+    let shown = relative.to_string_lossy().replace('\\', "/");
+    let content = std::fs::read_to_string(&canonical).ok()?;
+    Some((shown, canonical, content))
+}
+
+fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)> {
+    let Some((start, end)) = raw.split_once(':') else {
+        return Err(Error::Invalid(format!(
+            "read-file --lines expects A:B, got `{raw}`"
+        )));
+    };
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| Error::Invalid(format!("read-file --lines expects A:B, got `{raw}`")))?;
+    let end = end
+        .parse::<usize>()
+        .map_err(|_| Error::Invalid(format!("read-file --lines expects A:B, got `{raw}`")))?;
+    if start == 0 || end < start {
+        return Err(Error::Invalid(format!(
+            "read-file --lines expects 1 <= A <= B, got `{raw}`"
+        )));
+    }
+    if end > line_count {
+        return Err(Error::Invalid(format!(
+            "read-file --lines ends at {end}, but the file has {line_count} lines"
+        )));
+    }
+    Ok((start, end))
+}
+
+fn read_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
+}
+
+fn read_insert_file_pack(
+    store: &greppy_store::Store,
+    project: &str,
+    path: &str,
+    content: &str,
+    start_line: usize,
+) -> Result<String> {
+    let content_sha256 = read_sha256(content.as_bytes());
+    store
+        .insert_expand_pack(&greppy_store::NewExpandPack {
+            project: project.to_string(),
+            command: "read-file".into(),
+            query: format!("{path}:{start_line}"),
+            graph_generation: 0,
+            summary_json: serde_json::json!({
+                "text": format!("{path} continues at {start_line}"),
+                "content_sha256": content_sha256,
+            }),
+            payload_text: format!("{path}:{start_line}\n"),
+            payload_json: Some(serde_json::json!({
+                "kind": READ_FILE_PACK_KIND,
+                "path": path,
+                "start_line": start_line,
+                "content_sha256": content_sha256,
+            })),
+            ttl_secs: READ_PACK_TTL_SECS,
+        })
+        .map_err(Error::from)
+}
+
+fn read_render_file_page(
+    store: &greppy_store::Store,
+    project: &str,
+    path: &str,
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    with_handle: bool,
+    root_path: &std::path::Path,
+) -> Result<String> {
+    let mut out = format!("{path}:{start_line}-{end_line}\n");
+    out.push_str(read_line_slice(content, start_line, end_line));
+    if with_handle {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let full = read_full_handle(root_path, path, content.as_bytes(), start_line, end_line)?;
+        out.push_str("handle: ");
+        out.push_str(&read_compact_handle(store, project, full)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+pub(crate) fn dispatch_read_files(
+    paths: &[String],
+    lines: Option<&str>,
+    all: bool,
+    with_handle: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    let store = open_default_store_query_writer(root)?;
+    let project = project_for(root)?;
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    let mut failed = false;
+    let mut printed = false;
+    let mut previous_ended_with_newline = true;
+    for path in paths {
+        let Some((shown, _, content)) = read_open_file(&root_path, &canonical_root, path) else {
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!("no such file: {path}");
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let line_count = read_line_count(&content);
+        let (start_line, end_line, continuation) = if let Some(raw) = lines {
+            let (start, end) = read_parse_file_range(raw, line_count)?;
+            (start, end, None)
+        } else if all || line_count <= READ_FILE_PAGE_LINES {
+            (1, line_count, None)
+        } else {
+            let end = READ_FILE_PAGE_LINES;
+            let id = read_insert_file_pack(&store, &project, &shown, &content, end + 1)?;
+            (1, end, Some(id))
+        };
+        let mut group = read_render_file_page(
+            &store,
+            &project,
+            &shown,
+            &content,
+            start_line,
+            end_line,
+            with_handle,
+            &root_path,
+        )?;
+        if let Some(id) = continuation {
+            if !group.ends_with('\n') {
+                group.push('\n');
+            }
+            group.push_str(&format!(
+                "{} more lines — greppy expand {} continues at {}\n",
+                read_count(line_count - end_line),
+                id,
+                end_line + 1
+            ));
+        }
+        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+        print!("{group}");
+        previous_ended_with_newline = group.ends_with('\n');
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
+fn read_locate_file_pack(
+    store: &greppy_store::Store,
+    root_path: &std::path::Path,
+    project: &str,
+    path: &str,
+    expected_hash: &str,
+) -> Result<Option<(String, String)>> {
+    if let Ok(content) = std::fs::read_to_string(root_path.join(path)) {
+        if read_sha256(content.as_bytes()) == expected_hash {
+            return Ok(Some((path.to_string(), content)));
+        }
+    }
+    let mut matches = Vec::new();
+    for state in store.list_file_states(project)? {
+        let Ok(content) = std::fs::read_to_string(root_path.join(&state.rel_path)) else {
+            continue;
+        };
+        if read_sha256(content.as_bytes()) == expected_hash {
+            matches.push((state.rel_path, content));
+            if matches.len() > 1 {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(matches.pop())
+}
+pub(crate) fn dispatch_read_expand(
+    store: &greppy_store::Store,
+    pack: &greppy_store::ExpandPack,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    let Some(metadata) = pack.payload_json.as_ref() else {
+        println!("expand: invalid {} pack", pack.command);
+        return Ok(1);
+    };
+    let root_path = resolve_root(root)?;
+    let project = &pack.project;
+    let result = match pack.command.as_str() {
+        "read-file" => {
+            if metadata.get("kind").and_then(serde_json::Value::as_str) != Some(READ_FILE_PACK_KIND)
+            {
+                None
+            } else {
+                let path = metadata
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let start = metadata
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                let hash = metadata
+                    .get("content_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let Some((path, content)) =
+                    read_locate_file_pack(store, &root_path, project, path, hash)?
+                else {
+                    println!("expand: read-file changed since this pack was created");
+                    return Ok(1);
+                };
+                let line_count = read_line_count(&content);
+                if start == 0 || start > line_count {
+                    println!("expand: read-file changed since this pack was created");
+                    return Ok(1);
+                }
+                let end = (start + READ_FILE_PAGE_LINES - 1).min(line_count);
+                let mut text = read_render_file_page(
+                    store, project, &path, &content, start, end, false, &root_path,
+                )?;
+                let mut next = serde_json::Value::Null;
+                if end < line_count {
+                    let id = read_insert_file_pack(store, project, &path, &content, end + 1)?;
+                    text.push_str(&format!(
+                        "{} more lines — greppy expand {} continues at {}\n",
+                        read_count(line_count - end),
+                        id,
+                        end + 1
+                    ));
+                    next = serde_json::json!(id);
+                }
+                Some((
+                    text,
+                    serde_json::json!({
+                        "kind": READ_FILE_PACK_KIND,
+                        "path": path,
+                        "start_line": start,
+                        "end_line": end,
+                        "next_expand_id": next,
+                    }),
+                ))
+            }
+        }
+        _ => None,
+    };
+    let Some((text, value)) = result else {
+        println!("expand: invalid {} pack", pack.command);
+        return Ok(1);
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": pack.id,
+                "project": pack.project,
+                "command": pack.command,
+                "query": pack.query,
+                "graph_generation": pack.graph_generation,
+                "created_at": pack.created_at,
+                "expires_at": pack.expires_at,
+                "summary": pack.summary_json,
+                "payload_text": text,
+                "payload_json": value,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize expand JSON: {error}")))?
+        );
+    } else {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(0)
+}
+
 /// Read an edit source argument: a file path, or `-` for stdin.
 pub(crate) fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
     if source_file == "-" {

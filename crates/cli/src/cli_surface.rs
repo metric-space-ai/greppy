@@ -230,6 +230,22 @@ pub enum Command {
         #[arg(long, hide = true)]
         json: bool,
     },
+    /// Read files directly, in 400-line pages unless a range or all lines were requested.
+    #[command(name = "read-file")]
+    ReadFile {
+        /// Repository-relative or absolute file paths.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// Print exactly the inclusive 1-based range A:B.
+        #[arg(long, value_name = "A:B", conflicts_with = "all")]
+        lines: Option<String>,
+        /// Print every line without pagination.
+        #[arg(long, conflicts_with = "lines")]
+        all: bool,
+        /// Also print a compact edit handle for every printed span.
+        #[arg(long)]
+        handle: bool,
+    },
     /// Replace a definition with NEW; without NEW, read it from stdin.
     Replace {
         #[arg(value_name = "S", allow_hyphen_values = true)]

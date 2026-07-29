@@ -123,3 +123,56 @@ fn read_handle_is_compact_and_existing_json_shape_survives() {
     assert!(handle.starts_with("geh2:"), "{handle}");
     assert!(handle.len() <= 70, "{}: {handle}", handle.len());
 }
+#[test]
+fn read_file_pages_and_expand_continues_at_the_named_line() {
+    let (repo, store) = fresh_workspace("pages");
+    let content = (1..=805)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("long.txt"), &content).unwrap();
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.starts_with("long.txt:1-400\nline 1\n"), "{stdout}");
+    assert!(
+        stdout.contains("line 400\n405 more lines — greppy expand "),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with(" continues at 401\n"), "{stdout}");
+    let id = stdout
+        .lines()
+        .last()
+        .and_then(|line| line.split("greppy expand ").nth(1))
+        .and_then(|tail| tail.split_whitespace().next())
+        .expect("continuation id");
+
+    let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
+    assert!(
+        expanded.starts_with("long.txt:401-800\nline 401\n"),
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("5 more lines — greppy expand "),
+        "{expanded}"
+    );
+    assert!(expanded.ends_with(" continues at 801\n"), "{expanded}");
+}
+
+#[test]
+fn read_file_range_and_all_bypass_pagination() {
+    let (repo, store) = fresh_workspace("range-all");
+    std::fs::write(repo.join("config.json"), "a\nb\nc\nd\n").unwrap();
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "config.json", "--lines", "2:3"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(stdout, "config.json:2-3\nb\nc\n");
+
+    let (all_code, all_out, all_err) = run(&repo, &store, &["read-file", "config.json", "--all"]);
+    assert_eq!(all_code, 0, "stdout={all_out}\nstderr={all_err}");
+    assert_eq!(all_out, "config.json:1-4\na\nb\nc\nd\n");
+}
