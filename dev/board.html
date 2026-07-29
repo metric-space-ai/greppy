@@ -84,22 +84,23 @@
     <div class="metric"><dt>0.2.1 gemessen</dt><dd>0,46×<small> Baseline</small></dd></div>
     <div class="metric"><dt>0.3.0 Ziel</dt><dd>&lt;0,30×<small> Baseline</small></dd></div>
     <div class="metric"><dt>Prompt (AGENTS.md)</dt><dd>fertig<small> · 11 Wächter grün</small></dd></div>
-    <div class="metric"><dt>Binary deckt Prompt</dt><dd>~60 %<small> der Kommandos</small></dd></div>
+    <div class="metric"><dt>Binary deckt Prompt</dt><dd>~70 %<small> der Kommandos</small></dd></div>
   </dl>
 
   <section>
     <h2>Kritischer Pfad zum Bench — in dieser Reihenfolge</h2>
     <ol class="path">
-      <li><strong>where-am-i-Abnahme bestehen</strong> — gebaut, aber in der Echt-Ausgabe
-          durchgefallen (0-Definitionen-Zeilen mit Expand-Angebot, „most-used"-Trio zeigt
-          Testfixtures statt referenzierter Symbole, Doku/Config-Zählungen blähen die
-          Zahlen). <span class="state s-work">Sol behebt, Auftrag mit IST-Beleg</span></li>
+      <li><strong>where-am-i</strong> — Abnahme im zweiten Anlauf bestanden: Trio zeigt
+          referenzierte Symbole (Node, Store, ExtractionResult), Doku/Config separat,
+          keine Leerzeilen-Angebote. Integriert, dev-0.3.0 nachgezogen.
+          <span class="state s-done">fertig (427b055)</span> — Folgeposten: entry-points-Zeile
+          ist noch eine 60-Pfade-Wand, Kompressionsauftrag in der Queue</li>
       <li><strong><code>brief</code> bauen</strong> — Rumpf-Skizze statt Dreierbündel.
           <span class="state s-work">Kimi baut</span></li>
       <li><strong>READ-Familie bauen</strong> — read / read-smart / read-file.
-          <span class="state s-work">Sol baut (gehärteter Wrapper)</span></li>
-      <li><strong>EDIT bauen</strong> — 11 Verben in 5 grünen Scheiben, Auftrag fertig.
-          Größter offener Posten. <span class="state s-open">nach READ</span></li>
+          <span class="state s-work">Sol baut</span></li>
+      <li><strong>EDIT bauen</strong> — 11 Verben in 5 grünen Scheiben.
+          <span class="state s-work">Sol baut (parallel)</span></li>
       <li><strong>Mehrfachsymbole</strong> für who-calls/callees.
           <span class="state s-open">klein</span></li>
       <li><strong>Smoke-Pass</strong>: jede Prompt-Zeile gegen das Binary.
@@ -128,8 +129,8 @@
           </tr>
           <tr>
             <td><code>NAVIGATE</code> where-am-i</td>
-            <td><span class="state s-fail">Abnahme nicht bestanden</span></td>
-            <td>dev/captures/where-am-i-IST.txt · Fix-Auftrag läuft (Sol)</td>
+            <td><span class="state s-done">fertig</span></td>
+            <td>2. Anlauf nach Abnahme-Befund; integriert (427b055)</td>
           </tr>
           <tr>
             <td><code>NAVIGATE</code> brief</td>
@@ -142,9 +143,14 @@
             <td>erster Lauf über den gehärteten claude-agent (Präambel, Journal, Salvage)</td>
           </tr>
           <tr>
-            <td><code>EDIT</code> · Mehrfachsymbole</td>
-            <td><span class="state s-open">nicht gebaut</span></td>
-            <td>EDIT startet auf dem nächsten freien Sol-Slot (5 Scheiben, Aufträge fertig)</td>
+            <td><code>EDIT</code></td>
+            <td><span class="state s-work">im Bau (Sol)</span></td>
+            <td>5 grüne Scheiben, Quittungen, --dry-run/--verify</td>
+          </tr>
+          <tr>
+            <td>Mehrfachsymbole · entry-points-Kompression</td>
+            <td><span class="state s-open">Queue</span></td>
+            <td>Kleinposten für den nächsten freien Slot</td>
           </tr>
           <tr>
             <td><code>bash-smart</code> v1 (trainingsfrei)</td>
@@ -224,8 +230,8 @@
     </ul>
   </section>
 
-  <footer>Stand 29.07.2026 vormittags · Läufe: where-am-i-Fix (Sol) · bash-smart (Sol) ·
-    READ (Sol) · brief (Kimi) · Downloads Pass 2 (gpu3) · Wrapper-Härtung GELANDET
-    (14 Stub-Tests grün, installiert) · Zweig recovery/cli-umbau</footer>
+  <footer>Stand 29.07.2026 mittags · Läufe: bash-smart · READ · EDIT (3 Sol, Limit exakt voll) ·
+    brief (Kimi) · Downloads Pass 2 (gpu3) · where-am-i + Wrapper-Härtung gelandet ·
+    Zweig recovery/cli-umbau, dev-0.3.0 nachgezogen</footer>
 
 </div>
