@@ -2063,7 +2063,7 @@ pub(crate) fn dispatch_edit_grammar(
             emit_edit_outcome(outcome, json, None)?
         }
     };
-    Ok(GrammarDispatch::Handled(code))
+    Ok(GrammarDispatch(code))
 }
 
 pub(crate) fn edit_status_name(status: greppy_edit::Status) -> &'static str {
