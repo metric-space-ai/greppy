@@ -84,7 +84,7 @@
     <div class="metric"><dt>0.2.1 gemessen</dt><dd>0,46×<small> Baseline</small></dd></div>
     <div class="metric"><dt>0.3.0 Ziel</dt><dd>&lt;0,30×<small> Baseline</small></dd></div>
     <div class="metric"><dt>Prompt (AGENTS.md)</dt><dd>fertig<small> · 11 Wächter grün</small></dd></div>
-    <div class="metric"><dt>Binary deckt Prompt</dt><dd>~85 %<small> · Gate 24/28</small></dd></div>
+    <div class="metric"><dt>Binary deckt Prompt</dt><dd>100 %<small> · Gate 33/33</small></dd></div>
   </dl>
 
   <section>
@@ -99,15 +99,21 @@
           <span class="state s-done">fertig, integriert</span></li>
       <li><strong>EDIT</strong> — 11 Verben, Quittungen nennen jede Stelle, Verweigerungen
           mit wahren Sätzen. <span class="state s-done">fertig, integriert</span></li>
-      <li><strong>READ-Familie</strong> — read / read-smart / read-file.
-          <span class="state s-work">Sol baut (3. Anlauf, von integrierter Basis)</span></li>
-      <li><strong>Mehrfachsymbole</strong> — der letzte ::Function::-Altpfad.
-          <span class="state s-work">Sol baut</span></li>
-      <li><strong>search --path</strong> — ON EVERY COMMAND galt nicht für die Suchfamilie
-          (Gate-Fund). <span class="state s-work">Kimi baut</span></li>
-      <li><strong>Smoke-Pass</strong>: dev/smoke_pass.py, 29 Fälle inkl. Fußflags und
-          Vokabular-Verweigerungen. <span class="state s-work">24 ok · 4 fail = exakt die
-          laufenden Bauposten</span></li>
+      <li><strong>READ-Familie</strong> — 6 grüne Scheiben (byte-genaues read, Tiefenfaltung
+          mit Satz-Lücken, 400er-Seiten). <span class="state s-done">fertig, integriert</span></li>
+      <li><strong>Mehrfachsymbole</strong> — Einzelform in Gruppen, Altpfad tot; impact
+          verweigert Mehrfach. <span class="state s-done">fertig (Orchestrator)</span></li>
+      <li><strong>search + read --path</strong> — ON EVERY COMMAND gilt jetzt überall.
+          <span class="state s-done">fertig</span></li>
+      <li><strong>Smoke-Pass: 33/33 GRÜN</strong> — jede Prompt-Zeile im Binary
+          nachweisbar; 8 Suiten (85 Tests) grün dazu.
+          <span class="state s-done">Gate bestanden (28beb7c)</span></li>
+      <li><strong>Altschuld-Restrunden</strong> — Runde 2 (4 Suiten, Kimi: 2 Scheiben
+          schon grün) · Runde 3 (cli_hardening, 29 Tests, Auftrag bereit).
+          <span class="state s-work">läuft</span></li>
+      <li><strong>bash-smart-Prompt-Zeile</strong> — Entwurf in
+          dev/AGENTS-bash-smart-line-draft.md, verkauft nur was schifft.
+          <span class="state s-open">OWNER-FREIGABE</span></li>
       <li><strong>e2b-Bench</strong> auf gpu3: CUDA-Build, Vorindexieren bis „embedded
           N spans", Daemon-Prewarm + Wegwerf-Query, RB1–8 + Reasoning, Kosten-Eval.
           <span class="state s-open">Endpunkt</span></li>
