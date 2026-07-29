@@ -8,7 +8,6 @@
 
 use super::*;
 
-
 const WHERE_INVENTORY_BUDGET: usize = 25;
 const WHERE_INVENTORY_KIND: &str = "greppy.where-am-i.inventory.v1";
 
@@ -21,9 +20,17 @@ struct WhereInventoryEntry {
     most_used: Vec<String>,
 }
 
+struct WhereInventory {
+    entries: Vec<WhereInventoryEntry>,
+    empty_files: usize,
+}
+
 fn where_is_definition(node: &greppy_store::Node) -> bool {
     !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
-        && !matches!(node.label.as_str(), "Import" | "Call" | "Parameter")
+        && !matches!(
+            node.label.as_str(),
+            "Import" | "Call" | "Parameter" | "Folder" | "Project"
+        )
 }
 
 fn where_nodes_for_files(
@@ -41,19 +48,58 @@ fn where_nodes_for_files(
         .collect()
 }
 
-fn where_most_used(
+fn where_is_hub_symbol(node: &greppy_store::Node) -> bool {
+    if matches!(
+        node.label.as_str(),
+        "Field" | "Variable" | "Parameter" | "EnumVariant" | "AssocConst" | "Property"
+    ) {
+        return false;
+    }
+    let name = node.name.trim().to_ascii_lowercase();
+    name.chars().count() > 1
+        && !matches!(
+            name.as_str(),
+            "out" | "result" | "options" | "block" | "err" | "value"
+        )
+}
+
+fn where_incoming_degrees(
     store: &greppy_store::Store,
+    project: &str,
+) -> Result<std::collections::HashMap<i64, usize>> {
+    let mut degrees = std::collections::HashMap::new();
+    for edge_type in ["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"] {
+        for edge in store.list_edges_by_type(project, edge_type, i64::MAX as usize)? {
+            *degrees.entry(edge.target_id).or_default() += 1;
+        }
+    }
+    Ok(degrees)
+}
+
+fn where_most_used(
+    root_path: &std::path::Path,
+    incoming_degrees: &std::collections::HashMap<i64, usize>,
     definitions: &[greppy_store::Node],
-) -> Result<Vec<String>> {
+) -> Vec<String> {
     let mut ranked = Vec::with_capacity(definitions.len());
-    for node in definitions {
-        let degree = store
-            .incoming_edges(node.id, Some("CALLS"), i64::MAX as usize)?
-            .len()
-            + store
-                .incoming_edges(node.id, Some("USAGE"), i64::MAX as usize)?
-                .len();
-        ranked.push((degree, nav_short_name(node), node.file_path.clone(), node.start_line));
+    let mut sources = std::collections::HashMap::<String, Option<Vec<String>>>::new();
+    for node in definitions.iter().filter(|node| where_is_hub_symbol(node)) {
+        let lines = sources
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(root_path, &node.file_path));
+        if nav_is_test(lines.as_ref(), node) {
+            continue;
+        }
+        let degree = incoming_degrees.get(&node.id).copied().unwrap_or(0);
+        if degree == 0 {
+            continue;
+        }
+        ranked.push((
+            degree,
+            nav_short_name(node),
+            node.file_path.clone(),
+            node.start_line,
+        ));
     }
     ranked.sort_by(|left, right| {
         right
@@ -72,7 +118,7 @@ fn where_most_used(
             break;
         }
     }
-    Ok(names)
+    names
 }
 
 fn where_join_path(scope: &str, child: &str) -> String {
@@ -108,17 +154,19 @@ fn where_collapse_directory(mut path: String, files: &[greppy_store::FileState])
 }
 
 fn where_inventory_entries(
-    store: &greppy_store::Store,
+    root_path: &std::path::Path,
+    incoming_degrees: &std::collections::HashMap<i64, usize>,
     scope: &str,
     files: &[greppy_store::FileState],
     nodes: &[greppy_store::Node],
-) -> Result<Vec<WhereInventoryEntry>> {
+) -> Result<WhereInventory> {
     let prefix = if scope.is_empty() {
         String::new()
     } else {
         format!("{scope}/")
     };
-    let mut direct_files = std::collections::BTreeMap::<String, Vec<greppy_store::FileState>>::new();
+    let mut direct_files =
+        std::collections::BTreeMap::<String, Vec<greppy_store::FileState>>::new();
     let mut directories = std::collections::BTreeMap::<String, Vec<greppy_store::FileState>>::new();
     for file in files {
         let Some(rest) = file.rel_path.strip_prefix(&prefix) else {
@@ -139,7 +187,7 @@ fn where_inventory_entries(
     let mut entries = Vec::new();
     for (path, entry_files) in direct_files {
         let definitions = where_nodes_for_files(nodes, &entry_files);
-        let most_used = where_most_used(store, &definitions)?;
+        let most_used = where_most_used(root_path, incoming_degrees, &definitions);
         entries.push(WhereInventoryEntry {
             path,
             is_file: true,
@@ -151,7 +199,7 @@ fn where_inventory_entries(
     for (path, entry_files) in directories {
         let path = where_collapse_directory(path, &entry_files);
         let definitions = where_nodes_for_files(nodes, &entry_files);
-        let most_used = where_most_used(store, &definitions)?;
+        let most_used = where_most_used(root_path, incoming_degrees, &definitions);
         entries.push(WhereInventoryEntry {
             path,
             is_file: false,
@@ -160,6 +208,12 @@ fn where_inventory_entries(
             most_used,
         });
     }
+    let empty_files = entries
+        .iter()
+        .filter(|entry| entry.definitions.is_empty())
+        .map(|entry| entry.files.len())
+        .sum();
+    entries.retain(|entry| !entry.definitions.is_empty());
     entries.sort_by(|left, right| {
         right
             .definitions
@@ -168,7 +222,10 @@ fn where_inventory_entries(
             .then_with(|| right.files.len().cmp(&left.files.len()))
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok(entries)
+    Ok(WhereInventory {
+        entries,
+        empty_files,
+    })
 }
 
 fn where_count(value: usize) -> String {
@@ -248,8 +305,16 @@ fn insert_where_inventory_pack(
 
 fn where_entry_line(entry: &WhereInventoryEntry, id: &str, width: usize) -> String {
     let name = where_entry_display(entry);
-    let file_word = if entry.files.len() == 1 { "file" } else { "files" };
-    let def_word = if entry.definitions.len() == 1 { "def" } else { "defs" };
+    let file_word = if entry.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let def_word = if entry.definitions.len() == 1 {
+        "def"
+    } else {
+        "defs"
+    };
     let mut line = format!(
         "{name:<width$}  {} {file_word}  {} {def_word}",
         where_count(entry.files.len()),
@@ -286,7 +351,10 @@ fn where_test_tree_root(path: &str) -> Option<String> {
     let mut parts = Vec::new();
     for part in path.split('/') {
         parts.push(part);
-        if matches!(part.to_ascii_lowercase().as_str(), "test" | "tests" | "spec" | "specs" | "__tests__") {
+        if matches!(
+            part.to_ascii_lowercase().as_str(),
+            "test" | "tests" | "spec" | "specs" | "__tests__"
+        ) {
             return Some(format!("{}/", parts.join("/")));
         }
     }
@@ -340,16 +408,60 @@ fn where_test_roots(
     roots.into_iter().collect()
 }
 
-pub(crate) fn dispatch_where_am_i(root: Option<&str>) -> Result<i32> {
+fn where_is_documentation_file(file: &greppy_store::FileState) -> bool {
+    file.language == "markdown"
+}
+
+fn where_is_config_file(file: &greppy_store::FileState) -> bool {
+    matches!(file.language.as_str(), "json" | "toml" | "yaml")
+}
+
+fn where_code_nodes(
+    nodes: &[greppy_store::Node],
+    files: &[greppy_store::FileState],
+) -> Vec<greppy_store::Node> {
+    let non_code_paths = files
+        .iter()
+        .filter(|file| where_is_documentation_file(file) || where_is_config_file(file))
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    nodes
+        .iter()
+        .filter(|node| {
+            where_is_definition(node) && !non_code_paths.contains(node.file_path.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn dispatch_where_am_i(root: Option<&str>, json: bool) -> Result<i32> {
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
     let files = store.list_file_states(&project)?;
     let nodes = store.list_nodes(&project, "", "", 0, i64::MAX as usize)?;
-    let definitions = nodes
+
+    let documentation_paths = files
         .iter()
-        .filter(|node| where_is_definition(node))
+        .filter(|file| where_is_documentation_file(file))
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let config_paths = files
+        .iter()
+        .filter(|file| where_is_config_file(file))
+        .map(|file| file.rel_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let code_nodes = where_code_nodes(&nodes, &files);
+    let documentation_sections = nodes
+        .iter()
+        .filter(|node| {
+            where_is_definition(node) && documentation_paths.contains(node.file_path.as_str())
+        })
+        .count();
+    let config_keys = nodes
+        .iter()
+        .filter(|node| where_is_definition(node) && config_paths.contains(node.file_path.as_str()))
         .count();
 
     let mut language_counts = std::collections::BTreeMap::<String, usize>::new();
@@ -365,12 +477,83 @@ pub(crate) fn dispatch_where_am_i(root: Option<&str>) -> Result<i32> {
         .map(|(language, _)| language.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+
+    let incoming_degrees = where_incoming_degrees(&store, &project)?;
+    let inventory =
+        where_inventory_entries(&root_path, &incoming_degrees, "", &files, &code_nodes)?;
+    let width = inventory
+        .entries
+        .iter()
+        .map(where_entry_display)
+        .map(|name| name.len())
+        .max()
+        .unwrap_or(0);
+    let mut inventory_json = Vec::with_capacity(inventory.entries.len());
+    let mut inventory_text = Vec::with_capacity(inventory.entries.len());
+    for entry in &inventory.entries {
+        let handle = insert_where_inventory_pack(
+            &store,
+            root,
+            &project,
+            &entry.path,
+            entry.is_file,
+            0,
+            &entry.files,
+            entry.definitions.len(),
+        )?;
+        inventory_text.push(where_entry_line(entry, &handle.id, width));
+        inventory_json.push(serde_json::json!({
+            "path": where_entry_display(entry),
+            "files": entry.files.len(),
+            "definitions": entry.definitions.len(),
+            "most_used": entry.most_used,
+            "expand_id": handle.id,
+        }));
+    }
+
+    let entry_points = where_entry_points(&code_nodes);
+    let test_roots = where_test_roots(&root_path, &files, &code_nodes);
+    if json {
+        let value = serde_json::json!({
+            "schema_version": "greppy.where-am-i.v1",
+            "root": root_path.to_string_lossy(),
+            "census": {
+                "files": files.len(),
+                "definitions": code_nodes.len(),
+                "further_files_without_definitions": inventory.empty_files,
+                "documentation": {
+                    "files": documentation_paths.len(),
+                    "sections": documentation_sections,
+                },
+                "config": {
+                    "files": config_paths.len(),
+                    "keys": config_keys,
+                },
+            },
+            "inventory": inventory_json,
+            "languages": languages.iter().map(|(language, count)| serde_json::json!({
+                "language": language,
+                "files": count,
+            })).collect::<Vec<_>>(),
+            "orientation": {
+                "entry_points": entry_points,
+                "test_roots": test_roots,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| Error::Parse(format!("serialize where-am-i JSON: {error}")))?
+        );
+        return Ok(0);
+    }
+
     if language_text.is_empty() {
         println!(
             "{} — {} files, {} definitions",
             root_path.display(),
             where_count(files.len()),
-            where_count(definitions)
+            where_count(code_nodes.len())
         );
     } else {
         println!(
@@ -378,36 +561,66 @@ pub(crate) fn dispatch_where_am_i(root: Option<&str>) -> Result<i32> {
             root_path.display(),
             language_text,
             where_count(files.len()),
-            where_count(definitions)
+            where_count(code_nodes.len())
         );
     }
 
-    let entries = where_inventory_entries(&store, "", &files, &nodes)?;
-    if !entries.is_empty() {
+    if !inventory_text.is_empty()
+        || inventory.empty_files > 0
+        || !documentation_paths.is_empty()
+        || !config_paths.is_empty()
+    {
         println!();
-        let width = entries
-            .iter()
-            .map(where_entry_display)
-            .map(|name| name.len())
-            .max()
-            .unwrap_or(0);
-        for entry in &entries {
-            let handle = insert_where_inventory_pack(
-                &store,
-                root,
-                &project,
-                &entry.path,
-                entry.is_file,
-                0,
-                &entry.files,
-                entry.definitions.len(),
-            )?;
-            println!("{}", where_entry_line(entry, &handle.id, width));
-        }
+    }
+    for line in inventory_text {
+        println!("{line}");
+    }
+    if inventory.empty_files > 0 {
+        println!(
+            "{} further {} hold no definitions",
+            where_count(inventory.empty_files),
+            if inventory.empty_files == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        );
+    }
+    let mut supplementary = Vec::new();
+    if !documentation_paths.is_empty() {
+        supplementary.push(format!(
+            "docs: {} {}, {} {}",
+            where_count(documentation_paths.len()),
+            if documentation_paths.len() == 1 {
+                "file"
+            } else {
+                "files"
+            },
+            where_count(documentation_sections),
+            if documentation_sections == 1 {
+                "section"
+            } else {
+                "sections"
+            }
+        ));
+    }
+    if !config_paths.is_empty() {
+        supplementary.push(format!(
+            "config: {} {}, {} {}",
+            where_count(config_paths.len()),
+            if config_paths.len() == 1 {
+                "file"
+            } else {
+                "files"
+            },
+            where_count(config_keys),
+            if config_keys == 1 { "key" } else { "keys" }
+        ));
+    }
+    if !supplementary.is_empty() {
+        println!("{}", supplementary.join(" · "));
     }
 
-    let entry_points = where_entry_points(&nodes);
-    let test_roots = where_test_roots(&root_path, &files, &nodes);
     if !entry_points.is_empty() || !test_roots.is_empty() {
         println!();
     }
@@ -459,7 +672,10 @@ fn where_scope_states<'a>(
     is_file: bool,
 ) -> Vec<&'a greppy_store::FileState> {
     if is_file {
-        states.iter().filter(|file| file.rel_path == scope).collect()
+        states
+            .iter()
+            .filter(|file| file.rel_path == scope)
+            .collect()
     } else {
         let prefix = format!("{scope}/");
         states
@@ -602,11 +818,14 @@ pub(crate) fn where_inventory_expand_payload(
     let Some((scope, files)) =
         where_live_inventory_files(&states, &stored_scope, is_file, &expected)
     else {
-        return Ok(Err("expand: inventory changed since this pack was created".into()));
+        return Ok(Err(
+            "expand: inventory changed since this pack was created".into()
+        ));
     };
     let root_path = resolve_root(root)?;
     let nodes = store.list_nodes(project, "", "", 0, i64::MAX as usize)?;
-    let mut definitions = where_nodes_for_files(&nodes, &files);
+    let code_nodes = where_code_nodes(&nodes, &states);
+    let mut definitions = where_nodes_for_files(&code_nodes, &files);
     definitions.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
@@ -672,8 +891,11 @@ pub(crate) fn where_inventory_expand_payload(
         )));
     }
 
-    let entries = where_inventory_entries(store, &scope, &files, &nodes)?;
-    let width = entries
+    let incoming_degrees = where_incoming_degrees(store, project)?;
+    let inventory =
+        where_inventory_entries(&root_path, &incoming_degrees, &scope, &files, &code_nodes)?;
+    let width = inventory
+        .entries
         .iter()
         .map(where_entry_display)
         .map(|name| name.len())
@@ -681,7 +903,7 @@ pub(crate) fn where_inventory_expand_payload(
         .unwrap_or(0);
     let mut text = String::new();
     let mut children = Vec::new();
-    for entry in &entries {
+    for entry in &inventory.entries {
         let handle = insert_where_inventory_pack(
             store,
             root,
@@ -702,6 +924,17 @@ pub(crate) fn where_inventory_expand_payload(
             "expand_id": handle.id,
         }));
     }
+    if inventory.empty_files > 0 {
+        text.push_str(&format!(
+            "{} further {} hold no definitions\n",
+            where_count(inventory.empty_files),
+            if inventory.empty_files == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        ));
+    }
     Ok(Ok((
         text,
         serde_json::json!({
@@ -709,6 +942,7 @@ pub(crate) fn where_inventory_expand_payload(
             "scope_path": scope,
             "total": definitions.len(),
             "children": children,
+            "further_files_without_definitions": inventory.empty_files,
         }),
     )))
 }

@@ -76,7 +76,11 @@ pub enum Command {
         json: bool,
     },
     /// The repository at one glance: layout, languages, entry points, test roots.
-    WhereAmI,
+    WhereAmI {
+        /// Emit machine-readable JSON with the same census as the text hub.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect or safely reclaim Greppy-managed cache data.
     Cache {
         #[command(subcommand)]

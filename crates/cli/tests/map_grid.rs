@@ -12,10 +12,8 @@ fn bin() -> &'static str {
 
 fn fresh_repo(tag: &str) -> (PathBuf, PathBuf) {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let base = std::env::temp_dir().join(format!(
-        "greppy-cli-where-{tag}-{}-{n}",
-        std::process::id()
-    ));
+    let base =
+        std::env::temp_dir().join(format!("greppy-cli-where-{tag}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let repo = base.join("repo");
     std::fs::create_dir_all(repo.join("edit-src/sub")).unwrap();
@@ -30,11 +28,12 @@ fn fresh_repo(tag: &str) -> (PathBuf, PathBuf) {
     )
     .unwrap();
 
+    std::fs::write(repo.join("README.md"), "# Where fixture\n\n## Layout\n").unwrap();
+    std::fs::write(repo.join("empty.txt"), "orientation prose only\n").unwrap();
+
     let mut hub = "pub fn hub() -> u32 { 1 }\n".to_string();
     for index in 0..15 {
-        hub.push_str(&format!(
-            "pub fn caller_{index:02}() -> u32 {{ hub() }}\n"
-        ));
+        hub.push_str(&format!("pub fn caller_{index:02}() -> u32 {{ hub() }}\n"));
     }
     std::fs::write(repo.join("edit-src/a.rs"), hub).unwrap();
 
@@ -114,21 +113,36 @@ fn hub_is_one_screen_of_indexed_facts() {
     index(&repo, &store);
 
     let (code, stdout, stderr) = run(&repo, &store, &["where-am-i"]);
-    assert_eq!(code, 0, "where-am-i failed\nstdout={stdout}\nstderr={stderr}");
-    assert!(stdout.lines().count() <= 60, "hub exceeded one screen:\n{stdout}");
+    assert_eq!(
+        code, 0,
+        "where-am-i failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stdout.lines().count() <= 60,
+        "hub exceeded one screen:\n{stdout}"
+    );
 
     let root = stdout.lines().next().expect("root line");
     assert!(root.contains(&repo.display().to_string()), "{root}");
     assert!(root.contains("rust") && root.contains("java"), "{root}");
-    assert!(root.contains("files") && root.contains("definitions"), "{root}");
+    assert!(
+        root.contains("files") && root.contains("definitions"),
+        "{root}"
+    );
     assert!(!stdout.contains("(none detected)") && !stdout.contains("try:"));
 
     let edit = stdout
         .lines()
         .find(|line| line.starts_with("edit-src/"))
         .expect("edit-src hub line");
-    assert!(edit.contains("2 files") && edit.contains("30 defs"), "{edit}");
-    assert!(edit.contains("hub"), "highest incoming degree must be visible: {edit}");
+    assert!(
+        edit.contains("2 files") && edit.contains("30 defs"),
+        "{edit}"
+    );
+    assert!(
+        edit.contains("— hub — greppy expand "),
+        "only referenced non-test code symbols belong in the trio: {edit}"
+    );
     expand_id(edit);
 
     let cli = stdout
@@ -138,11 +152,84 @@ fn hub_is_one_screen_of_indexed_facts() {
     expand_id(cli);
 
     assert!(
-        stdout.lines().any(|line| line.starts_with("src/main/java/com/acme/")),
+        stdout
+            .lines()
+            .any(|line| line.starts_with("src/main/java/com/acme/")),
         "single-child directory chains must collapse to the first branch: {stdout}"
     );
+    assert!(
+        !stdout.lines().any(|line| line.contains("  0 defs")),
+        "empty census entries must not get rows: {stdout}"
+    );
+    for path in ["Cargo.toml", "README.md", "empty.txt"] {
+        assert!(
+            !stdout.lines().any(|line| line.starts_with(path)),
+            "non-code entry got a row for {path}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("3 further files hold no definitions"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("docs: 1 file, 2 sections"), "{stdout}");
+    assert!(stdout.contains("config: 1 file, 4 keys"), "{stdout}");
     assert!(stdout.contains("entry points: cli-src/main.rs"), "{stdout}");
-    assert!(stdout.contains("tests:") && stdout.contains("tests/") && stdout.contains("inline #[test] modules"), "{stdout}");
+    assert!(
+        stdout.contains("tests:")
+            && stdout.contains("tests/")
+            && stdout.contains("inline #[test] modules"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn json_carries_the_same_code_census_without_empty_expand_rows() {
+    let (repo, store) = fresh_repo("json");
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(&repo, &store, &["where-am-i", "--json"]);
+    assert_eq!(
+        code, 0,
+        "where-am-i JSON failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(value["schema_version"], "greppy.where-am-i.v1");
+    assert_eq!(value["census"]["files"], 9);
+    assert_eq!(value["census"]["further_files_without_definitions"], 3);
+    assert_eq!(value["census"]["documentation"]["files"], 1);
+    assert_eq!(value["census"]["documentation"]["sections"], 2);
+    assert_eq!(value["census"]["config"]["files"], 1);
+    assert_eq!(value["census"]["config"]["keys"], 4);
+
+    let inventory = value["inventory"].as_array().expect("inventory array");
+    assert!(
+        inventory
+            .iter()
+            .all(|entry| entry["definitions"].as_u64().unwrap_or(0) > 0),
+        "empty entry in JSON: {stdout}"
+    );
+    assert!(
+        inventory
+            .iter()
+            .all(|entry| entry["expand_id"].as_str().is_some_and(|id| id.len() == 16)),
+        "every visible answer row has an expand id: {stdout}"
+    );
+    let edit = inventory
+        .iter()
+        .find(|entry| entry["path"] == "edit-src/")
+        .expect("edit-src inventory row");
+    assert_eq!(edit["files"], 2);
+    assert_eq!(edit["definitions"], 30);
+    assert_eq!(edit["most_used"], serde_json::json!(["hub"]));
+    assert!(
+        value["census"]["definitions"].as_u64().unwrap_or(0)
+            > inventory
+                .iter()
+                .map(|entry| entry["definitions"].as_u64().unwrap_or(0))
+                .max()
+                .unwrap_or(0),
+        "headline must carry the whole code census: {stdout}"
+    );
 }
 
 #[test]
@@ -254,13 +341,22 @@ fn inventory_pack_relocates_by_hash_or_refuses_drift() {
 
     std::fs::rename(repo.join("module"), repo.join("renamed")).unwrap();
     let (code, relocated, stderr) = run(&repo, &store, &["expand", &id]);
-    assert_eq!(code, 0, "hash-preserving rename must relocate: {stderr}\n{relocated}");
-    assert!(relocated.contains("renamed/item.rs:1  movable"), "{relocated}");
+    assert_eq!(
+        code, 0,
+        "hash-preserving rename must relocate: {stderr}\n{relocated}"
+    );
+    assert!(
+        relocated.contains("renamed/item.rs:1  movable"),
+        "{relocated}"
+    );
 
     std::fs::write(repo.join("renamed/item.rs"), "pub fn changed() {}\n").unwrap();
     let (code, refused, stderr) = run(&repo, &store, &["expand", &id]);
     assert_eq!(code, 1, "content drift must refuse: {stderr}\n{refused}");
-    assert!(refused.contains("inventory changed since this pack was created"), "{refused}");
+    assert!(
+        refused.contains("inventory changed since this pack was created"),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -284,6 +380,9 @@ fn dead_orientation_verbs_are_refused_before_grep() {
             stdout.contains(&format!("unrecognized subcommand '{verb}'")),
             "{args:?}: {stdout}"
         );
-        assert!(!stdout.contains("grep-bait.txt"), "dead verb became grep: {stdout}");
+        assert!(
+            !stdout.contains("grep-bait.txt"),
+            "dead verb became grep: {stdout}"
+        );
     }
 }

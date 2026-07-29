@@ -1734,7 +1734,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
-        "where-am-i" => "greppy where-am-i [--root DIR]",
+        "where-am-i" => "greppy where-am-i [--json] [--root DIR]",
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
@@ -2237,7 +2237,7 @@ fn dispatch_subcommand(
                 dispatch_index(path.as_deref(), root, EmbeddingCliArgs { device, no_gpu })
             }
         }
-        Command::WhereAmI => dispatch_where_am_i(root),
+        Command::WhereAmI { json } => dispatch_where_am_i(root, json),
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Trial { args } => trial::run(args, root),
         Command::SearchGraph { name, json } => {
