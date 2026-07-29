@@ -3216,9 +3216,34 @@ pub(crate) fn dispatch_who_calls(
             nodes.push(n);
         }
     }
+    // A file anchor emitted on the definition itself (the C++ extractor's
+    // bookkeeping USAGE edge) is not a caller. Filter BEFORE deciding
+    // emptiness — otherwise an uncalled function prints nothing at all
+    // instead of its true answer.
+    nodes.retain(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name));
     nodes.retain(|node| path_filters.matches(&node.file_path));
-    if nodes.is_empty() && !path_filters.is_empty() && !json {
-        println!("no callers under path filter: {}", path_filters.shown());
+    if nodes.is_empty() {
+        if json {
+            let project = project_for(root)?;
+            nav_counts_json(
+                &store,
+                root,
+                "who-calls",
+                query_symbol,
+                &project,
+                true,
+                0,
+                0,
+                all,
+                Vec::new(),
+            )?;
+            return Ok(0);
+        }
+        if path_filters.is_empty() {
+            println!("no callers");
+        } else {
+            println!("no callers under path filter: {}", path_filters.shown());
+        }
         return Ok(0);
     }
     let total = nodes.len();
