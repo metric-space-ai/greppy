@@ -46,6 +46,26 @@ impl Fixture {
             .output()
             .expect("run greppy")
     }
+
+    fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Output {
+        use std::io::Write as _;
+
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn greppy");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin)
+            .expect("write greppy stdin");
+        child.wait_with_output().expect("wait for greppy")
+    }
 }
 
 impl Drop for Fixture {
@@ -78,6 +98,21 @@ fn dry_run_noop_never_claims_applied() {
     assert_eq!(text, "would apply neu.txt:1\n");
     assert!(!text.contains("applied"), "{text}");
     assert_file(&fixture.repo.join("neu.txt"), "x\n");
+}
+
+#[test]
+fn absent_new_payload_is_read_byte_exactly_from_stdin() {
+    let fixture = Fixture::new("piped-stdin");
+
+    let output = fixture.run_with_stdin(&["write", "piped.txt"], b"from stdin\n");
+    let text = combined(&output);
+
+    assert!(output.status.success(), "{text}");
+    assert!(text.starts_with("applied piped.txt:1  "), "{text}");
+    assert_eq!(
+        std::fs::read(fixture.repo.join("piped.txt")).unwrap(),
+        b"from stdin\n"
+    );
 }
 
 #[test]
