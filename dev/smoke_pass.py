@@ -90,14 +90,15 @@ def main() -> None:
             print(f"ok   {name}")
     for verb in REMOVED:
         code, out = run(binary, [verb, "parse_path"])
-        # a removed verb must fall through to grep (its exit codes) and MUST NOT
-        # produce resolved symbol rows
-        if re.search(r"^\S+:\d+  \S+", out, re.M):
-            failed += 1
-            print(f"FAIL removed:{verb}: still answers with symbol rows")
-        else:
+        # dead greppy vocabulary is REFUSED before grep passthrough
+        # (unknown_verb_refusal): exit 64, the refusal names the verb, and it
+        # neither answers with symbol rows nor greps the verb as a pattern.
+        if code == 64 and "unrecognized" in out and not re.search(r"^\S+:\d+  \S+", out, re.M):
             passed += 1
-            print(f"ok   removed:{verb} (grep passthrough)")
+            print(f"ok   removed:{verb} (refused)")
+        else:
+            failed += 1
+            print(f"FAIL removed:{verb}: exit {code}, wanted the vocabulary refusal")
     print(f"\nSMOKE: {passed} ok, {failed} fail")
     sys.exit(1 if failed else 0)
 
