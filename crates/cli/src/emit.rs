@@ -344,15 +344,26 @@ pub(crate) fn emit_edit_outcome(
                 if let Some(headline) = &record.headline {
                     println!("{headline}");
                 } else {
+                    let short_id = record
+                        .transaction_id
+                        .as_deref()
+                        .map(|id| &id[..id.len().min(6)]);
                     for (index, file) in record.files.iter().enumerate() {
-                        match record.span {
+                        let address = match record.span {
                             Some((first, last)) if index == 0 && first == last => {
-                                println!("{word} {file}:{first}");
+                                format!("{file}:{first}")
                             }
                             Some((first, last)) if index == 0 => {
-                                println!("{word} {file}:{first}-{last}");
+                                format!("{file}:{first}-{last}")
                             }
-                            _ => println!("{word} {file}"),
+                            _ => file.clone(),
+                        };
+                        if record.already_as_sent {
+                            println!("applied, already as sent  {address}");
+                        } else if let Some(id) = short_id.filter(|_| record.published) {
+                            println!("{word} {address}  {id}");
+                        } else {
+                            println!("{word} {address}");
                         }
                     }
                 }
@@ -385,146 +396,6 @@ pub(crate) fn emit_edit_outcome(
             }
             Ok(refusal.exit)
         }
-    }
-}
-
-pub(crate) fn finish_edit(
-    certificate: greppy_edit::Certificate,
-    report_path: Option<String>,
-    json: bool,
-    root: Option<&str>,
-    root_path: &std::path::Path,
-) -> Result<i32> {
-    let mut certificate = certificate;
-    if certificate.published {
-        // close the read->edit->read loop: refresh the store so the next
-        // read/graph query addresses the edited file without a manual
-        // reindex. index() is incremental from the second run, so this
-        // touches only the changed file. A refresh failure downgrades the
-        // flag, never the edit (the workspace write already happened).
-        let refreshed = std::env::current_exe()
-            .ok()
-            .and_then(|exe| {
-                std::process::Command::new(exe)
-                    .arg("--root")
-                    .arg(root_path)
-                    .arg("index")
-                    .arg(root_path)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .ok()
-            })
-            .map(|status| status.success())
-            .unwrap_or(false);
-        for op in &mut certificate.operations {
-            op.store_refreshed = refreshed;
-        }
-    }
-    let handles = certificate_operation_handles(&certificate, root_path);
-    let mut full_value = serde_json::to_value(&certificate)
-        .map_err(|e| Error::Invalid(format!("serialize full certificate: {e}")))?;
-    certificate_operation_extras(&mut full_value, &certificate.transaction_id, &handles);
-    let full = serde_json::to_string_pretty(&full_value)
-        .map_err(|e| Error::Invalid(format!("serialize full certificate: {e}")))?;
-    let mut report_written = None;
-    if let Some(path) = report_path {
-        std::fs::write(&path, format!("{full}\n")).map_err(|source| Error::Io {
-            context: format!("write report {path}"),
-            source,
-        })?;
-        report_written = Some(path);
-    }
-
-    let expand = if let (Ok(store), Ok(project)) =
-        (open_default_store_query_writer(root), project_for(root))
-    {
-        let summary = serde_json::json!({
-            "text": format!(
-                "edit certificate: {} operation(s), status {}",
-                certificate.operations.len(),
-                edit_status_name(certificate.status)
-            ),
-            "transaction_id": &certificate.transaction_id,
-            "status": edit_status_name(certificate.status),
-            "operations": certificate.operations.len(),
-        });
-        insert_expand_pack_best_effort(
-            &store,
-            &project,
-            "edit",
-            &certificate.transaction_id,
-            current_graph_generation_or_zero(&store, root),
-            summary,
-            format!("{full}\n"),
-            serde_json::to_value(&certificate).ok(),
-        )
-    } else {
-        None
-    };
-
-    if let Some(expand) = &expand {
-        insert_expand_alias_best_effort(root, &certificate.transaction_id, &expand.id);
-    }
-    if json {
-        // The stdout form, not the archival one: it carries `exit_code` and
-        // drops evidence that only `--report` and `expand` need. Printing the
-        // full Serialize form here silently dropped `exit_code` from the
-        // documented certificate contract.
-        let stdout_form = certificate
-            .to_compact_json_pretty()
-            .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?;
-        // One caller-side branch for every edit verb: a certificate that did
-        // not apply carries the same `error.code` the grammar verbs emit.
-        let mut value: serde_json::Value = serde_json::from_str(&stdout_form)
-            .map_err(|e| Error::Invalid(format!("re-read certificate: {e}")))?;
-        certificate_operation_extras(&mut value, &certificate.transaction_id, &handles);
-        if let Some(root) = value.as_object_mut() {
-            // The evidence stdout omits is omitted, not replaced by a stand-in
-            // string that reads like a diff to anything parsing the field.
-            if let Some(operations) = root.get_mut("operations").and_then(|v| v.as_array_mut()) {
-                for operation in operations {
-                    if let Some(operation) = operation.as_object_mut() {
-                        operation.remove("unified_diff");
-                    }
-                }
-            }
-            if let Some(path) = &report_written {
-                root.insert("report_path".into(), serde_json::json!(path));
-            }
-            if certificate.exit_code() != 0 {
-                let message = certificate_refusal_message(&certificate)
-                    .or_else(|| certificate.compact_failure_diagnosis())
-                    .unwrap_or_else(|| format!("edit {}", edit_status_name(certificate.status)));
-                root.insert(
-                    "error".into(),
-                    serde_json::json!({
-                        "code": certificate_refusal_code(&certificate),
-                        "message": message,
-                    }),
-                );
-            }
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?
-        );
-    } else {
-        render_compact_edit_certificate(&certificate, root_path);
-    }
-    Ok(certificate.exit_code())
-}
-
-pub(crate) fn insert_expand_alias_best_effort(root: Option<&str>, alias: &str, id: &str) {
-    let Some(path) = expand_alias_path(root, alias) else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_ok() {
-        let _ = std::fs::write(path, id);
     }
 }
 
