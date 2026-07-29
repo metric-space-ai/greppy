@@ -550,20 +550,6 @@ fn cli_result_offset() -> usize {
     CLI_RESULT_OFFSET.with(std::cell::Cell::get)
 }
 
-thread_local! {
-    /// `read --context N`: how many lines above a definition come along, so its
-    /// doc comment arrives with it instead of costing a second call.
-    static CLI_READ_CONTEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn set_cli_read_context(context: Option<usize>) {
-    CLI_READ_CONTEXT.with(|value| value.set(context.unwrap_or(0)));
-}
-
-fn cli_read_context() -> i64 {
-    i64::try_from(CLI_READ_CONTEXT.with(std::cell::Cell::get)).unwrap_or(0)
-}
-
 fn cli_result_limit(default: usize) -> usize {
     CLI_RESULT_LIMIT
         .with(|value| value.get())
@@ -2479,6 +2465,7 @@ fn indexed_path_matches_query(indexed_path: &str, query_path: &str) -> bool {
     }
 }
 
+
 fn accepted_symbol_spelling(query: &str) -> Option<&'static str> {
     if let Some((path, _)) = split_path_qualified(query) {
         return Some(if path.contains('/') || path.contains('\\') {
@@ -2516,7 +2503,6 @@ fn qualify_symbol_with_path(symbol: Option<&str>, path: Option<&str>) -> Option<
     }
     Some(format!("{p}::{s}"))
 }
-
 
 fn is_callable_node_label(label: &str) -> bool {
     matches!(label, "Function" | "Method" | "Constructor")
@@ -4502,61 +4488,6 @@ const BRIEF_JSON_SCHEMA_VERSION: &str = "greppy.brief.v1";
 
 
 
-fn parse_read_line_range(raw: Option<&str>, line_count: usize) -> Result<(usize, usize)> {
-    let Some(raw) = raw else {
-        return Ok((1, line_count));
-    };
-    let (start, end) = raw.split_once(':').unwrap_or((raw, raw));
-    let start = start.parse::<usize>().map_err(|_| {
-        Error::Invalid(format!(
-            "read --lines/--line expects a positive line N or range N:M, got `{raw}`"
-        ))
-    })?;
-    let end = end.parse::<usize>().map_err(|_| {
-        Error::Invalid(format!(
-            "read --lines/--line expects a positive line N or range N:M, got `{raw}`"
-        ))
-    })?;
-    if start == 0 || end < start {
-        return Err(Error::Invalid(format!(
-            "read --lines/--line expects 1 <= N <= M, got `{raw}`"
-        )));
-    }
-    if start > line_count && line_count > 0 {
-        return Err(Error::Invalid(format!(
-            "read --lines/--line starts at {start}, but the file has {line_count} line(s)"
-        )));
-    }
-    Ok((start, end.min(line_count)))
-}
-
-
-/// Split a trailing `:START[-END]` (or `:START[:END]`) off a read subject.
-///
-/// greppy prints spans as `path:120-160`, so that is what an agent hands back.
-/// Returns the bare path and the range in the `START:END` form `--lines` takes.
-/// A path-qualified symbol (`file.rs::Symbol`) is left alone.
-fn split_trailing_line_range(subject: &str) -> Option<(&str, String)> {
-    if subject.contains("::") {
-        return None;
-    }
-    let (path, tail) = subject.rsplit_once(':')?;
-    if path.is_empty() || tail.is_empty() {
-        return None;
-    }
-    let (start, end) = match tail.split_once(['-', ':']) {
-        Some((start, end)) => (start, if end.is_empty() { start } else { end }),
-        None => (tail, tail),
-    };
-    let start: usize = start.parse().ok()?;
-    let end: usize = end.parse().ok()?;
-    if start == 0 || end < start {
-        return None;
-    }
-    Some((path, format!("{start}:{end}")))
-}
-
-
 
 /// Byte offsets of an inclusive 1-based line range within `content`.
 fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (usize, usize) {
@@ -6497,15 +6428,6 @@ fn nav_continuation_command(req: &NavMultiRequest<'_>, offset: usize) -> String 
     parts.push(offset.to_string());
     parts.join(" ")
 }
-
-/// What `read` was asked to read, after `-`, `--symbol` and `--path` have been
-/// folded into one ordered list of subjects.
-struct ReadPlan {
-    subjects: Vec<String>,
-    forced_symbol: bool,
-    lines: Option<String>,
-}
-
 
 
 
