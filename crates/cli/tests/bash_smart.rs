@@ -171,7 +171,15 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
 
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // The contract: the 75ms timeout fires instead of waiting out the child's
+    // 5s sleep. The bound must stay well under that sleep, but generous enough
+    // not to measure cold-store setup and machine load (a 2s bound failed on a
+    // first run while the same test passed suite-warm).
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "kill took {:?} — the timeout did not preempt the child's sleep",
+        started.elapsed()
+    );
     assert_eq!(output.status.code(), Some(137), "stderr={stderr}");
     assert!(stdout.starts_with("partial\n"), "{stdout}");
     assert!(stdout.contains("greppy expand "), "{stdout}");
