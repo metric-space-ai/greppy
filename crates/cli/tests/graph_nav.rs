@@ -1610,6 +1610,20 @@ fn brief_reports_a_missing_symbol() {
 }
 
 #[test]
+fn brief_refuses_a_second_symbol() {
+    // 0.3.0: brief sketches ONE body. The legacy `brief A B` bundle
+    // (`== A ==` + full source) is gone — a second positional is a usage
+    // error, like any malformed invocation.
+    let (repo, store) = index_fixture("brief-two-symbols");
+    let (code, out, err) = run(&["brief", "caller", "do_it"], &repo, &store);
+    assert_eq!(code, 64, "a second symbol must be a usage error; stderr={err}");
+    assert!(
+        !out.contains("== caller ==") && !out.contains("== do_it =="),
+        "the multi-symbol bundle must never print; got: {out}"
+    );
+}
+
+#[test]
 fn brief_refuses_a_name_that_has_nothing_to_sketch() {
     let root = fresh_dir("brief-const");
     let repo = root.join("repo");

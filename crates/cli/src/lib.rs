@@ -1715,7 +1715,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "impact" => {
             "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
-        "brief" => "greppy brief SYMBOL [SYMBOL ...] [--path PATH] [--json] [--root DIR]",
+        "brief" => "greppy brief SYMBOL [--path PATH] [--json] [--root DIR]",
         "read" => {
             "greppy read SYMBOL [--path FILE] [--handle] [--json] [--root DIR]  \
              or: greppy read FILE [--line N[:M]] [--handle] [--json] [--root DIR]"
@@ -2674,16 +2674,21 @@ fn dispatch_subcommand(
             )
         }
         Command::Brief {
-            symbols,
+            symbol,
             path_opts,
             code: _,
             all: _,
             json,
         } => {
-            let targets = nav_targets(&symbols)?;
+            let targets = nav_targets(std::slice::from_ref(&symbol))?;
             validate_path_filters(root, &path_opts, "--path")?;
             if targets.len() > 1 {
-                return dispatch_brief_multi(&targets, &path_opts, json, root);
+                // One SYMBOL is enforced at the clap level; several can only
+                // arrive through the `-` pipe, and brief sketches ONE body.
+                return Err(Error::Invalid(format!(
+                    "brief takes exactly one symbol; the pipe delivered {} — brief them one at a time",
+                    targets.len()
+                )));
             }
             dispatch_brief(targets.first().map(String::as_str), &path_opts, json, root)
         }
@@ -7409,166 +7414,6 @@ fn nav_continuation_command(req: &NavMultiRequest<'_>, offset: usize) -> String 
     parts.push("--offset".to_string());
     parts.push(offset.to_string());
     parts.join(" ")
-}
-
-/// `brief A B` — the same briefing per target, in one call: the definition,
-/// the callers, the callees, and the tests that reach it.
-fn dispatch_brief_multi(
-    targets: &[String],
-    paths: &[String],
-    json: bool,
-    root: Option<&str>,
-) -> Result<i32> {
-    let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-    let project = project_for(root)?;
-    if let Some(code) = graph_stale_gate(
-        &store,
-        root,
-        &project,
-        "brief",
-        json,
-        serde_json::json!({"schema_version": BRIEF_JSON_SCHEMA_VERSION}),
-        "definitions",
-    )? {
-        return Ok(code);
-    }
-    if let Some(code) = provider_policy_graph_gate(
-        &store,
-        root,
-        &project,
-        "brief",
-        json,
-        serde_json::json!({"schema_version": BRIEF_JSON_SCHEMA_VERSION}),
-        "definitions",
-    )? {
-        return Ok(code);
-    }
-    let mut resolved: Vec<Vec<i64>> = Vec::with_capacity(targets.len());
-    let mut missing: Vec<String> = Vec::new();
-    for target in targets {
-        let ids = resolve_symbol_nodes(&store, Some(target.as_str()))?;
-        if ids.is_empty() {
-            missing.push(target.clone());
-        }
-        resolved.push(ids);
-    }
-    if !missing.is_empty() {
-        return Err(Error::Invalid(unknown_targets_message(
-            &store, &project, &missing,
-        )));
-    }
-    let path_filters = prepare_query_path_filters(root, "brief", "", paths)?;
-    let root_path = resolve_root(root)?;
-    let incoming = impact_edge_spec(greppy_search::ReachDirection::Incoming, None);
-
-    let mut entries = Vec::with_capacity(targets.len());
-    let mut hits = Vec::new();
-    for (index, ids) in resolved.iter().enumerate() {
-        let symbol = &targets[index];
-        let mut definition = serde_json::Value::Null;
-        for id in ids {
-            let Some(node) = store.get_node(*id)? else {
-                continue;
-            };
-            if !path_filters.matches(&node.file_path) {
-                continue;
-            }
-            let span = read_span_with_meta(
-                &root_path,
-                &node.file_path,
-                node.start_line,
-                node.end_line,
-                CONTEXT_SPAN_CAP,
-                false,
-            );
-            let source = span.as_ref().map(|s| s.text.as_str()).unwrap_or("");
-            let mut value = node_hit_json(&node);
-            value["target"] = serde_json::json!(symbol);
-            value["label"] = serde_json::json!(&node.label);
-            value["source"] = serde_json::json!(source);
-            if definition.is_null() {
-                definition = value.clone();
-            }
-            hits.push(value);
-            break;
-        }
-        let mut callers = incoming_call_nodes_for_targets(&store, ids)?;
-        callers.retain(|node| path_filters.matches(&node.file_path));
-        let mut callees: std::collections::BTreeMap<i64, greppy_store::Node> =
-            std::collections::BTreeMap::new();
-        for source in callee_source_ids_for_symbols(&store, &project, ids)? {
-            for step in greppy_search::callees_of(&store, source)? {
-                if let Some(node) = step.node {
-                    callees.entry(step.node_id).or_insert(node);
-                }
-            }
-        }
-        callees.retain(|_, node| path_filters.matches(&node.file_path));
-        let reaching = nav_rows_for_target(
-            &store,
-            &project,
-            ids,
-            index,
-            NavKind::Impact,
-            greppy_search::ReachDirection::Incoming,
-            &incoming,
-            6,
-        )?;
-        let tests: Vec<serde_json::Value> = reaching
-            .iter()
-            .filter(|row| is_test_node(&row.node) && path_filters.matches(&row.node.file_path))
-            .map(|row| node_hit_json(&row.node))
-            .collect();
-        entries.push(serde_json::json!({
-            "symbol": symbol,
-            "symbol_found": true,
-            "total_exact": callers.len() + callees.len(),
-            "definition": definition,
-            "callers": callers.iter().map(node_hit_json).collect::<Vec<_>>(),
-            "callees": callees.values().map(node_hit_json).collect::<Vec<_>>(),
-            "tests": tests,
-        }));
-    }
-
-    if json {
-        let value = serde_json::json!({
-            "schema_version": BRIEF_JSON_SCHEMA_VERSION,
-            "command": "brief",
-            "status": "ok",
-            "project": project,
-            "targets": entries,
-            "total_exact": hits.len(),
-            "shown": hits.len(),
-            "hits": hits,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|e| Error::Invalid(format!("serialize brief JSON: {e}")))?
-        );
-        return Ok(0);
-    }
-    for entry in &entries {
-        println!("== {} ==", entry["symbol"].as_str().unwrap_or(""));
-        if let Some(source) = entry["definition"]["source"].as_str() {
-            let file = entry["definition"]["file"].as_str().unwrap_or("");
-            let line = entry["definition"]["line"].as_i64().unwrap_or(0);
-            println!("{file}:{line}");
-            print_code_span_text(source);
-        }
-        for (label, key) in [("caller", "callers"), ("callee", "callees"), ("test", "tests")] {
-            for row in entry[key].as_array().into_iter().flatten() {
-                println!(
-                    "{label} {} {}:{}",
-                    row["qualified_name"].as_str().unwrap_or(""),
-                    row["file"].as_str().unwrap_or(""),
-                    row["line"].as_i64().unwrap_or(0)
-                );
-            }
-        }
-    }
-    Ok(0)
 }
 
 /// What `read` was asked to read, after `-`, `--symbol` and `--path` have been

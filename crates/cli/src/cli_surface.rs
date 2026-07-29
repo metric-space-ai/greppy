@@ -208,10 +208,9 @@ pub enum Command {
     /// traits have no body to sketch: they print their whole definition.
     /// This is the orientation aid; `who-calls` and `callees` give addresses.
     Brief {
-        /// The symbols to brief. Several are briefed in one call:
-        /// `greppy brief A B C`. `-` reads them from the pipe.
+        /// The symbol to brief — exactly one. `-` reads it from the pipe.
         #[arg(value_name = "SYMBOL")]
-        symbols: Vec<String>,
+        symbol: String,
         /// Restrict returned definitions/callers/callees to these files or
         /// directory subtrees. Graph resolution itself remains workspace-wide.
         /// Repeatable.
