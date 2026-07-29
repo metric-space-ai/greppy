@@ -693,6 +693,24 @@ pub enum EditCommand {
         dry_run: bool,
         verify: bool,
     },
+    Delete {
+        symbol: String,
+        dry_run: bool,
+        verify: bool,
+    },
+    DeleteLines {
+        file: String,
+        lines: String,
+        dry_run: bool,
+        verify: bool,
+    },
+    InsertLines {
+        file: String,
+        line: usize,
+        new: Option<String>,
+        dry_run: bool,
+        verify: bool,
+    },
 }
 
 impl Cli {
@@ -727,6 +745,9 @@ const SUBCOMMANDS: &[&str] = &[
     "replace-lines",
     "replace-span",
     "write",
+    "delete",
+    "delete-lines",
+    "insert-lines",
     "who-calls",
     "callees",
     "fan-in",
@@ -1280,6 +1301,9 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "replace-lines" => "greppy replace-lines F A:B [NEW] [--dry-run] [--verify]",
         "replace-span" => "greppy replace-span H [NEW] [--dry-run] [--verify]",
         "write" => "greppy write PATH [NEW] [--dry-run] [--verify]",
+        "delete" => "greppy delete S [--dry-run] [--verify]",
+        "delete-lines" => "greppy delete-lines F A:B [--dry-run] [--verify]",
+        "insert-lines" => "greppy insert-lines F N [NEW] [--dry-run] [--verify]",
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "search" => {
             "greppy search WHAT IT DOES [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
@@ -1957,6 +1981,15 @@ fn dispatch_subcommand(
         ),
         Command::Write { path, new, dry_run, verify, json } => dispatch_edit(
             EditCommand::Write { path, new, dry_run, verify }, json, root,
+        ),
+        Command::Delete { symbol, dry_run, verify, json } => dispatch_edit(
+            EditCommand::Delete { symbol, dry_run, verify }, json, root,
+        ),
+        Command::DeleteLines { file, lines, dry_run, verify, json } => dispatch_edit(
+            EditCommand::DeleteLines { file, lines, dry_run, verify }, json, root,
+        ),
+        Command::InsertLines { file, line, new, dry_run, verify, json } => dispatch_edit(
+            EditCommand::InsertLines { file, line, new, dry_run, verify }, json, root,
         ),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),

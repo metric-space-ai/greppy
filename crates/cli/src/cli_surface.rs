@@ -317,6 +317,45 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Remove a definition.
+    Delete {
+        #[arg(value_name = "S", allow_hyphen_values = true)]
+        symbol: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove inclusive 1-based lines A:B from F.
+    DeleteLines {
+        #[arg(value_name = "F", allow_hyphen_values = true)]
+        file: String,
+        #[arg(value_name = "A:B", allow_hyphen_values = true)]
+        lines: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Insert NEW after line N in F; line 0 means the top.
+    InsertLines {
+        #[arg(value_name = "F", allow_hyphen_values = true)]
+        file: String,
+        #[arg(value_name = "N", allow_hyphen_values = true)]
+        line: usize,
+        #[arg(value_name = "NEW", allow_hyphen_values = true)]
+        new: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print deterministic graph statistics for the workspace project:
     /// file count, node counts by label, edge counts by type, and the
     /// node/edge totals.

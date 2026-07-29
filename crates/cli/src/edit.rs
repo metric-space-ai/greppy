@@ -2428,6 +2428,89 @@ pub(crate) fn dispatch_edit_grammar(
                 .and_then(|bytes| run_trained_write(root_path, &path, bytes, dry_run, verify));
             emit_edit_outcome(outcome, json, None)?
         }
+        EditCommand::Delete { symbol, dry_run, verify } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                let spec = WhereSpec {
+                    file: None,
+                    old: None,
+                    old_file: None,
+                    pattern: None,
+                    lines: None,
+                    symbol: Some(symbol),
+                    body: false,
+                    target: None,
+                    path: None,
+                };
+                let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path)?;
+                let (new_content, changed) = edit_op_delete(&located);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, None)?
+        }
+        EditCommand::DeleteLines { file, lines, dry_run, verify } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                let spec = WhereSpec {
+                    file: Some(file),
+                    old: None,
+                    old_file: None,
+                    pattern: None,
+                    lines: Some(lines),
+                    symbol: None,
+                    body: false,
+                    target: None,
+                    path: None,
+                };
+                let located = edit_locate(&spec, SelectorKind::Lines, root, root_path)?;
+                let (new_content, changed) = edit_op_delete(&located);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, None)?
+        }
+        EditCommand::InsertLines { file, line, new, dry_run, verify } => {
+            let outcome = (|| -> EditResult<EditRecord> {
+                let mut inserted = edit_positional_payload(new, "NEW")?;
+                let (rel, abs, content) = edit_read_file(root_path, &file)?;
+                let total = edit_line_count(&content);
+                if line > total {
+                    return Err(EditRefusal::new(
+                        "range_out_of_bounds",
+                        format!("{rel} has {total} line(s); cannot insert after line {line}"),
+                        13,
+                    ));
+                }
+                let ending: &[u8] = if content.windows(2).any(|pair| pair == b"\r\n") {
+                    b"\r\n"
+                } else {
+                    b"\n"
+                };
+                if !inserted.ends_with(b"\n") {
+                    inserted.extend_from_slice(ending);
+                }
+                let at = if line == 0 {
+                    0
+                } else {
+                    line_range_to_bytes(&content, line, line).1
+                };
+                if line > 0 && at == content.len() && !content.ends_with(b"\n") {
+                    let mut separated = ending.to_vec();
+                    separated.extend_from_slice(&inserted);
+                    inserted = separated;
+                }
+                let located = Located {
+                    rel,
+                    abs,
+                    content,
+                    ranges: vec![(at, at)],
+                    kind: SelectorKind::Lines,
+                    regex: None,
+                    needle: None,
+                };
+                let mut edits = vec![(at, at, inserted)];
+                let (new_content, changed) = edit_splice(&located.content, &mut edits);
+                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+            })();
+            emit_edit_outcome(outcome, json, None)?
+        }
     };
     Ok(GrammarDispatch::Handled(code))
 }
