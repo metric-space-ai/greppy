@@ -1,4 +1,16 @@
-//! Explanatory empty-output coverage for literal code search.
+//! Explanatory empty-output coverage for `search-pattern`, plus the
+//! retirement pin for the pre-0.3.0 name `search-code` whose literal-search
+//! contract this file used to pin.
+//!
+//! 0.3.0 contract (dev/SEARCH-OUTPUT-SPEC.md, normative):
+//! * `search-code` is dead vocabulary: refused as an unknown subcommand
+//!   (exit 64) before grep passthrough — never grepped, never answered.
+//! * `search-pattern` is regex-native: a pattern with metacharacters is
+//!   simply a pattern. Zero hits print `no matches` (naming the path filter
+//!   when one is given) and exit 1 (grep's convention, deliberately). The
+//!   only added line is a computed fact — `case-insensitive: N matches`
+//!   when the case-insensitive run would hit — never an instruction
+//!   (NAV law 1: no justification, no instruction).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,43 +49,95 @@ fn run(repo: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// The pre-0.3.0 `search-code` subcommand is dead-listed vocabulary: like
+/// `edit change-signature` (edit_m4) it must be REFUSED as an unknown
+/// subcommand — an agent with a stale habit learns immediately instead of
+/// getting garbage grep matches for `search-code` as a pattern.
 #[test]
-fn empty_literal_search_names_interpretation_and_path_filters() {
-    let (repo, store) = fresh_workspace("literal");
+fn retired_search_code_is_refused_not_grepped() {
+    let (repo, store) = fresh_workspace("retired");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
 
-    let (code, stdout, stderr) = run(
-        &repo,
-        &store,
-        &["search-code", "absent_value", "src"],
-    );
+    let (code, stdout, stderr) = run(&repo, &store, &["search-code", "absent_value", "src"]);
 
-    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.contains("(no matches)"), "{stdout}");
-    assert!(stdout.contains("query_interpreted_as: literal"), "{stdout}");
-    assert!(stdout.contains("path_filters: src"), "{stdout}");
+    let text = format!("{stdout}{stderr}");
+    assert_eq!(
+        code, 64,
+        "`greppy search-code` must refuse as invalid vocabulary; stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        text.contains("unrecognized subcommand 'search-code'"),
+        "the refusal names the dead verb; got: {text}"
+    );
+    assert!(
+        !text.contains("src/lib.rs") && !text.contains("no matches"),
+        "the refusal neither greps nor answers; got: {text}"
+    );
 }
 
+/// Zero hits name the active path filter and nothing else: one line, no
+/// interpretation metadata, no retry teaching (NAV law 1).
 #[test]
-fn empty_metacharacter_search_teaches_the_regex_retry() {
+fn empty_search_pattern_names_the_path_filter_without_teaching() {
+    let (repo, store) = fresh_workspace("empty-filter");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+
+    let (code, stdout, _stderr) =
+        run(&repo, &store, &["search-pattern", "absent_value", "--path", "src"]);
+
+    assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
+    assert_eq!(
+        stdout, "no matches under path filter: src\n",
+        "empty output is exactly one line naming the path filter — no \
+         query_interpreted_as/path_filters metadata, no instruction; got: {stdout:?}"
+    );
+}
+
+/// `search-pattern` is regex-native: `absent.*value` is simply a pattern that
+/// matches nothing. The pre-0.3.0 teaching ("regex metacharacters are literal
+/// in search-code" + "try: greppy rg ...") is dead with the command.
+#[test]
+fn metacharacter_pattern_is_just_a_pattern_without_teaching() {
     let (repo, store) = fresh_workspace("metacharacters");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
 
-    let (code, stdout, stderr) = run(
+    let (code, stdout, _stderr) = run(
         &repo,
         &store,
-        &["search-code", "absent.*value", "src"],
+        &["search-pattern", "absent.*value", "--path", "src"],
     );
 
-    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
-    assert!(
-        stdout.contains("regex metacharacters are literal in search-code"),
-        "{stdout}"
+    assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
+    assert_eq!(
+        stdout, "no matches under path filter: src\n",
+        "a metacharacter pattern gets the plain empty answer; got: {stdout:?}"
     );
     assert!(
-        stdout.contains("try: greppy rg 'absent.*value' src"),
-        "{stdout}"
+        !stdout.contains("literal") && !stdout.contains("try:"),
+        "no metacharacter teaching and no rg retry line; got: {stdout:?}"
+    );
+}
+
+/// The one fact an empty answer may add: when the case-insensitive run WOULD
+/// hit, the computed count follows — a number, not an instruction.
+#[test]
+fn empty_search_pattern_reports_the_case_insensitive_fact() {
+    let (repo, store) = fresh_workspace("case-fact");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+
+    let (code, stdout, _stderr) = run(
+        &repo,
+        &store,
+        &["search-pattern", "PRESENT", "--fixed", "--path", "src"],
+    );
+
+    assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
+    assert_eq!(
+        stdout, "no matches under path filter: src\ncase-insensitive: 1 matches\n",
+        "the empty answer carries the computed case-insensitive fact; got: {stdout:?}"
     );
 }
