@@ -54,6 +54,13 @@ CASES = {
     "bash-smart": (["bash-smart", "--", "sh", "-c", "echo ok"], {0}, [r"ok"]),
     "expand-bad-id": (["expand", "ffffffffffffffff"], {1}, [r"not found|expired"]),
     "grep-passthrough": (["-c", "parse_path", "edit-src/data.rs"], {0}, [r"^\d+$"]),
+    # ON EVERY COMMAND promises --path, --json, --limit on every verb: sample
+    # them across the families so a missing wire cannot hide again.
+    "footer-path-search": (["search-symbol", "parse_path", "--path", "edit-src"], {0}, [r"parse_path"]),
+    "footer-path-nav": (["who-calls", "parse_path", "--path", "edit-src"], {0}, [r"^\S+:\d+  \S+"]),
+    "footer-json-search": (["search-pattern", "fn parse_path", "--json"], {0}, [r"\{"]),
+    "footer-limit-nav": (["who-calls", "parse_path", "--limit", "1"], {0}, [r"^\S+:\d+  \S+"]),
+    "footer-path-read": (["read", "parse_path", "--path", "edit-src"], {0}, []),
 }
 
 REMOVED = ["find-usages", "references", "map", "outline", "changes", "verify",
