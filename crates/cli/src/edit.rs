@@ -2346,6 +2346,306 @@ pub(crate) fn run_trained_write(
     Ok(record)
 }
 
+#[derive(Debug)]
+struct TrainedPatchHunk {
+    declared_old_line: usize,
+    old_lines: Vec<String>,
+    new_lines: Vec<String>,
+}
+
+#[derive(Debug)]
+struct TrainedPatchFile {
+    path: String,
+    hunks: Vec<TrainedPatchHunk>,
+}
+
+fn trained_patch_path(header: &str) -> Option<String> {
+    let raw = header.split_whitespace().next()?;
+    if raw == "/dev/null" {
+        return None;
+    }
+    Some(
+        raw.strip_prefix("a/")
+            .or_else(|| raw.strip_prefix("b/"))
+            .unwrap_or(raw)
+            .to_string(),
+    )
+}
+
+fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
+    let text = std::str::from_utf8(diff).map_err(|_| {
+        EditRefusal::new("invalid_patch", "the unified diff is not UTF-8", 20)
+    })?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut files = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        if !lines[index].starts_with("--- ") {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(next) = lines.get(index).filter(|line| line.starts_with("+++ ")) else {
+            return Err(EditRefusal::new(
+                "invalid_patch",
+                "a --- file header is not followed by +++",
+                20,
+            ));
+        };
+        let Some(path) = trained_patch_path(&next[4..]) else {
+            return Err(EditRefusal::new(
+                "invalid_patch",
+                "file creation and deletion are not supported by patch",
+                20,
+            ));
+        };
+        index += 1;
+        let mut hunks = Vec::new();
+        while index < lines.len() && !lines[index].starts_with("--- ") {
+            if !lines[index].starts_with("@@") {
+                index += 1;
+                continue;
+            }
+            let declared_old_line = lines[index]
+                .split_whitespace()
+                .find(|field| field.starts_with('-'))
+                .and_then(|field| field[1..].split(',').next())
+                .and_then(|number| number.parse::<usize>().ok())
+                .unwrap_or(1);
+            index += 1;
+            let mut old_lines = Vec::new();
+            let mut new_lines = Vec::new();
+            while index < lines.len()
+                && !lines[index].starts_with("@@")
+                && !lines[index].starts_with("--- ")
+            {
+                let line = lines[index];
+                match line.as_bytes().first() {
+                    Some(b' ') => {
+                        old_lines.push(line[1..].to_string());
+                        new_lines.push(line[1..].to_string());
+                    }
+                    Some(b'-') => old_lines.push(line[1..].to_string()),
+                    Some(b'+') => new_lines.push(line[1..].to_string()),
+                    Some(b'\\') => {}
+                    _ => {
+                        return Err(EditRefusal::new(
+                            "invalid_patch",
+                            "a hunk contains a line without a unified-diff prefix",
+                            20,
+                        ))
+                    }
+                }
+                index += 1;
+            }
+            if old_lines.is_empty() {
+                return Err(EditRefusal::new(
+                    "invalid_patch",
+                    format!("{path}: a hunk has no context line to anchor on"),
+                    20,
+                ));
+            }
+            hunks.push(TrainedPatchHunk {
+                declared_old_line,
+                old_lines,
+                new_lines,
+            });
+        }
+        if hunks.is_empty() {
+            return Err(EditRefusal::new(
+                "invalid_patch",
+                format!("{path}: the diff carries no hunk"),
+                20,
+            ));
+        }
+        files.push(TrainedPatchFile { path, hunks });
+    }
+    if files.is_empty() {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            "the diff carries no file header",
+            20,
+        ));
+    }
+    Ok(files)
+}
+
+fn apply_trained_patch_file(
+    path: &str,
+    content: &[u8],
+    hunks: &[TrainedPatchHunk],
+) -> EditResult<EditedContent> {
+    let text = std::str::from_utf8(content).map_err(|_| {
+        EditRefusal::new("invalid_patch", format!("{path} is not UTF-8"), 20)
+    })?;
+    let line_texts: Vec<&str> = text.lines().collect();
+    let mut line_ranges = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < content.len() {
+        let end = content[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| cursor + offset + 1)
+            .unwrap_or(content.len());
+        line_ranges.push((cursor, end));
+        cursor = end;
+    }
+    let ending = if content.windows(2).any(|pair| pair == b"\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut edits = Vec::new();
+    for hunk in hunks {
+        let candidates: Vec<usize> = line_texts
+            .windows(hunk.old_lines.len())
+            .enumerate()
+            .filter(|(_, window)| {
+                window
+                    .iter()
+                    .zip(&hunk.old_lines)
+                    .all(|(actual, expected)| actual.trim_end_matches('\r') == expected)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let first = match candidates.as_slice() {
+            [only] => *only,
+            [] => {
+                return Err(EditRefusal::new(
+                    "patch_context",
+                    format!(
+                        "{path}: hunk context did not match (the @@ line {} is advisory) — nothing written",
+                        hunk.declared_old_line
+                    ),
+                    13,
+                ))
+            }
+            many => {
+                let declared = hunk.declared_old_line.saturating_sub(1);
+                if many.contains(&declared) {
+                    declared
+                } else {
+                    return Err(EditRefusal::new(
+                        "patch_context",
+                        format!("{path}: hunk context matches more than once — nothing written"),
+                        13,
+                    ));
+                }
+            }
+        };
+        let start = line_ranges[first].0;
+        let end = line_ranges[first + hunk.old_lines.len() - 1].1;
+        let had_final_ending = content[start..end].ends_with(b"\n");
+        let mut replacement = hunk.new_lines.join(ending).into_bytes();
+        if had_final_ending {
+            replacement.extend_from_slice(ending.as_bytes());
+        }
+        edits.push((start, end, replacement));
+    }
+    edits.sort_by_key(|edit| edit.0);
+    if edits.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            format!("{path}: patch hunks overlap"),
+            20,
+        ));
+    }
+    Ok(edit_splice(content, &mut edits))
+}
+
+pub(crate) fn run_trained_patch(
+    root_path: &std::path::Path,
+    diff: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+) -> EditResult<EditRecord> {
+    let parsed = parse_trained_patch(&diff)?;
+    let mut planned = Vec::new();
+    for file in parsed {
+        let (rel, abs, content) = edit_read_file(root_path, &file.path)?;
+        let (after, changed) = apply_trained_patch_file(&rel, &content, &file.hunks)?;
+        let language = greppy_edit::language_for_path(std::path::Path::new(&rel));
+        if language.is_supported() {
+            if let (Some(before_counts), Some(after_counts)) = (
+                greppy_edit::txn::syntax_counts(language, &content),
+                greppy_edit::txn::syntax_counts(language, &after),
+            ) {
+                if after_counts.errors > before_counts.errors
+                    || after_counts.missing > before_counts.missing
+                {
+                    return Err(EditRefusal::new(
+                        "invalid_result",
+                        "refused: the edit would break the file's syntax — nothing written",
+                        13,
+                    ));
+                }
+            }
+        }
+        planned.push((rel, abs, content, after, changed));
+    }
+    let already = planned.iter().all(|(_, _, before, after, _)| before == after);
+    let mut record = EditRecord {
+        files: planned.iter().map(|(rel, _, _, _, _)| rel.clone()).collect(),
+        span: planned.first().and_then(|(_, _, _, after, changed)| {
+            let (start, end) = changed.first().copied()?;
+            Some(edit_span_lines(after, start, end.saturating_sub(start)))
+        }),
+        published: !dry_run,
+        already_as_sent: already,
+        ..EditRecord::default()
+    };
+    for (rel, _, before, after, changed) in &planned {
+        record.operations.push(EditOperation {
+            file: rel.clone(),
+            ranges: changed.clone(),
+            sha_before: Some(edit_sha256_hex(before)),
+            sha_after: Some(edit_sha256_hex(after)),
+            diff: Some(edit_unified_diff(rel, before, after)),
+            ..EditOperation::default()
+        });
+    }
+    if already || dry_run {
+        return Ok(record);
+    }
+    let before: Vec<UndoBefore> = planned
+        .iter()
+        .map(|(rel, _, content, _, _)| UndoBefore {
+            rel: rel.clone(),
+            content: Some(content.clone()),
+        })
+        .collect();
+    let transaction = edit_journal_open(root_path, &before);
+    edit_journal_crash_hook()?;
+    for (_, abs, content, after, _) in &planned {
+        if let Err(error) = greppy_edit::publish::publish_atomic(
+            root_path,
+            abs,
+            after,
+            &edit_sha256_hex(content),
+        ) {
+            if let Some(pending) = edit_journal_read(
+                &edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING),
+            ) {
+                let _ = edit_journal_restore(root_path, &pending, false);
+            }
+            edit_journal_abort(root_path);
+            return Err(EditRefusal::new(
+                "publish_failed",
+                format!("patch transaction failed: {error} — nothing written"),
+                16,
+            ));
+        }
+    }
+    if let Some(id) = transaction {
+        edit_journal_close(root_path, &id);
+        record.transaction_id = Some(id);
+    }
+    if verify {
+        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+    }
+    Ok(record)
+}
+
 pub(crate) fn run_trained_rename(
     root_path: &std::path::Path,
     root: Option<&str>,
@@ -2704,6 +3004,11 @@ pub(crate) fn dispatch_edit_grammar(
         }
         EditCommand::Undo { id, dry_run, verify } => {
             let outcome = run_edit_undo(root_path, id.as_deref(), dry_run, verify);
+            emit_edit_outcome(outcome, json, None)?
+        }
+        EditCommand::Patch { diff, dry_run, verify } => {
+            let outcome = edit_positional_payload(diff, "DIFF")
+                .and_then(|bytes| run_trained_patch(root_path, bytes, dry_run, verify));
             emit_edit_outcome(outcome, json, None)?
         }
     };

@@ -722,6 +722,11 @@ pub enum EditCommand {
         dry_run: bool,
         verify: bool,
     },
+    Patch {
+        diff: Option<String>,
+        dry_run: bool,
+        verify: bool,
+    },
 }
 
 impl Cli {
@@ -761,6 +766,7 @@ const SUBCOMMANDS: &[&str] = &[
     "insert-lines",
     "rename",
     "undo",
+    "patch",
     "who-calls",
     "callees",
     "fan-in",
@@ -1319,6 +1325,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "insert-lines" => "greppy insert-lines F N [NEW] [--dry-run] [--verify]",
         "rename" => "greppy rename S NAME [--dry-run] [--verify]",
         "undo" => "greppy undo [ID] [--dry-run] [--verify]",
+        "patch" => "greppy patch [DIFF] [--dry-run] [--verify]",
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "search" => {
             "greppy search WHAT IT DOES [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
@@ -2011,6 +2018,9 @@ fn dispatch_subcommand(
         ),
         Command::Undo { id, dry_run, verify, json } => dispatch_edit(
             EditCommand::Undo { id, dry_run, verify }, json, root,
+        ),
+        Command::Patch { diff, dry_run, verify, json } => dispatch_edit(
+            EditCommand::Patch { diff, dry_run, verify }, json, root,
         ),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),

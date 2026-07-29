@@ -380,6 +380,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Apply a unified diff to every named file as one transaction.
+    Patch {
+        #[arg(value_name = "DIFF", allow_hyphen_values = true)]
+        diff: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print deterministic graph statistics for the workspace project:
     /// file count, node counts by label, edge counts by type, and the
     /// node/edge totals.
