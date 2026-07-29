@@ -101,6 +101,69 @@ fn dry_run_noop_never_claims_applied() {
 }
 
 #[test]
+fn multi_site_apply_receipt_names_every_touched_line() {
+    let fixture = Fixture::new("multi-site-apply");
+    std::fs::write(
+        fixture.repo.join("repeated.txt"),
+        "alpha\nbeta\nalpha\ngamma\n",
+    )
+    .unwrap();
+
+    let output = fixture.run(&[
+        "replace-text",
+        "repeated.txt",
+        "alpha",
+        "ALPHA",
+        "--expect",
+        "2",
+    ]);
+    let text = combined(&output);
+
+    assert!(output.status.success(), "{text}");
+    let transaction = text
+        .strip_prefix("applied repeated.txt:1,3  ")
+        .and_then(|tail| tail.strip_suffix('\n'))
+        .expect("receipt must name both disjoint sites and only then the transaction");
+    assert_eq!(transaction.len(), 6, "{text}");
+    assert!(
+        transaction.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "{text}"
+    );
+    assert_file(
+        &fixture.repo.join("repeated.txt"),
+        "ALPHA\nbeta\nALPHA\ngamma\n",
+    );
+}
+
+#[test]
+fn multi_site_dry_run_receipt_names_every_site_without_writing() {
+    let fixture = Fixture::new("multi-site-dry-run");
+    std::fs::write(
+        fixture.repo.join("repeated.txt"),
+        "alpha\nbeta\nalpha\ngamma\n",
+    )
+    .unwrap();
+
+    let output = fixture.run(&[
+        "replace-text",
+        "repeated.txt",
+        "alpha",
+        "ALPHA",
+        "--expect",
+        "2",
+        "--dry-run",
+    ]);
+    let text = combined(&output);
+
+    assert!(output.status.success(), "{text}");
+    assert_eq!(text, "would apply repeated.txt:1,3\n");
+    assert_file(
+        &fixture.repo.join("repeated.txt"),
+        "alpha\nbeta\nalpha\ngamma\n",
+    );
+}
+
+#[test]
 fn absent_new_payload_is_read_byte_exactly_from_stdin() {
     let fixture = Fixture::new("piped-stdin");
 

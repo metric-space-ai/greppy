@@ -171,6 +171,96 @@ pub(crate) fn edit_splice(
     (out, written)
 }
 
+/// Turn result byte ranges into the exact line runs a compact receipt names.
+/// Two writes on adjacent lines are one contiguous run; disjoint writes retain
+/// the comma that proves the edit did not touch the lines between them.
+pub(crate) fn edit_line_span_runs(
+    content: &[u8],
+    ranges: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|(start, end)| {
+            let start = (*start).min(content.len());
+            let end = (*end).min(content.len()).max(start);
+            edit_span_lines(content, start, end - start)
+        })
+        .collect();
+    edit_merge_line_spans(spans)
+}
+
+pub(crate) fn edit_merge_line_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (first, last) in spans {
+        if let Some(run) = runs.last_mut() {
+            if first <= run.1.saturating_add(1) {
+                run.1 = run.1.max(last);
+                continue;
+            }
+        }
+        runs.push((first, last));
+    }
+    runs
+}
+
+pub(crate) fn edit_format_line_address(file: &str, spans: &[(usize, usize)]) -> String {
+    let suffix = spans
+        .iter()
+        .map(|(first, last)| {
+            if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{file}:{suffix}")
+}
+
+pub(crate) fn edit_exact_address(file: &str, content: &[u8], ranges: &[(usize, usize)]) -> String {
+    edit_format_line_address(file, &edit_line_span_runs(content, ranges))
+}
+
+/// The shared emitter has a single contiguous `span` slot. When an operation
+/// has several sites (or several files), supply its exact compact lines as the
+/// headline instead, preserving the same status words and transaction suffix.
+pub(crate) fn edit_set_exact_receipt(
+    record: &mut EditRecord,
+    addresses: Vec<String>,
+    exact_required: bool,
+) {
+    if !exact_required || addresses.is_empty() {
+        return;
+    }
+    let short_id = record
+        .transaction_id
+        .as_deref()
+        .map(|id| &id[..id.len().min(6)]);
+    let lines = addresses
+        .into_iter()
+        .map(|address| {
+            if record.already_as_sent {
+                format!("applied, already as sent  {address}")
+            } else {
+                let word = if record.published {
+                    "applied"
+                } else {
+                    "would apply"
+                };
+                if let Some(id) = short_id.filter(|_| record.published) {
+                    format!("{word} {address}  {id}")
+                } else {
+                    format!("{word} {address}")
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    record.headline = Some(lines);
+}
+
 /// Refuse a path that leaves the repository, whether by climbing out of it or
 /// through a symlink that points out.
 pub(crate) fn edit_guard_path(root_path: &std::path::Path, abs: &std::path::Path) -> EditResult<()> {
@@ -654,6 +744,8 @@ pub(crate) fn edit_publish(
     let first_end = first_end.min(new_content.len());
     let text = String::from_utf8_lossy(&new_content[first_start..first_end]).into_owned();
     let span = edit_span_lines(&new_content, first_start, first_end - first_start);
+    let exact_required = changed.len() > 1;
+    let exact_address = edit_exact_address(&located.rel, &new_content, &changed);
     let mut operation = EditOperation {
         file: located.rel.clone(),
         ranges: changed,
@@ -676,6 +768,7 @@ pub(crate) fn edit_publish(
         // `applied, already as sent` wording is reserved for a non-dry call.
         record.already_as_sent = !dry_run;
         record.operations = vec![operation];
+        edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
         return Ok(record);
     }
     let language = greppy_edit::language_for_path(std::path::Path::new(&located.rel));
@@ -697,6 +790,7 @@ pub(crate) fn edit_publish(
         // A handle addresses bytes on disk. A dry run wrote none, so handing
         // one back would hand back an address that is already stale.
         record.operations = vec![operation];
+        edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
         return Ok(record);
     }
     let before_sha = edit_sha256_hex(&located.content);
@@ -735,6 +829,7 @@ pub(crate) fn edit_publish(
     if verify {
         record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
     }
+    edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
     Ok(record)
 }
 
@@ -1638,6 +1733,14 @@ pub(crate) fn run_trained_patch(
         planned.push((rel, abs, content, after, changed));
     }
     let already = planned.iter().all(|(_, _, before, after, _)| before == after);
+    let exact_required = planned.len() > 1
+        || planned
+            .iter()
+            .any(|(_, _, _, _, changed)| changed.len() > 1);
+    let exact_addresses = planned
+        .iter()
+        .map(|(rel, _, _, after, changed)| edit_exact_address(rel, after, changed))
+        .collect::<Vec<_>>();
     let mut record = EditRecord {
         files: planned.iter().map(|(rel, _, _, _, _)| rel.clone()).collect(),
         span: planned.first().and_then(|(_, _, _, after, changed)| {
@@ -1659,6 +1762,7 @@ pub(crate) fn run_trained_patch(
         });
     }
     if already || dry_run {
+        edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
         return Ok(record);
     }
     let before: Vec<UndoBefore> = planned
@@ -1697,7 +1801,53 @@ pub(crate) fn run_trained_patch(
     if verify {
         record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
     }
+    edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(record)
+}
+
+pub(crate) fn edit_rename_receipt_addresses(
+    root_path: &std::path::Path,
+    certificate: &greppy_edit::certificate::Certificate,
+    before: &[UndoBefore],
+    old_name: &str,
+    new_name: &str,
+) -> Vec<String> {
+    let mut by_file: std::collections::BTreeMap<String, Vec<(usize, usize)>> =
+        std::collections::BTreeMap::new();
+    let length_delta = new_name.len() as i128 - old_name.len() as i128;
+    for operation in &certificate.operations {
+        let file = edit_operation_path(operation, root_path);
+        let Some(content) = before
+            .iter()
+            .find(|entry| entry.rel == file)
+            .and_then(|entry| entry.content.as_deref())
+        else {
+            by_file
+                .entry(file)
+                .or_default()
+                .push(edit_operation_line_span(operation, root_path));
+            continue;
+        };
+        let mut ranges = operation.changed_byte_ranges.clone();
+        ranges.sort_unstable();
+        for (index, (after_start, _)) in ranges.into_iter().enumerate() {
+            // Rename replacements cannot add newlines. Translate each result
+            // offset back through the preceding identifier-length shifts, then
+            // read its unchanged line number from the before image. This also
+            // keeps dry-run receipts exact, when the result is not on disk.
+            let before_start = (after_start as i128 - length_delta * index as i128)
+                .clamp(0, content.len() as i128) as usize;
+            by_file.entry(file.clone()).or_default().push(edit_span_lines(
+                content,
+                before_start,
+                old_name.len().min(content.len().saturating_sub(before_start)),
+            ));
+        }
+    }
+    by_file
+        .into_iter()
+        .map(|(file, spans)| edit_format_line_address(&file, &edit_merge_line_spans(spans)))
+        .collect()
 }
 
 pub(crate) fn run_trained_rename(
@@ -1813,6 +1963,18 @@ pub(crate) fn run_trained_rename(
             certificate.exit_code(),
         )));
     }
+    let exact_required = certificate.operations.len() > 1
+        || certificate
+            .operations
+            .iter()
+            .any(|operation| operation.changed_byte_ranges.len() > 1);
+    let exact_addresses = edit_rename_receipt_addresses(
+        root_path,
+        &certificate,
+        &before,
+        &short_name,
+        new_name,
+    );
     let mut files: Vec<String> = certificate
         .operations
         .iter()
@@ -1841,6 +2003,7 @@ pub(crate) fn run_trained_rename(
     if verify && certificate.published {
         record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
     }
+    edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(Ok(record))
 }
 
