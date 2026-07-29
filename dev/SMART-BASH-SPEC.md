@@ -36,27 +36,40 @@ overlap; a small head reads the hidden state at each line-end token — one
 prediction per line, ONE forward pass per window. Classes:
 
 ```
-error / warning / question / artifact / progress / text
-+ a continuation bit ("this line continues the previous one")
+error / warning / progress / text
 ```
 
-The continuation bit lifts BLOCKS: a rust error is five lines, a traceback
-twenty — the engineer quotes the block, so the head must too. Display policy
-is derived, not judged: error, question and artifact blocks are lifted verbatim
-with line numbers; warnings are counted and sampled; progress stays collapsed;
-text stays in the pack unless layer 4 surfaces it.
+Labels are emitted as RANGES of consecutive lines sharing a class, so a block
+falls out of the labeling itself — a rust error is five lines, a traceback
+twenty, and the engineer quotes the block, so the head must too. No separate
+continuation bit: it was a second judgment call and measured 67% self-agreement.
+Display policy is derived, not judged: error blocks are lifted verbatim with
+line numbers; warnings are counted and sampled; progress stays collapsed; text
+stays in the pack unless layer 4 surfaces it.
 
-**Six classes, not seven — measured, 2026-07-29.** The original scheme split
-the remainder into `result` (the answer) and `info` (context). A 4-round
-double-labeling QA (M3 vs Kimi, ~470 lines per round) put the five specific
-classes near 100% agreement and made result/info oscillate 99 → 98 → 46 → 48
-with every wording change, in exact anti-phase with info: the boundary is a
-judgment call, not a definition gap. Deriving it from behaviour instead
-(lines reappearing in the agent's next turn) failed on the same data — 1 of 76
-error lines, 160 of 186 walls empty — because agents paraphrase rather than
-quote. So the tool never asks which prose line is "the answer": what the head
-cannot label reliably, the mechanics carry. Full evidence:
-`greppy-data-pipeline/docs/CLASS-SCHEME-DECISION.md`.
+**Four classes — each survivor earned its place by measurement, 2026-07-29.**
+The scheme started at seven and shrank three times, every step forced by data
+from the prompt lab (`greppy-data-pipeline/prompt_lab.py`: the same prompt run
+twice over the same walls, self-agreement as the only criterion — a teacher
+that cannot agree with itself cannot teach):
+
+```
+result / info   dropped   the boundary is a judgment call: 4 QA rounds swung
+                          99 → 98 → 46 → 48 in anti-phase with info; deriving
+                          it from behaviour failed too (1 of 76 error lines —
+                          agents paraphrase, they do not quote)
+artifact        dropped   never stabilized in six measurements: 42 / 80 / 14 %
+question        dropped   vanishingly rare in agent traces (non-interactive);
+                          a waiting prompt is caught mechanically instead —
+                          a timeout with an unterminated last line
+continuation    dropped   67% self-agreement; ranges give blocks for free
+```
+
+The labeling prompt sees ONLY the numbered raw output lines — no command, no
+following agent turn, no dataset hint. Context the head cannot access at
+inference produces labels it cannot learn; an earlier prompt passed the agent's
+next turn and scored 86.7% self-agreement against the final 97.6%. Full
+evidence: `greppy-data-pipeline/docs/CLASS-SCHEME-DECISION.md`.
 
 **4. Surprisal net — for what no class catches.** In the same pass, per-line
 perplexity under the model; the most surprising unclassified lines are lifted
