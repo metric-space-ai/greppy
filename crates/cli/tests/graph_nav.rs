@@ -829,8 +829,8 @@ fn search_symbols_json_reports_exact_counts_and_metadata() {
 }
 
 /// A one-file edit heals on the triggering symbol search, and a read issued
-/// while greppy-edit's own refresh holds the writer lock waits for that fresh
-/// snapshot instead of returning an empty `refreshing` payload.
+/// while a refresh holds the writer lock waits for that fresh snapshot
+/// instead of returning an empty `refreshing` payload.
 #[test]
 fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     let (repo, store) = index_fixture("symbols-json-stale");
@@ -841,13 +841,13 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     .unwrap();
 
     let (code, out, err) = run(
-        &["search-symbols", "WidgetRenamed", "--json"],
+        &["search-symbol", "WidgetRenamed", "--json"],
         &repo,
         &store,
     );
     assert_eq!(
         code, 0,
-        "search-symbols must heal one-file drift in-band; stderr={err}\nstdout={out}"
+        "search-symbol must heal one-file drift in-band; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -864,28 +864,28 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     );
 
     let (repo, store) = index_fixture("read-waits-for-edit-refresh");
+    // An edit leaves the indexed graph one file behind...
+    std::fs::write(
+        repo.join("src/helper.rs"),
+        "pub fn do_it() -> u32 {\n    let answer = 84;\n    answer\n}\n",
+    )
+    .unwrap();
+    // ...and the refresh that heals it pauses just before publishing, holding
+    // the writer lock, so the read below meets an active writer.
     let ready = repo.parent().unwrap().join("edit-index-ready");
-    let mut edit = Command::new(bin());
-    edit.args([
-        "edit",
-        "text-cas",
-        "--file",
-        "src/helper.rs",
-        "--old",
-        "answer = 42",
-        "--new",
-        "answer = 84",
-    ])
-    .current_dir(&repo)
-    .env("GREPPY_STORE_DIR", &store)
-    .env("GREPPY_TEST_SKIP_INFERENCE", "1")
-    .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
-    .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
-    .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "1000")
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-    let child = edit.spawn().expect("spawn greppy-edit with held refresh");
-    for _ in 0..500 {
+    let mut index = Command::new(bin());
+    index
+        .args(["index", "."])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "5000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = index.spawn().expect("spawn indexer with held refresh");
+    for _ in 0..1500 {
         if ready.exists() {
             break;
         }
@@ -893,7 +893,7 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     }
     assert!(
         ready.exists(),
-        "edit-owned indexer did not reach the publication failpoint"
+        "indexer did not reach the publication failpoint"
     );
 
     let (code, out, err) = run(&["read", "do_it", "--json"], &repo, &store);
@@ -915,12 +915,12 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
         "read must return the post-edit definition: {v:?}"
     );
 
-    let edit_out = child.wait_with_output().expect("wait for greppy-edit");
+    let index_out = child.wait_with_output().expect("wait for indexer");
     assert!(
-        edit_out.status.success(),
-        "greppy-edit failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&edit_out.stdout),
-        String::from_utf8_lossy(&edit_out.stderr)
+        index_out.status.success(),
+        "indexer failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&index_out.stdout),
+        String::from_utf8_lossy(&index_out.stderr)
     );
 }
 
@@ -1464,37 +1464,210 @@ fn impact_base_text_and_json_use_merge_base_diff_sources() {
 }
 
 #[test]
-fn brief_bundles_definition_callers_and_callees_in_one_call() {
-    // do_it() is defined in helper.rs and called by caller() in lib.rs.
-    // `brief do_it` must return, in one call: its definition body, its
-    // CALLERS section listing `caller`, and a CALLS section.
+fn brief_sketches_the_body_instead_of_bundling_three_commands() {
+    // caller() is defined in lib.rs and calls do_it() in helper.rs.
+    // `brief caller` prints the sentence-less head verbatim and a sketch
+    // naming the one call — not the old CALLERS/REFERENCES/CALLS bundle.
     let (repo, store) = index_fixture("brief");
+    let (code, out, err) = run(&["brief", "caller"], &repo, &store);
+    assert_eq!(code, 0, "brief should exit 0; stderr={err}\nstdout={out}");
+    assert!(
+        out.contains("src/lib.rs:5\nfn caller() {"),
+        "brief must print the head address and the verbatim signature; got: {out}"
+    );
+    assert!(
+        out.contains("do_it") && out.contains('}'),
+        "brief's sketch must name the callee and close the block; got: {out}"
+    );
+    assert!(
+        !out.contains("-- CALLERS")
+            && !out.contains("-- REFERENCES")
+            && !out.contains("-- CALLS")
+            && !out.contains("== "),
+        "brief must not bundle who-calls/callees behind ASCII bars; got: {out}"
+    );
+
+    // do_it calls nothing: the sketch is empty and the aggregated callers
+    // line carries the one caller.
     let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
-    assert_eq!(code, 0, "brief should exit 0; stderr={err}");
+    assert_eq!(code, 0, "brief should exit 0; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("do_it") && out.contains("pub fn do_it"),
-        "brief must show the definition with source; got: {out}"
+        out.contains("pub fn do_it() -> u32 {"),
+        "brief must show the verbatim head; got: {out}"
     );
     assert!(
-        out.contains("(src/helper.rs:1-4)"),
-        "brief header must report the actual expanded source span; got: {out}"
-    );
-    let header = out.find("== ").expect("brief output must contain a header");
-    let source = out
-        .find("    pub fn do_it")
-        .expect("brief output must contain indented source");
-    let between = &out[header..source];
-    assert!(
-        !between.lines().any(|line| line.starts_with("  - ")),
-        "test-only inference bypass must preserve deterministic brief output; got: {out}"
+        out.contains("called by caller"),
+        "brief must aggregate callers into one line; got: {out}"
     );
     assert!(
-        out.contains("-- CALLERS") && out.contains("caller"),
-        "brief must list callers incl. `caller`; got: {out}"
+        !out.contains("-- CALLERS") && !out.contains("-- CALLS"),
+        "brief must not print section bars; got: {out}"
+    );
+}
+
+#[test]
+fn brief_sketches_match_branches_as_the_parser_sees_them() {
+    let root = fresh_dir("brief-match");
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"fn classify(x: u32) -> u32 {
+    match x {
+        0 => zero(),
+        _ => one(),
+    }
+}
+fn only(spans: Vec<u32>) -> u32 {
+    match spans.as_slice() {
+        [] => zero(),
+        [x] => one(),
+        many => zero(),
+    }
+}
+fn zero() -> u32 { 0 }
+fn one() -> u32 { 1 }
+"#,
+    )
+    .unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(&["brief", "classify"], &repo, &store);
+    assert_eq!(code, 0, "brief classify should exit 0; stderr={err}");
+    assert!(
+        out.contains("match x"),
+        "brief must sketch the match branch; got: {out}"
     );
     assert!(
-        out.contains("-- CALLS"),
-        "brief must have a CALLS (callees) section; got: {out}"
+        out.contains("0 — zero") && out.contains("else — one"),
+        "brief must fold each arm's call into the arm's line; got: {out}"
+    );
+
+    let (code, out, err) = run(&["brief", "only"], &repo, &store);
+    assert_eq!(code, 0, "brief only should exit 0; stderr={err}");
+    assert!(
+        out.contains("match spans.as_slice()"),
+        "brief must sketch the slice match with its scrutinee; got: {out}"
+    );
+    assert!(
+        out.contains("[] — zero") && out.contains("[x] — one") && out.contains("many — zero"),
+        "slice and binding patterns keep their real shape; got: {out}"
+    );
+}
+
+#[test]
+fn brief_prints_a_struct_as_its_whole_definition_without_a_sketch() {
+    let (repo, store) = index_fixture("brief-struct");
+    let (code, out, err) = run(&["brief", "Widget"], &repo, &store);
+    assert_eq!(code, 0, "brief Widget should exit 0; stderr={err}");
+    assert!(
+        out.contains("src/types.rs:1\npub struct Widget { pub w: u32 }"),
+        "a struct's fields are its interface: whole definition, no sketch; got: {out}"
+    );
+}
+
+#[test]
+fn brief_refuses_an_ambiguous_name_with_addresses_not_bodies() {
+    let root = fresh_dir("brief-ambiguous");
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(src.join("lib.rs"), "mod a;\nmod b;\n").unwrap();
+    std::fs::write(src.join("a.rs"), "pub fn dup() -> u32 { 1 }\n").unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn dup() -> u32 { 2 }\n").unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(&["brief", "dup"], &repo, &store);
+    assert_eq!(code, 1, "brief dup must refuse; stderr={err}\nstdout={out}");
+    assert!(
+        out.contains("`dup` is 2 definitions")
+            && out.contains("src/a.rs:1")
+            && out.contains("src/b.rs:1"),
+        "brief must refuse with one address per definition; got: {out}"
+    );
+    assert!(
+        !out.contains("pub fn dup"),
+        "brief must not print the bodies of every definition; got: {out}"
+    );
+}
+
+#[test]
+fn brief_reports_a_missing_symbol() {
+    let (repo, store) = index_fixture("brief-missing");
+    let (code, out, err) = run(&["brief", "no_such_symbol"], &repo, &store);
+    assert_eq!(code, 1, "brief must exit 1 for an unknown name; stderr={err}");
+    assert!(
+        out.contains("no symbol `no_such_symbol`"),
+        "brief must say the name does not resolve; got: {out}"
+    );
+}
+
+#[test]
+fn brief_refuses_a_name_that_has_nothing_to_sketch() {
+    let root = fresh_dir("brief-const");
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const LIMIT: u32 = 10;\npub fn within(x: u32) -> bool { x < LIMIT }\n",
+    )
+    .unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(&["brief", "LIMIT"], &repo, &store);
+    assert_eq!(code, 1, "brief LIMIT must refuse; stderr={err}\nstdout={out}");
+    assert!(
+        out.contains("`LIMIT` is a ") && out.contains("not a function"),
+        "brief must print the kind line for a name with no body; got: {out}"
+    );
+}
+
+#[test]
+fn brief_offers_the_call_tree_below_as_an_expand_pack() {
+    let root = fresh_dir("brief-expand");
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "fn hub() { a(); b(); }\nfn a() {}\nfn b() {}\n",
+    )
+    .unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(&["brief", "hub"], &repo, &store);
+    assert_eq!(code, 0, "brief hub should exit 0; stderr={err}");
+    let offer = out
+        .lines()
+        .find(|line| line.starts_with("expand "))
+        .unwrap_or_else(|| panic!("brief must offer the call tree pack; got: {out}"));
+    assert!(
+        offer.contains("the call tree below hub sketched, 2 functions,"),
+        "the offer must state the function and line counts; got: {offer}"
+    );
+    let id = offer
+        .split_whitespace()
+        .nth(1)
+        .expect("the offer carries an expand id");
+    let (code, out, err) = run(&["expand", id], &repo, &store);
+    assert_eq!(code, 0, "expand should exit 0; stderr={err}");
+    assert!(
+        out.contains("fn a() {}") && out.contains("fn b() {}"),
+        "the pack must sketch every function below hub; got: {out}"
     );
 }
 
@@ -1524,14 +1697,13 @@ fn recurse(n: u32) -> u32 {
 
     let (code, out, err) = run(&["brief", "recurse"], &repo, &store);
     assert_eq!(code, 0, "brief recurse should exit 0; stderr={err}");
-    let callers = out
-        .split("-- CALLERS")
-        .nth(1)
-        .and_then(|tail| tail.split("-- CALLS").next())
-        .unwrap_or("");
     assert!(
-        callers.contains("recurse") && !callers.contains("(no callers)"),
+        out.contains("called by recurse"),
         "brief must report a recursive self-call as a caller, got: {out}"
+    );
+    assert!(
+        out.contains("  recurse\n"),
+        "brief's sketch must name the recursive call, got: {out}"
     );
 }
 
@@ -1553,14 +1725,12 @@ fn class_navigation_is_first_class_for_callees_brief_imports_and_search_symbols(
     let (code, out, err) = run(&["brief", "RunnerFilter"], &repo, &store);
     assert_eq!(code, 0, "brief RunnerFilter should exit 0; stderr={err}");
     assert!(
-        out.contains("class RunnerFilter")
-            && out.contains("-- CALLERS")
-            && out.contains("build_filter")
-            && out.contains("-- REFERENCES")
-            && out.contains("IMPORTS Module checkov/cloudformation/runner.py")
-            && out.contains("-- CALLS")
-            && out.contains("setup_filter"),
-        "brief on a class must show definition, instantiation callers, references/imports, and member callees; got: {out}"
+        out.contains("class RunnerFilter:")
+            && out.contains("def __init__(self):")
+            && !out.contains("-- CALLERS")
+            && !out.contains("-- REFERENCES")
+            && !out.contains("-- CALLS"),
+        "brief on a class must print the whole definition, no sketch, no bars; got: {out}"
     );
     assert!(
         !out.contains("__file__"),

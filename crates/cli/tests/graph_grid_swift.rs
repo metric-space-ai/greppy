@@ -291,10 +291,10 @@ fn graph_grid_swift_brief_shows_definition_with_callers() {
     );
     assert!(
         out.contains("public func helperFunction() -> Int")
-            && out.contains("-- CALLERS")
-            && out.contains("caller")
+            && out.contains("called by caller")
+            && !out.contains("-- CALLERS")
             && out.contains("src/Helpers.swift:"),
-        "brief must bundle the Swift helper definition and its cross-file caller; got={out:?}"
+        "brief must sketch the Swift helper and aggregate its cross-file caller; got={out:?}"
     );
 }
 

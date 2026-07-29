@@ -201,10 +201,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// One-call briefing for a symbol: its definition (with source), its direct
-    /// callers, and its direct callees — everything an agent needs to answer
-    /// "how does S work / what is its role / what depends on it" in a SINGLE
-    /// call, instead of iterating search + who-calls + callees separately.
+    /// Sketch the body of a function: its doc sentence, the verbatim
+    /// signature head, then one line per call site or branch naming the real
+    /// symbol used there — followed by the aggregated callers and, when the
+    /// call tree below is worth it, an expand offer. Structs, enums and
+    /// traits have no body to sketch: they print their whole definition.
+    /// This is the orientation aid; `who-calls` and `callees` give addresses.
     Brief {
         /// The symbols to brief. Several are briefed in one call:
         /// `greppy brief A B C`. `-` reads them from the pipe.
@@ -216,7 +218,7 @@ pub enum Command {
         #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,
         /// Accepted for agent ergonomics: brief already prints the
-        /// definition's source, so --code is a no-op — but agents
+        /// definition's head, so --code is a no-op — but agents
         /// carrying the flag over from the nav commands must not be
         /// punished with a parse error (P3 forensics: a real agent lost
         /// a call to exactly this).
