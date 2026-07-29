@@ -22,7 +22,7 @@ do not fake those lines: a sketch line is emitted only for a call site or a
 branch the parser can see. Everything else is left out.
 
 ACCEPTANCE — run these and paste the real output in your report:
-  cd /Volumes/tmp/outputs-repo && export GREPPY_STORE_DIR=/Volumes/tmp/wc-store
+  cd /Volumes/tmp/outputs-repo && export GREPPY_STORE_DIR=/Volumes/tmp/wc-store2
   greppy brief parse_path      # sentence, signature, sketch, no ASCII bars
   greppy brief data_set        # the branch structure of the match statements
   greppy brief Snapshot        # a struct: whole definition, no sketch
@@ -31,7 +31,7 @@ ACCEPTANCE — run these and paste the real output in your report:
   cargo build --release
   cargo test -p greppy --test graph_nav
 
-FILE WHITELIST: crates/cli/src/lib.rs, crates/cli/tests/*.rs.
+FILE WHITELIST: crates/cli/src/nav.rs, crates/cli/src/lib.rs, crates/cli/src/cli_surface.rs, crates/cli/tests/*.rs.
 FORBIDDEN: dispatch_who_calls, dispatch_callees, dispatch_impact, dispatch_path,
 search-code, semantic-search, read, edit, AGENTS.md, every --json shape.
 
