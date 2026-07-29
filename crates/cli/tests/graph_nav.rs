@@ -1379,88 +1379,25 @@ pub fn caller_c() -> u32 { crate::hub::hub() }
     (repo, store)
 }
 
+
+
 #[test]
-fn impact_since_json_maps_changed_hunk_to_symbol_and_transitive_callers() {
-    let (repo, store) = make_real_git_diff_impact_repo("impact-since-diff");
+fn impact_refuses_the_retired_diff_flags() {
+    // --since/--base died with the ORIENT dissolution; the prompt's impact
+    // signature is `impact S [--depth N] [--direction outgoing]`. The retired
+    // flags are a usage error, not a silent alias.
+    let (repo, store) = make_real_git_diff_impact_repo("impact-retired-flags");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
-    let (code, out, err) = run(&["impact", "--since", "HEAD~1", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "impact --since --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid impact diff json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "impact");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["scope"], "diff");
-    assert_eq!(v["diff_scope"], "since");
-    assert_eq!(v["backend"], "git_diff_graph");
-    assert_eq!(v["fresh"], true);
-    assert_eq!(v["direction"], "incoming");
-    assert_eq!(v["edge_type"], "all_references");
-    assert_eq!(
-        v["edge_types"],
-        serde_json::json!(["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"])
-    );
-    assert_eq!(v["diff_files_total"], 1);
-    assert_eq!(v["source_total"], 1);
-    assert_eq!(v["source_symbols"].as_array().unwrap().len(), 1);
-    assert!(
-        v["source_symbols"][0]["qualified_name"]
-            .as_str()
-            .unwrap_or("")
-            .contains("hub"),
-        "changed hunk should map to hub source symbol: {v:?}"
-    );
-    assert_eq!(v["total_exact"], 3);
-    let hits = v["hits"].as_array().expect("impact diff hits");
-    assert_eq!(hits.len(), 3);
-    assert!(
-        hits.iter().all(|hit| hit["qualified_name"]
-            .as_str()
-            .unwrap_or("")
-            .contains("caller_")),
-        "impact diff hits should be caller functions: {v:?}"
-    );
-    assert!(hits.iter().all(|hit| hit["source_count"] == 1));
-}
-
-#[test]
-fn impact_base_text_and_json_use_merge_base_diff_sources() {
-    let (repo, store) = make_real_git_diff_impact_repo("impact-base-diff");
-    let (code, out, err) = run(&["index", "."], &repo, &store);
-    assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
-
-    let (code, out, err) = run(&["impact", "--base", "basepoint"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "impact --base text should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("diff sources: 1 shown of 1 total")
-            && out.contains("source")
-            && out.contains("hub")
-            && out.contains("caller_"),
-        "impact --base text should show source hub and impacted callers; got: {out}"
-    );
-
-    let (code, out, err) = run(&["impact", "--base", "basepoint", "--json"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "impact --base --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid impact base json: {e}; stdout={out:?}"));
-    assert_eq!(v["scope"], "diff");
-    assert_eq!(v["diff_scope"], "base");
-    assert_eq!(v["backend"], "git_diff_graph");
-    assert_eq!(v["source_total"], 1);
-    assert_eq!(v["total_exact"], 3);
-    assert_eq!(v["shown"], 3);
-    assert_eq!(v["merge_base"].as_str().unwrap_or("").len(), 40);
-    assert_eq!(v["hits"].as_array().unwrap().len(), 3);
+    for flag in [&["impact", "--since", "HEAD~1"][..], &["impact", "--base", "main"][..]] {
+        let (code, out, err) = run(flag, &repo, &store);
+        assert_eq!(code, 64, "retired flag must be a usage error; stdout={out} stderr={err}");
+        assert!(
+            out.contains("unexpected argument") || err.contains("unexpected argument"),
+            "the refusal names the unexpected argument; stdout={out} stderr={err}"
+        );
+    }
 }
 
 #[test]
