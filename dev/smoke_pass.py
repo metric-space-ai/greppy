@@ -48,7 +48,7 @@ CASES = {
     "read-file": (["read-file", "edit-src/data.rs"], {0}, []),
     # refusals carry their own exit codes and true sentences:
     # 13 = OLD occurs 0/N times, 20 = empty stdin, 10 = nothing to undo
-    "replace-text": (["replace-text", "README.md", "no-such-text-xyzzy", "NEW", "--dry-run"], {13}, [r"occurs 0 times"]),
+    "replace-text": (["replace-text", "edit-src/data.rs", "no-such-text-xyzzy", "NEW", "--dry-run"], {13}, [r"occurs 0 times"]),
     "patch": (["patch", "--dry-run"], {20}, [r"no DIFF"]),
     "undo": (["undo", "no-such-id"], {10}, [r"nothing to undo"]),
     "bash-smart": (["bash-smart", "--", "sh", "-c", "echo ok"], {0}, [r"ok"]),
