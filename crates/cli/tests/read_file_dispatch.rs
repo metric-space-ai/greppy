@@ -210,3 +210,31 @@ fn read_handle_is_compact_and_existing_json_shape_survives() {
     assert!(handle.starts_with("geh2:"), "{handle}");
     assert!(handle.len() <= 70, "{}: {handle}", handle.len());
 }
+
+#[test]
+fn compact_read_handle_still_drives_replace_span() {
+    let (repo, store) = fresh_workspace("handle-replace");
+    let original = "pub fn target() {}\n";
+    std::fs::write(repo.join("lib.rs"), original).unwrap();
+    index(&repo, &store);
+
+    let (read_code, read_out, read_err) = run(&repo, &store, &["read", "target", "--handle"]);
+    assert_eq!(read_code, 0, "stdout={read_out}\nstderr={read_err}");
+    let handle = read_out
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .expect("compact read handle");
+
+    let replacement = "pub fn target() { println!(\"changed\"); }\n";
+    let (edit_code, edit_out, edit_err) = run(
+        &repo,
+        &store,
+        &["replace-span", handle, replacement, "--dry-run"],
+    );
+    assert_eq!(edit_code, 0, "stdout={edit_out}\nstderr={edit_err}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+        original,
+        "dry-run must not publish the replacement"
+    );
+}
