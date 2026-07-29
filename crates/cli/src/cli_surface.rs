@@ -546,6 +546,10 @@ pub enum Command {
             value_parser = ["function", "method", "class", "struct", "enum", "trait"]
         )]
         kind: Option<String>,
+        /// Restrict matches to these files or directory subtrees. Repeatable;
+        /// this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
         /// Also print each matched source line verbatim.
         #[arg(long)]
         code: bool,
@@ -564,6 +568,10 @@ pub enum Command {
             value_parser = ["function", "method", "class", "struct", "enum", "trait"]
         )]
         kind: Option<String>,
+        /// Restrict matches to these files or directory subtrees. Repeatable;
+        /// this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
         /// Emit machine-readable JSON with the existing stable shape.
         #[arg(long)]
         json: bool,
@@ -604,6 +612,10 @@ pub enum Command {
             value_parser = ["function", "method", "class", "struct", "enum", "trait"]
         )]
         kind: Option<String>,
+        /// Restrict matches to these files or directory subtrees. Repeatable;
+        /// this is the only path filter.
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
         /// Emit machine-readable JSON with the existing stable shape.
         #[arg(long)]
         json: bool,
