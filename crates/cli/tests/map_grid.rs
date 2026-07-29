@@ -325,6 +325,66 @@ fn large_file_inventory_pages_in_twenty_five_row_packs() {
 }
 
 #[test]
+fn entry_points_obey_the_fractal_size_law() {
+    let (repo, store) = fresh_repo("entry-points");
+    for index in 0..8 {
+        let dir = repo.join(format!("tool-{index:02}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+    }
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(&repo, &store, &["where-am-i"]);
+    assert_eq!(
+        code, 0,
+        "where-am-i failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("entry points: "))
+        .expect("entry points line");
+    let id = expand_id(line).to_string();
+    let (shown_part, rest) = line.split_once('…').expect("remainder marker");
+    let shown = shown_part
+        .trim_start_matches("entry points: ")
+        .split(", ")
+        .filter(|path| !path.trim().is_empty())
+        .count();
+    assert!(shown <= 6, "at most six paths shown: {line}");
+    let remainder: usize = rest
+        .split_whitespace()
+        .next()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("true remainder count: {line}"));
+    assert_eq!(remainder, 4, "9 entry points, {shown} shown: {line}");
+    assert!(
+        line.contains("cli-src/main.rs"),
+        "the most central launchers are shown: {line}"
+    );
+
+    let (code, pack, stderr) = run(&repo, &store, &["expand", &id]);
+    assert_eq!(code, 0, "expand failed: {stderr}\n{pack}");
+    let listed = pack
+        .lines()
+        .filter(|line| line.ends_with("/main.rs"))
+        .count();
+    assert_eq!(
+        listed,
+        shown + remainder,
+        "the pack lists every entry point:\n{pack}"
+    );
+
+    let (code, json, stderr) = run(&repo, &store, &["where-am-i", "--json"]);
+    assert_eq!(code, 0, "JSON failed: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(
+        value["orientation"]["entry_points"].as_array().map(Vec::len),
+        Some(shown + remainder),
+        "JSON still carries the full list: {json}"
+    );
+}
+
+#[test]
 fn inventory_pack_relocates_by_hash_or_refuses_drift() {
     let (repo, store) = fresh_repo("drift");
     std::fs::create_dir_all(repo.join("module")).unwrap();
