@@ -86,30 +86,43 @@ fn indexed_repo(tag: &str) -> (PathBuf, PathBuf) {
     (repo, store)
 }
 
-fn without_expand_id(output: (i32, String, String)) -> (i32, String, String) {
-    let stdout = output
-        .1
-        .lines()
-        .filter(|line| !line.starts_with("Expand: greppy expand "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (output.0, stdout, output.2)
-}
-
 #[test]
-fn who_calls_positional_directory_filter_returns_subset_and_explains_empty_scope() {
+fn who_calls_path_filtering_is_a_flag_and_empty_scope_is_an_answer() {
     let (repo, store) = indexed_repo("path-filter");
 
+    // A positional PATH is refused: positional arguments are symbols now
+    // (`who-calls A B C` answers for several symbols at once), so a path in
+    // that position is a usage error that teaches the flag spelling.
     let (code, stdout, stderr) = run(&["who-calls", "target", "src/inside"], &repo, &store);
-    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
-    assert!(stdout.contains("caller_inside"), "stdout={stdout}");
-    assert!(!stdout.contains("caller_outside"), "stdout={stdout}");
-
-    let (code, stdout, stderr) = run(&["who-calls", "target", "does/not/exist"], &repo, &store);
-    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert_eq!(code, 64, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("no callers under path filter: does/not/exist"),
+        stderr.contains("`src/inside` is a path, but a positional argument is always a symbol"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("--path src/inside"), "stderr={stderr}");
+
+    // The flag filters to the callers under it.
+    let (code, stdout, stderr) = run(&["who-calls", "target", "--path", "src/inside"], &repo, &store);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert_eq!(
+        stdout, "src/inside/caller.rs:1  caller_inside\n",
         "stdout={stdout}"
+    );
+
+    // An existing scope with no callers in it is an answer, exit 0.
+    let (code, stdout, stderr) = run(&["who-calls", "target", "--path", "src/api.rs"], &repo, &store);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert_eq!(
+        stdout, "no callers under path filter: src/api.rs\n",
+        "stdout={stdout}"
+    );
+
+    // A filter path that does not exist is a usage error, not an empty answer.
+    let (code, stdout, stderr) = run(&["who-calls", "target", "--path", "does/not/exist"], &repo, &store);
+    assert_eq!(code, 64, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("--path `does/not/exist` does not exist under"),
+        "stderr={stderr}"
     );
 }
 
@@ -141,22 +154,20 @@ fn root_file_and_subdirectory_misuse_teaches_the_real_root_and_corrected_command
 }
 
 #[test]
-fn symbol_miss_suggests_case_insensitive_near_match_and_discovery_commands() {
+fn symbol_miss_lists_similar_names_and_nothing_else() {
     let (repo, store) = indexed_repo("miss-guidance");
     let (code, stdout, stderr) = run(&["who-calls", "startswith"], &repo, &store);
     assert_eq!(code, 1, "stderr={stderr}\nstdout={stdout}");
-    assert!(
-        stdout.contains("suggestion: `startsWith`"),
+    // The 0.3.0 miss is the bare statement plus the similar-names block —
+    // the case/underscore normalization tier finds `startsWith`. Law 1
+    // deletes the `try: greppy …` discovery instructions: the commands are
+    // documented once in the prompt, never repeated under a miss.
+    assert_eq!(
+        stdout,
+        "no symbol `startswith`\n\nsimilar names:\nsrc/api.rs:5  startsWith\n",
         "stdout={stdout}"
     );
-    assert!(
-        stdout.contains("try: greppy search-symbols"),
-        "stdout={stdout}"
-    );
-    assert!(
-        stdout.contains("try: greppy semantic-search"),
-        "stdout={stdout}"
-    );
+    assert!(!stdout.contains("try:"), "stdout={stdout}");
 }
 
 #[test]
@@ -174,29 +185,35 @@ fn type_method_query_resolves_rust_trait_impl_method() {
 }
 
 #[test]
-fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
+fn limit_max_aliases_hold_and_paths_are_flag_only() {
     let (repo, store) = indexed_repo("aliases");
 
-    let limit = run(&["search-code", "pub", "--limit", "1"], &repo, &store);
-    let max = run(&["search-code", "pub", "--max", "1"], &repo, &store);
+    let limit = run(&["search-pattern", "pub", "--limit", "1"], &repo, &store);
+    let max = run(&["search-pattern", "pub", "--max", "1"], &repo, &store);
+    assert_eq!(limit.0, 0, "search-pattern must answer: {limit:?}");
     assert_eq!(limit, max, "--limit and --max must be exact aliases");
 
-    for (command, query, path) in [
-        ("who-calls", "target", "src/inside"),
-        ("callees", "caller_inside", "src/api.rs"),
-        ("search-code", "target", "src/inside"),
-        ("search-symbols", "target", "src/api.rs"),
+    // The positional-PATH filter is gone: on the navigation verbs a
+    // positional argument is always a symbol, so a path there is refused and
+    // the refusal teaches `--path`; the flag performs the filter.
+    for (command, query, path, want_row) in [
+        ("who-calls", "target", "src/inside", "src/inside/caller.rs:1  caller_inside\n"),
+        ("callees", "caller_inside", "src/api.rs", "src/api.rs:2  target\n"),
     ] {
-        let positional = without_expand_id(run(&[command, query, path], &repo, &store));
-        let flagged = without_expand_id(run(
-            &[command, query, "--path", path],
-            &repo,
-            &store,
-        ));
+        let (code, _stdout, stderr) = run(&[command, query, path], &repo, &store);
         assert_eq!(
-            positional, flagged,
-            "{command}: positional PATH and --path differ"
+            code, 64,
+            "{command}: a positional path must be a usage error; stderr={stderr}"
         );
+        assert!(
+            stderr.contains(&format!(
+                "`{path}` is a path, but a positional argument is always a symbol"
+            )) && stderr.contains(&format!("--path {path}")),
+            "{command}: the refusal must teach the flag spelling; stderr={stderr}"
+        );
+        let (code, stdout, stderr) = run(&[command, query, "--path", path], &repo, &store);
+        assert_eq!(code, 0, "{command}: --path must filter; stderr={stderr}");
+        assert_eq!(stdout, want_row, "{command}: --path row differs");
     }
 
     let positional = run(&["read", "target"], &repo, &store);
@@ -226,15 +243,16 @@ fn global_output_flags_work_before_and_after_subcommand() {
     }
 
     let before = run(
-        &["--root", ".", "search-code", "target", "--limit", "1"],
+        &["--root", ".", "search-pattern", "target", "--limit", "1"],
         &repo,
         &store,
     );
     let after = run(
-        &["search-code", "target", "--limit", "1", "--root", "."],
+        &["search-pattern", "target", "--limit", "1", "--root", "."],
         &repo,
         &store,
     );
+    assert_eq!(before.0, 0, "search-pattern must answer: {before:?}");
     assert_eq!(before, after, "--root ordering differs");
 }
 
@@ -242,13 +260,13 @@ fn global_output_flags_work_before_and_after_subcommand() {
 fn unknown_flag_suggests_a_complete_corrected_invocation() {
     let (repo, store) = indexed_repo("unknown-flag");
     let (code, stdout, stderr) = run(
-        &["search-code", "target", "--jsoon", "--limit", "1"],
+        &["search-pattern", "target", "--jsoon", "--limit", "1"],
         &repo,
         &store,
     );
     assert_eq!(code, 64, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains(" search-code target --json --limit 1"),
+        stdout.contains(" search-pattern target --json --limit 1"),
         "stdout={stdout}"
     );
 }
