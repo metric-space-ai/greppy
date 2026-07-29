@@ -46,16 +46,18 @@ CASES = {
     "read": (["read", "parse_path"], {0}, [r"fn parse_path"]),
     "read-smart": (["read-smart", "data_set"], {0}, []),
     "read-file": (["read-file", "edit-src/data.rs"], {0}, []),
-    "replace-text": (["replace-text", "README.md", "no-such-text-xyzzy", "--dry-run"], {1}, []),
-    "patch": (["patch", "--dry-run"], {1, 64}, []),
-    "undo": (["undo", "no-such-id"], {1}, []),
+    # refusals carry their own exit codes and true sentences:
+    # 13 = OLD occurs 0/N times, 20 = empty stdin, 10 = nothing to undo
+    "replace-text": (["replace-text", "README.md", "no-such-text-xyzzy", "NEW", "--dry-run"], {13}, [r"occurs 0 times"]),
+    "patch": (["patch", "--dry-run"], {20}, [r"no DIFF"]),
+    "undo": (["undo", "no-such-id"], {10}, [r"nothing to undo"]),
     "bash-smart": (["bash-smart", "--", "sh", "-c", "echo ok"], {0}, [r"ok"]),
     "expand-bad-id": (["expand", "ffffffffffffffff"], {1}, [r"not found|expired"]),
     "grep-passthrough": (["-c", "parse_path", "edit-src/data.rs"], {0}, [r"^\d+$"]),
 }
 
 REMOVED = ["find-usages", "references", "map", "outline", "changes", "verify",
-           "search-symbols", "search-code", "orient"]
+           "search-symbols", "search-code"]  # orient was a section, never a verb
 
 
 def run(binary: str, tail: list[str]) -> tuple[int, str]:
