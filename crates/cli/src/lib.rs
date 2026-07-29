@@ -1945,72 +1945,9 @@ fn dispatch_subcommand(
         }
         Command::BashSmart { argv } => bash_smart::run(&argv, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
-        Command::Read {
-            targets,
-            symbol_opts,
-            path_opts,
-            lines,
-            context,
-            handle,
-            code: _,
-            json,
-            all: _,
-        } => {
-            set_cli_read_context(context);
-            let plan = read_plan(&targets, &symbol_opts, &path_opts, lines.as_deref())?;
-            if plan.subjects.len() > 1 {
-                return dispatch_read_multi(&plan, handle, json, root);
-            }
-            let subject = plan.subjects.first().cloned();
-            // A path-qualified symbol (`FILE::Symbol`) must reach graph
-            // resolution instead of being mistaken for a slash-containing
-            // filesystem path.
-            if !plan.forced_symbol {
-                if let Some(subject) = subject.as_deref() {
-                    // Every greppy result line is printed as `path:START-END`, so agents
-                    // paste that form straight back into `read`. Accept it: split the
-                    // trailing `:START[-END]` off and treat it as `--lines`. Without this
-                    // the whole string is looked up as a symbol name and answers
-                    // "no exact match", which cost turns in the measured runs.
-                    if plan.lines.is_none() {
-                        if let Some((file, range)) = split_trailing_line_range(subject) {
-                            if read_subject_is_path(file, root)? {
-                                return dispatch_read_file(file, Some(&range), handle, json, root);
-                            }
-                        }
-                    }
-                    if split_path_qualified(subject).is_none()
-                        && read_subject_is_path(subject, root)?
-                    {
-                        return dispatch_read_file(
-                            subject,
-                            plan.lines.as_deref(),
-                            handle,
-                            json,
-                            root,
-                        );
-                    }
-                    if looks_like_path(subject) {
-                        // Path-shaped and not on disk: keep the file answer
-                        // (closest-paths guidance) instead of hunting for a
-                        // symbol that cannot exist under that name.
-                        return dispatch_read_file(
-                            subject,
-                            plan.lines.as_deref(),
-                            handle,
-                            json,
-                            root,
-                        );
-                    }
-                }
-            }
-            if plan.lines.is_some() {
-                return Err(Error::Invalid(
-                    "read --lines/--line N[:M] requires a file path (for symbols, omit the line flag)"
-                        .into(),
-                ));
-            }
-            dispatch_read(subject.as_deref(), handle, json, root)
+        Command::Read { symbols, head, tail, handle, json } => {
+            let symbols = nav_targets(&symbols)?;
+            dispatch_read_symbols(&symbols, head, tail, handle, json, root)
         }
         Command::Replace { symbol, new, body, dry_run, verify, json } => dispatch_edit(
             EditCommand::Replace { symbol, new, body, dry_run, verify }, json, root,
@@ -2021,9 +1958,12 @@ fn dispatch_subcommand(
         Command::ReplaceLines { file, lines, new, dry_run, verify, json } => dispatch_edit(
             EditCommand::ReplaceLines { file, lines, new, dry_run, verify }, json, root,
         ),
-        Command::ReplaceSpan { handle, new, dry_run, verify, json } => dispatch_edit(
-            EditCommand::ReplaceSpan { handle, new, dry_run, verify }, json, root,
-        ),
+        Command::ReplaceSpan { handle, new, dry_run, verify, json } => {
+            let handle = resolve_compact_read_handle(&handle, root)?.unwrap_or(handle);
+            dispatch_edit(
+                EditCommand::ReplaceSpan { handle, new, dry_run, verify }, json, root,
+            )
+        }
         Command::Write { path, new, dry_run, verify, json } => dispatch_edit(
             EditCommand::Write { path, new, dry_run, verify }, json, root,
         ),
@@ -9174,12 +9114,8 @@ struct OutputBudgetSpec {
     offset: usize,
 }
 
-const DEFAULT_READ_FILE_MAX_BYTES: usize = 16 * 1024;
-
-
 fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
-    let default_read_budget = read_uses_default_file_budget(cli);
-    if cli.max_bytes.is_none() && cli.offset == 0 && !default_read_budget {
+    if cli.max_bytes.is_none() && cli.offset == 0 {
         return None;
     }
     let (command, json) = match cli.command.as_ref()? {
@@ -9188,7 +9124,6 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
-        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9205,9 +9140,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
     Some(OutputBudgetSpec {
         command,
         json,
-        max_bytes: cli
-            .max_bytes
-            .or(default_read_budget.then_some(DEFAULT_READ_FILE_MAX_BYTES)),
+        max_bytes: cli.max_bytes,
         offset: cli.offset,
     })
 }

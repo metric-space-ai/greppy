@@ -625,8 +625,11 @@
         // usage error — the legacy `brief A B` bundle is gone.
         assert!(Cli::try_parse_from(["greppy", "brief", "open", "close"]).is_err());
 
-        // read carries the nav commands' --code flag as an accepted no-op.
-        assert!(Cli::try_parse_from(["greppy", "read", "open", "a/mod.py", "--code"]).is_ok());
+        // read takes symbols only; file paths and the old no-op --code spelling
+        // belong to neither this verb nor its exact source contract.
+        assert!(Cli::try_parse_from(["greppy", "read", "open", "a/mod.py"]).is_ok());
+        assert!(Cli::try_parse_from(["greppy", "read", "open", "--code"]).is_err());
+        assert!(Cli::try_parse_from(["greppy", "read-file", "a/mod.py"]).is_ok());
 
         // An already-qualified symbol is not double-qualified.
         assert_eq!(

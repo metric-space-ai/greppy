@@ -188,11 +188,7 @@ fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
         ("search-symbols", "target", "src/api.rs"),
     ] {
         let positional = without_expand_id(run(&[command, query, path], &repo, &store));
-        let flagged = without_expand_id(run(
-            &[command, query, "--path", path],
-            &repo,
-            &store,
-        ));
+        let flagged = without_expand_id(run(&[command, query, "--path", path], &repo, &store));
         assert_eq!(
             positional, flagged,
             "{command}: positional PATH and --path differ"
@@ -200,8 +196,13 @@ fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
     }
 
     let positional = run(&["read", "target"], &repo, &store);
-    let flagged = run(&["read", "--symbol", "target"], &repo, &store);
-    assert_eq!(positional, flagged, "positional SYMBOL and --symbol differ");
+    assert_eq!(
+        positional.0, 0,
+        "stdout={}\nstderr={}",
+        positional.1, positional.2
+    );
+    let retired = run(&["read", "--symbol", "target"], &repo, &store);
+    assert_eq!(retired.0, 2, "retired --symbol unexpectedly parsed");
 }
 
 #[test]
