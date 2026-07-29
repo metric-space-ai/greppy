@@ -763,7 +763,7 @@ fn search_symbols_json_reports_exact_counts_and_metadata() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-symbols");
+    assert_eq!(v["command"], "search-symbol");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["fresh"], true);
     assert_eq!(v["provider_complete"], false);
@@ -819,7 +819,7 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-symbols");
+    assert_eq!(v["command"], "search-symbol");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["fresh"], true);
     assert!(
