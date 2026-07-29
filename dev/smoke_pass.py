@@ -1,0 +1,104 @@
+"""The bench gate: every command AGENTS.md advertises, run against the binary.
+
+For each advertised verb: one concrete invocation in the fixture repo, an
+expected exit code, required output markers, and forbidden legacy markers
+(old row shapes, ASCII bundles, German, removed verbs). A verb the binary
+does not hold yet fails loudly — that IS the gap the release still has.
+
+    python3 dev/smoke_pass.py <path-to-greppy-binary>
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+REPO = "/Volumes/tmp/outputs-repo"
+STORE = "/Volumes/tmp/wc-store2"
+
+FORBIDDEN_EVERYWHERE = [
+    "::Function::",          # pre-0.3.0 qualified rows
+    "-- CALLERS",            # pre-0.3.0 brief bundle
+    "== ",                   # pre-0.3.0 multi bundle headers
+    "weitere",               # German
+    "Zeilen",
+    "suggestion:",           # banned advisory lines
+    "try:",
+]
+
+# verb -> (argv-tail, expected-exits, required-regexes)
+CASES = {
+    "where-am-i": (["where-am-i"], {0}, [r"\d+ files", r"greppy expand [0-9a-f]+"]),
+    "who-calls": (["who-calls", "parse_path"], {0}, [r"^\S+:\d+  \S+", ]),
+    "who-calls-multi": (["who-calls", "parse_path", "data_set"], {0}, [r"^\S+:\d+  \S+"]),
+    "who-calls-missing": (["who-calls", "xyzzy_frobnicate"], {1}, [r"no symbol"]),
+    "callees": (["callees", "data_set"], {0}, [r"^\S+:\d+  \S+"]),
+    "brief": (["brief", "parse_path"], {0}, [r"^\S+:\d+$|^\S+\.rs:\d+"]),
+    "impact": (["impact", "parse_path"], {0}, [r"parse_path"]),
+    "path": (["path", "--from", "data_set", "--to", "parse_path"], {0}, [r"data_set"]),
+    "search": (["search", "restrict a value to a range"], {0, 1}, []),
+    "search-symbol": (["search-symbol", "parse_path"], {0}, [r"parse_path"]),
+    "search-pattern": (["search-pattern", "fn parse_path"], {0}, [r"parse_path"]),
+    "read": (["read", "parse_path"], {0}, [r"fn parse_path"]),
+    "read-smart": (["read-smart", "data_set"], {0}, []),
+    "read-file": (["read-file", "edit-src/data.rs"], {0}, []),
+    "replace-text": (["replace-text", "README.md", "no-such-text-xyzzy", "--dry-run"], {1}, []),
+    "patch": (["patch", "--dry-run"], {1, 64}, []),
+    "undo": (["undo", "no-such-id"], {1}, []),
+    "bash-smart": (["bash-smart", "--", "sh", "-c", "echo ok"], {0}, [r"ok"]),
+    "expand-bad-id": (["expand", "ffffffffffffffff"], {1}, [r"not found|expired"]),
+    "grep-passthrough": (["-c", "parse_path", "edit-src/data.rs"], {0}, [r"^\d+$"]),
+}
+
+REMOVED = ["find-usages", "references", "map", "outline", "changes", "verify",
+           "search-symbols", "search-code", "orient"]
+
+
+def run(binary: str, tail: list[str]) -> tuple[int, str]:
+    env = dict(os.environ, GREPPY_STORE_DIR=STORE)
+    proc = subprocess.run([binary, *tail], cwd=REPO, env=env,
+                          capture_output=True, text=True, timeout=300,
+                          stdin=subprocess.DEVNULL)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def main() -> None:
+    binary = os.path.abspath(sys.argv[1])
+    passed = failed = 0
+    for name, (tail, exits, required) in CASES.items():
+        code, out = run(binary, tail)
+        errors = []
+        if code not in exits:
+            errors.append(f"exit {code}, wanted {sorted(exits)}")
+        for marker in FORBIDDEN_EVERYWHERE:
+            if marker in out:
+                errors.append(f"forbidden marker {marker!r}")
+        for pattern in required:
+            if not re.search(pattern, out, re.M):
+                errors.append(f"missing /{pattern}/")
+        if errors:
+            failed += 1
+            print(f"FAIL {name}: " + "; ".join(errors))
+            for line in out.splitlines()[:3]:
+                print(f"     | {line[:110]}")
+        else:
+            passed += 1
+            print(f"ok   {name}")
+    for verb in REMOVED:
+        code, out = run(binary, [verb, "parse_path"])
+        # a removed verb must fall through to grep (its exit codes) and MUST NOT
+        # produce resolved symbol rows
+        if re.search(r"^\S+:\d+  \S+", out, re.M):
+            failed += 1
+            print(f"FAIL removed:{verb}: still answers with symbol rows")
+        else:
+            passed += 1
+            print(f"ok   removed:{verb} (grep passthrough)")
+    print(f"\nSMOKE: {passed} ok, {failed} fail")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
