@@ -550,20 +550,6 @@ fn cli_result_offset() -> usize {
     CLI_RESULT_OFFSET.with(std::cell::Cell::get)
 }
 
-thread_local! {
-    /// `read --context N`: how many lines above a definition come along, so its
-    /// doc comment arrives with it instead of costing a second call.
-    static CLI_READ_CONTEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn set_cli_read_context(context: Option<usize>) {
-    CLI_READ_CONTEXT.with(|value| value.set(context.unwrap_or(0)));
-}
-
-fn cli_read_context() -> i64 {
-    i64::try_from(CLI_READ_CONTEXT.with(std::cell::Cell::get)).unwrap_or(0)
-}
-
 fn cli_result_limit(default: usize) -> usize {
     CLI_RESULT_LIMIT
         .with(|value| value.get())
@@ -757,6 +743,8 @@ const SUBCOMMANDS: &[&str] = &[
     "bash-smart",
     "expand",
     "read",
+    "read-smart",
+    "read-file",
     "replace",
     "replace-text",
     "replace-lines",
@@ -1945,72 +1933,16 @@ fn dispatch_subcommand(
         }
         Command::BashSmart { argv } => bash_smart::run(&argv, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
-        Command::Read {
-            targets,
-            symbol_opts,
-            path_opts,
-            lines,
-            context,
-            handle,
-            code: _,
-            json,
-            all: _,
-        } => {
-            set_cli_read_context(context);
-            let plan = read_plan(&targets, &symbol_opts, &path_opts, lines.as_deref())?;
-            if plan.subjects.len() > 1 {
-                return dispatch_read_multi(&plan, handle, json, root);
-            }
-            let subject = plan.subjects.first().cloned();
-            // A path-qualified symbol (`FILE::Symbol`) must reach graph
-            // resolution instead of being mistaken for a slash-containing
-            // filesystem path.
-            if !plan.forced_symbol {
-                if let Some(subject) = subject.as_deref() {
-                    // Every greppy result line is printed as `path:START-END`, so agents
-                    // paste that form straight back into `read`. Accept it: split the
-                    // trailing `:START[-END]` off and treat it as `--lines`. Without this
-                    // the whole string is looked up as a symbol name and answers
-                    // "no exact match", which cost turns in the measured runs.
-                    if plan.lines.is_none() {
-                        if let Some((file, range)) = split_trailing_line_range(subject) {
-                            if read_subject_is_path(file, root)? {
-                                return dispatch_read_file(file, Some(&range), handle, json, root);
-                            }
-                        }
-                    }
-                    if split_path_qualified(subject).is_none()
-                        && read_subject_is_path(subject, root)?
-                    {
-                        return dispatch_read_file(
-                            subject,
-                            plan.lines.as_deref(),
-                            handle,
-                            json,
-                            root,
-                        );
-                    }
-                    if looks_like_path(subject) {
-                        // Path-shaped and not on disk: keep the file answer
-                        // (closest-paths guidance) instead of hunting for a
-                        // symbol that cannot exist under that name.
-                        return dispatch_read_file(
-                            subject,
-                            plan.lines.as_deref(),
-                            handle,
-                            json,
-                            root,
-                        );
-                    }
-                }
-            }
-            if plan.lines.is_some() {
-                return Err(Error::Invalid(
-                    "read --lines/--line N[:M] requires a file path (for symbols, omit the line flag)"
-                        .into(),
-                ));
-            }
-            dispatch_read(subject.as_deref(), handle, json, root)
+        Command::Read { symbols, head, tail, handle, json } => {
+            let symbols = nav_targets(&symbols)?;
+            dispatch_read_symbols(&symbols, head, tail, handle, json, root)
+        }
+        Command::ReadSmart { symbols, depth, handle } => {
+            let symbols = nav_targets(&symbols)?;
+            dispatch_read_smart(&symbols, depth, handle, root)
+        }
+        Command::ReadFile { paths, lines, all, handle } => {
+            dispatch_read_files(&paths, lines.as_deref(), all, handle, root)
         }
         Command::Replace { symbol, new, body, dry_run, verify, json } => dispatch_edit(
             EditCommand::Replace { symbol, new, body, dry_run, verify }, json, root,
@@ -2021,9 +1953,12 @@ fn dispatch_subcommand(
         Command::ReplaceLines { file, lines, new, dry_run, verify, json } => dispatch_edit(
             EditCommand::ReplaceLines { file, lines, new, dry_run, verify }, json, root,
         ),
-        Command::ReplaceSpan { handle, new, dry_run, verify, json } => dispatch_edit(
-            EditCommand::ReplaceSpan { handle, new, dry_run, verify }, json, root,
-        ),
+        Command::ReplaceSpan { handle, new, dry_run, verify, json } => {
+            let handle = resolve_compact_read_handle(&handle, root)?.unwrap_or(handle);
+            dispatch_edit(
+                EditCommand::ReplaceSpan { handle, new, dry_run, verify }, json, root,
+            )
+        }
         Command::Write { path, new, dry_run, verify, json } => dispatch_edit(
             EditCommand::Write { path, new, dry_run, verify }, json, root,
         ),
@@ -2535,6 +2470,7 @@ fn indexed_path_matches_query(indexed_path: &str, query_path: &str) -> bool {
     }
 }
 
+
 fn accepted_symbol_spelling(query: &str) -> Option<&'static str> {
     if let Some((path, _)) = split_path_qualified(query) {
         return Some(if path.contains('/') || path.contains('\\') {
@@ -2572,7 +2508,6 @@ fn qualify_symbol_with_path(symbol: Option<&str>, path: Option<&str>) -> Option<
     }
     Some(format!("{p}::{s}"))
 }
-
 
 fn is_callable_node_label(label: &str) -> bool {
     matches!(label, "Function" | "Method" | "Constructor")
@@ -4558,61 +4493,6 @@ const BRIEF_JSON_SCHEMA_VERSION: &str = "greppy.brief.v1";
 
 
 
-fn parse_read_line_range(raw: Option<&str>, line_count: usize) -> Result<(usize, usize)> {
-    let Some(raw) = raw else {
-        return Ok((1, line_count));
-    };
-    let (start, end) = raw.split_once(':').unwrap_or((raw, raw));
-    let start = start.parse::<usize>().map_err(|_| {
-        Error::Invalid(format!(
-            "read --lines/--line expects a positive line N or range N:M, got `{raw}`"
-        ))
-    })?;
-    let end = end.parse::<usize>().map_err(|_| {
-        Error::Invalid(format!(
-            "read --lines/--line expects a positive line N or range N:M, got `{raw}`"
-        ))
-    })?;
-    if start == 0 || end < start {
-        return Err(Error::Invalid(format!(
-            "read --lines/--line expects 1 <= N <= M, got `{raw}`"
-        )));
-    }
-    if start > line_count && line_count > 0 {
-        return Err(Error::Invalid(format!(
-            "read --lines/--line starts at {start}, but the file has {line_count} line(s)"
-        )));
-    }
-    Ok((start, end.min(line_count)))
-}
-
-
-/// Split a trailing `:START[-END]` (or `:START[:END]`) off a read subject.
-///
-/// greppy prints spans as `path:120-160`, so that is what an agent hands back.
-/// Returns the bare path and the range in the `START:END` form `--lines` takes.
-/// A path-qualified symbol (`file.rs::Symbol`) is left alone.
-fn split_trailing_line_range(subject: &str) -> Option<(&str, String)> {
-    if subject.contains("::") {
-        return None;
-    }
-    let (path, tail) = subject.rsplit_once(':')?;
-    if path.is_empty() || tail.is_empty() {
-        return None;
-    }
-    let (start, end) = match tail.split_once(['-', ':']) {
-        Some((start, end)) => (start, if end.is_empty() { start } else { end }),
-        None => (tail, tail),
-    };
-    let start: usize = start.parse().ok()?;
-    let end: usize = end.parse().ok()?;
-    if start == 0 || end < start {
-        return None;
-    }
-    Some((path, format!("{start}:{end}")))
-}
-
-
 
 /// Byte offsets of an inclusive 1-based line range within `content`.
 fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (usize, usize) {
@@ -5419,6 +5299,9 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     };
     if pack.command == "bash-smart" {
         return bash_smart::expand(&store, pack, json);
+    }
+    if matches!(pack.command.as_str(), "read-smart" | "read-file") {
+        return dispatch_read_expand(&store, &pack, json, root);
     }
     let mut payload_text = pack.payload_text.clone();
     let mut payload_json = pack.payload_json.clone();
@@ -6550,15 +6433,6 @@ fn nav_continuation_command(req: &NavMultiRequest<'_>, offset: usize) -> String 
     parts.push(offset.to_string());
     parts.join(" ")
 }
-
-/// What `read` was asked to read, after `-`, `--symbol` and `--path` have been
-/// folded into one ordered list of subjects.
-struct ReadPlan {
-    subjects: Vec<String>,
-    forced_symbol: bool,
-    lines: Option<String>,
-}
-
 
 
 
@@ -8295,8 +8169,7 @@ const GREPPY_ONLY_FLAGS: &[(&str, &str)] = &[
     ("--dry-run", "replace"),
     ("--verify", "replace"),
     ("--to", "path"),
-    ("--symbol", "read"),
-    ("--lines", "read"),
+    ("--lines", "read-file"),
     ("--handle", "read"),
     ("--kind", "search-symbol"),
     ("--depth", "impact"),
@@ -9179,12 +9052,8 @@ struct OutputBudgetSpec {
     offset: usize,
 }
 
-const DEFAULT_READ_FILE_MAX_BYTES: usize = 16 * 1024;
-
-
 fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
-    let default_read_budget = read_uses_default_file_budget(cli);
-    if cli.max_bytes.is_none() && cli.offset == 0 && !default_read_budget {
+    if cli.max_bytes.is_none() && cli.offset == 0 {
         return None;
     }
     let (command, json) = match cli.command.as_ref()? {
@@ -9193,7 +9062,6 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
-        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9210,9 +9078,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
     Some(OutputBudgetSpec {
         command,
         json,
-        max_bytes: cli
-            .max_bytes
-            .or(default_read_budget.then_some(DEFAULT_READ_FILE_MAX_BYTES)),
+        max_bytes: cli.max_bytes,
         offset: cli.offset,
     })
 }

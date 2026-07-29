@@ -15,7 +15,11 @@ pub(crate) fn read_background_job(path: &std::path::Path) -> Option<serde_json::
 /// nav commands print (P4). Missing/unreadable files or out-of-range lines
 /// return None — the row is skipped, never an error. Trimmed and capped so
 /// a pathological line cannot flood the agent's context.
-pub(crate) fn read_source_line(root: &std::path::Path, file_path: &str, line: u32) -> Option<String> {
+pub(crate) fn read_source_line(
+    root: &std::path::Path,
+    file_path: &str,
+    line: u32,
+) -> Option<String> {
     if line == 0 {
         return None;
     }
@@ -136,450 +140,1373 @@ pub(crate) fn read_span_with_meta(
     })
 }
 
-pub(crate) fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
-    let supplied = std::path::Path::new(subject);
-    if supplied.is_absolute() {
-        return supplied.to_path_buf();
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let from_cwd = cwd.join(supplied);
-        if from_cwd.exists() {
-            return from_cwd;
-        }
-    }
-    root_path.join(supplied)
+const READ_FILE_PAGE_LINES: usize = 400;
+const READ_PACK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+const READ_SMART_PACK_KIND: &str = "greppy.read-smart.span.v1";
+const READ_FILE_PACK_KIND: &str = "greppy.read-file.page.v1";
+const READ_HANDLE_PACK_KIND: &str = "greppy.read.handle.v2";
+const COMPACT_HANDLE_PREFIX: &str = "geh2:";
+
+#[derive(Clone)]
+struct DefinitionRead {
+    node: greppy_store::Node,
+    content: String,
+    start_line: usize,
+    end_line: usize,
 }
 
-pub(crate) fn read_subject_is_path(subject: &str, root: Option<&str>) -> Result<bool> {
-    let root_path = resolve_root(root)?;
-    if read_file_candidate(&root_path, subject).exists() {
-        return Ok(true);
+#[derive(Clone)]
+struct FoldGap {
+    start_line: usize,
+    end_line: usize,
+    indent: String,
+    sentence: String,
+    expand_id: String,
+}
+
+fn read_line_count(content: &str) -> usize {
+    content.lines().count()
+}
+
+fn read_line_slice(content: &str, start_line: usize, end_line: usize) -> &str {
+    if end_line < start_line {
+        return "";
     }
-    let supplied = std::path::Path::new(subject);
-    if supplied.is_absolute()
-        || subject.starts_with('.')
-        || subject.contains('/')
-        || subject.contains('\\')
-    {
-        return Ok(true);
+    let (start, end) = line_range_to_bytes(content.as_bytes(), start_line, end_line);
+    std::str::from_utf8(&content.as_bytes()[start..end]).unwrap_or("")
+}
+
+fn read_attribute_group_start(lines: &[&str], end: usize) -> Option<usize> {
+    if end == 0 {
+        return None;
     }
-    let path_extension = supplied
-        .extension()
-        .and_then(|extension| extension.to_str());
-    Ok(matches!(
-        path_extension,
-        Some(
-            "rs" | "py"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "ts"
-                | "tsx"
-                | "go"
-                | "rb"
-                | "java"
-                | "c"
-                | "h"
-                | "cpp"
-                | "cc"
-                | "cxx"
-                | "hpp"
-                | "hh"
-                | "cs"
-                | "php"
-                | "sh"
-                | "bash"
-                | "lua"
-                | "kt"
-                | "kts"
-                | "scala"
-                | "sc"
-                | "swift"
-                | "zig"
-                | "r"
-                | "json"
-                | "toml"
-                | "yaml"
-                | "yml"
-                | "md"
-                | "txt"
-        )
+    let immediate = lines[end - 1].trim();
+    if immediate.starts_with("#[") || immediate.starts_with("@") {
+        return Some(end - 1);
+    }
+    if !(immediate.ends_with(']') || immediate.ends_with(')')) {
+        return None;
+    }
+    let mut square = 0i32;
+    let mut paren = 0i32;
+    for index in (end.saturating_sub(32)..end).rev() {
+        let trimmed = lines[index].trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        square += trimmed.matches(']').count() as i32 - trimmed.matches('[').count() as i32;
+        paren += trimmed.matches(')').count() as i32 - trimmed.matches('(').count() as i32;
+        if (trimmed.starts_with("#[") || trimmed.starts_with('@')) && square <= 0 && paren <= 0 {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Documentation and attributes are part of the definition's read span. The
+/// parser/index address remains the definition head; this live-byte scan extends
+/// only across contiguous authored interface lines immediately above it.
+fn read_definition_start(content: &str, definition_start: usize) -> usize {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut cursor = definition_start.saturating_sub(1).min(lines.len());
+    loop {
+        if cursor == 0 {
+            break;
+        }
+        let trimmed = lines[cursor - 1].trim();
+        if trimmed.starts_with("///") {
+            cursor -= 1;
+            continue;
+        }
+        if let Some(attribute_start) = read_attribute_group_start(&lines, cursor) {
+            cursor = attribute_start;
+            continue;
+        }
+        break;
+    }
+    cursor + 1
+}
+
+fn read_definition(
+    root_path: &std::path::Path,
+    node: greppy_store::Node,
+) -> Result<Option<DefinitionRead>> {
+    let absolute = root_path.join(&node.file_path);
+    let content = match std::fs::read_to_string(&absolute) {
+        Ok(content) => content,
+        Err(_) => return Ok(None),
+    };
+    let line_count = read_line_count(&content);
+    let node_start = usize::try_from(node.start_line.max(1)).unwrap_or(1);
+    if node_start > line_count.max(1) {
+        return Ok(None);
+    }
+    let start_line = read_definition_start(&content, node_start);
+    let end_line = usize::try_from(node.end_line.max(node.start_line).max(1))
+        .unwrap_or(line_count)
+        .min(line_count);
+    if end_line < start_line {
+        return Ok(None);
+    }
+    Ok(Some(DefinitionRead {
+        node,
+        content,
+        start_line,
+        end_line,
+    }))
+}
+
+fn read_real_nodes(store: &greppy_store::Store, ids: &[i64]) -> Result<Vec<greppy_store::Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if node.file_path.is_empty()
+            || node.start_line < 1
+            || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+            || !seen.insert((node.file_path.clone(), node.start_line, node.end_line))
+        {
+            continue;
+        }
+        nodes.push(node);
+    }
+    Ok(nodes)
+}
+
+fn read_is_ambiguous(target: &str, nodes: &[greppy_store::Node]) -> bool {
+    if split_path_qualified(target).is_some() {
+        return false;
+    }
+    let sites = nodes
+        .iter()
+        .map(|node| node.file_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    sites.len() > 1
+}
+
+fn read_begin_group(printed: &mut bool, previous_ended_with_newline: &mut bool) {
+    if *printed {
+        if *previous_ended_with_newline {
+            print!("\n");
+        } else {
+            print!("\n\n");
+        }
+    }
+    *printed = true;
+}
+
+fn read_full_handle(
+    root_path: &std::path::Path,
+    file_path: &str,
+    content: &[u8],
+    start_line: usize,
+    end_line: usize,
+) -> Result<String> {
+    let (byte_start, byte_end) = line_range_to_bytes(content, start_line, end_line);
+    Ok(greppy_edit::EditHandle::for_range(
+        root_path,
+        std::path::Path::new(file_path),
+        content,
+        byte_start,
+        byte_end,
+    )?
+    .encode())
+}
+
+fn read_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn read_sha256_128(bytes: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut short = [0u8; 16];
+    short.copy_from_slice(&digest[..16]);
+    short
+}
+
+fn read_hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn read_base64url_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut index = 0;
+    while index < data.len() {
+        let a = data[index] as u32;
+        let b = data.get(index + 1).copied().unwrap_or(0) as u32;
+        let c = data.get(index + 2).copied().unwrap_or(0) as u32;
+        let value = (a << 16) | (b << 8) | c;
+        out.push(TABLE[((value >> 18) & 63) as usize] as char);
+        out.push(TABLE[((value >> 12) & 63) as usize] as char);
+        if index + 1 < data.len() {
+            out.push(TABLE[((value >> 6) & 63) as usize] as char);
+        }
+        if index + 2 < data.len() {
+            out.push(TABLE[(value & 63) as usize] as char);
+        }
+        index += 3;
+    }
+    out
+}
+
+fn read_base64url_decode(text: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut chunk = [0u8; 4];
+    let mut used = 0usize;
+    for byte in text.bytes() {
+        chunk[used] = value(byte)?;
+        used += 1;
+        if used == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            used = 0;
+        }
+    }
+    match used {
+        0 => {}
+        2 => out.push((chunk[0] << 2) | (chunk[1] >> 4)),
+        3 => {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Compact format C: one version byte, the pack's 64-bit address, and a
+/// 128-bit digest of the full edit handle. The short token is self-checking;
+/// the store retains the existing fully qualified handle consumed by edit.
+fn read_compact_handle(
+    store: &greppy_store::Store,
+    project: &str,
+    full_handle: String,
+) -> Result<String> {
+    let digest = read_sha256_128(full_handle.as_bytes());
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let id = store.insert_expand_pack(&greppy_store::NewExpandPack {
+        project: project.to_string(),
+        command: "read-handle".into(),
+        query: digest_hex.clone(),
+        graph_generation: 0,
+        summary_json: serde_json::json!({
+            "kind": READ_HANDLE_PACK_KIND,
+            "digest128": digest_hex,
+        }),
+        payload_text: full_handle,
+        payload_json: None,
+        ttl_secs: READ_PACK_TTL_SECS,
+    })?;
+    let id_bytes = read_hex_bytes(&id)
+        .filter(|bytes| bytes.len() == 8)
+        .ok_or_else(|| Error::Invalid("read handle store returned an invalid address".into()))?;
+    let mut binary = Vec::with_capacity(25);
+    binary.push(2);
+    binary.extend_from_slice(&id_bytes);
+    binary.extend_from_slice(&digest);
+    Ok(format!(
+        "{COMPACT_HANDLE_PREFIX}{}",
+        read_base64url_encode(&binary)
     ))
 }
 
-pub(crate) fn dispatch_read_file(
-    subject: &str,
-    lines: Option<&str>,
+pub(crate) fn resolve_compact_read_handle(
+    token: &str,
+    root: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(body) = token.strip_prefix(COMPACT_HANDLE_PREFIX) else {
+        return Ok(None);
+    };
+    let Some(binary) = read_base64url_decode(body) else {
+        return Ok(None);
+    };
+    if binary.len() != 25 || binary[0] != 2 {
+        return Ok(None);
+    }
+    let id = binary[1..9]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut expected = [0u8; 16];
+    expected.copy_from_slice(&binary[9..25]);
+    let store = open_default_store_query_writer(root)?;
+    let Some(pack) = store.get_expand_pack(&id)? else {
+        return Ok(None);
+    };
+    if pack.command != "read-handle"
+        || pack
+            .summary_json
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(READ_HANDLE_PACK_KIND)
+        || read_sha256_128(pack.payload_text.as_bytes()) != expected
+    {
+        return Ok(None);
+    }
+    Ok(Some(pack.payload_text))
+}
+
+fn read_render_block(
+    store: &greppy_store::Store,
+    project: &str,
+    root_path: &std::path::Path,
+    definition: &DefinitionRead,
+    start_line: usize,
+    end_line: usize,
+    with_handle: bool,
+) -> Result<String> {
+    let mut out = format!(
+        "{}:{}-{}  {}\n",
+        definition.node.file_path,
+        start_line,
+        end_line,
+        nav_short_name(&definition.node)
+    );
+    let source = read_line_slice(&definition.content, start_line, end_line);
+    out.push_str(source);
+    if with_handle {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let full = read_full_handle(
+            root_path,
+            &definition.node.file_path,
+            definition.content.as_bytes(),
+            start_line,
+            end_line,
+        )?;
+        let compact = read_compact_handle(store, project, full)?;
+        out.push_str("handle: ");
+        out.push_str(&compact);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn read_text_segments(
+    definition: &DefinitionRead,
+    head: Option<usize>,
+    tail: Option<usize>,
+) -> Vec<(usize, usize)> {
+    let total = definition.end_line - definition.start_line + 1;
+    match (head, tail) {
+        (None, None) => vec![(definition.start_line, definition.end_line)],
+        (Some(head), None) => vec![(
+            definition.start_line,
+            definition.start_line + head.min(total) - 1,
+        )],
+        (None, Some(tail)) => vec![(
+            definition.end_line + 1 - tail.min(total),
+            definition.end_line,
+        )],
+        (Some(head), Some(tail)) => vec![
+            (
+                definition.start_line,
+                definition.start_line + head.min(total) - 1,
+            ),
+            (
+                definition.end_line + 1 - tail.min(total),
+                definition.end_line,
+            ),
+        ],
+    }
+}
+
+fn read_json_miss(store: &greppy_store::Store, project: &str, query: &str) -> serde_json::Value {
+    let candidates = symbol_miss_suggestions(store, project, query)
+        .into_iter()
+        .filter_map(|name| {
+            let id = resolve_symbol_nodes(store, Some(&name))
+                .ok()?
+                .first()
+                .copied()?;
+            let node = store.get_node(id).ok().flatten()?;
+            Some(serde_json::json!({
+                "qualified_name": node.qualified_name,
+                "path": node.file_path,
+                "line": node.start_line,
+                "kind": node.label,
+            }))
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": "greppy.read.v1",
+        "command": "read",
+        "status": "not-found",
+        "query": query,
+        "candidates": candidates,
+    })
+}
+
+pub(crate) fn dispatch_read_symbols(
+    symbols: &[String],
+    head: Option<usize>,
+    tail: Option<usize>,
     with_handle: bool,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    const READ_FILE_JSON_SCHEMA_VERSION: &str = "greppy.read-file.v1";
+    if head == Some(0) || tail == Some(0) {
+        return Err(Error::Invalid(
+            "read --head/--tail values must be positive".into(),
+        ));
+    }
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
     let root_path = resolve_root(root)?;
-    let canonical_root = root_path.canonicalize().map_err(|source| Error::Io {
-        context: format!("canonicalize {}", root_path.display()),
-        source,
-    })?;
-    let candidate = read_file_candidate(&root_path, subject);
-    let canonical = candidate.canonicalize().ok();
-    let regular_file = canonical
-        .as_deref()
-        .is_some_and(|path| path.starts_with(&canonical_root) && path.is_file());
-    if !regular_file {
-        let suggestions = closest_read_paths(&canonical_root, subject)?;
-        if json {
+
+    if json && (head.is_some() || tail.is_some()) {
+        return Err(Error::Invalid(
+            "read --json is a whole-symbol shape; --head/--tail are text reads".into(),
+        ));
+    }
+
+    if json && symbols.len() > 1 {
+        let mut hits = Vec::with_capacity(symbols.len());
+        for query in symbols {
+            let ids = resolve_symbol_nodes(&store, Some(query))?;
+            let nodes = read_real_nodes(&store, &ids)?;
+            let Some(node) = nodes.first().cloned() else {
+                return Err(Error::Invalid(format!(
+                    "read: `{query}` is not a definition in this repository"
+                )));
+            };
+            let Some(definition) = read_definition(&root_path, node)? else {
+                return Err(Error::Invalid(format!(
+                    "read: definition span for `{query}` is stale"
+                )));
+            };
+            let source = read_line_slice(
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+            );
+            let handle = if with_handle {
+                let full = read_full_handle(
+                    &root_path,
+                    &definition.node.file_path,
+                    definition.content.as_bytes(),
+                    definition.start_line,
+                    definition.end_line,
+                )?;
+                Some(read_compact_handle(&store, &project, full)?)
+            } else {
+                None
+            };
+            hits.push(serde_json::json!({
+                "target": query,
+                "qualified_name": definition.node.qualified_name,
+                "file": definition.node.file_path,
+                "line": definition.start_line,
+                "path": definition.node.file_path,
+                "file_path": definition.node.file_path,
+                "start_line": definition.start_line,
+                "end_line": definition.end_line,
+                "lines": format!("{}:{}", definition.start_line, definition.end_line),
+                "source": source,
+                "handle": handle,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": "greppy.read.v1",
+                "command": "read",
+                "status": "ok",
+                "total_exact": hits.len(),
+                "shown": hits.len(),
+                "hits": hits,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
+        );
+        return Ok(0);
+    }
+
+    if json {
+        let query = symbols.first().map(String::as_str).unwrap_or("");
+        let ids = resolve_symbol_nodes(&store, Some(query))?;
+        let nodes = read_real_nodes(&store, &ids)?;
+        if nodes.is_empty() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&read_json_miss(&store, &project, query))
+                    .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
+            );
+            return Ok(1);
+        }
+        if read_is_ambiguous(query, &nodes) {
+            let candidates = nodes
+                .iter()
+                .map(|node| {
+                    serde_json::json!({
+                        "qualified_name": node.qualified_name,
+                        "path": node.file_path,
+                        "line": node.start_line,
+                    })
+                })
+                .collect::<Vec<_>>();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "schema_version": READ_FILE_JSON_SCHEMA_VERSION,
+                    "schema_version": "greppy.read.v1",
                     "command": "read",
-                    "status": "not-found",
-                    "path": subject,
-                    "path_candidates": suggestions,
+                    "status": "ambiguous",
+                    "query": query,
+                    "candidates": candidates,
                 }))
-                .map_err(|error| Error::Invalid(format!("serialize read file JSON: {error}")))?
+                .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
             );
-        } else if suggestions.is_empty() {
-            println!("read: file `{subject}` not found");
-        } else {
-            println!("read: file `{subject}` not found; closest paths:");
-            for suggestion in &suggestions {
-                println!("  {suggestion}");
-            }
-            println!("try: greppy read {}", shell_example_arg(&suggestions[0]));
+            return Ok(1);
         }
-        return Ok(10);
-    }
-    let canonical = canonical.expect("regular file check requires a canonical path");
-    let relative = canonical.strip_prefix(&canonical_root).map_err(|_| {
-        Error::Invalid(format!(
-            "read path `{subject}` resolves outside workspace {}",
-            canonical_root.display()
-        ))
-    })?;
-    let shown_path = relative.to_string_lossy().replace('\\', "/");
-    let content = std::fs::read_to_string(&canonical).map_err(|source| Error::Io {
-        context: format!("read {}", canonical.display()),
-        source,
-    })?;
-    let file_lines = content.lines().collect::<Vec<_>>();
-    let (start, end) = parse_read_line_range(lines, file_lines.len())?;
-    let selected = if end < start {
-        &file_lines[0..0]
-    } else {
-        &file_lines[start.saturating_sub(1)..end]
-    };
-    let (byte_start, byte_end) = if end < start {
-        (0, 0)
-    } else {
-        line_range_to_bytes(content.as_bytes(), start, end)
-    };
-    let handle_token = if with_handle {
-        Some(
-            greppy_edit::EditHandle::for_range(
-                &canonical_root,
-                std::path::Path::new(&shown_path),
-                content.as_bytes(),
-                byte_start,
-                byte_end,
-            )?
-            .encode(),
-        )
-    } else {
-        None
-    };
-    if json {
-        let rows = selected
-            .iter()
-            .enumerate()
-            .map(|(offset, text)| serde_json::json!({"line": start + offset, "text": text}))
-            .collect::<Vec<_>>();
+        let Some(definition) = read_definition(&root_path, nodes[0].clone())? else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&read_json_miss(&store, &project, query)).unwrap()
+            );
+            return Ok(1);
+        };
+        let source = read_line_slice(
+            &definition.content,
+            definition.start_line,
+            definition.end_line,
+        );
+        let (byte_start, byte_end) = line_range_to_bytes(
+            definition.content.as_bytes(),
+            definition.start_line,
+            definition.end_line,
+        );
+        let handle = if with_handle {
+            let full = read_full_handle(
+                &root_path,
+                &definition.node.file_path,
+                definition.content.as_bytes(),
+                definition.start_line,
+                definition.end_line,
+            )?;
+            Some(read_compact_handle(&store, &project, full)?)
+        } else {
+            None
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": READ_FILE_JSON_SCHEMA_VERSION,
+                "schema_version": "greppy.read.v1",
                 "command": "read",
                 "status": "ok",
-                "path": shown_path,
-                "start_line": start,
-                "end_line": end,
+                "qualified_name": definition.node.qualified_name,
+                "path": definition.node.file_path,
+                "start_line": definition.start_line,
+                "end_line": definition.end_line,
                 "byte_start": byte_start,
                 "byte_end": byte_end,
-                "lines": rows,
-                "handle": handle_token,
+                "source": source,
+                "handle": handle,
             }))
-            .map_err(|error| Error::Invalid(format!("serialize read file JSON: {error}")))?
+            .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
         );
-    } else {
-        // The header already states the span, so a per-line number repeats it
-        // once per line. Measured over a 41-task benchmark that repetition was
-        // 16.6% of everything `read` returned -- about 12,600 characters per
-        // task, re-billed on every subsequent turn -- while edits are addressed
-        // by content or by handle, not by line number.
-        println!("{shown_path}:{start}-{end}");
-        for text in selected {
-            println!("{text}");
-        }
-        if let Some(token) = &handle_token {
-            println!("handle: {token}");
-        }
+        return Ok(0);
     }
-    Ok(0)
+
+    let mut failed = false;
+    let mut printed = false;
+    let mut previous_ended_with_newline = true;
+    for query in symbols {
+        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+        let ids = resolve_symbol_nodes(&store, Some(query))?;
+        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        }
+        let nodes = read_real_nodes(&store, &ids)?;
+        let Some(node) = nodes.first().cloned() else {
+            nav_report_missing(&store, &project, query);
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let Some(definition) = read_definition(&root_path, node)? else {
+            nav_report_missing(&store, &project, query);
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let mut group = String::new();
+        for (start_line, end_line) in read_text_segments(&definition, head, tail) {
+            if !group.is_empty() && !group.ends_with('\n') {
+                group.push('\n');
+            }
+            group.push_str(&read_render_block(
+                &store,
+                &project,
+                &root_path,
+                &definition,
+                start_line,
+                end_line,
+                with_handle,
+            )?);
+        }
+        print!("{group}");
+        previous_ended_with_newline = group.ends_with('\n');
+    }
+    Ok(if failed { 1 } else { 0 })
 }
 
-/// `greppy read`: a symbol's exact definition span, optionally with an edit
-/// handle. Resolution mirrors `brief`; the returned bytes come from the LIVE
-/// file (the store addresses, the live file decides), so the handle's hashes
-/// always describe what the agent actually saw.
-pub(crate) fn dispatch_read(
-    symbol: Option<&str>,
+fn read_structural_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_expression"
+            | "if_statement"
+            | "else_clause"
+            | "for_expression"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_expression"
+            | "while_statement"
+            | "loop_expression"
+            | "match_expression"
+            | "match_statement"
+            | "switch_expression"
+            | "switch_statement"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "with_statement"
+            | "do_statement"
+            | "synchronized_statement"
+            | "async_block"
+            | "unsafe_block"
+            | "block"
+    )
+}
+
+fn read_node_end_line(row: usize, column: usize) -> usize {
+    row + usize::from(column > 0)
+}
+
+fn read_summary_sentence(root_path: &std::path::Path, file_path: &str, source: &str) -> String {
+    summarize_definition_span(root_path, file_path, source)
+        .into_iter()
+        .flatten()
+        .map(|sentence| sentence.split_whitespace().collect::<Vec<_>>().join(" "))
+        .find(|sentence| !sentence.is_empty())
+        .unwrap_or_else(|| "folded source block".to_string())
+}
+
+fn read_insert_smart_pack(
+    store: &greppy_store::Store,
+    project: &str,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    source: &str,
+    sentence: &str,
+) -> Result<String> {
+    let content_sha256 = read_sha256(source.as_bytes());
+    let metadata = serde_json::json!({
+        "kind": READ_SMART_PACK_KIND,
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "content_sha256": content_sha256,
+    });
+    store
+        .insert_expand_pack(&greppy_store::NewExpandPack {
+            project: project.to_string(),
+            command: "read-smart".into(),
+            query: format!("{path}:{start_line}-{end_line}"),
+            graph_generation: 0,
+            summary_json: serde_json::json!({
+                "text": sentence,
+                "content_sha256": content_sha256,
+            }),
+            payload_text: source.to_string(),
+            payload_json: Some(metadata),
+            ttl_secs: READ_PACK_TTL_SECS,
+        })
+        .map_err(Error::from)
+}
+
+/// Parse once, count structural blocks from the supplied root, and replace each
+/// first block at `depth` with one mechanically identifiable gap line.
+fn read_render_smart_source(
+    store: &greppy_store::Store,
+    project: &str,
+    root_path: &std::path::Path,
+    path: &str,
+    content: &str,
+    shown_start: usize,
+    shown_end: usize,
+    structural_start: usize,
+    structural_end: usize,
+    definition_root: bool,
+    depth: usize,
+) -> Result<String> {
+    let language = greppy_parser::language_for_path(std::path::Path::new(path));
+    if !language.is_supported() {
+        return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+    }
+    let Ok(tree) = greppy_parser::parse(language, content.as_bytes()) else {
+        return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+    };
+    let root_node = tree.root_node();
+    let mut selected = None;
+    let mut selected_width = usize::MAX;
+    let mut stack = vec![root_node];
+    while let Some(node) = stack.pop() {
+        let start = node.start_position().row + 1;
+        let end = read_node_end_line(node.end_position().row, node.end_position().column);
+        let suitable = if definition_root {
+            start == structural_start
+                && end >= structural_end
+                && node.child_by_field_name("body").is_some()
+        } else {
+            start == structural_start && end == structural_end && read_structural_kind(node.kind())
+        };
+        if suitable {
+            let width = node.end_byte().saturating_sub(node.start_byte());
+            if width < selected_width {
+                selected = Some(node);
+                selected_width = width;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_position().row + 1 <= structural_end
+                && read_node_end_line(child.end_position().row, child.end_position().column)
+                    >= structural_start
+            {
+                stack.push(child);
+            }
+        }
+    }
+    let Some(selected) = selected else {
+        return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+    };
+    let traversal_root = if definition_root {
+        let Some(body) = selected.child_by_field_name("body") else {
+            return Ok(read_line_slice(content, shown_start, shown_end).to_string());
+        };
+        body
+    } else {
+        selected
+            .child_by_field_name("body")
+            .or_else(|| selected.child_by_field_name("consequence"))
+            .unwrap_or(selected)
+    };
+
+    let mut candidates = Vec::<(usize, usize)>::new();
+    let mut children = traversal_root.walk();
+    let mut stack = traversal_root
+        .named_children(&mut children)
+        .map(|node| (node, 0usize))
+        .collect::<Vec<_>>();
+    while let Some((node, parent_depth)) = stack.pop() {
+        let candidate = read_structural_kind(node.kind());
+        let node_depth = parent_depth + usize::from(candidate);
+        let start = node.start_position().row + 1;
+        let end = read_node_end_line(node.end_position().row, node.end_position().column);
+        if candidate
+            && node_depth >= depth
+            && start >= shown_start
+            && end <= shown_end
+            && end >= start
+        {
+            candidates.push((start, end));
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push((child, node_depth));
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut non_overlapping = Vec::new();
+    for range in candidates {
+        if non_overlapping.last().is_none_or(|(_, end)| range.0 > *end) {
+            non_overlapping.push(range);
+        }
+    }
+
+    let mut gaps = Vec::with_capacity(non_overlapping.len());
+    for (start_line, end_line) in non_overlapping {
+        let source = read_line_slice(content, start_line, end_line);
+        let sentence = read_summary_sentence(root_path, path, source);
+        let expand_id = read_insert_smart_pack(
+            store, project, path, start_line, end_line, source, &sentence,
+        )?;
+        let opening = content.lines().nth(start_line - 1).unwrap_or("");
+        let indent = opening
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        gaps.push(FoldGap {
+            start_line,
+            end_line,
+            indent,
+            sentence,
+            expand_id,
+        });
+    }
+
+    let mut out = String::new();
+    let mut line = shown_start;
+    for gap in gaps {
+        if line < gap.start_line {
+            out.push_str(read_line_slice(content, line, gap.start_line - 1));
+        }
+        out.push_str(&format!(
+            "{}… {}-{} {} — greppy expand {}\n",
+            gap.indent, gap.start_line, gap.end_line, gap.sentence, gap.expand_id
+        ));
+        line = gap.end_line + 1;
+    }
+    if line <= shown_end {
+        out.push_str(read_line_slice(content, line, shown_end));
+    }
+    Ok(out)
+}
+
+pub(crate) fn dispatch_read_smart(
+    symbols: &[String],
+    depth: usize,
     with_handle: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    if depth == 0 {
+        return Err(Error::Invalid("read-smart --depth must be positive".into()));
+    }
+    prewarm_summary_daemon();
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    let root_path = resolve_root(root)?;
+    let mut failed = false;
+    let mut printed = false;
+    let mut previous_ended_with_newline = true;
+    for query in symbols {
+        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+        let ids = resolve_symbol_nodes(&store, Some(query))?;
+        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        }
+        let nodes = read_real_nodes(&store, &ids)?;
+        let Some(node) = nodes.first().cloned() else {
+            nav_report_missing(&store, &project, query);
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let Some(definition) = read_definition(&root_path, node)? else {
+            nav_report_missing(&store, &project, query);
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let mut group = format!(
+            "{}:{}-{}  {}\n",
+            definition.node.file_path,
+            definition.start_line,
+            definition.end_line,
+            nav_short_name(&definition.node)
+        );
+        let foldable = matches!(definition.node.label.as_str(), "Function" | "Method");
+        if foldable {
+            group.push_str(&read_render_smart_source(
+                &store,
+                &project,
+                &root_path,
+                &definition.node.file_path,
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+                definition.node.start_line.max(1) as usize,
+                definition.end_line,
+                true,
+                depth,
+            )?);
+        } else {
+            group.push_str(read_line_slice(
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+            ));
+        }
+        if with_handle {
+            if !group.ends_with('\n') {
+                group.push('\n');
+            }
+            let full = read_full_handle(
+                &root_path,
+                &definition.node.file_path,
+                definition.content.as_bytes(),
+                definition.start_line,
+                definition.end_line,
+            )?;
+            group.push_str("handle: ");
+            group.push_str(&read_compact_handle(&store, &project, full)?);
+            group.push('\n');
+        }
+        print!("{group}");
+        previous_ended_with_newline = group.ends_with('\n');
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
+fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
+    let supplied = std::path::Path::new(subject);
+    if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        root_path.join(supplied)
+    }
+}
+
+fn read_open_file(
+    root_path: &std::path::Path,
+    canonical_root: &std::path::Path,
+    subject: &str,
+) -> Option<(String, std::path::PathBuf, String)> {
+    let candidate = read_file_candidate(root_path, subject);
+    let canonical = candidate.canonicalize().ok()?;
+    if !canonical.starts_with(canonical_root) || !canonical.is_file() {
+        return None;
+    }
+    let relative = canonical.strip_prefix(canonical_root).ok()?;
+    let shown = relative.to_string_lossy().replace('\\', "/");
+    let content = std::fs::read_to_string(&canonical).ok()?;
+    Some((shown, canonical, content))
+}
+
+fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)> {
+    let Some((start, end)) = raw.split_once(':') else {
+        return Err(Error::Invalid(format!(
+            "read-file --lines expects A:B, got `{raw}`"
+        )));
+    };
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| Error::Invalid(format!("read-file --lines expects A:B, got `{raw}`")))?;
+    let end = end
+        .parse::<usize>()
+        .map_err(|_| Error::Invalid(format!("read-file --lines expects A:B, got `{raw}`")))?;
+    if start == 0 || end < start {
+        return Err(Error::Invalid(format!(
+            "read-file --lines expects 1 <= A <= B, got `{raw}`"
+        )));
+    }
+    if end > line_count {
+        return Err(Error::Invalid(format!(
+            "read-file --lines ends at {end}, but the file has {line_count} lines"
+        )));
+    }
+    Ok((start, end))
+}
+
+fn read_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
+}
+
+fn read_insert_file_pack(
+    store: &greppy_store::Store,
+    project: &str,
+    path: &str,
+    content: &str,
+    start_line: usize,
+) -> Result<String> {
+    let content_sha256 = read_sha256(content.as_bytes());
+    store
+        .insert_expand_pack(&greppy_store::NewExpandPack {
+            project: project.to_string(),
+            command: "read-file".into(),
+            query: format!("{path}:{start_line}"),
+            graph_generation: 0,
+            summary_json: serde_json::json!({
+                "text": format!("{path} continues at {start_line}"),
+                "content_sha256": content_sha256,
+            }),
+            payload_text: format!("{path}:{start_line}\n"),
+            payload_json: Some(serde_json::json!({
+                "kind": READ_FILE_PACK_KIND,
+                "path": path,
+                "start_line": start_line,
+                "content_sha256": content_sha256,
+            })),
+            ttl_secs: READ_PACK_TTL_SECS,
+        })
+        .map_err(Error::from)
+}
+
+fn read_render_file_page(
+    store: &greppy_store::Store,
+    project: &str,
+    path: &str,
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    with_handle: bool,
+    root_path: &std::path::Path,
+) -> Result<String> {
+    let mut out = format!("{path}:{start_line}-{end_line}\n");
+    out.push_str(read_line_slice(content, start_line, end_line));
+    if with_handle {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let full = read_full_handle(root_path, path, content.as_bytes(), start_line, end_line)?;
+        out.push_str("handle: ");
+        out.push_str(&read_compact_handle(store, project, full)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+pub(crate) fn dispatch_read_files(
+    paths: &[String],
+    lines: Option<&str>,
+    all: bool,
+    with_handle: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    let store = open_default_store_query_writer(root)?;
+    let project = project_for(root)?;
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    let mut failed = false;
+    let mut printed = false;
+    let mut previous_ended_with_newline = true;
+    for path in paths {
+        let Some((shown, _, content)) = read_open_file(&root_path, &canonical_root, path) else {
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!("no such file: {path}");
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        let line_count = read_line_count(&content);
+        let (start_line, end_line, continuation) = if let Some(raw) = lines {
+            let (start, end) = read_parse_file_range(raw, line_count)?;
+            (start, end, None)
+        } else if all || line_count <= READ_FILE_PAGE_LINES {
+            (1, line_count, None)
+        } else {
+            let end = READ_FILE_PAGE_LINES;
+            let id = read_insert_file_pack(&store, &project, &shown, &content, end + 1)?;
+            (1, end, Some(id))
+        };
+        let mut group = read_render_file_page(
+            &store,
+            &project,
+            &shown,
+            &content,
+            start_line,
+            end_line,
+            with_handle,
+            &root_path,
+        )?;
+        if let Some(id) = continuation {
+            if !group.ends_with('\n') {
+                group.push('\n');
+            }
+            group.push_str(&format!(
+                "{} more lines — greppy expand {} continues at {}\n",
+                read_count(line_count - end_line),
+                id,
+                end_line + 1
+            ));
+        }
+        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+        print!("{group}");
+        previous_ended_with_newline = group.ends_with('\n');
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
+fn read_locate_file_pack(
+    store: &greppy_store::Store,
+    root_path: &std::path::Path,
+    project: &str,
+    path: &str,
+    expected_hash: &str,
+) -> Result<Option<(String, String)>> {
+    if let Ok(content) = std::fs::read_to_string(root_path.join(path)) {
+        if read_sha256(content.as_bytes()) == expected_hash {
+            return Ok(Some((path.to_string(), content)));
+        }
+    }
+    let mut matches = Vec::new();
+    for state in store.list_file_states(project)? {
+        let Ok(content) = std::fs::read_to_string(root_path.join(&state.rel_path)) else {
+            continue;
+        };
+        if read_sha256(content.as_bytes()) == expected_hash {
+            matches.push((state.rel_path, content));
+            if matches.len() > 1 {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(matches.pop())
+}
+
+fn read_payload_line_count(payload: &str) -> usize {
+    let newlines = payload
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    newlines + usize::from(!payload.is_empty() && !payload.ends_with('\n'))
+}
+
+fn read_find_payload(content: &str, payload: &str) -> Vec<(usize, usize)> {
+    if payload.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let mut offset = 0usize;
+    while let Some(relative) = content[offset..].find(payload) {
+        let byte = offset + relative;
+        let start_line = content.as_bytes()[..byte]
+            .iter()
+            .filter(|value| **value == b'\n')
+            .count()
+            + 1;
+        let end_line = start_line + read_payload_line_count(payload).saturating_sub(1);
+        matches.push((start_line, end_line));
+        offset = byte + 1;
+    }
+    matches
+}
+
+fn read_locate_smart_pack(
+    store: &greppy_store::Store,
+    root_path: &std::path::Path,
+    project: &str,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    expected_hash: &str,
+    payload: &str,
+) -> Result<Option<(String, String, usize, usize)>> {
+    if let Ok(content) = std::fs::read_to_string(root_path.join(path)) {
+        let current = read_line_slice(&content, start_line, end_line);
+        if read_sha256(current.as_bytes()) == expected_hash && current == payload {
+            return Ok(Some((path.to_string(), content, start_line, end_line)));
+        }
+    }
+    let mut found = Vec::new();
+    for state in store.list_file_states(project)? {
+        let Ok(content) = std::fs::read_to_string(root_path.join(&state.rel_path)) else {
+            continue;
+        };
+        for (start, end) in read_find_payload(&content, payload) {
+            found.push((state.rel_path.clone(), content.clone(), start, end));
+            if found.len() > 1 {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(found.pop())
+}
+
+pub(crate) fn dispatch_read_expand(
+    store: &greppy_store::Store,
+    pack: &greppy_store::ExpandPack,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    const READ_JSON_SCHEMA_VERSION: &str = "greppy.read.v1";
-    let mut store = open_default_store_query_writer(root)?;
-    let project = project_for(root)?;
-    // Read is the workhorse of the edit loop, and the loop mutates files
-    // constantly (test setup, the agent's own edits). Refusing on a stale
-    // index — returning empty until a background reindex catches up — left
-    // the agent with nothing and it degraded to bash (forensics 2026-07-18:
-    // a real flask task took 123 turns, greppy all but unused). Instead,
-    // heal in-band: a reindexable stale index is rebuilt BLOCKING and served
-    // fresh on this same call. `read` verifies every span against the live
-    // file anyway, so a brief blocking reindex is strictly better than an
-    // empty answer. Only genuinely un-reindexable states (cold/failed) still
-    // refuse.
-    maybe_reindex_stale(&mut store, root)?;
-    if let Some(code) = graph_stale_gate(
-        &store,
-        root,
-        &project,
-        "read",
-        json,
-        serde_json::json!({"schema_version": READ_JSON_SCHEMA_VERSION}),
-        "definitions",
-    )? {
-        return Ok(code);
-    }
-    let ids = resolve_symbol_nodes(&store, symbol)?;
-    let root_path = resolve_root(root)?;
-    let mut nodes = Vec::new();
-    for id in &ids {
-        if let Some(node) = store.get_node(*id)? {
-            if !node.file_path.is_empty() && node.start_line >= 1 {
-                nodes.push(node);
-            }
-        }
-    }
-    // The per-file synthetic anchor answers to the file stem, so `greet` also
-    // hits `pkg/greet.go` and a unique definition reads as ambiguous. A file is
-    // read by path; the anchor only stands in when nothing else answered.
-    if nodes
-        .iter()
-        .any(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name))
-    {
-        nodes.retain(|node| {
-            !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
-        });
-    }
-    if nodes.is_empty() {
-        // Exact/graph resolution missed. greppy has an EMBEDDING engine
-        // precisely so a reasonable-but-inexact reference still resolves —
-        // "_startsWith", "impl Serialize for Bound", "the fn that validates
-        // prefixes". Hard-failing here (as the old bare-name suggestion did)
-        // wastes the second engine and forces the agent to guess formats
-        // (trace forensics 2026-07-17: 12 read not-founds, 4-5 turns each).
-        let query = symbol.unwrap_or("");
-        let hits = greppy_search::semantic_query(&store, query, None, Some(&project), 6)
-            .unwrap_or_default();
-        // A clearly dominant hit is safe to read directly (read mutates
-        // nothing); otherwise offer addressable candidates and let the agent
-        // pick. Dominance = single hit, or top score >= 1.4x the runner-up.
-        let dominant = match hits.as_slice() {
-            [only] => Some(only.node.id),
-            [top, second, ..] if top.score >= second.score * 1.4 => Some(top.node.id),
-            _ => None,
-        };
-        if let Some(id) = dominant {
-            if let Some(node) = store.get_node(id)? {
-                if !node.file_path.is_empty() && node.start_line >= 1 {
-                    if !json {
-                        println!(
-                            "read: `{query}` resolved semantically to `{}`",
-                            node.qualified_name
-                        );
-                    }
-                    nodes.push(node);
-                }
-            }
-        }
-        if nodes.is_empty() {
-            // No single confident match: hand back addressable candidates —
-            // the exact qualified name read accepts, plus location and kind —
-            // so the retry is copy-paste, not another guess.
-            let candidates: Vec<serde_json::Value> = hits
-                .iter()
-                .take(5)
-                .map(|h| {
-                    serde_json::json!({
-                        "qualified_name": h.node.qualified_name,
-                        "path": h.node.file_path,
-                        "line": h.node.start_line,
-                        "kind": h.node.label,
-                    })
-                })
-                .collect();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": READ_JSON_SCHEMA_VERSION,
-                        "command": "read",
-                        "status": "not-found",
-                        "query": query,
-                        "candidates": candidates,
-                    }))
-                    .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
-                );
-            } else if candidates.is_empty() {
-                println!("read: no definition found for `{query}`");
-            } else {
-                println!("read: no exact match for `{query}`; closest definitions:");
-                for h in hits.iter().take(5) {
-                    println!(
-                        "  {}  ({}:{}, {})",
-                        h.node.qualified_name, h.node.file_path, h.node.start_line, h.node.label
-                    );
-                }
-            }
-            return Ok(10);
-        }
-    }
-    if nodes.len() > 1 {
-        // distinct definition sites -> ambiguous, list candidates (exit 11);
-        // multiple store nodes on ONE site (Struct + Impl) are not ambiguity
-        let mut sites: Vec<(String, i64)> = nodes
-            .iter()
-            .map(|n| (n.file_path.clone(), n.start_line))
-            .collect();
-        sites.sort();
-        sites.dedup();
-        if sites.len() > 1 {
-            let candidates: Vec<serde_json::Value> = nodes
-                .iter()
-                .map(|n| {
-                    serde_json::json!({
-                        "qualified_name": n.qualified_name,
-                        "path": n.file_path,
-                        "line": n.start_line,
-                    })
-                })
-                .collect();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": READ_JSON_SCHEMA_VERSION,
-                        "command": "read",
-                        "status": "ambiguous",
-                        "query": symbol.unwrap_or(""),
-                        "candidates": candidates,
-                    }))
-                    .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
-                );
-            } else {
-                println!(
-                    "read: `{}` is ambiguous; qualify it (Owner.method) or use one of:",
-                    symbol.unwrap_or("")
-                );
-                for n in &nodes {
-                    println!("  {} {}:{}", n.qualified_name, n.file_path, n.start_line);
-                }
-            }
-            return Ok(11);
-        }
-    }
-    let node = &nodes[0];
-    let abs = root_path.join(&node.file_path);
-    let content = std::fs::read(&abs).map_err(|source| Error::Io {
-        context: format!("read {}", abs.display()),
-        source,
-    })?;
-    // `--context N` widens the span upwards only: the doc comment sits above the
-    // signature, and a definition's own end is where it ends.
-    let start_line = (node.start_line - cli_read_context()).max(1);
-    let Some(span) = read_span_with_meta(
-        &root_path,
-        &node.file_path,
-        start_line,
-        node.end_line,
-        usize::MAX,
-        false,
-    ) else {
-        println!(
-            "read: definition span for `{}` is stale; re-index and retry",
-            node.qualified_name
-        );
-        return Ok(12);
+    let Some(metadata) = pack.payload_json.as_ref() else {
+        println!("expand: invalid {} pack", pack.command);
+        return Ok(1);
     };
-    // line range -> byte range against the SAME live bytes
-    let (byte_start, byte_end) =
-        line_range_to_bytes(&content, start_line as usize, span.end_line as usize);
-    let handle_token = if with_handle {
-        let mut handle = greppy_edit::EditHandle::for_range(
-            &root_path,
-            std::path::Path::new(&node.file_path),
-            &content,
-            byte_start,
-            byte_end,
-        )?;
-        let language = greppy_edit::language_for_path(std::path::Path::new(&node.file_path));
-        handle.signature_fingerprint =
-            greppy_edit::verbs::signature_fingerprint(language, &content, (byte_start, byte_end));
-        handle.grammar_id = Some(format!("{language:?}"));
-        handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
-        Some(handle.encode())
-    } else {
-        None
+    let root_path = resolve_root(root)?;
+    let project = &pack.project;
+    let result = match pack.command.as_str() {
+        "read-file" => {
+            if metadata.get("kind").and_then(serde_json::Value::as_str) != Some(READ_FILE_PACK_KIND)
+            {
+                None
+            } else {
+                let path = metadata
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let start = metadata
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                let hash = metadata
+                    .get("content_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let Some((path, content)) =
+                    read_locate_file_pack(store, &root_path, project, path, hash)?
+                else {
+                    println!("expand: read-file changed since this pack was created");
+                    return Ok(1);
+                };
+                let line_count = read_line_count(&content);
+                if start == 0 || start > line_count {
+                    println!("expand: read-file changed since this pack was created");
+                    return Ok(1);
+                }
+                let end = (start + READ_FILE_PAGE_LINES - 1).min(line_count);
+                let mut text = read_render_file_page(
+                    store, project, &path, &content, start, end, false, &root_path,
+                )?;
+                let mut next = serde_json::Value::Null;
+                if end < line_count {
+                    let id = read_insert_file_pack(store, project, &path, &content, end + 1)?;
+                    text.push_str(&format!(
+                        "{} more lines — greppy expand {} continues at {}\n",
+                        read_count(line_count - end),
+                        id,
+                        end + 1
+                    ));
+                    next = serde_json::json!(id);
+                }
+                Some((
+                    text,
+                    serde_json::json!({
+                        "kind": READ_FILE_PACK_KIND,
+                        "path": path,
+                        "start_line": start,
+                        "end_line": end,
+                        "next_expand_id": next,
+                    }),
+                ))
+            }
+        }
+        "read-smart" => {
+            if metadata.get("kind").and_then(serde_json::Value::as_str)
+                != Some(READ_SMART_PACK_KIND)
+            {
+                None
+            } else {
+                let path = metadata
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let start = metadata
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                let end = metadata
+                    .get("end_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                let hash = metadata
+                    .get("content_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if read_sha256(pack.payload_text.as_bytes()) != hash {
+                    println!("expand: read-smart pack hash drift; refusing unverified source");
+                    return Ok(1);
+                }
+                let Some((path, content, start, end)) = read_locate_smart_pack(
+                    store,
+                    &root_path,
+                    project,
+                    path,
+                    start,
+                    end,
+                    hash,
+                    &pack.payload_text,
+                )?
+                else {
+                    println!("expand: read-smart span changed since this pack was created");
+                    return Ok(1);
+                };
+                let text = read_render_smart_source(
+                    store, project, &root_path, &path, &content, start, end, start, end, false, 1,
+                )?;
+                Some((
+                    text,
+                    serde_json::json!({
+                        "kind": READ_SMART_PACK_KIND,
+                        "path": path,
+                        "start_line": start,
+                        "end_line": end,
+                    }),
+                ))
+            }
+        }
+        _ => None,
+    };
+    let Some((text, value)) = result else {
+        println!("expand: invalid {} pack", pack.command);
+        return Ok(1);
     };
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": READ_JSON_SCHEMA_VERSION,
-                "command": "read",
-                "status": "ok",
-                "qualified_name": node.qualified_name,
-                "path": node.file_path,
-                "start_line": node.start_line,
-                "end_line": span.end_line,
-                "byte_start": byte_start,
-                "byte_end": byte_end,
-                "source": span.text,
-                "handle": handle_token,
+                "id": pack.id,
+                "project": pack.project,
+                "command": pack.command,
+                "query": pack.query,
+                "graph_generation": pack.graph_generation,
+                "created_at": pack.created_at,
+                "expires_at": pack.expires_at,
+                "summary": pack.summary_json,
+                "payload_text": text,
+                "payload_json": value,
             }))
-            .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
+            .map_err(|error| Error::Invalid(format!("serialize expand JSON: {error}")))?
         );
     } else {
-        println!(
-            "{} {}:{}-{}",
-            node.qualified_name, node.file_path, node.start_line, span.end_line
-        );
-        println!("{}", span.text);
-        if let Some(token) = &handle_token {
-            println!("handle: {token}");
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
         }
     }
     Ok(0)
 }
 
-/// `greppy edit`: dispatch to the transactional verbs; print the
-/// certificate; map its status to the registered exit code.
-/// Read an edit source argument: a file path, or `-` for stdin (agents
-/// naturally try heredocs; K3 reasoning trace 2026-07-17: "Need pass new
-/// source via stdin?").
+/// Read an edit source argument: a file path, or `-` for stdin.
 pub(crate) fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
     if source_file == "-" {
         use std::io::Read;
@@ -596,236 +1523,6 @@ pub(crate) fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
         context: format!("read {source_file}"),
         source,
     })
-}
-
-pub(crate) fn read_plan(
-    targets: &[String],
-    symbol_opts: &[String],
-    path_opts: &[String],
-    lines: Option<&str>,
-) -> Result<ReadPlan> {
-    let mut positional = Vec::new();
-    for value in targets {
-        if value == "-" {
-            positional.extend(targets_from_stdin()?);
-            continue;
-        }
-        positional.push(value.clone());
-    }
-    let forced_symbol = !symbol_opts.is_empty();
-    let mut subjects: Vec<String> = Vec::new();
-    if forced_symbol {
-        subjects.extend(symbol_opts.iter().cloned());
-        subjects.extend(positional);
-        // A single `--path` next to a single symbol is the historic
-        // disambiguator (`read open --path FILE`), not another subject.
-        if subjects.len() == 1 && path_opts.len() == 1 {
-            if let Some(folded) = qualify_symbol_with_path(
-                subjects.first().map(String::as_str),
-                Some(path_opts[0].as_str()),
-            ) {
-                subjects[0] = folded;
-            }
-        } else {
-            subjects.extend(path_opts.iter().cloned());
-        }
-    } else if positional.len() == 1 && path_opts.len() == 1 {
-        if let Some(folded) = qualify_symbol_with_path(
-            positional.first().map(String::as_str),
-            Some(path_opts[0].as_str()),
-        ) {
-            subjects.push(folded);
-        } else {
-            subjects.extend(positional);
-            subjects.extend(path_opts.iter().cloned());
-        }
-    } else {
-        subjects.extend(positional);
-        subjects.extend(path_opts.iter().cloned());
-    }
-    for subject in &subjects {
-        if subject.trim().is_empty() {
-            return Err(Error::Invalid(
-                "empty read target: a symbol name or a path was expected (an unexpanded shell \
-                 variable produces this). Nothing was read."
-                    .into(),
-            ));
-        }
-    }
-    if lines.is_some() && subjects.len() > 1 {
-        return Err(Error::Invalid(format!(
-            "--lines names one range in one file, but {} targets were given; read them \
-             separately, or drop --lines",
-            subjects.len()
-        )));
-    }
-    Ok(ReadPlan {
-        subjects,
-        forced_symbol,
-        lines: lines.map(str::to_string),
-    })
-}
-
-/// `read S [S …]` / `read PATH [PATH …]` — every target is read in one call,
-/// and one target that cannot be read refuses the whole call: three files that
-/// worked plus a silently dropped fourth looks like success.
-pub(crate) fn dispatch_read_multi(plan: &ReadPlan, with_handle: bool, json: bool, root: Option<&str>) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let canonical_root = root_path
-        .canonicalize()
-        .unwrap_or_else(|_| root_path.clone());
-    let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-
-    enum Subject {
-        File(String),
-        Symbol(greppy_store::Node),
-    }
-    let mut subjects = Vec::with_capacity(plan.subjects.len());
-    let mut missing: Vec<String> = Vec::new();
-    for raw in &plan.subjects {
-        // `file.rs::Symbol` is a qualified SYMBOL, not a slash-containing path.
-        let path_qualified = split_path_qualified(raw).is_some();
-        if !plan.forced_symbol && !path_qualified && read_subject_is_path(raw, root)? {
-            subjects.push(Subject::File(raw.clone()));
-            continue;
-        }
-        if !plan.forced_symbol && !path_qualified && looks_like_path(raw) {
-            missing.push(format!("`{raw}` is not a file in this repository"));
-            continue;
-        }
-        let ids = resolve_symbol_nodes(&store, Some(raw.as_str()))?;
-        let mut node = None;
-        for id in &ids {
-            if let Some(candidate) = store.get_node(*id)? {
-                if !candidate.file_path.is_empty() && candidate.start_line >= 1 {
-                    node = Some(candidate);
-                    break;
-                }
-            }
-        }
-        match node {
-            Some(node) => subjects.push(Subject::Symbol(node)),
-            None => missing.push(format!("`{raw}` is not a definition in this repository")),
-        }
-    }
-    if !missing.is_empty() {
-        return Err(Error::Invalid(format!(
-            "read: {} — nothing was read for the other targets either.",
-            missing.join("; ")
-        )));
-    }
-
-    let mut hits = Vec::with_capacity(subjects.len());
-    let mut text = String::new();
-    for (index, subject) in subjects.iter().enumerate() {
-        let (shown_path, start, end, source, content) = match subject {
-            Subject::File(raw) => {
-                let candidate = read_file_candidate(&root_path, raw);
-                let canonical = candidate.canonicalize().map_err(|source| Error::Io {
-                    context: format!("canonicalize {}", candidate.display()),
-                    source,
-                })?;
-                let relative = canonical.strip_prefix(&canonical_root).map_err(|_| {
-                    Error::Invalid(format!("read path `{raw}` resolves outside the workspace"))
-                })?;
-                let shown = relative.to_string_lossy().replace('\\', "/");
-                let content = std::fs::read(&canonical).map_err(|source| Error::Io {
-                    context: format!("read {}", canonical.display()),
-                    source,
-                })?;
-                let body = String::from_utf8_lossy(&content).into_owned();
-                let lines = body.lines().count().max(1);
-                (shown, 1i64, lines as i64, body, content)
-            }
-            Subject::Symbol(node) => {
-                let absolute = root_path.join(&node.file_path);
-                let content = std::fs::read(&absolute).map_err(|source| Error::Io {
-                    context: format!("read {}", absolute.display()),
-                    source,
-                })?;
-                let Some(span) = read_span_with_meta(
-                    &root_path,
-                    &node.file_path,
-                    node.start_line,
-                    node.end_line,
-                    usize::MAX,
-                    false,
-                ) else {
-                    return Err(Error::Invalid(format!(
-                        "read: definition span for `{}` is stale; re-index and retry",
-                        node.qualified_name
-                    )));
-                };
-                (
-                    node.file_path.clone(),
-                    node.start_line,
-                    span.end_line,
-                    span.text,
-                    content,
-                )
-            }
-        };
-        let (byte_start, byte_end) =
-            line_range_to_bytes(&content, start.max(1) as usize, end.max(start) as usize);
-        let handle_token = if with_handle {
-            Some(
-                greppy_edit::EditHandle::for_range(
-                    &root_path,
-                    std::path::Path::new(&shown_path),
-                    &content,
-                    byte_start,
-                    byte_end,
-                )?
-                .encode(),
-            )
-        } else {
-            None
-        };
-        let target = &plan.subjects[index.min(plan.subjects.len() - 1)];
-        hits.push(serde_json::json!({
-            "target": target,
-            "qualified_name": match subject {
-                Subject::Symbol(node) => node.qualified_name.clone(),
-                Subject::File(_) => shown_path.clone(),
-            },
-            "file": &shown_path,
-            "line": start,
-            "path": &shown_path,
-            "file_path": &shown_path,
-            "start_line": start,
-            "end_line": end,
-            "lines": format!("{start}:{end}"),
-            "source": &source,
-            "handle": handle_token,
-        }));
-        text.push_str(&format!("{shown_path}:{start}-{end}\n"));
-        text.push_str(&source);
-        if !source.ends_with('\n') {
-            text.push('\n');
-        }
-        if let Some(token) = &handle_token {
-            text.push_str(&format!("handle: {token}\n"));
-        }
-    }
-    if json {
-        let value = serde_json::json!({
-            "schema_version": "greppy.read.v1",
-            "command": "read",
-            "status": "ok",
-            "total_exact": hits.len(),
-            "shown": hits.len(),
-            "hits": hits,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
-        );
-    } else {
-        print!("{text}");
-    }
-    Ok(0)
 }
 
 pub(crate) fn read_last_used_unix_secs(dir: &std::path::Path) -> u64 {
@@ -848,32 +1545,4 @@ pub(crate) fn read_last_used_unix_secs(dir: &std::path::Path) -> u64 {
                 .map(|age| age.as_secs())
         })
         .unwrap_or(0)
-}
-
-pub(crate) fn read_uses_default_file_budget(cli: &Cli) -> bool {
-    let Some(Command::Read {
-        targets,
-        symbol_opts,
-        path_opts,
-        lines,
-        json,
-        all,
-        ..
-    }) = cli.command.as_ref()
-    else {
-        return false;
-    };
-    if *json || *all || lines.is_some() || !symbol_opts.is_empty() {
-        return false;
-    }
-    if targets.len() + path_opts.len() != 1 {
-        return false;
-    }
-    if targets.is_empty() {
-        return true;
-    }
-    targets.first().is_some_and(|subject| {
-        split_path_qualified(subject).is_none()
-            && read_subject_is_path(subject, cli.root.as_deref()).unwrap_or(false)
-    })
 }

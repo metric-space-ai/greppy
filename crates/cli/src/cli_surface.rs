@@ -211,47 +211,54 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Read a symbol's exact definition span (byte-precise source). With
-    /// --handle, also returns an edit handle that pins the file, byte range,
-    /// and content hashes — pass it to `greppy replace-span`. File paths and
-    /// `--lines A:B` ranges produce the same directly consumable handle form.
-    /// Prefer this
-    /// over opening whole files: it returns exactly the code that matters.
+    /// Print symbol definitions as source bytes, including documentation and
+    /// attributes immediately above each definition.
     Read {
-        /// What to read: symbols, files, or `-` to take them from the pipe.
-        /// Several targets are read in one call. A name that is also a path on
-        /// disk is read as the file; `--symbol` forces the definition.
-        #[arg(value_name = "TARGET")]
-        targets: Vec<String>,
-        /// Force symbol reads, and name further symbols. Repeatable.
-        #[arg(long = "symbol", value_name = "SYMBOL")]
-        symbol_opts: Vec<String>,
-        /// Read these files, or disambiguate a symbol that resolves in several
-        /// files (equivalent to the `path::SYMBOL` form). Repeatable.
-        #[arg(long = "path", value_name = "FILE")]
-        path_opts: Vec<String>,
-        /// For file reads, print only the inclusive 1-based line N or range N:M.
-        /// `--line` is accepted as the conventional singular spelling.
-        #[arg(long, alias = "line", value_name = "N[:M]")]
-        lines: Option<String>,
-        /// For symbol reads, also the N lines above the definition, so its doc
-        /// comment comes along instead of costing a second call.
+        /// Symbols to read, or `-` to take symbols from the pipe.
+        #[arg(value_name = "SYMBOL", required = true)]
+        symbols: Vec<String>,
+        /// Print only the first M lines of each definition.
+        #[arg(long, value_name = "M")]
+        head: Option<usize>,
+        /// Print only the last N lines of each definition.
         #[arg(long, value_name = "N")]
-        context: Option<usize>,
-        /// Also return an edit handle for the symbol, file, or selected line range.
+        tail: Option<usize>,
+        /// Also print a compact edit handle for every printed span.
         #[arg(long)]
         handle: bool,
-        /// Accepted for agent ergonomics: read already prints the definition's
-        /// source, so --code is a no-op — agents carrying it over from the nav
-        /// commands must not lose the call to a parse error.
-        #[arg(long)]
-        code: bool,
-        /// Emit machine-readable JSON (source, span, handle, candidates).
-        #[arg(long)]
+        /// Emit the existing machine-readable read shape.
+        #[arg(long, hide = true)]
         json: bool,
-        /// For whole-file reads, lift the default stdout byte budget.
+    },
+    /// Print symbol definitions with nested structural blocks folded into
+    /// semantic one-line gaps that can be expanded recursively.
+    #[command(name = "read-smart")]
+    ReadSmart {
+        /// Symbols to read, or `-` to take symbols from the pipe.
+        #[arg(value_name = "SYMBOL", required = true)]
+        symbols: Vec<String>,
+        /// Keep blocks above this structural depth raw; fold blocks at this depth.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        depth: usize,
+        /// Also print a compact edit handle for each definition span.
         #[arg(long)]
+        handle: bool,
+    },
+    /// Read files directly, in 400-line pages unless a range or all lines were requested.
+    #[command(name = "read-file")]
+    ReadFile {
+        /// Repository-relative or absolute file paths.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// Print exactly the inclusive 1-based range A:B.
+        #[arg(long, value_name = "A:B", conflicts_with = "all")]
+        lines: Option<String>,
+        /// Print every line without pagination.
+        #[arg(long, conflicts_with = "lines")]
         all: bool,
+        /// Also print a compact edit handle for every printed span.
+        #[arg(long)]
+        handle: bool,
     },
     /// Replace a definition with NEW; without NEW, read it from stdin.
     Replace {

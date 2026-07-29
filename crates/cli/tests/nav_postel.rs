@@ -217,8 +217,13 @@ fn limit_max_aliases_hold_and_paths_are_flag_only() {
     }
 
     let positional = run(&["read", "target"], &repo, &store);
-    let flagged = run(&["read", "--symbol", "target"], &repo, &store);
-    assert_eq!(positional, flagged, "positional SYMBOL and --symbol differ");
+    assert_eq!(
+        positional.0, 0,
+        "stdout={}\nstderr={}",
+        positional.1, positional.2
+    );
+    let retired = run(&["read", "--symbol", "target"], &repo, &store);
+    assert_eq!(retired.0, 2, "retired --symbol unexpectedly parsed");
 }
 
 #[test]

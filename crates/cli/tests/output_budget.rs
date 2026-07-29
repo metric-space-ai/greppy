@@ -154,12 +154,11 @@ fn mini_budget_never_cuts_a_json_diagnostic() {
     let (code, stdout, stderr) = run(
         repo,
         store,
-        &["read", "src/missing.rs", "--json", "--max-bytes", "1"],
+        &["read", "zzz_missing_symbol", "--json", "--max-bytes", "1"],
     );
 
-    assert_eq!(code, 10, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["status"], "not-found");
-    assert_eq!(value["path"], "src/missing.rs");
-    assert_eq!(value["path_candidates"][0], "src/lib.rs");
+    assert_eq!(value["query"], "zzz_missing_symbol");
 }
