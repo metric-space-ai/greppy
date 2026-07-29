@@ -1347,6 +1347,38 @@ fn impact_json_explicit_calls_edge_is_not_remapped_to_all_references() {
     assert_eq!(v["edge_types"], serde_json::json!(["CALLS"]));
 }
 
+fn make_real_git_diff_impact_repo(tag: &str) -> (PathBuf, PathBuf) {
+    let root = fresh_dir(tag);
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.rs"), "mod hub;\nmod callers;\n").unwrap();
+    std::fs::write(src.join("hub.rs"), "pub fn hub() -> u32 { 7 }\n").unwrap();
+    std::fs::write(
+        src.join("callers.rs"),
+        r#"
+pub fn caller_a() -> u32 { crate::hub::hub() }
+pub fn caller_b() -> u32 { crate::hub::hub() }
+pub fn caller_c() -> u32 { crate::hub::hub() }
+"#,
+    )
+    .unwrap();
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "greppy@example.invalid"]);
+    git(&repo, &["config", "user.name", "greppy test"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "baseline"]);
+    git(&repo, &["branch", "basepoint"]);
+
+    std::fs::write(src.join("hub.rs"), "pub fn hub() -> u32 { 8 }\n").unwrap();
+    git(&repo, &["add", "src/hub.rs"]);
+    git(&repo, &["commit", "-m", "change hub"]);
+
+    let store = root.join("store");
+    (repo, store)
+}
+
 #[test]
 fn impact_since_json_maps_changed_hunk_to_symbol_and_transitive_callers() {
     let (repo, store) = make_real_git_diff_impact_repo("impact-since-diff");
