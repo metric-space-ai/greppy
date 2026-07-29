@@ -1366,8 +1366,8 @@ pub(crate) fn dispatch_brief(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    // brief always summarizes its definition span; overlap the model load
-    // with resolution and store open.
+    // brief summarizes its definition span and its callees'; overlap the
+    // model load with resolution and store open.
     prewarm_summary_daemon();
     let query_symbol = symbol.unwrap_or("");
     let path_filters = prepare_query_path_filters(root, "brief", query_symbol, paths)?;
@@ -1396,24 +1396,19 @@ pub(crate) fn dispatch_brief(
     )? {
         return Ok(code);
     }
-    // `brief` is graph-first and must remain useful when EmbeddingGemma cannot
-    // be resolved. Probe configuration only (never load the model), surface the
-    // degradation, then continue with definition/callers/callees unchanged.
-    let semantic_backend_unavailable = embedding_config_for_required_use(EmbeddingCliArgs {
-        device: None,
-        no_gpu: false,
-    })
-    .err()
-    .filter(embedding_asset_missing_error)
-    .map(|error| error.to_string());
-    if !json && semantic_backend_unavailable.is_some() {
-        println!(
-            "semantic backend unavailable (asset missing) — brief continuing with graph-only definition/callers/callees"
-        );
-    }
     let targets = resolve_symbol_nodes(&store, symbol)?;
-    if targets.is_empty() {
-        if json {
+    if json {
+        // `brief` is graph-first and must remain useful when EmbeddingGemma
+        // cannot be resolved. Probe configuration only (never load the model)
+        // and surface the degradation in the machine-readable payload.
+        let semantic_backend_unavailable = embedding_config_for_required_use(EmbeddingCliArgs {
+            device: None,
+            no_gpu: false,
+        })
+        .err()
+        .filter(embedding_asset_missing_error)
+        .map(|error| error.to_string());
+        if targets.is_empty() {
             let miss = symbol_miss_json(&store, &project, query_symbol);
             println!(
                 "{}",
@@ -1438,10 +1433,7 @@ pub(crate) fn dispatch_brief(
             );
             return Ok(1);
         }
-        return content_fallback(&store, root, symbol.unwrap_or(""), "brief", &path_filters);
-    }
-    let root_path = resolve_root(root)?;
-    if json {
+        let root_path = resolve_root(root)?;
         return dispatch_brief_json(
             &store,
             &project,
@@ -1455,146 +1447,948 @@ pub(crate) fn dispatch_brief(
             },
         );
     }
-    let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
-
-    // Definition(s) + source span.
-    let mut seen_def = std::collections::BTreeSet::new();
-    for id in &targets {
-        if let Some(n) = store.get_node(*id)? {
-            if path_filters.matches(&n.file_path) && seen_def.insert(n.id) {
-                evidence_nodes.push((
-                    format!("definition {}", display_node_name(&n)),
-                    n.clone(),
-                    serde_json::json!({"section": "definition"}),
-                ));
-                let span = read_span_with_meta(
-                    &root_path,
-                    &n.file_path,
-                    n.start_line,
-                    n.end_line,
-                    CONTEXT_SPAN_CAP,
-                    false,
-                );
-                let header_end_line = span
-                    .as_ref()
-                    .map(|span| span.end_line)
-                    .unwrap_or(n.end_line);
-                println!(
-                    "== {} ({}:{}-{}) ==",
-                    display_node_name(&n),
-                    n.file_path,
-                    n.start_line,
-                    header_end_line
-                );
-                if let Some(span) = span {
-                    if let Some(summary) =
-                        summarize_definition_span(&root_path, &n.file_path, &span.text)
-                    {
-                        for bullet in summary {
-                            println!("  - {bullet}");
-                        }
-                        if !span.text.is_empty() {
-                            println!();
-                        }
-                    }
-                    print_code_span_text(&span.text);
-                }
-            }
-        }
-    }
-
-    let mut callers = incoming_call_nodes_for_targets(&store, &targets)?;
-    callers.retain(|node| path_filters.matches(&node.file_path));
-    let cshown = callers.len().min(cli_result_limit(BRIEF_LIMIT));
-    println!("\n-- CALLERS ({}) --", callers.len());
-    for n in &callers[..cshown] {
-        evidence_nodes.push((
-            format!("caller {}", display_node_name(n)),
-            n.clone(),
-            serde_json::json!({"section": "callers"}),
-        ));
-        println!("  {} {}", display_node_name(n), node_line_span(n));
-    }
-    print_nav_more_footer(callers.len(), cshown);
-
-    if targets_include_non_callable(&store, &targets)? {
-        let mut refs = greppy_search::find_references_to_any(
+    // Text mode: the body of the function, sketched. The failures are
+    // exactly who-calls' failures, through the same helpers.
+    let root_path = resolve_root(root)?;
+    if let Some(symbol) = symbol {
+        if let Some(code) = nav_refuse_non_callable(
             &store,
+            &root_path,
+            symbol,
             &targets,
-            greppy_search::MAX_REACH_RESULTS,
-        )?;
-        refs.retain(|reference| path_filters.matches(&reference.node.file_path));
-        let total = refs.len();
-        refs.truncate(cli_result_limit(BRIEF_LIMIT));
-        println!("\n-- REFERENCES ({}) --", total);
-        for r in &refs {
-            if let Some(node) = store.get_node(r.node.id)? {
-                evidence_nodes.push((
-                    format!("reference {} {}", r.edge_type, display_node_name(&node)),
-                    node,
-                    serde_json::json!({"section": "references", "edge_type": r.edge_type}),
-                ));
-            }
-            println!(
-                "  {} {} {}",
-                r.edge_type,
-                display_row_name(&r.node),
-                line_span(&r.node.file_path, r.node.start_line, r.node.end_line)
-            );
+            NavDirection::Outgoing,
+        )? {
+            return Ok(code);
         }
-        print_nav_more_footer(total, refs.len());
-    }
-
-    // Direct callees (outgoing CALLS).
-    let mut callees: std::collections::BTreeMap<i64, greppy_store::Node> =
-        std::collections::BTreeMap::new();
-    let callee_sources = callee_source_ids_for_symbols(&store, &project, &targets)?;
-    for id in &callee_sources {
-        for step in greppy_search::callees_of(&store, *id)? {
-            if let Some(n) = step.node {
-                callees.entry(step.node_id).or_insert(n);
-            }
+        if let Some(code) = nav_refuse_ambiguous(&store, symbol, &targets)? {
+            return Ok(code);
         }
     }
-    callees.retain(|_, node| path_filters.matches(&node.file_path));
-    let eshown = callees.len().min(cli_result_limit(BRIEF_LIMIT));
-    println!("\n-- CALLS ({}) --", callees.len());
-    for n in callees.values().take(eshown) {
-        evidence_nodes.push((
-            format!("callee {}", display_node_name(n)),
-            n.clone(),
-            serde_json::json!({"section": "calls"}),
-        ));
-        println!("  {} {}", display_node_name(n), node_line_span(n));
+    if targets.is_empty() {
+        nav_report_missing(&store, &project, query_symbol);
+        return Ok(1);
     }
-    print_nav_more_footer(callees.len(), eshown);
-    if evidence_nodes.is_empty() && !path_filters.is_empty() {
+    let mut brief = BriefRender::new(&store, &root_path);
+    let mut seen_def = std::collections::BTreeSet::new();
+    let mut seen_span = std::collections::BTreeSet::new();
+    let mut printed = 0usize;
+    for id in &targets {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if !path_filters.matches(&node.file_path) || !seen_def.insert(node.id) {
+            continue;
+        }
+        if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+            continue;
+        }
+        // A name shared by a function and its field/variable briefs the
+        // function; the field has no body and no interface to show.
+        if !NavDirection::Outgoing.answerable(&node.label) {
+            continue;
+        }
+        // Some extractors persist the same definition twice under one name
+        // (a Scala `def` lands as a Function and a Method on one span); the
+        // brief of a span is printed once.
+        if !seen_span.insert((node.file_path.clone(), node.start_line)) {
+            continue;
+        }
+        if printed > 0 {
+            println!();
+        }
+        printed += 1;
+        brief.print_brief(&node);
+        if !brief_is_function(&node) {
+            continue;
+        }
+        let mut tail = Vec::new();
+        if let Some(line) = brief.callers_line(&node)? {
+            tail.push(line);
+        }
+        if let Some(line) =
+            brief.expand_offer(root, &project, query_symbol, &node, &path_filters)?
+        {
+            tail.push(line);
+        }
+        if !tail.is_empty() {
+            println!();
+            for line in tail {
+                println!("{line}");
+            }
+        }
+    }
+    if printed == 0 && !path_filters.is_empty() {
         println!(
-            "\n(no brief results under path filter: {})",
+            "(no brief results under path filter: {})",
             path_filters.shown()
         );
     }
-    let evidence_rows = evidence_nodes
-        .iter()
-        .map(|(title, node, extra_json)| ExpandEvidenceNode {
-            title: title.clone(),
-            node,
-            site_lines: Vec::new(),
-            extra_json: extra_json.clone(),
-        })
-        .collect::<Vec<_>>();
-    if let Some(expand) = insert_nav_expand_pack(
-        &store,
-        root,
-        &project,
-        "brief",
-        query_symbol,
-        evidence_rows.len(),
-        &evidence_rows,
-    ) {
-        println!("{}", expand.text_line());
-    }
     Ok(0)
+}
+
+/// Whether the node has a body to sketch. Structs, enums, traits and modules
+/// have no body: their fields, variants and method signatures ARE the
+/// interface, so brief prints the whole definition instead.
+fn brief_is_function(node: &greppy_store::Node) -> bool {
+    matches!(node.label.as_str(), "Function" | "Method")
+}
+
+/// A call site the parser can see: the function part exactly as written
+/// (`Snapshot::read`, `parse_path`) and the line it starts on.
+struct BriefCallSite {
+    line: u32,
+    text: String,
+}
+
+/// One arm of a `match`: the pattern reduced to its label and the line range
+/// the arm spans, so calls inside it fold into the arm's sketch line.
+struct BriefMatchArm {
+    line: u32,
+    label: String,
+    end_line: u32,
+}
+
+/// A `match` the parser can see, with the scrutinee exactly as written.
+struct BriefMatch {
+    line: u32,
+    scrutinee: String,
+    arms: Vec<BriefMatchArm>,
+}
+
+/// Everything a sketch needs from parsing a Rust file once: the call sites
+/// whose function is an identifier or a scoped path, and the `match`
+/// statements with their arms. Method calls (`x.foo()`) and calls inside
+/// macros are plumbing, not steps of the body, so they are not collected.
+struct BriefRustOutline {
+    calls: Vec<BriefCallSite>,
+    matches: Vec<BriefMatch>,
+}
+
+/// Parse the file once and collect the call sites and matches. Returns None
+/// when tree-sitter cannot parse the file; the sketch then falls back to the
+/// graph's call edges alone.
+fn brief_rust_outline(source: &str) -> Option<BriefRustOutline> {
+    let tree = greppy_parser::parse(greppy_parser::Language::Rust, source.as_bytes()).ok()?;
+    let bytes = source.as_bytes();
+    let mut calls = Vec::new();
+    let mut matches = Vec::new();
+    let mut stack = vec![(tree.root_node(), false)];
+    while let Some((node, in_macro)) = stack.pop() {
+        let kind = node.kind();
+        let child_in_macro = in_macro || kind == "macro_invocation";
+        if kind == "call_expression" && !in_macro {
+            let mut function = node.child_by_field_name("function");
+            if let Some(f) = function {
+                if f.kind() == "generic_function" {
+                    function = f.child_by_field_name("function");
+                }
+            }
+            if let Some(f) = function {
+                if matches!(f.kind(), "identifier" | "scoped_identifier") {
+                    if let Ok(text) = f.utf8_text(bytes) {
+                        calls.push(BriefCallSite {
+                            line: f.start_position().row as u32 + 1,
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+        } else if kind == "match_expression" && !in_macro {
+            let scrutinee = node
+                .child_by_field_name("value")
+                .and_then(|value| value.utf8_text(bytes).ok())
+                .map(brief_collapse_ws)
+                .unwrap_or_default();
+            let mut arms = Vec::new();
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for arm in body.children(&mut cursor) {
+                    if arm.kind() != "match_arm" {
+                        continue;
+                    }
+                    let Some(pattern) = arm.child_by_field_name("pattern") else {
+                        continue;
+                    };
+                    let Ok(text) = pattern.utf8_text(bytes) else {
+                        continue;
+                    };
+                    arms.push(BriefMatchArm {
+                        line: pattern.start_position().row as u32 + 1,
+                        label: brief_arm_label(text),
+                        end_line: arm.end_position().row as u32 + 1,
+                    });
+                }
+            }
+            matches.push(BriefMatch {
+                line: node.start_position().row as u32 + 1,
+                scrutinee,
+                arms,
+            });
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push((child, child_in_macro));
+        }
+    }
+    calls.sort_by_key(|call| call.line);
+    matches.sort_by_key(|m| m.line);
+    Some(BriefRustOutline { calls, matches })
+}
+
+/// Whitespace-collapsed source text: a scrutinee or pattern broken across
+/// lines still reads as one sketch line.
+fn brief_collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The arm pattern reduced to its label: a string literal loses its quotes,
+/// `_` reads as `else`, an or-pattern takes its first alternative, a tuple or
+/// struct variant loses its fields, and a path keeps its last segment. A
+/// pattern led by anything else (a slice, a literal, a reference) stands as
+/// written. The label is orientation, not source — the source is one `read`
+/// away.
+fn brief_arm_label(pattern: &str) -> String {
+    let collapsed = brief_collapse_ws(pattern);
+    let first = collapsed.split('|').next().unwrap_or(&collapsed).trim();
+    if first == "_" {
+        return "else".to_string();
+    }
+    if let Some(rest) = first.strip_prefix('"') {
+        let end = rest.find('"').unwrap_or(rest.len());
+        return rest[..end].to_string();
+    }
+    if !first.chars().next().is_some_and(char::is_alphabetic) {
+        return first.to_string();
+    }
+    let head = first.split(['(', '{']).next().unwrap_or(first).trim();
+    head.rsplit("::").next().unwrap_or(head).trim().to_string()
+}
+
+/// One printed sketch line: a call, a `match`, or a match arm. `depth` is the
+/// branch nesting — arms sit one level under their match — rendered as two
+/// spaces per level.
+struct BriefSketchLine {
+    line: u32,
+    depth: usize,
+    text: String,
+}
+
+/// An outgoing CALLS edge of the briefed function, reduced to what the sketch
+/// needs to resolve a parser call site to the real callee.
+struct BriefEdge {
+    line: u32,
+    name: String,
+    target_id: i64,
+}
+
+/// How the body's first line is recognised, by file extension. Brace
+/// languages open the body with `{` at paren depth zero; Python opens it with
+/// the trailing colon; for declaration-line languages (Ruby, Elixir, Haskell,
+/// OCaml, Lua) the head is the declaration line itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BriefBodyOpen {
+    Brace,
+    Colon,
+    Declaration,
+}
+
+fn brief_body_open_kind(file_path: &str) -> BriefBodyOpen {
+    match file_path.rsplit('.').next().unwrap_or("") {
+        "py" | "pyi" => BriefBodyOpen::Colon,
+        "rb" | "ex" | "exs" | "hs" | "lhs" | "ml" | "mli" | "lua" | "jl" | "r" | "R" => {
+            BriefBodyOpen::Declaration
+        }
+        _ => BriefBodyOpen::Brace,
+    }
+}
+
+/// The block's address: `file:line` when the head is one line,
+/// `file:start-end` otherwise — and exactly those file lines follow.
+fn brief_address(file_path: &str, start: u32, end: u32) -> String {
+    if end > start {
+        format!("{file_path}:{start}-{end}")
+    } else {
+        format!("{file_path}:{start}")
+    }
+}
+
+/// Renders one brief: the sentence, the verbatim head, the sketch, the
+/// closing brace — and, for the pack, the same block for every function the
+/// briefed one reaches. File lines, parsed outlines, callee hints and
+/// owner-qualified resolutions are cached across the main brief and every
+/// function of the expand pack.
+struct BriefRender<'a> {
+    store: &'a greppy_store::Store,
+    root: &'a std::path::Path,
+    file_lines: std::collections::HashMap<String, Option<Vec<String>>>,
+    outlines: std::collections::HashMap<String, Option<BriefRustOutline>>,
+    hints: std::collections::HashMap<i64, Option<String>>,
+    resolutions: std::collections::HashMap<String, Vec<i64>>,
+    /// Hints and generated sentences cost a daemon call each; the expand pack
+    /// renders names only, so preparing it stays one bounded graph walk.
+    with_hints: bool,
+}
+
+impl<'a> BriefRender<'a> {
+    fn new(store: &'a greppy_store::Store, root: &'a std::path::Path) -> Self {
+        BriefRender {
+            store,
+            root,
+            file_lines: Default::default(),
+            outlines: Default::default(),
+            hints: Default::default(),
+            resolutions: Default::default(),
+            with_hints: true,
+        }
+    }
+
+    fn lines(&mut self, file_path: &str) -> Option<&Vec<String>> {
+        self.file_lines
+            .entry(file_path.to_string())
+            .or_insert_with(|| nav_file_lines(self.root, file_path))
+            .as_ref()
+    }
+
+    fn outline(&mut self, file_path: &str) -> Option<&BriefRustOutline> {
+        if !file_path.ends_with(".rs") {
+            return None;
+        }
+        self.outlines
+            .entry(file_path.to_string())
+            .or_insert_with(|| {
+                let source = std::fs::read_to_string(self.root.join(file_path)).ok()?;
+                brief_rust_outline(&source)
+            })
+            .as_ref()
+    }
+
+    /// The callee's navigation hint, lowercased into the sketch line — the
+    /// same sentence the impact tree puts beside its nodes. Only functions
+    /// carry one: the purpose model reads a body, and a variant or field has
+    /// none, so its "hint" would describe the wrong span.
+    fn hint(&mut self, target_id: i64) -> Option<String> {
+        if !self.with_hints {
+            return None;
+        }
+        if let Some(hint) = self.hints.get(&target_id) {
+            return hint.clone();
+        }
+        let hint = self
+            .store
+            .get_node(target_id)
+            .ok()
+            .flatten()
+            .filter(|node| brief_is_function(node))
+            .and_then(|node| impact_node_sentence(self.root, &node));
+        self.hints.insert(target_id, hint.clone());
+        hint
+    }
+
+    /// `Snapshot::read`-style scoped calls the indexer did not resolve to an
+    /// edge still name a real symbol: resolve `Owner::member` through the
+    /// same resolver an agent's query would use.
+    fn resolve_scoped(&mut self, text: &str) -> Vec<i64> {
+        if let Some(ids) = self.resolutions.get(text) {
+            return ids.clone();
+        }
+        let ids = resolve_symbol_nodes(self.store, Some(text)).unwrap_or_default();
+        self.resolutions.insert(text.to_string(), ids.clone());
+        ids
+    }
+
+    /// The sentence: the definition's own doc comment when there is one, the
+    /// generated navigation hint otherwise. An authored sentence beats a
+    /// generated one, and no sentence at all beats an invented one.
+    fn sentence(&mut self, node: &greppy_store::Node, head_start: u32) -> Option<String> {
+        if let Some(lines) = self.lines(&node.file_path) {
+            let mut doc = Vec::new();
+            let mut i = head_start as usize;
+            while i >= 2 {
+                let trimmed = lines[i - 2].trim();
+                let text = if let Some(rest) = trimmed.strip_prefix("///") {
+                    rest.trim()
+                } else if trimmed.starts_with('#')
+                    && !trimmed.starts_with("#[")
+                    && !trimmed.starts_with("#!")
+                {
+                    trimmed.trim_start_matches('#').trim()
+                } else {
+                    break;
+                };
+                doc.push(text.to_string());
+                i -= 1;
+            }
+            doc.reverse();
+            let sentence = doc.join(" ");
+            if !sentence.is_empty() {
+                return Some(sentence);
+            }
+        }
+        if !self.with_hints {
+            return None;
+        }
+        let span = read_span_with_meta(
+            self.root,
+            &node.file_path,
+            node.start_line,
+            node.end_line,
+            CONTEXT_SPAN_CAP,
+            false,
+        )?;
+        summarize_definition_span(self.root, &node.file_path, &span.text)?
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .find(|s| !s.is_empty())
+    }
+
+    /// The first line of the head: the node's own line, extended upward over
+    /// the attributes (`#[test]`, `#[derive]`, decorators) — they change
+    /// behaviour and belong to the interface. Bracket counting upward keeps a
+    /// multi-line attribute whole.
+    fn head_start(&mut self, node: &greppy_store::Node) -> u32 {
+        let start = node.start_line.max(1) as u32;
+        let Some(lines) = self.lines(&node.file_path) else {
+            return start;
+        };
+        let mut head = start;
+        let mut balance = 0i32;
+        let mut i = start as usize;
+        while i >= 2 {
+            let trimmed = lines[i - 2].trim();
+            let opens = trimmed.matches(['(', '[']).count() as i32;
+            let closes = trimmed.matches([')', ']']).count() as i32;
+            balance += opens - closes;
+            if balance < 0 {
+                head = (i - 1) as u32;
+                i -= 1;
+                continue;
+            }
+            let attribute = trimmed.starts_with("#[")
+                || (trimmed.starts_with('@')
+                    && trimmed[1..].chars().next().is_some_and(char::is_alphabetic));
+            if attribute {
+                head = (i - 1) as u32;
+                i -= 1;
+                continue;
+            }
+            break;
+        }
+        head
+    }
+
+    /// The line the body opens on, and whether a closing brace closes it.
+    fn body_open(&self, node: &greppy_store::Node) -> Option<(u32, bool)> {
+        let start = node.start_line.max(1) as u32;
+        let end = node.end_line.max(node.start_line) as u32;
+        let kind = brief_body_open_kind(&node.file_path);
+        if kind == BriefBodyOpen::Declaration {
+            return (start < end).then_some((start, false));
+        }
+        let lines = nav_file_lines(self.root, &node.file_path)?;
+        let mut depth = 0i32;
+        for line_no in start..=end.min(lines.len() as u32) {
+            let text = &lines[(line_no - 1) as usize];
+            let chars: Vec<char> = text.chars().collect();
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut index = 0usize;
+            let mut code_len = chars.len();
+            while index < chars.len() {
+                let c = chars[index];
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        in_string = false;
+                    }
+                } else {
+                    match c {
+                        '"' => in_string = true,
+                        '/' if chars.get(index + 1) == Some(&'/') => {
+                            code_len = index;
+                            break;
+                        }
+                        '(' | '[' => depth += 1,
+                        ')' | ']' => depth -= 1,
+                        '{' if depth == 0 && kind == BriefBodyOpen::Brace => {
+                            return Some((line_no, true));
+                        }
+                        ';' if depth == 0 => return None,
+                        _ => {}
+                    }
+                }
+                index += 1;
+            }
+            if kind == BriefBodyOpen::Colon && depth == 0 {
+                let code: String = chars[..code_len].iter().collect();
+                if code.trim_end().ends_with(':') {
+                    return Some((line_no, false));
+                }
+            }
+        }
+        None
+    }
+
+    /// The outgoing CALLS edges of the function, as the sketch's resolution
+    /// table. The edge's line locates one occurrence; the name resolves every
+    /// occurrence of the same callee.
+    fn edges_of(&self, node: &greppy_store::Node) -> Vec<BriefEdge> {
+        let mut edges = Vec::new();
+        for edge in self
+            .store
+            .outgoing_edges(node.id, Some("CALLS"), 1024)
+            .unwrap_or_default()
+        {
+            let Ok(Some(target)) = self.store.get_node(edge.target_id) else {
+                continue;
+            };
+            if is_synthetic_file_anchor(&target.label, &target.name, &target.qualified_name) {
+                continue;
+            }
+            let line = edge
+                .properties
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .map(|line| line as u32)
+                .unwrap_or(0);
+            edges.push(BriefEdge {
+                line,
+                name: target.name.clone(),
+                target_id: target.id,
+            });
+        }
+        edges
+    }
+
+    /// Resolve one parser call site to the callee it names. Edge targets win
+    /// (the graph resolved them); a scoped call the indexer could not resolve
+    /// goes through owner-qualified name resolution. Anything else names a
+    /// symbol outside this repository — there is nothing to follow, so the
+    /// call gets no sketch line.
+    fn resolve_call(&mut self, site: &BriefCallSite, edges: &[BriefEdge]) -> Option<(i64, String)> {
+        let leaf = site.text.rsplit("::").next().unwrap_or(&site.text);
+        let mut best: Option<(u32, i64)> = None;
+        for edge in edges.iter().filter(|edge| edge.name == leaf) {
+            let distance = edge.line.abs_diff(site.line);
+            if best.is_none_or(|(bd, bid)| (distance, edge.target_id) < (bd, bid)) {
+                best = Some((distance, edge.target_id));
+            }
+        }
+        if let Some((_, id)) = best {
+            let name = self
+                .store
+                .get_node(id)
+                .ok()
+                .flatten()
+                .map(|node| nav_short_name(&node))
+                .unwrap_or_else(|| leaf.to_string());
+            return Some((id, name));
+        }
+        if site.text.contains("::") {
+            if let Some(id) = self.resolve_scoped(&site.text).first().copied() {
+                let name = self
+                    .store
+                    .get_node(id)
+                    .ok()
+                    .flatten()
+                    .map(|node| nav_short_name(&node))
+                    .unwrap_or_else(|| site.text.clone());
+                return Some((id, name));
+            }
+        }
+        None
+    }
+
+    /// The sketch: one line per call site or branch the parser can see, in
+    /// source order. Calls inside a match arm fold into the arm's line as a
+    /// name list; everything else is left out — a line is emitted only where
+    /// there is something real to name.
+    fn sketch(&mut self, node: &greppy_store::Node, head_end: u32) -> Vec<BriefSketchLine> {
+        let end_line = node.end_line.max(node.start_line) as u32;
+        let edges = self.edges_of(node);
+        let mut items: Vec<(u32, u8, BriefSketchLine)> = Vec::new();
+        let outline = self.outline(&node.file_path).map(|o| o.clone_refs());
+        if let Some(outline) = outline {
+            let in_body = |line: u32| line > head_end && line <= end_line;
+            // Arm ranges, for folding calls and nesting matches.
+            let mut arm_ranges: Vec<(u32, u32, usize, usize)> = Vec::new(); // (start, end, match idx, arm idx)
+            for (mi, m) in outline.matches.iter().enumerate() {
+                if !in_body(m.line) {
+                    continue;
+                }
+                for (ai, arm) in m.arms.iter().enumerate() {
+                    arm_ranges.push((arm.line, arm.end_line, mi, ai));
+                }
+            }
+            let containing_arm = |line: u32| -> Option<(usize, usize)> {
+                arm_ranges
+                    .iter()
+                    .filter(|(start, end, _, _)| *start <= line && line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start)
+                    .map(|(_, _, mi, ai)| (*mi, *ai))
+            };
+            // Match depth: a match inside an arm of another match nests.
+            let mut depths: std::collections::HashMap<usize, usize> = Default::default();
+            for (mi, m) in outline.matches.iter().enumerate() {
+                if !in_body(m.line) {
+                    continue;
+                }
+                let depth = containing_arm(m.line)
+                    .filter(|(pmi, _)| *pmi != mi)
+                    .map(|(pmi, _)| depths.get(&pmi).copied().unwrap_or(0) + 1)
+                    .unwrap_or(0);
+                depths.insert(mi, depth);
+                items.push((
+                    m.line,
+                    0,
+                    BriefSketchLine {
+                        line: m.line,
+                        depth,
+                        text: format!("match {}", m.scrutinee),
+                    },
+                ));
+            }
+            // Fold each call into the innermost arm containing it, or emit it
+            // as a body-level step.
+            let mut folds: std::collections::BTreeMap<(usize, usize), Vec<String>> =
+                Default::default();
+            for site in outline.calls.iter().filter(|site| in_body(site.line)) {
+                let Some((target_id, name)) = self.resolve_call(site, &edges) else {
+                    continue;
+                };
+                if let Some((mi, ai)) = containing_arm(site.line) {
+                    let names = folds.entry((mi, ai)).or_default();
+                    if !names.iter().any(|n| n == &name) {
+                        names.push(name);
+                    }
+                    continue;
+                }
+                let text = match self.hint(target_id) {
+                    Some(hint) => format!("{name} — {hint}"),
+                    None => name,
+                };
+                let depth = 0;
+                items.push((
+                    site.line,
+                    1,
+                    BriefSketchLine {
+                        line: site.line,
+                        depth,
+                        text,
+                    },
+                ));
+            }
+            for (mi, m) in outline.matches.iter().enumerate() {
+                if !in_body(m.line) {
+                    continue;
+                }
+                let depth = depths.get(&mi).copied().unwrap_or(0) + 1;
+                for (ai, arm) in m.arms.iter().enumerate() {
+                    if !in_body(arm.line) {
+                        continue;
+                    }
+                    let text = match folds.get(&(mi, ai)) {
+                        Some(names) if !names.is_empty() => {
+                            format!("{} — {}", arm.label, names.join(", "))
+                        }
+                        _ => arm.label.clone(),
+                    };
+                    items.push((
+                        arm.line,
+                        2,
+                        BriefSketchLine {
+                            line: arm.line,
+                            depth,
+                            text,
+                        },
+                    ));
+                }
+            }
+        } else {
+            // No parse for this language: the graph's call edges still give
+            // every call site with the real callee.
+            for edge in &edges {
+                if edge.line <= head_end || edge.line > end_line {
+                    continue;
+                }
+                let name = self
+                    .store
+                    .get_node(edge.target_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| nav_short_name(&node))
+                    .unwrap_or_else(|| edge.name.clone());
+                let text = match self.hint(edge.target_id) {
+                    Some(hint) => format!("{name} — {hint}"),
+                    None => name,
+                };
+                items.push((
+                    edge.line,
+                    1,
+                    BriefSketchLine {
+                        line: edge.line,
+                        depth: 0,
+                        text,
+                    },
+                ));
+            }
+        }
+        items.sort_by_key(|(line, order, _)| (*line, *order));
+        items.into_iter().map(|(_, _, item)| item).collect()
+    }
+
+    /// The block every brief and every pack entry shares: the sentence, the
+    /// address naming the head's range, the head byte for byte, the sketch,
+    /// and the closing brace closing it.
+    fn render_block(&mut self, node: &greppy_store::Node) -> String {
+        let mut out = String::new();
+        let head_start = self.head_start(node);
+        if let Some(sentence) = self.sentence(node, head_start) {
+            out.push_str(&sentence);
+            out.push_str("\n\n");
+        }
+        if !brief_is_function(node) {
+            // A struct, enum or trait has no body to sketch: its fields and
+            // variants are the interface, so the head is the whole definition.
+            let end = node.end_line.max(node.start_line) as u32;
+            out.push_str(&brief_address(&node.file_path, head_start, end));
+            out.push('\n');
+            if let Some(lines) = self.lines(&node.file_path) {
+                for line in lines
+                    .iter()
+                    .take(end as usize)
+                    .skip((head_start - 1) as usize)
+                {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            return out;
+        }
+        let end_line = node.end_line.max(node.start_line) as u32;
+        let (head_end, brace) = self.body_open(node).unwrap_or((end_line, false));
+        out.push_str(&brief_address(&node.file_path, head_start, head_end));
+        out.push('\n');
+        if let Some(lines) = self.lines(&node.file_path) {
+            for line in lines
+                .iter()
+                .take(head_end as usize)
+                .skip((head_start - 1) as usize)
+            {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        let sketch = self.sketch(node, head_end);
+        if !sketch.is_empty() {
+            let width = sketch
+                .iter()
+                .map(|item| item.line)
+                .max()
+                .unwrap_or(0)
+                .to_string()
+                .len()
+                + 2;
+            for item in &sketch {
+                out.push_str(&format!(
+                    "{:>width$}  {}{}\n",
+                    item.line,
+                    "  ".repeat(item.depth),
+                    item.text,
+                    width = width
+                ));
+            }
+        }
+        if brace && head_end < end_line {
+            if let Some(lines) = self.lines(&node.file_path) {
+                if let Some(line) = lines.get((end_line - 1) as usize) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Print one brief block, trailing blank lines trimmed.
+    fn print_brief(&mut self, node: &greppy_store::Node) {
+        let block = self.render_block(node);
+        print!("{}", block);
+    }
+
+    /// `called by dispatch_edit_inner and 6 tests` — aggregated, never
+    /// listed; the full list is `who-calls`.
+    fn callers_line(&mut self, node: &greppy_store::Node) -> Result<Option<String>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut callers = Vec::new();
+        for edge in self.store.incoming_edges(node.id, Some("CALLS"), 1024)? {
+            if !seen.insert(edge.source_id) {
+                continue;
+            }
+            let Some(caller) = self.store.get_node(edge.source_id)? else {
+                continue;
+            };
+            if is_synthetic_file_anchor(&caller.label, &caller.name, &caller.qualified_name) {
+                continue;
+            }
+            callers.push(caller);
+        }
+        if callers.is_empty() {
+            return Ok(None);
+        }
+        callers.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+        });
+        let mut names = Vec::new();
+        let mut tests = 0usize;
+        for caller in &callers {
+            let is_test = nav_is_test(self.lines(&caller.file_path), caller);
+            if is_test {
+                tests += 1;
+            } else {
+                names.push(nav_short_name(caller));
+            }
+        }
+        let mut text = String::from("called by ");
+        let named = match names.len() {
+            0 => String::new(),
+            1 => names[0].clone(),
+            2 => format!("{} and {}", names[0], names[1]),
+            3 => format!("{}, {} and {}", names[0], names[1], names[2]),
+            n => format!("{}, {} and {} others", names[0], names[1], n - 2),
+        };
+        let test_part = match tests {
+            0 => String::new(),
+            1 => "1 test".to_string(),
+            n => format!("{n} tests"),
+        };
+        match (names.is_empty(), test_part.is_empty()) {
+            (true, false) => text.push_str(&test_part),
+            (false, true) => text.push_str(&named),
+            (false, false) => {
+                text.push_str(&named);
+                text.push_str(" and ");
+                text.push_str(&test_part);
+            }
+            (true, true) => return Ok(None),
+        }
+        Ok(Some(text))
+    }
+
+    /// The expand offer: the same sketch for every function this one calls,
+    /// recursively, each once. Worth its line only when the follow-up would be
+    /// more than a single `brief` call.
+    fn expand_offer(
+        &mut self,
+        root: Option<&str>,
+        project: &str,
+        query: &str,
+        node: &greppy_store::Node,
+        path_filters: &QueryPathFilters,
+    ) -> Result<Option<String>> {
+        const PACK_LIMIT: usize = 100;
+        let mut seen = std::collections::HashSet::from([node.id]);
+        let mut frontier = std::collections::VecDeque::from([node.id]);
+        let mut order = Vec::new();
+        while let Some(id) = frontier.pop_front() {
+            if order.len() >= PACK_LIMIT {
+                break;
+            }
+            let mut next = Vec::new();
+            for edge in self.store.outgoing_edges(id, Some("CALLS"), 1024)? {
+                if !seen.insert(edge.target_id) {
+                    continue;
+                }
+                next.push(edge.target_id);
+            }
+            next.sort_unstable();
+            for target_id in next {
+                let Some(target) = self.store.get_node(target_id)? else {
+                    continue;
+                };
+                if is_synthetic_file_anchor(&target.label, &target.name, &target.qualified_name)
+                    || !brief_is_function(&target)
+                    || !path_filters.matches(&target.file_path)
+                {
+                    continue;
+                }
+                order.push(target);
+                frontier.push_back(target_id);
+                if order.len() >= PACK_LIMIT {
+                    break;
+                }
+            }
+        }
+        if order.len() < 2 {
+            return Ok(None);
+        }
+        let with_hints = std::mem::replace(&mut self.with_hints, false);
+        let mut payload = String::new();
+        for (index, target) in order.iter().enumerate() {
+            if index > 0 {
+                payload.push('\n');
+            }
+            payload.push_str(&self.render_block(target));
+        }
+        self.with_hints = with_hints;
+        let functions = order.len();
+        let lines = payload.lines().count();
+        let offer = format!(
+            "the call tree below {} sketched, {} functions, {} lines",
+            nav_short_name(node),
+            functions,
+            lines
+        );
+        let handle = insert_expand_pack_best_effort(
+            self.store,
+            project,
+            "brief",
+            query,
+            current_graph_generation_or_zero(self.store, root),
+            serde_json::json!({"text": offer}),
+            payload,
+            None,
+        );
+        Ok(handle.map(|handle| format!("expand {} — {offer}", handle.id)))
+    }
+}
+
+impl BriefRustOutline {
+    /// The outline is rebuilt per briefed function from the per-file cache;
+    /// cloning the vectors keeps the cache borrow short.
+    fn clone_refs(&self) -> BriefRustOutline {
+        BriefRustOutline {
+            calls: self
+                .calls
+                .iter()
+                .map(|c| BriefCallSite {
+                    line: c.line,
+                    text: c.text.clone(),
+                })
+                .collect(),
+            matches: self
+                .matches
+                .iter()
+                .map(|m| BriefMatch {
+                    line: m.line,
+                    scrutinee: m.scrutinee.clone(),
+                    arms: m
+                        .arms
+                        .iter()
+                        .map(|a| BriefMatchArm {
+                            line: a.line,
+                            label: a.label.clone(),
+                            end_line: a.end_line,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 pub(crate) fn dispatch_brief_json(

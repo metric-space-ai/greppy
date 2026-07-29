@@ -267,16 +267,12 @@ fn graph_grid_dart_brief_shows_definition_with_callers() {
     let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
     assert_eq!(code, 0, "brief should exit 0; stderr={err}");
     assert!(
-        out.contains("do_it") && out.contains("int do_it"),
-        "brief must show the definition with source body; got: {out}"
+        out.contains("int do_it") && out.contains("lib/helper.dart:"),
+        "brief must show the verbatim head with its address; got: {out}"
     );
     assert!(
-        out.contains("(lib/helper.dart:"),
-        "brief header must report the expanded source span (lib/helper.dart); got: {out}"
-    );
-    assert!(
-        out.contains("-- CALLERS") && out.contains("caller"),
-        "brief must list callers including `caller`; got: {out}"
+        out.contains("called by caller") && !out.contains("-- CALLERS"),
+        "brief must aggregate callers into one line, no bars; got: {out}"
     );
 }
 

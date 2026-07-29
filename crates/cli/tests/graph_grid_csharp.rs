@@ -312,8 +312,8 @@ fn graph_grid_csharp_brief_shows_definition_with_callers() {
         "brief helper must include its C# definition source; got: {out:?}"
     );
     assert!(
-        out.contains("-- CALLERS") && out.contains("caller") && out.contains("src/Main.cs:"),
-        "brief helper must include its cross-file caller; got: {out:?}"
+        out.contains("called by MainFlow::caller") && !out.contains("-- CALLERS"),
+        "brief helper must aggregate its cross-file caller into one line; got: {out:?}"
     );
 }
 

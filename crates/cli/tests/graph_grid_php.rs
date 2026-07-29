@@ -283,16 +283,12 @@ fn graph_grid_php_brief_shows_definition_with_callers() {
     let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
     assert_eq!(code, 0, "brief should exit 0; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("do_it") && out.contains("function do_it"),
-        "brief must show the definition with source body; got: {out}"
+        out.contains("function do_it") && out.contains("src/Helpers.php:"),
+        "brief must show the verbatim head with its address; got: {out}"
     );
     assert!(
-        out.contains("(src/Helpers.php:"),
-        "brief header must report the expanded source span (src/Helpers.php); got: {out}"
-    );
-    assert!(
-        out.contains("-- CALLERS") && out.contains("caller"),
-        "brief must list callers including `caller`; got: {out}"
+        out.contains("called by caller") && !out.contains("-- CALLERS"),
+        "brief must aggregate callers into one line, no bars; got: {out}"
     );
 }
 

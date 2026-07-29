@@ -251,7 +251,7 @@ fn graph_grid_cpp_search_symbols_finds_all_definitions() {
 }
 
 // ---------------------------------------------------------------------------
-// 8 — brief: definition + callers + callees bundled in one call.
+// 8 — brief: the body sketched, callers aggregated into one line.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -260,16 +260,12 @@ fn graph_grid_cpp_brief_shows_definition_with_callers() {
     let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
     assert_eq!(code, 0, "brief should exit 0; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("do_it") && out.contains("inline int do_it"),
-        "brief must show the definition with source body; got: {out}"
+        out.contains("inline int do_it") && out.contains("src/helper.hpp:"),
+        "brief must show the verbatim head with its address; got: {out}"
     );
     assert!(
-        out.contains("(src/helper.hpp:"),
-        "brief header must report the expanded source span (src/helper.hpp); got: {out}"
-    );
-    assert!(
-        out.contains("-- CALLERS") && out.contains("caller"),
-        "brief must list callers including `caller`; got: {out}"
+        out.contains("called by caller") && !out.contains("-- CALLERS"),
+        "brief must aggregate callers into one line, no bars; got: {out}"
     );
 }
 

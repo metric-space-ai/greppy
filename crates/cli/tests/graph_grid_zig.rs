@@ -296,16 +296,12 @@ fn graph_grid_zig_brief_shows_definition_with_callers() {
     let (code, out, err) = run(&["brief", "doIt"], &repo, &store);
     assert_eq!(code, 0, "brief should exit 0; stderr={err}");
     assert!(
-        out.contains("doIt"),
-        "brief must show the definition body of doIt; got: {out}"
+        out.contains("doIt") && out.contains("src/helper.zig:"),
+        "brief must show the verbatim head of doIt with its address; got: {out}"
     );
     assert!(
-        out.contains("(src/helper.zig:"),
-        "brief header must report the expanded source span (src/helper.zig); got: {out}"
-    );
-    assert!(
-        out.contains("-- CALLERS") && out.contains("caller"),
-        "brief must list callers including `caller`; got: {out}"
+        out.contains("called by caller") && !out.contains("-- CALLERS"),
+        "brief must aggregate callers into one line, no bars; got: {out}"
     );
 }
 

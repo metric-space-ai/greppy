@@ -247,8 +247,8 @@ fn graph_grid_kotlin_brief_shows_definition_with_callers() {
         "brief must show helperFunction's Kotlin definition: {out}"
     );
     assert!(
-        out.contains("-- CALLERS") && out.contains("caller"),
-        "brief must show caller for helperFunction: {out}"
+        out.contains("called by caller") && !out.contains("-- CALLERS"),
+        "brief must aggregate the caller of helperFunction into one line: {out}"
     );
 }
 

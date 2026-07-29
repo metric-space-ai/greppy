@@ -270,8 +270,8 @@ fn graph_grid_ruby_brief_shows_definition_with_callers() {
         "brief do_it must show the definition; got: {out}"
     );
     assert!(
-        out.contains("CALLERS") && out.contains("caller"),
-        "brief must list callers incl. `caller`; got: {out}"
+        out.contains("called by caller") && !out.contains("CALLERS"),
+        "brief must aggregate callers into one line; got: {out}"
     );
 }
 

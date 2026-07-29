@@ -188,7 +188,7 @@ fn stage_5_matches_name_fragments() {
     let result = run(&repo, &store, &["brief", "Config"], &[]);
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
-    assert!(text.contains("ConfigLoaderFactory"), "{text}");
+    assert!(text.contains("no symbol `Config`"), "{text}");
     assert_factual_only(&text);
 }
 

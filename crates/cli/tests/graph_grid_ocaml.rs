@@ -146,7 +146,7 @@ fn graph_grid_ocaml_brief_shows_definition_with_callers() {
     let (c, o, e) = run(&["brief", "do_it"], &r, &s);
     assert_eq!(c, 0, "{e}");
     assert!(
-        o.contains("let do_it") && o.contains("-- CALLERS") && o.contains("caller"),
+        o.contains("let do_it") && o.contains("called by caller") && !o.contains("-- CALLERS"),
         "{o}"
     );
 }

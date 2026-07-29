@@ -168,7 +168,10 @@ fn graph_grid_elixir_brief_shows_definition_with_callers() {
         out.contains("def do_it") && out.contains("lib/helper.ex"),
         "{out}"
     );
-    assert!(out.contains("CALLERS") && out.contains("caller"), "{out}");
+    assert!(
+        out.contains("called by caller") && !out.contains("CALLERS"),
+        "{out}"
+    );
 }
 
 #[test]

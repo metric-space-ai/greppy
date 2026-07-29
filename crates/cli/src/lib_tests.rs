@@ -624,22 +624,16 @@
         .command
         {
             Some(Command::Brief {
-                symbols, path_opts, ..
+                symbol, path_opts, ..
             }) => {
-                assert_eq!(symbols, vec!["open".to_string()]);
+                assert_eq!(symbol, "open");
                 assert_eq!(path_opts, vec!["src/flask/testing.py".to_string()]);
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match Cli::try_parse_from(["greppy", "brief", "open", "close"])
-            .unwrap()
-            .command
-        {
-            Some(Command::Brief { symbols, .. }) => {
-                assert_eq!(symbols, vec!["open".to_string(), "close".to_string()]);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        // 0.3.0: brief takes exactly ONE symbol. A second positional is a
+        // usage error — the legacy `brief A B` bundle is gone.
+        assert!(Cli::try_parse_from(["greppy", "brief", "open", "close"]).is_err());
 
         // read carries the nav commands' --code flag as an accepted no-op.
         assert!(Cli::try_parse_from(["greppy", "read", "open", "a/mod.py", "--code"]).is_ok());
