@@ -1317,7 +1317,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "brief" => "greppy brief SYMBOL [--path PATH] [--json] [--root DIR]",
         "read" => {
-            "greppy read SYMBOL [--path FILE] [--handle] [--json] [--root DIR]  \
+            "greppy read SYMBOL [--head M] [--tail N] [--handle] [--root DIR]  \
              or: greppy read FILE [--line N[:M]] [--handle] [--json] [--root DIR]"
         }
         "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
@@ -1886,20 +1886,15 @@ fn dispatch_subcommand(
         } => {
             let targets = nav_targets(&symbols)?;
             validate_path_filters(root, &path_opts, "--path")?;
+            // The prompt's signature is `impact S` — one symbol. The multi
+            // note covers who-calls and callees only; a second symbol here is
+            // a usage error, like brief's (the tree of one symbol is already
+            // a screen, several at once would break the size law).
             if targets.len() > 1 {
-                return dispatch_nav_multi(NavMultiRequest {
-                    command: "impact",
-                    kind: NavKind::Impact,
-                    targets: &targets,
-                    paths: &path_opts,
-                    code: false,
-                    all,
-                    json,
-                    root,
-                    direction: &direction,
-                    edge: edge.as_deref(),
-                    depth,
-                });
+                return Err(Error::Invalid(format!(
+                    "impact takes one symbol, got {}: impact them one at a time",
+                    targets.len()
+                )));
             }
             dispatch_impact(
                 targets.first().map(String::as_str),
@@ -1933,16 +1928,19 @@ fn dispatch_subcommand(
         }
         Command::BashSmart { argv } => bash_smart::run(&argv, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
-        Command::Read { symbols, head, tail, handle, json } => {
+        Command::Read { symbols, head, tail, handle, json, path_opts } => {
             let symbols = nav_targets(&symbols)?;
-            dispatch_read_symbols(&symbols, head, tail, handle, json, root)
+            validate_path_filters(root, &path_opts, "--path")?;
+            dispatch_read_symbols(&symbols, head, tail, handle, json, &path_opts, root)
         }
-        Command::ReadSmart { symbols, depth, handle } => {
+        Command::ReadSmart { symbols, depth, handle, path_opts } => {
             let symbols = nav_targets(&symbols)?;
-            dispatch_read_smart(&symbols, depth, handle, root)
+            validate_path_filters(root, &path_opts, "--path")?;
+            dispatch_read_smart(&symbols, depth, handle, &path_opts, root)
         }
-        Command::ReadFile { paths, lines, all, handle } => {
-            dispatch_read_files(&paths, lines.as_deref(), all, handle, root)
+        Command::ReadFile { paths, lines, all, handle, path_opts } => {
+            validate_path_filters(root, &path_opts, "--path")?;
+            dispatch_read_files(&paths, lines.as_deref(), all, handle, &path_opts, root)
         }
         Command::Replace { symbol, new, body, dry_run, verify, json } => dispatch_edit(
             EditCommand::Replace { symbol, new, body, dry_run, verify }, json, root,
@@ -6250,28 +6248,64 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         return Ok(0);
     }
 
-    for row in window {
-        let mut line = String::new();
-        if let Some(hops) = row.hops {
-            line.push_str(&format!("hop {hops} "));
+    // The multi answer is the single answer, grouped: one bare line naming
+    // the queried symbol opens each group (it answers "which question", it is
+    // not decoration), then the same rows the single-symbol path prints. An
+    // empty group states its empty answer instead of vanishing.
+    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    let empty_word = match req.kind {
+        NavKind::WhoCalls => "no callers",
+        NavKind::Callees => "no callees",
+        NavKind::Impact => "no reach",
+    };
+    for (index, symbol) in req.targets.iter().enumerate() {
+        if index > 0 {
+            println!();
         }
-        if let Some(edge_type) = &row.edge_type {
-            line.push_str(edge_type);
-            line.push(' ');
+        println!("{symbol}");
+        if totals[index] == 0 {
+            println!("{empty_word}");
+            continue;
         }
-        line.push_str(&display_node_name(&row.node));
-        line.push_str(&format!(" {}:{}", row.node.file_path, row.node.start_line));
-        println!("{line}");
-        if req.code {
-            if let Some((source, handle)) = node_source_and_handle(&root_path, &row.node) {
-                print_code_span_text(&source);
-                println!("handle: {handle}");
+        // A group whose rows all fell behind the cap must not look like an
+        // empty answer: count what is missing.
+        if !window.iter().any(|row| row.target == index) {
+            println!("… {} below the cut", totals[index]);
+            continue;
+        }
+        for row in window.iter().filter(|row| row.target == index) {
+            // Same truth as the single-symbol rows: the shared source-aware
+            // test detection, not the cheaper node-only heuristic.
+            let lines = sources
+                .entry(row.node.file_path.clone())
+                .or_insert_with(|| nav_file_lines(&root_path, &row.node.file_path));
+            let test_suffix = if nav_is_test(lines.as_ref(), &row.node) {
+                "  test"
+            } else {
+                ""
+            };
+            println!(
+                "{}:{}  {}{}",
+                row.node.file_path,
+                row.node.start_line,
+                nav_short_name(&row.node),
+                test_suffix
+            );
+            if req.code {
+                if let Some((source, handle)) = node_source_and_handle(&root_path, &row.node) {
+                    print_code_span_text(&source);
+                    println!("handle: {handle}");
+                }
             }
         }
     }
-    // With `--offset` the budget layer prints its own `try:` continuation.
     if !req.all && cli_result_offset() == 0 && end < total {
-        println!("{}", nav_continuation_command(&req, end));
+        println!(
+            "… {} more — {}",
+            total - end,
+            nav_continuation_command(&req, end)
+        );
     }
     Ok(0)
 }

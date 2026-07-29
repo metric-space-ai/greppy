@@ -570,6 +570,7 @@ pub(crate) fn dispatch_read_symbols(
     tail: Option<usize>,
     with_handle: bool,
     json: bool,
+    paths: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
     if head == Some(0) || tail == Some(0) {
@@ -581,6 +582,7 @@ pub(crate) fn dispatch_read_symbols(
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
+    let path_filters = prepare_query_path_filters(root, "read", "", paths)?;
 
     if json && (head.is_some() || tail.is_some()) {
         return Err(Error::Invalid(
@@ -592,7 +594,8 @@ pub(crate) fn dispatch_read_symbols(
         let mut hits = Vec::with_capacity(symbols.len());
         for query in symbols {
             let ids = resolve_symbol_nodes(&store, Some(query))?;
-            let nodes = read_real_nodes(&store, &ids)?;
+            let mut nodes = read_real_nodes(&store, &ids)?;
+            nodes.retain(|node| path_filters.matches(&node.file_path));
             let Some(node) = nodes.first().cloned() else {
                 return Err(Error::Invalid(format!(
                     "read: `{query}` is not a definition in this repository"
@@ -652,7 +655,8 @@ pub(crate) fn dispatch_read_symbols(
     if json {
         let query = symbols.first().map(String::as_str).unwrap_or("");
         let ids = resolve_symbol_nodes(&store, Some(query))?;
-        let nodes = read_real_nodes(&store, &ids)?;
+        let mut nodes = read_real_nodes(&store, &ids)?;
+        nodes.retain(|node| path_filters.matches(&node.file_path));
         if nodes.is_empty() {
             println!(
                 "{}",
@@ -999,6 +1003,7 @@ pub(crate) fn dispatch_read_smart(
     symbols: &[String],
     depth: usize,
     with_handle: bool,
+    paths: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
     if depth == 0 {
@@ -1204,11 +1209,13 @@ pub(crate) fn dispatch_read_files(
     lines: Option<&str>,
     all: bool,
     with_handle: bool,
+    path_filter_args: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
     let store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
+    let path_filters = prepare_query_path_filters(root, "read-file", "", path_filter_args)?;
     let canonical_root = root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
@@ -1216,6 +1223,13 @@ pub(crate) fn dispatch_read_files(
     let mut printed = false;
     let mut previous_ended_with_newline = true;
     for path in paths {
+        if !path_filters.matches(path) {
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!("outside path filter: {path}");
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        }
         let Some((shown, _, content)) = read_open_file(&root_path, &canonical_root, path) else {
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("no such file: {path}");

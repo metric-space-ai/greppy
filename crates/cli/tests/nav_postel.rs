@@ -223,7 +223,9 @@ fn limit_max_aliases_hold_and_paths_are_flag_only() {
         positional.1, positional.2
     );
     let retired = run(&["read", "--symbol", "target"], &repo, &store);
-    assert_eq!(retired.0, 2, "retired --symbol unexpectedly parsed");
+    // read IS a subcommand; a retired flag on it is a usage error, not a
+    // silent grep passthrough.
+    assert_eq!(retired.0, 64, "retired --symbol must be a usage error");
 }
 
 #[test]

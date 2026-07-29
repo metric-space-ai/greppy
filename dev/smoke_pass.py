@@ -21,7 +21,8 @@ STORE = "/Volumes/tmp/wc-store2"
 FORBIDDEN_EVERYWHERE = [
     "::Function::",          # pre-0.3.0 qualified rows
     "-- CALLERS",            # pre-0.3.0 brief bundle
-    "== ",                   # pre-0.3.0 multi bundle headers
+    # (the pre-0.3.0 bundle header `== name ==` is checked as a line-anchored
+    # regex below — a bare "== " substring is legitimate source code)
     "weitere",               # German
     "Zeilen",
     "suggestion:",           # banned advisory lines
@@ -91,6 +92,8 @@ def main() -> None:
                 continue
             if marker in out:
                 errors.append(f"forbidden marker {marker!r}")
+        if not json_case and re.search(r"^== \S.* ==$", out, re.M):
+            errors.append("forbidden bundle header '== name =='")
         for pattern in required:
             if not re.search(pattern, out, re.M):
                 errors.append(f"missing /{pattern}/")

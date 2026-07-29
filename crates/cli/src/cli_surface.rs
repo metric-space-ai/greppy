@@ -229,6 +229,9 @@ pub enum Command {
         /// Emit the existing machine-readable read shape.
         #[arg(long, hide = true)]
         json: bool,
+        /// Only results under this file or directory (repeatable).
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
     },
     /// Print symbol definitions with nested structural blocks folded into
     /// semantic one-line gaps that can be expanded recursively.
@@ -243,6 +246,9 @@ pub enum Command {
         /// Also print a compact edit handle for each definition span.
         #[arg(long)]
         handle: bool,
+        /// Only results under this file or directory (repeatable).
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
     },
     /// Read files directly, in 400-line pages unless a range or all lines were requested.
     #[command(name = "read-file")]
@@ -259,6 +265,9 @@ pub enum Command {
         /// Also print a compact edit handle for every printed span.
         #[arg(long)]
         handle: bool,
+        /// Only results under this file or directory (repeatable).
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
     },
     /// Replace a definition with NEW; without NEW, read it from stdin.
     Replace {
