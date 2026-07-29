@@ -671,7 +671,10 @@ pub(crate) fn edit_publish(
         ..EditRecord::default()
     };
     if new_content == located.content {
-        record.already_as_sent = true;
+        // A dry run never claims an application, even when the requested bytes
+        // are already present. Its receipt remains `would apply`; the stronger
+        // `applied, already as sent` wording is reserved for a non-dry call.
+        record.already_as_sent = !dry_run;
         record.operations = vec![operation];
         return Ok(record);
     }
@@ -1347,7 +1350,7 @@ pub(crate) fn run_trained_write(
     }
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
     if before.as_deref() == Some(bytes.as_slice()) {
-        record.already_as_sent = true;
+        record.already_as_sent = !dry_run;
         return Ok(record);
     }
     if dry_run {
@@ -1642,7 +1645,7 @@ pub(crate) fn run_trained_patch(
             Some(edit_span_lines(after, start, end.saturating_sub(start)))
         }),
         published: !dry_run,
-        already_as_sent: already,
+        already_as_sent: already && !dry_run,
         ..EditRecord::default()
     };
     for (rel, _, before, after, changed) in &planned {
@@ -1826,7 +1829,7 @@ pub(crate) fn run_trained_rename(
         files,
         span,
         published: !dry_run,
-        already_as_sent: already,
+        already_as_sent: already && !dry_run,
         ..EditRecord::default()
     };
     if certificate.published {
