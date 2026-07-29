@@ -10,6 +10,12 @@ use super::*;
 
 const WHERE_INVENTORY_BUDGET: usize = 25;
 const WHERE_INVENTORY_KIND: &str = "greppy.where-am-i.inventory.v1";
+const WHERE_ENTRY_POINTS_KIND: &str = "greppy.where-am-i.entry-points.v1";
+/// Fractal size law for the orientation block: the text level shows at most
+/// this many entry points and prices the rest behind one expand id. A list
+/// only one longer than the cap is shown whole — hiding a single path behind
+/// a pack would cost more than it saves.
+const WHERE_ENTRY_POINTS_SHOWN: usize = 5;
 
 #[derive(Clone)]
 struct WhereInventoryEntry {
@@ -347,6 +353,57 @@ fn where_entry_points(nodes: &[greppy_store::Node]) -> Vec<String> {
     files
 }
 
+/// Centrality key for the shown few: conventional launchers the toolchain
+/// reaches from outside the graph (main.rs, build.rs, __main__.py) first,
+/// then paths closest to the repo root, then alphabetical.
+fn where_entry_point_rank(path: &str) -> (u8, usize, &str) {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let stem = file_name.split('.').next().unwrap_or(file_name);
+    let not_launcher = u8::from(!matches!(stem, "main" | "build" | "__main__"));
+    (not_launcher, path.matches('/').count(), path)
+}
+
+fn where_central_entry_points(entry_points: &[String], cap: usize) -> Vec<String> {
+    let mut ranked = entry_points.to_vec();
+    ranked.sort_by(|left, right| {
+        where_entry_point_rank(left).cmp(&where_entry_point_rank(right))
+    });
+    ranked.truncate(cap);
+    ranked
+}
+
+/// The remainder of the entry-points line: one expand pack listing every
+/// entry point, stored through the same machinery as the inventory rows.
+fn insert_where_entry_points_pack(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    entry_points: &[String],
+) -> Result<ExpandHandle> {
+    let mut text = String::new();
+    for path in entry_points {
+        text.push_str(path);
+        text.push('\n');
+    }
+    insert_expand_pack_best_effort(
+        store,
+        project,
+        "where-am-i",
+        "entry points",
+        current_graph_generation_or_zero(store, root),
+        serde_json::json!({
+            "text": format!("{} entry points", where_count(entry_points.len())),
+            "entry_points": entry_points.len(),
+        }),
+        text,
+        Some(serde_json::json!({
+            "kind": WHERE_ENTRY_POINTS_KIND,
+            "entry_points": entry_points,
+        })),
+    )
+    .ok_or_else(|| Error::Invalid("could not store entry-points pack".into()))
+}
+
 fn where_test_tree_root(path: &str) -> Option<String> {
     let mut parts = Vec::new();
     for part in path.split('/') {
@@ -625,10 +682,31 @@ pub(crate) fn dispatch_where_am_i(root: Option<&str>, json: bool) -> Result<i32>
         println!();
     }
     if !entry_points.is_empty() {
-        println!("entry points: {}", entry_points.join(", "));
+        if entry_points.len() <= WHERE_ENTRY_POINTS_SHOWN + 1 {
+            println!("entry points: {}", entry_points.join(", "));
+        } else {
+            let shown = where_central_entry_points(&entry_points, WHERE_ENTRY_POINTS_SHOWN);
+            let handle = insert_where_entry_points_pack(&store, root, &project, &entry_points)?;
+            println!(
+                "entry points: {} … {} more — greppy expand {}",
+                shown.join(", "),
+                where_count(entry_points.len() - shown.len()),
+                handle.id
+            );
+        }
     }
     if !test_roots.is_empty() {
-        println!("tests: {}", test_roots.join(", "));
+        // One phrasing for inline tests: the attribute spelling stands for
+        // both, so the line never mixes granularities.
+        let has_attribute = test_roots
+            .iter()
+            .any(|root| root.as_str() == "inline #[test] modules");
+        let shown = test_roots
+            .iter()
+            .filter(|root| root.as_str() != "inline test definitions" || !has_attribute)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        println!("tests: {}", shown.join(", "));
     }
     Ok(0)
 }
@@ -809,6 +887,34 @@ pub(crate) fn where_inventory_expand_payload(
     project: &str,
     metadata: &serde_json::Value,
 ) -> Result<std::result::Result<(String, serde_json::Value), String>> {
+    if metadata.get("kind").and_then(serde_json::Value::as_str) == Some(WHERE_ENTRY_POINTS_KIND)
+    {
+        let entry_points = metadata
+            .get("entry_points")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|paths| {
+                paths
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+            });
+        let Some(entry_points) = entry_points else {
+            return Ok(Err("expand: invalid where-am-i entry-points pack".into()));
+        };
+        let mut text = String::new();
+        for path in &entry_points {
+            text.push_str(path);
+            text.push('\n');
+        }
+        return Ok(Ok((
+            text,
+            serde_json::json!({
+                "kind": WHERE_ENTRY_POINTS_KIND,
+                "total": entry_points.len(),
+                "entry_points": entry_points,
+            }),
+        )));
+    }
     let Some((stored_scope, is_file, page_offset, expected)) =
         where_parse_inventory_metadata(metadata)
     else {
