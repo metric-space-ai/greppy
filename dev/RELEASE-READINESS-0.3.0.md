@@ -42,6 +42,40 @@
 None of items 1-5 is visible from a partial local run, which is how the earlier
 claim survived: `bash_smart` sorts before `edit_*`, which sorts before
 `graph_grid_*`, so the first failure masked every later one.
+
+6. **Three of the four required workflows cannot run on a release branch at
+   all.** `codeql.yml`, `security-audit.yml` and `task-bank-audit.yml` trigger
+   only on `push: branches: [main]`, on pull requests, on schedule, or on
+   `workflow_dispatch`. A push to `recovery/cli-umbau` triggers none of them,
+   which is why the release SHA has no runs for any of the three — nothing was
+   forgotten, the gate is simply unsatisfiable from a branch.
+
+   Worse, two carry path filters, so merging is not sufficient either. Measured
+   against `main..HEAD`:
+
+   - `security-audit.yml` — watches `**/Cargo.toml`, `Cargo.lock`. 0.3.0 changes
+     `Cargo.lock`, `crates/cli/Cargo.toml`, `crates/edit/Cargo.toml`, so a merge
+     **does** trigger it.
+   - `codeql.yml` — no path filter, a merge triggers it.
+   - `task-bank-audit.yml` — watches the task-bank generators and JSON corpora.
+     0.3.0 touches **none** of them, so a merge does **not** trigger it, and
+     `release.yml` would refuse the tag with no obvious cause.
+
+## The tag sequence, in the only order that works
+
+1. Get `ci.yml` green on the release subject (items 1-5).
+2. Land the work on `main` — this is what makes `ci`, `codeql` and
+   `security-audit` run on the release SHA.
+3. **Dispatch `task-bank-audit.yml` manually on the release SHA.** It cannot
+   trigger itself for this change. A `workflow_dispatch` run records the branch
+   head as its `headSha`, which is exactly what the gate queries. Skipping this
+   step is the one failure mode that looks like a bug in `release.yml`.
+4. Bind summary-quality, agent-benchmark and coding-benchmark evidence to that
+   same SHA.
+5. Tag.
+
+## Other release facts, unchanged
+
 - `AGENTS.md` frozen byte for byte by a twelfth guard (`APPROVED_SHA256`);
   verified that a one-byte append fails it.
 - Version bumped to 0.3.0; `CHANGELOG.md` rewritten against the shipped

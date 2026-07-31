@@ -263,7 +263,10 @@ pub(crate) fn edit_set_exact_receipt(
 
 /// Refuse a path that leaves the repository, whether by climbing out of it or
 /// through a symlink that points out.
-pub(crate) fn edit_guard_path(root_path: &std::path::Path, abs: &std::path::Path) -> EditResult<()> {
+pub(crate) fn edit_guard_path(
+    root_path: &std::path::Path,
+    abs: &std::path::Path,
+) -> EditResult<()> {
     match greppy_edit::publish::require_inside_workspace(root_path, abs) {
         Ok(_) => Ok(()),
         Err(Error::Io { .. }) => Err(EditRefusal::new(
@@ -314,10 +317,18 @@ pub(crate) fn edit_resolve_symbol(
     want_body: bool,
 ) -> EditResult<ResolvedSpan> {
     let store = open_default_store_query_writer(root).map_err(|error| {
-        EditRefusal::new("symbol_not_found", format!("no symbol `{name}`: {error}"), 10)
+        EditRefusal::new(
+            "symbol_not_found",
+            format!("no symbol `{name}`: {error}"),
+            10,
+        )
     })?;
     let ids = resolve_symbol_nodes(&store, Some(name)).map_err(|error| {
-        EditRefusal::new("symbol_not_found", format!("no symbol `{name}`: {error}"), 10)
+        EditRefusal::new(
+            "symbol_not_found",
+            format!("no symbol `{name}`: {error}"),
+            10,
+        )
     })?;
     let mut nodes = Vec::new();
     for id in &ids {
@@ -374,7 +385,12 @@ pub(crate) fn edit_resolve_symbol(
             .collect();
         let listed = nodes
             .iter()
-            .map(|node| format!("  {} {}:{}", node.qualified_name, node.file_path, node.start_line))
+            .map(|node| {
+                format!(
+                    "  {} {}:{}",
+                    node.qualified_name, node.file_path, node.start_line
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         return Err(EditRefusal::new(
@@ -401,12 +417,10 @@ pub(crate) fn edit_resolve_symbol(
     let mut range = edit_strip_trailing_newline(&content, range);
     if want_body {
         let Some(body) = greppy_edit::verbs::body_range_within(language, &content, range) else {
-            return Err(EditRefusal::new(
-                "no_body",
-                format!("`{name}` has no body"),
-                13,
-            )
-            .with("symbol", serde_json::json!(name)));
+            return Err(
+                EditRefusal::new("no_body", format!("`{name}` has no body"), 13)
+                    .with("symbol", serde_json::json!(name)),
+            );
         };
         range = edit_strip_trailing_newline(&content, body);
     }
@@ -483,7 +497,11 @@ pub(crate) fn edit_locate(
         SelectorKind::Target => {
             let token = spec.target.as_deref().unwrap_or_default();
             let handle = greppy_edit::EditHandle::decode(token).map_err(|error| {
-                EditRefusal::new("invalid_handle", format!("not a usable handle: {error}"), 20)
+                EditRefusal::new(
+                    "invalid_handle",
+                    format!("not a usable handle: {error}"),
+                    20,
+                )
             })?;
             let handle_root = std::path::Path::new(&handle.workspace_root)
                 .canonicalize()
@@ -542,9 +560,8 @@ pub(crate) fn edit_locate(
                     (rel, abs, content, vec![(0, length)], None, None)
                 }
                 SelectorKind::Lines => {
-                    let (first, last) = edit_parse_line_range(
-                        spec.lines.as_deref().unwrap_or_default(),
-                    )?;
+                    let (first, last) =
+                        edit_parse_line_range(spec.lines.as_deref().unwrap_or_default())?;
                     let (rel, abs, content) = edit_read_file(root_path, file)?;
                     let total = edit_line_count(&content);
                     if last > total || first > total {
@@ -596,7 +613,14 @@ pub(crate) fn edit_locate(
                         .find_iter(&content)
                         .map(|found| (found.start(), found.end()))
                         .collect();
-                    (rel, abs, content, ranges, Some(regex), Some(pattern.to_string()))
+                    (
+                        rel,
+                        abs,
+                        content,
+                        ranges,
+                        Some(regex),
+                        Some(pattern.to_string()),
+                    )
                 }
                 SelectorKind::Symbol | SelectorKind::Target => unreachable!(),
             };
@@ -625,10 +649,10 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
         // The count alone does not let a caller decide between "pass --expect N"
         // and "I anchored on the wrong text", so the refusal names what was
         // searched for and where every match sits.
-        let _subject = located
-            .needle
-            .as_deref()
-            .map_or_else(|| located.kind.name().to_string(), |text| format!("`{text}`"));
+        let _subject = located.needle.as_deref().map_or_else(
+            || located.kind.name().to_string(),
+            |text| format!("`{text}`"),
+        );
         let sites: Vec<String> = located
             .ranges
             .iter()
@@ -717,7 +741,11 @@ pub(crate) fn edit_positional_payload(
     }
     let mut bytes = Vec::new();
     std::io::stdin().read_to_end(&mut bytes).map_err(|error| {
-        EditRefusal::new("content_unreadable", format!("read {name} from stdin: {error}"), 20)
+        EditRefusal::new(
+            "content_unreadable",
+            format!("read {name} from stdin: {error}"),
+            20,
+        )
     })?;
     if bytes.is_empty() {
         return Err(EditRefusal::new(
@@ -752,7 +780,11 @@ pub(crate) fn edit_publish(
         result_span: Some(text.clone()),
         sha_before: Some(edit_sha256_hex(&located.content)),
         sha_after: Some(edit_sha256_hex(&new_content)),
-        diff: Some(edit_unified_diff(&located.rel, &located.content, &new_content)),
+        diff: Some(edit_unified_diff(
+            &located.rel,
+            &located.content,
+            &new_content,
+        )),
         ..EditOperation::default()
     };
     let mut record = EditRecord {
@@ -883,10 +915,19 @@ pub(crate) fn edit_op_delete(located: &Located) -> EditedContent {
 
 /// The compiler or linter for the touched files, when the workspace declares
 /// one. No tests: a test run is too long for a single edit call.
-pub(crate) fn edit_verify_diagnostics(root_path: &std::path::Path, files: &[String]) -> Vec<String> {
+pub(crate) fn edit_verify_diagnostics(
+    root_path: &std::path::Path,
+    files: &[String],
+) -> Vec<String> {
     let mut argv: Option<Vec<&str>> = None;
     if root_path.join("Cargo.toml").is_file() {
-        argv = Some(vec!["cargo", "check", "--message-format", "short", "--quiet"]);
+        argv = Some(vec![
+            "cargo",
+            "check",
+            "--message-format",
+            "short",
+            "--quiet",
+        ]);
     } else if root_path.join("go.mod").is_file() {
         argv = Some(vec!["go", "build", "./..."]);
     } else if files.iter().any(|file| file.ends_with(".py"))
@@ -929,7 +970,10 @@ pub(crate) fn edit_journal_write(path: &std::path::Path, value: &serde_json::Val
 /// Record the pre-images and open a transaction. Anything that dies between
 /// here and [`edit_journal_close`] leaves `pending.json` behind — which is
 /// exactly what `recover` looks for.
-pub(crate) fn edit_journal_open(root_path: &std::path::Path, before: &[UndoBefore]) -> Option<String> {
+pub(crate) fn edit_journal_open(
+    root_path: &std::path::Path,
+    before: &[UndoBefore],
+) -> Option<String> {
     if before.is_empty() {
         return None;
     }
@@ -1068,15 +1112,14 @@ pub(crate) fn edit_journal_restore(
         let abs = root_path.join(&rel);
         match entry["blob"].as_str() {
             Some(blob) => {
-                let bytes = std::fs::read(dir.join(EDIT_JOURNAL_BLOBS).join(blob)).map_err(
-                    |error| {
+                let bytes =
+                    std::fs::read(dir.join(EDIT_JOURNAL_BLOBS).join(blob)).map_err(|error| {
                         EditRefusal::new(
                             "nothing_to_undo",
                             format!("{rel}: the pre-image is gone ({error})"),
                             10,
                         )
-                    },
-                )?;
+                    })?;
                 if let Some(parent) = abs.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -1289,7 +1332,10 @@ pub(crate) fn edit_record_json(
     report_path: Option<&str>,
 ) -> serde_json::Value {
     let mut value = serde_json::Map::new();
-    value.insert("schema_version".into(), serde_json::json!(EDIT_RECORD_SCHEMA));
+    value.insert(
+        "schema_version".into(),
+        serde_json::json!(EDIT_RECORD_SCHEMA),
+    );
     value.insert(
         "status".into(),
         serde_json::json!(if record.published {
@@ -1371,7 +1417,10 @@ pub(crate) fn edit_record_json(
 /// A refusal is an answer too: the same shape, with the cause named. Without
 /// `published` and `exit_code` a caller that asked for `--json` cannot tell a
 /// refusal from a success without re-reading the process exit code.
-pub(crate) fn edit_refusal_json(refusal: &EditRefusal, report_path: Option<&str>) -> serde_json::Value {
+pub(crate) fn edit_refusal_json(
+    refusal: &EditRefusal,
+    report_path: Option<&str>,
+) -> serde_json::Value {
     let mut error = serde_json::Map::new();
     error.insert("code".into(), serde_json::json!(refusal.code));
     error.insert("message".into(), serde_json::json!(refusal.message));
@@ -1379,7 +1428,10 @@ pub(crate) fn edit_refusal_json(refusal: &EditRefusal, report_path: Option<&str>
         error.insert((*key).into(), value.clone());
     }
     let mut value = serde_json::Map::new();
-    value.insert("schema_version".into(), serde_json::json!(EDIT_RECORD_SCHEMA));
+    value.insert(
+        "schema_version".into(),
+        serde_json::json!(EDIT_RECORD_SCHEMA),
+    );
     value.insert("status".into(), serde_json::json!("refused"));
     value.insert("published".into(), serde_json::json!(false));
     value.insert("exit_code".into(), serde_json::json!(refusal.exit));
@@ -1410,13 +1462,17 @@ pub(crate) fn run_trained_write(
     if abs.exists() {
         edit_guard_path(root_path, &abs)?;
     } else if let Some(parent) = abs.parent() {
-        let root = root_path.canonicalize().unwrap_or_else(|_| root_path.to_path_buf());
+        let root = root_path
+            .canonicalize()
+            .unwrap_or_else(|_| root_path.to_path_buf());
         let mut existing = parent;
         while !existing.exists() {
             let Some(next) = existing.parent() else { break };
             existing = next;
         }
-        let canonical = existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf());
+        let canonical = existing
+            .canonicalize()
+            .unwrap_or_else(|_| existing.to_path_buf());
         if !canonical.starts_with(&root) {
             return Err(EditRefusal::new(
                 "path_outside_repo",
@@ -1483,7 +1539,11 @@ pub(crate) fn run_trained_write(
     };
     if let Err(error) = publish {
         edit_journal_abort(root_path);
-        return Err(EditRefusal::new("publish_failed", format!("{path}: {error}"), 16));
+        return Err(EditRefusal::new(
+            "publish_failed",
+            format!("{path}: {error}"),
+            16,
+        ));
     }
     if let Some(id) = transaction {
         edit_journal_close(root_path, &id);
@@ -1522,9 +1582,8 @@ fn trained_patch_path(header: &str) -> Option<String> {
 }
 
 fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
-    let text = std::str::from_utf8(diff).map_err(|_| {
-        EditRefusal::new("invalid_patch", "the unified diff is not UTF-8", 20)
-    })?;
+    let text = std::str::from_utf8(diff)
+        .map_err(|_| EditRefusal::new("invalid_patch", "the unified diff is not UTF-8", 20))?;
     let lines: Vec<&str> = text.lines().collect();
     let mut files = Vec::new();
     let mut index = 0usize;
@@ -1624,9 +1683,8 @@ fn apply_trained_patch_file(
     content: &[u8],
     hunks: &[TrainedPatchHunk],
 ) -> EditResult<EditedContent> {
-    let text = std::str::from_utf8(content).map_err(|_| {
-        EditRefusal::new("invalid_patch", format!("{path} is not UTF-8"), 20)
-    })?;
+    let text = std::str::from_utf8(content)
+        .map_err(|_| EditRefusal::new("invalid_patch", format!("{path} is not UTF-8"), 20))?;
     let line_texts: Vec<&str> = text.lines().collect();
     let mut line_ranges = Vec::new();
     let mut cursor = 0usize;
@@ -1732,7 +1790,9 @@ pub(crate) fn run_trained_patch(
         }
         planned.push((rel, abs, content, after, changed));
     }
-    let already = planned.iter().all(|(_, _, before, after, _)| before == after);
+    let already = planned
+        .iter()
+        .all(|(_, _, before, after, _)| before == after);
     let exact_required = planned.len() > 1
         || planned
             .iter()
@@ -1742,7 +1802,10 @@ pub(crate) fn run_trained_patch(
         .map(|(rel, _, _, after, changed)| edit_exact_address(rel, after, changed))
         .collect::<Vec<_>>();
     let mut record = EditRecord {
-        files: planned.iter().map(|(rel, _, _, _, _)| rel.clone()).collect(),
+        files: planned
+            .iter()
+            .map(|(rel, _, _, _, _)| rel.clone())
+            .collect(),
         span: planned.first().and_then(|(_, _, _, after, changed)| {
             let (start, end) = changed.first().copied()?;
             Some(edit_span_lines(after, start, end.saturating_sub(start)))
@@ -1775,15 +1838,12 @@ pub(crate) fn run_trained_patch(
     let transaction = edit_journal_open(root_path, &before);
     edit_journal_crash_hook()?;
     for (_, abs, content, after, _) in &planned {
-        if let Err(error) = greppy_edit::publish::publish_atomic(
-            root_path,
-            abs,
-            after,
-            &edit_sha256_hex(content),
-        ) {
-            if let Some(pending) = edit_journal_read(
-                &edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING),
-            ) {
+        if let Err(error) =
+            greppy_edit::publish::publish_atomic(root_path, abs, after, &edit_sha256_hex(content))
+        {
+            if let Some(pending) =
+                edit_journal_read(&edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING))
+            {
                 let _ = edit_journal_restore(root_path, &pending, false);
             }
             edit_journal_abort(root_path);
@@ -1837,11 +1897,16 @@ pub(crate) fn edit_rename_receipt_addresses(
             // keeps dry-run receipts exact, when the result is not on disk.
             let before_start = (after_start as i128 - length_delta * index as i128)
                 .clamp(0, content.len() as i128) as usize;
-            by_file.entry(file.clone()).or_default().push(edit_span_lines(
-                content,
-                before_start,
-                old_name.len().min(content.len().saturating_sub(before_start)),
-            ));
+            by_file
+                .entry(file.clone())
+                .or_default()
+                .push(edit_span_lines(
+                    content,
+                    before_start,
+                    old_name
+                        .len()
+                        .min(content.len().saturating_sub(before_start)),
+                ));
         }
     }
     by_file
@@ -1912,13 +1977,14 @@ pub(crate) fn run_trained_rename(
             ) else {
                 continue;
             };
-            scopes.entry(source.file_path.clone()).or_default().push(
-                line_range_to_bytes(
+            scopes
+                .entry(source.file_path.clone())
+                .or_default()
+                .push(line_range_to_bytes(
                     &content,
                     source.start_line as usize,
                     span.end_line as usize,
-                ),
-            );
+                ));
         }
     }
     let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
@@ -1953,9 +2019,12 @@ pub(crate) fn run_trained_rename(
         let message = if certificate.status == greppy_edit::Status::InvalidResult {
             "refused: the edit would break the file's syntax — nothing written".to_string()
         } else {
-            certificate
-                .compact_failure_diagnosis()
-                .unwrap_or_else(|| format!("rename {} — nothing written", edit_status_name(certificate.status)))
+            certificate.compact_failure_diagnosis().unwrap_or_else(|| {
+                format!(
+                    "rename {} — nothing written",
+                    edit_status_name(certificate.status)
+                )
+            })
         };
         return Ok(Err(EditRefusal::new(
             certificate_refusal_code(&certificate),
@@ -1968,13 +2037,8 @@ pub(crate) fn run_trained_rename(
             .operations
             .iter()
             .any(|operation| operation.changed_byte_ranges.len() > 1);
-    let exact_addresses = edit_rename_receipt_addresses(
-        root_path,
-        &certificate,
-        &before,
-        &short_name,
-        new_name,
-    );
+    let exact_addresses =
+        edit_rename_receipt_addresses(root_path, &certificate, &before, &short_name, new_name);
     let mut files: Vec<String> = certificate
         .operations
         .iter()
@@ -2063,7 +2127,11 @@ pub(crate) fn dispatch_edit_grammar(
                     target: None,
                     path: None,
                 };
-                let kind = if regex { SelectorKind::Pattern } else { SelectorKind::Text };
+                let kind = if regex {
+                    SelectorKind::Pattern
+                } else {
+                    SelectorKind::Text
+                };
                 let located = edit_locate(&spec, kind, root, root_path)?;
                 edit_check_cardinality(&located, expect)?;
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes);
@@ -2132,7 +2200,11 @@ pub(crate) fn dispatch_edit_grammar(
                 .and_then(|bytes| run_trained_write(root_path, &path, bytes, dry_run, verify));
             emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Delete { symbol, dry_run, verify } => {
+        EditCommand::Delete {
+            symbol,
+            dry_run,
+            verify,
+        } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let spec = WhereSpec {
                     file: None,
@@ -2151,7 +2223,12 @@ pub(crate) fn dispatch_edit_grammar(
             })();
             emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::DeleteLines { file, lines, dry_run, verify } => {
+        EditCommand::DeleteLines {
+            file,
+            lines,
+            dry_run,
+            verify,
+        } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let spec = WhereSpec {
                     file: Some(file),
@@ -2170,7 +2247,13 @@ pub(crate) fn dispatch_edit_grammar(
             })();
             emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::InsertLines { file, line, new, dry_run, verify } => {
+        EditCommand::InsertLines {
+            file,
+            line,
+            new,
+            dry_run,
+            verify,
+        } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let mut inserted = edit_positional_payload(new, "NEW")?;
                 let (rel, abs, content) = edit_read_file(root_path, &file)?;
@@ -2215,15 +2298,28 @@ pub(crate) fn dispatch_edit_grammar(
             })();
             emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Rename { symbol, name, dry_run, verify } => {
+        EditCommand::Rename {
+            symbol,
+            name,
+            dry_run,
+            verify,
+        } => {
             let outcome = run_trained_rename(root_path, root, &symbol, &name, dry_run, verify)?;
             emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Undo { id, dry_run, verify } => {
+        EditCommand::Undo {
+            id,
+            dry_run,
+            verify,
+        } => {
             let outcome = run_edit_undo(root_path, id.as_deref(), dry_run, verify);
             emit_edit_outcome(outcome, json, None)?
         }
-        EditCommand::Patch { diff, dry_run, verify } => {
+        EditCommand::Patch {
+            diff,
+            dry_run,
+            verify,
+        } => {
             let outcome = edit_positional_payload(diff, "DIFF")
                 .and_then(|bytes| run_trained_patch(root_path, bytes, dry_run, verify));
             emit_edit_outcome(outcome, json, None)?

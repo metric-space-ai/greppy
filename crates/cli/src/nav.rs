@@ -365,9 +365,7 @@ fn where_entry_point_rank(path: &str) -> (u8, usize, &str) {
 
 fn where_central_entry_points(entry_points: &[String], cap: usize) -> Vec<String> {
     let mut ranked = entry_points.to_vec();
-    ranked.sort_by(|left, right| {
-        where_entry_point_rank(left).cmp(&where_entry_point_rank(right))
-    });
+    ranked.sort_by(|left, right| where_entry_point_rank(left).cmp(&where_entry_point_rank(right)));
     ranked.truncate(cap);
     ranked
 }
@@ -887,8 +885,7 @@ pub(crate) fn where_inventory_expand_payload(
     project: &str,
     metadata: &serde_json::Value,
 ) -> Result<std::result::Result<(String, serde_json::Value), String>> {
-    if metadata.get("kind").and_then(serde_json::Value::as_str) == Some(WHERE_ENTRY_POINTS_KIND)
-    {
+    if metadata.get("kind").and_then(serde_json::Value::as_str) == Some(WHERE_ENTRY_POINTS_KIND) {
         let entry_points = metadata
             .get("entry_points")
             .and_then(serde_json::Value::as_array)
@@ -1576,13 +1573,9 @@ pub(crate) fn dispatch_brief(
     // exactly who-calls' failures, through the same helpers.
     let root_path = resolve_root(root)?;
     if let Some(symbol) = symbol {
-        if let Some(code) = nav_refuse_non_callable(
-            &store,
-            &root_path,
-            symbol,
-            &targets,
-            NavDirection::Outgoing,
-        )? {
+        if let Some(code) =
+            nav_refuse_non_callable(&store, &root_path, symbol, &targets, NavDirection::Outgoing)?
+        {
             return Ok(code);
         }
         if let Some(code) = nav_refuse_ambiguous(&store, symbol, &targets)? {

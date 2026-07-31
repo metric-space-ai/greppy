@@ -21,9 +21,7 @@
 
 #![cfg(unix)]
 
-use greppy_edit::verbs::{
-    delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions,
-};
+use greppy_edit::verbs::{delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions};
 use greppy_edit::{Certificate, EditHandle, Language, Status};
 
 // ------------------------------------------------------------------ helpers
@@ -110,7 +108,8 @@ fn java_def_range(content: &[u8], name: &str) -> (usize, usize) {
 #[test]
 fn grid_java_replace_body_unique() {
     let ws = workspace();
-    let content = b"class MathOps {\n    int add(int a, int b) {\n        return a + b;\n    }\n}\n";
+    let content =
+        b"class MathOps {\n    int add(int a, int b) {\n        return a + b;\n    }\n}\n";
     let file = write(ws.path(), "m.java", content);
     let def_range = java_def_range(content, "add");
 
@@ -145,7 +144,10 @@ fn grid_java_replace_body_unique() {
     assert!(!out.contains("return a + b;"));
 
     let json = serde_json::to_value(&cert).unwrap();
-    assert_eq!(json["schema_version"].as_str(), Some("greppy.edit-certificate.v1"));
+    assert_eq!(
+        json["schema_version"].as_str(),
+        Some("greppy.edit-certificate.v1")
+    );
     assert_eq!(json["status"].as_str(), Some("applied"));
     let _: Certificate = serde_json::from_value(json).unwrap();
 
@@ -254,7 +256,10 @@ fn grid_java_replace_body_ambiguous() {
     let ws = workspace();
     let content = b"// this is a leading comment, not a Java definition\n\nclass Foo {\n}\n";
     let file = write(ws.path(), "m.java", content);
-    let def_start = std::str::from_utf8(content).unwrap().find("class Foo").unwrap();
+    let def_start = std::str::from_utf8(content)
+        .unwrap()
+        .find("class Foo")
+        .unwrap();
     let def_range = (0usize, def_start);
 
     let cert = replace_body(
@@ -348,7 +353,8 @@ fn grid_java_replace_body_stale() {
     let file = write(ws.path(), "m.java", content);
     let planned_range = java_def_range(content, "foo");
     let options = planned_options(ws.path(), content, planned_range);
-    let mutated = b"class Foo {\n    int foo() {\n        return 999;\n    }\n    void other() {}\n}\n";
+    let mutated =
+        b"class Foo {\n    int foo() {\n        return 999;\n    }\n    void other() {}\n}\n";
     std::fs::write(&file, mutated).unwrap();
 
     let cert = replace_body(

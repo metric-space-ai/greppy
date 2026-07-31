@@ -238,20 +238,26 @@ pub(crate) fn embedding_asset_missing_error(error: &Error) -> bool {
     matches!(error, Error::Config(message) if message.contains("EmbeddingGemma assets are unavailable"))
 }
 
-pub(crate) fn embedding_config_for_index(args: EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>> {
+pub(crate) fn embedding_config_for_index(
+    args: EmbeddingCliArgs<'_>,
+) -> Result<Option<EmbeddingModelConfig>> {
     if test_inference_skipped() {
         return Ok(None);
     }
     Ok(Some(embedding_config_required(args)?))
 }
 
-pub(crate) fn embedding_config_for_required_use(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
+pub(crate) fn embedding_config_for_required_use(
+    args: EmbeddingCliArgs<'_>,
+) -> Result<EmbeddingModelConfig> {
     embedding_config_required(args)
 }
 
 /// Resolve the mandatory embedded EmbeddingGemma model. The `Option` remains
 /// only for non-fatal query paths that predate the always-embedded contract.
-pub(crate) fn embedding_config_optional(args: EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>> {
+pub(crate) fn embedding_config_optional(
+    args: EmbeddingCliArgs<'_>,
+) -> Result<Option<EmbeddingModelConfig>> {
     embedding_config_required(args).map(Some)
 }
 
@@ -295,7 +301,9 @@ pub(crate) fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
     )
 }
 
-pub(crate) fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
+pub(crate) fn embedding_config_required(
+    args: EmbeddingCliArgs<'_>,
+) -> Result<EmbeddingModelConfig> {
     #[cfg(debug_assertions)]
     if std::env::var_os(ENV_TEST_EMBED_ASSET_MISSING).is_some() {
         return Err(Error::Config(

@@ -123,7 +123,11 @@ pub(crate) fn git_diff_search_spec(
     }
 }
 
-pub(crate) fn git_resolve_commitish(root_path: &std::path::Path, rev: &str, context: &str) -> Result<String> {
+pub(crate) fn git_resolve_commitish(
+    root_path: &std::path::Path,
+    rev: &str,
+    context: &str,
+) -> Result<String> {
     let rev = rev.trim();
     if rev.is_empty() {
         return Err(Error::Invalid(format!(

@@ -21,9 +21,7 @@
 
 #![cfg(unix)]
 
-use greppy_edit::verbs::{
-    delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions,
-};
+use greppy_edit::verbs::{delete_span, insert_adjacent, replace_body, InsertPosition, VerbOptions};
 use greppy_edit::{Certificate, EditHandle, Language, Status};
 
 // ------------------------------------------------------------------ helpers
@@ -118,13 +116,20 @@ fn grid_rust_replace_body_unique() {
     assert_eq!(cert.operations.len(), 1);
 
     let out = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(&out.as_bytes()[..32], &content[..32], "signature must be preserved");
+    assert_eq!(
+        &out.as_bytes()[..32],
+        &content[..32],
+        "signature must be preserved"
+    );
     assert!(out.starts_with("fn add(a: u32, b: u32) -> u32 {"));
     assert!(out.contains("a - b"));
     assert!(!out.contains("a + b"));
 
     let json = serde_json::to_value(&cert).unwrap();
-    assert_eq!(json["schema_version"].as_str(), Some("greppy.edit-certificate.v1"));
+    assert_eq!(
+        json["schema_version"].as_str(),
+        Some("greppy.edit-certificate.v1")
+    );
     assert_eq!(json["status"].as_str(), Some("applied"));
     let _: Certificate = serde_json::from_value(json).unwrap();
 

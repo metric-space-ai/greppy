@@ -331,8 +331,9 @@ pub(crate) fn emit_edit_outcome(
                 let compact = edit_record_json(&record, false, report_path);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&compact)
-                        .map_err(|error| Error::Invalid(format!("serialize edit record: {error}")))?
+                    serde_json::to_string_pretty(&compact).map_err(|error| Error::Invalid(
+                        format!("serialize edit record: {error}")
+                    ))?
                 );
             } else {
                 // Success is one bare line: verb and address. The text that
@@ -340,7 +341,11 @@ pub(crate) fn emit_edit_outcome(
                 // where the spec orders them. A dry run must not say "applied"
                 // — it wrote nothing, and a receipt that overstates is the
                 // worst output this tool can produce.
-                let word = if record.published { "applied" } else { "would apply" };
+                let word = if record.published {
+                    "applied"
+                } else {
+                    "would apply"
+                };
                 if let Some(headline) = &record.headline {
                     println!("{headline}");
                 } else {
@@ -517,7 +522,11 @@ pub(crate) fn print_search_code_entries(entries: &[SearchCodeEntry]) {
             SearchCodeEntry::Definition(definition) => print_search_row(
                 &definition.file,
                 definition.start_line,
-                definition.qualified_name.rsplit("::").next().unwrap_or(&definition.qualified_name),
+                definition
+                    .qualified_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&definition.qualified_name),
                 None,
                 false,
             ),

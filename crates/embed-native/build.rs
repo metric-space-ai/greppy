@@ -67,9 +67,7 @@ fn build_cuda() {
     // Linux/Windows, so `cpu-only` could never prevent this build script from
     // running. An nvcc that exists and *fails* is still a hard error below.
     let Some(resolved) = resolve_executable(&nvcc) else {
-        println!(
-            "cargo:warning=greppy-embed-native: no CUDA backend — `{nvcc}` not found on PATH"
-        );
+        println!("cargo:warning=greppy-embed-native: no CUDA backend — `{nvcc}` not found on PATH");
         return;
     };
     let nvcc_path = resolved
