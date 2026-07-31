@@ -81,6 +81,7 @@ class ValidationTests(LocalRepositoryFixture):
         )
         proof = result["validation"]
         self.assertEqual(proof["parent_plus_test"], "fail")
+        self.assertEqual(proof["failure_mode"], "test")
         self.assertEqual(proof["gold_plus_test"], "pass")
         self.assertEqual(proof["clean_room_repetitions"], 2)
         self.assertTrue(proof["offline"])
@@ -93,6 +94,47 @@ class ValidationTests(LocalRepositoryFixture):
         row = {**self.row, "parent_commit": "0" * 40}
         with self.assertRaisesRegex(base.AdapterError, "M\\^1 provenance"):
             base.validate_candidate(row, self.repo, self.root / "bad", 2, self.config, "sha256:" + "b" * 64)
+
+    def test_parent_post_patch_build_failure_is_valid_only_when_gold_builds(self) -> None:
+        parent_only_failure = [
+            sys.executable, "-c",
+            "import logic; raise SystemExit(logic.VALUE != 'new')",
+        ]
+        config = {**self.config, "post_patch_commands": [parent_only_failure]}
+        valid = base.validate_candidate_for_ledger(
+            self.row, self.repo, self.root / "parent-build-fails", 2, config,
+            "sha256:" + "b" * 64,
+        )
+        self.assertEqual(valid["validation_outcome"], "passed")
+        self.assertNotIn("exclusion_reason", valid)
+        self.assertEqual(valid["validation"]["parent_plus_test"], "fail")
+        self.assertEqual(valid["validation"]["failure_mode"], "build")
+        self.assertEqual(valid["validation"]["gold_plus_test"], "pass")
+
+        both_fail_config = {
+            **self.config,
+            "post_patch_commands": [[sys.executable, "-c", "raise SystemExit(1)"]],
+        }
+        excluded = base.validate_candidate_for_ledger(
+            self.row, self.repo, self.root / "parent-and-gold-build-fail", 2,
+            both_fail_config, "sha256:" + "b" * 64,
+        )
+        self.assertEqual(excluded["validation_outcome"], "failed")
+        self.assertEqual(excluded["exclusion_reason"], "registered_budget_inexecutable")
+        self.assertEqual(excluded["exclusion_cause"], "offline post-patch setup failed")
+
+    def test_setup_failure_before_test_patch_is_still_excluded(self) -> None:
+        config = {
+            **self.config,
+            "setup_commands": [[sys.executable, "-c", "raise SystemExit(1)"]],
+        }
+        excluded = base.validate_candidate_for_ledger(
+            self.row, self.repo, self.root / "setup-fails", 2, config,
+            "sha256:" + "b" * 64,
+        )
+        self.assertEqual(excluded["validation_outcome"], "failed")
+        self.assertEqual(excluded["exclusion_reason"], "registered_budget_inexecutable")
+        self.assertEqual(excluded["exclusion_cause"], "offline setup failed")
 
     def test_post_patch_commands_reject_shell_strings(self) -> None:
         config = {**self.config, "post_patch_commands": ["python3 -c pass"]}

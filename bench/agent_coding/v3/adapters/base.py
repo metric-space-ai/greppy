@@ -489,6 +489,7 @@ def validate_candidate(
     setup = command_list(config.get("setup_commands", []), "setup_commands")
     post_patch = command_list(config.get("post_patch_commands", []), "post_patch_commands")
     logs: list[dict[str, Any]] = []
+    failure_mode = "test"
     for repetition in range(repetitions):
         with worktree(mirror, parent, scratch, f"rep-{repetition}-parent") as parent_tree:
             for command in setup:
@@ -497,11 +498,17 @@ def validate_candidate(
             baseline = run_logged(p2p, parent_tree, env, timeout); logs.append(baseline)
             if baseline["returncode"] != 0: raise AdapterError("parent PASS_TO_PASS baseline failed")
             apply_patch(parent_tree, test_patch)
+            parent_build_failed = False
             for command in post_patch:
                 result = run_logged(command, parent_tree, env, timeout); logs.append(result)
-                if result["returncode"] != 0: raise AdapterError("offline post-patch setup failed")
-            failure = run_logged(f2p, parent_tree, env, timeout); logs.append(failure)
-            if failure["returncode"] in (None, 0): raise AdapterError("parent plus hidden tests did not fail")
+                if result["returncode"] != 0:
+                    parent_build_failed = True
+                    failure_mode = "build"
+                    break
+            if not parent_build_failed:
+                failure = run_logged(f2p, parent_tree, env, timeout); logs.append(failure)
+                if failure["returncode"] in (None, 0):
+                    raise AdapterError("parent plus hidden tests did not fail")
         with worktree(mirror, parent, scratch, f"rep-{repetition}-gold") as gold_tree:
             for command in setup:
                 result = run_logged(command, gold_tree, env, timeout); logs.append(result)
@@ -530,8 +537,9 @@ def validate_candidate(
             "pr_delta_no_target_drift": True, "authoritative_metadata_sha256": metadata_hash,
         },
         "validation": {
-            "parent_baseline": "pass", "parent_plus_test": "fail", "gold_plus_test": "pass",
-            "merged_plus_test": "pass", "clean_room_repetitions": repetitions, "offline": True,
+            "parent_baseline": "pass", "parent_plus_test": "fail", "failure_mode": failure_mode,
+            "gold_plus_test": "pass", "merged_plus_test": "pass",
+            "clean_room_repetitions": repetitions, "offline": True,
             "fail_to_pass": test_paths, "pass_to_pass": [shlex.join(p2p)],
             "test_command": f2p, "fail_to_pass_commands": [f2p], "pass_to_pass_commands": [p2p],
             "setup_commands": setup, "post_patch_commands": post_patch, "timeout_seconds": timeout,
