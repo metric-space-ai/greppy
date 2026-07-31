@@ -489,6 +489,46 @@ def clone_pinned_repository(task: dict[str, Any], parent: pathlib.Path) -> pathl
     return backing
 
 
+def _initialize_isolated_repository(path: pathlib.Path, timeout_seconds: int) -> None:
+    run_checked(
+        ["git", "init", "--quiet"],
+        cwd=path,
+        timeout_seconds=timeout_seconds,
+        operation="isolated repository initialization",
+    )
+    for key, value in (
+        ("user.name", "Greppy Coding Benchmark"),
+        ("user.email", "coding-benchmark@example.invalid"),
+        ("core.logAllRefUpdates", "false"),
+    ):
+        run_checked(
+            ["git", "config", key, value],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated repository configuration",
+        )
+    run_checked(
+        ["git", "add", "--force", "--all", "--", "."],
+        cwd=path,
+        timeout_seconds=timeout_seconds,
+        operation="isolated repository staging",
+    )
+    run_checked(
+        [
+            "git",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-m",
+            "Benchmark pinned tree",
+        ],
+        cwd=path,
+        timeout_seconds=timeout_seconds,
+        operation="isolated repository commit",
+    )
+
+
 @contextlib.contextmanager
 def temporary_worktree(
     backing: pathlib.Path,
@@ -496,29 +536,73 @@ def temporary_worktree(
     path: pathlib.Path,
     timeout_seconds: int,
 ) -> Iterator[pathlib.Path]:
+    """Materialize a pinned tree as a fresh one-commit repository.
+
+    The transient checkout linked to the upstream mirror is removed before the
+    caller (and therefore the agent) can observe the workspace.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    run_checked(
-        ["git", "--git-dir", str(backing), "worktree", "add", "--detach", str(path), commit],
+    expected_tree = run_checked(
+        ["git", "--git-dir", str(backing), "rev-parse", f"{commit}^{{tree}}"],
         cwd=path.parent,
         timeout_seconds=timeout_seconds,
-        operation="worktree creation",
+        operation="pinned tree identity capture",
+    ).stdout.decode("ascii", "strict").strip()
+    source = path.parent / f".{path.name}-pinned-source"
+    if path.exists() or source.exists():
+        raise HarnessError("isolated workspace path already exists")
+    run_checked(
+        ["git", "--git-dir", str(backing), "worktree", "add", "--detach", str(source), commit],
+        cwd=path.parent,
+        timeout_seconds=timeout_seconds,
+        operation="pinned tree materialization",
     )
     try:
-        yield path
+        shutil.copytree(source, path, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    except Exception:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
     finally:
         run_process(
-            ["git", "--git-dir", str(backing), "worktree", "remove", "--force", str(path)],
+            ["git", "--git-dir", str(backing), "worktree", "remove", "--force", str(source)],
             cwd=path.parent,
             timeout_seconds=min(timeout_seconds, 120),
         )
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(source, ignore_errors=True)
         run_process(
             ["git", "--git-dir", str(backing), "worktree", "prune", "--expire", "now"],
             cwd=path.parent,
             timeout_seconds=min(timeout_seconds, 120),
         )
+    try:
+        _initialize_isolated_repository(path, timeout_seconds)
+        actual_tree = run_checked(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated tree identity capture",
+        ).stdout.decode("ascii", "strict").strip()
+        commit_count = run_checked(
+            ["git", "rev-list", "--all", "--count"],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated commit count",
+        ).stdout.decode("ascii", "strict").strip()
+        remotes = run_checked(
+            ["git", "remote"],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated remote check",
+        ).stdout.strip()
+        if actual_tree != expected_tree:
+            raise HarnessError("isolated repository tree differs from pinned tree")
+        if commit_count != "1" or remotes or (path / ".git" / "logs").exists():
+            raise HarnessError("isolated repository contains upstream Git metadata")
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
         if path.exists():
-            raise HarnessError("worktree cleanup failed")
+            raise HarnessError("isolated workspace cleanup failed")
 
 
 def apply_mutation(worktree: pathlib.Path, patch: str, timeout_seconds: int) -> None:
@@ -751,6 +835,114 @@ def classify_v2_patched_failure(
     }
 
 
+GREPPY_EDIT_VERBS = frozenset(
+    {
+        "replace",
+        "replace-text",
+        "replace-lines",
+        "replace-span",
+        "insert-lines",
+        "delete",
+        "delete-lines",
+        "patch",
+        "write",
+        "rename",
+        "undo",
+    }
+)
+GREPPY_FILE_EDIT_VERBS = frozenset(
+    {"replace-text", "replace-lines", "insert-lines", "delete-lines", "write"}
+)
+GREPPY_OPTIONS_WITH_VALUES = frozenset({"--expect", "--limit", "--offset", "--path", "--root"})
+
+
+def _shell_command_segments(command: str) -> list[list[str]]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments: list[list[str]] = []
+    segment: list[str] = []
+    for token in tokens:
+        if token and set(token) <= set(";&|"):
+            if segment:
+                segments.append(segment)
+                segment = []
+        else:
+            segment.append(token)
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _greppy_invocations(command: str) -> list[tuple[str, list[str]]]:
+    invocations: list[tuple[str, list[str]]] = []
+    for segment in _shell_command_segments(command):
+        index = 0
+        while index < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index]):
+            index += 1
+        if index < len(segment) and segment[index] == "command":
+            index += 1
+        if index < len(segment) and segment[index] == "env":
+            index += 1
+            while index < len(segment) and (
+                segment[index].startswith("-")
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index])
+            ):
+                index += 1
+        if index >= len(segment) or pathlib.PurePosixPath(segment[index]).name != "greppy":
+            continue
+        arguments = segment[index + 1 :]
+        verb_index = 0
+        while verb_index < len(arguments):
+            argument = arguments[verb_index]
+            if argument in GREPPY_OPTIONS_WITH_VALUES:
+                verb_index += 2
+                continue
+            if argument.startswith("--"):
+                verb_index += 1
+                continue
+            break
+        if verb_index < len(arguments) and (
+            arguments[verb_index] in GREPPY_EDIT_VERBS or arguments[verb_index] == "read-file"
+        ):
+            invocations.append((arguments[verb_index], arguments[verb_index + 1 :]))
+    return invocations
+
+
+def _first_positional(arguments: Sequence[str]) -> str | None:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in GREPPY_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if argument.startswith("--"):
+            index += 1
+            continue
+        return argument
+    return None
+
+
+def _normalized_source_path(value: str) -> str:
+    normalized = pathlib.PurePosixPath(value.replace("\\", "/")).as_posix()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _patch_paths(diff: str) -> set[str]:
+    paths: set[str] = set()
+    for line in diff.splitlines():
+        match = re.match(r"^(?:---|\+\+\+)\s+(?:[ab]/)?([^\t]+)", line)
+        if match and match.group(1) != "/dev/null":
+            paths.add(_normalized_source_path(match.group(1)))
+    return paths
+
+
 def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
@@ -790,14 +982,22 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
                     source_opens += 1
                     m = re.search(r"(?:cat|head|tail|sed\s+-n\s+\S+)\s+([\w./-]+)", command)
                     opened_file = m.group(1) if m else None
-                if re.search(r"greppy[^\n]*\bedit\b", command):
+                for verb, arguments in _greppy_invocations(command):
+                    if verb == "read-file":
+                        opened_file = _first_positional(arguments)
+                        continue
                     edit_calls += 1
-                    m = re.search(r"--file\s+([\w./-]+)", command)
-                    if m:
-                        edited_files.add(m.group(1))
-                    # symbol-adressierte edits: datei unbekannt bis zertifikat;
-                    # konservativ nicht zaehlen
-            if opened_file and opened_file in edited_files:
+                    if verb in GREPPY_FILE_EDIT_VERBS:
+                        touched = _first_positional(arguments)
+                        if touched:
+                            edited_files.add(_normalized_source_path(touched))
+                    elif verb == "patch":
+                        diff = _first_positional(arguments)
+                        if diff:
+                            edited_files.update(_patch_paths(diff))
+                    # Symbol, span, rename, and undo commands do not carry a
+                    # file positional in the shipped 0.3.0 grammar.
+            if opened_file and _normalized_source_path(opened_file) in edited_files:
                 post_edit_source_opens += 1
         if message.get("errorMessage"):
             error = str(message["errorMessage"])
@@ -821,6 +1021,7 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         "turns": turns,
         "reported_error": bool(error),
         "edit_calls": edit_calls,
+        "edited_files": sorted(edited_files),
         "post_edit_source_opens": post_edit_source_opens,
         # provider error text, redacted upstream with the rest of stdout;
         # 10 consecutive identical failures on one task are invisible
@@ -834,21 +1035,10 @@ def shared_user_prompt(task: dict[str, Any]) -> str:
     return f"Task:\n{task['user_task'].strip()}\n\nVerification command:\n{command}\n"
 
 
-# Per-arm pi tool surface. The greppy-edit arm's displacement prompt states
-# "there is no apply_patch and no manual patching"; with pi's builtin
-# edit/write/read in the tool palette that statement is visibly false and
-# gets ignored (trace forensics 2026-07-17: the arm's agent used builtin
-# edit and never called greppy). Displacement only works when the
-# environment matches the claim - the MSCC panel proves prompt-driven
-# adoption (78-87% greppy usage) exactly where the prompt's claim is true.
-# The edit arm therefore ships bash only: greppy read/edit is the paved
-# road, bash remains the honest escape hatch (and bash-side manual edits
-# stay measurable as fallback_edits in trace forensics).
-ARM_TOOLS = {
-    "explorer": "bash,read,edit,write",
-    "greppy": "bash,read,edit,write",
-    "greppy-edit": "bash",
-}
+# The experimental contract holds Pi's built-in tool palette constant. Arm
+# differences come only from the preregistered system-prompt treatment.
+COMMON_ARM_TOOLS = "bash,read,edit,write"
+ARM_TOOLS = {arm: COMMON_ARM_TOOLS for arm in ARMS}
 
 
 def system_prompt(arm: str, greppy_bin: pathlib.Path) -> str:
@@ -882,7 +1072,7 @@ def run_pi_agent(
     # gives the agent an absolute path, but agents drift to bare `greppy`;
     # without this they silently hit a stale system/ctox shim whose passthrough
     # routes unknown subcommands to grep -> contaminated measurement.
-    binshim = raw_dir / ".binshim"
+    binshim = pi_config_dir / ".binshim"
     binshim.mkdir(parents=True, exist_ok=True)
     shim = binshim / "greppy"
     if shim.is_symlink() or shim.exists():
@@ -1022,6 +1212,12 @@ def run_mutation_preflight(
     worktree_path = task_tmp / "preflight-worktree"
     preflight_store = task_tmp / "preflight-greppy-store"
     with temporary_worktree(backing, task["repository"]["commit"], worktree_path, task["timeout_seconds"]) as worktree:
+        base_commit = run_checked(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            timeout_seconds=task["timeout_seconds"],
+            operation="isolated base commit capture",
+        ).stdout.decode("ascii", "strict").strip()
         try:
             setup = run_setup_commands(
                 task=task,
@@ -1066,7 +1262,7 @@ def run_mutation_preflight(
                 }
 
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
-        mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        mutation_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         mutated_spawn_error = False
         try:
             mutated_result = run_process(
@@ -1135,6 +1331,12 @@ def run_arm(
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     with temporary_worktree(backing, task["repository"]["commit"], worktree_path, task["timeout_seconds"]) as worktree:
+        base_commit = run_checked(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            timeout_seconds=task["timeout_seconds"],
+            operation="isolated base commit capture",
+        ).stdout.decode("ascii", "strict").strip()
         setup = run_setup_commands(
             task=task,
             worktree=worktree,
@@ -1143,7 +1345,7 @@ def run_arm(
             secrets=secrets,
         )
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
-        mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        mutation_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         mutation_hash = sha256_bytes(mutation_diff)
         if mutation_hash != expected_mutation_hash:
             raise HarnessError("arm mutation differs from preflight mutation")
@@ -1180,7 +1382,7 @@ def run_arm(
             raw_dir=raw_dir,
             secrets=secrets,
         )
-        pretest_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        pretest_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         safe_pretest_diff = redact(pretest_diff, secrets)
         atomic_write_bytes(raw_dir / "pretest.patch", safe_pretest_diff)
         if safe_pretest_diff != pretest_diff:
@@ -1197,7 +1399,7 @@ def run_arm(
         )
         test_output = redact(test_result.stdout + test_result.stderr, secrets)
         atomic_write_bytes(raw_dir / "test.log", test_output)
-        final_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        final_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         safe_final_diff = redact(final_diff, secrets)
         atomic_write_bytes(raw_dir / "final.patch", safe_final_diff)
         if safe_final_diff != final_diff:
@@ -1293,8 +1495,17 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     # edit-loop metrics over the edit arm's solved rows
     edit_calls_total = sum(row[1]["agent"].get("edit_calls", 0) for row in solved)
     post_edit_rereads = sum(row[1]["agent"].get("post_edit_source_opens", 0) for row in solved)
-    reread_rate = post_edit_rereads / edit_calls_total if edit_calls_total else 0.0
-    reread_pass = reread_rate <= POST_EDIT_REREADS_MAX
+    if edit_calls_total:
+        reread_rate: float | None = post_edit_rereads / edit_calls_total
+        reread_pass = reread_rate <= POST_EDIT_REREADS_MAX
+        reread_reason = None
+    else:
+        reread_rate = None
+        reread_pass = False
+        reread_reason = (
+            "greppy-edit arm produced zero observed greppy edits; "
+            "the post-edit re-read gate cannot pass without observation"
+        )
     # navigation arm (v3 semantics) stays visible as a reported check
     nav_solved = [(b, n) for b, n in nav_pairs if b["correctness"] and n["correctness"]]
     nav_cost_ratio = ratio(
@@ -1338,9 +1549,10 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         "edit_loop": {
             "edit_calls_total": edit_calls_total,
             "post_edit_source_opens": post_edit_rereads,
-            "post_edit_reread_rate": round(reread_rate, 4),
+            "post_edit_reread_rate": round(reread_rate, 4) if reread_rate is not None else None,
             "threshold": POST_EDIT_REREADS_MAX,
             "passes": reread_pass,
+            "reason": reread_reason,
         },
         "navigation_arm_v3_check": {
             "greppy_to_explorer_provider_cost": nav_cost_ratio,
@@ -1494,15 +1706,18 @@ def build_base_manifest(
             "only_intended_prompt_delta": "navigation treatment",
         },
         "isolation": {
-            "temporary_git_worktree_per_arm": True,
+            "single_commit_repository_per_preflight_and_arm": True,
+            "upstream_refs_remotes_and_reflogs_excluded": True,
+            "upstream_mirror_outside_agent_workspace": True,
+            "task_id_excluded_from_agent_paths_and_prompts": True,
             "greppy_store_per_arm": True,
             "pi_config_per_arm": True,
-            "worktree_cleanup_in_finally": True,
+            "workspace_cleanup_in_finally": True,
         },
         "setup_contract": {
             "required_task_field": True,
             "direct_argv_without_shell": True,
-            "runs_in_each_fresh_preflight_and_arm_worktree": True,
+            "runs_in_each_fresh_preflight_and_arm_repository": True,
             "runs_before_mutation": True,
             "provider_key_removed": True,
             "excluded_from_agent_wall": True,
@@ -1664,15 +1879,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if all((task["id"], arm) in completed for arm in selected_arms):
             continue
         print(f"[{task['id']}] preparing pinned repository", flush=True)
-        # ignore_cleanup_errors: the greppy daemon may still be flushing into
-        # the worktree when the context exits; a leaked temp dir on an
-        # ephemeral runner is harmless, a crashed 2.5h benchmark run is not.
+        # Keep the full upstream mirror in a separately randomized harness
+        # directory. Agent-visible paths are task-id-free and contain only the
+        # fresh one-commit repository materialized for that attempt.
+        # ignore_cleanup_errors tolerates a greppy daemon still flushing during
+        # teardown; a leaked ephemeral temp dir must not discard a long run.
         with tempfile.TemporaryDirectory(
-            prefix=f"greppy-agent-coding-{task['id']}-", ignore_cleanup_errors=True
-        ) as tmp_name:
+            prefix="greppy-agent-coding-", ignore_cleanup_errors=True
+        ) as tmp_name, tempfile.TemporaryDirectory(
+            prefix="greppy-agent-source-", ignore_cleanup_errors=True
+        ) as backing_tmp_name:
             task_tmp = pathlib.Path(tmp_name)
             try:
-                backing = clone_pinned_repository(task, task_tmp)
+                backing = clone_pinned_repository(task, pathlib.Path(backing_tmp_name))
                 preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task["id"], secrets)
                 base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
                 if not preflight["valid"]:

@@ -37,11 +37,14 @@ class GitFixture(unittest.TestCase):
         git(self.source, "config", "user.name", "Benchmark Test")
         git(self.source, "config", "user.email", "benchmark@example.invalid")
         (self.source / "value.txt").write_text("old\n", encoding="utf-8")
+        (self.source / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        (self.source / "ignored.txt").write_text("tracked despite ignore\n", encoding="utf-8")
         (self.source / "test_guard.py").write_text(
             "import pathlib\nassert pathlib.Path('value.txt').read_text() == 'old\\n'\n",
             encoding="utf-8",
         )
-        git(self.source, "add", "value.txt", "test_guard.py")
+        git(self.source, "add", "value.txt", ".gitignore", "test_guard.py")
+        git(self.source, "add", "--force", "ignored.txt")
         git(self.source, "commit", "-qm", "fixture")
         self.commit = git(self.source, "rev-parse", "HEAD")
         self.backing = self.root / "repo.git"
@@ -66,7 +69,7 @@ class PatchTests(GitFixture):
             bench.apply_mutation(worktree, self.PATCH, 10)
             self.assertEqual((worktree / "value.txt").read_text(encoding="utf-8"), "new\n")
             (worktree / "asset.bin").write_bytes(b"\x00\x01\xff\x00")
-            diff = bench.capture_binary_diff(worktree, self.commit, 10)
+            diff = bench.capture_binary_diff(worktree, git(worktree, "rev-parse", "HEAD"), 10)
             self.assertIn(b"+new", diff)
             self.assertIn(b"GIT binary patch", diff)
             self.assertRegex(bench.sha256_bytes(diff), r"^[0-9a-f]{64}$")
@@ -90,6 +93,19 @@ class WorktreeTests(GitFixture):
         backing = bench.clone_pinned_repository(task, clone_parent)
         resolved = git(clone_parent, "--git-dir", str(backing), "rev-parse", "HEAD")
         self.assertEqual(resolved, self.commit)
+
+    def test_agent_workspace_has_one_commit_and_no_upstream_metadata(self) -> None:
+        worktree_path = self.root / "isolated-workspace"
+        with bench.temporary_worktree(self.backing, self.commit, worktree_path, 10) as worktree:
+            bench.apply_mutation(worktree, PatchTests.PATCH, 10)
+            commits = git(worktree, "log", "--all", "--oneline").splitlines()
+            self.assertEqual(len(commits), 1)
+            self.assertNotIn(self.commit[:12], "\n".join(commits))
+            self.assertEqual(git(worktree, "remote"), "")
+            self.assertTrue((worktree / ".git").is_dir())
+            self.assertFalse((worktree / ".git" / "logs").exists())
+            self.assertIn("ignored.txt", git(worktree, "ls-files").splitlines())
+            self.assertEqual((worktree / "value.txt").read_text(encoding="utf-8"), "new\n")
 
     def test_worktree_is_removed_after_exception(self) -> None:
         worktree_path = self.root / "cleanup-worktree"
@@ -304,7 +320,7 @@ class SetupLifecycleTests(GitFixture):
         ) as hash_worktree:
             bench.apply_mutation(hash_worktree, test_patch, 10)
             expected_hash = bench.sha256_bytes(
-                bench.capture_binary_diff(hash_worktree, self.commit, 10)
+                bench.capture_binary_diff(hash_worktree, git(hash_worktree, "rev-parse", "HEAD"), 10)
             )
 
         def weaken_test(**kwargs):
@@ -477,6 +493,31 @@ class GradingTests(unittest.TestCase):
         self.assertEqual(grade["token_ratios_on_solved_pairs"]["greppy_to_explorer_input_tokens"], 0.8)
         self.assertFalse(grade["token_ratios_on_solved_pairs"]["is_gate_metric"])
 
+    def test_edit_reread_gate_fails_without_observed_greppy_edits(self) -> None:
+        task_ids = [f"t{i}" for i in range(30)]
+        rows: list[dict[str, object]] = []
+        for task_id in task_ids:
+            explorer = result_row(
+                task_id, "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10
+            )
+            navigation = result_row(
+                task_id, "greppy", passed=True, tools=8, source_opens=4, inputs=800, wall=8
+            )
+            edit = result_row(
+                task_id, "greppy-edit", passed=True, tools=8, source_opens=4, inputs=800, wall=8
+            )
+            edit["agent"]["edit_calls"] = 0
+            rows.extend([explorer, navigation, edit])
+        grade = bench.grade_results(rows, task_ids)
+        self.assertFalse(grade["edit_loop"]["passes"])
+        self.assertIsNone(grade["edit_loop"]["post_edit_reread_rate"])
+        self.assertEqual(
+            grade["edit_loop"]["reason"],
+            "greppy-edit arm produced zero observed greppy edits; "
+            "the post-edit re-read gate cannot pass without observation",
+        )
+        self.assertFalse(grade["passed"])
+
     def test_gate_fails_when_greppy_costs_more_dollars(self) -> None:
         task_ids = [f"t{i}" for i in range(30)]
         rows: list[dict[str, object]] = []
@@ -586,6 +627,19 @@ class GradingTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_all_arms_receive_the_same_builtin_tool_palette(self) -> None:
+        self.assertEqual(set(bench.ARM_TOOLS.values()), {"bash,read,edit,write"})
+
+    def test_task_id_is_not_in_agent_prompts(self) -> None:
+        task = {
+            "id": "repo-type-fixprefix123",
+            "user_task": "Repair the behavior.",
+            "test_command": ["python3", "-m", "unittest"],
+        }
+        self.assertNotIn(task["id"], bench.shared_user_prompt(task))
+        for arm in bench.ARMS:
+            self.assertNotIn(task["id"], bench.system_prompt(arm, pathlib.Path("/opt/greppy")))
+
     def test_arm_validity_requires_success_even_when_turns_exist(self) -> None:
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "timed_out": True}))
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "return_code": 1}))
@@ -689,6 +743,44 @@ class ContractTests(unittest.TestCase):
         task["setup_commands"] = [[]]
         with self.assertRaisesRegex(bench.HarnessError, "non-empty argv array"):
             bench.validate_task_document(document)
+
+    def test_greppy_edit_parser_uses_shipped_verbs_and_positional_file(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}],
+            "message": {
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {
+                            "command": "greppy replace-text src/a.rs 'OLD' 'NEW' --root ."
+                        },
+                    }
+                ]
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["edit_calls"], 1)
+        self.assertEqual(metrics["edited_files"], ["src/a.rs"])
+
+    def test_greppy_read_is_not_mistaken_for_an_edit(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}],
+            "message": {
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {"command": "greppy read replace-text --root ."},
+                    }
+                ]
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["edit_calls"], 0)
+        self.assertEqual(metrics["edited_files"], [])
 
     def test_secret_redaction_and_metric_parsing(self) -> None:
         secret = "sk-never-log-this"
