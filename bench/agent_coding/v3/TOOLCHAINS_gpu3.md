@@ -42,3 +42,29 @@ Traps that cost time here, so they do not cost it again:
 **These installs live in a home directory, not in an image.** Phase 2 requires
 them pinned into digest-pinned images with offline dependency caches; this file
 is the inventory that build must reproduce, not a substitute for it.
+
+## Probe ledger, 2026-07-31
+
+With every profile installed and `greppy` on PATH (`~/opt/bin/greppy` ->
+`~/greppy-030/target/release/greppy`, 0.3.0), all 24 adapters pass the tool
+preflight:
+
+```
+READY: 24   (cpp-catch2, cpp-fmt, cpp-opencv, go-caddy, go-kubernetes,
+             go-prometheus, java-gson, java-kafka, java-spring-framework,
+             javascript-eslint, javascript-node, javascript-webpack,
+             python-django, python-pytest, python-scrapy, ruby-discourse,
+             ruby-rails, ruby-rubocop, rust-clap, rust-ripgrep, rust-tokio,
+             typescript-compiler, typescript-vite, typescript-zod)
+```
+
+**This is a tool-availability probe, nothing more.** Phase 2 declares a row
+`ready` only after its own two-repetition offline smoke ledger inside a
+digest-pinned image, and `adapters/COMMAND_VERIFICATION.md` still lists twelve
+repositories whose test invocations need repository-specific review first
+(kubernetes, prometheus, zod, vite, the TypeScript compiler, kafka, opencv,
+eslint, webpack, node, rails, discourse). A green probe means the machine can
+start the work, not that the commands are right.
+
+The probe run is reproducible with `bash /tmp/probe_all.sh` on gpu3; the raw
+JSON ledger is kept beside this file.
