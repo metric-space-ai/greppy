@@ -2,8 +2,31 @@
   "schema_version": "greppy.agent-coding-freeze.v1",
   "freeze_id": "replace_with_opaque_freeze_id",
   "frozen_at": "2026-07-31T12:00:00Z",
-  "eligible_pr_created_after": "2026-05-01T00:00:00Z",
   "eligible_merged_after": "2026-05-01T00:00:00Z",
   "eligible_merged_before": "2026-07-15T23:59:59Z",
-  "source_metadata_cutoff": "2026-07-20T00:00:00Z"
+  "source_metadata_cutoff": "2026-07-20T00:00:00Z",
+  "frozen_spec": {
+    "repository_registry_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "corpus_contract_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "adapter_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "selection_secret_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "model": {
+      "provider": "replace-before-harvest",
+      "name": "replace-before-harvest",
+      "revision": "replace-before-harvest"
+    },
+    "agent": {
+      "name": "pi",
+      "version": "replace-before-harvest",
+      "configuration_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "budgets": {
+      "max_turns": 100,
+      "max_input_tokens": 200000,
+      "max_output_tokens": 50000,
+      "wall_seconds": 1800
+    },
+    "selection_algorithm": "HMAC-SHA256(secret, repo_id + NUL + candidate_id), ascending"
+  },
+  "frozen_spec_sha256": "32ba21fa1942f2a46bf5cd046965f3cddbd03f7d97920cd4453f9604804a9447"
 }

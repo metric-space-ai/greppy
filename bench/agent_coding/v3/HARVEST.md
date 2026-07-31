@@ -8,7 +8,8 @@ only after hidden `FAIL_TO_PASS` and `PASS_TO_PASS` tests prove the change.
 
 The corpus contract and `repository_registry.json` are preregistration inputs.
 The pipeline does not alter or backfill their 24 repositories, 8 languages,
-144 slots, or repository/class quotas.
+144 tasks, six tasks per repository, or at least two sealed reserves per
+repository. There are no task-class or patch-shape slots.
 
 ## Storage
 
@@ -58,7 +59,11 @@ private, versioned, and has this shape:
 }
 ```
 
-The commands are argv arrays and never run through a shell.
+The commands are argv arrays and never run through a shell. Before metadata
+harvest, `freeze.json` must contain a canonical `frozen_spec` and its SHA-256,
+binding the registry, contract, adapter manifest, model, agent, budgets, exact
+selection algorithm, and `sha256(selection_secret)`. The secret remains sealed
+during harvest and is stored with the sealed corpus for later verification.
 
 ```sh
 python3 -m bench.agent_coding.v3.pipeline preflight \
@@ -74,7 +79,8 @@ python3 -m bench.agent_coding.v3.pipeline metadata \
 python3 -m bench.agent_coding.v3.pipeline validate \
   --registry bench/agent_coding/v3/repository_registry.json \
   --freeze /nas-private/freeze.json \
-  --adapter-manifest /nas-private/adapters.json
+  --adapter-manifest /nas-private/adapters.json \
+  --selection-secret-file /nas-private/selection.key
 
 python3 -m bench.agent_coding.v3.pipeline seal \
   --registry bench/agent_coding/v3/repository_registry.json \
@@ -85,14 +91,15 @@ python3 -m bench.agent_coding.v3.pipeline seal \
   --denylist /nas-private/swe-and-prior-corpora.json \
   --stage-manifest "$GREPPY_BENCH_NVME_ROOT/scratch/agent-coding-v3/<freeze>/metadata/stage-manifest.json" \
   --stage-manifest "$GREPPY_BENCH_NVME_ROOT/scratch/agent-coding-v3/<freeze>/validate/stage-manifest.json" \
-  --id-key-file /nas-private/selection.key
+  --selection-secret-file /nas-private/selection.key
 ```
 
-`metadata` passes the frozen creation/merge window and a harvest target of 36
-to every adapter, then requires at least 36 captured candidates and at least 18
-marked structurally eligible before validation. `validate` passes the local
-trusted mirror, isolated NVMe worktree, two clean-room repetitions and an
-explicit offline flag. Both stages
+`metadata` passes the frozen creation/merge window plus `--all-merged-prs` to
+every adapter. The adapter emits exactly one row for every merged PR in that
+window; it has no target count and performs no patch-shape prefilter. `validate`
+preserves every row, records one enumerated technical exclusion when a candidate
+cannot proceed, and otherwise receives the local trusted mirror, isolated NVMe
+worktree, two clean-room repetitions and an explicit offline flag. Both stages
 publish per-repository JSONL atomically and then a deterministic combined
 ledger. A missing adapter, mirror, toolchain, output, or malformed ledger is a
 hard failure. Maven 3.9.9 and JDK 17 are already installed on gpu3's NVMe, but
@@ -126,12 +133,12 @@ Important fields are:
 - PR creation/merge timestamps, exact merged result and exact first parent;
 - merge strategy and positive provenance checks for target parent, merged tree
   and absence of target-branch drift;
-- issue title/body verbatim and the preregistered diagnostic task class;
-- exact changed source/test path lists from the adapter classifier;
+- issue title/body verbatim; task class, file counts and changed-line counts are
+  retained only as post-hoc diagnostics;
+- exact changed source/test path lists from the adapter classifier, without any
+  minimum or target based on their count;
 - parent-bound repository-scale evidence meeting 200 eligible files and 25,000
-  eligible LOC; two through twenty production paths, 40 through 1,200 changed
-  production lines, no more than 30 total paths, and a minority of ignored,
-  generated, or vendored paths;
+  eligible LOC; task patch size and shape do not affect admission;
 - proof states: parent baseline pass, parent+hidden-test fail,
   gold+hidden-test pass, complete merged result pass, two repetitions, offline;
 - nonempty `fail_to_pass` and `pass_to_pass` test IDs;
@@ -139,20 +146,24 @@ Important fields are:
   log hash, and validation timestamp.
 
 The sealer re-resolves the commit and parent from the trusted local mirror,
-re-splits and re-hashes every patch, and rejects any mismatch. Ranking inside
-each repository/class stratum is HMAC-SHA256 under the preregistered selection
-secret. Every final slot requires at least two mechanically passing candidates
-in its exact repository/class stratum before selection. There is no survivor
-backfill across a repository or class.
+re-splits and re-hashes every patch, and rejects any mismatch. For every
+repository it computes `HMAC-SHA256(secret, repo_id + NUL + candidate_id)`, sorts
+ascending, and walks that order until six tasks plus at least two reserves pass.
+A failed candidate can be replaced only by that repository's next rank. There is
+no cross-repository or task-class backfill.
+
+The sealed candidate ledger has one row per harvested PR, including repository,
+candidate ID, HMAC rank position, admission/exclusion decision, one enumerated
+technical exclusion reason, validation outcome, final task/reserve/neither
+disposition, and post-hoc shape/class diagnostics. This makes validation
+survivor bias directly auditable.
 
 Legacy V2 inputs are always loaded as local denylists. An explicit sealed
 denylist must additionally attest coverage of SWE-bench and all earlier Greppy
-corpora. Exact solution, issue, gold and grader-test matches fail immediately.
-Issue-title, production-path and production-diff similarities above 0.80 require
-reciprocal blinded review records; the sealer records those findings.
-Review records address peers by SHA-256 of canonical JSON containing only the
-registry repository ID, PR number, parent commit and merged result; this is the
-sealed `candidate_commitment`, not the agent-visible task ID.
+corpora. Exact solution, issue, gold and grader-test matches receive the single
+`denylisted` exclusion reason. Within-corpus issue-title, production-path and
+production-diff similarities are recorded post hoc as diagnostics only; they
+cannot admit, exclude, replace, or reweight a candidate.
 
 The sealed manifest and evidence bind the raw corpus contract, registry,
 freeze and adapter manifest; the canonical validated-candidate ledger; the

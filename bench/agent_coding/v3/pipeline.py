@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Orchestrate and seal a quota-balanced v3 taskbank from merged PRs.
+"""Orchestrate and seal a naturally sampled v3 taskbank from merged PRs.
 
-Repository adapters harvest authoritative PR/issue metadata and execute the
-repository-native clean-room proof.  The sealing stage binds that proof to
-freshly extracted patches, applies preregistered quotas, and emits source-only
-parent snapshots.  The orchestrator never clones repositories itself.
+Repository adapters harvest every merged PR in the frozen window and execute
+the repository-native clean-room proof. The sealing stage applies only the
+registered technical exclusions, walks each repository's sealed HMAC order,
+and emits source-only parent snapshots. The orchestrator never clones
+repositories itself.
 """
 
 from __future__ import annotations
@@ -42,6 +43,20 @@ OPAQUE_ID = re.compile(r"^task_[a-z2-7]{26}$")
 SAFE_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 UTC = dt.timezone.utc
 HERE = Path(__file__).resolve().parent
+SELECTION_ALGORITHM = "HMAC-SHA256(secret, repo_id + NUL + candidate_id), ascending"
+TECHNICAL_EXCLUSION_REASONS = frozenset({
+    "not_merged_or_linked_issue",
+    "unreconstructible_parent_or_merge",
+    "docs_format_generated_vendor_or_dependency_only",
+    "no_observable_code_or_config_fix",
+    "no_derivable_independent_behavior_tests",
+    "parent_hidden_wrong_failure",
+    "gold_or_pass_to_pass_not_green",
+    "external_paid_privileged_or_mutable_requirement",
+    "embargo_credential_or_solution_leak",
+    "denylisted",
+    "registered_budget_inexecutable",
+})
 LEGACY_DENYLISTS = (
     HERE.parent / "tasks_v2.json",
     HERE.parent / "harvest_candidates_v2.jsonl",
@@ -85,10 +100,11 @@ class HarvestError(ValueError):
 class Freeze:
     freeze_id: str
     frozen_at: dt.datetime
-    eligible_created_after: dt.datetime
     eligible_after: dt.datetime
     eligible_before: dt.datetime
     source_metadata_cutoff: dt.datetime
+    frozen_spec: Mapping[str, Any]
+    frozen_spec_sha256: str
 
 
 @dataclass(frozen=True)
@@ -97,11 +113,10 @@ class RepoRule:
     url: str
     language: str
     mirror: str
-    minimum: int
     quota: int
+    reserves: int
     test_globs: tuple[str, ...]
     ignore_globs: tuple[str, ...]
-    task_class_slots: Mapping[str, int]
     toolchain: str
     allow_submodules: bool = False
 
@@ -109,9 +124,8 @@ class RepoRule:
 @dataclass(frozen=True)
 class Quotas:
     target_tasks: int
-    min_repositories: int
+    repository_count: int
     max_per_language: Mapping[str, int]
-    task_class_quotas: Mapping[str, int]
 
 
 @dataclass(frozen=True)
@@ -119,17 +133,12 @@ class AdmissionRules:
     minimum_source_files: int
     minimum_source_loc: int
     minimum_band_counts: Mapping[str, int]
-    minimum_production_paths: int = 2
-    maximum_production_paths: int = 20
-    minimum_production_changed_lines: int = 40
-    maximum_production_changed_lines: int = 1200
-    maximum_total_paths: int = 30
-    minimum_candidates_per_slot: int = 2
 
 
 @dataclass
 class PreparedTask:
     task_id: str
+    candidate_id: str
     repo: RepoRule
     row: dict[str, Any]
     parent: str
@@ -145,7 +154,7 @@ class PreparedTask:
     gold_sha256: str
     full_sha256: str
     selection_score: str
-    production_changed_lines: int
+    production_changed_lines: int | None
     ignored_paths: list[str]
     repository_scale: dict[str, Any]
     candidate_commitment: str
@@ -211,24 +220,37 @@ def load_freeze(path: Path) -> Freeze:
     freeze_id = document.get("freeze_id")
     if not isinstance(freeze_id, str) or SAFE_KEY.fullmatch(freeze_id) is None:
         raise HarvestError("freeze_id must be a safe opaque path component")
+    # Parse time fields before the spec so malformed timestamps fail precisely.
+    frozen_at = parse_time(document.get("frozen_at"), "frozen_at")
+    merged_after = parse_time(document.get("eligible_merged_after"), "eligible_merged_after")
+    merged_before = parse_time(document.get("eligible_merged_before"), "eligible_merged_before")
+    metadata_cutoff = parse_time(document.get("source_metadata_cutoff"), "source_metadata_cutoff")
+    frozen_spec = document.get("frozen_spec")
+    frozen_spec_hash = document.get("frozen_spec_sha256")
+    if not isinstance(frozen_spec, dict):
+        raise HarvestError("freeze requires a frozen_spec object")
+    required_objects = ("model", "agent", "budgets")
+    if not all(isinstance(frozen_spec.get(field), dict) and frozen_spec[field] for field in required_objects):
+        raise HarvestError("frozen_spec requires non-empty model, agent, and budgets")
+    for field in ("repository_registry_sha256", "corpus_contract_sha256", "adapter_manifest_sha256", "selection_secret_sha256"):
+        if not isinstance(frozen_spec.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", frozen_spec[field]) is None:
+            raise HarvestError(f"frozen_spec.{field} must be a SHA-256")
+    if frozen_spec.get("selection_algorithm") != SELECTION_ALGORITHM:
+        raise HarvestError("frozen_spec selection algorithm differs from the implementation")
+    computed = sha256(canonical_json(frozen_spec))
+    if frozen_spec_hash != computed:
+        raise HarvestError("frozen_spec_sha256 does not bind the frozen spec")
     freeze = Freeze(
-        freeze_id=freeze_id,
-        frozen_at=parse_time(document.get("frozen_at"), "frozen_at"),
-        eligible_created_after=parse_time(
-            document.get("eligible_pr_created_after"), "eligible_pr_created_after"
-        ),
-        eligible_after=parse_time(document.get("eligible_merged_after"), "eligible_merged_after"),
-        eligible_before=parse_time(document.get("eligible_merged_before"), "eligible_merged_before"),
-        source_metadata_cutoff=parse_time(
-            document.get("source_metadata_cutoff"), "source_metadata_cutoff"
-        ),
+        freeze_id=freeze_id, frozen_at=frozen_at, eligible_after=merged_after,
+        eligible_before=merged_before, source_metadata_cutoff=metadata_cutoff,
+        frozen_spec=dict(frozen_spec), frozen_spec_sha256=computed,
     )
     if not (
-        freeze.eligible_created_after <= freeze.eligible_after <= freeze.eligible_before
+        freeze.eligible_after <= freeze.eligible_before
         <= freeze.source_metadata_cutoff <= freeze.frozen_at
     ):
         raise HarvestError(
-            "freeze times must satisfy created_after <= merged_after <= merged_before <= "
+            "freeze times must satisfy merged_after <= merged_before <= "
             "source_metadata_cutoff <= frozen_at"
         )
     return freeze
@@ -244,11 +266,9 @@ def load_contract(path: Path, freeze: Freeze) -> tuple[dict[str, Any], Admission
         raise HarvestError("unsupported corpus contract schema_version")
     temporal = document.get("temporal_holdout")
     scale = document.get("repository_scale")
-    validation = document.get("validation")
-    if not all(isinstance(value, dict) for value in (temporal, scale, validation)):
-        raise HarvestError("corpus contract lacks temporal, scale, or validation sections")
+    if not all(isinstance(value, dict) for value in (temporal, scale)):
+        raise HarvestError("corpus contract lacks temporal or repository-scale sections")
     expected_times = {
-        "candidate_pr_created_at_or_after": freeze.eligible_created_after,
         "candidate_pr_merged_at_or_after": freeze.eligible_after,
         "candidate_pr_merged_at_or_before": freeze.eligible_before,
     }
@@ -266,10 +286,6 @@ def load_contract(path: Path, freeze: Freeze) -> tuple[dict[str, Any], Admission
             str(key): _positive_int(value, f"repository_scale.minimum_band_counts.{key}")
             for key, value in (scale.get("minimum_band_counts") or {}).items()
         },
-        minimum_candidates_per_slot=_positive_int(
-            validation.get("minimum_candidate_pool_per_repo_class_slot"),
-            "validation.minimum_candidate_pool_per_repo_class_slot",
-        ),
     )
     return document, rules, raw
 
@@ -289,23 +305,24 @@ def load_registry(path: Path) -> tuple[dict[str, RepoRule], Quotas, bytes]:
     if not isinstance(document, dict) or document.get("schema_version") != "greppy.agent-coding-v3.repository-registry.1":
         raise HarvestError("unsupported registry schema_version")
     rows = document.get("repositories")
-    patterns = document.get("selection_patterns")
     languages = document.get("primary_languages")
-    if not isinstance(rows, list) or not rows or not isinstance(patterns, dict):
-        raise HarvestError("registry needs selection_patterns and repositories")
+    if not isinstance(rows, list) or not rows:
+        raise HarvestError("registry needs repositories")
     if not isinstance(languages, list) or not all(isinstance(value, str) for value in languages):
         raise HarvestError("registry primary_languages must be a string array")
     target = _positive_int(document.get("target_task_count"), "target_task_count")
     repository_count = _positive_int(document.get("repository_count"), "repository_count")
     per_repo = _positive_int(document.get("tasks_per_repository"), "tasks_per_repository")
+    reserves = _positive_int(document.get("minimum_reserves_per_repository"), "minimum_reserves_per_repository")
     per_language = _positive_int(document.get("language_task_quota"), "language_task_quota")
     if repository_count != len(rows) or target != repository_count * per_repo:
         raise HarvestError("registry task/repository counts are not internally consistent")
+    if per_language * len(languages) != target:
+        raise HarvestError("registry language balance does not equal target task count")
     quotas = Quotas(
         target_tasks=target,
-        min_repositories=repository_count,
+        repository_count=repository_count,
         max_per_language={str(language): per_language for language in languages},
-        task_class_quotas={},
     )
     rules: dict[str, RepoRule] = {}
     for index, row in enumerate(rows):
@@ -323,39 +340,24 @@ def load_registry(path: Path) -> tuple[dict[str, RepoRule], Quotas, bytes]:
         language = str(row["primary_language"])
         if language not in DEFAULT_TEST_GLOBS:
             raise HarvestError(f"repository {key} has no path classifier for language {language}")
-        pattern_name = row.get("selection_pattern")
-        class_slots = patterns.get(pattern_name) if isinstance(pattern_name, str) else None
-        if not isinstance(class_slots, dict) or sum(class_slots.values()) != per_repo:
-            raise HarvestError(f"repository {key} has an invalid selection pattern")
+        if language not in quotas.max_per_language:
+            raise HarvestError(f"repository {key} uses an undeclared language {language}")
         rules[key] = RepoRule(
             key=key,
             url=str(row["url"]).removesuffix(".git").rstrip("/"),
             language=language,
             mirror=mirror,
-            minimum=0,
             quota=per_repo,
+            reserves=reserves,
             test_globs=DEFAULT_TEST_GLOBS[language],
             ignore_globs=DEFAULT_IGNORE_GLOBS,
-            task_class_slots={
-                str(name): _positive_int(
-                    count, f"repository {key} task_class_slots.{name}", allow_zero=True
-                )
-                for name, count in class_slots.items()
-            },
             toolchain=str(row["toolchain_profile"]),
             allow_submodules=bool(row.get("allow_submodules", False)),
         )
-    declared_slots = Counter()
-    for rule in rules.values():
-        declared_slots.update(rule.task_class_slots)
-        if rule.task_class_slots and sum(rule.task_class_slots.values()) != rule.quota:
-            raise HarvestError(f"repository {rule.key} class slots do not sum to its quota")
-    quotas = Quotas(
-        target_tasks=quotas.target_tasks,
-        min_repositories=quotas.min_repositories,
-        max_per_language=quotas.max_per_language,
-        task_class_quotas=dict(declared_slots),
-    )
+    observed_languages = Counter(rule.language for rule in rules.values())
+    expected_repositories_per_language = per_language // per_repo
+    if any(observed_languages[language] != expected_repositories_per_language for language in languages):
+        raise HarvestError("registry repositories do not preserve the frozen language balance")
     return rules, quotas, raw
 
 
@@ -413,7 +415,8 @@ def is_vendor_or_generated(path: str) -> bool:
 
 def production_changed_lines(
     repo: Path, parent: str, solution: str, paths: Sequence[str]
-) -> int:
+) -> int | None:
+    """Return a post-hoc patch-size diagnostic; never use it for admission."""
     output = str(git(
         repo, ["diff", "--numstat", "--no-renames", parent, solution, "--", *paths], text=True
     ))
@@ -422,7 +425,7 @@ def production_changed_lines(
     for line in output.splitlines():
         parts = line.split("\t", 2)
         if len(parts) != 3 or parts[0] == "-" or parts[1] == "-":
-            raise HarvestError("production diff contains binary or malformed numstat data")
+            return None
         total += int(parts[0]) + int(parts[1])
         observed.add(parts[2])
     if observed != set(paths):
@@ -485,6 +488,16 @@ def opaque_id(key: bytes, freeze: Freeze, repo_key: str, pr_number: int, solutio
     digest = hmac.new(key, b"opaque-id-v3\0" + identity, hashlib.sha256).digest()[:16]
     import base64
     return "task_" + base64.b32encode(digest).decode("ascii").lower().rstrip("=")
+
+
+def canonical_candidate_id(pr_number: int) -> str:
+    return f"pull-request:{pr_number}"
+
+
+def candidate_hmac_rank(secret: bytes, repo_id: str, candidate_id: str) -> str:
+    """Implement the preregistered natural-sampling rank exactly."""
+    material = repo_id.encode("utf-8") + b"\0" + candidate_id.encode("utf-8")
+    return hmac.new(secret, material, hashlib.sha256).hexdigest()
 
 
 def candidate_identity(repo_key: str, pr_number: int, parent: str, solution: str) -> bytes:
@@ -575,8 +588,6 @@ def prepare_candidate(
         raise HarvestError("solution_commit must be a full Git object id")
     merged_at = parse_time(row.get("merged_at"), "candidate merged_at")
     created_at = parse_time(row.get("created_at"), "candidate created_at")
-    if created_at < freeze.eligible_created_after:
-        raise HarvestError("candidate PR predates the frozen creation cutoff")
     if created_at > merged_at:
         raise HarvestError("candidate PR was created after it merged")
     if not freeze.eligible_after <= merged_at <= freeze.eligible_before:
@@ -588,11 +599,9 @@ def prepare_candidate(
     issue_title = str(require_row(row, "issue_title", str))
     issue_body = str(require_row(row, "issue_body", str))
     user_task = issue_title + ("\n\n" + issue_body if issue_body else "")
-    task_type = str(require_row(row, "task_class", str)).strip()
-    if not issue_title or not task_type:
-        raise HarvestError("issue_title and task_class must be non-empty")
-    if task_type not in rule.task_class_slots or rule.task_class_slots[task_type] == 0:
-        raise HarvestError(f"task_class {task_type!r} has no slot for repository {rule.key}")
+    task_type = str(row.get("task_class") or "unclassified").strip()
+    if not issue_title:
+        raise HarvestError("issue_title must be non-empty")
     if solution[:8].lower() in user_task.lower():
         raise HarvestError("user_task leaks the solution object id")
     if re.search(rf"(?:/pull/|\bPR\s*#?)\s*{pr_number}\b", user_task, re.IGNORECASE):
@@ -626,8 +635,6 @@ def prepare_candidate(
         raise HarvestError("solution commit is newer than the frozen source metadata cutoff")
 
     paths = changed_paths(repo, parent, solution)
-    if len(paths) > admission.maximum_total_paths:
-        raise HarvestError(f"full PR changes {len(paths)} paths; maximum is {admission.maximum_total_paths}")
     ignored = {
         path for path in paths
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in rule.ignore_globs)
@@ -644,24 +651,11 @@ def prepare_candidate(
         raise HarvestError("changed_tests does not exactly match registry classification")
     if declared_sources is not None and declared_sources != sources:
         raise HarvestError("changed_source does not exactly match registry classification")
-    if not tests or not sources:
-        raise HarvestError("candidate must change both classified tests and implementation/source files")
-    if not admission.minimum_production_paths <= len(sources) <= admission.maximum_production_paths:
-        raise HarvestError(
-            f"candidate changes {len(sources)} production paths; required "
-            f"{admission.minimum_production_paths}..{admission.maximum_production_paths}"
-        )
-    if len(ignored) * 2 >= len(paths):
-        raise HarvestError("ignored, generated, or vendored paths make up at least half the PR")
+    if not sources:
+        raise HarvestError("candidate has no observable code or runtime-configuration change")
+    if not tests:
+        raise HarvestError("candidate has no derivable independent behavior-test patch")
     changed_line_count = production_changed_lines(repo, parent, solution, sources)
-    if not (
-        admission.minimum_production_changed_lines
-        <= changed_line_count <= admission.maximum_production_changed_lines
-    ):
-        raise HarvestError(
-            f"production diff changes {changed_line_count} lines; required "
-            f"{admission.minimum_production_changed_lines}..{admission.maximum_production_changed_lines}"
-        )
     scale = validate_repository_scale(row, repo, parent, admission)
     test_patch = extract_patch(repo, parent, solution, tests)
     gold_patch = extract_patch(repo, parent, solution, sources)
@@ -674,15 +668,17 @@ def prepare_candidate(
     validate_proof(row, hashes)
     task_id = opaque_id(id_key, freeze, rule.key, pr_number, solution)
     identity = candidate_identity(rule.key, pr_number, parent, solution)
+    candidate_id = canonical_candidate_id(pr_number)
     commitment = sha256(identity)
-    score = hmac.new(id_key, b"selection-v3\0" + identity, hashlib.sha256).hexdigest()
+    score = candidate_hmac_rank(id_key, rule.key, candidate_id)
     row = dict(row)
     row["user_task"] = user_task
     row["task_class"] = task_type
     row["issue_number"] = issue_number
     row["issue_url"] = issue_url
     return PreparedTask(
-        task_id=task_id, repo=rule, row=row, parent=parent, solution=solution,
+        task_id=task_id, candidate_id=candidate_id, repo=rule, row=row,
+        parent=parent, solution=solution,
         merged_at=merged_at, changed_paths=paths, test_paths=tests, source_paths=sources,
         test_patch=test_patch, gold_patch=gold_patch, full_patch=full_patch,
         test_sha256=hashes["test_patch_sha256"], gold_sha256=hashes["gold_patch_sha256"],
@@ -735,45 +731,20 @@ def audit_near_duplicates(tasks: Sequence[PreparedTask]) -> list[dict[str, Any]]
             maximum = max(title_similarity, path_similarity, diff_similarity)
             if maximum <= 0.80:
                 continue
-            if not (
+            reviewed = (
                 _has_near_duplicate_review(left, right)
                 and _has_near_duplicate_review(right, left)
-            ):
-                raise HarvestError(
-                    "near-duplicate candidates above 0.80 lack reciprocal blinded review: "
-                    f"{left.candidate_commitment} vs {right.candidate_commitment}"
-                )
+            )
             findings.append({
                 "left": left.candidate_commitment,
                 "right": right.candidate_commitment,
                 "title_similarity": round(title_similarity, 6),
                 "path_jaccard": round(path_similarity, 6),
                 "production_diff_token_jaccard": round(diff_similarity, 6),
-                "reviewed": True,
+                "reviewed": reviewed,
+                "diagnostic_only": True,
             })
     return findings
-
-
-def require_candidate_pools(
-    tasks: Sequence[PreparedTask], rules: Mapping[str, RepoRule], minimum_per_slot: int
-) -> None:
-    counts = Counter((task.repo.key, str(task.row["task_class"])) for task in tasks)
-    bands_by_repo: dict[str, set[str]] = defaultdict(set)
-    for task in tasks:
-        bands_by_repo[task.repo.key].add(str(task.repository_scale["size_band"]))
-    inconsistent = sorted(key for key, bands in bands_by_repo.items() if len(bands) != 1)
-    if inconsistent:
-        raise HarvestError(f"repository scale band varies across candidate parents: {inconsistent}")
-    for key, rule in rules.items():
-        for task_class, slots in rule.task_class_slots.items():
-            if slots <= 0:
-                continue
-            required = slots * minimum_per_slot
-            if counts[(key, task_class)] < required:
-                raise HarvestError(
-                    f"candidate pool {key}/{task_class} has {counts[(key, task_class)]} passing "
-                    f"candidates; requires at least {required} for {slots} slot(s)"
-                )
 
 
 def enforce_band_distribution(selected: Sequence[PreparedTask], admission: AdmissionRules) -> None:
@@ -863,23 +834,30 @@ def load_denylists(paths: Sequence[Path]) -> tuple[dict[str, set[Any]], list[dic
     return denied, commitments
 
 
+def candidate_denylist_matches(
+    task: PreparedTask, denied: Mapping[str, set[Any]],
+) -> list[str]:
+    repo_url = normalize_url(task.repo.url)
+    reasons: list[str] = []
+    if (repo_url, task.solution) in denied["solutions"]:
+        reasons.append("solution_commit")
+    if any(
+        repo_url == denied_url and task.solution.startswith(prefix)
+        for denied_url, prefix in denied["solution_prefixes"]
+    ):
+        reasons.append("solution_prefix")
+    if task.gold_sha256 in denied["gold_hashes"]:
+        reasons.append("gold_patch")
+    if task.test_sha256 in denied["test_hashes"]:
+        reasons.append("test_patch")
+    if task.row["issue_url"] in denied["issue_urls"]:
+        reasons.append("issue_url")
+    return reasons
+
+
 def enforce_denylists(tasks: Sequence[PreparedTask], denied: Mapping[str, set[Any]]) -> None:
     for task in tasks:
-        repo_url = normalize_url(task.repo.url)
-        reasons: list[str] = []
-        if (repo_url, task.solution) in denied["solutions"]:
-            reasons.append("solution commit")
-        if any(
-            repo_url == denied_url and task.solution.startswith(prefix)
-            for denied_url, prefix in denied["solution_prefixes"]
-        ):
-            reasons.append("solution prefix")
-        if task.gold_sha256 in denied["gold_hashes"]:
-            reasons.append("gold patch")
-        if task.test_sha256 in denied["test_hashes"]:
-            reasons.append("test patch")
-        if task.row["issue_url"] in denied["issue_urls"]:
-            reasons.append("issue URL")
+        reasons = candidate_denylist_matches(task, denied)
         if reasons:
             raise HarvestError(
                 f"candidate {task.candidate_commitment} matches denylist by {', '.join(reasons)}"
@@ -888,7 +866,8 @@ def enforce_denylists(tasks: Sequence[PreparedTask], denied: Mapping[str, set[An
 
 def validate_stage_manifests(
     paths: Sequence[Path], freeze: Freeze, adapter_manifest_path: Path,
-    adapters: Mapping[str, Mapping[str, Any]], candidates_path: Path,
+    adapters: Mapping[str, Mapping[str, Any]], rules: Mapping[str, RepoRule],
+    candidates_path: Path,
 ) -> list[dict[str, Any]]:
     if len(paths) != 2:
         raise HarvestError("seal requires exactly metadata and validation stage manifests")
@@ -910,6 +889,15 @@ def validate_stage_manifests(
             or document.get("adapter_manifest_sha256") != expected_adapter_hash
             or document.get("images") != expected_images
             or document.get("network") != ("bridge" if stage == "metadata" else "none")
+            or (
+                stage == "validate" and document.get("selection_order") != {
+                    "algorithm": SELECTION_ALGORITHM,
+                    "secret_sha256": freeze.frozen_spec["selection_secret_sha256"],
+                    "required_passing_per_repository": {
+                        key: rule.quota + rule.reserves for key, rule in sorted(rules.items())
+                    },
+                }
+            )
         ):
             raise HarvestError(f"adapter {stage} stage manifest commitments differ from seal inputs")
         combined = path.parent / "all.jsonl"
@@ -920,124 +908,88 @@ def validate_stage_manifests(
         by_stage[str(stage)] = (path, document)
     if set(by_stage) != {"metadata", "validate"}:
         raise HarvestError("both metadata and validation stage manifests are required")
+    candidate_sets: dict[str, set[tuple[str, str]]] = {}
+    for stage, (path, _) in by_stage.items():
+        identities: set[tuple[str, str]] = set()
+        for index, row in enumerate(load_jsonl(path.parent / "all.jsonl"), 1):
+            repository = row.get("repository")
+            pr_number = row.get("pr_number")
+            if not isinstance(repository, str) or not isinstance(pr_number, int):
+                raise HarvestError(f"adapter {stage} row {index} lacks repository/pr_number identity")
+            identity = (repository, str(row.get("candidate_id") or canonical_candidate_id(pr_number)))
+            if identity in identities:
+                raise HarvestError(f"adapter {stage} ledger duplicates candidate {identity}")
+            identities.add(identity)
+        candidate_sets[stage] = identities
+    if candidate_sets["metadata"] != candidate_sets["validate"]:
+        missing = sorted(candidate_sets["metadata"] - candidate_sets["validate"])
+        extra = sorted(candidate_sets["validate"] - candidate_sets["metadata"])
+        raise HarvestError(
+            f"validation ledger must contain every metadata candidate exactly once; "
+            f"missing={missing[:5]} extra={extra[:5]}"
+        )
     return [
         {
             "stage": stage,
             "manifest_sha256": sha256(path.read_bytes()),
             "combined_sha256": document["combined_sha256"],
             "network": document["network"],
+            "selection_order": document.get("selection_order"),
             "images": document["images"],
         }
         for stage, (path, document) in sorted(by_stage.items())
     ]
 
 
-def select_tasks(tasks: Sequence[PreparedTask], rules: Mapping[str, RepoRule], quotas: Quotas) -> list[PreparedTask]:
+def select_repository_sample(
+    ranked_candidates: Sequence[PreparedTask], task_count: int, reserve_count: int,
+) -> tuple[list[PreparedTask], list[PreparedTask]]:
+    """Take tasks then reserves from one repository's HMAC order."""
+    ordered = sorted(ranked_candidates, key=lambda task: (task.selection_score, task.candidate_id))
+    required = task_count + reserve_count
+    if len(ordered) < required:
+        repository = ordered[0].repo.key if ordered else "unknown"
+        raise HarvestError(
+            f"repository {repository} has {len(ordered)} reproducibly passing candidates; "
+            f"requires {task_count} tasks plus {reserve_count} reserves"
+        )
+    return ordered[:task_count], ordered[task_count:required]
+
+
+def select_tasks(
+    tasks: Sequence[PreparedTask], rules: Mapping[str, RepoRule], quotas: Quotas,
+) -> tuple[list[PreparedTask], list[PreparedTask]]:
     pools: dict[str, list[PreparedTask]] = defaultdict(list)
-    seen_sources: set[tuple[str, str]] = set()
     seen_ids: set[str] = set()
-    seen_gold: set[str] = set()
-    seen_tests: set[str] = set()
-    seen_issue_states: set[tuple[str, str, str]] = set()
     for task in tasks:
-        source = (task.repo.key, task.solution)
-        issue_state = (task.repo.key, task.parent, str(task.row["issue_url"]))
-        if (
-            source in seen_sources or task.task_id in seen_ids
-            or task.gold_sha256 in seen_gold or task.test_sha256 in seen_tests
-            or issue_state in seen_issue_states
-        ):
-            raise HarvestError("duplicate candidate source, patch, issue state, or opaque id")
-        seen_sources.add(source)
+        if task.task_id in seen_ids:
+            raise HarvestError("opaque task ID collision")
         seen_ids.add(task.task_id)
-        seen_gold.add(task.gold_sha256)
-        seen_tests.add(task.test_sha256)
-        seen_issue_states.add(issue_state)
         pools[task.repo.key].append(task)
-    for pool in pools.values():
-        pool.sort(key=lambda task: task.selection_score)
 
     selected: list[PreparedTask] = []
-    repo_counts: Counter[str] = Counter()
-    language_counts: Counter[str] = Counter()
-    type_counts: Counter[str] = Counter()
-
-    def can_take(task: PreparedTask) -> bool:
-        task_type = str(task.row["task_class"])
-        language_cap = quotas.max_per_language.get(task.repo.language)
-        type_cap = task.repo.task_class_slots.get(task_type) if task.repo.task_class_slots else None
-        return (
-            repo_counts[task.repo.key] < task.repo.quota
-            and (language_cap is None or language_counts[task.repo.language] < language_cap)
-            and (
-                type_cap is None
-                or sum(
-                    1 for selected_task in selected
-                    if selected_task.repo.key == task.repo.key
-                    and selected_task.row["task_class"] == task_type
-                ) < type_cap
-            )
-        )
-
-    def take(task: PreparedTask) -> None:
-        selected.append(task)
-        repo_counts[task.repo.key] += 1
-        language_counts[task.repo.language] += 1
-        type_counts[str(task.row["task_class"])] += 1
-
-    # First honor declared repository floors.  This prevents a high-yield repo
-    # from replacing harder-to-validate repositories.
+    reserves: list[PreparedTask] = []
     for key in sorted(rules):
         rule = rules[key]
-        if len(pools.get(key, [])) < rule.minimum:
-            raise HarvestError(f"repository {key} has fewer eligible tasks than its minimum")
-        for task in pools.get(key, [])[: rule.minimum]:
-            if not can_take(task):
-                raise HarvestError(f"global caps conflict with repository minimum for {key}")
-            take(task)
-
-    positions = {key: rules[key].minimum for key in rules}
-    while len(selected) < quotas.target_tasks:
-        progressed = False
-        for key in sorted(rules):
-            pool = pools.get(key, [])
-            pos = positions[key]
-            while pos < len(pool):
-                task = pool[pos]
-                pos += 1
-                positions[key] = pos
-                if can_take(task):
-                    take(task)
-                    progressed = True
-                    break
-            if len(selected) >= quotas.target_tasks:
-                break
-        if not progressed:
-            break
+        repo_tasks, repo_reserves = select_repository_sample(
+            pools.get(key, []), rule.quota, rule.reserves,
+        )
+        selected.extend(repo_tasks)
+        reserves.extend(repo_reserves)
 
     if len(selected) != quotas.target_tasks:
-        raise HarvestError(f"quotas selected {len(selected)} tasks, need {quotas.target_tasks}")
-    represented = {task.repo.key for task in selected}
-    if len(represented) < quotas.min_repositories:
-        raise HarvestError(
-            f"only {len(represented)} repositories represented, need {quotas.min_repositories}"
-        )
-    for key, rule in rules.items():
-        actual = Counter(
-            str(task.row["task_class"]) for task in selected if task.repo.key == key
-        )
-        expected = Counter({name: count for name, count in rule.task_class_slots.items() if count})
-        if actual != expected:
-            raise HarvestError(f"selected class slots for {key} are {dict(actual)}, expected {dict(expected)}")
+        raise HarvestError(f"natural sample selected {len(selected)} tasks, need {quotas.target_tasks}")
+    if len({task.repo.key for task in selected}) != quotas.repository_count:
+        raise HarvestError("natural sample does not represent every frozen repository")
+    language_counts = Counter(task.repo.language for task in selected)
     if language_counts != Counter(quotas.max_per_language):
         raise HarvestError(
-            f"selected language quotas are {dict(language_counts)}, expected {dict(quotas.max_per_language)}"
+            f"selected language balance is {dict(language_counts)}, expected {dict(quotas.max_per_language)}"
         )
-    if type_counts != Counter(quotas.task_class_quotas):
-        raise HarvestError(
-            f"selected class quotas are {dict(type_counts)}, expected {dict(quotas.task_class_quotas)}"
-        )
-    return sorted(selected, key=lambda task: task.task_id)
+    return (
+        sorted(selected, key=lambda task: task.task_id),
+        sorted(reserves, key=lambda task: (task.repo.key, task.selection_score)),
+    )
 
 
 def tree_entries(repo: Path, parent: str) -> list[tuple[int, str, str, str]]:
@@ -1116,8 +1068,9 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def build_release(
-    selected: Sequence[PreparedTask], freeze: Freeze, layout: StorageLayout,
-    registry_bytes: bytes, key_fingerprint: str, commitments: Mapping[str, Any],
+    selected: Sequence[PreparedTask], reserves: Sequence[PreparedTask], freeze: Freeze,
+    layout: StorageLayout, registry_bytes: bytes, selection_secret: bytes,
+    candidate_ledger: Sequence[Mapping[str, Any]], commitments: Mapping[str, Any],
     near_duplicate_findings: Sequence[Mapping[str, Any]],
 ) -> Path:
     target = layout.releases / freeze.freeze_id
@@ -1176,7 +1129,7 @@ def build_release(
                 "changed_paths": task.changed_paths,
                 "test_paths": task.test_paths,
                 "source_paths": task.source_paths,
-                "admission": {
+                "diagnostics": {
                     "production_changed_lines": task.production_changed_lines,
                     "production_path_count": len(task.source_paths),
                     "total_path_count": len(task.changed_paths),
@@ -1210,6 +1163,43 @@ def build_release(
                 },
             })
 
+        sealed_reserves: list[dict[str, Any]] = []
+        for task in reserves:
+            reserve_root = staging / "sealed" / "reserves"
+            snapshot_rel = f"reserves/snapshots/{task.task_id}.tar"
+            snapshot_hash = write_parent_snapshot(
+                layout.mirrors / task.repo.mirror, task.parent,
+                staging / "sealed" / snapshot_rel,
+                allow_submodules=task.repo.allow_submodules,
+            )
+            patch_dir = reserve_root / "patches"
+            patch_dir.mkdir(parents=True, exist_ok=True)
+            test_rel = f"reserves/patches/{task.task_id}.test.patch"
+            gold_rel = f"reserves/patches/{task.task_id}.gold.patch"
+            (staging / "sealed" / test_rel).write_bytes(task.test_patch)
+            (staging / "sealed" / gold_rel).write_bytes(task.gold_patch)
+            sealed_reserves.append({
+                "id": task.task_id,
+                "candidate_id": task.candidate_id,
+                "repository": {"key": task.repo.key, "url": task.repo.url},
+                "hmac_rank": task.selection_score,
+                "pr_number": task.row["pr_number"],
+                "parent_commit": task.parent,
+                "solution_commit": task.solution,
+                "snapshot": snapshot_rel,
+                "snapshot_sha256": snapshot_hash,
+                "test_patch": test_rel,
+                "test_patch_sha256": task.test_sha256,
+                "gold_patch": gold_rel,
+                "gold_patch_sha256": task.gold_sha256,
+                "validation": task.row["validation"],
+            })
+        secret_path = staging / "sealed" / "selection-secret.bin"
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        secret_path.write_bytes(selection_secret)
+        ledger_path = staging / "sealed" / "candidate-ledger.jsonl"
+        ledger_path.write_bytes(b"".join(canonical_json(row) + b"\n" for row in candidate_ledger))
+
         public_doc = {
             "schema_version": SCHEMA_VERSION,
             "freeze": {
@@ -1234,10 +1224,14 @@ def build_release(
         sealed_doc = {
             "schema_version": "greppy.agent-coding-sealed.v3",
             "freeze_id": freeze.freeze_id,
-            "id_key_sha256": key_fingerprint,
+            "selection_secret": "selection-secret.bin",
+            "selection_secret_sha256": sha256(selection_secret),
+            "candidate_ledger": "candidate-ledger.jsonl",
+            "candidate_ledger_sha256": sha256(ledger_path.read_bytes()),
             "registry_sha256": sha256(registry_bytes),
             "commitments": dict(commitments),
             "tasks": sealed_tasks,
+            "reserves": sealed_reserves,
         }
         atomic_json(staging / "public" / "taskbank.json", public_doc)
         atomic_json(staging / "sealed" / "manifest.json", sealed_doc)
@@ -1246,6 +1240,8 @@ def build_release(
             "freeze_id": freeze.freeze_id,
             "created_at": format_time(dt.datetime.now(UTC)),
             "task_count": len(selected),
+            "reserve_count": len(reserves),
+            "reserve_repository_counts": dict(sorted(Counter(t.repo.key for t in reserves).items())),
             "repository_counts": dict(sorted(Counter(t.repo.key for t in selected).items())),
             "language_counts": dict(sorted(Counter(t.repo.language for t in selected).items())),
             "task_class_counts": dict(sorted(Counter(str(t.row["task_class"]) for t in selected).items())),
@@ -1279,13 +1275,13 @@ def build_release(
         raise
 
 
-def read_id_key(path: Path) -> bytes:
+def read_selection_secret(path: Path) -> bytes:
     try:
         key = path.read_bytes().strip()
     except OSError as exc:
-        raise HarvestError(f"cannot read id key {path}: {exc}") from exc
+        raise HarvestError(f"cannot read selection secret {path}: {exc}") from exc
     if len(key) < 32:
-        raise HarvestError("id key must contain at least 32 bytes")
+        raise HarvestError("selection secret must contain at least 32 bytes")
     return key
 
 
@@ -1443,6 +1439,7 @@ def run_adapter_stage(
     *, stage: str, registry_path: Path, freeze_path: Path, adapter_manifest_path: Path,
     layout: StorageLayout, docker_binary: str | None = None,
     metadata_env_file: Path | None = None,
+    selection_secret_path: Path | None = None,
 ) -> Path:
     """Run registered per-repository metadata or clean-room validation adapters.
 
@@ -1454,6 +1451,17 @@ def run_adapter_stage(
         raise HarvestError(f"unsupported adapter stage {stage}")
     rules, _, _ = load_registry(registry_path)
     freeze = load_freeze(freeze_path)
+    if freeze.frozen_spec.get("repository_registry_sha256") != sha256(registry_path.read_bytes()):
+        raise HarvestError("frozen registry hash differs from adapter-stage input")
+    if freeze.frozen_spec.get("adapter_manifest_sha256") != sha256(adapter_manifest_path.read_bytes()):
+        raise HarvestError("frozen adapter manifest hash differs from adapter-stage input")
+    selection_secret = None
+    if stage == "validate":
+        if selection_secret_path is None:
+            raise HarvestError("validation stage requires the sealed selection secret")
+        selection_secret = read_selection_secret(selection_secret_path)
+        if freeze.frozen_spec.get("selection_secret_sha256") != sha256(selection_secret):
+            raise HarvestError("selection secret differs from the frozen commitment")
     adapters = load_adapter_manifest(adapter_manifest_path)
     missing = sorted(set(rules) - set(adapters))
     if missing:
@@ -1486,10 +1494,9 @@ def run_adapter_stage(
             arguments = [
                 "--repository-id", key,
                 "--repository-url", rule.url,
-                "--created-after", format_time(freeze.eligible_created_after),
                 "--merged-after", format_time(freeze.eligible_after),
                 "--merged-before", format_time(freeze.eligible_before),
-                "--per-repo", "36",
+                "--all-merged-prs",
                 "--output", f"/output/{temp.name}",
             ]
             argv = adapter_container_argv(
@@ -1501,6 +1508,21 @@ def run_adapter_stage(
             metadata = layout.scratch / freeze.freeze_id / "metadata" / f"{key}.jsonl"
             if not metadata.exists():
                 raise HarvestError(f"metadata stage output is missing for {key}")
+            assert selection_secret is not None
+            ranked_metadata = io_dir / "ranked-metadata.jsonl"
+            metadata_rows = load_jsonl(metadata)
+            metadata_rows.sort(key=lambda row: (
+                candidate_hmac_rank(
+                    selection_secret, key,
+                    str(row.get("candidate_id") or canonical_candidate_id(
+                        _positive_int(row.get("pr_number"), "metadata pr_number")
+                    )),
+                ),
+                str(row.get("candidate_id") or row.get("pr_number")),
+            ))
+            ranked_metadata.write_bytes(
+                b"".join(canonical_json(row) + b"\n" for row in metadata_rows)
+            )
             scratch = layout.worktrees / freeze.freeze_id / key
             scratch.mkdir(parents=True, exist_ok=True)
             mirror = layout.mirrors / rule.mirror
@@ -1510,6 +1532,7 @@ def run_adapter_stage(
                 "--metadata", "/input/metadata.jsonl",
                 "--scratch", "/scratch",
                 "--repetitions", "2",
+                "--required-passing", str(rule.quota + rule.reserves),
                 "--offline",
                 "--runner-image-id", observed_image_id,
                 "--output", f"/output/{temp.name}",
@@ -1518,7 +1541,7 @@ def run_adapter_stage(
                 docker_binary, adapter, "validation", network="none",
                 mounts=(
                     (mirror, "/input/mirror", True),
-                    (metadata, "/input/metadata.jsonl", True),
+                    (ranked_metadata, "/input/metadata.jsonl", True),
                     (scratch, "/scratch", False),
                     (io_dir, "/output", False),
                 ),
@@ -1538,35 +1561,14 @@ def run_adapter_stage(
         # to the next stage.
         rows = load_jsonl(temp)
         if stage == "metadata":
-            def structurally_eligible(row: Mapping[str, Any]) -> bool:
-                paths = row.get("authoritative_changed_paths")
-                if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
-                    return False
-                ignored = {
-                    path for path in paths
-                    if is_vendor_or_generated(path)
-                    or any(fnmatch.fnmatchcase(path, pattern) for pattern in rule.ignore_globs)
-                }
-                tests = {
-                    path for path in paths if path not in ignored
-                    and any(fnmatch.fnmatchcase(path, pattern) for pattern in rule.test_globs)
-                }
-                sources = set(paths) - ignored - tests
-                return bool(
-                    len(paths) <= 30 and 2 <= len(sources) <= 20 and tests
-                    and len(ignored) * 2 < len(paths)
-                )
-
-            eligible = sum(structurally_eligible(row) for row in rows)
-            if len(rows) < 36 or eligible < 18:
-                raise HarvestError(
-                    f"metadata adapter for {key} produced {len(rows)} candidates / "
-                    f"{eligible} structurally eligible; requires at least 36 / 18"
-                )
-            stage_stats[key] = {"rows": len(rows), "structurally_eligible": eligible}
+            # The adapter contract is exhaustive: no count cap and no patch-shape
+            # prefilter. Every merged PR in the frozen window is retained.
+            stage_stats[key] = {"rows": len(rows), "all_merged_prs": len(rows)}
         else:
             stage_stats[key] = {"rows": len(rows)}
         os.replace(temp, output)
+        if stage == "validate":
+            ranked_metadata.unlink()
         io_dir.rmdir()
         outputs.append(output)
     combined = stage_root / "all.jsonl"
@@ -1586,6 +1588,15 @@ def run_adapter_stage(
         "freeze_id": freeze.freeze_id,
         "adapter_manifest_sha256": sha256(adapter_manifest_path.read_bytes()),
         "network": "bridge" if stage == "metadata" else "none",
+        "selection_order": (
+            None if stage == "metadata" else {
+                "algorithm": SELECTION_ALGORITHM,
+                "secret_sha256": freeze.frozen_spec["selection_secret_sha256"],
+                "required_passing_per_repository": {
+                    key: rule.quota + rule.reserves for key, rule in sorted(rules.items())
+                },
+            }
+        ),
         "images": stage_images,
         "outputs": {
             output.name: {
@@ -1612,10 +1623,20 @@ def harvest(
         corpus.get("target_tasks") != quotas.target_tasks
         or corpus.get("repositories") != len(rules)
         or corpus.get("tasks_per_repository") != next(iter(rules.values())).quota
+        or corpus.get("minimum_reserves_per_repository") != next(iter(rules.values())).reserves
         or corpus.get("languages") != len(quotas.max_per_language)
     ):
         raise HarvestError("corpus contract and repository registry quotas differ")
-    id_key = read_id_key(id_key_path)
+    selection_secret = read_selection_secret(id_key_path)
+    expected_frozen_hashes = {
+        "repository_registry_sha256": sha256(registry_bytes),
+        "corpus_contract_sha256": sha256(contract_bytes),
+        "adapter_manifest_sha256": sha256(adapter_manifest_path.read_bytes()),
+        "selection_secret_sha256": sha256(selection_secret),
+    }
+    for field, observed in expected_frozen_hashes.items():
+        if freeze.frozen_spec.get(field) != observed:
+            raise HarvestError(f"frozen_spec.{field} differs from the harvest input")
     adapters = load_adapter_manifest(adapter_manifest_path)
     if set(adapters) != set(rules):
         raise HarvestError("ready adapter manifest does not cover the exact frozen registry")
@@ -1623,34 +1644,127 @@ def harvest(
         if adapters[key].get("toolchain_profile") != rule.toolchain:
             raise HarvestError(f"adapter toolchain profile mismatch for {key}")
     stage_commitments = validate_stage_manifests(
-        stage_manifest_paths, freeze, adapter_manifest_path, adapters, candidates_path
+        stage_manifest_paths, freeze, adapter_manifest_path, adapters, rules, candidates_path
     )
     denied, denylist_commitments = load_denylists(denylist_paths)
     candidate_rows = load_jsonl(candidates_path)
     prepared: list[PreparedTask] = []
+    prepared_by_key: dict[tuple[str, str], PreparedTask] = {}
+    ledger_seed: list[dict[str, Any]] = []
     verified: set[str] = set()
+    seen_candidate_keys: set[tuple[str, str]] = set()
+    validation_failure_reasons = {
+        "parent_hidden_wrong_failure", "gold_or_pass_to_pass_not_green",
+        "external_paid_privileged_or_mutable_requirement", "registered_budget_inexecutable",
+    }
     for index, row in enumerate(candidate_rows, 1):
         key = row.get("repository")
         if key not in rules:
             raise HarvestError(f"candidate {index} references unregistered repository {key!r}")
+        pr_number = _positive_int(row.get("pr_number"), f"candidate {index} pr_number")
+        candidate_id = str(row.get("candidate_id") or canonical_candidate_id(pr_number))
+        candidate_key = (str(key), candidate_id)
+        if candidate_key in seen_candidate_keys:
+            raise HarvestError(f"duplicate candidate ledger identity {candidate_key}")
+        seen_candidate_keys.add(candidate_key)
+        rank = candidate_hmac_rank(selection_secret, str(key), candidate_id)
+        declared_exclusion = row.get("exclusion_reason")
+        if declared_exclusion is not None:
+            if declared_exclusion not in TECHNICAL_EXCLUSION_REASONS:
+                raise HarvestError(
+                    f"candidate {index} has non-enumerated exclusion reason {declared_exclusion!r}"
+                )
+            ledger_seed.append({
+                "repository": str(key), "candidate_id": candidate_id,
+                "hmac_sha256": rank, "admission_decision": "excluded",
+                "exclusion_reason": declared_exclusion,
+                "exclusion_cause": row.get("exclusion_cause"),
+                "validation_outcome": (
+                    "failed" if declared_exclusion in validation_failure_reasons else "not_run"
+                ),
+                "diagnostics": {
+                    "task_class": row.get("task_class"),
+                    "authoritative_changed_path_count": len(row.get("authoritative_changed_paths") or []),
+                },
+            })
+            continue
+        if row.get("validation_outcome") == "not_run":
+            ledger_seed.append({
+                "repository": str(key), "candidate_id": candidate_id,
+                "hmac_sha256": rank, "admission_decision": "admitted",
+                "exclusion_reason": None, "exclusion_cause": None,
+                "validation_outcome": "not_run",
+                "diagnostics": {
+                    "task_class": row.get("task_class"),
+                    "authoritative_changed_path_count": len(row.get("authoritative_changed_paths") or []),
+                },
+            })
+            continue
         rule = rules[str(key)]
         mirror = layout.mirrors / rule.mirror
         if key not in verified:
             verify_mirror(mirror, rule)
             verified.add(str(key))
         try:
-            prepared.append(prepare_candidate(row, rule, mirror, freeze, id_key, admission))
+            task = prepare_candidate(row, rule, mirror, freeze, selection_secret, admission)
         except HarvestError as exc:
             raise HarvestError(f"candidate {index} ({key}): {exc}") from exc
-    enforce_denylists(prepared, denied)
-    require_candidate_pools(prepared, rules, admission.minimum_candidates_per_slot)
+        denylist_matches = candidate_denylist_matches(task, denied)
+        if denylist_matches:
+            ledger_seed.append({
+                "repository": str(key), "candidate_id": candidate_id,
+                "hmac_sha256": rank, "admission_decision": "excluded",
+                "exclusion_reason": "denylisted", "exclusion_cause": denylist_matches,
+                "validation_outcome": "not_run",
+                "diagnostics": {
+                    "task_class": task.row.get("task_class"),
+                    "production_path_count": len(task.source_paths),
+                    "production_changed_lines": task.production_changed_lines,
+                },
+            })
+            continue
+        prepared.append(task)
+        prepared_by_key[candidate_key] = task
+        ledger_seed.append({
+            "repository": str(key), "candidate_id": candidate_id,
+            "hmac_sha256": rank, "admission_decision": "admitted",
+            "exclusion_reason": None, "exclusion_cause": None,
+            "validation_outcome": "passed",
+            "diagnostics": {
+                "task_class": task.row.get("task_class"),
+                "production_path_count": len(task.source_paths),
+                "production_changed_lines": task.production_changed_lines,
+                "total_path_count": len(task.changed_paths),
+            },
+        })
     near_findings = audit_near_duplicates(prepared)
-    selected = select_tasks(prepared, rules, quotas)
+    selected, reserves = select_tasks(prepared, rules, quotas)
     enforce_band_distribution(selected, admission)
-    canonical_rows = b"".join(
-        canonical_json(row) + b"\n"
-        for row in sorted(candidate_rows, key=lambda value: canonical_json(value))
-    )
+    selected_keys = {(task.repo.key, task.candidate_id) for task in selected}
+    reserve_keys = {(task.repo.key, task.candidate_id) for task in reserves}
+    rank_positions: dict[tuple[str, str], int] = {}
+    by_repository: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in ledger_seed:
+        by_repository[entry["repository"]].append(entry)
+    for repository, entries in by_repository.items():
+        for position, entry in enumerate(
+            sorted(entries, key=lambda item: (item["hmac_sha256"], item["candidate_id"])), 1
+        ):
+            rank_positions[(repository, entry["candidate_id"])] = position
+    candidate_ledger: list[dict[str, Any]] = []
+    for entry in sorted(ledger_seed, key=lambda item: (item["repository"], rank_positions[(item["repository"], item["candidate_id"])])):
+        candidate_key = (entry["repository"], entry["candidate_id"])
+        disposition = (
+            "task" if candidate_key in selected_keys
+            else "reserve" if candidate_key in reserve_keys
+            else "neither"
+        )
+        candidate_ledger.append({
+            **entry,
+            "hmac_rank_position": rank_positions[candidate_key],
+            "disposition": disposition,
+        })
+    canonical_rows = b"".join(canonical_json(row) + b"\n" for row in candidate_ledger)
     registry_document = json.loads(registry_bytes)
     adapter_bytes = adapter_manifest_path.read_bytes()
     freeze_bytes = freeze_path.read_bytes()
@@ -1660,8 +1774,10 @@ def harvest(
         "canonical_candidate_ledger_sha256": sha256(canonical_rows),
         "adapter_manifest_sha256": sha256(adapter_bytes),
         "freeze_manifest_sha256": sha256(freeze_bytes),
-        "selection_secret_sha256": sha256(id_key),
-        "selection_algorithm": "HMAC-SHA256(selection_secret, canonical_candidate_identity)",
+        "frozen_spec_sha256": freeze.frozen_spec_sha256,
+        "selection_secret_sha256": sha256(selection_secret),
+        "selection_algorithm": SELECTION_ALGORITHM,
+        "replacement_algorithm": "same repository's next HMAC rank only",
         "opaque_id_algorithm": "first 128 bits of domain-separated HMAC-SHA256",
         "toolchain_profiles_sha256": sha256(canonical_json(registry_document["toolchain_profiles"])),
         "adapter_proof_sha256": {
@@ -1678,7 +1794,8 @@ def harvest(
         "adapter_stage_runs": stage_commitments,
     }
     return build_release(
-        selected, freeze, layout, registry_bytes, sha256(id_key), commitments, near_findings
+        selected, reserves, freeze, layout, registry_bytes, selection_secret,
+        candidate_ledger, commitments, near_findings,
     )
 
 
@@ -1700,11 +1817,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "--metadata-env-file", type=Path, required=True,
                 help="Docker env-file containing the GitHub API credential; its contents are never logged",
             )
+        else:
+            stage_parser.add_argument("--selection-secret-file", type=Path, required=True)
     seal_parser = subparsers.add_parser("seal")
     seal_parser.add_argument("--registry", type=Path, required=True)
     seal_parser.add_argument("--freeze", type=Path, required=True)
     seal_parser.add_argument("--candidates", type=Path, required=True)
-    seal_parser.add_argument("--id-key-file", type=Path, required=True)
+    seal_parser.add_argument(
+        "--selection-secret-file", "--id-key-file", dest="selection_secret_file",
+        type=Path, required=True,
+    )
     seal_parser.add_argument("--contract", type=Path, required=True)
     seal_parser.add_argument("--adapter-manifest", type=Path, required=True)
     seal_parser.add_argument(
@@ -1732,11 +1854,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stage=args.stage, registry_path=args.registry, freeze_path=args.freeze,
                 adapter_manifest_path=args.adapter_manifest, layout=layout,
                 metadata_env_file=getattr(args, "metadata_env_file", None),
+                selection_secret_path=getattr(args, "selection_secret_file", None),
             )
         else:
             output = harvest(
                 registry_path=args.registry, freeze_path=args.freeze,
-                candidates_path=args.candidates, id_key_path=args.id_key_file,
+                candidates_path=args.candidates, id_key_path=args.selection_secret_file,
                 contract_path=args.contract, adapter_manifest_path=args.adapter_manifest,
                 denylist_paths=args.denylist, stage_manifest_paths=args.stage_manifest,
                 layout=layout,

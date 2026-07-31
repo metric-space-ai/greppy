@@ -8,7 +8,8 @@ Greppy use is voluntary. Capability tags are added only after the run.
 ## Fixed design
 
 - 144 tasks from 24 repositories and eight graph-certified languages.
-- Exactly six tasks per repository (4.17%); exactly 18 per language (12.5%).
+- Exactly six tasks plus at least two sealed reserves per repository (4.17% of
+  released tasks); exactly 18 released tasks per language (12.5%).
 - Real merged PRs that close real issues; issue title and body are the verbatim
   prompt.
 - The PR's production delta is sealed gold. Its behavior tests become hidden
@@ -19,7 +20,7 @@ Greppy use is voluntary. Capability tags are added only after the run.
 - Same model, budget, normal tools, hardware and grader in both arms. The
   treatment is the exact shipped `AGENTS.md`, loaded at run time and hashed.
 
-The exact repository/class matrix is
+The exact repository/language registry is
 [`repository_registry.json`](repository_registry.json). The admission,
 selection, contamination, validation, execution and storage rules are in
 [`corpus_contract.json`](corpus_contract.json). Both files are preregistration
@@ -45,14 +46,15 @@ repo selection, holdout, isolation and quota policy.
 
 ## Harvest and selection sequence
 
-1. Generate and escrow the selection secret. Freeze this registry, contract,
-   temporal window, Greppy release candidate, agent, model and prompts.
-2. Harvest PR/issue metadata through the GitHub API for all 24 repos. Seek at
-   least 36 metadata candidates and require at least 18 structurally eligible
-   candidates per repo. Do not clone during metadata harvest.
-3. Freeze a canonical candidate ledger including PR timestamps, issue snapshot,
-   exact base/merge provenance, changed paths and metadata hashes. Denylist V2,
-   SWE-bench and previously published Greppy tasks.
+1. Before harvest, freeze and hash the registry, contract, temporal window,
+   model, agent, budgets, exact selection algorithm, and selection-secret
+   commitment. Escrow the secret itself.
+2. Harvest every merged PR in the window for all 24 repositories. There is no
+   target candidate count and no metadata prefilter by patch shape or task class.
+3. Preserve one candidate-ledger row per PR. Apply only the enumerated technical
+   exclusions, including linked-issue/provenance, substantive code or config,
+   independent behavior tests, reproducible parent-fail/gold-pass/PASS_TO_PASS,
+   offline execution, leak, denylist, and registered-budget checks.
 4. On gpu3, keep one trusted builder clone per repository on configured NVMe.
    Fetch missing objects into that clone and create disposable validation
    worktrees. Do not make a full clone per candidate.
@@ -60,13 +62,15 @@ repo selection, holdout, isolation and quota policy.
    then prove baseline-pass, hidden `FAIL_TO_PASS` parent-fail/gold-pass and
    `PASS_TO_PASS` on two clean runs. JDK/Maven deployment or version failure is
    a hard preflight failure, never a reason to drop Java.
-6. Classify candidates before either benchmark arm runs. Within every exact
-   repo/class slot, HMAC-rank all passing candidates and choose the first. A
-   failed candidate may be replaced only by the next passing candidate in the
-   same slot.
+6. For each repository, compute `HMAC-SHA256(secret, repo_id + NUL +
+   candidate_id)`, sort ascending, and validate in that order until six tasks
+   plus at least two reserves pass. Replacement is only the same repository's
+   next rank; task class, changed files/lines, cross-file shape, and expected
+   Greppy behavior cannot affect selection.
 7. Export deterministic parent trees into new one-commit repositories. Store
-   immutable snapshots, tests, gold and the signed corpus manifest on the
-   configured NAS; agents cannot mount or read it.
+   immutable snapshots, tests, gold, reserves, the candidate ledger, the sealed
+   selection secret, and the signed corpus manifest on configured NAS; agents
+   cannot mount or read it.
 8. Run exactly three complete paired trajectories and manually read all six traces.
    Fix and rerun the smoke after any prompt, binary, harness, adapter or limit
    change. Sign the reviewed smoke evidence. Only then start the 144-task run.
@@ -144,8 +148,10 @@ flow.
 
 ## Release-blocking invariants
 
-- The final matrix is exactly 24 repos × 6 tasks and matches every class quota.
-- No repo/class survivor may backfill a different slot.
+- The final corpus is exactly 24 repos × 6 tasks, eight languages, plus at least
+  two sealed reserves per repository.
+- A failed candidate is replaced only by the same repository's next HMAC rank;
+  no repository, class, or patch-shape backfill is allowed.
 - `git rev-list --all --count` is exactly one inside every agent workspace;
   there are no remotes, alternates, hidden tests or gold-derived IDs.
 - Agent network egress is denied.
@@ -157,12 +163,13 @@ flow.
 - Any post-seal change creates a new identity and requires a complete rerun.
 
 The preregistered release decision additionally requires all 144 tasks, paired
-correctness 95% lower bound at least −5 percentage points, repository-clustered
-ITT gross provider-cost ratio 95% upper bound at most 0.80, Greppy use on at
-least 80% of treatment tasks, and valid signed operational evidence. Missing or
-invalid arms and every zero denominator fail, and a failed full-run gate exits
-nonzero after preserving the immutable archive. Token and wall-time results
-include paired bootstrap intervals.
+correctness 95% lower bound at least −5 percentage points,
+repository-clustered ITT gross provider-cost ratio 95% upper bound at most
+0.80, and valid signed operational evidence. Greppy adoption is reported only
+as a diagnostic and can never gate release. Missing or invalid arms and every
+zero denominator fail, and a failed full-run gate exits nonzero after preserving
+the immutable archive. Token and wall-time results include paired bootstrap
+intervals.
 
 Pi's current post-hoc JSON cannot observe the workspace immediately before and
 after an individual failed Greppy edit. Therefore transactionality is explicitly

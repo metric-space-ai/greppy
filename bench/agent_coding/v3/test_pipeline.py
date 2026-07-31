@@ -6,16 +6,19 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
 from bench.agent_coding.v3.pipeline import (
     HarvestError,
+    candidate_hmac_rank,
     canonical_json,
     extract_patch,
     harvest,
     load_freeze,
     run_adapter_stage,
+    select_repository_sample,
 )
 from bench.agent_coding.v3.runner import load_release
 from bench.agent_coding.v3.storage import StorageError, StorageLayout, load_storage
@@ -48,7 +51,6 @@ class PipelineTest(unittest.TestCase):
             "schema_version": "greppy.agent-coding-freeze.v1",
             "freeze_id": "sealed_test_2026q3",
             "frozen_at": "2026-07-31T12:00:00Z",
-            "eligible_pr_created_after": "2026-05-01T00:00:00Z",
             "eligible_merged_after": "2026-05-01T00:00:00Z",
             "eligible_merged_before": "2026-07-15T23:59:59Z",
             "source_metadata_cutoff": "2026-07-20T00:00:00Z",
@@ -60,15 +62,15 @@ class PipelineTest(unittest.TestCase):
             "target_task_count": 2,
             "repository_count": 2,
             "tasks_per_repository": 1,
+            "minimum_reserves_per_repository": 1,
             "primary_languages": ["python"],
             "language_task_quota": 2,
-            "selection_patterns": {"A": {"reported_bugfix": 1}},
             "toolchain_profiles": {"python-pip": {
                 "gpu3_prerequisites": ["python3"], "runner_family": "pytest"
             }},
             "repositories": [
-                {"id": "python-one", "url": "https://example.test/one", "primary_language": "python", "selection_pattern": "A", "toolchain_profile": "python-pip"},
-                {"id": "python-two", "url": "https://example.test/two", "primary_language": "python", "selection_pattern": "A", "toolchain_profile": "python-pip"},
+                {"id": "python-one", "url": "https://example.test/one", "primary_language": "python", "toolchain_profile": "python-pip"},
+                {"id": "python-two", "url": "https://example.test/two", "primary_language": "python", "toolchain_profile": "python-pip"},
             ],
         }), encoding="utf-8")
         self.key_path = root / "selection.key"
@@ -76,9 +78,8 @@ class PipelineTest(unittest.TestCase):
         self.contract_path = root / "contract.json"
         self.contract_path.write_text(json.dumps({
             "schema_version": "greppy.agent-coding-v3.corpus-contract.1",
-            "corpus": {"target_tasks": 2, "repositories": 2, "tasks_per_repository": 1, "languages": 1},
+            "corpus": {"target_tasks": 2, "repositories": 2, "tasks_per_repository": 1, "minimum_reserves_per_repository": 1, "languages": 1},
             "temporal_holdout": {
-                "candidate_pr_created_at_or_after": "2026-05-01T00:00:00Z",
                 "candidate_pr_merged_at_or_after": "2026-05-01T00:00:00Z",
                 "candidate_pr_merged_at_or_before": "2026-07-15T23:59:59Z",
             },
@@ -86,7 +87,6 @@ class PipelineTest(unittest.TestCase):
                 "minimum_eligible_source_files": 200,
                 "minimum_eligible_source_loc": 25000,
             },
-            "validation": {"minimum_candidate_pool_per_repo_class_slot": 2},
         }), encoding="utf-8")
         self.adapter_path = root / "adapters.json"
         self.adapter_path.write_text(json.dumps({
@@ -133,8 +133,10 @@ class PipelineTest(unittest.TestCase):
                 titles = {
                     11: "Lunar parser rejects inverted envelopes",
                     12: "Volcanic cache preserves cobalt markers",
+                    13: "Stellar decoder repairs amber signals",
                     21: "Orbital scheduler handles empty epochs",
                     22: "Quartz serializer normalizes broken frames",
+                    23: "Meteor router retains violet headers",
                 }
                 rows.append({
                     "repository": key, "pr_number": 100 + identity,
@@ -179,9 +181,9 @@ class PipelineTest(unittest.TestCase):
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
         (self.metadata_stage_dir / "all.jsonl").write_text(
-            "".join(json.dumps({"candidate": number}) + "\n" for number in range(36)),
-            encoding="utf-8",
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
+        self.refresh_freeze_spec()
         self.stage_manifest_paths = [
             self.metadata_stage_dir / "stage-manifest.json",
             self.validation_stage_dir / "stage-manifest.json",
@@ -192,6 +194,7 @@ class PipelineTest(unittest.TestCase):
         self.temp.cleanup()
 
     def harvest_release(self) -> Path:
+        self.refresh_freeze_spec()
         self.refresh_stage_manifests()
         return harvest(
             registry_path=self.registry_path, freeze_path=self.freeze_path,
@@ -200,6 +203,22 @@ class PipelineTest(unittest.TestCase):
             denylist_paths=[self.denylist_path],
             stage_manifest_paths=self.stage_manifest_paths, layout=self.layout,
         )
+
+    def refresh_freeze_spec(self) -> None:
+        document = json.loads(self.freeze_path.read_text())
+        spec = {
+            "repository_registry_sha256": hashlib.sha256(self.registry_path.read_bytes()).hexdigest(),
+            "corpus_contract_sha256": hashlib.sha256(self.contract_path.read_bytes()).hexdigest(),
+            "adapter_manifest_sha256": hashlib.sha256(self.adapter_path.read_bytes()).hexdigest(),
+            "selection_secret_sha256": hashlib.sha256(self.key_path.read_bytes().strip()).hexdigest(),
+            "model": {"provider": "test", "name": "test-model", "revision": "1"},
+            "agent": {"name": "test-agent", "version": "1"},
+            "budgets": {"max_turns": 10, "max_tokens": 1000, "wall_seconds": 60},
+            "selection_algorithm": "HMAC-SHA256(secret, repo_id + NUL + candidate_id), ascending",
+        }
+        document["frozen_spec"] = spec
+        document["frozen_spec_sha256"] = hashlib.sha256(canonical_json(spec)).hexdigest()
+        self.freeze_path.write_text(json.dumps(document), encoding="utf-8")
 
     def refresh_stage_manifests(self) -> None:
         adapters = json.loads(self.adapter_path.read_text())["adapters"]
@@ -217,6 +236,13 @@ class PipelineTest(unittest.TestCase):
                 "schema_version": "greppy.agent-coding-v3.adapter-stage.1",
                 "stage": stage, "freeze_id": "sealed_test_2026q3",
                 "adapter_manifest_sha256": adapter_hash, "network": network,
+                "selection_order": (
+                    None if stage == "metadata" else {
+                        "algorithm": "HMAC-SHA256(secret, repo_id + NUL + candidate_id), ascending",
+                        "secret_sha256": hashlib.sha256(self.key_path.read_bytes().strip()).hexdigest(),
+                        "required_passing_per_repository": {"python-one": 2, "python-two": 2},
+                    }
+                ),
                 "images": images, "outputs": {},
                 "combined_sha256": hashlib.sha256(combined.read_bytes()).hexdigest(),
             }), encoding="utf-8")
@@ -230,7 +256,7 @@ class PipelineTest(unittest.TestCase):
         run(repo, "git", "remote", "add", "origin", f"https://example.test/{key.removeprefix('python-')}")
         (repo / "src").mkdir()
         (repo / "tests").mkdir()
-        variants = ("lunar", "volcanic")
+        variants = ("lunar", "volcanic", "stellar")
         repo_word = key.replace("python-", "")
         for variant in variants:
             for suffix in ("core", "edge"):
@@ -271,6 +297,14 @@ class PipelineTest(unittest.TestCase):
         public = json.loads(public_text)
         sealed = json.loads((output / "sealed/manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(len(public["tasks"]), 2)
+        self.assertEqual(len(sealed["reserves"]), 2)
+        self.assertEqual((output / "sealed/selection-secret.bin").read_bytes(), self.key_path.read_bytes())
+        ledger = [
+            json.loads(line)
+            for line in (output / "sealed/candidate-ledger.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(ledger), 6)
+        self.assertEqual({row["disposition"] for row in ledger}, {"task", "reserve", "neither"})
         self.assertFalse(public["execution_contract"]["apply_test_patch_before_agent"])
         self.assertNotIn("pr_number", public_text)
         self.assertNotIn("solution_commit", public_text)
@@ -285,9 +319,9 @@ class PipelineTest(unittest.TestCase):
                 self.assertFalse(any(public_task["id"] in name for name in names))
                 sample = next(name for name in names if name.startswith("src/") and name.endswith(".py"))
                 self.assertNotIn(b"fixed_", archive.extractfile(sample).read())
-            self.assertEqual(private_task["admission"]["production_path_count"], 2)
-            self.assertEqual(private_task["admission"]["production_changed_lines"], 80)
-            self.assertEqual(private_task["admission"]["total_path_count"], 3)
+            self.assertEqual(private_task["diagnostics"]["production_path_count"], 2)
+            self.assertEqual(private_task["diagnostics"]["production_changed_lines"], 80)
+            self.assertEqual(private_task["diagnostics"]["total_path_count"], 3)
             evaluation = private_task["evaluation"]
             self.assertEqual(evaluation["post_patch_commands"], [["python3", "-c", "pass"]])
             self.assertEqual(
@@ -300,16 +334,17 @@ class PipelineTest(unittest.TestCase):
         for field in (
             "corpus_contract_sha256", "canonical_candidate_ledger_sha256",
             "adapter_manifest_sha256", "toolchain_profiles_sha256", "freeze_manifest_sha256",
+            "frozen_spec_sha256", "selection_secret_sha256",
         ):
             self.assertRegex(commitments[field], r"^[0-9a-f]{64}$")
 
-    def test_cutoff_is_enforced_before_writing_release(self) -> None:
+    def test_pr_created_before_merge_window_is_still_in_the_natural_sample(self) -> None:
         rows = [json.loads(line) for line in self.candidates_path.read_text().splitlines()]
-        rows[0]["created_at"] = "2026-04-30T23:59:59Z"
+        rows[0]["created_at"] = "2025-01-01T00:00:00Z"
         self.candidates_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        with self.assertRaisesRegex(HarvestError, "creation cutoff"):
-            self.harvest_release()
-        self.assertFalse((self.layout.releases / "sealed_test_2026q3").exists())
+        output = self.harvest_release()
+        ledger = (output / "sealed/candidate-ledger.jsonl").read_text()
+        self.assertIn('"candidate_id":"pull-request:111"', ledger)
 
     def test_seal_rejects_missing_or_shell_string_post_patch_commands(self) -> None:
         original = [json.loads(line) for line in self.candidates_path.read_text().splitlines()]
@@ -327,14 +362,16 @@ class PipelineTest(unittest.TestCase):
             ):
                 self.harvest_release()
 
-    def test_every_repo_class_slot_requires_two_passing_candidates(self) -> None:
+    def test_each_repository_requires_its_own_task_and_reserve(self) -> None:
         rows = [json.loads(line) for line in self.candidates_path.read_text().splitlines()]
+        for row in rows:
+            if row["repository"] == "python-one" and row["pr_number"] in {112, 113}:
+                row["exclusion_reason"] = "gold_or_pass_to_pass_not_green"
+                row["exclusion_cause"] = "clean-room validation failed"
         self.candidates_path.write_text(
-            "".join(json.dumps(row) + "\n" for row in rows if not (
-                row["repository"] == "python-one" and row["pr_number"] == 112
-            )), encoding="utf-8",
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
         )
-        with self.assertRaisesRegex(HarvestError, "requires at least 2"):
+        with self.assertRaisesRegex(HarvestError, "requires 1 tasks plus 1 reserves"):
             self.harvest_release()
 
     def test_repository_scale_floor_is_enforced(self) -> None:
@@ -361,15 +398,53 @@ class PipelineTest(unittest.TestCase):
                 "solution_commit": row["solution_commit"],
             }],
         }))
-        with self.assertRaisesRegex(HarvestError, "matches denylist"):
-            self.harvest_release()
+        output = self.harvest_release()
+        ledger = [
+            json.loads(line)
+            for line in (output / "sealed/candidate-ledger.jsonl").read_text().splitlines()
+        ]
+        denied = next(item for item in ledger if item["candidate_id"] == "pull-request:111")
+        self.assertEqual(denied["admission_decision"], "excluded")
+        self.assertEqual(denied["exclusion_reason"], "denylisted")
+        self.assertEqual(denied["disposition"], "neither")
 
-    def test_near_duplicate_requires_blinded_review_hook(self) -> None:
+    def test_near_duplicate_shape_is_diagnostic_and_cannot_change_selection(self) -> None:
         rows = [json.loads(line) for line in self.candidates_path.read_text().splitlines()]
         rows[1]["issue_title"] = rows[0]["issue_title"]
         self.candidates_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        with self.assertRaisesRegex(HarvestError, "near-duplicate"):
-            self.harvest_release()
+        output = self.harvest_release()
+        evidence = json.loads((output / "evidence/harvest.json").read_text())
+        findings = evidence["near_duplicate_review_findings"]
+        self.assertTrue(findings)
+        self.assertTrue(all(item["diagnostic_only"] for item in findings))
+        self.assertEqual(evidence["task_count"], 2)
+
+    def test_hmac_order_is_secret_keyed_and_replacement_stays_in_repository(self) -> None:
+        candidate_ids = ["pull-request:1", "pull-request:2", "pull-request:3"]
+        first_secret = b"first sealed selection secret" * 2
+        second_secret = b"second sealed selection secret" * 2
+
+        def order(secret: bytes) -> list[str]:
+            return sorted(
+                candidate_ids,
+                key=lambda candidate_id: candidate_hmac_rank(secret, "repo-a", candidate_id),
+            )
+
+        self.assertEqual(order(first_secret), order(first_secret))
+        self.assertNotEqual(order(first_secret), order(second_secret))
+        ranked_a = [
+            SimpleNamespace(
+                candidate_id=candidate_id,
+                selection_score=candidate_hmac_rank(first_secret, "repo-a", candidate_id),
+                repo=SimpleNamespace(key="repo-a"),
+            )
+            for candidate_id in candidate_ids
+        ]
+        task, replacement = select_repository_sample(ranked_a, 1, 1)
+        full_order = order(first_secret)
+        self.assertEqual(task[0].candidate_id, full_order[0])
+        self.assertEqual(replacement[0].candidate_id, full_order[1])
+        self.assertEqual(replacement[0].repo.key, task[0].repo.key)
 
     def test_adapter_stages_run_only_in_pinned_images_with_isolated_mounts(self) -> None:
         adapters = json.loads(self.adapter_path.read_text())["adapters"]
@@ -395,19 +470,16 @@ class PipelineTest(unittest.TestCase):
                 mounts[fields["dst"]] = Path(fields["src"])
             output_value = command[command.index("--output") + 1]
             host_output = mounts["/output"] / Path(output_value).name
-            if "adapter-metadata" in command:
-                rows = [
-                    {
-                        "candidate": number,
-                        "authoritative_changed_paths": (
-                            ["src/one.py", "src/two.py", "tests/test_one.py"]
-                            if number < 18 else ["README.md"]
-                        ),
-                    }
-                    for number in range(36)
-                ]
-            else:
-                rows = [{"validated": True}, {"validated": True}]
+            repository = command[command.index("--repository-id") + 1]
+            rows = [
+                {
+                    "repository": repository,
+                    "pr_number": number,
+                    "authoritative_changed_paths": ["src/one.py"],
+                    **({"validated": True} if "adapter-validation" in command else {}),
+                }
+                for number in (101, 102)
+            ]
             host_output.write_text("".join(json.dumps(row) + "\n" for row in rows))
             return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -426,6 +498,7 @@ class PipelineTest(unittest.TestCase):
                 stage="validate", registry_path=self.registry_path,
                 freeze_path=self.freeze_path, adapter_manifest_path=self.adapter_path,
                 layout=self.layout, docker_binary="fake-docker",
+                selection_secret_path=self.key_path,
             )
         self.assertTrue(metadata.is_file())
         self.assertTrue(validated.is_file())
@@ -438,8 +511,8 @@ class PipelineTest(unittest.TestCase):
             mount_specs = [argv[index + 1] for index, value in enumerate(argv) if value == "--mount"]
             self.assertEqual(len(mount_specs), 1)
             self.assertIn("dst=/output", mount_specs[0])
-            self.assertIn("--per-repo", argv)
-            self.assertEqual(argv[argv.index("--per-repo") + 1], "36")
+            self.assertIn("--all-merged-prs", argv)
+            self.assertNotIn("--per-repo", argv)
         for argv in validation_runs:
             self.assertEqual(argv[argv.index("--network") + 1], "none")
             mount_specs = [argv[index + 1] for index, value in enumerate(argv) if value == "--mount"]
@@ -447,6 +520,7 @@ class PipelineTest(unittest.TestCase):
             self.assertTrue(any("dst=/input/mirror,readonly" in spec for spec in mount_specs))
             self.assertTrue(any("dst=/input/metadata.jsonl,readonly" in spec for spec in mount_specs))
             self.assertIn("--runner-image-id", argv)
+            self.assertEqual(argv[argv.index("--required-passing") + 1], "2")
             self.assertRegex(argv[argv.index("--runner-image-id") + 1], r"^sha256:[0-9a-f]{64}$")
         manifest = json.loads(
             (validated.parent / "stage-manifest.json").read_text(encoding="utf-8")
@@ -473,8 +547,7 @@ class StorageTest(unittest.TestCase):
             path.write_text(json.dumps({
                 "schema_version": "greppy.agent-coding-freeze.v1",
                 "freeze_id": "x1", "frozen_at": "2026-08-01",
-                "eligible_pr_created_after": "2026-05-01T00:00:00Z",
-                "eligible_merged_after": "2026-05-01T00:00:00Z",
+                    "eligible_merged_after": "2026-05-01T00:00:00Z",
                 "eligible_merged_before": "2026-07-01T00:00:00Z",
                 "source_metadata_cutoff": "2026-07-02T00:00:00Z",
             }))

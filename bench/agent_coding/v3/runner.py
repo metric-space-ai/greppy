@@ -44,14 +44,12 @@ PROVIDER_PRICE_USD_PER_MILLION = {
 }
 V3_COST_RATIO_MAX = 0.80
 V3_CORRECTNESS_MARGIN = -0.05
-V3_MIN_GREPPY_ADOPTION = 0.80
 PREFLIGHT_REPORT_SCHEMA = "greppy.agent-coding-v3.gpu3-preflight.1"
 PREFLIGHT_ATTESTATION_SCHEMA = "greppy.agent-coding-v3.gpu3-preflight-attestation.1"
 SMOKE_EVIDENCE_SCHEMA = "greppy.agent-coding-v3.smoke-evidence.1"
 GATE_CONTRACT = {
     "correctness_margin": V3_CORRECTNESS_MARGIN,
     "cost_ratio_max": V3_COST_RATIO_MAX,
-    "greppy_adoption_min": V3_MIN_GREPPY_ADOPTION,
     "correctness_bootstrap_samples": 10_000,
     "cost_bootstrap_samples": 10_000,
     "transactionality_gate": False,
@@ -1055,9 +1053,31 @@ def probe_agent_image(
         raise RunnerError("runtime AGENTS.md hash probe failed inside agent image")
 
 
+def rate_metric(numerator: int, denominator: int) -> dict[str, Any]:
+    if denominator < 0 or numerator < 0 or numerator > denominator:
+        raise RunnerError("rate numerator/denominator are invalid")
+    if denominator == 0:
+        return {
+            "numerator": numerator, "denominator": 0, "rate": "N/A",
+            "gate_eligible": False,
+        }
+    return {
+        "numerator": numerator, "denominator": denominator,
+        "rate": round(numerator / denominator, 6), "gate_eligible": True,
+    }
+
+
+def rate_gate_passes(metric: Mapping[str, Any], threshold: float) -> bool:
+    return bool(
+        metric.get("gate_eligible") is True
+        and isinstance(metric.get("rate"), (int, float))
+        and float(metric["rate"]) >= threshold
+    )
+
+
 def _describe(values: Sequence[float]) -> dict[str, Any]:
     if not values:
-        return {"n": 0, "mean": None, "median": None, "denominator_status": "zero_fail"}
+        return {"n": 0, "mean": None, "median": None, "denominator_status": "N/A"}
     return {
         "n": len(values),
         "mean": round(statistics.fmean(values), 9),
@@ -1152,12 +1172,15 @@ def summarize_results(rows: Sequence[dict[str, Any]], agents_md: str) -> dict[st
         gross_input = [float(entry["agent"]["metrics"].get("input_tokens", 0) or 0) for entry in entries]
         wall = [float(entry["agent"].get("wall_seconds", 0) or 0) for entry in entries]
         source_opens = [float(entry["agent"]["metrics"].get("source_open_events", 0) or 0) for entry in entries]
+        correctness_rate = rate_metric(solved, len(entries))
         arm_summary[arm] = {
             "intention_to_treat": True,
             "attempted_tasks": len(entries),
             "solved_tasks": solved,
-            "correctness_rate": round(solved / len(entries), 6) if entries else None,
-            "correctness_denominator_status": "measured" if entries else "zero_fail",
+            "correctness_rate": correctness_rate["rate"],
+            "correctness_denominator_status": (
+                "measured" if correctness_rate["gate_eligible"] else "N/A"
+            ),
             "total_provider_cost_usd_all_tasks_all_attempts": round(sum(costs), 9) if costs_complete else None,
             "cost_per_solve_usd": round(sum(costs) / solved, 9) if solved and costs_complete else None,
             "cost_per_solve_denominator_status": "measured" if solved and costs_complete else "zero_or_missing_fail",
@@ -1187,7 +1210,7 @@ def summarize_results(rows: Sequence[dict[str, Any]], agents_md: str) -> dict[st
     cost_upper = _repo_clustered_cost_upper(rows)
     treatment_entries = arm_rows["treatment"]
     adopted = sum(entry["agent"]["metrics"].get("greppy_calls", 0) > 0 for entry in treatment_entries)
-    adoption_rate = adopted / len(treatment_entries) if treatment_entries else None
+    adoption_rate = rate_metric(adopted, len(treatment_entries))
     token_differences = []
     wall_differences = []
     for task in rows:
@@ -1245,12 +1268,12 @@ def summarize_results(rows: Sequence[dict[str, Any]], agents_md: str) -> dict[st
             "threshold": V3_COST_RATIO_MAX,
             "passes": complete_valid and all_costs_complete and cost_upper is not None and cost_upper <= V3_COST_RATIO_MAX,
         },
-        "greppy_task_adoption": {
+        "greppy_task_adoption_diagnostic_only": {
             "adopted_treatment_tasks": adopted,
             "treatment_tasks": len(treatment_entries),
-            "rate": round(adoption_rate, 6) if adoption_rate is not None else None,
-            "minimum": V3_MIN_GREPPY_ADOPTION,
-            "passes": adoption_rate is not None and adoption_rate >= V3_MIN_GREPPY_ADOPTION,
+            "rate": adoption_rate["rate"],
+            "gate_eligible": False,
+            "is_release_gate": False,
         },
         "greppy_edit_adoption_diagnostic_only": {
             "tasks": sum(entry["agent"]["metrics"].get("greppy_edit_calls", 0) > 0 for entry in treatment_entries),
@@ -1512,7 +1535,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "subset_runs_are_smoke_only": True,
             "correctness_noninferiority_passes": summary["correctness_noninferiority"]["passes"],
             "itt_cost_passes": summary["primary_cost_gate"]["passes"],
-            "greppy_adoption_passes": summary["greppy_task_adoption"]["passes"],
         }
         release_gate["passed"] = (all(
             value is True for key, value in release_gate.items()

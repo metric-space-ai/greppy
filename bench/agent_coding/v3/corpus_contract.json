@@ -12,25 +12,9 @@
     "tasks_per_language": 18,
     "maximum_repository_share": 0.041667,
     "maximum_language_share": 0.125,
-    "task_class_quotas": {
-      "reported_bugfix": 42,
-      "feature_implementation": 30,
-      "cross_cutting_behavior": 24,
-      "api_or_config_migration": 18,
-      "behavior_preserving_refactor": 18,
-      "robustness_validation": 12
-    },
-    "task_class_definitions": {
-      "reported_bugfix": "A user-observable defect with a reproduction or falsifiable expected behavior.",
-      "feature_implementation": "A new user-visible capability described by an issue or accepted PR requirement.",
-      "cross_cutting_behavior": "One behavior must be changed consistently across modules, implementations, or call sites.",
-      "api_or_config_migration": "A public or internal API, schema, configuration, serialization, or compatibility transition with downstream updates.",
-      "behavior_preserving_refactor": "A structural change motivated by maintainability, performance, or architecture and protected by behavior tests.",
-      "robustness_validation": "Validation, error handling, boundary behavior, concurrency safety, or malformed-input handling with an observable failure mode."
-    }
+    "minimum_reserves_per_repository": 2
   },
   "temporal_holdout": {
-    "candidate_pr_created_at_or_after": "2026-05-01T00:00:00Z",
     "candidate_pr_merged_at_or_after": "2026-05-01T00:00:00Z",
     "candidate_pr_merged_at_or_before": "2026-07-15T23:59:59Z",
     "declared_model_training_cutoff_must_be_on_or_before": "2026-04-01T00:00:00Z",
@@ -46,34 +30,53 @@
     "minimum_eligible_source_files": 200,
     "minimum_eligible_source_loc": 25000,
     "size_bands": {
-      "medium": {"source_loc_min": 25000, "source_loc_max_exclusive": 100000},
-      "large": {"source_loc_min": 100000, "source_loc_max_exclusive": 500000},
-      "very_large": {"source_loc_min": 500000}
+      "medium": {
+        "source_loc_min": 25000,
+        "source_loc_max_exclusive": 100000
+      },
+      "large": {
+        "source_loc_min": 100000,
+        "source_loc_max_exclusive": 500000
+      },
+      "very_large": {
+        "source_loc_min": 500000
+      }
     },
-    "minimum_band_counts": {"medium": 6, "large": 8, "very_large": 4},
+    "minimum_band_counts": {
+      "medium": 6,
+      "large": 8,
+      "very_large": 4
+    },
     "unallocated_repositories": 6,
     "failure_policy": "A registry repository below the hard medium floor must be replaced by preregistration amendment before sealing; task quotas may never be moved to another existing repository."
   },
   "candidate_admission": {
     "required": [
-      "PR is merged and its base, head, merge strategy, merge result, issue/PR text, and timestamps are captured from authoritative metadata.",
-      "PR changes at least two non-test production or runtime-configuration paths and at least one behavior test path.",
-      "Production diff changes 40 through 1200 non-generated lines across 2 through 20 production paths.",
-      "Full PR diff changes at most 30 paths and does not consist primarily of formatting, snapshots, generated files, vendored files, or dependency lockfiles.",
-      "Natural issue states a falsifiable outcome without relying on the gold diff; the agent prompt is the issue title plus issue body verbatim, not an authored benchmark instruction.",
-      "The task is executable offline after dependency materialization and has a focused grader command with a 30-minute hard ceiling.",
-      "The task can be graded on Linux x86_64 on gpu3 without privileged services or mutable third-party state."
+      "PR is merged and closes one unambiguously linked real issue; authoritative PR, issue, merge, and timestamp metadata are captured.",
+      "The exact target parent and merged-result tree are reconstructible without unrelated target-branch drift.",
+      "The change contains an observable code or runtime-configuration fix and is not solely docs, formatting, generated, vendor, or dependency-bump material.",
+      "Independent behavior tests are derivable from the PR and issue without exposing the solution.",
+      "Parent plus hidden tests fails for the intended reason; gold plus hidden tests and PASS_TO_PASS are reproducibly green twice in clean workspaces.",
+      "The task runs offline under the registered model and agent budgets without paid services, privileged infrastructure, or mutable external data.",
+      "The issue and fixtures contain no embargo, credentials, solution commit, complete patch, or copy-pastable implementation.",
+      "The task is absent from SWE-bench, V2, prior V3 corpora, and every registered denylist."
     ],
-    "excluded": [
-      "documentation-only, test-only, benchmark-only, formatting-only, generated-only, vendor-only, or dependency-bump-only changes",
-      "security embargoes, credential-bearing fixtures, telemetry or network-dependent tests, nondeterministic performance-only claims, and tasks requiring paid services",
-      "PR text or linked discussion containing a complete patch, direct solution commit, or copy-pastable implementation",
-      "tasks already present in SWE-bench, V2, another published coding benchmark, or a previous Greppy release corpus",
-      "tasks selected because Greppy succeeds, because a particular Greppy command is expected to apply, or because exploratory arm results are favorable"
-    ],
+    "excluded_reason_enum": {
+      "not_merged_or_linked_issue": "PR is not merged or has no unambiguously linked real issue.",
+      "unreconstructible_parent_or_merge": "Parent or merged-result tree cannot be reconstructed unambiguously.",
+      "docs_format_generated_vendor_or_dependency_only": "Change is solely docs, formatting, generated, vendor, or dependency-bump material.",
+      "no_observable_code_or_config_fix": "No observable code or runtime-configuration fix exists.",
+      "no_derivable_independent_behavior_tests": "Independent behavior tests cannot be derived.",
+      "parent_hidden_wrong_failure": "Parent plus hidden tests does not fail for the intended reason.",
+      "gold_or_pass_to_pass_not_green": "Gold plus hidden tests or PASS_TO_PASS is not reproducibly green.",
+      "external_paid_privileged_or_mutable_requirement": "Task needs internet, a paid service, privileged infrastructure, or mutable data.",
+      "embargo_credential_or_solution_leak": "Task contains an embargo, credential, complete solution, or other leak.",
+      "denylisted": "Task is already in SWE-bench, V2, another registered corpus, or a denylist.",
+      "registered_budget_inexecutable": "Task is technically inexecutable under the frozen budget for a logged non-Greppy-specific cause."
+    },
+    "no_patch_shape_gate": "Changed-line counts, changed-file counts, cross-file status, migration/refactor/bugfix labels, symbol depth, and expected tool use are post-hoc diagnostics only.",
     "multi_commit_prs_allowed": true,
-    "merge_reconstruction": "Use the exact target-branch parent immediately before the merged result and the exact merged result tree. Prove that the reconstructed gold delta contains the PR change and no unrelated target-branch drift; reject ambiguous rebases instead of assuming a parent.",
-    "navigation_pressure_is_repository_level": "The large unfamiliar repository and cross-file production change create the navigation requirement. No task prompt names or requests Greppy commands, and tool-use counts never affect task admission."
+    "merge_reconstruction": "Use the exact target-branch parent immediately before the merged result and the exact merged result tree. Reject ambiguous reconstruction."
   },
   "validation": {
     "required_proofs": [
@@ -98,39 +101,32 @@
       "unresolved merge provenance"
     ],
     "test_visibility": "The agent receives only the verbatim issue title/body and parent snapshot. Sealed FAIL_TO_PASS is applied only after the agent phase; PASS_TO_PASS definitions and gold remain unavailable to the agent.",
-    "grading_isolation": "Grade from a fresh parent snapshot by applying the captured agent patch, then the sealed grader tests. The grader executable and sealed tests are outside the agent-writable tree.",
-    "minimum_candidate_pool_per_repo_class_slot": 2,
-    "minimum_structurally_eligible_candidates_per_repository": 18,
-    "recommended_metadata_candidates_per_repository": 36
+    "grading_isolation": "Grade from a fresh parent snapshot by applying the captured agent patch, then the sealed grader tests. The grader executable and sealed tests are outside the agent-writable tree."
   },
   "selection": {
-    "unit": "repository plus task class slot from repository_registry.json",
-    "classification_time": "Classify from frozen issue/PR metadata before running either benchmark arm.",
-    "ranking": "After all candidates and validation verdicts are frozen, rank passing candidates inside each repository/class stratum by HMAC-SHA256(selection_secret, canonical_candidate_id).",
-    "selection_secret": "Generate before metadata harvest, store only with sealed corpus materials, and publish after all benchmark runs.",
-    "replacement": "If a selected candidate fails final clean-room validation, use the next ranked passing candidate from the same repository and task class only.",
-    "forbidden_backfill": "Never replace a missing repository/class slot with another class, language, or repository.",
-    "unfillable_slot": "Before seal, amend the registry while preserving language, pattern, quota, and scale. After seal, the 144-task release corpus fails qualification.",
-    "blinding": "Corpus selectors may inspect metadata, diffs, and tests for validity but may not inspect benchmark-arm outcomes before the corpus hash is sealed."
+    "unit": "repository",
+    "freeze_before_harvest": "Registry, time window, model, agent, budgets, selection algorithm, and selection-secret commitment are frozen in a hashed spec before metadata harvest.",
+    "candidate_universe": "Every merged PR in each registered repository and frozen time window is one candidate; adapters may not cap or hand-pick the count.",
+    "technical_exclusions": "Apply only candidate_admission.excluded_reason_enum to every candidate.",
+    "ranking": "For each technical survivor compute HMAC-SHA256(selection_secret, repo_id + NUL + candidate_id), then sort ascending.",
+    "selection_secret": "Publish sha256(selection_secret) in the frozen spec before harvest; keep the secret sealed during harvest and publish it with the sealed corpus so ordering is verifiable afterward.",
+    "walk": "Validate in rank order until six tasks plus at least two sealed reserves reproducibly pass for every repository.",
+    "replacement": "A failed candidate is replaced only by the same repository's next HMAC rank.",
+    "forbidden_backfill": "Never backfill from another repository or toward any task class, patch shape, or desired Greppy mechanism.",
+    "blinding": "Neither benchmark arm nor Greppy is run before the corpus seal."
   },
   "deduplication": {
-    "exact_keys": [
-      "canonical repository plus merged-result tree",
-      "canonical repository plus parent tree plus normalized issue URL",
-      "gold production patch SHA-256",
-      "sealed grader patch SHA-256"
-    ],
-    "near_duplicate_checks": [
-      "normalized issue/title similarity",
-      "changed production path-set Jaccard similarity",
-      "tokenized production diff similarity"
-    ],
-    "near_duplicate_policy": "Manual blinded review is required above 0.80 similarity; retain at most one task from a duplicate family.",
     "cross_benchmark_denylists": [
       "bench/agent_coding/tasks_v2.json",
       "bench/agent_coding/harvest_candidates_v2.jsonl",
       "bench/agent_coding/harvest_candidates_v2_serious.jsonl"
-    ]
+    ],
+    "post_hoc_diagnostics": [
+      "normalized issue/title similarity",
+      "changed production path-set Jaccard similarity",
+      "tokenized production diff similarity"
+    ],
+    "selection_effect": "Within-corpus exact or near similarity is reported after sampling and cannot admit, exclude, replace, or reweight a candidate. Cross-benchmark matches are handled only by the frozen denylist."
   },
   "agent_snapshot": {
     "format": "deterministic parent-tree archive imported into a new one-commit Git repository",
@@ -236,11 +232,6 @@
       "threshold_ratio": 0.8,
       "pass": "upper bound <= 0.80"
     },
-    "mechanism": {
-      "greppy_task_adoption_minimum": 0.8,
-      "adoption_definition": "A treatment task contains at least one observed Greppy command call.",
-      "edit_specific_adoption": "diagnostic only; it is not a release gate"
-    },
     "transactionality": {
       "release_gate": false,
       "current_observability": "unobservable: Pi JSON is post-hoc and has no per-tool before/after hook",
@@ -292,7 +283,7 @@
       "all task snapshot hashes",
       "all grader and gold hashes",
       "selection HMAC commitments",
-      "task class and quota audit",
+      "repository/language shape and natural-sampling audit",
       "repository scale measurements",
       "toolchain/container/dependency identities",
       "Greppy binary and AGENTS.md hashes",
@@ -300,12 +291,30 @@
     ],
     "required_independent_audits": [
       "gold and Git-history isolation",
-      "quota and deterministic-selection reproduction",
+      "deterministic HMAC ordering and same-repository replacement reproduction",
       "parent-fail/gold-pass clean-room reproduction",
       "no V2 or public-benchmark duplicates",
       "agent network and filesystem isolation",
       "NVMe-to-NAS evidence checksum and immutability verification"
     ],
-    "post_seal_changes": "Any task, test, prompt, model, binary, quota, storage-role, or grading change creates a new corpus/run identity and requires a complete rerun."
+    "post_seal_changes": "Any task, test, prompt, model, binary, repository shape, storage-role, or grading change creates a new corpus/run identity and requires a complete rerun."
+  },
+  "diagnostics": {
+    "post_hoc_only": [
+      "gold patch changed lines and production file count",
+      "affected modules, packages, and languages",
+      "issue length, test runtime, and repository size",
+      "task class and cross-file/local shape",
+      "observed Greppy adoption, verbs, tool calls, source opens, rereads, edit attempts, refusals, and fallbacks"
+    ],
+    "task_class_definitions": {
+      "reported_bugfix": "A user-observable defect with a reproduction or falsifiable expected behavior.",
+      "feature_implementation": "A new user-visible capability described by an issue or accepted PR requirement.",
+      "cross_cutting_behavior": "One behavior must be changed consistently across modules, implementations, or call sites.",
+      "api_or_config_migration": "A public or internal API, schema, configuration, serialization, or compatibility transition with downstream updates.",
+      "behavior_preserving_refactor": "A structural change motivated by maintainability, performance, or architecture and protected by behavior tests.",
+      "robustness_validation": "Validation, error handling, boundary behavior, concurrency safety, or malformed-input handling with an observable failure mode."
+    },
+    "selection_effect": "Diagnostic tags may never admit, exclude, replace, reweight, or gate a task."
   }
 }
