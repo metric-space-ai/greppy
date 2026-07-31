@@ -1271,12 +1271,27 @@ fn impact_incoming_reports_transitive_callers_in_one_call() {
     let (code, out, err) = run(&["impact", "hub"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}");
     // The answer is a tree: one row per reached caller, indentation is the
-    // route. No `hop N` prefixes, no truncation footer, no expand offer.
+    // route. No `hop N` prefixes, no expand offer — and, like every other
+    // command, one screen plus a TRUE count of what is missing; `--all` is
+    // the flag that delivers the rest.
     let rows = out.lines().filter(|l| l.contains("caller_")).count();
-    assert_eq!(rows, 60, "impact reaches all 60 callers; got {rows}\n{out}");
+    assert_eq!(rows, 40, "impact shows one screen of the 60 callers; got {rows}\n{out}");
+    assert!(
+        out.contains("… 20 more reached — greppy impact hub --all"),
+        "the tail is one true count with the exact command; got: {out}"
+    );
     assert!(
         !out.contains("hop ") && !out.contains("shown of") && !out.contains("Expand:"),
         "the flat hop list is gone; got: {out}"
+    );
+
+    let (code, out, err) = run(&["impact", "hub", "--all"], &repo, &store);
+    assert_eq!(code, 0, "impact --all should exit 0; stderr={err}");
+    let rows = out.lines().filter(|l| l.contains("caller_")).count();
+    assert_eq!(rows, 60, "--all reaches all 60 callers; got {rows}\n{out}");
+    assert!(
+        !out.contains("more reached"),
+        "--all leaves nothing to count; got: {out}"
     );
 }
 
