@@ -64,7 +64,7 @@ TASKS = HERE / "tasks_v2.json"
 RESULTS = HERE / "results.json"
 RAW_ROOT = HERE / "raw_runs"
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
-BENCHMARK_PROMPT_VERSION = "greppy-agent-nav-v4"
+BENCHMARK_PROMPT_VERSION = "greppy-agents-md-0.3.0"
 ARM_ORDER_VERSION = "sha256-task-agent-v1"
 
 
@@ -156,48 +156,26 @@ EXPLORER_SYS = (
 )
 
 
-def gp_sys(root: str) -> str:
-    """Greppy agent prompt: concise product documentation, not an answer hint.
+AGENTS_MD = (REPO / "AGENTS.md").read_text(encoding="utf-8")
 
-    Owner rule: every failed call costs the agent extra thinking plus a
-    tool call. v2 therefore documents the tool the way a man page would —
-    exact flags (nothing to guess), routing by QUESTION TYPE (the v1 prompt
-    under-used `context` on semantic questions), and a hard error rule so
-    a failed call never spirals into flag-guessing. Kept concise: the
-    prompt is re-sent every turn.
+
+def gp_sys(root: str) -> str:
+    """The greppy arm's manual IS the product prompt.
+
+    One source of truth: the guarded AGENTS.md this release ships. An embedded
+    copy drifted once (nav-v4 still advertised four removed verbs against the
+    0.3.0 binary — every such call would have died in the vocabulary refusal
+    and the bench would have measured an agent with a lying manual). The
+    preamble carries only what the file cannot know: the binary path, the
+    repository root, and the --root requirement.
     """
     g = f"{BIN}"
     return (
         f"Answer the question about the code at {root} using the greppy "
-        f"code-intelligence CLI ({g}), always with `--root {root}`. It returns "
-        f"exact source locations and can return source evidence. Deterministic "
-        f"source spans and graph relations are authoritative; short English "
-        f"summaries are navigation hints only.\n"
-        f"Pick the command by QUESTION TYPE:\n"
-        f"- 'where/how does the code do X' (behavior, no symbol name): "
-        f"semantic-search \"X\" - returns ranked definitions with exact spans, "
-        f"source signatures, short purpose hints, and an expand handle.\n"
-        f"- 'who calls S / is S used / can I change or delete S': who-calls S "
-        f"(callers), find-usages S (all references), callees S (what S calls). "
-        f"Use --code only when the returned relationship needs source context; "
-        f"use an Expand handle when Greppy provides one.\n"
-        f"- 'what breaks if S changes / how far does S reach': impact S "
-        f"[--direction incoming|outgoing] - the whole transitive set in ONE "
-        f"call.\n"
-        f"- 'what is S / how does S work': brief S - definition + callers + "
-        f"callees in ONE call.\n"
-        f"- know part of a name: search-symbols NAME [--kind function|method|"
-        f"struct|class]. Literal text: search-code TEXT. Call chain: "
-        f"path --from A --to B.\n"
-        f"The generated purpose sentence can help choose what to inspect, but "
-        f"never use it as evidence without the associated source.\n"
-        f"ERROR RULE: if a command errors or returns nothing useful, do not "
-        f"retry variants of the same call. Follow the suggestion in its "
-        f"output if present; otherwise switch: symbol not found -> "
-        f"search-symbols NAME; context weak -> search-code with a distinctive "
-        f"literal. Maximum ONE fallback, then answer from what you have.\n"
-        f"Be efficient, inspect enough returned evidence to answer correctly, "
-        f"and end with the final answer."
+        f"CLI at {g}; pass `--root {root}` on every call. Its manual:\n\n"
+        + AGENTS_MD
+        + "\nBe efficient, inspect enough returned evidence to answer "
+        "correctly, and end with the final answer."
     )
 
 
