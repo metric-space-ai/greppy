@@ -611,6 +611,9 @@ class GradingTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_all_arms_receive_the_same_builtin_tool_palette(self) -> None:
+        self.assertEqual(set(bench.ARM_TOOLS.values()), {"bash,read,edit,write"})
+
     def test_arm_validity_requires_success_even_when_turns_exist(self) -> None:
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "timed_out": True}))
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "return_code": 1}))

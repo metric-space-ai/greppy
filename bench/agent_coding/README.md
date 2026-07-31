@@ -15,11 +15,13 @@ the repository and pass an independent test.
 
 Every pair uses the same pinned repository commit, ordered setup argv arrays,
 mutation patch, user task, test argv, timeout, Pi version, MiniMax-M3 model,
-built-in tools, shared system prompt, and user prompt. The only intended prompt
-delta is the preregistered navigation treatment: the Greppy arm receives the
-Greppy command guide, while the explorer arm receives no code-intelligence
-workflow. Full prompt hashes, the shared user-prompt hash, and the setup-command
-hash are recorded in `MANIFEST.json`.
+built-in tools, shared system prompt, and user prompt. Every arm receives the
+same explicit Pi tool palette: `bash,read,edit,write`; no arm is advantaged or
+constrained by a palette cut. The only intended prompt delta is the
+preregistered navigation treatment: the Greppy arms receive their Greppy
+command guides, while the explorer arm receives no code-intelligence workflow.
+Full prompt hashes, the shared user-prompt hash, the per-arm palette, and the
+setup-command hash are recorded in `MANIFEST.json`.
 
 The order of the two arms is deterministically counterbalanced from the task
 ID. Each arm gets a separate temporary Git worktree, `GREPPY_STORE_DIR`, and

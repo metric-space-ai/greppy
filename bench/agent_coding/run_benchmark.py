@@ -951,21 +951,10 @@ def shared_user_prompt(task: dict[str, Any]) -> str:
     return f"Task:\n{task['user_task'].strip()}\n\nVerification command:\n{command}\n"
 
 
-# Per-arm pi tool surface. The greppy-edit arm's displacement prompt states
-# "there is no apply_patch and no manual patching"; with pi's builtin
-# edit/write/read in the tool palette that statement is visibly false and
-# gets ignored (trace forensics 2026-07-17: the arm's agent used builtin
-# edit and never called greppy). Displacement only works when the
-# environment matches the claim - the MSCC panel proves prompt-driven
-# adoption (78-87% greppy usage) exactly where the prompt's claim is true.
-# The edit arm therefore ships bash only: greppy read/edit is the paved
-# road, bash remains the honest escape hatch (and bash-side manual edits
-# stay measurable as fallback_edits in trace forensics).
-ARM_TOOLS = {
-    "explorer": "bash,read,edit,write",
-    "greppy": "bash,read,edit,write",
-    "greppy-edit": "bash",
-}
+# The experimental contract holds Pi's built-in tool palette constant. Arm
+# differences come only from the preregistered system-prompt treatment.
+COMMON_ARM_TOOLS = "bash,read,edit,write"
+ARM_TOOLS = {arm: COMMON_ARM_TOOLS for arm in ARMS}
 
 
 def system_prompt(arm: str, greppy_bin: pathlib.Path) -> str:
