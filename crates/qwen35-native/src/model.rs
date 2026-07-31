@@ -40,7 +40,7 @@ enum Backend {
     Cpu(Box<CpuQwen35Model>),
     #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal(crate::metal::model::MetalQwen35Model),
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     Cuda(crate::cuda::model::CudaQwen35Model),
 }
 
@@ -151,7 +151,7 @@ impl Qwen35Summarizer {
             Backend::Cpu(_) => "cpu-q4k",
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(ref model) => model.backend_name(),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(ref model) => model.backend_name(),
         }
     }
@@ -174,7 +174,7 @@ impl Qwen35Summarizer {
             Backend::Cpu(model) => model.diagnostic_target_prefill(token_ids)?,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(model) => model.diagnostic_target_prefill(token_ids)?,
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(model) => model.diagnostic_target_prefill(token_ids)?,
         };
         Ok(DiagnosticTargetPrefill {
@@ -219,7 +219,7 @@ impl Qwen35Summarizer {
             Backend::Cpu(model) => model.diagnostic_generate_mtp(prompt_token_ids, params)?,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(model) => model.diagnostic_generate_mtp(prompt_token_ids, params)?,
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(model) => model.diagnostic_generate_mtp(prompt_token_ids, params)?,
         };
         finish_diagnostic_generation(output, max_output_tokens)
@@ -234,7 +234,7 @@ impl Qwen35Summarizer {
             Backend::Cpu(model) => model.generate(&self.tokenizer, prompt, params),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(model) => model.generate(&self.tokenizer, prompt, params),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(model) => model.generate(&self.tokenizer, prompt, params),
         }
     }
@@ -951,13 +951,13 @@ fn load_auto_backend(
     {
         load_metal_with_cpu_fallback(model, inventory, eos_token_id)
     }
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         load_cuda_with_cpu_fallback(model, inventory, eos_token_id)
     }
     #[cfg(not(any(
         all(feature = "metal", target_os = "macos"),
-        all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
+        all(feature = "cuda", target_os = "linux")
     )))]
     {
         load_cpu_backend(model, inventory, eos_token_id)
@@ -979,7 +979,7 @@ fn load_metal_with_cpu_fallback(
     }
 }
 
-#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 fn load_cuda_with_cpu_fallback(
     model: &greppy_embed_native::GgufModel,
     inventory: Qwen35Inventory,
@@ -1018,12 +1018,12 @@ fn load_cuda_backend(
     inventory: Qwen35Inventory,
     eos_token_id: u32,
 ) -> Result<Backend> {
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         crate::cuda::model::CudaQwen35Model::from_gguf(model, inventory, eos_token_id)
             .map(Backend::Cuda)
     }
-    #[cfg(not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         let _ = (model, inventory, eos_token_id);
         Err(Error::GenerationUnavailable(
@@ -1094,7 +1094,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let ids = summarizer
@@ -1161,7 +1161,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let ids = summarizer
@@ -1243,7 +1243,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let ids = summarizer
@@ -1326,7 +1326,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt = crate::prompt::brief_chat_prompt(
@@ -1461,7 +1461,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, input_target);
@@ -1532,7 +1532,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, rows + 1);
@@ -1582,7 +1582,7 @@ mod cpu_perf_tests {
             Backend::Cpu(model) => model,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(_) => panic!("expected CPU backend"),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, position + 1);
@@ -1815,11 +1815,7 @@ mod metal_perf_tests {
     }
 }
 
-#[cfg(all(
-    test,
-    feature = "cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
+#[cfg(all(test, feature = "cuda", target_os = "linux"))]
 mod tests {
 
     use super::*;
