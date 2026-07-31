@@ -129,8 +129,8 @@ class MetadataTests(unittest.TestCase):
         pr = github_pr(parents=["1" * 40, "2" * 40], merge_oid="3" * 40, commits=["4" * 40])
         rows = base.harvest_metadata(
             client=FakeGitHub(pr), repository_id="repo", repository_url="https://github.com/o/r",
-            created_after=self.NOW, merged_after=self.NOW,
-            merged_before=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc), target=1,
+            merged_after=self.NOW,
+            merged_before=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc),
             config={"default_task_class": "reported_bugfix"},
         )
         self.assertEqual(rows[0]["issue_number"], 4)
@@ -141,13 +141,15 @@ class MetadataTests(unittest.TestCase):
     def test_multi_commit_rebase_is_rejected_as_ambiguous(self) -> None:
         merge_oid = "3" * 40
         pr = github_pr(parents=["2" * 40], merge_oid=merge_oid, commits=["1" * 40, merge_oid])
-        with self.assertRaisesRegex(base.AdapterError, "yielded 0"):
-            base.harvest_metadata(
-                client=FakeGitHub(pr), repository_id="repo", repository_url="https://github.com/o/r",
-                created_after=self.NOW, merged_after=self.NOW,
-                merged_before=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc), target=1,
-                config={},
-            )
+        rows = base.harvest_metadata(
+            client=FakeGitHub(pr), repository_id="repo", repository_url="https://github.com/o/r",
+            merged_after=self.NOW,
+            merged_before=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc),
+            config={},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["exclusion_reason"], "unreconstructible_parent_or_merge")
+        self.assertEqual(rows[0]["candidate_id"], "pull-request:10")
 
 
 class ProbeAndManifestTests(unittest.TestCase):

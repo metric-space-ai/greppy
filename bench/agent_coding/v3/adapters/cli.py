@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from .base import (
     AdapterError, GitHubClient, atomic_jsonl, format_time, harvest_metadata,
     load_config, load_jsonl, parse_time, preflight_payload, proof_sha256,
-    validate_candidate,
+    validate_candidate_for_ledger,
 )
 
 
@@ -28,10 +28,9 @@ def parser() -> argparse.ArgumentParser:
     metadata = sub.choices["metadata"]
     metadata.add_argument("--repository-id")
     metadata.add_argument("--repository-url")
-    metadata.add_argument("--created-after")
     metadata.add_argument("--merged-after")
     metadata.add_argument("--merged-before")
-    metadata.add_argument("--per-repo", type=int)
+    metadata.add_argument("--all-merged-prs", action="store_true")
     metadata.add_argument("--output", type=pathlib.Path)
     validate = sub.choices["validate"]
     validate.add_argument("--repository-id")
@@ -39,6 +38,7 @@ def parser() -> argparse.ArgumentParser:
     validate.add_argument("--metadata", type=pathlib.Path)
     validate.add_argument("--scratch", type=pathlib.Path)
     validate.add_argument("--repetitions", type=int)
+    validate.add_argument("--required-passing", type=int)
     validate.add_argument("--offline", action="store_true")
     validate.add_argument("--runner-image-id")
     validate.add_argument("--output", type=pathlib.Path)
@@ -62,30 +62,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.role == "probe":
             raise AdapterError("probe requires --preflight")
         if args.role == "metadata":
-            required(args, "repository_id", "repository_url", "created_after", "merged_after", "merged_before", "per_repo", "output")
+            required(args, "repository_id", "repository_url", "merged_after", "merged_before", "output")
+            if not args.all_merged_prs:
+                raise AdapterError("metadata harvest must request every merged PR")
             if args.repository_id != config["repository_id"] or args.repository_url.rstrip("/") != config["repository_url"].rstrip("/"):
                 raise AdapterError("pipeline repository identity differs from adapter config")
             rows = harvest_metadata(
                 client=GitHubClient(os.environ.get("GITHUB_TOKEN", "")),
                 repository_id=args.repository_id, repository_url=args.repository_url,
-                created_after=parse_time(args.created_after), merged_after=parse_time(args.merged_after),
-                merged_before=parse_time(args.merged_before), target=args.per_repo, config=config,
+                merged_after=parse_time(args.merged_after),
+                merged_before=parse_time(args.merged_before), config=config,
             )
             atomic_jsonl(args.output, rows)
         else:
-            required(args, "repository_id", "mirror", "metadata", "scratch", "repetitions", "output")
+            required(
+                args, "repository_id", "mirror", "metadata", "scratch",
+                "repetitions", "required_passing", "output",
+            )
             if args.repository_id != config["repository_id"] or not args.offline or args.repetitions != 2:
                 raise AdapterError("validation identity/offline/two-run contract differs")
+            if args.required_passing < 1:
+                raise AdapterError("validation requires a positive passing target")
             digest = args.runner_image_id or os.environ.get("GREPPY_ADAPTER_IMAGE_ID", "")
             if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
                 raise AdapterError("GREPPY_ADAPTER_IMAGE_ID must bind the validation image")
-            rows = [
-                validate_candidate(
+            rows = []
+            passing = 0
+            for row in load_jsonl(args.metadata):
+                if passing >= args.required_passing:
+                    rows.append({**row, "validation_outcome": "not_run"})
+                    continue
+                result = validate_candidate_for_ledger(
                     row, args.mirror.resolve(), args.scratch.resolve(), args.repetitions,
                     config, digest, proof_sha256(config_path, config),
                 )
-                for row in load_jsonl(args.metadata)
-            ]
+                rows.append(result)
+                passing += result.get("validation_outcome") == "passed"
             atomic_jsonl(args.output, rows)
         return 0
     except (AdapterError, OSError, json.JSONDecodeError, ValueError) as exc:

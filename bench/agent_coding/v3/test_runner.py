@@ -406,6 +406,17 @@ class NetworkIsolationTests(unittest.TestCase):
 
 
 class SummaryTests(unittest.TestCase):
+    def test_zero_denominator_rate_is_na_and_cannot_pass_a_gate(self) -> None:
+        metric = runner.rate_metric(0, 0)
+        self.assertEqual(metric["rate"], "N/A")
+        self.assertFalse(metric["gate_eligible"])
+        self.assertFalse(runner.rate_gate_passes(metric, 0.0))
+        summary = runner.summarize_results([], "manual")
+        self.assertEqual(
+            summary["greppy_task_adoption_diagnostic_only"]["rate"], "N/A"
+        )
+        self.assertFalse(summary["correctness_noninferiority"]["passes"])
+
     def test_runtime_command_vocabulary_drives_greppy_adoption_metrics(self) -> None:
         manual = "READ:\n  read S    source\n\nEDIT:\n  replace S N    edit\n"
         commands, edits = runner.commands_from_agents_md(manual)

@@ -5,63 +5,296 @@
   "target_task_count": 144,
   "repository_count": 24,
   "tasks_per_repository": 6,
-  "primary_languages": ["rust", "go", "python", "typescript", "java", "cpp", "javascript", "ruby"],
+  "primary_languages": [
+    "rust",
+    "go",
+    "python",
+    "typescript",
+    "java",
+    "cpp",
+    "javascript",
+    "ruby"
+  ],
   "language_task_quota": 18,
-  "selection_patterns": {
-    "A": {"reported_bugfix": 2, "feature_implementation": 1, "cross_cutting_behavior": 1, "api_or_config_migration": 1, "behavior_preserving_refactor": 0, "robustness_validation": 1},
-    "B": {"reported_bugfix": 2, "feature_implementation": 1, "cross_cutting_behavior": 1, "api_or_config_migration": 1, "behavior_preserving_refactor": 1, "robustness_validation": 0},
-    "G": {"reported_bugfix": 1, "feature_implementation": 2, "cross_cutting_behavior": 1, "api_or_config_migration": 0, "behavior_preserving_refactor": 1, "robustness_validation": 1}
-  },
   "toolchain_profiles": {
-    "python-pip": {"runner_family": "pytest-or-repository-runner", "required_tools": ["uv", "python3.12"], "offline_dependency_cache": "python-wheelhouse"},
-    "rust-cargo": {"runner_family": "cargo-scoped", "required_tools": ["cargo", "rustc"], "offline_dependency_cache": "cargo-home-and-target-cache"},
-    "go-test": {"runner_family": "go-package-scoped", "required_tools": ["go"], "offline_dependency_cache": "go-mod-and-build-cache"},
-    "java-maven": {"runner_family": "maven-surefire-scoped", "required_tools": ["java", "mvn"], "offline_dependency_cache": "maven-repository", "blocking_note": "JDK 17 and Maven 3.9.9 exist on gpu3 NVMe but are not ambient PATH defaults; host mode exposes them through JAVA_HOME/PATH, while container mode binds and probes them in the adapter image."},
-    "java-gradle": {"runner_family": "gradle-test-scoped", "required_tools": ["java"], "offline_dependency_cache": "gradle-user-home", "wrapper_required": true},
-    "ts-pnpm": {"runner_family": "vitest-jest-or-repository-runner", "required_tools": ["node", "pnpm"], "offline_dependency_cache": "pnpm-store"},
-    "javascript-node": {"runner_family": "package-or-repository-runner", "required_tools": ["node"], "offline_dependency_cache": "package-manager-store"},
-    "cpp-cmake": {"runner_family": "ctest-or-target-scoped", "required_tools": ["cmake", "ninja", "c++"], "offline_dependency_cache": "cmake-dependency-cache"},
-    "ruby-bundler": {"runner_family": "rspec-or-repository-runner", "required_tools": ["ruby", "bundle"], "offline_dependency_cache": "bundle-cache"}
+    "python-pip": {
+      "runner_family": "pytest-or-repository-runner",
+      "required_tools": [
+        "uv",
+        "python3.12"
+      ],
+      "offline_dependency_cache": "python-wheelhouse"
+    },
+    "rust-cargo": {
+      "runner_family": "cargo-scoped",
+      "required_tools": [
+        "cargo",
+        "rustc"
+      ],
+      "offline_dependency_cache": "cargo-home-and-target-cache"
+    },
+    "go-test": {
+      "runner_family": "go-package-scoped",
+      "required_tools": [
+        "go"
+      ],
+      "offline_dependency_cache": "go-mod-and-build-cache"
+    },
+    "java-maven": {
+      "runner_family": "maven-surefire-scoped",
+      "required_tools": [
+        "java",
+        "mvn"
+      ],
+      "offline_dependency_cache": "maven-repository",
+      "blocking_note": "JDK 17 and Maven 3.9.9 exist on gpu3 NVMe but are not ambient PATH defaults; host mode exposes them through JAVA_HOME/PATH, while container mode binds and probes them in the adapter image."
+    },
+    "java-gradle": {
+      "runner_family": "gradle-test-scoped",
+      "required_tools": [
+        "java"
+      ],
+      "offline_dependency_cache": "gradle-user-home",
+      "wrapper_required": true
+    },
+    "ts-pnpm": {
+      "runner_family": "vitest-jest-or-repository-runner",
+      "required_tools": [
+        "node",
+        "pnpm"
+      ],
+      "offline_dependency_cache": "pnpm-store"
+    },
+    "javascript-node": {
+      "runner_family": "package-or-repository-runner",
+      "required_tools": [
+        "node"
+      ],
+      "offline_dependency_cache": "package-manager-store"
+    },
+    "cpp-cmake": {
+      "runner_family": "ctest-or-target-scoped",
+      "required_tools": [
+        "cmake",
+        "ninja",
+        "c++"
+      ],
+      "offline_dependency_cache": "cmake-dependency-cache"
+    },
+    "ruby-bundler": {
+      "runner_family": "rspec-or-repository-runner",
+      "required_tools": [
+        "ruby",
+        "bundle"
+      ],
+      "offline_dependency_cache": "bundle-cache"
+    }
   },
   "adapter_image_contract": {
     "required": true,
     "reference_format": "registry/image@sha256:<manifest-digest>",
     "local_image_id_required": true,
     "network_during_probe": "none",
-    "probe_must_report": ["repository_id", "ready", "proof_sha256", "tool versions required by toolchain_profile"]
+    "probe_must_report": [
+      "repository_id",
+      "ready",
+      "proof_sha256",
+      "tool versions required by toolchain_profile"
+    ]
   },
   "repositories": [
-    {"id": "rust-ripgrep", "url": "https://github.com/BurntSushi/ripgrep", "primary_language": "rust", "selection_pattern": "A", "toolchain_profile": "rust-cargo", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "rust-clap", "url": "https://github.com/clap-rs/clap", "primary_language": "rust", "selection_pattern": "B", "toolchain_profile": "rust-cargo", "scale_requirement": "medium-or-larger", "v3_adapter": "reuse-and-revalidate"},
-    {"id": "rust-tokio", "url": "https://github.com/tokio-rs/tokio", "primary_language": "rust", "selection_pattern": "G", "toolchain_profile": "rust-cargo", "scale_requirement": "medium-or-larger", "v3_adapter": "reuse-and-revalidate"},
-
-    {"id": "go-caddy", "url": "https://github.com/caddyserver/caddy", "primary_language": "go", "selection_pattern": "A", "toolchain_profile": "go-test", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "go-prometheus", "url": "https://github.com/prometheus/prometheus", "primary_language": "go", "selection_pattern": "B", "toolchain_profile": "go-test", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "go-kubernetes", "url": "https://github.com/kubernetes/kubernetes", "primary_language": "go", "selection_pattern": "G", "toolchain_profile": "go-test", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-
-    {"id": "python-scrapy", "url": "https://github.com/scrapy/scrapy", "primary_language": "python", "selection_pattern": "A", "toolchain_profile": "python-pip", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "python-pytest", "url": "https://github.com/pytest-dev/pytest", "primary_language": "python", "selection_pattern": "B", "toolchain_profile": "python-pip", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "python-django", "url": "https://github.com/django/django", "primary_language": "python", "selection_pattern": "G", "toolchain_profile": "python-pip", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-
-    {"id": "typescript-zod", "url": "https://github.com/colinhacks/zod", "primary_language": "typescript", "selection_pattern": "A", "toolchain_profile": "ts-pnpm", "scale_requirement": "medium-or-larger", "v3_adapter": "reuse-and-revalidate"},
-    {"id": "typescript-vite", "url": "https://github.com/vitejs/vite", "primary_language": "typescript", "selection_pattern": "B", "toolchain_profile": "ts-pnpm", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "typescript-compiler", "url": "https://github.com/microsoft/TypeScript", "primary_language": "typescript", "selection_pattern": "G", "toolchain_profile": "javascript-node", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-
-    {"id": "java-gson", "url": "https://github.com/google/gson", "primary_language": "java", "selection_pattern": "A", "toolchain_profile": "java-maven", "scale_requirement": "medium-or-larger", "v3_adapter": "reuse-and-revalidate"},
-    {"id": "java-spring-framework", "url": "https://github.com/spring-projects/spring-framework", "primary_language": "java", "selection_pattern": "B", "toolchain_profile": "java-gradle", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "java-kafka", "url": "https://github.com/apache/kafka", "primary_language": "java", "selection_pattern": "B", "toolchain_profile": "java-gradle", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-
-    {"id": "cpp-fmt", "url": "https://github.com/fmtlib/fmt", "primary_language": "cpp", "selection_pattern": "A", "toolchain_profile": "cpp-cmake", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "cpp-catch2", "url": "https://github.com/catchorg/Catch2", "primary_language": "cpp", "selection_pattern": "B", "toolchain_profile": "cpp-cmake", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "cpp-opencv", "url": "https://github.com/opencv/opencv", "primary_language": "cpp", "selection_pattern": "B", "toolchain_profile": "cpp-cmake", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-
-    {"id": "javascript-eslint", "url": "https://github.com/eslint/eslint", "primary_language": "javascript", "selection_pattern": "G", "toolchain_profile": "javascript-node", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "javascript-webpack", "url": "https://github.com/webpack/webpack", "primary_language": "javascript", "selection_pattern": "B", "toolchain_profile": "javascript-node", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "javascript-node", "url": "https://github.com/nodejs/node", "primary_language": "javascript", "selection_pattern": "B", "toolchain_profile": "javascript-node", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-
-    {"id": "ruby-rubocop", "url": "https://github.com/rubocop/rubocop", "primary_language": "ruby", "selection_pattern": "G", "toolchain_profile": "ruby-bundler", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "ruby-rails", "url": "https://github.com/rails/rails", "primary_language": "ruby", "selection_pattern": "B", "toolchain_profile": "ruby-bundler", "scale_requirement": "medium-or-larger", "v3_adapter": "required"},
-    {"id": "ruby-discourse", "url": "https://github.com/discourse/discourse", "primary_language": "ruby", "selection_pattern": "B", "toolchain_profile": "ruby-bundler", "scale_requirement": "medium-or-larger", "v3_adapter": "required"}
+    {
+      "id": "rust-ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "primary_language": "rust",
+      "toolchain_profile": "rust-cargo",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "rust-clap",
+      "url": "https://github.com/clap-rs/clap",
+      "primary_language": "rust",
+      "toolchain_profile": "rust-cargo",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "reuse-and-revalidate"
+    },
+    {
+      "id": "rust-tokio",
+      "url": "https://github.com/tokio-rs/tokio",
+      "primary_language": "rust",
+      "toolchain_profile": "rust-cargo",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "reuse-and-revalidate"
+    },
+    {
+      "id": "go-caddy",
+      "url": "https://github.com/caddyserver/caddy",
+      "primary_language": "go",
+      "toolchain_profile": "go-test",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "go-prometheus",
+      "url": "https://github.com/prometheus/prometheus",
+      "primary_language": "go",
+      "toolchain_profile": "go-test",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "go-kubernetes",
+      "url": "https://github.com/kubernetes/kubernetes",
+      "primary_language": "go",
+      "toolchain_profile": "go-test",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "python-scrapy",
+      "url": "https://github.com/scrapy/scrapy",
+      "primary_language": "python",
+      "toolchain_profile": "python-pip",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "python-pytest",
+      "url": "https://github.com/pytest-dev/pytest",
+      "primary_language": "python",
+      "toolchain_profile": "python-pip",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "python-django",
+      "url": "https://github.com/django/django",
+      "primary_language": "python",
+      "toolchain_profile": "python-pip",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "typescript-zod",
+      "url": "https://github.com/colinhacks/zod",
+      "primary_language": "typescript",
+      "toolchain_profile": "ts-pnpm",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "reuse-and-revalidate"
+    },
+    {
+      "id": "typescript-vite",
+      "url": "https://github.com/vitejs/vite",
+      "primary_language": "typescript",
+      "toolchain_profile": "ts-pnpm",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "typescript-compiler",
+      "url": "https://github.com/microsoft/TypeScript",
+      "primary_language": "typescript",
+      "toolchain_profile": "javascript-node",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "java-gson",
+      "url": "https://github.com/google/gson",
+      "primary_language": "java",
+      "toolchain_profile": "java-maven",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "reuse-and-revalidate"
+    },
+    {
+      "id": "java-spring-framework",
+      "url": "https://github.com/spring-projects/spring-framework",
+      "primary_language": "java",
+      "toolchain_profile": "java-gradle",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "java-kafka",
+      "url": "https://github.com/apache/kafka",
+      "primary_language": "java",
+      "toolchain_profile": "java-gradle",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "cpp-fmt",
+      "url": "https://github.com/fmtlib/fmt",
+      "primary_language": "cpp",
+      "toolchain_profile": "cpp-cmake",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "cpp-catch2",
+      "url": "https://github.com/catchorg/Catch2",
+      "primary_language": "cpp",
+      "toolchain_profile": "cpp-cmake",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "cpp-opencv",
+      "url": "https://github.com/opencv/opencv",
+      "primary_language": "cpp",
+      "toolchain_profile": "cpp-cmake",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "javascript-eslint",
+      "url": "https://github.com/eslint/eslint",
+      "primary_language": "javascript",
+      "toolchain_profile": "javascript-node",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "javascript-webpack",
+      "url": "https://github.com/webpack/webpack",
+      "primary_language": "javascript",
+      "toolchain_profile": "javascript-node",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "javascript-node",
+      "url": "https://github.com/nodejs/node",
+      "primary_language": "javascript",
+      "toolchain_profile": "javascript-node",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "ruby-rubocop",
+      "url": "https://github.com/rubocop/rubocop",
+      "primary_language": "ruby",
+      "toolchain_profile": "ruby-bundler",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "ruby-rails",
+      "url": "https://github.com/rails/rails",
+      "primary_language": "ruby",
+      "toolchain_profile": "ruby-bundler",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    },
+    {
+      "id": "ruby-discourse",
+      "url": "https://github.com/discourse/discourse",
+      "primary_language": "ruby",
+      "toolchain_profile": "ruby-bundler",
+      "scale_requirement": "medium-or-larger",
+      "v3_adapter": "required"
+    }
   ],
   "adapter_preflight": {
     "existing_adapter_registry_count": 17,
@@ -70,8 +303,10 @@
     "methodology_to_reuse": "Preserve merged PR closing a real issue, exact pre-fix parent, issue title/body verbatim, hidden FAIL_TO_PASS, and PASS_TO_PASS."
   },
   "change_control": {
-    "before_seal": "A repository may be replaced only by a public amendment that preserves primary language, six-task quota, selection pattern, toolchain family, and scale requirement.",
-    "after_seal": "No repository replacement or task reallocation is allowed; an unfillable repository/class slot invalidates the release corpus.",
-    "no_survivor_backfill": true
-  }
+    "before_seal": "A repository may be replaced only by a public amendment preserving primary language, six-task quota, at least two reserves, toolchain family, and scale requirement.",
+    "after_seal": "No repository replacement or task reallocation is allowed; an unfillable repository invalidates the release corpus.",
+    "same_repository_next_rank_only": true,
+    "cross_repository_backfill_forbidden": true
+  },
+  "minimum_reserves_per_repository": 2
 }

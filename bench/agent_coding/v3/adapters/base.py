@@ -263,13 +263,17 @@ def classify_task(labels: Sequence[str], config: Mapping[str, Any]) -> str:
 
 def harvest_metadata(
     *, client: GitHubClient, repository_id: str, repository_url: str,
-    created_after: dt.datetime, merged_after: dt.datetime, merged_before: dt.datetime,
-    target: int, config: Mapping[str, Any],
+    merged_after: dt.datetime, merged_before: dt.datetime,
+    config: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    """Harvest every merged PR in the window, including technical exclusions."""
     owner, name = github_repo_parts(repository_url)
     rows: list[dict[str, Any]] = []
-    for page in range(1, 21):
-        pulls = client.rest(f"/repos/{owner}/{name}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}")
+    page = 1
+    while True:
+        pulls = client.rest(
+            f"/repos/{owner}/{name}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"
+        )
         if not isinstance(pulls, list):
             raise AdapterError("GitHub pulls response is not an array")
         if not pulls:
@@ -279,7 +283,7 @@ def harvest_metadata(
                 continue
             created = parse_time(str(summary["created_at"]))
             merged = parse_time(str(summary["merged_at"]))
-            if created < created_after or not merged_after <= merged <= merged_before:
+            if not merged_after <= merged <= merged_before:
                 continue
             number = int(summary["number"])
             data = client.graphql(PR_QUERY, {"owner": owner, "name": name, "number": number})
@@ -288,37 +292,50 @@ def harvest_metadata(
             merge = pr.get("mergeCommit") or {}
             parents = [node.get("oid") for node in ((merge.get("parents") or {}).get("nodes") or [])]
             paths = [node.get("path") for node in ((pr.get("files") or {}).get("nodes") or [])]
-            commit_oids = [((node.get("commit") or {}).get("oid")) for node in ((pr.get("commits") or {}).get("nodes") or [])]
-            if not pr.get("merged") or len(issues) != 1 or not merge.get("oid") or len(paths) > 30 or not parents:
-                continue
-            issue = issues[0]
+            commit_oids = [
+                ((node.get("commit") or {}).get("oid"))
+                for node in ((pr.get("commits") or {}).get("nodes") or [])
+            ]
+            issue = issues[0] if len(issues) == 1 and isinstance(issues[0], dict) else {}
             labels = [node.get("name", "") for node in ((issue.get("labels") or {}).get("nodes") or [])]
-            strategy = "merge" if len(parents) > 1 else ("rebase" if merge["oid"] in commit_oids else "squash")
-            # In a multi-commit rebase the merge result's first parent is the
-            # previous rebased PR commit, not the target branch before the PR.
-            # Without an authoritative pre-merge base reconstruction the gold
-            # delta is ambiguous, so the contract requires rejection.
-            if strategy == "rebase":
-                continue
+            strategy = (
+                "merge" if len(parents) > 1
+                else "rebase" if merge.get("oid") in commit_oids
+                else "squash"
+            )
+            exclusion_reason = None
+            if not pr.get("merged") or len(issues) != 1:
+                exclusion_reason = "not_merged_or_linked_issue"
+            elif not merge.get("oid") or not parents or strategy == "rebase":
+                exclusion_reason = "unreconstructible_parent_or_merge"
             authoritative = {
                 "pr": number, "created_at": pr.get("createdAt"), "merged_at": pr.get("mergedAt"),
-                "solution": merge["oid"], "parents": parents, "paths": paths,
-                "issue": {"number": issue.get("number"), "title": issue.get("title"), "body": issue.get("body"), "url": issue.get("url")},
+                "solution": merge.get("oid"), "parents": parents, "paths": paths,
+                "issue": {
+                    "number": issue.get("number"), "title": issue.get("title"),
+                    "body": issue.get("body"), "url": issue.get("url"),
+                },
             }
-            rows.append({
+            row = {
                 "repository": repository_id, "repository_url": repository_url,
-                "pr_number": number, "issue_number": issue["number"], "issue_url": issue["url"],
-                "issue_title": issue["title"], "issue_body": issue.get("body") or "",
-                "created_at": pr["createdAt"], "merged_at": pr["mergedAt"],
-                "solution_commit": str(merge["oid"]).lower(), "parent_commit": str(parents[0]).lower(),
+                "candidate_id": f"pull-request:{number}", "pr_number": number,
+                "issue_number": issue.get("number"), "issue_url": issue.get("url"),
+                "issue_title": issue.get("title") or "", "issue_body": issue.get("body") or "",
+                "created_at": pr.get("createdAt") or summary.get("created_at"),
+                "merged_at": pr.get("mergedAt") or summary.get("merged_at"),
+                "solution_commit": str(merge.get("oid") or "").lower(),
+                "parent_commit": str(parents[0] if parents else "").lower(),
                 "authoritative_changed_paths": paths, "merge_strategy": strategy,
                 "task_class": classify_task(labels, config),
                 "authoritative_metadata_sha256": sha256(canonical_json(authoritative)),
-            })
-            if len(rows) >= target:
-                return rows
-    if len(rows) < target:
-        raise AdapterError(f"GitHub metadata yielded {len(rows)} eligible PRs, need {target}")
+            }
+            if exclusion_reason:
+                row["exclusion_reason"] = exclusion_reason
+                row["exclusion_cause"] = "authoritative GitHub metadata"
+            rows.append(row)
+        if len(pulls) < 100:
+            break
+        page += 1
     return rows
 
 
@@ -459,7 +476,10 @@ def validate_candidate(
     if paths != row.get("authoritative_changed_paths"):
         raise AdapterError("local changed paths differ from authoritative PR metadata")
     source_paths, test_paths = split_paths(paths, config)
-    if not source_paths or not test_paths: raise AdapterError("candidate lacks source or tests after classification")
+    if not source_paths:
+        raise AdapterError("candidate has no observable source or runtime-configuration fix")
+    if not test_paths:
+        raise AdapterError("candidate has no derivable independent behavior tests")
     test_patch = extract_patch(mirror, parent, solution, test_paths)
     gold_patch = extract_patch(mirror, parent, solution, source_paths)
     full_patch = extract_patch(mirror, parent, solution, paths)
@@ -501,7 +521,8 @@ def validate_candidate(
     metadata_hash = str(row.get("authoritative_metadata_sha256", ""))
     if not re.fullmatch(r"[0-9a-f]{64}", metadata_hash): raise AdapterError("metadata hash is missing")
     return {
-        **dict(row), "changed_source": source_paths, "changed_tests": test_paths,
+        **dict(row), "validation_outcome": "passed",
+        "changed_source": source_paths, "changed_tests": test_paths,
         **({"adapter_proof_sha256": adapter_proof_sha256} if adapter_proof_sha256 else {}),
         "repository_scale": repository_scale(mirror, parent, config),
         "merge_provenance": {
@@ -518,3 +539,38 @@ def validate_candidate(
             "logs_sha256": sha256(canonical_json(logs)), "validated_at": format_time(dt.datetime.now(UTC)),
         },
     }
+
+
+def validate_candidate_for_ledger(
+    row: Mapping[str, Any], mirror: pathlib.Path, scratch: pathlib.Path,
+    repetitions: int, config: Mapping[str, Any], runner_image_digest: str,
+    adapter_proof_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Return exactly one auditable row even when technical validation excludes it."""
+    if row.get("exclusion_reason"):
+        return {**dict(row), "validation_outcome": "not_run"}
+    try:
+        return validate_candidate(
+            row, mirror, scratch, repetitions, config, runner_image_digest,
+            adapter_proof_sha256,
+        )
+    except AdapterError as exc:
+        message = str(exc)
+        if "provenance" in message or "changed paths differ" in message or "solution commit" in message:
+            reason = "unreconstructible_parent_or_merge"
+        elif "no observable" in message:
+            reason = "no_observable_code_or_config_fix"
+        elif "no derivable" in message:
+            reason = "no_derivable_independent_behavior_tests"
+        elif "parent plus hidden tests" in message:
+            reason = "parent_hidden_wrong_failure"
+        elif "PASS_TO_PASS" in message or "gold F2P/P2P" in message:
+            reason = "gold_or_pass_to_pass_not_green"
+        else:
+            reason = "registered_budget_inexecutable"
+        if "greppy" in message.lower():
+            raise AdapterError("technical exclusion causes may not be Greppy-specific") from exc
+        return {
+            **dict(row), "exclusion_reason": reason, "exclusion_cause": message,
+            "validation_outcome": "failed",
+        }
