@@ -2440,8 +2440,8 @@ fn symbol_miss_json(store: &greppy_store::Store, project: &str, query: &str) -> 
     serde_json::json!({
         "suggestions": symbol_miss_suggestions(store, project, query),
         "next": [
-            format!("greppy search-symbols {}", shell_example_arg(query)),
-            format!("greppy semantic-search {}", shell_example_arg(query)),
+            format!("greppy search-symbol {}", shell_example_arg(query)),
+            format!("greppy search {}", shell_example_arg(query)),
         ],
     })
 }
@@ -5689,8 +5689,8 @@ fn content_fallback(
     for suggestion in suggestions {
         println!("suggestion: `{suggestion}`");
     }
-    println!("try: greppy search-symbols {}", shell_example_arg(symbol));
-    println!("try: greppy semantic-search {}", shell_example_arg(symbol));
+    println!("try: greppy search-symbol {}", shell_example_arg(symbol));
+    println!("try: greppy search {}", shell_example_arg(symbol));
     Ok(0)
 }
 
@@ -5737,7 +5737,7 @@ fn validate_nav_target(target: &str) -> Result<()> {
         let literal = target.replace(['*', '?', '[', ']'], "");
         return Err(Error::Invalid(format!(
             "`{target}` is a glob, not a symbol name, and greppy never expands one. Run \
-             `greppy search-symbols {}` for the exact name first",
+             `greppy search-symbol {}` for the exact name first",
             shell_example_arg(&literal)
         )));
     }

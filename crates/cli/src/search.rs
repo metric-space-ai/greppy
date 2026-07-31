@@ -365,7 +365,11 @@ pub(crate) fn dispatch_search_symbols(
         } else {
             println!("{}", indexed_stale_skip_message("search-symbol", freshness));
         }
-        return Ok(1);
+        // A refreshing/drifting index is a TEMPORARY refusal — the same
+        // situation search, plus and context report as retryable. Returning a
+        // flat 1 told an agent "permanently not there" for a state that
+        // resolves by itself, and a wrong answer is what follows.
+        return Ok(freshness_refusal_exit(freshness));
     }
     let freshness = decision.freshness().clone();
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
@@ -2002,7 +2006,7 @@ pub(crate) fn semantic_fallback_commands(query: &str, paths: &[String], root: Op
     let tokens = semantic_fallback_tokens(query);
     let mut commands = Vec::new();
     if let Some(symbol_token) = tokens.last() {
-        let mut command = format!("greppy search-symbols {}", shell_example_arg(symbol_token));
+        let mut command = format!("greppy search-symbol {}", shell_example_arg(symbol_token));
         for path in paths {
             command.push(' ');
             command.push_str(&shell_example_arg(path));

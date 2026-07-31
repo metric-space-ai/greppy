@@ -186,7 +186,7 @@
     #[test]
     fn semantic_fallback_commands_use_query_tokens() {
         let commands = semantic_fallback_commands("find semantic progress marker", &[], None);
-        assert_eq!(commands[0], "greppy search-symbols marker");
+        assert_eq!(commands[0], "greppy search-symbol marker");
         assert_eq!(commands[1], "greppy grep -rnE 'semantic|progress|marker' .");
     }
 

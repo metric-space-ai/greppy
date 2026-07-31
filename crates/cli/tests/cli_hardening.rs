@@ -1359,9 +1359,12 @@ fn discover_scope_env_controls_index_and_query_freshness() {
         &repo,
         &store,
     );
+    // A refreshing/drifting index is a TEMPORARY refusal (EXIT_TEMPFAIL 75),
+    // the same code search/plus/context return: the agent must be able to tell
+    // "retry in a moment" from "permanently absent".
     assert_eq!(
-        code, 1,
-        "default query must reject a scoped index instead of emitting stale hits; stderr={err}\nstdout={out}"
+        code, 75,
+        "default query must reject a scoped index as retryable, not as a miss; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -1647,8 +1650,8 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 1,
-        "preserved but stale active index must be refused; stderr={err}\nstdout={out}"
+        code, 75,
+        "preserved but stale active index is refused as retryable; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -1667,8 +1670,8 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 1,
-        "failed publish must leave the stale refusal in place; stderr={err}\nstdout={out}"
+        code, 75,
+        "failed publish leaves the retryable stale refusal in place; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -1942,8 +1945,8 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
         &envs,
     );
     assert_eq!(
-        code, 1,
-        "large drift must refuse stale hits while a refresh runs; stderr={err}"
+        code, 75,
+        "a refresh in flight is retryable, not a permanent miss; stderr={err}"
     );
     let first: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(first["freshness"]["state"], "refreshing");
@@ -1970,8 +1973,8 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
         &envs,
     );
     assert_eq!(
-        code, 1,
-        "second stale query must still refuse while the same refresh runs; stderr={err}"
+        code, 75,
+        "second stale query stays a retryable refusal while the same refresh runs; stderr={err}"
     );
     let second: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(second["freshness"]["state"], "refreshing");

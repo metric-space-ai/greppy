@@ -41,8 +41,8 @@ pub(crate) fn print_symbol_miss_guidance(store: &greppy_store::Store, project: &
     for suggestion in symbol_miss_suggestions(store, project, query) {
         println!("suggestion: `{suggestion}`");
     }
-    println!("try: greppy search-symbols {}", shell_example_arg(query));
-    println!("try: greppy semantic-search {}", shell_example_arg(query));
+    println!("try: greppy search-symbol {}", shell_example_arg(query));
+    println!("try: greppy search {}", shell_example_arg(query));
 }
 
 /// Emit a truncation footer for the navigation commands when more results
