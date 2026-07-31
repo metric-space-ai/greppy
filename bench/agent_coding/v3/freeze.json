@@ -1,0 +1,32 @@
+{
+  "schema_version": "greppy.agent-coding-freeze.v1",
+  "freeze_id": "v3-10c61c29e3c4a101",
+  "frozen_at": "2026-07-31T14:40:00Z",
+  "eligible_merged_after": "2026-05-01T00:00:00Z",
+  "eligible_merged_before": "2026-07-15T23:59:59Z",
+  "source_metadata_cutoff": "2026-07-20T00:00:00Z",
+  "frozen_spec": {
+    "repository_registry_sha256": "650377866581c02153f8e2bb4022410b701d67cb477f8b9b4c217211c9c1b150",
+    "corpus_contract_sha256": "96a2c43fd62f4adf17c81a520af498facfe93460479d2fe347e5321f1ec544d4",
+    "adapter_manifest_sha256": "dabf92cf637bc0a1c2ad3b72bc5d97d26fc519533979da108674a40c7434fb54",
+    "selection_secret_sha256": "15a67a6b5aac992812b48b93fcd3ca5e09da4d5ae08ea87524104b2a49e9c83e",
+    "model": {
+      "provider": "minimax",
+      "name": "MiniMax-M3",
+      "revision": "declared-unknown-cutoff"
+    },
+    "agent": {
+      "name": "pi",
+      "version": "0.80.2",
+      "configuration_sha256": "733a5ff0abfb63114daf60e6b3d92127e292ac6a5d5d5db1a0746625c3296120"
+    },
+    "budgets": {
+      "max_turns": 100,
+      "max_input_tokens": 200000,
+      "max_output_tokens": 50000,
+      "wall_seconds": 1800
+    },
+    "selection_algorithm": "HMAC-SHA256(secret, repo_id + NUL + candidate_id), ascending"
+  },
+  "frozen_spec_sha256": "7f0b375b7ca1e897731cc06126fca1c7708d55fd1c96798300840f8053939efa"
+}

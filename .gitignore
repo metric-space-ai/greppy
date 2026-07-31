@@ -77,3 +77,7 @@ crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
 crates/cli/assets/embeddinggemma-300m-q4k/*.gguf
 crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
 bench/agent_coding/*.bak*
+
+# v3 selection secret must never be committed; only its sha256 commitment
+# lives in freeze.json.
+bench/agent_coding/v3/*secret*
