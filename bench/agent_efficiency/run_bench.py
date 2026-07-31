@@ -317,6 +317,14 @@ def run_pi(
     return parsed
 
 
+# A greppy invocation that returns source text: the read family, or any
+# command carrying --code. `brief` sketches a body without printing it and is
+# deliberately NOT here; neither are pure relationship queries.
+SOURCE_RETURNING_GREPPY = re.compile(
+    r"greppy\S*\s+(read|read-smart|read-file)\b|greppy\S*\s+\S+[^|;&]*\s--code\b"
+)
+
+
 def parse_pi_jsonl(out: str) -> dict:
     inp = outp = tools = 0
     source_open_calls = 0
@@ -358,6 +366,15 @@ def parse_pi_jsonl(out: str) -> dict:
                 arguments = item.get("arguments") or {}
                 command = str(arguments.get("command", ""))
                 if re.search(r"(^|[;&|]\s*)(cat|head|tail|sed\s+-n)\s", command):
+                    source_open_calls += 1
+                elif SOURCE_RETURNING_GREPPY.search(command):
+                    # Arm-neutral definition: a call that RETURNS SOURCE TEXT is
+                    # a source open, whoever returns it. Counting `cat` but not
+                    # `greppy read` would have measured the same act as free for
+                    # one arm and costly for the other — a bias in the
+                    # candidate's favour. greppy's advantage must show up in HOW
+                    # MANY such calls it needs and how much text they carry
+                    # (ctx_chars), never in a definitional loophole.
                     source_open_calls += 1
             u = m.get("usage", {}) or {}
             turn_input = int(u.get("input", 0) or 0)
