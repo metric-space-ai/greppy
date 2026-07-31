@@ -489,6 +489,46 @@ def clone_pinned_repository(task: dict[str, Any], parent: pathlib.Path) -> pathl
     return backing
 
 
+def _initialize_isolated_repository(path: pathlib.Path, timeout_seconds: int) -> None:
+    run_checked(
+        ["git", "init", "--quiet"],
+        cwd=path,
+        timeout_seconds=timeout_seconds,
+        operation="isolated repository initialization",
+    )
+    for key, value in (
+        ("user.name", "Greppy Coding Benchmark"),
+        ("user.email", "coding-benchmark@example.invalid"),
+        ("core.logAllRefUpdates", "false"),
+    ):
+        run_checked(
+            ["git", "config", key, value],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated repository configuration",
+        )
+    run_checked(
+        ["git", "add", "--force", "--all", "--", "."],
+        cwd=path,
+        timeout_seconds=timeout_seconds,
+        operation="isolated repository staging",
+    )
+    run_checked(
+        [
+            "git",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-m",
+            "Benchmark pinned tree",
+        ],
+        cwd=path,
+        timeout_seconds=timeout_seconds,
+        operation="isolated repository commit",
+    )
+
+
 @contextlib.contextmanager
 def temporary_worktree(
     backing: pathlib.Path,
@@ -496,29 +536,73 @@ def temporary_worktree(
     path: pathlib.Path,
     timeout_seconds: int,
 ) -> Iterator[pathlib.Path]:
+    """Materialize a pinned tree as a fresh one-commit repository.
+
+    The transient checkout linked to the upstream mirror is removed before the
+    caller (and therefore the agent) can observe the workspace.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    run_checked(
-        ["git", "--git-dir", str(backing), "worktree", "add", "--detach", str(path), commit],
+    expected_tree = run_checked(
+        ["git", "--git-dir", str(backing), "rev-parse", f"{commit}^{{tree}}"],
         cwd=path.parent,
         timeout_seconds=timeout_seconds,
-        operation="worktree creation",
+        operation="pinned tree identity capture",
+    ).stdout.decode("ascii", "strict").strip()
+    source = path.parent / f".{path.name}-pinned-source"
+    if path.exists() or source.exists():
+        raise HarnessError("isolated workspace path already exists")
+    run_checked(
+        ["git", "--git-dir", str(backing), "worktree", "add", "--detach", str(source), commit],
+        cwd=path.parent,
+        timeout_seconds=timeout_seconds,
+        operation="pinned tree materialization",
     )
     try:
-        yield path
+        shutil.copytree(source, path, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    except Exception:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
     finally:
         run_process(
-            ["git", "--git-dir", str(backing), "worktree", "remove", "--force", str(path)],
+            ["git", "--git-dir", str(backing), "worktree", "remove", "--force", str(source)],
             cwd=path.parent,
             timeout_seconds=min(timeout_seconds, 120),
         )
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(source, ignore_errors=True)
         run_process(
             ["git", "--git-dir", str(backing), "worktree", "prune", "--expire", "now"],
             cwd=path.parent,
             timeout_seconds=min(timeout_seconds, 120),
         )
+    try:
+        _initialize_isolated_repository(path, timeout_seconds)
+        actual_tree = run_checked(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated tree identity capture",
+        ).stdout.decode("ascii", "strict").strip()
+        commit_count = run_checked(
+            ["git", "rev-list", "--all", "--count"],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated commit count",
+        ).stdout.decode("ascii", "strict").strip()
+        remotes = run_checked(
+            ["git", "remote"],
+            cwd=path,
+            timeout_seconds=timeout_seconds,
+            operation="isolated remote check",
+        ).stdout.strip()
+        if actual_tree != expected_tree:
+            raise HarnessError("isolated repository tree differs from pinned tree")
+        if commit_count != "1" or remotes or (path / ".git" / "logs").exists():
+            raise HarnessError("isolated repository contains upstream Git metadata")
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
         if path.exists():
-            raise HarnessError("worktree cleanup failed")
+            raise HarnessError("isolated workspace cleanup failed")
 
 
 def apply_mutation(worktree: pathlib.Path, patch: str, timeout_seconds: int) -> None:
@@ -988,7 +1072,7 @@ def run_pi_agent(
     # gives the agent an absolute path, but agents drift to bare `greppy`;
     # without this they silently hit a stale system/ctox shim whose passthrough
     # routes unknown subcommands to grep -> contaminated measurement.
-    binshim = raw_dir / ".binshim"
+    binshim = pi_config_dir / ".binshim"
     binshim.mkdir(parents=True, exist_ok=True)
     shim = binshim / "greppy"
     if shim.is_symlink() or shim.exists():
@@ -1128,6 +1212,12 @@ def run_mutation_preflight(
     worktree_path = task_tmp / "preflight-worktree"
     preflight_store = task_tmp / "preflight-greppy-store"
     with temporary_worktree(backing, task["repository"]["commit"], worktree_path, task["timeout_seconds"]) as worktree:
+        base_commit = run_checked(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            timeout_seconds=task["timeout_seconds"],
+            operation="isolated base commit capture",
+        ).stdout.decode("ascii", "strict").strip()
         try:
             setup = run_setup_commands(
                 task=task,
@@ -1172,7 +1262,7 @@ def run_mutation_preflight(
                 }
 
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
-        mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        mutation_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         mutated_spawn_error = False
         try:
             mutated_result = run_process(
@@ -1241,6 +1331,12 @@ def run_arm(
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     with temporary_worktree(backing, task["repository"]["commit"], worktree_path, task["timeout_seconds"]) as worktree:
+        base_commit = run_checked(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            timeout_seconds=task["timeout_seconds"],
+            operation="isolated base commit capture",
+        ).stdout.decode("ascii", "strict").strip()
         setup = run_setup_commands(
             task=task,
             worktree=worktree,
@@ -1249,7 +1345,7 @@ def run_arm(
             secrets=secrets,
         )
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
-        mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        mutation_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         mutation_hash = sha256_bytes(mutation_diff)
         if mutation_hash != expected_mutation_hash:
             raise HarnessError("arm mutation differs from preflight mutation")
@@ -1286,7 +1382,7 @@ def run_arm(
             raw_dir=raw_dir,
             secrets=secrets,
         )
-        pretest_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        pretest_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         safe_pretest_diff = redact(pretest_diff, secrets)
         atomic_write_bytes(raw_dir / "pretest.patch", safe_pretest_diff)
         if safe_pretest_diff != pretest_diff:
@@ -1303,7 +1399,7 @@ def run_arm(
         )
         test_output = redact(test_result.stdout + test_result.stderr, secrets)
         atomic_write_bytes(raw_dir / "test.log", test_output)
-        final_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        final_diff = capture_binary_diff(worktree, base_commit, task["timeout_seconds"])
         safe_final_diff = redact(final_diff, secrets)
         atomic_write_bytes(raw_dir / "final.patch", safe_final_diff)
         if safe_final_diff != final_diff:
@@ -1610,15 +1706,18 @@ def build_base_manifest(
             "only_intended_prompt_delta": "navigation treatment",
         },
         "isolation": {
-            "temporary_git_worktree_per_arm": True,
+            "single_commit_repository_per_preflight_and_arm": True,
+            "upstream_refs_remotes_and_reflogs_excluded": True,
+            "upstream_mirror_outside_agent_workspace": True,
+            "task_id_excluded_from_agent_paths_and_prompts": True,
             "greppy_store_per_arm": True,
             "pi_config_per_arm": True,
-            "worktree_cleanup_in_finally": True,
+            "workspace_cleanup_in_finally": True,
         },
         "setup_contract": {
             "required_task_field": True,
             "direct_argv_without_shell": True,
-            "runs_in_each_fresh_preflight_and_arm_worktree": True,
+            "runs_in_each_fresh_preflight_and_arm_repository": True,
             "runs_before_mutation": True,
             "provider_key_removed": True,
             "excluded_from_agent_wall": True,
@@ -1780,15 +1879,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if all((task["id"], arm) in completed for arm in selected_arms):
             continue
         print(f"[{task['id']}] preparing pinned repository", flush=True)
-        # ignore_cleanup_errors: the greppy daemon may still be flushing into
-        # the worktree when the context exits; a leaked temp dir on an
-        # ephemeral runner is harmless, a crashed 2.5h benchmark run is not.
+        # Keep the full upstream mirror in a separately randomized harness
+        # directory. Agent-visible paths are task-id-free and contain only the
+        # fresh one-commit repository materialized for that attempt.
+        # ignore_cleanup_errors tolerates a greppy daemon still flushing during
+        # teardown; a leaked ephemeral temp dir must not discard a long run.
         with tempfile.TemporaryDirectory(
-            prefix=f"greppy-agent-coding-{task['id']}-", ignore_cleanup_errors=True
-        ) as tmp_name:
+            prefix="greppy-agent-coding-", ignore_cleanup_errors=True
+        ) as tmp_name, tempfile.TemporaryDirectory(
+            prefix="greppy-agent-source-", ignore_cleanup_errors=True
+        ) as backing_tmp_name:
             task_tmp = pathlib.Path(tmp_name)
             try:
-                backing = clone_pinned_repository(task, task_tmp)
+                backing = clone_pinned_repository(task, pathlib.Path(backing_tmp_name))
                 preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task["id"], secrets)
                 base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
                 if not preflight["valid"]:

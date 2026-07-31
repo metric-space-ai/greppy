@@ -23,12 +23,16 @@ command guides, while the explorer arm receives no code-intelligence workflow.
 Full prompt hashes, the shared user-prompt hash, the per-arm palette, and the
 setup-command hash are recorded in `MANIFEST.json`.
 
-The order of the two arms is deterministically counterbalanced from the task
-ID. Each arm gets a separate temporary Git worktree, `GREPPY_STORE_DIR`, and
-`PI_CODING_AGENT_DIR`. Before measurement, a third disposable worktree runs
-setup, requires the independent test to pass on the clean pinned source, then
-applies the mutation and requires that same test to fail without timing out.
-Each arm independently reruns setup before applying the mutation. With
+The order of the arms is deterministically counterbalanced from the task ID.
+Each arm gets a separate temporary Git repository, `GREPPY_STORE_DIR`, and
+`PI_CODING_AGENT_DIR`. The repository contains one synthetic commit holding the
+pinned tree, with the task mutation left uncommitted; it has no upstream refs,
+remotes, or reflogs. The full clone used to verify and materialize the pinned
+commit stays outside the agent workspace, and task IDs are absent from agent
+paths and prompts. Before measurement, a third disposable one-commit repository
+runs setup, requires the independent test to pass on the clean pinned source,
+then applies the mutation and requires that same test to fail without timing
+out. Each arm independently reruns setup before applying the mutation. With
 `--warm-greppy`, only the Greppy arm is indexed after mutation but before the
 measured agent timer starts; setup and warmup durations are recorded separately.
 
@@ -141,12 +145,11 @@ Default checkpoint directories under `bench/agent_coding/runs/` are also ignored
 their manifest can be uploaded directly as a benchmark artifact.
 
 Pi and every command it starts run in their own process group. A timeout kills
-the complete process group. Worktree removal runs in `finally`, followed by
-forced directory removal and Git worktree pruning; task-level temporary roots
-provide a second cleanup layer for exceptions, timeouts, Ctrl-C, SIGTERM, and
-SIGHUP. As with any process, SIGKILL or machine power loss cannot execute
-cleanup handlers; stale operating-system temporary directories can then be
-removed normally.
+the complete process group. Isolated repository removal runs in `finally`;
+task-level temporary roots provide a second cleanup layer for exceptions,
+timeouts, Ctrl-C, SIGTERM, and SIGHUP. As with any process, SIGKILL or machine
+power loss cannot execute cleanup handlers; stale operating-system temporary
+directories can then be removed normally.
 
 ## Preregistered gate
 
@@ -177,8 +180,9 @@ python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
 ```
 
 They cover patch validation/application (including binary diff capture),
-worktree cleanup on exceptions, strict argv-only setup validation, setup failure
-and secret handling, clean-pass/mutated-fail preflight behavior, setup exclusion
+one-commit workspace isolation and cleanup on exceptions, strict argv-only setup
+validation, setup failure and secret handling, clean-pass/mutated-fail preflight
+behavior, setup exclusion
 from measured agent wall time, metric parsing and secret redaction, exact paired
 correctness grading, the 20% efficiency threshold across all three metrics,
 30/20 minimum sample sizes, strict agent success validity, manifest

@@ -37,11 +37,14 @@ class GitFixture(unittest.TestCase):
         git(self.source, "config", "user.name", "Benchmark Test")
         git(self.source, "config", "user.email", "benchmark@example.invalid")
         (self.source / "value.txt").write_text("old\n", encoding="utf-8")
+        (self.source / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        (self.source / "ignored.txt").write_text("tracked despite ignore\n", encoding="utf-8")
         (self.source / "test_guard.py").write_text(
             "import pathlib\nassert pathlib.Path('value.txt').read_text() == 'old\\n'\n",
             encoding="utf-8",
         )
-        git(self.source, "add", "value.txt", "test_guard.py")
+        git(self.source, "add", "value.txt", ".gitignore", "test_guard.py")
+        git(self.source, "add", "--force", "ignored.txt")
         git(self.source, "commit", "-qm", "fixture")
         self.commit = git(self.source, "rev-parse", "HEAD")
         self.backing = self.root / "repo.git"
@@ -66,7 +69,7 @@ class PatchTests(GitFixture):
             bench.apply_mutation(worktree, self.PATCH, 10)
             self.assertEqual((worktree / "value.txt").read_text(encoding="utf-8"), "new\n")
             (worktree / "asset.bin").write_bytes(b"\x00\x01\xff\x00")
-            diff = bench.capture_binary_diff(worktree, self.commit, 10)
+            diff = bench.capture_binary_diff(worktree, git(worktree, "rev-parse", "HEAD"), 10)
             self.assertIn(b"+new", diff)
             self.assertIn(b"GIT binary patch", diff)
             self.assertRegex(bench.sha256_bytes(diff), r"^[0-9a-f]{64}$")
@@ -90,6 +93,19 @@ class WorktreeTests(GitFixture):
         backing = bench.clone_pinned_repository(task, clone_parent)
         resolved = git(clone_parent, "--git-dir", str(backing), "rev-parse", "HEAD")
         self.assertEqual(resolved, self.commit)
+
+    def test_agent_workspace_has_one_commit_and_no_upstream_metadata(self) -> None:
+        worktree_path = self.root / "isolated-workspace"
+        with bench.temporary_worktree(self.backing, self.commit, worktree_path, 10) as worktree:
+            bench.apply_mutation(worktree, PatchTests.PATCH, 10)
+            commits = git(worktree, "log", "--all", "--oneline").splitlines()
+            self.assertEqual(len(commits), 1)
+            self.assertNotIn(self.commit[:12], "\n".join(commits))
+            self.assertEqual(git(worktree, "remote"), "")
+            self.assertTrue((worktree / ".git").is_dir())
+            self.assertFalse((worktree / ".git" / "logs").exists())
+            self.assertIn("ignored.txt", git(worktree, "ls-files").splitlines())
+            self.assertEqual((worktree / "value.txt").read_text(encoding="utf-8"), "new\n")
 
     def test_worktree_is_removed_after_exception(self) -> None:
         worktree_path = self.root / "cleanup-worktree"
@@ -304,7 +320,7 @@ class SetupLifecycleTests(GitFixture):
         ) as hash_worktree:
             bench.apply_mutation(hash_worktree, test_patch, 10)
             expected_hash = bench.sha256_bytes(
-                bench.capture_binary_diff(hash_worktree, self.commit, 10)
+                bench.capture_binary_diff(hash_worktree, git(hash_worktree, "rev-parse", "HEAD"), 10)
             )
 
         def weaken_test(**kwargs):
@@ -613,6 +629,16 @@ class GradingTests(unittest.TestCase):
 class ContractTests(unittest.TestCase):
     def test_all_arms_receive_the_same_builtin_tool_palette(self) -> None:
         self.assertEqual(set(bench.ARM_TOOLS.values()), {"bash,read,edit,write"})
+
+    def test_task_id_is_not_in_agent_prompts(self) -> None:
+        task = {
+            "id": "repo-type-fixprefix123",
+            "user_task": "Repair the behavior.",
+            "test_command": ["python3", "-m", "unittest"],
+        }
+        self.assertNotIn(task["id"], bench.shared_user_prompt(task))
+        for arm in bench.ARMS:
+            self.assertNotIn(task["id"], bench.system_prompt(arm, pathlib.Path("/opt/greppy")))
 
     def test_arm_validity_requires_success_even_when_turns_exist(self) -> None:
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "timed_out": True}))
