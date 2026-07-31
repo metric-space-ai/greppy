@@ -52,7 +52,6 @@ CASES = {
     "replace-text": (["replace-text", "edit-src/data.rs", "no-such-text-xyzzy", "NEW", "--dry-run"], {13}, [r"occurs 0 times"]),
     "patch": (["patch", "--dry-run"], {20}, [r"no DIFF"]),
     "undo": (["undo", "no-such-id"], {10}, [r"nothing to undo"]),
-    "bash-smart": (["bash-smart", "--", "sh", "-c", "echo ok"], {0}, [r"ok"]),
     "expand-bad-id": (["expand", "ffffffffffffffff"], {1}, [r"not found|expired"]),
     "grep-passthrough": (["-c", "parse_path", "edit-src/data.rs"], {0}, [r"^\d+$"]),
     # ON EVERY COMMAND promises --path, --json, --limit on every verb: sample
@@ -66,6 +65,10 @@ CASES = {
 
 REMOVED = ["find-usages", "references", "map", "outline", "changes", "verify",
            "search-symbols", "search-code"]  # orient was a section, never a verb
+
+# Compiled out of 0.3.0 (feature `bash-smart`): not retired vocabulary, so it
+# is not refused — it is simply not a greppy verb and falls through to grep.
+NOT_IN_THIS_RELEASE = ["bash-smart"]
 
 
 def run(binary: str, tail: list[str]) -> tuple[int, str]:
@@ -116,6 +119,14 @@ def main() -> None:
         else:
             failed += 1
             print(f"FAIL removed:{verb}: exit {code}, wanted the vocabulary refusal")
+    for verb in NOT_IN_THIS_RELEASE:
+        code, out = run(binary, [verb, "--", "sh", "-c", "echo ok"])
+        if code != 64 and "greppy expand" not in out and "…" not in out:
+            passed += 1
+            print(f"ok   absent:{verb} (not a verb in this release)")
+        else:
+            failed += 1
+            print(f"FAIL absent:{verb}: the binary still answers it (exit {code})")
     print(f"\nSMOKE: {passed} ok, {failed} fail")
     sys.exit(1 if failed else 0)
 
