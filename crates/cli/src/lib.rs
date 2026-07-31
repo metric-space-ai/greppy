@@ -34,6 +34,24 @@ const _: () = assert!(
      neither, build with --features cpu-only."
 );
 
+// Route this module's stdout through one optional collector. Query commands
+// activate it for --max-bytes/--offset, and whole-file reads also activate a
+// conservative default budget; grep passthrough bytes remain untouched.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::output_write(format_args!($($arg)*), false);
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        crate::output_write(format_args!(""), true);
+    }};
+    ($($arg:tt)*) => {{
+        crate::output_write(format_args!($($arg)*), true);
+    }};
+}
+
 mod cli_surface;
 pub use cli_surface::*;
 mod nav;
@@ -75,24 +93,6 @@ mod inference_daemon;
 #[cfg(any(unix, windows))]
 mod summarize_daemon;
 mod trial;
-
-// Route this module's stdout through one optional collector. Query commands
-// activate it for --max-bytes/--offset, and whole-file reads also activate a
-// conservative default budget; grep passthrough bytes remain untouched.
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        crate::output_write(format_args!($($arg)*), false);
-    }};
-}
-
-macro_rules! println {
-    () => {{
-        crate::output_write(format_args!(""), true);
-    }};
-    ($($arg:tt)*) => {{
-        crate::output_write(format_args!($($arg)*), true);
-    }};
-}
 
 fn output_write(arguments: std::fmt::Arguments<'_>, newline: bool) {
     use std::io::Write as _;
@@ -9252,11 +9252,48 @@ fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> 
         if spec
             .max_bytes
             .is_none_or(|max_bytes| rendered.len() <= max_bytes)
-            || !pop_result_item(&mut value)
         {
             return Some(rendered);
         }
+        if result_item_count(&value) > 1 {
+            pop_result_item(&mut value);
+            continue;
+        }
+        // Progress guarantee: a budget too small for even one full row must
+        // not shrink the answer to zero rows with a same-offset retry — that
+        // offer would loop forever delivering nothing. The last row sheds its
+        // heavy optional fields instead; only when fully slimmed and still
+        // over budget does it ship as-is.
+        if !slim_last_result_item(&mut value) {
+            return Some(rendered);
+        }
     }
+}
+
+/// One degrade step on the sole remaining result row: drop the heaviest
+/// optional field present. Returns false when nothing is left to shed.
+fn slim_last_result_item(value: &mut serde_json::Value) -> bool {
+    let Some(items) = value
+        .get_mut("hits")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let Some(row) = items.first_mut().and_then(|row| row.as_object_mut()) else {
+        return false;
+    };
+    for heavy in ["handle", "source", "snippet"] {
+        if row.remove(heavy).is_some() {
+            return true;
+        }
+    }
+    if let Some(matches) = row.get_mut("matches").and_then(serde_json::Value::as_array_mut) {
+        if matches.len() > 1 {
+            matches.truncate(1);
+            return true;
+        }
+    }
+    false
 }
 
 fn text_line_is_priority(line: &str) -> bool {
