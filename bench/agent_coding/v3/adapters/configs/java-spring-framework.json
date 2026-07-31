@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "java-spring-framework",
+  "repository_url": "https://github.com/spring-projects/spring-framework",
+  "primary_language": "java",
+  "toolchain_profile": "java-gradle",
+  "test_globs": ["**/src/test/**", "**/*Tests.java"],
+  "ignore_globs": ["build/**", "**/build/**", "**/generated/**"],
+  "source_extensions": [".java", ".kt"],
+  "label_task_classes": {"type: bug": "reported_bugfix", "type: enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

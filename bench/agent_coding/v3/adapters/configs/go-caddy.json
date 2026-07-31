@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "go-caddy",
+  "repository_url": "https://github.com/caddyserver/caddy",
+  "primary_language": "go",
+  "toolchain_profile": "go-test",
+  "test_globs": ["*_test.go", "**/*_test.go"],
+  "ignore_globs": ["vendor/**", "**/vendor/**", "**/generated/**"],
+  "source_extensions": [".go"],
+  "label_task_classes": {"bug": "reported_bugfix", "feature": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

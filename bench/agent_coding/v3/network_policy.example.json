@@ -1,0 +1,42 @@
+{
+  "schema_version": "greppy.agent-coding-v3.docker-network-policy.1",
+  "status": "template-not-sealed",
+  "docker": {
+    "minimum_version": "27.2.0",
+    "binary": "docker"
+  },
+  "topology": {
+    "agent_internal_network": "greppy-v3-agent-internal",
+    "proxy_egress_network": "greppy-v3-proxy-egress",
+    "proxy_container": "greppy-v3-egress-proxy",
+    "proxy_port": 3128,
+    "proxy_policy_path": "/etc/greppy-proxy/policy.json",
+    "proxy_image_id": "sha256:REPLACE_WITH_LOCAL_PROXY_IMAGE_ID",
+    "agent_audit_image": "python:3.12-alpine@sha256:REPLACE_WITH_PINNED_MANIFEST_DIGEST",
+    "agent_audit_image_id": "sha256:REPLACE_WITH_LOCAL_AGENT_IMAGE_ID"
+  },
+  "provider_contract": {
+    "provider_source": "../../agent_efficiency/minimax-provider.js",
+    "provider_source_sha256": "c9e31cafdaad24801f706106a91cce3dc75528d51b056f3ace09ac20cbd1696e",
+    "allow_connect": [
+      {"host": "api.minimax.io", "port": 443}
+    ],
+    "proxy_policy_sha256": "4bff6ca783f6253c7a4999c7956f2c0318372eff66239c98921f07a01bacf480",
+    "probe_url": "https://api.minimax.io/anthropic",
+    "reachable_http_statuses": [400, 401, 403, 404, 405]
+  },
+  "negative_probes": {
+    "proxy_denied_urls": ["https://github.com/"],
+    "dns_denied_names": ["github.com"],
+    "direct_socket_denied": [
+      {"host": "1.1.1.1", "port": 443},
+      {"host": "8.8.8.8", "port": 53}
+    ]
+  },
+  "mount_isolation": {
+    "forbidden_root_env": ["GREPPY_BENCH_NAS_ROOT"],
+    "forbidden_nvme_relative_paths": ["mirrors", "scratch/agent-coding-v3/sealed"],
+    "proxy_allowed_mounts": []
+  },
+  "probe_timeout_seconds": 15
+}

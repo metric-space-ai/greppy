@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "rust-ripgrep",
+  "repository_url": "https://github.com/BurntSushi/ripgrep",
+  "primary_language": "rust",
+  "toolchain_profile": "rust-cargo",
+  "test_globs": ["tests/**", "**/tests/**"],
+  "ignore_globs": ["**/vendor/**", "target/**", "Cargo.lock"],
+  "source_extensions": [".rs"],
+  "label_task_classes": {"bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

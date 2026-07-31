@@ -1,0 +1,14 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "cpp-fmt",
+  "repository_url": "https://github.com/fmtlib/fmt",
+  "primary_language": "cpp",
+  "toolchain_profile": "cpp-cmake",
+  "test_globs": ["test/**", "tests/**", "**/*test.cc", "**/*test.cpp"],
+  "ignore_globs": ["build/**", "**/build/**", "doc/**", "support/**", "**/generated/**"],
+  "source_extensions": [".cc", ".cpp", ".c", ".h", ".hpp"],
+  "setup_commands": [["cmake", "-S", ".", "-B", "build", "-G", "Ninja", "-DFMT_TEST=ON", "-DCMAKE_BUILD_TYPE=Release"], ["cmake", "--build", "build", "-j2"]],
+  "post_patch_commands": [["cmake", "--build", "build", "-j2"]],
+  "label_task_classes": {"bug": "reported_bugfix", "feature": "feature_implementation"},
+  "timeout_seconds": 1800
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "typescript-compiler",
+  "repository_url": "https://github.com/microsoft/TypeScript",
+  "primary_language": "typescript",
+  "toolchain_profile": "javascript-node",
+  "test_globs": ["tests/**", "**/*.test.ts", "**/*.spec.ts", "tests/cases/**"],
+  "ignore_globs": ["node_modules/**", "**/node_modules/**", "built/**", "**/generated/**", "package-lock.json"],
+  "source_extensions": [".ts", ".tsx"],
+  "f2p_command": ["npm", "test", "--", "{test_paths}"],
+  "p2p_command": ["npm", "test"],
+  "label_task_classes": {"bug": "reported_bugfix", "suggestion": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 3600
+}

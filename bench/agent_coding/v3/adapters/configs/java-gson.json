@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "java-gson",
+  "repository_url": "https://github.com/google/gson",
+  "primary_language": "java",
+  "toolchain_profile": "java-maven",
+  "test_globs": ["**/src/test/**", "**/*Test.java", "**/*Tests.java"],
+  "ignore_globs": ["target/**", "**/target/**", "**/generated/**"],
+  "source_extensions": [".java"],
+  "label_task_classes": {"bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

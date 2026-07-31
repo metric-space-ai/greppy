@@ -1,0 +1,15 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "typescript-vite",
+  "repository_url": "https://github.com/vitejs/vite",
+  "primary_language": "typescript",
+  "toolchain_profile": "ts-pnpm",
+  "test_globs": ["**/__tests__/**", "**/*.test.ts", "**/*.spec.ts", "playground/**"],
+  "ignore_globs": ["node_modules/**", "**/node_modules/**", "dist/**", "**/dist/**", "pnpm-lock.yaml"],
+  "source_extensions": [".ts", ".tsx"],
+  "f2p_command": ["pnpm", "--offline", "test", "--", "{test_paths}"],
+  "p2p_command": ["pnpm", "--offline", "test"],
+  "label_task_classes": {"bug": "reported_bugfix", "feat": "feature_implementation", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

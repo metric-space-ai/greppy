@@ -1,0 +1,30 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-manifest.1",
+  "note": "Registry coverage is 24/24. No row is ready until build_manifest.py executes all local preflights and verifies a real two-run offline smoke validation ledger for that repository and digest-pinned image.",
+  "adapters": [
+    {"repository_id": "rust-ripgrep", "status": "pending", "toolchain_profile": "rust-cargo", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "rust-clap", "status": "pending", "toolchain_profile": "rust-cargo", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "rust-tokio", "status": "pending", "toolchain_profile": "rust-cargo", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "go-caddy", "status": "pending", "toolchain_profile": "go-test", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "go-prometheus", "status": "pending", "toolchain_profile": "go-test", "reason": "real repository smoke validation not executed; generated asset prerequisites need manual verification"},
+    {"repository_id": "go-kubernetes", "status": "pending", "toolchain_profile": "go-test", "reason": "real repository smoke validation not executed; repository-supported package runner needs manual verification"},
+    {"repository_id": "python-scrapy", "status": "pending", "toolchain_profile": "python-pip", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "python-pytest", "status": "pending", "toolchain_profile": "python-pip", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "python-django", "status": "pending", "toolchain_profile": "python-pip", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "typescript-zod", "status": "pending", "toolchain_profile": "ts-pnpm", "reason": "real repository smoke validation not executed; changed-path forwarding needs manual verification"},
+    {"repository_id": "typescript-vite", "status": "pending", "toolchain_profile": "ts-pnpm", "reason": "real repository smoke validation not executed; repository-specific pnpm target needs manual verification"},
+    {"repository_id": "typescript-compiler", "status": "pending", "toolchain_profile": "javascript-node", "reason": "real repository smoke validation not executed; repository-specific test selector needs manual verification"},
+    {"repository_id": "java-gson", "status": "pending", "toolchain_profile": "java-maven", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "java-spring-framework", "status": "pending", "toolchain_profile": "java-gradle", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "java-kafka", "status": "pending", "toolchain_profile": "java-gradle", "reason": "real repository smoke validation not executed; module-scoped Gradle target needs manual verification"},
+    {"repository_id": "cpp-fmt", "status": "pending", "toolchain_profile": "cpp-cmake", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "cpp-catch2", "status": "pending", "toolchain_profile": "cpp-cmake", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "cpp-opencv", "status": "pending", "toolchain_profile": "cpp-cmake", "reason": "real repository smoke validation not executed; module-scoped CTest target needs manual verification"},
+    {"repository_id": "javascript-eslint", "status": "pending", "toolchain_profile": "javascript-node", "reason": "real repository smoke validation not executed; npm test-path forwarding needs manual verification"},
+    {"repository_id": "javascript-webpack", "status": "pending", "toolchain_profile": "javascript-node", "reason": "real repository smoke validation not executed; package-manager test selector needs manual verification"},
+    {"repository_id": "javascript-node", "status": "pending", "toolchain_profile": "javascript-node", "reason": "real repository smoke validation not executed; tools/test.py path selection needs manual verification"},
+    {"repository_id": "ruby-rubocop", "status": "pending", "toolchain_profile": "ruby-bundler", "reason": "real repository smoke validation not executed"},
+    {"repository_id": "ruby-rails", "status": "pending", "toolchain_profile": "ruby-bundler", "reason": "real repository smoke validation not executed; component-scoped Rails runner needs manual verification"},
+    {"repository_id": "ruby-discourse", "status": "pending", "toolchain_profile": "ruby-bundler", "reason": "real repository smoke validation not executed; service-backed RSpec setup needs manual verification"}
+  ]
+}

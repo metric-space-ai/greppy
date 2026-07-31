@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "python-pytest",
+  "repository_url": "https://github.com/pytest-dev/pytest",
+  "primary_language": "python",
+  "toolchain_profile": "python-pip",
+  "test_globs": ["testing/**", "tests/**", "**/test_*.py", "**/*_test.py"],
+  "ignore_globs": ["**/vendor/**", "**/generated/**", "**/*.lock"],
+  "source_extensions": [".py"],
+  "label_task_classes": {"bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

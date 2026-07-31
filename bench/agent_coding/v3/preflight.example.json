@@ -1,0 +1,44 @@
+{
+  "schema_version": "greppy.agent-coding-v3.gpu3-preflight-config.1",
+  "execution_mode": "container",
+  "registry": "repository_registry.json",
+  "network_policy": "network_policy.example.json",
+  "adapter_manifest": "adapters.example.json",
+  "adapter_probe_timeout_seconds": 30,
+  "nvme": {
+    "root": "",
+    "minimum_free_gib": 500
+  },
+  "nas": {
+    "root": "",
+    "minimum_free_gib": 500
+  },
+  "tools": {
+    "probe_timeout_seconds": 20,
+    "required_java_major": 17,
+    "command_overrides": {},
+    "exact_versions": {
+      "greppy": "0.3.0"
+    },
+    "minimum_versions": {
+      "git": "2.30",
+      "rg": "13.0",
+      "python3": "3.11",
+      "uv": "0.5",
+      "cargo": "1.75",
+      "rustc": "1.75",
+      "go": "1.22",
+      "java": "17",
+      "mvn": "3.8.6",
+      "node": "20",
+      "pnpm": "9",
+      "cmake": "3.25",
+      "ninja": "1.10",
+      "c++": null,
+      "ruby": "3.2",
+      "bundle": "2.5",
+      "pi": null,
+      "greppy": "0.3.0"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "ruby-rubocop",
+  "repository_url": "https://github.com/rubocop/rubocop",
+  "primary_language": "ruby",
+  "toolchain_profile": "ruby-bundler",
+  "test_globs": ["spec/**", "test/**", "**/*_spec.rb", "**/test_*.rb"],
+  "ignore_globs": ["vendor/**", "**/vendor/**", "coverage/**", "Gemfile.lock"],
+  "source_extensions": [".rb"],
+  "f2p_command": ["bundle", "exec", "rspec", "{test_paths}"],
+  "p2p_command": ["bundle", "exec", "rspec"],
+  "label_task_classes": {"bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "javascript-node",
+  "repository_url": "https://github.com/nodejs/node",
+  "primary_language": "javascript",
+  "toolchain_profile": "javascript-node",
+  "test_globs": ["test/**", "**/test-*.js", "**/*.test.js"],
+  "ignore_globs": ["out/**", "deps/**", "tools/node_modules/**", "**/generated/**"],
+  "source_extensions": [".js", ".mjs", ".cc", ".c", ".h"],
+  "f2p_command": ["python3", "tools/test.py", "{test_paths}"],
+  "p2p_command": ["python3", "tools/test.py"],
+  "setup_commands": [["./configure"], ["make", "-j2"]],
+  "post_patch_commands": [["make", "-j2"]],
+  "label_task_classes": {"bug": "reported_bugfix", "feature request": "feature_implementation"},
+  "timeout_seconds": 3600
+}

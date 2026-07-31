@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "javascript-eslint",
+  "repository_url": "https://github.com/eslint/eslint",
+  "primary_language": "javascript",
+  "toolchain_profile": "javascript-node",
+  "test_globs": ["tests/**", "**/*.test.js", "**/*.spec.js"],
+  "ignore_globs": ["node_modules/**", "**/node_modules/**", "dist/**", "package-lock.json"],
+  "source_extensions": [".js", ".mjs"],
+  "label_task_classes": {"bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

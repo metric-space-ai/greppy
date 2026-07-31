@@ -1,0 +1,15 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "java-kafka",
+  "repository_url": "https://github.com/apache/kafka",
+  "primary_language": "java",
+  "toolchain_profile": "java-gradle",
+  "test_globs": ["**/src/test/**", "**/*Test.java", "**/*Test.scala"],
+  "ignore_globs": ["build/**", "**/build/**", "**/generated/**", "gradle/wrapper/**"],
+  "source_extensions": [".java", ".scala"],
+  "f2p_command": ["./gradlew", "--offline", "test"],
+  "p2p_command": ["./gradlew", "--offline", "test"],
+  "label_task_classes": {"bug": "reported_bugfix", "new feature": "feature_implementation", "improvement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 3600
+}

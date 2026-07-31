@@ -1,0 +1,9 @@
+{
+  "schema_version": "greppy.agent-coding-freeze.v1",
+  "freeze_id": "replace_with_opaque_freeze_id",
+  "frozen_at": "2026-07-31T12:00:00Z",
+  "eligible_pr_created_after": "2026-05-01T00:00:00Z",
+  "eligible_merged_after": "2026-05-01T00:00:00Z",
+  "eligible_merged_before": "2026-07-15T23:59:59Z",
+  "source_metadata_cutoff": "2026-07-20T00:00:00Z"
+}

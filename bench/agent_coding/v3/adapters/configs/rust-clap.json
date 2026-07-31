@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "rust-clap",
+  "repository_url": "https://github.com/clap-rs/clap",
+  "primary_language": "rust",
+  "toolchain_profile": "rust-cargo",
+  "test_globs": ["tests/**", "**/tests/**", "**/*_test.rs"],
+  "ignore_globs": ["target/**", "**/target/**", "**/generated/**", "Cargo.lock"],
+  "source_extensions": [".rs"],
+  "label_task_classes": {"bug": "reported_bugfix", "feature": "feature_implementation", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

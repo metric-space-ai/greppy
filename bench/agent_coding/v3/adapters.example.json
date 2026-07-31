@@ -1,0 +1,35 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-manifest.1",
+  "note": "Template only. Pending rows deliberately fail preflight. Every ready row must add a digest-pinned image reference, local image_id, matching toolchain_profile, proof_sha256, and complete argv arrays under commands.probe, commands.metadata and commands.validation. Each command accepts --preflight and emits proof-bound role JSON; the probe additionally reports profile tools plus rg/pi/exact Greppy 0.3.0 from the agent image/mount.",
+  "ready_row_contract": {
+    "required_fields": ["repository_id", "status=ready", "toolchain_profile", "image with @sha256 digest", "local image_id", "proof_sha256", "commands.probe", "commands.metadata", "commands.validation"],
+    "command_preflight_output": ["ready=true", "repository_id", "command_role", "proof_sha256"],
+    "probe_output_additions": ["tools required by toolchain_profile", "agent_tools.rg", "agent_tools.pi", "agent_tools.greppy=0.3.0"]
+  },
+  "adapters": [
+    {"repository_id": "rust-ripgrep", "status": "pending", "toolchain_profile": "rust-cargo"},
+    {"repository_id": "rust-clap", "status": "pending", "toolchain_profile": "rust-cargo"},
+    {"repository_id": "rust-tokio", "status": "pending", "toolchain_profile": "rust-cargo"},
+    {"repository_id": "go-caddy", "status": "pending", "toolchain_profile": "go-test"},
+    {"repository_id": "go-prometheus", "status": "pending", "toolchain_profile": "go-test"},
+    {"repository_id": "go-kubernetes", "status": "pending", "toolchain_profile": "go-test"},
+    {"repository_id": "python-scrapy", "status": "pending", "toolchain_profile": "python-pip"},
+    {"repository_id": "python-pytest", "status": "pending", "toolchain_profile": "python-pip"},
+    {"repository_id": "python-django", "status": "pending", "toolchain_profile": "python-pip"},
+    {"repository_id": "typescript-zod", "status": "pending", "toolchain_profile": "ts-pnpm"},
+    {"repository_id": "typescript-vite", "status": "pending", "toolchain_profile": "ts-pnpm"},
+    {"repository_id": "typescript-compiler", "status": "pending", "toolchain_profile": "javascript-node"},
+    {"repository_id": "java-gson", "status": "pending", "toolchain_profile": "java-maven"},
+    {"repository_id": "java-spring-framework", "status": "pending", "toolchain_profile": "java-gradle"},
+    {"repository_id": "java-kafka", "status": "pending", "toolchain_profile": "java-gradle"},
+    {"repository_id": "cpp-fmt", "status": "pending", "toolchain_profile": "cpp-cmake"},
+    {"repository_id": "cpp-catch2", "status": "pending", "toolchain_profile": "cpp-cmake"},
+    {"repository_id": "cpp-opencv", "status": "pending", "toolchain_profile": "cpp-cmake"},
+    {"repository_id": "javascript-eslint", "status": "pending", "toolchain_profile": "javascript-node"},
+    {"repository_id": "javascript-webpack", "status": "pending", "toolchain_profile": "javascript-node"},
+    {"repository_id": "javascript-node", "status": "pending", "toolchain_profile": "javascript-node"},
+    {"repository_id": "ruby-rubocop", "status": "pending", "toolchain_profile": "ruby-bundler"},
+    {"repository_id": "ruby-rails", "status": "pending", "toolchain_profile": "ruby-bundler"},
+    {"repository_id": "ruby-discourse", "status": "pending", "toolchain_profile": "ruby-bundler"}
+  ]
+}

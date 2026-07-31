@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "go-kubernetes",
+  "repository_url": "https://github.com/kubernetes/kubernetes",
+  "primary_language": "go",
+  "toolchain_profile": "go-test",
+  "test_globs": ["*_test.go", "**/*_test.go", "test/**"],
+  "ignore_globs": ["vendor/**", "**/vendor/**", "**/generated/**", "staging/src/k8s.io/api/**"],
+  "source_extensions": [".go"],
+  "label_task_classes": {"kind/bug": "reported_bugfix", "kind/feature": "feature_implementation", "kind/api-change": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 3600
+}

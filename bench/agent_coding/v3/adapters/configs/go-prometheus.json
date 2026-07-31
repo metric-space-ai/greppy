@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "go-prometheus",
+  "repository_url": "https://github.com/prometheus/prometheus",
+  "primary_language": "go",
+  "toolchain_profile": "go-test",
+  "test_globs": ["*_test.go", "**/*_test.go"],
+  "ignore_globs": ["vendor/**", "**/vendor/**", "**/generated/**", "web/ui/**"],
+  "source_extensions": [".go"],
+  "label_task_classes": {"bug": "reported_bugfix", "kind/bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

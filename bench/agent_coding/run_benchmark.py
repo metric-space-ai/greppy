@@ -51,6 +51,7 @@ GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v4"
 # reported check so the navigation arm's non-inferiority remains visible.
 EDIT_COST_RATIO_MAX = 0.80
 POST_EDIT_REREADS_MAX = 0.1
+MIN_GREPPY_EDIT_ADOPTION_RATE = 0.80
 # Frozen MiniMax-M3 standard-tier billed rates (USD per million tokens,
 # snapshot 2026-07-14, <=512k context; output counts are provider-billed and
 # include reasoning tokens). The gate compares both arms under the same model
@@ -69,6 +70,35 @@ def provider_cost_usd(agent: dict) -> float:
         float(agent.get(field, 0) or 0) * rate / 1_000_000
         for field, rate in PROVIDER_PRICE_USD_PER_MILLION.items()
     )
+
+
+PROVIDER_USAGE_FIELDS = (
+    "input_tokens",
+    "uncached_input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
+
+def aggregate_provider_attempts(final_agent: dict[str, Any], attempts: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Charge every provider attempt while retaining final-attempt behavior metrics."""
+    if not attempts:
+        return final_agent
+    aggregate = dict(final_agent)
+    aggregate["provider_attempts"] = len(attempts)
+    aggregate["provider_attempt_usage"] = [
+        {
+            **{field: int(attempt.get(field, 0) or 0) for field in PROVIDER_USAGE_FIELDS},
+            "provider_cost_usd": round(provider_cost_usd(attempt), 9),
+            "reported_error": bool(attempt.get("reported_error")),
+        }
+        for attempt in attempts
+    ]
+    for field in PROVIDER_USAGE_FIELDS:
+        aggregate[field] = sum(int(attempt.get(field, 0) or 0) for attempt in attempts)
+    aggregate["provider_cost_usd_all_attempts"] = round(provider_cost_usd(aggregate), 9)
+    return aggregate
 HARNESS_VERSION = "2"
 DEFAULT_MODEL = os.environ.get("GREPPY_BENCH_MODEL", "MiniMax-M3")
 DEFAULT_PROVIDER = os.environ.get("GREPPY_BENCH_PROVIDER", "minimax")
@@ -92,29 +122,24 @@ SHARED_SYSTEM_PROMPT = (
 )
 
 EXPLORER_POLICY = (
-    "Explore the repository as needed with the normal shell and file-reading tools "
+    "Explore the repository as needed with rg plus the normal shell and file-reading tools "
     "available to you, then implement and verify the fix."
 )
 
 AGENTS_MD = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
-# Both greppy arms serve the SHIPPED manual verbatim. The previous templates
-# were written against the retired M4 grammar (`edit replace-body`,
-# `edit text-cas`, `edit apply --plan`, `edit rename-symbol`,
-# `edit change-signature`) and the retired search verbs — every one of them is
-# refused by 0.3.0, so the edit arm would have scored a near-zero against its
-# own harness rather than against the product. The arms still differ in their
-# TREATMENT (navigate-only vs edit-through-greppy); only the vocabulary now
-# comes from one source of truth.
+# Both Greppy arms serve the SHIPPED manual verbatim. Embedded command guides
+# are forbidden because they drift away from the released CLI. The arms still
+# differ in their treatment policy; the command vocabulary has exactly one
+# source of truth.
 GREPPY_EDIT_POLICY_TEMPLATE = (
-    "This system does not ship grep, ripgrep, or a patch utility for source "
-    "files. Greppy replaces all of them; the executable is {greppy}, always "
-    "with `--root .`. If you need original grep behavior, call greppy exactly "
-    "like grep (byte-exact passthrough).\n"
-    "Navigate and READ with greppy instead of opening whole files, and make "
-    "every source change THROUGH greppy's EDIT verbs — no manual patching, no "
-    "apply_patch. A refused edit is information: it tells you the file or the "
-    "target moved; re-read and retry deliberately.\n"
+    "Use Greppy as the primary code-navigation and editing surface. The "
+    "executable is {greppy}; always pass `--root .`. The normal shell, read, "
+    "edit, and write tools remain available exactly as in the control arm, so "
+    "use them only when Greppy cannot express the operation.\n"
+    "Navigate and read with Greppy, and make source changes through Greppy's "
+    "current EDIT verbs. A refused edit is information: it tells you the file "
+    "or target moved; re-read and retry deliberately.\n"
     "Verify the final result with the supplied verification command.\n\n"
     "Greppy's manual:\n\n" + AGENTS_MD
 )
@@ -473,20 +498,71 @@ def clone_pinned_repository(task: dict[str, Any], parent: pathlib.Path) -> pathl
     backing = parent / "repo.git"
     timeout = task["timeout_seconds"]
     run_checked(
-        ["git", "clone", "--mirror", "--no-local", "--", task["repository"]["url"], str(backing)],
+        ["git", "init", "--bare", "--quiet", str(backing)],
         cwd=parent,
         timeout_seconds=timeout,
-        operation="repository clone",
+        operation="sealed repository initialization",
+    )
+    commit = task["repository"]["commit"]
+    run_checked(
+        [
+            "git",
+            "--git-dir",
+            str(backing),
+            "fetch",
+            "--depth=1",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+            task["repository"]["url"],
+            f"{commit}:refs/heads/bench",
+        ],
+        cwd=parent,
+        timeout_seconds=timeout,
+        operation="single-commit repository fetch",
+    )
+    run_checked(
+        ["git", "--git-dir", str(backing), "symbolic-ref", "HEAD", "refs/heads/bench"],
+        cwd=parent,
+        timeout_seconds=timeout,
+        operation="sealed repository HEAD setup",
     )
     resolved = run_checked(
-        ["git", "--git-dir", str(backing), "rev-parse", "--verify", f"{task['repository']['commit']}^{{commit}}"],
+        ["git", "--git-dir", str(backing), "rev-parse", "--verify", f"{commit}^{{commit}}"],
         cwd=parent,
         timeout_seconds=timeout,
         operation="pinned commit verification",
     ).stdout.decode("ascii", "replace").strip()
-    if resolved.lower() != task["repository"]["commit"].lower():
+    if resolved.lower() != commit.lower():
         raise HarnessError("repository did not resolve to the pinned commit")
+    refs = run_checked(
+        ["git", "--git-dir", str(backing), "for-each-ref", "--format=%(refname)"],
+        cwd=parent,
+        timeout_seconds=timeout,
+        operation="sealed repository ref audit",
+    ).stdout.decode("utf-8", "replace").splitlines()
+    if refs != ["refs/heads/bench"]:
+        raise HarnessError("sealed repository contains unexpected refs")
     return backing
+
+
+def assert_agent_repository_is_sealed(worktree: pathlib.Path, timeout_seconds: int) -> None:
+    remotes = run_checked(
+        ["git", "remote"],
+        cwd=worktree,
+        timeout_seconds=timeout_seconds,
+        operation="agent repository remote audit",
+    ).stdout.decode("utf-8", "replace").splitlines()
+    history = run_checked(
+        ["git", "log", "--all", "--oneline"],
+        cwd=worktree,
+        timeout_seconds=timeout_seconds,
+        operation="agent repository history audit",
+    ).stdout.decode("utf-8", "replace").splitlines()
+    if remotes:
+        raise HarnessError("agent repository exposes a Git remote")
+    if len(history) != 1:
+        raise HarnessError(f"agent repository must expose exactly one commit, found {len(history)}")
 
 
 @contextlib.contextmanager
@@ -504,6 +580,7 @@ def temporary_worktree(
         operation="worktree creation",
     )
     try:
+        assert_agent_repository_is_sealed(path, timeout_seconds)
         yield path
     finally:
         run_process(
@@ -751,10 +828,175 @@ def classify_v2_patched_failure(
     }
 
 
+def _commands_from_shipped_manual(manual: str) -> dict[str, frozenset[str]]:
+    commands: dict[str, set[str]] = {}
+    section: str | None = None
+    for line in manual.splitlines():
+        header = re.match(r"^([A-Z][^:]*):", line)
+        if header:
+            section = header.group(1)
+            commands.setdefault(section, set())
+            continue
+        match = re.match(r"^  ([a-z][a-z0-9-]+)(?:\s|$)", line)
+        if section and match:
+            commands[section].add(match.group(1))
+    return {name: frozenset(values) for name, values in commands.items()}
+
+
+SHIPPED_COMMANDS_BY_SECTION = _commands_from_shipped_manual(AGENTS_MD)
+GREPPY_READ_VERBS = SHIPPED_COMMANDS_BY_SECTION.get("READ", frozenset())
+GREPPY_EDIT_VERBS = SHIPPED_COMMANDS_BY_SECTION.get("EDIT", frozenset())
+GREPPY_VERBS = frozenset().union(*SHIPPED_COMMANDS_BY_SECTION.values())
+if not GREPPY_READ_VERBS or not GREPPY_EDIT_VERBS or not GREPPY_VERBS:
+    raise RuntimeError("shipped AGENTS.md did not yield READ/EDIT command sets")
+_EDIT_PATH_STRATEGIES = {
+    "replace": "qualified_symbol",
+    "replace-text": "first_path",
+    "replace-lines": "first_path",
+    "replace-span": "opaque_handle",
+    "insert-lines": "first_path",
+    "delete": "qualified_symbol",
+    "delete-lines": "first_path",
+    "patch": "unified_diff",
+    "write": "first_path",
+    "rename": "qualified_symbol",
+    "undo": "undo_log",
+}
+if set(GREPPY_EDIT_VERBS) != set(_EDIT_PATH_STRATEGIES):
+    missing = sorted(set(GREPPY_EDIT_VERBS) - set(_EDIT_PATH_STRATEGIES))
+    stale = sorted(set(_EDIT_PATH_STRATEGIES) - set(GREPPY_EDIT_VERBS))
+    raise RuntimeError(f"shipped edit addressing changed; missing={missing}, stale={stale}")
+_SHELL_WRAPPERS = frozenset({"command", "env", "nice", "nohup", "sudo", "timeout"})
+_GREPPY_OPTIONS_WITH_VALUE = frozenset(
+    {"--root", "--path", "--limit", "--offset", "--head", "--tail", "--depth", "--direction", "--lines", "--expect", "--kind", "--from", "--to"}
+)
+
+
+def _normalise_source_path(value: str) -> str | None:
+    value = value.strip().replace("\\", "/")
+    if not value or value == "-" or value.startswith("$"):
+        return None
+    while value.startswith("./"):
+        value = value[2:]
+    return value or None
+
+
+def _shell_segments(command: str) -> list[list[str]]:
+    """Tokenise shell command positions without executing or expanding them."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token and all(character in ";&|()" for character in token):
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _greppy_invocations(command: str) -> list[tuple[str, list[str], bool]]:
+    """Return current Greppy verbs invoked at shell command positions."""
+    invocations: list[tuple[str, list[str], bool]] = []
+    for segment in _shell_segments(command):
+        greppy_index: int | None = None
+        executable_seen = False
+        for index, token in enumerate(segment):
+            if not executable_seen and ("=" in token and not token.startswith(("-", "="))):
+                continue
+            basename = pathlib.PurePosixPath(token).name
+            if basename == "greppy":
+                greppy_index = index
+                break
+            if not executable_seen and basename in _SHELL_WRAPPERS:
+                continue
+            if token.startswith("-") and not executable_seen:
+                continue
+            executable_seen = True
+            break
+        if greppy_index is None:
+            continue
+        tail = segment[greppy_index + 1 :]
+        for index, token in enumerate(tail):
+            if token in GREPPY_VERBS:
+                invocations.append((token, tail[index + 1 :], "--code" in tail))
+                break
+    return invocations
+
+
+def _qualified_symbol_path(value: str) -> str | None:
+    if "::" not in value:
+        return None
+    prefix = value.split("::", 1)[0]
+    return _normalise_source_path(prefix) if "/" in prefix or "." in pathlib.PurePosixPath(prefix).name else None
+
+
+def _greppy_positionals(args: Sequence[str]) -> list[str]:
+    positional: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg in _GREPPY_OPTIONS_WITH_VALUE:
+            skip_value = True
+            continue
+        if arg.startswith("-"):
+            continue
+        positional.append(arg)
+    return positional
+
+
+def _greppy_edit_paths(verb: str, args: Sequence[str], command: str) -> set[str]:
+    positional = _greppy_positionals(args)
+    paths: set[str] = set()
+    strategy = _EDIT_PATH_STRATEGIES[verb]
+    if strategy == "first_path" and positional:
+        path = _normalise_source_path(positional[0])
+        if path:
+            paths.add(path)
+    elif strategy == "qualified_symbol" and positional:
+        path = _qualified_symbol_path(positional[0])
+        if path:
+            paths.add(path)
+    elif strategy == "unified_diff":
+        for match in re.finditer(r"(?:^|\n)(?:--- a/|\+\+\+ b/)([^\s]+)", command):
+            path = _normalise_source_path(match.group(1))
+            if path and path != "/dev/null":
+                paths.add(path)
+    return paths
+
+
+def _bash_source_read_paths(command: str) -> list[str | None]:
+    reads: list[str | None] = []
+    for segment in _shell_segments(command):
+        for index, token in enumerate(segment):
+            basename = pathlib.PurePosixPath(token).name
+            if basename not in {"cat", "head", "tail", "sed"}:
+                continue
+            if basename == "sed" and "-n" not in segment[index + 1 :]:
+                continue
+            candidates = [part for part in segment[index + 1 :] if not part.startswith("-")]
+            if basename == "sed" and candidates and re.fullmatch(r"\d+(?:,\d+)?p", candidates[0]):
+                candidates = candidates[1:]
+            reads.append(_normalise_source_path(candidates[-1]) if candidates else None)
+            break
+    return reads
+
+
 def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
-    edit_calls = 0
+    edit_calls = greppy_read_calls = fallback_edit_calls = 0
     post_edit_source_opens = 0
     edited_files: set[str] = set()
     error: str | None = None
@@ -780,25 +1022,37 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
             if not isinstance(item, dict) or item.get("type") != "toolCall":
                 continue
             name = item.get("name")
-            opened_file = None
+            opened_paths: list[str | None] = []
             if name == "read":
                 source_opens += 1
-                opened_file = str((item.get("arguments") or {}).get("path", ""))
+                opened_paths.append(_normalise_source_path(str((item.get("arguments") or {}).get("path", ""))))
+            elif name in {"edit", "write"}:
+                fallback_edit_calls += 1
+                path = _normalise_source_path(str((item.get("arguments") or {}).get("path", "")))
+                if path:
+                    edited_files.add(path)
             elif name == "bash":
                 command = str((item.get("arguments") or {}).get("command", ""))
-                if re.search(r"(^|[;&|]\s*)(cat|head|tail|sed\s+-n)\s", command):
-                    source_opens += 1
-                    m = re.search(r"(?:cat|head|tail|sed\s+-n\s+\S+)\s+([\w./-]+)", command)
-                    opened_file = m.group(1) if m else None
-                if re.search(r"greppy[^\n]*\bedit\b", command):
-                    edit_calls += 1
-                    m = re.search(r"--file\s+([\w./-]+)", command)
-                    if m:
-                        edited_files.add(m.group(1))
-                    # symbol-adressierte edits: datei unbekannt bis zertifikat;
-                    # konservativ nicht zaehlen
-            if opened_file and opened_file in edited_files:
-                post_edit_source_opens += 1
+                bash_reads = _bash_source_read_paths(command)
+                source_opens += len(bash_reads)
+                opened_paths.extend(bash_reads)
+                for verb, args, emits_code in _greppy_invocations(command):
+                    if verb in GREPPY_READ_VERBS:
+                        greppy_read_calls += 1
+                        source_opens += 1
+                        if verb == "read-file":
+                            positional = _greppy_positionals(args)
+                            opened_paths.extend(_normalise_source_path(path) for path in positional)
+                        else:
+                            opened_paths.append(_qualified_symbol_path(args[0]) if args else None)
+                    else:
+                        if verb in GREPPY_EDIT_VERBS:
+                            edit_calls += 1
+                            edited_files.update(_greppy_edit_paths(verb, args, command))
+                        elif emits_code:
+                            source_opens += 1
+                            opened_paths.append(None)
+            post_edit_source_opens += sum(path is not None and path in edited_files for path in opened_paths)
         if message.get("errorMessage"):
             error = str(message["errorMessage"])
             last_error_text = error[:300]
@@ -821,6 +1075,8 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         "turns": turns,
         "reported_error": bool(error),
         "edit_calls": edit_calls,
+        "greppy_read_calls": greppy_read_calls,
+        "fallback_edit_calls": fallback_edit_calls,
         "post_edit_source_opens": post_edit_source_opens,
         # provider error text, redacted upstream with the rest of stdout;
         # 10 consecutive identical failures on one task are invisible
@@ -834,20 +1090,13 @@ def shared_user_prompt(task: dict[str, Any]) -> str:
     return f"Task:\n{task['user_task'].strip()}\n\nVerification command:\n{command}\n"
 
 
-# Per-arm pi tool surface. The greppy-edit arm's displacement prompt states
-# "there is no apply_patch and no manual patching"; with pi's builtin
-# edit/write/read in the tool palette that statement is visibly false and
-# gets ignored (trace forensics 2026-07-17: the arm's agent used builtin
-# edit and never called greppy). Displacement only works when the
-# environment matches the claim - the MSCC panel proves prompt-driven
-# adoption (78-87% greppy usage) exactly where the prompt's claim is true.
-# The edit arm therefore ships bash only: greppy read/edit is the paved
-# road, bash remains the honest escape hatch (and bash-side manual edits
-# stay measurable as fallback_edits in trace forensics).
+# The release gate is a causal product comparison, so every arm receives the
+# identical built-in tool surface. A constrained deployment profile can be run
+# separately, but must not be presented as the Greppy-vs-control gate.
 ARM_TOOLS = {
     "explorer": "bash,read,edit,write",
     "greppy": "bash,read,edit,write",
-    "greppy-edit": "bash",
+    "greppy-edit": "bash,read,edit,write",
 }
 
 
@@ -876,6 +1125,14 @@ def run_pi_agent(
     secrets: Sequence[str],
 ) -> tuple[dict[str, Any], ProcessResult]:
     env = os.environ.copy()
+    # CI commonly exports source revision variables. They are irrelevant to
+    # the model and violate the sealed-task contract if exposed to shell use.
+    for key, value in list(env.items()):
+        if re.search(r"(?:^|_)(?:COMMIT|SHA)(?:_|$)", key, re.IGNORECASE):
+            env.pop(key, None)
+            continue
+        if task["id"] in value or task["repository"]["commit"].lower() in value.lower():
+            env.pop(key, None)
     env["GREPPY_STORE_DIR"] = str(store_dir)
     env["PI_CODING_AGENT_DIR"] = str(pi_config_dir)
     # Pin bare `greppy` on PATH to the binary under test. The system prompt
@@ -1125,10 +1382,11 @@ def run_arm(
     warm_greppy: bool,
     expected_mutation_hash: str,
     secrets: Sequence[str],
+    store_dir_override: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     arm_tmp = task_tmp / arm
     worktree_path = arm_tmp / "worktree"
-    store_dir = arm_tmp / "greppy-store"
+    store_dir = store_dir_override or (arm_tmp / "greppy-store")
     pi_config_dir = arm_tmp / "pi-config"
     store_dir.mkdir(parents=True, exist_ok=True)
     pi_config_dir.mkdir(parents=True, exist_ok=True)
@@ -1153,12 +1411,12 @@ def run_arm(
             else {}
         )
 
-        warmup: dict[str, Any] = {"enabled": bool(warm_greppy and arm == "greppy")}
+        warmup: dict[str, Any] = {"enabled": bool(warm_greppy and arm in {"greppy", "greppy-edit"})}
         if warmup["enabled"]:
             env = environment_without_provider_key()
             env["GREPPY_STORE_DIR"] = str(store_dir)
             warm_result = run_process(
-                [str(greppy_bin), "--root", str(worktree), "index", str(worktree)],
+                [str(greppy_bin), "--root", str(worktree), "where-am-i"],
                 cwd=worktree,
                 timeout_seconds=task["timeout_seconds"],
                 env=env,
@@ -1180,6 +1438,7 @@ def run_arm(
             raw_dir=raw_dir,
             secrets=secrets,
         )
+        assert_agent_repository_is_sealed(worktree, task["timeout_seconds"])
         pretest_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
         safe_pretest_diff = redact(pretest_diff, secrets)
         atomic_write_bytes(raw_dir / "pretest.patch", safe_pretest_diff)
@@ -1293,8 +1552,11 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     # edit-loop metrics over the edit arm's solved rows
     edit_calls_total = sum(row[1]["agent"].get("edit_calls", 0) for row in solved)
     post_edit_rereads = sum(row[1]["agent"].get("post_edit_source_opens", 0) for row in solved)
-    reread_rate = post_edit_rereads / edit_calls_total if edit_calls_total else 0.0
-    reread_pass = reread_rate <= POST_EDIT_REREADS_MAX
+    reread_rate = post_edit_rereads / edit_calls_total if edit_calls_total else None
+    reread_pass = reread_rate is not None and reread_rate <= POST_EDIT_REREADS_MAX
+    adopted_tasks = sum(row[1]["agent"].get("edit_calls", 0) > 0 for row in solved)
+    adoption_rate = adopted_tasks / len(solved) if solved else None
+    adoption_pass = adoption_rate is not None and adoption_rate >= MIN_GREPPY_EDIT_ADOPTION_RATE
     # navigation arm (v3 semantics) stays visible as a reported check
     nav_solved = [(b, n) for b, n in nav_pairs if b["correctness"] and n["correctness"]]
     nav_cost_ratio = ratio(
@@ -1317,7 +1579,8 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         and observed_not_lower
         and no_significant_regression
         and efficiency_pass
-        and reread_pass,
+        and reread_pass
+        and adoption_pass,
         "complete": complete,
         "sample_size": {
             "minimum_complete_pairs": MIN_COMPLETE_PAIRS,
@@ -1338,9 +1601,17 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         "edit_loop": {
             "edit_calls_total": edit_calls_total,
             "post_edit_source_opens": post_edit_rereads,
-            "post_edit_reread_rate": round(reread_rate, 4),
+            "post_edit_reread_rate": round(reread_rate, 4) if reread_rate is not None else None,
             "threshold": POST_EDIT_REREADS_MAX,
+            "denominator_status": "measured" if edit_calls_total else "not_applicable_no_greppy_edits",
             "passes": reread_pass,
+        },
+        "greppy_edit_adoption": {
+            "adopted_solved_tasks": adopted_tasks,
+            "solved_tasks": len(solved),
+            "adoption_rate": round(adoption_rate, 4) if adoption_rate is not None else None,
+            "minimum_rate": MIN_GREPPY_EDIT_ADOPTION_RATE,
+            "passes": adoption_pass,
         },
         "navigation_arm_v3_check": {
             "greppy_to_explorer_provider_cost": nav_cost_ratio,
@@ -1349,6 +1620,7 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         },
         "cost_on_solved_pairs": {
             "metric": "provider_cost_usd",
+            "includes_all_provider_retry_attempts": True,
             "pricing_as_of": PRICING_AS_OF,
             "threshold_ratio": EDIT_COST_RATIO_MAX,
             "greppy_edit_to_explorer_provider_cost": cost_ratio,
@@ -1371,11 +1643,16 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     }
 
 
-def deterministic_arm_order(task_id: str) -> list[str]:
-    return list(ARMS if hashlib.sha256(task_id.encode("utf-8")).digest()[0] % 2 == 0 else reversed(ARMS))
+def balanced_arm_orders(task_ids: Sequence[str]) -> dict[str, list[str]]:
+    """Preregister an exact AB/BA split; the diagnostic nav arm stays last."""
+    ordered = sorted(task_ids)
+    return {
+        task_id: (["explorer", "greppy-edit", "greppy"] if index % 2 == 0 else ["greppy-edit", "explorer", "greppy"])
+        for index, task_id in enumerate(ordered)
+    }
 
 
-def task_manifest_entry(task: dict[str, Any]) -> dict[str, Any]:
+def task_manifest_entry(task: dict[str, Any], arm_order: Sequence[str]) -> dict[str, Any]:
     return {
         "id": task["id"],
         "repository": task["repository"],
@@ -1386,7 +1663,7 @@ def task_manifest_entry(task: dict[str, Any]) -> dict[str, Any]:
         "test_command_sha256": sha256_bytes(canonical_json_bytes(task["test_command"])),
         "timeout_seconds": task["timeout_seconds"],
         "shared_user_prompt_sha256": sha256_text(shared_user_prompt(task)),
-        "arm_order": deterministic_arm_order(task["id"]),
+        "arm_order": list(arm_order),
     }
 
 
@@ -1444,9 +1721,12 @@ def build_base_manifest(
     pi_bin: pathlib.Path,
     greppy_bin: pathlib.Path,
     warm_greppy: bool,
+    raw_trajectory_audit_count: int = 0,
 ) -> dict[str, Any]:
     explorer_system = system_prompt("explorer", greppy_bin)
     greppy_system = system_prompt("greppy", greppy_bin)
+    greppy_edit_system = system_prompt("greppy-edit", greppy_bin)
+    arm_orders = balanced_arm_orders([task["id"] for task in tasks])
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "harness_version": HARNESS_VERSION,
@@ -1483,15 +1763,27 @@ def build_base_manifest(
             "sha256": sha256_bytes(task_path.read_bytes()),
             "canonical_content_sha256": sha256_bytes(canonical_json_bytes(task_document)),
         },
-        "tasks": [task_manifest_entry(task) for task in tasks],
+        "tasks": [task_manifest_entry(task, arm_orders[task["id"]]) for task in tasks],
         "prompt_contract": {
+            "shipped_agents_md_path": "AGENTS.md",
+            "shipped_agents_md_sha256": sha256_text(AGENTS_MD),
             "shared_system_sha256": sha256_text(SHARED_SYSTEM_PROMPT),
             "explorer_treatment_sha256": sha256_text(EXPLORER_POLICY),
             "greppy_treatment_sha256": sha256_text(GREPPY_POLICY_TEMPLATE),
+            "greppy_edit_treatment_sha256": sha256_text(GREPPY_EDIT_POLICY_TEMPLATE),
             "explorer_full_system_sha256": sha256_text(explorer_system),
             "greppy_full_system_sha256": sha256_text(greppy_system),
+            "greppy_edit_full_system_sha256": sha256_text(greppy_edit_system),
             "same_user_prompt_per_pair": True,
-            "only_intended_prompt_delta": "navigation treatment",
+            "identical_builtin_tool_palette_per_arm": len(set(ARM_TOOLS.values())) == 1,
+            "only_intended_prompt_delta": "Greppy treatment instructions and shipped manual",
+            "full_system_utf8_bytes": {
+                "explorer": len(explorer_system.encode("utf-8")),
+                "greppy": len(greppy_system.encode("utf-8")),
+                "greppy-edit": len(greppy_edit_system.encode("utf-8")),
+            },
+            "greppy_edit_minus_explorer_utf8_bytes": len(greppy_edit_system.encode("utf-8"))
+            - len(explorer_system.encode("utf-8")),
         },
         "isolation": {
             "temporary_git_worktree_per_arm": True,
@@ -1508,6 +1800,11 @@ def build_base_manifest(
             "excluded_from_agent_wall": True,
         },
         "warm_greppy_outside_measurement": warm_greppy,
+        "warmed_arms": [arm for arm in ARMS if warm_greppy and arm in {"greppy", "greppy-edit"}],
+        "raw_trajectory_pilot_audit": {
+            "required_before_large_run": 3,
+            "operator_confirmed_count": raw_trajectory_audit_count,
+        },
         "gate_preregistration": {
             "correctness": (
                 "Greppy paired correctness wins >= losses, plus one-sided exact "
@@ -1515,7 +1812,16 @@ def build_base_manifest(
             ),
             "efficiency_population": "pairs where both arms pass the independent test",
             "minimum_sample": "at least 30 complete pairs and at least 20 both-solved pairs",
-            "efficiency": "sum ratio <= 0.80 for tool calls AND source opens AND input tokens",
+            "efficiency": (
+                "greppy-edit/explorer billed provider-dollar sum ratio <= 0.80 on both-solved pairs; "
+                "all billed retry attempts are included"
+            ),
+            "edit_adoption": "at least 80% of both-solved greppy-edit tasks invoke a current Greppy edit verb",
+            "post_edit_rereads": (
+                "same-file post-edit source opens/current Greppy edit calls <= 0.10; "
+                "zero edit calls is N/A and fails"
+            ),
+            "causal_tools": "explorer and greppy-edit receive the identical bash, read, edit, write palette",
             "wall_time": "reported only for solved pairs; never a gate metric",
             "failed_test_speed_credit": False,
         },
@@ -1537,6 +1843,8 @@ RESUME_IDENTITY_FIELDS = (
     "isolation",
     "setup_contract",
     "warm_greppy_outside_measurement",
+    "warmed_arms",
+    "raw_trajectory_pilot_audit",
     "gate_preregistration",
 )
 
@@ -1580,6 +1888,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "Other arms are neither run nor marked failed, so an existing baseline stays intact.",
     )
     parser.add_argument("--output-dir", type=pathlib.Path, help="checkpoint/manifest directory")
+    parser.add_argument("--raw-dir", type=pathlib.Path, help="raw trace root (run-id is appended)")
+    parser.add_argument("--temp-dir", type=pathlib.Path, help="temporary clone/worktree root")
+    parser.add_argument("--store-dir", type=pathlib.Path, help="Greppy store root (run-id/task/arm/attempt are appended)")
+    parser.add_argument(
+        "--raw-trajectory-audit-count",
+        type=int,
+        default=0,
+        help="operator-confirmed pilot trajectories audited before a run with more than three tasks",
+    )
     parser.add_argument("--run-id", help="stable run id; defaults to UTC timestamp plus task hash")
     parser.add_argument("--resume", action="store_true", help="resume completed arms from output-dir/results.json")
     parser.add_argument("--pi-bin", default=os.environ.get("PI_BIN", "pi"))
@@ -1597,6 +1914,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.validate_only:
         print(f"validated {len(tasks)} task(s)")
         return 0
+    if args.raw_trajectory_audit_count < 0:
+        raise HarnessError("raw trajectory audit count cannot be negative")
+    if len(tasks) > 3 and args.raw_trajectory_audit_count < 3:
+        raise HarnessError(
+            "runs with more than three tasks require --raw-trajectory-audit-count 3 "
+            "after manually reviewing three pilot trajectories"
+        )
 
     api_key = os.environ.get("MINIMAX_API_KEY", "")
     if not api_key:
@@ -1611,9 +1935,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", run_id):
         raise HarnessError("run-id is invalid")
     run_dir = (args.output_dir or (HERE / "runs" / run_id)).resolve()
-    raw_run_dir = RAW_ROOT / run_id
+    raw_run_dir = (args.raw_dir.resolve() if args.raw_dir else RAW_ROOT) / run_id
+    temp_root = args.temp_dir.resolve() if args.temp_dir else None
+    store_run_dir = (args.store_dir.resolve() / run_id) if args.store_dir else None
     run_dir.mkdir(parents=True, exist_ok=True)
     raw_run_dir.mkdir(parents=True, exist_ok=True)
+    if temp_root:
+        temp_root.mkdir(parents=True, exist_ok=True)
+    if store_run_dir:
+        store_run_dir.mkdir(parents=True, exist_ok=True)
 
     existing_document: dict[str, Any] | None = None
     previous_manifest: dict[str, Any] = {}
@@ -1628,6 +1958,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     expected_ids = [task["id"] for task in tasks]
+    arm_orders = balanced_arm_orders(expected_ids)
     base_manifest = build_base_manifest(
         run_id=run_id,
         task_path=task_path,
@@ -1636,6 +1967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pi_bin=pi_bin,
         greppy_bin=greppy_bin,
         warm_greppy=args.warm_greppy,
+        raw_trajectory_audit_count=args.raw_trajectory_audit_count,
     )
     existing_rows = validate_resume_rows(
         existing_document.get("results") if existing_document is not None else [],
@@ -1660,7 +1992,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         selected_arms = ARMS
 
-    for task in tasks:
+    for task_index, task in enumerate(tasks, start=1):
+        # Task IDs in historical banks may contain a gold-commit prefix. Keep
+        # them in evidence rows, never in agent-visible cwd/store/raw paths.
+        task_slot = f"task-{task_index:04d}"
         if all((task["id"], arm) in completed for arm in selected_arms):
             continue
         print(f"[{task['id']}] preparing pinned repository", flush=True)
@@ -1668,12 +2003,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the worktree when the context exits; a leaked temp dir on an
         # ephemeral runner is harmless, a crashed 2.5h benchmark run is not.
         with tempfile.TemporaryDirectory(
-            prefix=f"greppy-agent-coding-{task['id']}-", ignore_cleanup_errors=True
+            prefix=f"greppy-agent-coding-{task_slot}-",
+            dir=temp_root,
+            ignore_cleanup_errors=True,
         ) as tmp_name:
             task_tmp = pathlib.Path(tmp_name)
             try:
                 backing = clone_pinned_repository(task, task_tmp)
-                preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task["id"], secrets)
+                preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task_slot, secrets)
                 base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
                 if not preflight["valid"]:
                     if task.get("task_bank") == "v2":
@@ -1688,7 +2025,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "mutation preflight requires setup success, a clean-source test pass, "
                         "and a mutated-source test failure without timeout"
                     )
-                for arm in deterministic_arm_order(task["id"]):
+                for arm in arm_orders[task["id"]]:
                     if arm not in selected_arms:
                         continue
                     if (task["id"], arm) in completed:
@@ -1700,6 +2037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # retry those up to two times so infrastructure noise
                         # does not consume task validity. Timeouts and harness
                         # failures are not retried.
+                        provider_attempt_agents: list[dict[str, Any]] = []
                         for attempt in range(1, 6):
                             # each attempt needs untouched worktree/store dirs;
                             # reusing the previous attempt's task_tmp fails on
@@ -1711,12 +2049,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     task=task,
                                     backing=backing,
                                     task_tmp=attempt_tmp,
-                                    raw_dir=raw_run_dir / task["id"] / arm,
+                                    raw_dir=raw_run_dir / task_slot / arm / f"attempt-{attempt}",
                                     pi_bin=pi_bin,
                                     greppy_bin=greppy_bin,
                                     warm_greppy=args.warm_greppy,
                                     expected_mutation_hash=preflight["mutation_diff_sha256"],
                                     secrets=secrets,
+                                    store_dir_override=(
+                                        store_run_dir / task_slot / arm / f"attempt-{attempt}"
+                                        if store_run_dir
+                                        else None
+                                    ),
                                 )
                             except HarnessError as harness_error:
                                 # warmup/worktree failures are runner-environment
@@ -1727,7 +2070,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 print(f"[{task['id']}] {arm}: {harness_error}, retry {attempt}/4", flush=True)
                                 time.sleep(30 * attempt)
                                 continue
-                            row["agent"]["provider_attempts"] = attempt
+                            provider_attempt_agents.append(row["agent"])
                             provider_flake = (
                                 not row["valid"]
                                 and row["agent"].get("reported_error")
@@ -1737,6 +2080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 break
                             print(f"[{task['id']}] {arm}: provider error, retry {attempt}/4", flush=True)
                             time.sleep(30 * attempt)
+                        row["agent"] = aggregate_provider_attempts(row["agent"], provider_attempt_agents)
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source
                         row = sanitized_failure_row(task["id"], arm, error)
                     rows.append(row)

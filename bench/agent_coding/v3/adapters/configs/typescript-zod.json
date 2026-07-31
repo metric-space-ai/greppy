@@ -1,0 +1,13 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "typescript-zod",
+  "repository_url": "https://github.com/colinhacks/zod",
+  "primary_language": "typescript",
+  "toolchain_profile": "ts-pnpm",
+  "test_globs": ["tests/**", "**/*.test.ts", "**/*.spec.ts"],
+  "ignore_globs": ["node_modules/**", "**/node_modules/**", "dist/**", "pnpm-lock.yaml"],
+  "source_extensions": [".ts", ".tsx"],
+  "label_task_classes": {"bug": "reported_bugfix", "enhancement": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 1800
+}

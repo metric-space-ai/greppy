@@ -1,0 +1,15 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "javascript-webpack",
+  "repository_url": "https://github.com/webpack/webpack",
+  "primary_language": "javascript",
+  "toolchain_profile": "javascript-node",
+  "test_globs": ["test/**", "tests/**", "**/*.test.js", "**/*.spec.js"],
+  "ignore_globs": ["node_modules/**", "**/node_modules/**", "dist/**", "package-lock.json", "yarn.lock"],
+  "source_extensions": [".js", ".mjs"],
+  "f2p_command": ["npm", "test", "--", "{test_paths}"],
+  "p2p_command": ["npm", "test"],
+  "label_task_classes": {"bug": "reported_bugfix", "feature": "feature_implementation"},
+  "setup_commands": [],
+  "timeout_seconds": 3600
+}

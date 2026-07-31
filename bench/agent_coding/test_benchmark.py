@@ -46,6 +46,7 @@ class GitFixture(unittest.TestCase):
         self.commit = git(self.source, "rev-parse", "HEAD")
         self.backing = self.root / "repo.git"
         git(self.root, "clone", "--mirror", "--no-local", str(self.source), str(self.backing))
+        git(self.root, "--git-dir", str(self.backing), "remote", "remove", "origin")
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -81,6 +82,9 @@ class PatchTests(GitFixture):
 
 class WorktreeTests(GitFixture):
     def test_repository_clone_resolves_exact_pinned_commit(self) -> None:
+        (self.source / "value.txt").write_text("gold\n", encoding="utf-8")
+        git(self.source, "commit", "-qam", "gold solution")
+        gold_commit = git(self.source, "rev-parse", "HEAD")
         clone_parent = self.root / "clone-parent"
         clone_parent.mkdir()
         task = {
@@ -90,6 +94,17 @@ class WorktreeTests(GitFixture):
         backing = bench.clone_pinned_repository(task, clone_parent)
         resolved = git(clone_parent, "--git-dir", str(backing), "rev-parse", "HEAD")
         self.assertEqual(resolved, self.commit)
+        self.assertEqual(git(clone_parent, "--git-dir", str(backing), "remote"), "")
+        self.assertEqual(git(clone_parent, "--git-dir", str(backing), "rev-list", "--all", "--count"), "1")
+        hidden = subprocess.run(
+            ["git", "--git-dir", str(backing), "cat-file", "-e", f"{gold_commit}^{{commit}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(hidden.returncode, 0)
+        with bench.temporary_worktree(backing, self.commit, self.root / "sealed-worktree", 10) as worktree:
+            self.assertEqual(git(worktree, "log", "--all", "--oneline").count("\n"), 0)
+            self.assertEqual(git(worktree, "remote"), "")
 
     def test_worktree_is_removed_after_exception(self) -> None:
         worktree_path = self.root / "cleanup-worktree"
@@ -280,6 +295,48 @@ class SetupLifecycleTests(GitFixture):
         self.assertGreaterEqual(row["setup"]["wall_seconds"], 0.15)
         self.assertEqual(row["agent"]["wall_seconds"], 0.01)
         self.assertTrue(row["valid"])
+
+    def test_warmup_includes_the_gated_greppy_edit_arm(self) -> None:
+        task = self.task()
+        preflight = bench.run_mutation_preflight(
+            task,
+            self.backing,
+            self.root / "warm-preflight",
+            self.root / "raw-warm-preflight",
+            [],
+        )
+        greppy = self.root / "fake-greppy"
+        greppy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        greppy.chmod(0o755)
+        metrics = {
+            "wall_seconds": 0.01,
+            "success": True,
+            "turns": 1,
+            "reported_error": False,
+            "tool_calls": 0,
+            "source_opens": 0,
+            "input_tokens": 1,
+            "output_tokens": 1,
+        }
+        with mock.patch.object(
+            bench,
+            "run_pi_agent",
+            return_value=(metrics, bench.ProcessResult(0, b"", b"", 0.01, False)),
+        ):
+            row = bench.run_arm(
+                arm="greppy-edit",
+                task=task,
+                backing=self.backing,
+                task_tmp=self.root / "warm-arm",
+                raw_dir=self.root / "raw-warm-arm",
+                pi_bin=pathlib.Path(sys.executable),
+                greppy_bin=greppy,
+                warm_greppy=True,
+                expected_mutation_hash=preflight["mutation_diff_sha256"],
+                secrets=[],
+            )
+        self.assertTrue(row["warmup"]["enabled"])
+        self.assertEqual(row["warmup"]["return_code"], 0)
 
     def test_v2_arm_restores_agent_modified_test_before_final_run(self) -> None:
         test_patch = """diff --git a/test_guard.py b/test_guard.py
@@ -493,6 +550,34 @@ class GradingTests(unittest.TestCase):
         self.assertFalse(grade["cost_on_solved_pairs"]["passes"])
         self.assertFalse(grade["passed"])
 
+    def test_zero_edit_denominator_is_na_and_fails_gate(self) -> None:
+        task_ids = [f"t{i}" for i in range(30)]
+        rows: list[dict[str, object]] = []
+        for task_id in task_ids:
+            explorer = result_row(task_id, "explorer", passed=True, tools=10, inputs=1000, wall=10)
+            candidate = result_row(task_id, "greppy-edit", passed=True, tools=8, inputs=700, wall=8)
+            candidate["agent"]["edit_calls"] = 0
+            rows.extend([explorer, candidate])
+        grade = bench.grade_results(rows, task_ids)
+        self.assertIsNone(grade["edit_loop"]["post_edit_reread_rate"])
+        self.assertEqual(grade["edit_loop"]["denominator_status"], "not_applicable_no_greppy_edits")
+        self.assertFalse(grade["edit_loop"]["passes"])
+        self.assertFalse(grade["greppy_edit_adoption"]["passes"])
+        self.assertFalse(grade["passed"])
+
+    def test_gate_requires_edit_adoption_on_eighty_percent_of_solved_tasks(self) -> None:
+        task_ids = [f"t{i}" for i in range(30)]
+        rows: list[dict[str, object]] = []
+        for index, task_id in enumerate(task_ids):
+            explorer = result_row(task_id, "explorer", passed=True, tools=10, inputs=1000, wall=10)
+            candidate = result_row(task_id, "greppy-edit", passed=True, tools=8, inputs=700, wall=8)
+            candidate["agent"]["edit_calls"] = 1 if index < 23 else 0
+            rows.extend([explorer, candidate])
+        grade = bench.grade_results(rows, task_ids)
+        self.assertEqual(grade["greppy_edit_adoption"]["adoption_rate"], round(23 / 30, 4))
+        self.assertFalse(grade["greppy_edit_adoption"]["passes"])
+        self.assertFalse(grade["passed"])
+
     def test_one_task_cannot_pass_the_benchmark(self) -> None:
         rows = [
             result_row("t1", "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10),
@@ -586,6 +671,13 @@ class GradingTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_legacy_prompt_file_cannot_copy_the_command_vocabulary(self) -> None:
+        prompt_path = bench.HERE / "prompts" / "greppy_system_v3.md"
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        self.assertNotIn("greppy ", prompt_text.lower())
+        self.assertIn(bench.AGENTS_MD, bench.GREPPY_POLICY_TEMPLATE)
+        self.assertIn(bench.AGENTS_MD, bench.GREPPY_EDIT_POLICY_TEMPLATE)
+
     def test_arm_validity_requires_success_even_when_turns_exist(self) -> None:
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "timed_out": True}))
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "return_code": 1}))
@@ -627,6 +719,14 @@ class ContractTests(unittest.TestCase):
             self.assertTrue(manifest["platform"]["architecture"])
             self.assertRegex(manifest["tasks"][0]["setup_commands_sha256"], r"^[0-9a-f]{64}$")
             self.assertIn("setup_contract", bench.RESUME_IDENTITY_FIELDS)
+            prompt = manifest["prompt_contract"]
+            self.assertEqual(prompt["shipped_agents_md_sha256"], bench.sha256_text(bench.AGENTS_MD))
+            self.assertRegex(prompt["greppy_edit_full_system_sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(prompt["identical_builtin_tool_palette_per_arm"])
+            self.assertGreater(prompt["greppy_edit_minus_explorer_utf8_bytes"], 0)
+            self.assertEqual(len(set(bench.ARM_TOOLS.values())), 1)
+            self.assertIn("provider-dollar", manifest["gate_preregistration"]["efficiency"])
+            self.assertIn("zero edit calls is N/A and fails", manifest["gate_preregistration"]["post_edit_rereads"])
             changed_setup = json.loads(json.dumps(manifest))
             changed_setup["tasks"][0]["setup_commands_sha256"] = "0" * 64
             with self.assertRaisesRegex(bench.HarnessError, "tasks"):
@@ -711,6 +811,146 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(metrics["output_tokens"], 20)
         self.assertEqual(metrics["tool_calls"], 1)
         self.assertEqual(metrics["source_opens"], 1)
+
+    def test_current_greppy_read_and_edit_verbs_are_structurally_measured(self) -> None:
+        commands = [
+            "/opt/bench/greppy --root . read-file src/lib.rs --lines 1:20",
+            "greppy --root . replace-text --expect 1 src/lib.rs old new",
+            "greppy --root . read-file ./src/lib.rs",
+            "greppy --root . rename src/model.rs::OldName NewName",
+            "printf 'greppy replace fake'",  # text is not a command invocation
+        ]
+        events = []
+        for command in commands:
+            events.append(
+                {
+                    "type": "turn_end",
+                    "toolResults": [{}],
+                    "message": {
+                        "usage": {},
+                        "content": [{"type": "toolCall", "name": "bash", "arguments": {"command": command}}],
+                    },
+                }
+            )
+        metrics = bench.parse_pi_jsonl("\n".join(json.dumps(event) for event in events).encode())
+        self.assertEqual(metrics["greppy_read_calls"], 2)
+        self.assertEqual(metrics["edit_calls"], 2)
+        self.assertEqual(metrics["post_edit_source_opens"], 1)
+        self.assertEqual(metrics["source_opens"], 2)
+
+    def test_every_shipped_edit_verb_is_recognised(self) -> None:
+        commands = [
+            "greppy --root . replace src/lib.rs::run body",
+            "greppy --root . replace-text src/lib.rs old new",
+            "greppy --root . replace-lines src/lib.rs 1:2 body",
+            "greppy --root . replace-span handle body",
+            "greppy --root . insert-lines src/lib.rs 3 body",
+            "greppy --root . delete src/lib.rs::run",
+            "greppy --root . delete-lines src/lib.rs 1:2",
+            "greppy --root . patch change.diff",
+            "greppy --root . write src/new.rs body",
+            "greppy --root . rename src/lib.rs::Old New",
+            "greppy --root . undo",
+        ]
+        events = [
+            {
+                "type": "turn_end",
+                "toolResults": [{}],
+                "message": {
+                    "usage": {},
+                    "content": [{"type": "toolCall", "name": "bash", "arguments": {"command": command}}],
+                },
+            }
+            for command in commands
+        ]
+        metrics = bench.parse_pi_jsonl("\n".join(json.dumps(event) for event in events).encode())
+        self.assertEqual(metrics["edit_calls"], len(bench.GREPPY_EDIT_VERBS))
+
+    def test_command_sets_are_extracted_from_the_runtime_shipped_manual(self) -> None:
+        extracted = bench._commands_from_shipped_manual(bench.AGENTS_MD)
+        self.assertTrue(extracted["READ"])
+        self.assertTrue(extracted["EDIT"])
+        self.assertEqual(
+            extracted["READ"], frozenset({"read", "read-smart", "read-file"})
+        )
+        self.assertEqual(
+            extracted["EDIT"],
+            frozenset({
+                "replace", "replace-text", "replace-lines", "replace-span",
+                "insert-lines", "delete", "delete-lines", "patch", "write",
+                "rename", "undo",
+            }),
+        )
+
+    def test_navigation_code_output_counts_as_source_open(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{}],
+            "message": {
+                "usage": {},
+                "content": [{
+                    "type": "toolCall", "name": "bash",
+                    "arguments": {"command": "greppy --root . who-calls parse --code"},
+                }],
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["source_opens"], 1)
+        self.assertEqual(metrics["greppy_read_calls"], 0)
+
+    def test_balanced_arm_orders_are_exact_and_nav_arm_does_not_split_pair(self) -> None:
+        for count, expected in ((41, (21, 20)), (144, (72, 72))):
+            task_ids = [f"task-{index:03d}" for index in range(count)]
+            orders = bench.balanced_arm_orders(list(reversed(task_ids)))
+            explorer_first = sum(order.index("explorer") < order.index("greppy-edit") for order in orders.values())
+            edit_first = count - explorer_first
+            self.assertEqual((explorer_first, edit_first), expected)
+            self.assertTrue(all(order[-1] == "greppy" for order in orders.values()))
+
+    def test_builtin_edits_are_fallbacks_not_greppy_adoption(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{}],
+            "message": {
+                "usage": {},
+                "content": [
+                    {"type": "toolCall", "name": "edit", "arguments": {"path": "src/lib.rs"}},
+                    {"type": "toolCall", "name": "read", "arguments": {"path": "src/lib.rs"}},
+                ],
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["fallback_edit_calls"], 1)
+        self.assertEqual(metrics["edit_calls"], 0)
+        self.assertEqual(metrics["post_edit_source_opens"], 1)
+
+    def test_all_provider_retry_attempts_are_billed(self) -> None:
+        failed = {
+            "input_tokens": 100,
+            "uncached_input_tokens": 100,
+            "output_tokens": 10,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reported_error": True,
+        }
+        final = {
+            "input_tokens": 200,
+            "uncached_input_tokens": 200,
+            "output_tokens": 20,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reported_error": False,
+            "edit_calls": 1,
+        }
+        aggregate = bench.aggregate_provider_attempts(final, [failed, final])
+        self.assertEqual(aggregate["provider_attempts"], 2)
+        self.assertEqual(aggregate["uncached_input_tokens"], 300)
+        self.assertEqual(aggregate["output_tokens"], 30)
+        self.assertEqual(aggregate["edit_calls"], 1)
+        self.assertAlmostEqual(
+            aggregate["provider_cost_usd_all_attempts"],
+            bench.provider_cost_usd(failed) + bench.provider_cost_usd(final),
+        )
 
 
 class TaskBankV2Tests(unittest.TestCase):

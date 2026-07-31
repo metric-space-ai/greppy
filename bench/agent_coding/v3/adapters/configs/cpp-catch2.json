@@ -1,0 +1,14 @@
+{
+  "schema_version": "greppy.agent-coding-v3.adapter-config.1",
+  "repository_id": "cpp-catch2",
+  "repository_url": "https://github.com/catchorg/Catch2",
+  "primary_language": "cpp",
+  "toolchain_profile": "cpp-cmake",
+  "test_globs": ["tests/**", "**/*test.cpp", "**/*tests.cpp"],
+  "ignore_globs": ["build/**", "**/build/**", "docs/**", "**/generated/**"],
+  "source_extensions": [".cc", ".cpp", ".c", ".h", ".hpp"],
+  "setup_commands": [["cmake", "-S", ".", "-B", "build", "-G", "Ninja", "-DCATCH_BUILD_TESTING=ON", "-DCMAKE_BUILD_TYPE=Release"], ["cmake", "--build", "build", "-j2"]],
+  "post_patch_commands": [["cmake", "--build", "build", "-j2"]],
+  "label_task_classes": {"bug": "reported_bugfix", "feature": "feature_implementation", "improvement": "feature_implementation"},
+  "timeout_seconds": 1800
+}
