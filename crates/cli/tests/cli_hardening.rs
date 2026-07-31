@@ -281,7 +281,7 @@ fn hold_exclusive_lock(path: &Path) -> TestFileLock {
 }
 
 // ---------------------------------------------------------------------------
-// RV-011 — index . then search-code finds content (same project identity).
+// RV-011 — index . then search-pattern finds content (same project identity).
 // RV-006 — searching from a subdirectory resolves the SAME store.
 // ---------------------------------------------------------------------------
 
@@ -300,25 +300,25 @@ fn index_dot_then_search_from_root_and_subdir() {
         "index should key project on the repo-root basename; got: {out}"
     );
 
-    // RV-011: search-code from the repo root finds current source content.
-    let (code, out, err) = run(&["search-code", "alpha_unique_marker"], &repo, &store);
-    assert_eq!(code, 0, "search-code from root should exit 0; stderr={err}");
+    // RV-011: search-pattern from the repo root finds current source content.
+    let (code, out, err) = run(&["search-pattern", "alpha_unique_marker"], &repo, &store);
+    assert_eq!(code, 0, "search-pattern from root should exit 0; stderr={err}");
     assert!(
         out.contains("alpha_unique_marker"),
-        "search-code from root must find source content (RV-011); got: {out:?}"
+        "search-pattern from root must find source content (RV-011); got: {out:?}"
     );
 
-    // RV-006: search-code from a SUBDIRECTORY must resolve the same store
+    // RV-006: search-pattern from a SUBDIRECTORY must resolve the same store
     // (walk up to the .git root) and still find the content — not exit 73.
     let sub = repo.join("sub");
-    let (code, out, err) = run(&["search-code", "alpha_unique_marker"], &sub, &store);
+    let (code, out, err) = run(&["search-pattern", "alpha_unique_marker"], &sub, &store);
     assert_eq!(
         code, 0,
-        "search-code from subdir must exit 0, not 73 (RV-006); stderr={err}"
+        "search-pattern from subdir must exit 0, not 73 (RV-006); stderr={err}"
     );
     assert!(
         out.contains("alpha_unique_marker"),
-        "search-code from subdir must find content via the shared store (RV-006); got: {out:?}"
+        "search-pattern from subdir must find content via the shared store (RV-006); got: {out:?}"
     );
     assert!(
         !out.contains("(no matches)"),
@@ -327,7 +327,7 @@ fn index_dot_then_search_from_root_and_subdir() {
 }
 
 #[test]
-fn search_code_json_reports_exact_counts_and_truncation_metadata() {
+fn search_pattern_json_reports_exact_counts_and_truncation_metadata() {
     let (root, _scratch) = fresh_dir("search-json");
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -346,11 +346,11 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
     );
 
     let (code, out, err) = run(
-        &["search-code", "--json", "json_unique_marker"],
+        &["search-pattern", "--json", "json_unique_marker"],
         &repo,
         &store,
     );
-    assert_eq!(code, 0, "search-code --json should exit 0; stderr={err}");
+    assert_eq!(code, 0, "search-pattern --json should exit 0; stderr={err}");
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
@@ -361,7 +361,7 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
     assert_eq!(v["provider_complete"], false);
     assert!(
         v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1,
-        "search-code JSON must expose provider incompleteness: {v:?}"
+        "search-pattern JSON must expose provider incompleteness: {v:?}"
     );
     assert!(
         v["incomplete_providers"]
@@ -377,7 +377,7 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
     assert_eq!(v["truncated"], true);
     assert_eq!(v["hits"].as_array().unwrap().len(), 20);
     assert!(
-        v["hits"][0]["location"]
+        v["hits"][0]["matches"][0]["location"]
             .as_str()
             .unwrap_or("")
             .starts_with("src/lib.rs:"),
@@ -385,10 +385,10 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
     );
 }
 
-/// Small drift is atomically reindexed, while the current search-code request
+/// Small drift is atomically reindexed, while the current search-pattern request
 /// uses the live filesystem rather than the already-open old snapshot.
 #[test]
-fn search_code_json_auto_reindexes_and_reports_current_state() {
+fn search_pattern_json_auto_reindexes_and_reports_current_state() {
     let (repo, store, _scratch) = make_repo("search-json-stale", "old_json_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -402,7 +402,7 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
     .unwrap();
 
     let (code, out, err) = run(
-        &["search-code", "--json", "old_json_stale_marker"],
+        &["search-pattern", "--json", "old_json_stale_marker"],
         &repo,
         &store,
     );
@@ -419,7 +419,7 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
 
     let (code, out, err) = run(
-        &["search-code", "--json", "new_json_stale_marker"],
+        &["search-pattern", "--json", "new_json_stale_marker"],
         &repo,
         &store,
     );
@@ -436,10 +436,10 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
     );
 }
 
-/// With auto-reindex disabled, stale search-code still uses the current live
+/// With auto-reindex disabled, stale search-pattern still uses the current live
 /// filesystem and never exposes old FTS rows.
 #[test]
-fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
+fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     let (repo, store, _scratch) = make_repo("search-json-stale-label", "old_labeled_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -453,7 +453,7 @@ fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     .unwrap();
 
     let (code, out, err) = run_with_env(
-        &["search-code", "--json", "old_labeled_stale_marker"],
+        &["search-pattern", "--json", "old_labeled_stale_marker"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -473,9 +473,9 @@ fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
 }
 
 #[test]
-fn provider_policy_require_complete_does_not_block_search_code_json() {
+fn provider_policy_require_complete_does_not_block_search_pattern_json() {
     let (repo, store, _scratch) =
-        make_repo("provider-policy-search-code", "provider_policy_code_marker");
+        make_repo("provider-policy-search-pattern", "provider_policy_code_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -483,18 +483,18 @@ fn provider_policy_require_complete_does_not_block_search_code_json() {
     );
 
     let (code, out, err) = run_with_env(
-        &["search-code", "--json", "provider_policy_code_marker"],
+        &["search-pattern", "--json", "provider_policy_code_marker"],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
     );
     assert_eq!(
         code, 0,
-        "strict provider policy must not block literal search-code; stderr={err}\nstdout={out}"
+        "strict provider policy must not block literal search-pattern; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
-        "search-code JSON should remain machine-readable; stderr={err:?}"
+        "search-pattern JSON should remain machine-readable; stderr={err:?}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -506,9 +506,9 @@ fn provider_policy_require_complete_does_not_block_search_code_json() {
 }
 
 #[test]
-fn provider_policy_require_complete_blocks_search_symbols_json() {
+fn provider_policy_require_complete_blocks_search_symbol_json() {
     let (repo, store, _scratch) = make_repo(
-        "provider-policy-search-symbols",
+        "provider-policy-search-symbol",
         "provider_policy_symbol_marker",
     );
     let (code, out, err) = run(&["index", "."], &repo, &store);
@@ -518,7 +518,7 @@ fn provider_policy_require_complete_blocks_search_symbols_json() {
     );
 
     let (code, out, err) = run_with_env(
-        &["search-symbols", "--json", "provider_policy_symbol_marker"],
+        &["search-symbol", "--json", "provider_policy_symbol_marker"],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -529,7 +529,7 @@ fn provider_policy_require_complete_blocks_search_symbols_json() {
     );
     assert!(
         err.is_empty(),
-        "strict search-symbols JSON should not require stderr parsing; stderr={err:?}"
+        "strict search-symbol JSON should not require stderr parsing; stderr={err:?}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -592,7 +592,7 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
 
     let (code, out, err) = run_with_env(
         &[
-            "semantic-search",
+            "search",
             "--json",
             "find provider policy semantic vector marker",
         ],
@@ -625,12 +625,12 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
     assert_eq!(code, 0, "index failed; stdout={out} stderr={err}");
 
     let (code, out, err) = run(
-        &["semantic-search", "--json", "find semantic progress marker"],
+        &["search", "--json", "find semantic progress marker"],
         &repo,
         &store,
     );
     assert_eq!(
-        code, 75,
+        code, 1,
         "an incomplete semantic generation must be retryable; stdout={out} stderr={err}"
     );
     assert!(err.is_empty(), "JSON status must stay on stdout: {err:?}");
@@ -698,11 +698,11 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
     drop(graph);
 
     let (code, out, err) = run(
-        &["semantic-search", "--json", "find semantic progress marker"],
+        &["search", "--json", "find semantic progress marker"],
         &repo,
         &store,
     );
-    assert_eq!(code, 75, "partial vectors must remain hidden; stderr={err}");
+    assert_eq!(code, 1, "partial vectors must remain hidden; stderr={err}");
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["status"], "indexing");
     assert!(value["hits"].as_array().unwrap().is_empty());
@@ -744,7 +744,7 @@ fn provider_policy_require_complete_blocks_plus_vectors_before_model_config() {
 }
 
 #[test]
-fn search_code_stale_text_falls_back_to_live_grep() {
+fn search_pattern_stale_text_falls_back_to_live_grep() {
     let (repo, store, _scratch) = make_repo("search-text-stale", "old_text_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -760,19 +760,25 @@ fn search_code_stale_text_falls_back_to_live_grep() {
     // Kill the inline auto-reindex so the stale text path (live-grep
     // fallback) is actually exercised; with the default policy this
     // small drift would be healed and served from the index instead.
+    // `--code` prints the matched line verbatim, so "serves current
+    // content" is pinned on the line text itself, not just the address.
     let (code, out, err) = run_with_env(
-        &["search-code", "new_text_stale_marker"],
+        &["search-pattern", "--code", "new_text_stale_marker"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
         code, 0,
-        "stale search-code text should live-grep current files; stderr={err}\nstdout={out}"
+        "stale search-pattern text should live-grep current files; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("falling back to live grep"),
-        "stale search-code text should explain live fallback; stderr={err:?}"
+        err.is_empty(),
+        "live-filesystem fallback is the search-pattern contract, not a warning; stderr={err:?}"
+    );
+    assert!(
+        out.contains("lib.rs:1"),
+        "live fallback must print the grep-like address; got: {out:?}"
     );
     assert!(
         out.contains("new_text_stale_marker"),
@@ -784,352 +790,38 @@ fn search_code_stale_text_falls_back_to_live_grep() {
     );
 }
 
+/// The pre-0.3.0 vocabulary stays refused: the renamed verbs die at
+/// invocation with EX_USAGE (64), and the git-scope flags that only the
+/// dead `search-code` spelling carried are rejected by the living
+/// `search-pattern` rather than silently ignored.
 #[test]
-fn search_code_changed_text_live_greps_only_git_changes_without_index() {
-    let (repo, store, _scratch) = make_real_git_repo("search-code-changed-text");
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn changed_text_marker() -> i32 { 2 }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        repo.join("src/new.rs"),
-        "pub fn changed_text_marker_untracked() -> i32 { 3 }\n",
-    )
-    .unwrap();
+fn removed_verbs_and_scope_flags_are_refused() {
+    let (repo, store, _scratch) = make_repo("removed-vocabulary", "removed_vocabulary_marker");
 
-    let (code, out, err) = run(
-        &["search-code", "--changed", "changed_text_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --changed text should not require an index; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "search-code --changed text should be a clean grep-like query; stderr={err:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:1"),
-        "modified tracked file must be searched; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/new.rs:1"),
-        "untracked file must be searched; got: {out:?}"
-    );
-    assert!(
-        !out.contains("clean_committed_marker"),
-        "clean committed files must not be searched by --changed; got: {out:?}"
-    );
-}
+    for verb in ["search-code", "search-symbols", "semantic-search"] {
+        let (code, out, _err) = run(&[verb, "removed_vocabulary_marker"], &repo, &store);
+        assert_eq!(code, 64, "{verb} must be refused with EX_USAGE");
+        assert!(
+            out.contains(&format!("unrecognized subcommand '{verb}'")),
+            "{verb} refusal must name the dead verb; got: {out:?}"
+        );
+    }
 
-#[test]
-fn search_code_changed_json_reports_live_scope_and_exact_counts() {
-    let (repo, store, _scratch) = make_real_git_repo("search-code-changed-json");
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn changed_json_marker() -> i32 { 2 }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        repo.join("src/new.rs"),
-        "pub fn changed_json_marker_untracked() -> i32 { 3 }\n",
-    )
-    .unwrap();
-
-    let (code, out, err) = run(
-        &["search-code", "--changed", "--json", "changed_json_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --changed --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "machine-readable changed search-code JSON should not require stderr parsing; stderr={err:?}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["scope"], "changed");
-    assert_eq!(v["backend"], "live_grep");
-    assert_eq!(v["fresh"], true);
-    assert_eq!(v["freshness"], serde_json::Value::Null);
-    assert_eq!(v["changed_files_total"], 2);
-    assert_eq!(v["total_exact"], 2);
-    assert_eq!(v["shown"], 2);
-    assert_eq!(v["omitted"], 0);
-    assert_eq!(v["truncated"], false);
-    assert_eq!(v["hits"].as_array().unwrap().len(), 2);
-}
-
-#[test]
-fn search_code_staged_text_greps_git_index_blob_not_worktree() {
-    let (repo, store, _scratch) = make_real_git_repo("search-code-staged-text");
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn staged_text_marker() -> i32 { 2 }\n",
-    )
-    .unwrap();
-    git(&repo, &["add", "src/lib.rs"]);
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn unstaged_after_add_marker() -> i32 { 3 }\n",
-    )
-    .unwrap();
-
-    let (code, out, err) = run(
-        &["search-code", "--staged", "staged_text_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --staged text should search staged blobs without requiring an index; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "search-code --staged text should be a clean grep-like query; stderr={err:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:1"),
-        "staged blob must be searched; got: {out:?}"
-    );
-    assert!(
-        out.contains("staged_text_marker"),
-        "staged blob content must be visible; got: {out:?}"
-    );
-
-    let (code, out, err) = run(
-        &["search-code", "--staged", "unstaged_after_add_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "text no-match keeps existing search-code no-match behavior; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        out.contains("(no matches)"),
-        "--staged must not read unstaged worktree-only content; got: {out:?}"
-    );
-}
-
-#[test]
-fn search_code_staged_json_reports_git_blob_scope_and_exact_counts() {
-    let (repo, store, _scratch) = make_real_git_repo("search-code-staged-json");
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn staged_json_marker() -> i32 { 2 }\n",
-    )
-    .unwrap();
-    git(&repo, &["add", "src/lib.rs"]);
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn unstaged_json_after_add_marker() -> i32 { 3 }\n",
-    )
-    .unwrap();
-
-    let (code, out, err) = run(
-        &["search-code", "--staged", "--json", "staged_json_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --staged --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "machine-readable staged search-code JSON should not require stderr parsing; stderr={err:?}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["scope"], "staged");
-    assert_eq!(v["backend"], "git_blob_grep");
-    assert_eq!(v["fresh"], true);
-    assert_eq!(v["freshness"], serde_json::Value::Null);
-    assert_eq!(v["staged_files_total"], 1);
-    assert_eq!(v["total_exact"], 1);
-    assert_eq!(v["shown"], 1);
-    assert_eq!(v["omitted"], 0);
-    assert_eq!(v["truncated"], false);
-    assert_eq!(v["hits"].as_array().unwrap().len(), 1);
-    assert!(
-        v["hits"][0]["snippet"]
-            .as_str()
-            .unwrap_or("")
-            .contains("staged_json_marker"),
-        "JSON hit must come from staged blob, got {v:?}"
-    );
-
-    let (code, out, err) = run(
-        &[
-            "search-code",
-            "--staged",
-            "--json",
-            "unstaged_json_after_add_marker",
-        ],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 1,
-        "staged JSON no-match should use the existing JSON no-match code; stderr={err}\nstdout={out}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["status"], "no_matches");
-    assert_eq!(v["total_exact"], 0);
-    assert!(err.is_empty());
-}
-
-#[test]
-fn search_code_since_text_and_json_live_grep_rev_diff_without_index() {
-    let (repo, store, _scratch) = make_real_git_repo("search-code-since");
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn since_diff_marker() -> i32 { 4 }\n",
-    )
-    .unwrap();
-    git(&repo, &["add", "src/lib.rs"]);
-    git(&repo, &["commit", "-m", "feature since"]);
-
-    let (code, out, err) = run(
-        &["search-code", "--since", "HEAD~1", "since_diff_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --since text should search rev-diff files without an index; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "search-code --since text should be a clean grep-like query; stderr={err:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:1"),
-        "rev-diff file must be searched; got: {out:?}"
-    );
-    assert!(
-        out.contains("since_diff_marker"),
-        "rev-diff content must be visible; got: {out:?}"
-    );
-
-    let (code, out, err) = run(
-        &[
-            "search-code",
-            "--since",
-            "HEAD~1",
-            "--json",
-            "since_diff_marker",
-        ],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --since --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "machine-readable since search-code JSON should not require stderr parsing; stderr={err:?}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["scope"], "since");
-    assert_eq!(v["backend"], "git_diff_live_grep");
-    assert_eq!(v["fresh"], true);
-    assert_eq!(v["freshness"], serde_json::Value::Null);
-    assert_eq!(v["merge_base"], serde_json::Value::Null);
-    assert_eq!(v["diff_files_total"], 1);
-    assert_eq!(v["total_exact"], 1);
-    assert_eq!(v["shown"], 1);
-    assert_eq!(v["omitted"], 0);
-    assert_eq!(v["truncated"], false);
-    assert_eq!(v["hits"].as_array().unwrap().len(), 1);
-    assert_eq!(v["diff_rev"].as_str().unwrap_or("").len(), 40);
-}
-
-#[test]
-fn search_code_base_text_and_json_live_grep_merge_base_diff_without_index() {
-    let (repo, store, _scratch) = make_real_git_repo("search-code-base");
-    git(&repo, &["branch", "basepoint"]);
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn base_diff_marker() -> i32 { 5 }\n",
-    )
-    .unwrap();
-    git(&repo, &["add", "src/lib.rs"]);
-    git(&repo, &["commit", "-m", "feature base"]);
-
-    let (code, out, err) = run(
-        &["search-code", "--base", "basepoint", "base_diff_marker"],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --base text should search merge-base diff files without an index; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "search-code --base text should be a clean grep-like query; stderr={err:?}"
-    );
-    assert!(
-        out.contains("src/lib.rs:1"),
-        "merge-base diff file must be searched; got: {out:?}"
-    );
-    assert!(
-        out.contains("base_diff_marker"),
-        "merge-base diff content must be visible; got: {out:?}"
-    );
-
-    let (code, out, err) = run(
-        &[
-            "search-code",
-            "--base",
-            "basepoint",
-            "--json",
-            "base_diff_marker",
-        ],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "search-code --base --json should exit 0; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "machine-readable base search-code JSON should not require stderr parsing; stderr={err:?}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["scope"], "base");
-    assert_eq!(v["backend"], "git_diff_live_grep");
-    assert_eq!(v["fresh"], true);
-    assert_eq!(v["freshness"], serde_json::Value::Null);
-    assert_eq!(v["diff_files_total"], 1);
-    assert_eq!(v["total_exact"], 1);
-    assert_eq!(v["shown"], 1);
-    assert_eq!(v["omitted"], 0);
-    assert_eq!(v["truncated"], false);
-    assert_eq!(v["hits"].as_array().unwrap().len(), 1);
-    assert_eq!(v["diff_rev"].as_str().unwrap_or("").len(), 40);
-    assert_eq!(v["merge_base"].as_str().unwrap_or("").len(), 40);
+    for flag in ["--changed", "--staged", "--since", "--base"] {
+        let (code, out, _err) = run(
+            &["search-pattern", flag, "removed_vocabulary_marker"],
+            &repo,
+            &store,
+        );
+        assert_eq!(
+            code, 64,
+            "search-pattern must refuse the retired scope flag {flag}"
+        );
+        assert!(
+            out.contains(&format!("unexpected argument '{flag}'")),
+            "{flag} refusal must name the dead flag; stdout={out:?}"
+        );
+    }
 }
 
 #[cfg(not(feature = "ci-test-assets"))]
@@ -1183,7 +875,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     insert_default_model_vectors(&store_dir, 2);
 
     let (code, out, err) = run_with_env(
-        &["semantic-search", "--json", "find vector guard marker"],
+        &["search", "--json", "find vector guard marker"],
         &repo,
         &store_dir,
         &[("GREPPY_VECTOR_EXACT_CANDIDATE_LIMIT", "1")],
@@ -1244,7 +936,7 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
     let _writer = hold_index_before_publish(&repo, &store_dir, "semantic-vector-stale");
 
     let (code, out, err) = run_with_env(
-        &["semantic-search", "--json", "find vector stale marker"],
+        &["search", "--json", "find vector stale marker"],
         &repo,
         &store_dir,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -1287,7 +979,7 @@ fn semantic_stale_index_refuses_vector_hits() {
     let _writer = hold_index_before_publish(&repo, &store_dir, "semantic-stale");
 
     let (code, out, err) = run_with_env(
-        &["semantic-search", "--json", "semantic_stale_marker"],
+        &["search", "--json", "semantic_stale_marker"],
         &repo,
         &store_dir,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -1639,7 +1331,7 @@ fn discover_scope_env_controls_index_and_query_freshness() {
     );
 
     let (code, out, err) = run_with_env(
-        &["search-symbols", "clean_committed_marker", "--json"],
+        &["search-symbol", "clean_committed_marker", "--json"],
         &repo,
         &store,
         &scope_env,
@@ -1663,12 +1355,12 @@ fn discover_scope_env_controls_index_and_query_freshness() {
     );
 
     let (code, out, err) = run(
-        &["search-symbols", "clean_committed_marker", "--json"],
+        &["search-symbol", "clean_committed_marker", "--json"],
         &repo,
         &store,
     );
     assert_eq!(
-        code, 75,
+        code, 1,
         "default query must reject a scoped index instead of emitting stale hits; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -1709,7 +1401,7 @@ fn pure_head_drift_refreshes_metadata_without_reindexing() {
     assert_ne!(before.head_oid, committed.head_oid);
 
     let (code, out, err) = run(
-        &["search-symbols", "clean_committed_marker", "--json"],
+        &["search-symbol", "clean_committed_marker", "--json"],
         &repo,
         &store_dir,
     );
@@ -1751,14 +1443,14 @@ fn global_root_flag_resolves_same_store_from_outside() {
     let (code, out, err) = run(&["--root", repo_s, "index", repo_s], &outside, &store);
     assert_eq!(code, 0, "index --root should succeed; stderr={err}\n{out}");
 
-    // search-code with `--root` after the subcommand (global flag) from
+    // search-pattern with `--root` after the subcommand (global flag) from
     // the same unrelated cwd must hit the same store.
     let (code, out, err) = run(
-        &["search-code", "--root", repo_s, "beta_unique_marker"],
+        &["search-pattern", "--root", repo_s, "beta_unique_marker"],
         &outside,
         &store,
     );
-    assert_eq!(code, 0, "search-code --root should exit 0; stderr={err}");
+    assert_eq!(code, 0, "search-pattern --root should exit 0; stderr={err}");
     assert!(
         out.contains("beta_unique_marker"),
         "global --root must target the indexed store (RV-006); got: {out:?}"
@@ -1766,7 +1458,7 @@ fn global_root_flag_resolves_same_store_from_outside() {
 
     // And `--root` before the subcommand must work identically.
     let (code, out, _err) = run(
-        &["--root", repo_s, "search-code", "beta_unique_marker"],
+        &["--root", repo_s, "search-pattern", "beta_unique_marker"],
         &outside,
         &store,
     );
@@ -1823,16 +1515,25 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
     assert_eq!(code, 0, "second index should succeed; stderr={err}\n{out}");
     assert!(!backup.exists(), "graph.db.prev must not be retained");
 
-    let (code, out, err) = run(&["search-symbols", "new_atomic_marker"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "new_atomic_marker"], &repo, &store);
     assert_eq!(code, 0, "new active snapshot should query; stderr={err}");
     assert!(
         out.contains("new_atomic_marker"),
         "active index must be the second snapshot; got {out:?}"
     );
-    let (_code, out, _err) = run(&["search-symbols", "old_atomic_marker"], &repo, &store);
+    // The text miss cascade echoes the query and similar names, so the
+    // no-leak property is pinned on the JSON hit set itself.
+    let (code, out, err) = run(
+        &["search-symbol", "old_atomic_marker", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "retired symbol must miss; stderr={err}");
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(
-        !out.contains("old_atomic_marker"),
-        "old symbol must not leak from active snapshot after publish; got {out:?}"
+        v["hits"].as_array().unwrap().is_empty(),
+        "old symbol must not leak from active snapshot after publish; got {v:?}"
     );
 }
 
@@ -1868,7 +1569,7 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         "seeded production snapshot must take the incremental path and only re-index the changed file; stdout={out}"
     );
 
-    let (code, out, err) = run(&["search-symbols", "new_incremental_marker"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "new_incremental_marker"], &repo, &store);
     assert_eq!(
         code, 0,
         "incremental active snapshot should query new marker; stderr={err}"
@@ -1878,7 +1579,7 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         "new symbol must be visible after seeded incremental publish; got {out:?}"
     );
     let (code, out, err) = run(
-        &["search-symbols", "untouched_incremental_helper"],
+        &["search-symbol", "untouched_incremental_helper"],
         &repo,
         &store,
     );
@@ -1890,10 +1591,17 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         out.contains("untouched_incremental_helper"),
         "unchanged file's graph rows must be preserved by incremental temp snapshot; got {out:?}"
     );
-    let (_code, out, _err) = run(&["search-symbols", "old_incremental_marker"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "old_incremental_marker", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "replaced symbol must miss; stderr={err}");
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(
-        !out.contains("old_incremental_marker"),
-        "changed file's old symbol must not leak after incremental publish; got {out:?}"
+        v["hits"].as_array().unwrap().is_empty(),
+        "changed file's old symbol must not leak after incremental publish; got {v:?}"
     );
 }
 
@@ -1933,28 +1641,40 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
     // The old snapshot remains physically valid but is stale relative to the
     // worktree, so graph queries must refuse it.
     let (code, out, err) = run_with_env(
-        &["search-symbols", "old_failure_marker"],
+        &["search-symbol", "old_failure_marker", "--json"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 75,
+        code, 1,
         "preserved but stale active index must be refused; stderr={err}\nstdout={out}"
     );
-    assert!(!out.contains("old_failure_marker"));
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
+    assert_eq!(v["status"], "skipped_stale_index");
+    assert!(
+        v["hits"].as_array().unwrap().is_empty(),
+        "stale refusal must not emit the preserved symbol: {v:?}"
+    );
 
     // The failed temp graph must never become visible: its new symbol
     // is absent from the preserved active index.
-    let (_code, out, _err) = run_with_env(
-        &["search-symbols", "new_failure_marker"],
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "new_failure_marker", "--json"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
+    assert_eq!(
+        code, 1,
+        "failed publish must leave the stale refusal in place; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(
-        !out.contains("new_failure_marker"),
-        "failed publish must not expose symbols from the failed temp graph; got {out:?}"
+        v["hits"].as_array().unwrap().is_empty(),
+        "failed publish must not expose symbols from the failed temp graph; got {v:?}"
     );
 }
 
@@ -1986,7 +1706,7 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
         "quarantine artifacts are removed after successful publication"
     );
 
-    let (code, out, err) = run(&["search-symbols", "new_corrupt_marker"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "new_corrupt_marker"], &repo, &store);
     assert_eq!(
         code, 0,
         "replacement active snapshot should query; stderr={err}"
@@ -2111,7 +1831,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         "successful recovery index must remove stale graph.db.next.* snapshots"
     );
 
-    let (code, out, err) = run(&["search-symbols", "new_kill_marker"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "new_kill_marker"], &repo, &store);
     assert_eq!(
         code, 0,
         "recovered active snapshot should query new marker; stderr={err}"
@@ -2120,10 +1840,17 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         out.contains("new_kill_marker"),
         "new symbol must be visible after recovery index; got {out:?}"
     );
-    let (_code, out, _err) = run(&["search-symbols", "old_kill_marker"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "old_kill_marker", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "pre-crash symbol must miss; stderr={err}");
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(
-        !out.contains("old_kill_marker"),
-        "old symbol must not leak after recovery publish; got {out:?}"
+        v["hits"].as_array().unwrap().is_empty(),
+        "old symbol must not leak after recovery publish; got {v:?}"
     );
 }
 
@@ -2164,7 +1891,7 @@ fn index_publishes_graph_when_embedding_backend_is_unavailable() {
     );
 
     // The published graph is complete and queryable without embeddings.
-    let (code, out, err) = run(&["search-symbols", "embed_degraded_marker"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "embed_degraded_marker"], &repo, &store);
     assert_eq!(
         code, 0,
         "graph queries must work against the degraded-published snapshot; stderr={err}"
@@ -2209,12 +1936,15 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
         ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
     ];
     let (code, out, err) = run_with_env(
-        &["search-symbols", "--json", "old_large_drift_marker"],
+        &["search-symbol", "--json", "old_large_drift_marker"],
         &repo,
         &store,
         &envs,
     );
-    assert_eq!(code, 75, "large drift must be temporary; stderr={err}");
+    assert_eq!(
+        code, 1,
+        "large drift must refuse stale hits while a refresh runs; stderr={err}"
+    );
     let first: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(first["freshness"]["state"], "refreshing");
     assert!(first["hits"].as_array().unwrap().is_empty());
@@ -2234,14 +1964,14 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
     assert_eq!(first_job["state"], "refreshing");
 
     let (code, out, err) = run_with_env(
-        &["search-symbols", "--json", "old_large_drift_marker"],
+        &["search-symbol", "--json", "old_large_drift_marker"],
         &repo,
         &store,
         &envs,
     );
     assert_eq!(
-        code, 75,
-        "second stale query must be temporary; stderr={err}"
+        code, 1,
+        "second stale query must still refuse while the same refresh runs; stderr={err}"
     );
     let second: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(second["freshness"]["state"], "refreshing");
@@ -2372,7 +2102,7 @@ fn r3_old_lock_contents_without_os_lock_are_harmless() {
     );
 
     let (code, out, err) = run(
-        &["search-symbols", "stale_lock_marker_after_takeover"],
+        &["search-symbol", "stale_lock_marker_after_takeover"],
         &repo,
         &store,
     );
