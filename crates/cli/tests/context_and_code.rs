@@ -4,8 +4,9 @@
 //!   most relevant definitions (not just a `file:line` pointer), so an
 //!   agent reads the code directly from greppy output.
 //! * The `--code` flag on `who-calls` / `callees` /
-//!   `trace` appends each result node's source body to the usual
-//!   `file:line` line.
+//!   `trace` appends verbatim source to the usual `file:line` line: the
+//!   call-site statement for `who-calls`, the definition span for
+//!   `callees` / `trace` (dev/NAV-OUTPUT-SPEC.md).
 //!
 //! These spawn the real `greppy` binary against a multi-file fixture
 //! indexed end-to-end, so the spans are read from the same files the
@@ -767,21 +768,27 @@ fn plus_explain_line_one_module_hit_uses_display_name() {
 // --code flag on the navigation commands.
 // ---------------------------------------------------------------------------
 
+// 0.3.0 contract (dev/NAV-OUTPUT-SPEC.md, `--code`): for who-calls the span
+// is the STATEMENT ENCLOSING THE CALL SITE inside the caller — NOT the
+// caller's body — printed as `<file>:<line>  <name>` followed by the
+// byte-exact verbatim file lines (their own indentation kept, no dedent).
 #[test]
-fn who_calls_code_includes_callers_body() {
+fn who_calls_code_prints_the_byte_exact_call_site_statement() {
     let (repo, store) = index_fixture("whocalls-code");
 
-    // `do_it` is called by `caller` in lib.rs. who-calls --code must
-    // include the caller's body (CALLER_BODY_MARKER), not just file:line.
+    // `do_it` is called by `caller` in lib.rs from one statement on line 7.
+    // who-calls --code must print the call-site address and exactly that
+    // statement, verbatim — not the caller's body (CALLER_BODY_MARKER).
     let (code, out, err) = run(&["who-calls", "do_it", "--code"], &repo, &store);
     assert_eq!(code, 0, "who-calls --code should exit 0; stderr={err}");
-    assert!(
-        out.contains("caller") && out.contains("src/lib.rs:"),
-        "who-calls --code must still print the caller's file:line; got: {out:?}"
+    assert_eq!(
+        out, "src/lib.rs:7  caller\n    helper::do_it();\n",
+        "who-calls --code must print the call-site address, then exactly the \
+         verbatim statement enclosing it (indentation kept, nothing else)"
     );
     assert!(
-        out.contains("CALLER_BODY_MARKER"),
-        "who-calls --code must include the caller's source body; got: {out:?}"
+        !out.contains("CALLER_BODY_MARKER"),
+        "who-calls --code must NOT print the caller's body; got: {out:?}"
     );
 }
 
