@@ -619,23 +619,6 @@ pub(crate) fn emit_search_code_results_with_format(
     Ok(())
 }
 
-pub(crate) fn print_semantic_vector_hit(
-    hit: &greppy_store::VectorSearchHit,
-    purposes: Option<&[SemanticVectorPurpose]>,
-) {
-    let loc = vector_hit_loc(hit);
-    if let Some(purpose) = vector_purpose_for_hit(purposes, hit) {
-        println!("{}", purpose.display_loc);
-        println!("    {}", purpose.signature);
-        for bullet in &purpose.bullets {
-            println!("        {bullet}");
-        }
-    } else {
-        println!("{loc}");
-    }
-    println!();
-}
-
 /// Render the resolved `context` definitions — shared by the exact-name
 /// fast path and the general resolution path so both emit identical
 /// JSON / span output. Returns exit 0 when at least one definition was

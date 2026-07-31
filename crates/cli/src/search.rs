@@ -167,25 +167,6 @@ pub(crate) fn semantic_embedding_indexing_json(
     Ok(())
 }
 
-/// Semantic queries are plain English, so the symbol-shape rules do not apply;
-/// only `-` is expanded.
-pub(crate) fn semantic_queries(raw: &[String]) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for value in raw {
-        if value == "-" {
-            out.extend(targets_from_stdin()?);
-            continue;
-        }
-        if value.trim().is_empty() {
-            return Err(Error::Invalid(
-                "empty query: semantic-search needs a plain-English description".into(),
-            ));
-        }
-        out.push(value.clone());
-    }
-    Ok(out)
-}
-
 fn search_all_nodes(store: &greppy_store::Store, project: &str) -> Result<Vec<greppy_store::Node>> {
     const PAGE: usize = 4096;
     let mut nodes = Vec::new();
@@ -276,6 +257,10 @@ fn search_print_symbol_rows(root_path: &std::path::Path, nodes: &[greppy_store::
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps search inputs explicit across the embedding fallback boundary"
+)]
 fn search_symbol_meaning_hits(
     store: &greppy_store::Store,
     project: &str,
@@ -322,6 +307,10 @@ fn search_symbol_meaning_hits(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the stable search-symbol CLI surface on the release branch"
+)]
 pub(crate) fn dispatch_search_symbols(
     query: Option<&str>,
     kind: Option<&str>,
@@ -866,6 +855,10 @@ fn print_search_pattern_rows(rows: &[SearchPatternRow], code: bool, all: bool) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the stable search-code CLI surface on the release branch"
+)]
 pub(crate) fn dispatch_search_code(
     query: Option<&str>,
     kind: Option<&str>,
@@ -955,285 +948,6 @@ pub(crate) fn dispatch_search_code(
     Ok(0)
 }
 
-pub(crate) fn dispatch_search_code_changed(
-    query: &str,
-    json: bool,
-    fixed: bool,
-    root: Option<&str>,
-    path_filters: &QueryPathFilters,
-) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let project = workspace_locator::project_identity(&root_path);
-    let mut changed_files = git_changed_files(&root_path)?;
-    changed_files.retain(|path| path_filters.matches(path));
-    let all_hits = live_grep_search_code_paths_pattern(query, &root_path, &changed_files, fixed)?;
-    let shown_hits = all_hits
-        .iter()
-        .take(cli_result_limit(SEARCH_CODE_LIMIT))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if json {
-        search_code_changed_json(
-            query,
-            &project,
-            changed_files.len(),
-            all_hits.len(),
-            &shown_hits,
-            path_filters,
-        )?;
-        return Ok(if all_hits.is_empty() { 1 } else { 0 });
-    }
-
-    if shown_hits.is_empty() {
-        print_search_code_no_matches(query, fixed, path_filters);
-        return Ok(0);
-    }
-    for h in &shown_hits {
-        println!("{}  {}", h.location, clamp_snippet(&h.snippet));
-    }
-    Ok(0)
-}
-
-pub(crate) fn search_code_changed_json(
-    query: &str,
-    project: &str,
-    changed_files_total: usize,
-    total_exact: usize,
-    hits: &[greppy_search::CodeHit],
-    path_filters: &QueryPathFilters,
-) -> Result<()> {
-    let shown = hits.len();
-    let omitted = total_exact.saturating_sub(shown);
-    let rows = hits
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "location": h.location,
-                "rank": h.rank,
-                "snippet": clamp_snippet(&h.snippet).as_ref(),
-            })
-        })
-        .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-pattern",
-            "status": if total_exact == 0 { "no_matches" } else { "ok" },
-            "query": query,
-            "project": project,
-            "scope": "changed",
-            "path_filters": path_filters.json_value(),
-            "backend": "live_grep",
-            "fresh": true,
-            "freshness": serde_json::Value::Null,
-            "changed_files_total": changed_files_total,
-            "total_exact": total_exact,
-            "shown": shown,
-            "omitted": omitted,
-            "truncated": omitted > 0,
-            "hits": rows,
-        }))
-        .map_err(|e| Error::Invalid(format!("serialize search-code changed JSON: {e}")))?
-    );
-    Ok(())
-}
-
-pub(crate) fn dispatch_search_code_staged(
-    query: &str,
-    json: bool,
-    fixed: bool,
-    root: Option<&str>,
-    path_filters: &QueryPathFilters,
-) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let project = workspace_locator::project_identity(&root_path);
-    let mut staged_files = git_staged_files(&root_path)?;
-    staged_files.retain(|path| path_filters.matches(path));
-    let all_hits = grep_staged_git_blobs_pattern(query, &root_path, &staged_files, fixed)?;
-    let shown_hits = all_hits
-        .iter()
-        .take(cli_result_limit(SEARCH_CODE_LIMIT))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if json {
-        search_code_staged_json(
-            query,
-            &project,
-            staged_files.len(),
-            all_hits.len(),
-            &shown_hits,
-        )?;
-        return Ok(if all_hits.is_empty() { 1 } else { 0 });
-    }
-
-    if shown_hits.is_empty() {
-        print_search_code_no_matches(query, fixed, path_filters);
-        return Ok(0);
-    }
-    for h in &shown_hits {
-        println!("{}  {}", h.location, clamp_snippet(&h.snippet));
-    }
-    Ok(0)
-}
-
-pub(crate) fn search_code_staged_json(
-    query: &str,
-    project: &str,
-    staged_files_total: usize,
-    total_exact: usize,
-    hits: &[greppy_search::CodeHit],
-) -> Result<()> {
-    let shown = hits.len();
-    let omitted = total_exact.saturating_sub(shown);
-    let rows = hits
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "location": h.location,
-                "rank": h.rank,
-                "snippet": clamp_snippet(&h.snippet).as_ref(),
-            })
-        })
-        .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-pattern",
-            "status": if total_exact == 0 { "no_matches" } else { "ok" },
-            "query": query,
-            "project": project,
-            "scope": "staged",
-            "backend": "git_blob_grep",
-            "fresh": true,
-            "freshness": serde_json::Value::Null,
-            "staged_files_total": staged_files_total,
-            "total_exact": total_exact,
-            "shown": shown,
-            "omitted": omitted,
-            "truncated": omitted > 0,
-            "hits": rows,
-        }))
-        .map_err(|e| Error::Invalid(format!("serialize search-code staged JSON: {e}")))?
-    );
-    Ok(())
-}
-
-pub(crate) fn dispatch_search_code_since(
-    query: &str,
-    rev: &str,
-    json: bool,
-    fixed: bool,
-    root: Option<&str>,
-    path_filters: &QueryPathFilters,
-) -> Result<i32> {
-    dispatch_search_code_diff_scope(
-        query,
-        DiffSearchScope::Since { rev },
-        json,
-        fixed,
-        root,
-        path_filters,
-    )
-}
-
-pub(crate) fn dispatch_search_code_base(
-    query: &str,
-    base: &str,
-    json: bool,
-    fixed: bool,
-    root: Option<&str>,
-    path_filters: &QueryPathFilters,
-) -> Result<i32> {
-    dispatch_search_code_diff_scope(
-        query,
-        DiffSearchScope::Base { base },
-        json,
-        fixed,
-        root,
-        path_filters,
-    )
-}
-
-pub(crate) fn dispatch_search_code_diff_scope(
-    query: &str,
-    scope: DiffSearchScope<'_>,
-    json: bool,
-    fixed: bool,
-    root: Option<&str>,
-    path_filters: &QueryPathFilters,
-) -> Result<i32> {
-    let root_path = resolve_root(root)?;
-    let project = workspace_locator::project_identity(&root_path);
-    let mut spec = git_diff_search_spec(&root_path, scope)?;
-    spec.files.retain(|path| path_filters.matches(path));
-    let all_hits = live_grep_search_code_paths_pattern(query, &root_path, &spec.files, fixed)?;
-    let shown_hits = all_hits
-        .iter()
-        .take(cli_result_limit(SEARCH_CODE_LIMIT))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if json {
-        search_code_diff_scope_json(query, &project, &spec, all_hits.len(), &shown_hits)?;
-        return Ok(if all_hits.is_empty() { 1 } else { 0 });
-    }
-
-    if shown_hits.is_empty() {
-        print_search_code_no_matches(query, fixed, path_filters);
-        return Ok(0);
-    }
-    for h in &shown_hits {
-        println!("{}  {}", h.location, clamp_snippet(&h.snippet));
-    }
-    Ok(0)
-}
-
-pub(crate) fn search_code_diff_scope_json(
-    query: &str,
-    project: &str,
-    spec: &DiffSearchSpec,
-    total_exact: usize,
-    hits: &[greppy_search::CodeHit],
-) -> Result<()> {
-    let shown = hits.len();
-    let omitted = total_exact.saturating_sub(shown);
-    let rows = hits
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "location": h.location,
-                "rank": h.rank,
-                "snippet": clamp_snippet(&h.snippet).as_ref(),
-            })
-        })
-        .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-pattern",
-            "status": if total_exact == 0 { "no_matches" } else { "ok" },
-            "query": query,
-            "project": project,
-            "scope": spec.scope,
-            "backend": "git_diff_live_grep",
-            "fresh": true,
-            "freshness": serde_json::Value::Null,
-            "diff_rev": &spec.diff_rev,
-            "merge_base": spec.merge_base.as_deref(),
-            "diff_files_total": spec.files.len(),
-            "total_exact": total_exact,
-            "shown": shown,
-            "omitted": omitted,
-            "truncated": omitted > 0,
-            "hits": rows,
-        }))
-        .map_err(|e| Error::Invalid(format!("serialize search-code diff JSON: {e}")))?
-    );
-    Ok(())
-}
-
 fn search_sentence(raw: &str) -> Option<String> {
     let sentence = raw.trim().trim_end_matches('.').trim();
     if sentence.is_empty() {
@@ -1311,6 +1025,10 @@ fn print_search_meaning_rows(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the stable semantic-search CLI surface on the release branch"
+)]
 pub(crate) fn dispatch_semantic(
     query: Option<&str>,
     paths: &[String],

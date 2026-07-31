@@ -554,11 +554,6 @@ pub(crate) fn edit_locate(
         _ => {
             let file = spec.file.as_deref().unwrap_or_default();
             let (rel, abs, content, ranges, regex, needle) = match kind {
-                SelectorKind::WholeFile => {
-                    let (rel, abs, content) = edit_read_file(root_path, file)?;
-                    let length = content.len();
-                    (rel, abs, content, vec![(0, length)], None, None)
-                }
                 SelectorKind::Lines => {
                     let (first, last) =
                         edit_parse_line_range(spec.lines.as_deref().unwrap_or_default())?;
@@ -2394,43 +2389,4 @@ pub(crate) fn edit_operation_line_span(
     let line_count = content.iter().filter(|byte| **byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
     (1, line_count.max(1))
-}
-
-pub(crate) fn edit_symbol_miss_candidates(
-    store: &greppy_store::Store,
-    project: &str,
-    symbol: &str,
-) -> Vec<greppy_edit::certificate::Candidate> {
-    let mut candidates = Vec::new();
-    for name in symbol_miss_suggestions(store, project, symbol) {
-        let Ok(ids) = resolve_symbol_nodes(store, Some(&name)) else {
-            continue;
-        };
-        for id in ids {
-            let Ok(Some(node)) = store.get_node(id) else {
-                continue;
-            };
-            if node.file_path.is_empty() || node.start_line < 1 {
-                continue;
-            }
-            let duplicate =
-                candidates
-                    .iter()
-                    .any(|candidate: &greppy_edit::certificate::Candidate| {
-                        candidate.qualified_name == node.qualified_name
-                            && candidate.path == node.file_path
-                    });
-            if !duplicate {
-                candidates.push(greppy_edit::certificate::Candidate {
-                    qualified_name: node.qualified_name,
-                    path: node.file_path,
-                    line: node.start_line as usize,
-                });
-            }
-            if candidates.len() == 5 {
-                return candidates;
-            }
-        }
-    }
-    candidates
 }

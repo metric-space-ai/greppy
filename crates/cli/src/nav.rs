@@ -272,6 +272,10 @@ fn where_inventory_metadata(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps evidence-pack metadata explicit at the insertion boundary"
+)]
 fn insert_where_inventory_pack(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -1050,6 +1054,10 @@ pub(crate) fn where_inventory_expand_payload(
     )))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the stable impact CLI surface on the release branch"
+)]
 pub(crate) fn dispatch_impact(
     symbol: Option<&str>,
     paths: &[String],
@@ -1896,7 +1904,7 @@ impl<'a> BriefRender<'a> {
             .get_node(target_id)
             .ok()
             .flatten()
-            .filter(|node| brief_is_function(node))
+            .filter(brief_is_function)
             .and_then(|node| impact_node_sentence(self.root, &node));
         self.hints.insert(target_id, hint.clone());
         hint
@@ -2973,7 +2981,7 @@ pub(crate) fn nav_refuse_ambiguous(
 /// the statement, and it says the repository does not know this name.
 pub(crate) fn nav_report_missing(store: &greppy_store::Store, project: &str, query: &str) {
     println!("no symbol `{query}`");
-    let normalise = |name: &str| name.to_ascii_lowercase().replace('_', "").replace('-', "");
+    let normalise = |name: &str| name.to_ascii_lowercase().replace(['_', '-'], "");
     let wanted = normalise(query);
     let mut near: Vec<(String, String, i64)> = Vec::new();
     for name in symbol_miss_suggestions(store, project, query) {

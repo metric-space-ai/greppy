@@ -623,14 +623,6 @@ fn parse_path_disambiguation_and_hyphen_values() {
     assert!(Cli::try_parse_from(["greppy", "read", "open", "--code"]).is_err());
     assert!(Cli::try_parse_from(["greppy", "read-file", "a/mod.py"]).is_ok());
 
-    // An already-qualified symbol is not double-qualified.
-    assert_eq!(
-        qualify_symbol_with_path(Some("a.py::open"), Some("b.py")),
-        None
-    );
-    // A non-file path (no extension) is not folded into an unresolvable query.
-    assert_eq!(qualify_symbol_with_path(Some("open"), Some("src")), None);
-
     // Selector and content values may begin with '-' (real diff/RST lines).
     assert!(Cli::try_parse_from([
         "greppy",
@@ -1591,33 +1583,6 @@ fn is_grep_passthrough_distinguishes_subcommands_from_grep_args() {
         ])),
         mk(&["-R", "foo", "."])
     );
-}
-
-#[cfg(feature = "agent")]
-#[test]
-fn agent_router_reserves_prompt_but_not_explicit_grep() {
-    let argv = ["greppy", "-p", "fix it"]
-        .into_iter()
-        .map(std::ffi::OsString::from)
-        .collect::<Vec<_>>();
-    assert!(is_agent_invocation(&argv));
-    assert!(!is_grep_passthrough(&argv));
-
-    let grep = ["greppy", "grep", "-p", "pattern"]
-        .into_iter()
-        .map(std::ffi::OsString::from)
-        .collect::<Vec<_>>();
-    assert!(!is_agent_invocation(&grep));
-    assert!(!is_grep_passthrough(&grep));
-}
-
-#[cfg(feature = "agent")]
-#[test]
-fn agent_arguments_accept_apply_result_without_provider_flags() {
-    let args =
-        AgentInvocation::try_parse_from(["greppy", "--apply-result", "deadbeef-00000000"]).unwrap();
-    assert_eq!(args.apply_result.as_deref(), Some("deadbeef-00000000"));
-    assert!(args.prompt.is_none());
 }
 
 // a non-UTF-8 first token can never be a subcommand

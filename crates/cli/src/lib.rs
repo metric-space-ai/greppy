@@ -119,334 +119,6 @@ fn output_write(arguments: std::fmt::Arguments<'_>, newline: bool) {
     }
 }
 
-#[cfg(feature = "agent")]
-#[derive(Debug, Parser)]
-#[command(
-    name = "greppy",
-    bin_name = "greppy",
-    disable_help_subcommand = true,
-    about = "Run Greppy's optional isolated headless coding agent."
-)]
-struct AgentInvocation {
-    /// Run a headless coding task against an isolated snapshot.
-    #[arg(short = 'p', long = "prompt", conflicts_with = "apply_result")]
-    prompt: Option<String>,
-    /// Apply a previously returned run artifact.
-    #[arg(long, value_name = "RUN_ID", conflicts_with = "prompt")]
-    apply_result: Option<String>,
-    #[arg(long)]
-    root: Option<String>,
-    #[arg(long, value_name = "URL")]
-    base_url: Option<String>,
-    #[arg(long, value_name = "MODEL")]
-    model: Option<String>,
-    #[arg(long, default_value = "OPENAI_API_KEY", value_name = "ENV_NAME")]
-    api_key_env: String,
-    #[arg(long)]
-    json: bool,
-    #[arg(long)]
-    apply: bool,
-    #[arg(long)]
-    keep_run: bool,
-    #[arg(long, default_value_t = 24)]
-    max_turns: usize,
-    #[arg(long)]
-    max_output_tokens: Option<u64>,
-    #[arg(long, default_value_t = 900)]
-    timeout_seconds: u64,
-}
-
-#[cfg(feature = "agent")]
-struct AgentInferenceHooks {
-    root: std::path::PathBuf,
-    cache_dir: std::path::PathBuf,
-    cfg: EmbeddingModelConfig,
-}
-
-#[cfg(feature = "agent")]
-struct DaemonCodeEmbeddingProvider {
-    cache_dir: std::path::PathBuf,
-    model_key: String,
-    cfg: EmbeddingModelConfig,
-}
-
-#[cfg(feature = "agent")]
-impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider {
-    fn model_id(&self) -> &str {
-        &self.cfg.model_id
-    }
-
-    fn prompt_version(&self) -> &str {
-        greppy_embed_native::PROMPT_VERSION
-    }
-
-    fn task_profile(&self) -> &str {
-        greppy_embed_native::CODE_RETRIEVAL_PROFILE
-    }
-
-    fn embed_code_document(
-        &mut self,
-        title: Option<&str>,
-        content: &str,
-    ) -> greppy_core::Result<Vec<f32>> {
-        self.embed_code_documents(&[(title, content)])
-            .and_then(|mut vectors| {
-                vectors
-                    .pop()
-                    .ok_or_else(|| Error::Store("document embedder returned no vector".into()))
-            })
-    }
-
-    fn embed_code_documents(
-        &mut self,
-        documents: &[(Option<&str>, &str)],
-    ) -> greppy_core::Result<Vec<Vec<f32>>> {
-        use sha2::{Digest, Sha256};
-        let cache = greppy_store::QueryEmbeddingCache::open(&self.cache_dir).ok();
-        let cache_model_key = format!("{}|document", self.model_key);
-        let keys = documents
-            .iter()
-            .map(|(title, content)| {
-                let mut hasher = Sha256::new();
-                hasher.update(title.unwrap_or_default().as_bytes());
-                hasher.update([0]);
-                hasher.update(content.as_bytes());
-                format!("{:x}", hasher.finalize())
-            })
-            .collect::<Vec<_>>();
-        let mut vectors = vec![None; documents.len()];
-        let mut missing_by_key = std::collections::BTreeMap::<String, Vec<usize>>::new();
-        for (index, key) in keys.iter().enumerate() {
-            if let Some(vector) = cache
-                .as_ref()
-                .and_then(|cache| cache.get(&cache_model_key, key).ok().flatten())
-            {
-                vectors[index] = Some(vector);
-            } else {
-                missing_by_key.entry(key.clone()).or_default().push(index);
-            }
-        }
-        if !missing_by_key.is_empty() {
-            let mut singleflight_locks = Vec::new();
-            let mut missing = Vec::new();
-            for (key, indexes) in &missing_by_key {
-                let lock = greppy_core::cache::acquire_named_lock(
-                    &format!("agent-embedding-{key}"),
-                    greppy_core::cache::LockMode::Exclusive,
-                    false,
-                )
-                .map_err(|error| Error::io("acquire embedding singleflight lock", error))?
-                .ok_or_else(|| Error::Store("blocking embedding lock returned no guard".into()))?;
-                if let Some(vector) = cache
-                    .as_ref()
-                    .and_then(|cache| cache.get(&cache_model_key, key).ok().flatten())
-                {
-                    for index in indexes {
-                        vectors[*index] = Some(vector.clone());
-                    }
-                } else {
-                    missing.push(indexes[0]);
-                    singleflight_locks.push(lock);
-                }
-            }
-            let missing_documents = missing
-                .iter()
-                .map(|index| documents[*index])
-                .collect::<Vec<_>>();
-            if !missing_documents.is_empty() {
-                #[cfg(any(unix, windows))]
-                let daemon = embed_daemon::embed_documents_via_daemon_result(
-                    &self.cfg,
-                    &self.model_key,
-                    &missing_documents,
-                );
-                #[cfg(not(any(unix, windows)))]
-                let daemon = embed_daemon::EmbedDocumentsDaemonResult::NoDaemon;
-                let embedded = match daemon {
-                    embed_daemon::EmbedDocumentsDaemonResult::Embedded(vectors) => vectors,
-                    embed_daemon::EmbedDocumentsDaemonResult::NoDaemon => {
-                        let model = load_embedding_model(&self.cfg, Some(self.cache_dir.clone()))?;
-                        model.embed_documents(&missing_documents).map_err(|error| {
-                            Error::Store(format!("document embedding fallback: {error}"))
-                        })?
-                    }
-                    embed_daemon::EmbedDocumentsDaemonResult::DaemonBusy => {
-                        return Err(Error::Store(
-                            "EmbeddingGemma daemon remained busy for document embeddings".into(),
-                        ));
-                    }
-                    embed_daemon::EmbedDocumentsDaemonResult::Failed => {
-                        return Err(Error::Store(
-                            "EmbeddingGemma daemon failed document embeddings".into(),
-                        ));
-                    }
-                };
-                if embedded.len() != missing.len() {
-                    return Err(Error::Store(format!(
-                        "document embedder returned {} vectors for {} inputs",
-                        embedded.len(),
-                        missing.len()
-                    )));
-                }
-                for (index, vector) in missing.into_iter().zip(embedded) {
-                    if let Some(cache) = &cache {
-                        let _ = cache.put(&cache_model_key, &keys[index], &vector);
-                    }
-                    for duplicate in &missing_by_key[&keys[index]] {
-                        vectors[*duplicate] = Some(vector.clone());
-                    }
-                }
-            }
-            drop(singleflight_locks);
-        }
-        vectors
-            .into_iter()
-            .enumerate()
-            .map(|(index, vector)| {
-                vector.ok_or_else(|| {
-                    Error::Store(format!("missing document embedding at index {index}"))
-                })
-            })
-            .collect()
-    }
-
-    fn max_input_tokens(&self) -> usize {
-        self.cfg.max_length.unwrap_or(2_048)
-    }
-}
-
-#[cfg(feature = "agent")]
-impl greppy_agent::EmbeddingHooks for AgentInferenceHooks {
-    fn refresh(
-        &self,
-        store_path: &std::path::Path,
-        source_root: &std::path::Path,
-        project: &str,
-        graph_generation: u64,
-    ) -> greppy_agent::Result<()> {
-        let mut store =
-            greppy_store::Store::open_with(store_path, greppy_store::OpenOptions::query_writer())
-                .map_err(|error| {
-                greppy_agent::Error::Workspace(format!("open task embedding store: {error}"))
-            })?;
-        let mut provider = DaemonCodeEmbeddingProvider {
-            cache_dir: self.cache_dir.clone(),
-            model_key: embedding_query_cache_key(&self.cfg),
-            cfg: self.cfg.clone(),
-        };
-        let report = greppy_indexer::index_code_embeddings_for_project(
-            &mut store,
-            source_root,
-            project,
-            &mut provider,
-            greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation),
-        )
-        .map_err(|error| {
-            greppy_agent::Error::Workspace(format!("refresh task embeddings: {error}"))
-        })?;
-        if report.is_complete() {
-            let key = embedding_complete_key(project);
-            store
-                .conn()
-                .execute(
-                    "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    rusqlite::params![key, format!("{}|{}", graph_generation, self.cfg.model_id)],
-                )
-                .map_err(|error| {
-                    greppy_agent::Error::Workspace(format!(
-                        "record task embedding completeness: {error}"
-                    ))
-                })?;
-        }
-        let _ = store
-            .conn()
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-        Ok(())
-    }
-}
-
-#[cfg(feature = "agent")]
-impl greppy_agent::NavigationHooks for AgentInferenceHooks {
-    fn semantic_search(
-        &self,
-        workspace: &greppy_agent::TaskWorkspace,
-        query: &str,
-        limit: usize,
-    ) -> greppy_agent::Result<serde_json::Value> {
-        workspace.ensure_index()?;
-        let store = greppy_store::Store::open_with(
-            workspace.graph_path(),
-            greppy_store::OpenOptions::read_only(),
-        )
-        .map_err(|error| greppy_agent::Error::Tool {
-            tool: "semantic_search".into(),
-            message: format!("open task graph: {error}"),
-        })?;
-        let generation = store
-            .list_workspace_states()
-            .map_err(|error| greppy_agent::Error::Tool {
-                tool: "semantic_search".into(),
-                message: error.to_string(),
-            })?
-            .into_iter()
-            .map(|state| state.graph_generation)
-            .max()
-            .unwrap_or(0);
-        let complete = store
-            .conn()
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = ?1",
-                [embedding_complete_key(workspace.project())],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            == Some(format!("{}|{}", generation, self.cfg.model_id));
-        if complete {
-            let root = self.root.to_string_lossy();
-            if let Ok(vector) = embed_query_cached(&self.cfg, Some(root.as_ref()), query) {
-                let scope = greppy_search::embeddinggemma_code_retrieval_scope(
-                    workspace.project(),
-                    &self.cfg.model_id,
-                    Some(generation),
-                    limit,
-                );
-                if let Ok(hits) = greppy_search::vector_search_exact(&store, &vector, &scope) {
-                    return Ok(serde_json::json!({
-                        "query": query,
-                        "backend": "embeddinggemma",
-                        "hits": hits.into_iter().map(|hit| serde_json::json!({
-                            "score": hit.score,
-                            "qualified_name": hit.embedding.qualified_name,
-                            "file": hit.embedding.file_path,
-                            "start_line": hit.embedding.start_line,
-                            "end_line": hit.embedding.end_line
-                        })).collect::<Vec<_>>()
-                    }));
-                }
-            }
-        }
-        let hits =
-            greppy_search::semantic_query(&store, query, None, Some(workspace.project()), limit)
-                .map_err(|error| greppy_agent::Error::Tool {
-                    tool: "semantic_search".into(),
-                    message: error.to_string(),
-                })?;
-        Ok(serde_json::json!({
-            "query": query,
-            "backend": "algorithmic",
-            "hits": hits.into_iter().map(|hit| serde_json::json!({
-                "score": hit.score,
-                "qualified_name": hit.node.qualified_name,
-                "kind": hit.node.label,
-                "file": hit.node.file_path,
-                "start_line": hit.node.start_line,
-                "end_line": hit.node.end_line
-            })).collect::<Vec<_>>()
-        }))
-    }
-}
-
 /// Exit code for subcommands that are recognised but not yet implemented
 /// in the current phase. EX_UNAVAILABLE (69) is the standard BSD sysexits
 /// value.
@@ -463,9 +135,6 @@ pub const EXIT_IO: u8 = 73;
 /// agents) can distinguish a transient lock contention from a real
 /// IO error. EX_TEMPFAIL (75) is the BSD sysexits value.
 pub const EXIT_TEMPFAIL: u8 = 75;
-
-/// Cap on test names listed per bucket in `changes` text output; the full
-/// lists remain in `--json`.
 
 const DEFAULT_EMBEDDINGGEMMA_MODEL_ID: &str = "google/embeddinggemma-300m";
 const ENV_DEVICE: &str = "GREPPY_DEVICE";
@@ -856,9 +525,7 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
         return None;
     }
-    if greppy_only_flag(&rest[1..]).is_none() {
-        return None;
-    }
+    greppy_only_flag(&rest[1..])?;
     Some(format!(
         "unrecognized command `{verb}`\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
          impact, brief, search, search-symbol, search-pattern, path, read, replace, patch)"
@@ -915,28 +582,6 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     }
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
-    #[cfg(feature = "agent")]
-    if is_agent_invocation(&argv) {
-        // Refuse a nested run BEFORE anything else — before argument validation,
-        // before the store, and long before a model call. The agent runs build
-        // and test commands through `/bin/sh -lc` with PATH passed through, so a
-        // task can reach this binary; without this the run could cascade, each
-        // level burning its own model budget. Keyed on the ENVIRONMENT, never on
-        // the command line, so `$(which greppy) -p`, aliases and wrappers are all
-        // caught. greppy_agent::run_agent holds the same line for library callers.
-        if let Err(error) = agent_refuse_nested_invocation() {
-            eprintln!("greppy: {error}");
-            return EXIT_USAGE;
-        }
-        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
-        return match dispatch_agent_invocation(argv) {
-            Ok(code) => code.clamp(0, 255) as u8,
-            Err(error) => {
-                eprintln!("greppy: {error}");
-                error_exit_code(&error)
-            }
-        };
-    }
     if let Some(message) = unknown_verb_refusal(&argv) {
         println!("{message}");
         return EXIT_USAGE;
@@ -1044,204 +689,6 @@ fn unabbreviated_invalid_argument(argv: &[std::ffi::OsString], first_line: &str)
         .skip(1)
         .map(|token| token.to_string_lossy().into_owned())
         .find(|token| token.starts_with(reported) && token != reported)
-}
-
-#[cfg(feature = "agent")]
-fn is_agent_invocation(argv: &[std::ffi::OsString]) -> bool {
-    if argv.get(1).is_some_and(|token| token == "grep") {
-        return false;
-    }
-    argv.iter().skip(1).any(|token| {
-        token == "-p"
-            || token == "--prompt"
-            || token == "--apply-result"
-            || token.to_string_lossy().starts_with("--prompt=")
-            || token.to_string_lossy().starts_with("--apply-result=")
-    })
-}
-
-#[cfg(feature = "agent")]
-fn dispatch_agent_invocation(argv: Vec<std::ffi::OsString>) -> Result<i32> {
-    let args = match AgentInvocation::try_parse_from(argv.iter()) {
-        Ok(args) => args,
-        Err(error)
-            if matches!(
-                error.kind(),
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-            ) =>
-        {
-            error
-                .print()
-                .map_err(|error| Error::io("print agent help", error))?;
-            return Ok(0);
-        }
-        Err(error) => {
-            return Err(Error::Invalid(
-                error
-                    .to_string()
-                    .lines()
-                    .next()
-                    .unwrap_or("invalid agent arguments")
-                    .to_string(),
-            ));
-        }
-    };
-    if let Some(run_id) = args.apply_result.as_deref() {
-        let root = args
-            .root
-            .as_deref()
-            .map(|root| resolve_root(Some(root)))
-            .transpose()?;
-        let report = greppy_agent::apply_result(run_id, root.as_deref())
-            .map_err(|error| Error::Store(format!("apply agent result: {error}")))?;
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report)
-                    .map_err(|error| Error::Invalid(format!("serialize apply report: {error}")))?
-            );
-        } else if report.applied {
-            println!(
-                "applied run {} ({} files)",
-                report.run_id,
-                report.changed_files.len()
-            );
-        } else {
-            println!(
-                "run {} was not applied; conflicts: {}",
-                report.run_id,
-                report.conflicts.join(", ")
-            );
-        }
-        return Ok(if report.applied {
-            0
-        } else {
-            EXIT_TEMPFAIL as i32
-        });
-    }
-
-    let prompt = args
-        .prompt
-        .filter(|prompt| !prompt.trim().is_empty())
-        .ok_or_else(|| {
-            Error::Invalid("`-p PROMPT` or `--apply-result RUN_ID` is required".into())
-        })?;
-    let root = resolve_root(args.root.as_deref())?;
-    let base_url = args
-        .base_url
-        .or_else(|| env_nonempty("GREPPY_AGENT_BASE_URL"))
-        .or_else(|| env_nonempty("OPENAI_BASE_URL"))
-        .unwrap_or_else(|| "https://api.openai.com/v1".into());
-    let model = args
-        .model
-        .or_else(|| env_nonempty("GREPPY_AGENT_MODEL"))
-        .or_else(|| env_nonempty("OPENAI_MODEL"))
-        .ok_or_else(|| {
-            Error::Invalid("`--model MODEL` or GREPPY_AGENT_MODEL/OPENAI_MODEL is required".into())
-        })?;
-    let api_key = std::env::var(&args.api_key_env)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::Invalid(format!(
-                "API key environment variable {} is not set or empty",
-                args.api_key_env
-            ))
-        })?;
-    drop(open_default_store(Some(root.to_string_lossy().as_ref()))?);
-    let base_graph = workspace_locator::store_path(&root);
-    let project = workspace_locator::project_identity(&root);
-
-    let embedding_cfg = embedding_config_optional(EmbeddingCliArgs {
-        device: None,
-        no_gpu: false,
-    })?;
-    let inference_hooks = embedding_cfg.map(|cfg| {
-        std::sync::Arc::new(AgentInferenceHooks {
-            root: root.clone(),
-            cache_dir: workspace_locator::store_dir(&root),
-            cfg,
-        })
-    });
-    let embedding_hooks = inference_hooks
-        .as_ref()
-        .map(|hooks| hooks.clone() as std::sync::Arc<dyn greppy_agent::EmbeddingHooks>);
-    let navigation_hooks = inference_hooks
-        .as_ref()
-        .map(|hooks| hooks.clone() as std::sync::Arc<dyn greppy_agent::NavigationHooks>);
-    let workspace = greppy_agent::TaskWorkspace::create(
-        &root,
-        &base_graph,
-        project,
-        args.keep_run,
-        embedding_hooks,
-    )
-    .map_err(|error| Error::Store(format!("create agent workspace: {error}")))?;
-    let cancellation_workspace = workspace.clone();
-    if let Err(error) = ctrlc::set_handler(move || cancellation_workspace.cancel()) {
-        let _ = workspace.discard_run();
-        return Err(Error::Store(format!(
-            "install agent cancellation handler: {error}"
-        )));
-    }
-
-    let mut config = greppy_agent::AgentConfig::with_defaults(
-        prompt,
-        greppy_agent::ResponsesConfig {
-            base_url,
-            model,
-            api_key,
-            max_output_tokens: args.max_output_tokens,
-            request_timeout: std::time::Duration::from_secs(args.timeout_seconds.clamp(1, 3600)),
-        },
-        workspace,
-    );
-    config.max_assistant_turns = args.max_turns.clamp(1, 200);
-    config.apply = args.apply;
-    config.navigation_hooks = navigation_hooks;
-    if !args.json {
-        config.event_sink = Some(std::sync::Arc::new(|event: &greppy_agent::AgentEvent| {
-            if let greppy_agent::AgentEvent::ToolCallStarted { name, .. } = event {
-                eprintln!("greppy -p: {name}");
-            }
-        }));
-    }
-    let result = greppy_agent::run_agent(config)
-        .map_err(|error| Error::Store(format!("agent run: {error}")))?;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| Error::Invalid(format!("serialize agent result: {error}")))?
-        );
-    } else {
-        println!("{}", result.message);
-        println!();
-        println!("Run: {}", result.run_id);
-        println!("Changes: {}", result.changeset.changes.len());
-        if let Some(path) = result.artifact.as_deref() {
-            println!("Artifact: {}", path.display());
-        }
-        if let Some(apply) = result.apply.as_ref() {
-            println!(
-                "Apply: {}",
-                if apply.applied {
-                    "applied"
-                } else {
-                    "conflicted"
-                }
-            );
-        }
-    }
-    Ok(if result.status == "cancelled" {
-        130
-    } else if result.status != "completed"
-        || result.apply.as_ref().is_some_and(|report| !report.applied)
-    {
-        EXIT_TEMPFAIL as i32
-    } else {
-        0
-    })
 }
 
 fn normalize_global_output_flags(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
@@ -1670,10 +1117,6 @@ fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
 /// * If it equals a recognised subcommand name → NOT a passthrough.
 /// * Otherwise (a flag like `-R`, a pattern, or nothing) → passthrough.
 fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
-    #[cfg(feature = "agent")]
-    if is_agent_invocation(argv) {
-        return false;
-    }
     let mut i = 1; // skip argv[0]
     while i < argv.len() {
         let tok = &argv[i];
@@ -2629,44 +2072,6 @@ fn indexed_path_matches_query(indexed_path: &str, query_path: &str) -> bool {
     }
 }
 
-fn accepted_symbol_spelling(query: &str) -> Option<&'static str> {
-    if let Some((path, _)) = split_path_qualified(query) {
-        return Some(if path.contains('/') || path.contains('\\') {
-            "path-qualified `path/file::Symbol` spelling"
-        } else {
-            "bare-file-qualified `file.ext::Symbol` spelling"
-        });
-    }
-    if query.contains('.') && split_qualified(query).is_some() {
-        return Some("dotted `Owner.method` spelling");
-    }
-    None
-}
-
-/// Fold an optional disambiguating file path into a `path::SYMBOL` query so the
-/// existing path-qualified resolver ([`resolve_symbol_nodes`]) narrows SYMBOL to
-/// that file. Opt-in: returns None (leave the query unchanged) unless a symbol
-/// and a file-like path are both present and the symbol is not already
-/// path-qualified. Agents type `brief open src/flask/testing.py` to break a tie;
-/// serving that is cheaper than punishing it with a parse error.
-fn qualify_symbol_with_path(symbol: Option<&str>, path: Option<&str>) -> Option<String> {
-    let s = symbol?;
-    let p = path?;
-    if p.is_empty() || split_path_qualified(s).is_some() {
-        return None;
-    }
-    // Require a file-like path (a basename carrying an extension) so
-    // split_path_qualified recognises the `path.ext::` boundary; otherwise the
-    // fold would only manufacture an unresolvable query. Owner-qualified
-    // symbols such as `Type::method` are still folded: only an already
-    // path-qualified symbol makes the explicit --path redundant.
-    let basename = p.rsplit(['/', '\\']).next().unwrap_or(p);
-    if !basename.contains('.') {
-        return None;
-    }
-    Some(format!("{p}::{s}"))
-}
-
 fn is_callable_node_label(label: &str) -> bool {
     matches!(label, "Function" | "Method" | "Constructor")
 }
@@ -2877,13 +2282,6 @@ struct ExpandEvidenceNode<'a> {
 }
 
 impl ExpandHandle {
-    fn text_line(&self) -> String {
-        format!(
-            "Expand: greppy expand {}  (prepared evidence: {})",
-            self.id, self.summary
-        )
-    }
-
     fn json_value(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
@@ -2891,13 +2289,6 @@ impl ExpandHandle {
             "kind": "evidence_pack",
             "summary": self.summary,
         })
-    }
-
-    fn semantic_text_line(&self) -> String {
-        format!(
-            "greppy expand {}  → source evidence for {}",
-            self.id, self.summary
-        )
     }
 }
 
@@ -4523,17 +3914,6 @@ fn dispatch_trace(
     Ok(0)
 }
 
-/// `greppy impact S` — the transitive blast radius of `S` in ONE call.
-///
-/// `--direction incoming` (default) walks every transitive CALLER of `S`
-/// (answers "if I change S, what breaks?"); `--direction outgoing` walks
-/// everything `S` transitively reaches. Each reached node is printed once,
-/// at its minimum hop distance, ordered by (hops, qualified_name), with a
-/// capped total + `… and N more` footer. This is the single-command answer
-/// that replaces the dozen iterative `who-calls`/`callees` an agent would
-/// otherwise run for a multi-hop question — the whole point of having a graph.
-#[allow(clippy::too_many_arguments)]
-
 /// Rows of callers/callees shown by `brief` before truncating — smaller than
 /// NAV_LIMIT because a briefing is a summary, not an exhaustive listing.
 const BRIEF_LIMIT: usize = 15;
@@ -4644,9 +4024,6 @@ fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (u
     (start, end)
 }
 
-const MINIMAL_CHANGE_SIGNATURE_EXAMPLE: &str =
-    include_str!("../../../docs/contracts/change-signature-spec.minimal.json");
-
 // ---------------------------------------------------------------------------
 // The new edit grammar: four operations over one WHERE selector.
 //
@@ -4752,7 +4129,6 @@ enum SelectorKind {
     Text,
     Pattern,
     Lines,
-    WholeFile,
     Symbol,
     Target,
 }
@@ -4773,7 +4149,6 @@ impl SelectorKind {
             SelectorKind::Text => "--old",
             SelectorKind::Pattern => "--pattern",
             SelectorKind::Lines => "--lines",
-            SelectorKind::WholeFile => "--file",
             SelectorKind::Symbol => "--symbol",
             SelectorKind::Target => "--target",
         }
@@ -4794,98 +4169,9 @@ struct Located {
     needle: Option<String>,
 }
 
-fn classify_selector(spec: &WhereSpec) -> EditResult<SelectorKind> {
-    let mut chosen: Vec<&'static str> = Vec::new();
-    if spec.old.is_some() {
-        chosen.push("--old");
-    }
-    if spec.old_file.is_some() {
-        chosen.push("--old-file");
-    }
-    if spec.pattern.is_some() {
-        chosen.push("--pattern");
-    }
-    if spec.lines.is_some() {
-        chosen.push("--lines");
-    }
-    if spec.symbol.is_some() {
-        chosen.push("--symbol");
-    }
-    if spec.target.is_some() {
-        chosen.push("--target");
-    }
-    if chosen.len() > 1 {
-        return Err(EditRefusal::new(
-            "selector_conflict",
-            format!(
-                "{} name different targets; WHERE is exactly one of them",
-                chosen.join(" and ")
-            ),
-            20,
-        )
-        .with("selectors", serde_json::json!(chosen)));
-    }
-    let kind = match chosen.first().copied() {
-        Some("--old") | Some("--old-file") => SelectorKind::Text,
-        Some("--pattern") => SelectorKind::Pattern,
-        Some("--lines") => SelectorKind::Lines,
-        Some("--symbol") => SelectorKind::Symbol,
-        Some("--target") => SelectorKind::Target,
-        _ => {
-            if spec.file.is_some() {
-                SelectorKind::WholeFile
-            } else {
-                return Err(EditRefusal::new(
-                    "selector_missing",
-                    "no WHERE: pass --file F with --old/--old-file/--pattern/--lines, \
-                     --file F alone, --symbol S, or --target H",
-                    20,
-                ));
-            }
-        }
-    };
-    match kind {
-        SelectorKind::Text | SelectorKind::Pattern | SelectorKind::Lines => {
-            if spec.file.is_none() {
-                return Err(EditRefusal::new(
-                    "selector_missing",
-                    format!("{} addresses a file; pass --file F with it", kind.name()),
-                    20,
-                ));
-            }
-        }
-        SelectorKind::Symbol | SelectorKind::Target => {
-            if spec.file.is_some() {
-                return Err(EditRefusal::new(
-                    "selector_conflict",
-                    format!(
-                        "--file and {} name different targets; WHERE is exactly one of them",
-                        kind.name()
-                    ),
-                    20,
-                ));
-            }
-        }
-        SelectorKind::WholeFile => {}
-    }
-    if spec.body && spec.symbol.is_none() {
-        return Err(EditRefusal::new(
-            "body_without_symbol",
-            "--body names the body of a definition; it needs --symbol S",
-            20,
-        ));
-    }
-    Ok(kind)
-}
-
 /// A resolved definition: its path relative to the root, its absolute path,
 /// the bytes of the file it lives in, and the byte range it occupies.
 type ResolvedSpan = (String, std::path::PathBuf, Vec<u8>, (usize, usize));
-
-/// An empty replacement is never an intention: it is a command substitution
-/// that produced nothing, a file that was created but never written, or a
-/// broken pipe. Writing it would delete working code and report success.
-const EMPTY_CONTENT_HINT: &str = "`delete` is the verb that removes a span";
 
 /// A rewritten file, and the byte ranges of it the edit wrote.
 type EditedContent = (Vec<u8>, Vec<(usize, usize)>);
@@ -4912,91 +4198,6 @@ const EDIT_JOURNAL_DEPTH: usize = 100;
 struct UndoBefore {
     rel: String,
     content: Option<Vec<u8>>,
-}
-
-impl UndoBefore {
-    fn read(root_path: &std::path::Path, rel: &str) -> Self {
-        Self {
-            rel: rel.to_string(),
-            content: std::fs::read(root_path.join(rel)).ok(),
-        }
-    }
-}
-
-/// Record a transaction whose files are already on disk. The verbs that go
-/// through a certificate publish before they report, so there is nothing left
-/// to interrupt by the time this runs.
-fn record_edit_undo(root_path: &std::path::Path, before: &[UndoBefore]) {
-    if let Some(id) = edit_journal_open(root_path, before) {
-        edit_journal_close(root_path, &id);
-    }
-}
-
-/// Pre-images for the files a plan names, captured before it runs.
-fn plan_undo_snapshot(root_path: &std::path::Path, plan_text: &str) -> Vec<UndoBefore> {
-    let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) else {
-        return Vec::new();
-    };
-    let mut out: Vec<UndoBefore> = Vec::new();
-    for operation in plan["operations"].as_array().unwrap_or(&Vec::new()) {
-        for key in ["file", "to"] {
-            let Some(file) = operation[key].as_str() else {
-                continue;
-            };
-            if out.iter().any(|item| item.rel == file) {
-                continue;
-            }
-            out.push(UndoBefore::read(root_path, file));
-        }
-    }
-    out
-}
-
-// --- whole-file verbs -------------------------------------------------------
-//
-// `write`, `move` and `remove` are the three questions that are about the file
-// rather than about a span inside it. `move` and `remove` are only worth having
-// because they do the language work `mv` and `rm` cannot: a rename that leaves
-// the importers behind produces a repository that does not build, and a delete
-// that leaves dangling imports turns one mistake into a broken build.
-
-/// How a language spells "the module this file is". Only the languages whose
-/// module identity greppy can state exactly are here; for anything else `move`
-/// moves the file and says it rewrote nothing, rather than guessing.
-enum ModuleIdentity {
-    /// `crate::a::helper`, plus the bare identifier its declaring file uses.
-    Rust { path: String, ident: String },
-    /// `pkg.helper`.
-    Python { path: String },
-}
-
-/// One file that names the moved module, and — when a new path was given — the
-/// text it has to carry afterwards.
-struct ModuleReference {
-    file: String,
-    rewritten: Option<String>,
-}
-
-// --- a plan of whole-file verbs ---------------------------------------------
-
-/// Whether a plan is written in the whole-file verbs. A plan that mixes them
-/// with the span verbs is not silently split: it is refused by the executor
-/// that owns it.
-fn plan_is_whole_file(plan_text: &str) -> Option<Vec<serde_json::Value>> {
-    let plan: serde_json::Value = serde_json::from_str(plan_text).ok()?;
-    let operations = plan["operations"].as_array()?.clone();
-    if operations.is_empty() {
-        return None;
-    }
-    operations
-        .iter()
-        .all(|operation| {
-            matches!(
-                operation["verb"].as_str(),
-                Some("write") | Some("move") | Some("remove")
-            )
-        })
-        .then_some(operations)
 }
 
 // --- reporting --------------------------------------------------------------
@@ -5081,233 +4282,6 @@ fn one_line_truncated(text: &str, max_chars: usize) -> String {
         compact.push('…');
     }
     compact
-}
-
-fn render_compact_edit_certificate(
-    certificate: &greppy_edit::Certificate,
-    root_path: &std::path::Path,
-) {
-    // The output states what is the case; it does not tell the caller what to do
-    // next. A hard-wired suggestion does not know the task, and the traces show it
-    // guesses wrong: one handed `search-symbols` a file path, a query that cannot
-    // match by construction. Printed nine times, followed twice.
-    if let Some(diagnosis) = certificate.compact_failure_diagnosis() {
-        println!("diagnosis: {}", one_line_truncated(&diagnosis, 500));
-        return;
-    }
-    if certificate.exit_code() != 0 {
-        println!(
-            "diagnosis: edit {} for {} operation(s)",
-            edit_status_name(certificate.status),
-            certificate.operations.len()
-        );
-        return;
-    }
-    let status = edit_status_name(certificate.status);
-    for operation in &certificate.operations {
-        let path = edit_operation_path(operation, root_path);
-        let (start, end) = edit_operation_line_span(operation, root_path);
-        // One bare line per operation (spec v8). The written-state echo that
-        // used to follow carried a measured justification (130/269 edits were
-        // re-read without it, on an older output regime); the frozen spec
-        // removes it on the CAS argument. The post-edit re-read rate is the
-        // first metric to check on the next bench — if it climbs, revisit
-        // here, with data.
-        if start == end {
-            println!("{status} {path}:{start}");
-        } else {
-            println!("{status} {path}:{start}-{end}");
-        }
-    }
-}
-
-/// Shared tail of every edit command: refresh the store after a published
-/// edit, preserve the full certificate, render compact stdout, map the exit code.
-/// Say what the operation was looking for. "expected 1 target(s), found 0"
-/// names the count but not the text, and the caller cannot tell a typo in the
-/// anchor from a file that moved on. The plan it submitted has the text, so it
-/// is put back on the postcondition that failed.
-fn annotate_plan_refusal(certificate: &mut greppy_edit::Certificate, plan_text: &str) {
-    let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) else {
-        return;
-    };
-    let operations = plan
-        .get("operations")
-        .or_else(|| plan.get("ops"))
-        .and_then(|value| value.as_array());
-    let Some(operations) = operations else { return };
-    for (index, report) in certificate.operations.iter_mut().enumerate() {
-        if report.postconditions_passed {
-            continue;
-        }
-        let declared = operations.get(index).filter(|operation| {
-            operation
-                .get("file")
-                .and_then(|file| file.as_str())
-                .is_none_or(|file| file.ends_with(&report.file) || report.file.ends_with(file))
-        });
-        let Some(declared) = declared else { continue };
-        let sought = ["old", "pattern", "symbol", "selector"]
-            .iter()
-            .find_map(|key| declared.get(*key).and_then(|value| value.as_str()));
-        let Some(sought) = sought else { continue };
-        for postcondition in &mut report.postconditions {
-            if postcondition.passed {
-                continue;
-            }
-            let detail = postcondition.detail.get_or_insert_with(String::new);
-            if !detail.contains(sought) {
-                detail.push_str(&format!("; looking for `{sought}`"));
-            }
-            break;
-        }
-    }
-}
-
-/// A handle for every span a certificate operation wrote. A plan writes several
-/// spans, so one handle is not enough: without one per operation a multi-file
-/// change forces a re-read of every file it touched. Only a published
-/// operation gets one — a handle addresses bytes that are on disk.
-fn certificate_operation_handles(
-    certificate: &greppy_edit::Certificate,
-    root_path: &std::path::Path,
-) -> Vec<Option<String>> {
-    certificate
-        .operations
-        .iter()
-        .map(|operation| {
-            if !certificate.published {
-                return None;
-            }
-            // `changed_byte_ranges` addresses the file as it WAS; the handle
-            // has to address it as it now IS, and the text that is now there is
-            // exactly `node_after`.
-            let (start, before_end) = *operation.changed_byte_ranges.first()?;
-            let end = operation
-                .node_after
-                .as_ref()
-                .map_or(before_end, |text| start + text.len());
-            let candidate = std::path::Path::new(&operation.file);
-            let abs = if candidate.is_absolute() {
-                candidate.to_path_buf()
-            } else {
-                root_path.join(candidate)
-            };
-            let content = std::fs::read(&abs).ok()?;
-            let rel = abs
-                .strip_prefix(root_path)
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| operation.file.clone());
-            greppy_edit::EditHandle::for_range(
-                root_path,
-                std::path::Path::new(&rel),
-                &content,
-                start,
-                end.min(content.len()),
-            )
-            .ok()
-            .map(|handle| handle.encode())
-        })
-        .collect()
-}
-
-/// Put the transaction every operation belongs to, and the handle for the span
-/// it wrote, on the operation itself. A single id printed above the list does
-/// not prove the operations share it.
-fn certificate_operation_extras(
-    value: &mut serde_json::Value,
-    transaction_id: &str,
-    handles: &[Option<String>],
-) {
-    let Some(operations) = value.get_mut("operations").and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    for (index, operation) in operations.iter_mut().enumerate() {
-        let Some(operation) = operation.as_object_mut() else {
-            continue;
-        };
-        operation.insert("transaction_id".into(), serde_json::json!(transaction_id));
-        if let Some(Some(handle)) = handles.get(index) {
-            operation.insert("handle".into(), serde_json::json!(handle));
-        }
-    }
-}
-
-/// The operation that actually refused. Once one operation of an all-or-nothing
-/// plan refuses, every operation is marked failed, so the first one is usually
-/// only a casualty; the caller needs the one that names a cause.
-fn certificate_refusal_message(certificate: &greppy_edit::Certificate) -> Option<String> {
-    let mut casualty = None;
-    for operation in &certificate.operations {
-        if operation.postconditions_passed {
-            continue;
-        }
-        let Some(detail) = operation
-            .postconditions
-            .iter()
-            .find(|postcondition| !postcondition.passed)
-            .and_then(|postcondition| postcondition.detail.as_deref())
-        else {
-            continue;
-        };
-        let line = format!("{}: {detail}", operation.file);
-        if detail.contains("another operation") {
-            casualty.get_or_insert(line);
-        } else {
-            return Some(line);
-        }
-    }
-    casualty
-}
-
-/// Resolve an edit target: either a `--target HANDLE` (verified against the
-/// live file) or a `--symbol` (resolved like `read`, against the live file).
-/// Returns the file path (workspace-relative), live content, and byte range —
-/// or a ready-made refusal certificate (not-found / ambiguous / stale).
-enum EditTarget {
-    Resolved {
-        rel_path: String,
-        range: (usize, usize),
-        planned_file_sha256: String,
-        planned_target_sha256: String,
-    },
-    Refusal(Box<greppy_edit::Certificate>),
-}
-
-/// The byte range of `impl NAME { … }` — the type's own methods, not a trait
-/// implementation. Used only when the definition `--symbol NAME` resolved to
-/// carries no body of its own, so nothing that already works changes.
-fn rust_inherent_impl_range(content: &[u8], name: &str) -> Option<(usize, usize)> {
-    let text = std::str::from_utf8(content).ok()?;
-    let mut cursor = 0usize;
-    while let Some(found) = text[cursor..].find("impl ") {
-        let at = cursor + found;
-        cursor = at + 5;
-        let rest = &text[cursor..];
-        let Some(brace) = rest.find('{') else { break };
-        let head = rest[..brace].trim();
-        // `impl Trait for Name` implements someone else's contract; the method
-        // an agent asks for belongs in the type's own block.
-        if head != name {
-            continue;
-        }
-        let open = cursor + brace;
-        let mut depth = 0usize;
-        for (offset, byte) in text[open..].bytes().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((at, open + offset + 1));
-                    }
-                }
-                _ => {}
-            }
-        }
-        return None;
-    }
-    None
 }
 
 struct BriefJsonContext<'a> {
@@ -6092,7 +5066,6 @@ fn node_source_and_handle(
 enum NavKind {
     WhoCalls,
     Callees,
-    Impact,
 }
 
 struct NavMultiRequest<'a> {
@@ -6104,9 +5077,6 @@ struct NavMultiRequest<'a> {
     all: bool,
     json: bool,
     root: Option<&'a str>,
-    direction: &'a str,
-    edge: Option<&'a str>,
-    depth: usize,
 }
 
 struct NavRow {
@@ -6139,16 +5109,12 @@ fn dispatch_nav(
             all,
             json,
             root,
-            direction: "incoming",
-            edge: None,
-            depth: 0,
         });
     }
     let symbol = targets.first().map(String::as_str);
     match kind {
         NavKind::WhoCalls => dispatch_who_calls(symbol, paths, code, all, json, root),
         NavKind::Callees => dispatch_callees(symbol, paths, code, all, json, root),
-        NavKind::Impact => Err(Error::Invalid("impact has its own dispatch arm".into())),
     }
 }
 
@@ -6203,26 +5169,13 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
     for (index, ids) in resolved.iter().enumerate() {
         ensure_unambiguous_target(&store, &req.targets[index], ids)?;
     }
-    let dir = match req.direction.to_ascii_lowercase().as_str() {
-        "incoming" | "in" | "callers" => greppy_search::ReachDirection::Incoming,
-        "outgoing" | "out" | "callees" => greppy_search::ReachDirection::Outgoing,
-        other => {
-            return Err(Error::Invalid(format!(
-                "impact --direction must be 'incoming' or 'outgoing', got '{other}'"
-            )));
-        }
-    };
-    let edge_upper = req.edge.map(|edge| edge.trim().to_ascii_uppercase());
-    let edge_spec = impact_edge_spec(dir, edge_upper.as_deref());
     let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
 
     let mut rows: Vec<NavRow> = Vec::new();
     let mut totals = vec![0usize; req.targets.len()];
     let mut tests: Vec<Vec<serde_json::Value>> = vec![Vec::new(); req.targets.len()];
     for (index, ids) in resolved.iter().enumerate() {
-        let mut collected = nav_rows_for_target(
-            &store, &project, ids, index, req.kind, dir, &edge_spec, req.depth,
-        )?;
+        let mut collected = nav_rows_for_target(&store, &project, ids, index, req.kind)?;
         collected.retain(|row| path_filters.matches(&row.node.file_path));
         totals[index] = collected.len();
         tests[index] = collected
@@ -6305,7 +5258,6 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
     let empty_word = match req.kind {
         NavKind::WhoCalls => "no callers",
         NavKind::Callees => "no callees",
-        NavKind::Impact => "no reach",
     };
     for (index, symbol) in req.targets.iter().enumerate() {
         if index > 0 {
@@ -6358,16 +5310,12 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
     Ok(0)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn nav_rows_for_target(
     store: &greppy_store::Store,
     project: &str,
     ids: &[i64],
     index: usize,
     kind: NavKind,
-    dir: greppy_search::ReachDirection,
-    edge_spec: &ImpactEdgeSpec<'_>,
-    depth: usize,
 ) -> Result<Vec<NavRow>> {
     let out = match kind {
         NavKind::WhoCalls => {
@@ -6414,47 +5362,6 @@ fn nav_rows_for_target(
                     hops: None,
                 })
                 .collect()
-        }
-        NavKind::Impact => {
-            let start_ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
-            let mut by_id: std::collections::HashMap<i64, greppy_search::ImpactNode> =
-                std::collections::HashMap::new();
-            for id in ids {
-                for reached in greppy_search::impact_radius_any_edge_type(
-                    store,
-                    *id,
-                    dir,
-                    &edge_spec.edge_types,
-                    depth,
-                    4096,
-                )? {
-                    if start_ids.contains(&reached.node.id) {
-                        continue;
-                    }
-                    by_id
-                        .entry(reached.node.id)
-                        .and_modify(|kept| {
-                            if reached.hops < kept.hops {
-                                kept.hops = reached.hops;
-                            }
-                        })
-                        .or_insert(reached);
-                }
-            }
-            let mut reached: Vec<greppy_search::ImpactNode> = by_id.into_values().collect();
-            reached.sort_by(|a, b| a.hops.cmp(&b.hops).then_with(|| a.node.id.cmp(&b.node.id)));
-            let mut out = Vec::new();
-            for step in reached {
-                if let Some(node) = store.get_node(step.node.id)? {
-                    out.push(NavRow {
-                        target: index,
-                        node,
-                        edge_type: None,
-                        hops: Some(step.hops),
-                    });
-                }
-            }
-            out
         }
     };
     Ok(out)
@@ -6815,18 +5722,6 @@ fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMat
     })
 }
 
-enum DiffSearchScope<'a> {
-    Since { rev: &'a str },
-    Base { base: &'a str },
-}
-
-struct DiffSearchSpec {
-    scope: &'static str,
-    diff_rev: String,
-    merge_base: Option<String>,
-    files: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 struct PlusHit {
     location: String,
@@ -6928,21 +5823,6 @@ fn live_grep_code_hits_pattern(
     live_grep_search_code_paths_pattern(query, root_path, &paths, fixed)
 }
 
-fn live_grep_code_hits_filtered_pattern(
-    query: &str,
-    root_path: &std::path::Path,
-    path_filters: &QueryPathFilters,
-    fixed: bool,
-) -> Result<Vec<greppy_search::CodeHit>> {
-    let mut hits = live_grep_code_hits_pattern(query, root_path, fixed)?;
-    hits.retain(|hit| {
-        hit.location
-            .rsplit_once(':')
-            .is_some_and(|(path, _)| path_filters.matches(path))
-    });
-    Ok(hits)
-}
-
 fn source_code_hits_ranked(
     store: &greppy_store::Store,
     project: &str,
@@ -6964,18 +5844,6 @@ fn source_code_hits_ranked(
             relevance: 1.0,
         })
         .collect())
-}
-
-fn parse_git_diff_new_range(hunk: &str) -> Option<(i64, i64)> {
-    let token = hunk
-        .split_whitespace()
-        .find(|part| part.starts_with('+') && part.len() > 1)?;
-    let range = &token[1..];
-    let (start, count) = match range.split_once(',') {
-        Some((start, count)) => (start.parse::<i64>().ok()?, count.parse::<i64>().ok()?),
-        None => (range.parse::<i64>().ok()?, 1),
-    };
-    Some((start, count))
 }
 
 fn live_grep_search_code_paths_pattern(
@@ -7094,14 +5962,6 @@ struct SemanticVectorPurpose {
     display_loc: String,
     signature: String,
     bullets: Vec<String>,
-}
-
-fn vector_hit_loc(hit: &greppy_store::VectorSearchHit) -> String {
-    line_span(
-        &hit.embedding.file_path,
-        hit.embedding.start_line,
-        hit.embedding.end_line,
-    )
 }
 
 fn dedupe_semantic_vector_hits(
@@ -9327,28 +8187,6 @@ fn error_exit_code(error: &Error) -> u8 {
         Error::Invalid(_) => EXIT_USAGE,
         _ => EXIT_IO,
     }
-}
-
-#[cfg(feature = "agent")]
-/// Environment-keyed refusal used at the CLI entry; mirrors the guard inside
-/// `greppy_agent::run_agent` so neither entry point can be bypassed.
-fn agent_refuse_nested_invocation() -> std::result::Result<(), String> {
-    let depth = std::env::var(greppy_agent::ENV_AGENT_DEPTH)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    let run_id = std::env::var(greppy_agent::ENV_AGENT_RUN_ID)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    if depth == 0 && run_id.is_none() {
-        return Ok(());
-    }
-    Err(format!(
-        "refusing to start a nested agent run: this process is already inside an agent run ({}={}, {}={depth}). Use greppy's navigation and edit commands directly instead of invoking the agent recursively.",
-        greppy_agent::ENV_AGENT_RUN_ID,
-        run_id.as_deref().unwrap_or("<unset>"),
-        greppy_agent::ENV_AGENT_DEPTH,
-    ))
 }
 
 #[cfg(test)]

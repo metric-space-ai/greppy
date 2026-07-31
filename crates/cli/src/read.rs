@@ -173,7 +173,7 @@ fn read_line_slice(content: &str, start_line: usize, end_line: usize) -> &str {
         return "";
     }
     let (start, end) = line_range_to_bytes(content.as_bytes(), start_line, end_line);
-    std::str::from_utf8(&content.as_bytes()[start..end]).unwrap_or("")
+    &content[start..end]
 }
 
 fn read_attribute_group_start(lines: &[&str], end: usize) -> Option<usize> {
@@ -860,6 +860,10 @@ fn read_insert_smart_pack(
 
 /// Parse once, count structural blocks from the supplied root, and replace each
 /// first block at `depth` with one mechanically identifiable gap line.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps source and structural ranges explicit during rendering"
+)]
 fn read_render_smart_source(
     store: &greppy_store::Store,
     project: &str,
@@ -903,7 +907,7 @@ fn read_render_smart_source(
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.start_position().row + 1 <= structural_end
+            if child.start_position().row < structural_end
                 && read_node_end_line(child.end_position().row, child.end_position().column)
                     >= structural_start
             {
@@ -1014,18 +1018,21 @@ pub(crate) fn dispatch_read_smart(
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
+    let path_filters = prepare_query_path_filters(root, "read-smart", "", paths)?;
     let mut failed = false;
     let mut printed = false;
     let mut previous_ended_with_newline = true;
     for query in symbols {
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
         let ids = resolve_symbol_nodes(&store, Some(query))?;
-        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+        let mut nodes = read_real_nodes(&store, &ids)?;
+        nodes.retain(|node| path_filters.matches(&node.file_path));
+        let filtered_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+        if nav_refuse_ambiguous(&store, query, &filtered_ids)?.is_some() {
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
-        let nodes = read_real_nodes(&store, &ids)?;
         let Some(node) = nodes.first().cloned() else {
             nav_report_missing(&store, &project, query);
             previous_ended_with_newline = true;
@@ -1180,6 +1187,10 @@ fn read_insert_file_pack(
         .map_err(Error::from)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps page metadata explicit at the rendering boundary"
+)]
 fn read_render_file_page(
     store: &greppy_store::Store,
     project: &str,
@@ -1332,6 +1343,10 @@ fn read_find_payload(content: &str, payload: &str) -> Vec<(usize, usize)> {
     matches
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps stored and live span identity explicit during relocation"
+)]
 fn read_locate_smart_pack(
     store: &greppy_store::Store,
     root_path: &std::path::Path,
