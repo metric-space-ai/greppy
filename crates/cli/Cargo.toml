@@ -49,6 +49,11 @@ windows-sys = { workspace = true, features = [
 # build choices are the accelerated backends; CPU is always available.
 [features]
 default = []
+# bash-smart is 0.4.0 work: the training-free v1 layers are built and tested,
+# but the classifier head that makes them "smart" is not. 0.3.0 must not ship a
+# command whose name promises more than the release delivers, so the verb is
+# compiled out by default and the suites run with --features bash-smart.
+bash-smart = []
 # Internal debug/CI fixture mode. It replaces the 827 MB payloads with four
 # SHA-verified sentinels so non-inference integration tests can start quickly.
 # Release builds reject this feature at compile time; product builds always use

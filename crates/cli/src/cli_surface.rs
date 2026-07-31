@@ -193,6 +193,7 @@ pub enum Command {
         json: bool,
     },
     /// Run a command untouched and fold long output behind an expand id.
+    #[cfg(feature = "bash-smart")]
     #[command(name = "bash-smart")]
     BashSmart {
         /// Command argv after `--`.
