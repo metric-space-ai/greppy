@@ -235,7 +235,7 @@ query($owner:String!,$name:String!,$number:Int!){
   number createdAt mergedAt merged mergeCommit{oid parents(first:2){nodes{oid}}}
   commits(first:100){nodes{commit{oid}}} files(first:100){nodes{path}}
   closingIssuesReferences(first:10){nodes{number title body url labels(first:20){nodes{name}}}}
- }} }
+ }}
 }"""
 
 
