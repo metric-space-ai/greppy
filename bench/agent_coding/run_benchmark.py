@@ -751,6 +751,114 @@ def classify_v2_patched_failure(
     }
 
 
+GREPPY_EDIT_VERBS = frozenset(
+    {
+        "replace",
+        "replace-text",
+        "replace-lines",
+        "replace-span",
+        "insert-lines",
+        "delete",
+        "delete-lines",
+        "patch",
+        "write",
+        "rename",
+        "undo",
+    }
+)
+GREPPY_FILE_EDIT_VERBS = frozenset(
+    {"replace-text", "replace-lines", "insert-lines", "delete-lines", "write"}
+)
+GREPPY_OPTIONS_WITH_VALUES = frozenset({"--expect", "--limit", "--offset", "--path", "--root"})
+
+
+def _shell_command_segments(command: str) -> list[list[str]]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments: list[list[str]] = []
+    segment: list[str] = []
+    for token in tokens:
+        if token and set(token) <= set(";&|"):
+            if segment:
+                segments.append(segment)
+                segment = []
+        else:
+            segment.append(token)
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _greppy_invocations(command: str) -> list[tuple[str, list[str]]]:
+    invocations: list[tuple[str, list[str]]] = []
+    for segment in _shell_command_segments(command):
+        index = 0
+        while index < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index]):
+            index += 1
+        if index < len(segment) and segment[index] == "command":
+            index += 1
+        if index < len(segment) and segment[index] == "env":
+            index += 1
+            while index < len(segment) and (
+                segment[index].startswith("-")
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index])
+            ):
+                index += 1
+        if index >= len(segment) or pathlib.PurePosixPath(segment[index]).name != "greppy":
+            continue
+        arguments = segment[index + 1 :]
+        verb_index = 0
+        while verb_index < len(arguments):
+            argument = arguments[verb_index]
+            if argument in GREPPY_OPTIONS_WITH_VALUES:
+                verb_index += 2
+                continue
+            if argument.startswith("--"):
+                verb_index += 1
+                continue
+            break
+        if verb_index < len(arguments) and (
+            arguments[verb_index] in GREPPY_EDIT_VERBS or arguments[verb_index] == "read-file"
+        ):
+            invocations.append((arguments[verb_index], arguments[verb_index + 1 :]))
+    return invocations
+
+
+def _first_positional(arguments: Sequence[str]) -> str | None:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in GREPPY_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if argument.startswith("--"):
+            index += 1
+            continue
+        return argument
+    return None
+
+
+def _normalized_source_path(value: str) -> str:
+    normalized = pathlib.PurePosixPath(value.replace("\\", "/")).as_posix()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _patch_paths(diff: str) -> set[str]:
+    paths: set[str] = set()
+    for line in diff.splitlines():
+        match = re.match(r"^(?:---|\+\+\+)\s+(?:[ab]/)?([^\t]+)", line)
+        if match and match.group(1) != "/dev/null":
+            paths.add(_normalized_source_path(match.group(1)))
+    return paths
+
+
 def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
@@ -790,14 +898,22 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
                     source_opens += 1
                     m = re.search(r"(?:cat|head|tail|sed\s+-n\s+\S+)\s+([\w./-]+)", command)
                     opened_file = m.group(1) if m else None
-                if re.search(r"greppy[^\n]*\bedit\b", command):
+                for verb, arguments in _greppy_invocations(command):
+                    if verb == "read-file":
+                        opened_file = _first_positional(arguments)
+                        continue
                     edit_calls += 1
-                    m = re.search(r"--file\s+([\w./-]+)", command)
-                    if m:
-                        edited_files.add(m.group(1))
-                    # symbol-adressierte edits: datei unbekannt bis zertifikat;
-                    # konservativ nicht zaehlen
-            if opened_file and opened_file in edited_files:
+                    if verb in GREPPY_FILE_EDIT_VERBS:
+                        touched = _first_positional(arguments)
+                        if touched:
+                            edited_files.add(_normalized_source_path(touched))
+                    elif verb == "patch":
+                        diff = _first_positional(arguments)
+                        if diff:
+                            edited_files.update(_patch_paths(diff))
+                    # Symbol, span, rename, and undo commands do not carry a
+                    # file positional in the shipped 0.3.0 grammar.
+            if opened_file and _normalized_source_path(opened_file) in edited_files:
                 post_edit_source_opens += 1
         if message.get("errorMessage"):
             error = str(message["errorMessage"])
@@ -821,6 +937,7 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         "turns": turns,
         "reported_error": bool(error),
         "edit_calls": edit_calls,
+        "edited_files": sorted(edited_files),
         "post_edit_source_opens": post_edit_source_opens,
         # provider error text, redacted upstream with the rest of stdout;
         # 10 consecutive identical failures on one task are invisible
@@ -1293,8 +1410,17 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     # edit-loop metrics over the edit arm's solved rows
     edit_calls_total = sum(row[1]["agent"].get("edit_calls", 0) for row in solved)
     post_edit_rereads = sum(row[1]["agent"].get("post_edit_source_opens", 0) for row in solved)
-    reread_rate = post_edit_rereads / edit_calls_total if edit_calls_total else 0.0
-    reread_pass = reread_rate <= POST_EDIT_REREADS_MAX
+    if edit_calls_total:
+        reread_rate: float | None = post_edit_rereads / edit_calls_total
+        reread_pass = reread_rate <= POST_EDIT_REREADS_MAX
+        reread_reason = None
+    else:
+        reread_rate = None
+        reread_pass = False
+        reread_reason = (
+            "greppy-edit arm produced zero observed greppy edits; "
+            "the post-edit re-read gate cannot pass without observation"
+        )
     # navigation arm (v3 semantics) stays visible as a reported check
     nav_solved = [(b, n) for b, n in nav_pairs if b["correctness"] and n["correctness"]]
     nav_cost_ratio = ratio(
@@ -1338,9 +1464,10 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         "edit_loop": {
             "edit_calls_total": edit_calls_total,
             "post_edit_source_opens": post_edit_rereads,
-            "post_edit_reread_rate": round(reread_rate, 4),
+            "post_edit_reread_rate": round(reread_rate, 4) if reread_rate is not None else None,
             "threshold": POST_EDIT_REREADS_MAX,
             "passes": reread_pass,
+            "reason": reread_reason,
         },
         "navigation_arm_v3_check": {
             "greppy_to_explorer_provider_cost": nav_cost_ratio,

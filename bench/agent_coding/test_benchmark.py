@@ -477,6 +477,31 @@ class GradingTests(unittest.TestCase):
         self.assertEqual(grade["token_ratios_on_solved_pairs"]["greppy_to_explorer_input_tokens"], 0.8)
         self.assertFalse(grade["token_ratios_on_solved_pairs"]["is_gate_metric"])
 
+    def test_edit_reread_gate_fails_without_observed_greppy_edits(self) -> None:
+        task_ids = [f"t{i}" for i in range(30)]
+        rows: list[dict[str, object]] = []
+        for task_id in task_ids:
+            explorer = result_row(
+                task_id, "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10
+            )
+            navigation = result_row(
+                task_id, "greppy", passed=True, tools=8, source_opens=4, inputs=800, wall=8
+            )
+            edit = result_row(
+                task_id, "greppy-edit", passed=True, tools=8, source_opens=4, inputs=800, wall=8
+            )
+            edit["agent"]["edit_calls"] = 0
+            rows.extend([explorer, navigation, edit])
+        grade = bench.grade_results(rows, task_ids)
+        self.assertFalse(grade["edit_loop"]["passes"])
+        self.assertIsNone(grade["edit_loop"]["post_edit_reread_rate"])
+        self.assertEqual(
+            grade["edit_loop"]["reason"],
+            "greppy-edit arm produced zero observed greppy edits; "
+            "the post-edit re-read gate cannot pass without observation",
+        )
+        self.assertFalse(grade["passed"])
+
     def test_gate_fails_when_greppy_costs_more_dollars(self) -> None:
         task_ids = [f"t{i}" for i in range(30)]
         rows: list[dict[str, object]] = []
@@ -689,6 +714,44 @@ class ContractTests(unittest.TestCase):
         task["setup_commands"] = [[]]
         with self.assertRaisesRegex(bench.HarnessError, "non-empty argv array"):
             bench.validate_task_document(document)
+
+    def test_greppy_edit_parser_uses_shipped_verbs_and_positional_file(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}],
+            "message": {
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {
+                            "command": "greppy replace-text src/a.rs 'OLD' 'NEW' --root ."
+                        },
+                    }
+                ]
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["edit_calls"], 1)
+        self.assertEqual(metrics["edited_files"], ["src/a.rs"])
+
+    def test_greppy_read_is_not_mistaken_for_an_edit(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}],
+            "message": {
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {"command": "greppy read replace-text --root ."},
+                    }
+                ]
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["edit_calls"], 0)
+        self.assertEqual(metrics["edited_files"], [])
 
     def test_secret_redaction_and_metric_parsing(self) -> None:
         secret = "sk-never-log-this"
