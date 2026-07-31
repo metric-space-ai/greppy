@@ -12,7 +12,7 @@ There is no model, so there is nothing to contaminate.
 Three strategies, the third being the C-original's own baseline:
 
   * greppy     — the bytes of the right greppy command's output
-                   (who-calls / callees / find-usages / semantic).
+                   (who-calls / callees / search).
   * grep         — the bytes of `grep -rn <symbol>` output (a careful,
                    line-numbered grep — the *tough* baseline).
   * file-reader  — grep for the symbol, then read every file that matched,
@@ -93,7 +93,7 @@ STRUCTURAL = [
     ("rust_medium", "who-calls", "compute_checksum"),
     ("rust_medium", "who-calls", "normalize_record"),
     ("rust_medium", "callees", "run_pipeline"),
-    ("rust_medium", "find-usages", "Record"),
+    ("rust_medium", "who-calls", "Record"),
     ("python_large", "who-calls", "validate_currency"),
     ("python_large", "callees", "run_pipeline"),
     ("ts_large", "who-calls", "normalizeRecord"),

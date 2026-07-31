@@ -8,7 +8,7 @@ Two guarantees are checked mechanically against the live greppy graph:
 
   2. GROUND-TRUTH ANSWERABILITY -- for every task in ``tasks.json`` the
      ``check`` descriptor is run against greppy (who-calls / callees /
-     find-usages / path / search-code / search-symbols) and the expected
+     path / search-pattern / search-symbol) and the expected
      symbols / files / counts must be present. A task that does not resolve is
      a FAIL, so a clean run proves the bank is 100% answerable.
 
@@ -71,8 +71,10 @@ def check_task(root, chk):
     expected members / file / count are present."""
     kind = chk["kind"]
     if kind in ("who_calls", "callees", "find_usages"):
+        # 0.3.0 folded find-usages into who-calls: it walks CALLS+USAGE, so
+        # "every reference" is exactly what who-calls now answers.
         sub = {"who_calls": "who-calls", "callees": "callees",
-               "find_usages": "find-usages"}[kind]
+               "find_usages": "who-calls"}[kind]
         data, raw = gp_json(root, sub, chk["symbol"])
         if data is None:
             return False, raw
@@ -104,7 +106,7 @@ def check_task(root, chk):
             f"(reason={data.get('reason')}, raw={raw.strip()[:80]})"
         )
     if kind in ("search_code", "search_symbols"):
-        sub = "search-code" if kind == "search_code" else "search-symbols"
+        sub = "search-pattern" if kind == "search_code" else "search-symbol"
         data, raw = gp_json(root, sub, chk["query"])
         if data is None:
             return False, raw

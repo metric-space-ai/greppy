@@ -218,7 +218,7 @@ def plus_sys(root: str) -> str:
         f"symbols, and lines faster than plain grep.\n"
         f"- After `plus` finds candidate code, read or inspect only the relevant "
         f"span/file you need. You must still interpret the code yourself.\n"
-        f"- For exact graph facts, use who-calls/callees/find-usages/path/impact "
+        f"- For exact graph facts, use who-calls/callees/path/impact "
         f"when you know the symbol. The 'N more … of T total' footer contains "
         f"exact counts; do not pass --all unless every row is truly required.\n"
         f"- Use context/brief only when reading the definition/body is needed; "
