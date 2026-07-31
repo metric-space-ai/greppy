@@ -2643,6 +2643,9 @@ const CODE_SPAN_CAP: usize = 25;
 /// `NAV_LIMIT` rows (deterministically ordered) and a `… and N more`
 /// footer; `--all` lifts the cap when the agent genuinely wants every site.
 const NAV_LIMIT: usize = 40;
+/// Rows of the impact tree before the count takes over: one screen, the same
+/// law every other command obeys.
+const IMPACT_TREE_LIMIT: usize = 40;
 
 /// Tighter row cap used when `--code` is set on a navigation command.
 /// Forensics finding F1b (token-bomb replay of `callees X --code`): with

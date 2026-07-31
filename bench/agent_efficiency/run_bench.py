@@ -44,6 +44,7 @@ import pathlib
 import re
 import statistics
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -169,10 +170,9 @@ def gp_sys(root: str) -> str:
     preamble carries only what the file cannot know: the binary path, the
     repository root, and the --root requirement.
     """
-    g = f"{BIN}"
     return (
-        f"Answer the question about the code at {root} using the greppy "
-        f"CLI at {g}; pass `--root {root}` on every call. Its manual:\n\n"
+        f"Answer the question about the code at {root} using the `greppy` "
+        f"command; pass `--root {root}` on every call. Its manual:\n\n"
         + AGENTS_MD
         + "\nBe efficient, inspect enough returned evidence to answer "
         "correctly, and end with the final answer."
@@ -239,6 +239,30 @@ def plus_sys(root: str) -> str:
 RATE_LIMIT_BACKOFFS_S = (45, 90, 180)
 
 
+def _greppy_on_path_env() -> dict:
+    """The agent must be able to spell `greppy` the way the manual does.
+
+    AGENTS.md — which IS the greppy arm's prompt — writes `greppy who-calls S`.
+    In deployment greppy is on PATH; in the bench it was only a long absolute
+    path, so the agent burned calls on `greppy: command not found` before
+    falling back. That is harness friction charged to the product. A symlink
+    in a run-local bin dir, prepended to PATH, makes the bench match
+    deployment. Only the greppy arm gets it (the baselines have no greppy).
+    """
+    bindir = pathlib.Path(tempfile.gettempdir()) / "greppy-bench-bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    link = bindir / "greppy"
+    target = pathlib.Path(BIN).resolve()
+    if link.is_symlink() or link.exists():
+        if link.resolve() != target:
+            link.unlink()
+    if not link.exists():
+        link.symlink_to(target)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+
 def run_pi(
     system: str,
     question: str,
@@ -274,7 +298,7 @@ def run_pi(
         t0 = time.time()
         try:
             p = subprocess.run(
-                cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                cmd, cwd=cwd, stdin=subprocess.DEVNULL, env=_greppy_on_path_env(),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
             )
             out = p.stdout.decode("utf-8", "replace")

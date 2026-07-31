@@ -1368,6 +1368,11 @@ pub(crate) fn dispatch_impact(
         .copied()
         .collect();
     let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    // The size law binds impact too: a reachable set of hundreds is an answer
+    // that must arrive as a screen plus a true count, never as one 812-line
+    // drop. `--all` is the flag that says "yes, really all of it".
+    let mut budget = if all { usize::MAX } else { IMPACT_TREE_LIMIT };
+    let mut omitted = 0usize;
     print_impact_tree(
         &repo_root,
         &children,
@@ -1376,7 +1381,12 @@ pub(crate) fn dispatch_impact(
         &mut sources,
         &mut std::collections::HashSet::new(),
         0,
+        &mut budget,
+        &mut omitted,
     );
+    if omitted > 0 {
+        println!("… {omitted} more reached — greppy impact {query_symbol} --all");
+    }
     Ok(0)
 }
 
@@ -1393,6 +1403,8 @@ pub(crate) fn print_impact_tree(
     sources: &mut std::collections::HashMap<String, Option<Vec<String>>>,
     printed: &mut std::collections::HashSet<i64>,
     depth: usize,
+    budget: &mut usize,
+    omitted: &mut usize,
 ) {
     let mut ids: Vec<i64> = ids.to_vec();
     ids.sort_by_key(|id| {
@@ -1405,6 +1417,11 @@ pub(crate) fn print_impact_tree(
         let Some(node) = nodes.get(&id) else {
             continue;
         };
+        if *budget == 0 {
+            *omitted += 1;
+            continue;
+        }
+        *budget -= 1;
         let indent = "  ".repeat(depth);
         let name = nav_short_name(node);
         let address = format!("{}:{}", node.file_path, node.start_line.max(1));
@@ -1434,6 +1451,8 @@ pub(crate) fn print_impact_tree(
                 sources,
                 printed,
                 depth + 1,
+                budget,
+                omitted,
             );
         }
     }
