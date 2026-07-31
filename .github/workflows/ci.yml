@@ -80,6 +80,20 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y sqlite3
 
+      # The platform GPU backend is not opt-in, so every Linux build compiles the
+      # vendored ggml-cuda kernels and needs nvcc. release.yml already installs
+      # this exact pinned toolkit for the same reason; CI was never brought in
+      # line and has been red on every 0.3.0 branch since the backend became
+      # mandatory. No GPU is needed at build time — only the compiler.
+      - name: Install CUDA toolkit (Ubuntu)
+        if: runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d
+        with:
+          cuda: '12.5.0'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+
       - name: Show toolchain
         run: |
           rustc --version
@@ -213,8 +227,21 @@ jobs:
         with:
           toolchain: '1.95.0'
 
+      - name: Install CUDA toolkit (Ubuntu)
+        if: runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d
+        with:
+          cuda: '12.5.0'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+
+      # Windows CUDA is deliberately outside the release gate (release.yml ships
+      # a CPU Windows binary), so this is the one target that builds without a
+      # GPU backend — and it must say so out loud rather than drift into a
+      # silent CPU build.
       - name: Build default product binary with real assets
-        run: cargo build -p greppy --bin greppy
+        run: cargo build -p greppy --bin greppy ${{ runner.os == 'Windows' && '--features cpu-only' || '' }}
 
       - name: Real CPU embedding inference gates
         run: |
@@ -256,11 +283,13 @@ jobs:
           key: windows-cpu-fast-assets-v1-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: windows-cpu-fast-assets-v1-
 
+      # This job's name is its contract: Windows ships a CPU binary, so the
+      # backend assertion is waived explicitly here and nowhere else.
       - name: Build Windows CPU test binary
-        run: cargo build --workspace --features greppy/ci-test-assets
+        run: cargo build --workspace --features greppy/ci-test-assets,greppy/cpu-only
 
       - name: Test Windows locks and daemon transport
-        run: cargo test -p greppy-core -p greppy-embed-native -p greppy --lib --features greppy/ci-test-assets -- --test-threads=1
+        run: cargo test -p greppy-core -p greppy-embed-native -p greppy --lib --features greppy/ci-test-assets,greppy/cpu-only -- --test-threads=1
 
       - name: Verify doctor registry
         shell: pwsh

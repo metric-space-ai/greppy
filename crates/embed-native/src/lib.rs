@@ -53,9 +53,19 @@ pub use cuda::model::{CudaEmbeddingModel, CudaForwardProfile};
 /// exactly the work greppy does on every query, and nothing fails when it is
 /// missing — it just gets slow, which is why it has to be caught by the
 /// compiler rather than noticed later.
+/// CUDA additionally requires that the kernels were actually compiled: the
+/// `cuda` feature is enabled unconditionally on Linux/Windows by a target
+/// dependency, so the feature alone says only that a backend was *wanted*.
+/// `embed_native_has_cuda_dylib` is set by the build script when nvcc produced
+/// the dylib, which is what makes a missing toolchain surface as the honest
+/// "no GPU backend for this target" error instead of a silent CPU build.
 pub const HAS_GPU_BACKEND: bool = cfg!(any(
     all(feature = "metal", target_os = "macos"),
-    all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
+    all(
+        feature = "cuda",
+        embed_native_has_cuda_dylib,
+        any(target_os = "linux", target_os = "windows")
+    )
 ));
 
 /// Embedding dimension produced by EmbeddingGemma after the two

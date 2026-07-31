@@ -58,8 +58,21 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed={}", ggml_include.display());
 
     let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".into());
-    let nvcc_path = resolve_executable(&nvcc)
-        .unwrap_or_else(|| PathBuf::from(&nvcc))
+    // A missing nvcc is a *configuration*, not a build error: this target simply
+    // has no CUDA backend. Say so and emit no dylib cfg, so `HAS_GPU_BACKEND`
+    // turns false and the consumer's own compile-time assertion fires with the
+    // sentence that names the way out (`--features cpu-only`). Panicking here
+    // instead made that escape hatch unreachable on exactly the platforms that
+    // need it — Cargo target dependencies enable `cuda` unconditionally on
+    // Linux/Windows, so `cpu-only` could never prevent this build script from
+    // running. An nvcc that exists and *fails* is still a hard error below.
+    let Some(resolved) = resolve_executable(&nvcc) else {
+        println!(
+            "cargo:warning=greppy-embed-native: no CUDA backend — `{nvcc}` not found on PATH"
+        );
+        return;
+    };
+    let nvcc_path = resolved
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&nvcc));
     let arch_list = cuda_arch_list();

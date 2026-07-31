@@ -1,6 +1,12 @@
 //! End-to-end coverage for the training-free bash-smart delivery contract.
+//!
+//! bash-smart is compiled out of the shipped 0.3.0 surface, so these tests only
+//! run when the feature that provides the verb is enabled. Without the gate
+//! they invoke a verb the binary does not have, the call falls through to real
+//! grep, and every assertion fails — which is what turned CI red on the release
+//! candidate rather than reporting an absent feature.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "bash-smart"))]
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
