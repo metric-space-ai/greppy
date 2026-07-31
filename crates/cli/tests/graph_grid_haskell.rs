@@ -158,13 +158,13 @@ fn graph_grid_haskell_who_calls_finds_cross_file_caller() {
         "who-calls must print the caller's file:line (src/Main.hs); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callers)"),
+        !out.contains("no callers"),
         "who-calls must find at least one caller; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 2 — who-calls: an uncalled symbol reports "(no callers)".
+// 2 — who-calls: an uncalled symbol reports "no callers".
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -173,8 +173,8 @@ fn graph_grid_haskell_who_calls_empty_for_uncalled() {
     // `render` is defined in Main.hs but never called from anywhere.
     let (code, out, _err) = run(&["who-calls", "render"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
+    assert_eq!(
+        out, "no callers\n",
         "render is uncalled, who-calls must report no callers; got: {out:?}"
     );
 }
@@ -206,39 +206,35 @@ fn graph_grid_haskell_impact_transitive_reaches_caller() {
     // single-command answer to "what breaks if I change doIt?".
     let (code, out, err) = run(&["impact", "doIt"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}\nstdout={out}");
-    assert!(
-        out.contains("caller"),
-        "impact doIt must reach `caller` at hop 1; got: {out:?}"
-    );
-    assert!(
-        out.contains("hop 1"),
-        "impact must report hop distance for direct callers; got: {out:?}"
+    assert_eq!(
+        out, "src/Main.hs:7  caller\n",
+        "impact doIt must render its direct caller as a plain row"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 7 — search-symbols: finds the definition of a symbol across the repo.
+// 7 — search-symbol: finds the definition of a symbol across the repo.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_haskell_search_symbols_finds_all_definitions() {
-    let (repo, store) = index_fixture("search-symbols");
-    let (code, out, err) = run(&["search-symbols", "doIt"], &repo, &store);
+fn graph_grid_haskell_search_symbol_finds_all_definitions() {
+    let (repo, store) = index_fixture("search-symbol");
+    let (code, out, err) = run(&["search-symbol", "doIt"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
         out.contains("doIt"),
-        "search-symbols doIt must find the doIt symbol; got: {out:?}"
+        "search-symbol doIt must find the doIt symbol; got: {out:?}"
     );
     assert!(
         out.contains("src/Helper.hs:"),
-        "search-symbols must print the symbol's file:line (src/Helper.hs); got: {out:?}"
+        "search-symbol must print the symbol's file:line (src/Helper.hs); got: {out:?}"
     );
     assert!(
-        out.contains("Function"),
-        "search-symbols must print the node label (Function for Haskell top-level defs); got: {out:?}"
+        out.contains("  function"),
+        "search-symbol must print the lowercase kind word for Haskell definitions; got: {out:?}"
     );
 }
 
@@ -275,17 +271,9 @@ fn graph_grid_haskell_path_connects_caller_to_helper() {
         code, 0,
         "path caller->doIt should exist and exit 0; stderr={err}\nstdout={out}"
     );
-    let caller_idx = out
-        .find("caller")
-        .expect("path must include start `caller`");
-    let callee_idx = out.find("doIt").expect("path must include goal `doIt`");
-    assert!(
-        caller_idx < callee_idx,
-        "path steps must be ordered caller -> doIt; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/Main.hs:") && out.contains("src/Helper.hs:"),
-        "path steps must carry file:line for both endpoints; got: {out:?}"
+    assert_eq!(
+        out, "src/Main.hs:7  caller\n  src/Main.hs:7  doIt\n",
+        "path must print the Haskell call site, not the callee definition"
     );
 }
 
@@ -378,7 +366,7 @@ marker _ = HELPER_VALUE
 // `newtype`-Deklarationen (`HASKELL_TYPE_KINDS = ["class", "data_type",
 // "newtype"]`) BEREITS zu "Class"-Knoten — die HASKELL-spezifische
 // Entscheidung ist, dass `data Widget = Widget Int` als Class (nicht Type
-// / Struct) im Graphen erscheint. search-symbols muss das Label "Class"
+// / Struct) im Graphen erscheint. search-symbol muss das Label "Class"
 // und den Dateipfad `src/Types.hs` liefern, sonst fehlt die Klassifikation,
 // die der Resolver für die nachfolgende USAGE-Auflösung (Zelle 5) benötigt.
 // ---------------------------------------------------------------------------
@@ -388,16 +376,16 @@ fn graph_grid_haskell_declarative_data_labelled_as_class() {
     let (repo, store) = index_fixture("data-as-class");
     // `data Widget = ...` is a Haskell algebraic data type. The bespoke
     // haskell extractor (`extract_haskell`) emits it as a "Class" node
-    // (Haskell has no Enum / Interface / Struct / Type label); search-symbols
+    // (Haskell has no Enum / Interface / Struct / Type label); search-symbol
     // must surface it as such.
-    let (code, out, err) = run(&["search-symbols", "Widget", "--json"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "Widget", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols Widget should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol Widget should exit 0; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid search-symbols json: {e}; stdout={out:?}"));
-    let hits = v["hits"].as_array().expect("search-symbols hits array");
+        .unwrap_or_else(|e| panic!("invalid search-symbol json: {e}; stdout={out:?}"));
+    let hits = v["hits"].as_array().expect("search-symbol hits array");
     assert!(
         hits.iter().any(|hit| {
             hit["label"] == "Class"

@@ -295,14 +295,20 @@ fn who_calls_covers_calls_and_usages_without_naming_the_edge() {
     // kind is how the graph stores them, not something the agent acts on, so it
     // is not printed -- the answer is the address and the symbol.
     let (code, out, err) = run(&["who-calls", "do_it"], &repo, &store);
-    assert_eq!(code, 0, "who-calls should exit 0; stderr={err}\nstdout={out}");
+    assert_eq!(
+        code, 0,
+        "who-calls should exit 0; stderr={err}\nstdout={out}"
+    );
     assert!(
         out.contains("caller") && !out.contains("CALLS"),
         "the caller is named, the edge kind is not; got: {out:?}"
     );
 
     let (code, out, err) = run(&["who-calls", "Widget"], &repo, &store);
-    assert_eq!(code, 0, "who-calls should exit 0; stderr={err}\nstdout={out}");
+    assert_eq!(
+        code, 0,
+        "who-calls should exit 0; stderr={err}\nstdout={out}"
+    );
     assert!(
         out.contains("render") && !out.contains("USAGE"),
         "a struct's referrers are listed the same way as callers; got: {out:?}"
@@ -571,8 +577,12 @@ fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
         let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
-        let (code, out, err) =
-            run_with_env(&args, &repo, &store, &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")]);
+        let (code, out, err) = run_with_env(
+            &args,
+            &repo,
+            &store,
+            &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
+        );
         assert_eq!(
             code, 75,
             "refreshing {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
@@ -808,11 +818,7 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     )
     .unwrap();
 
-    let (code, out, err) = run(
-        &["search-symbol", "WidgetRenamed", "--json"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["search-symbol", "WidgetRenamed", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "search-symbol must heal one-file drift in-band; stderr={err}\nstdout={out}"
@@ -823,11 +829,13 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     assert_eq!(v["status"], "ok");
     assert_eq!(v["fresh"], true);
     assert!(
-        v["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
-            hit["qualified_name"]
-                .as_str()
-                .is_some_and(|name| name.contains("WidgetRenamed"))
-        })),
+        v["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().any(|hit| {
+                hit["qualified_name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("WidgetRenamed"))
+            })),
         "healed symbol search must contain the edited definition: {v:?}"
     );
 
@@ -1275,7 +1283,10 @@ fn impact_incoming_reports_transitive_callers_in_one_call() {
     // command, one screen plus a TRUE count of what is missing; `--all` is
     // the flag that delivers the rest.
     let rows = out.lines().filter(|l| l.contains("caller_")).count();
-    assert_eq!(rows, 40, "impact shows one screen of the 60 callers; got {rows}\n{out}");
+    assert_eq!(
+        rows, 40,
+        "impact shows one screen of the 60 callers; got {rows}\n{out}"
+    );
     assert!(
         out.contains("… 20 more reached — greppy impact hub --all"),
         "the tail is one true count with the exact command; got: {out}"
@@ -1394,8 +1405,6 @@ pub fn caller_c() -> u32 { crate::hub::hub() }
     (repo, store)
 }
 
-
-
 #[test]
 fn impact_refuses_the_retired_diff_flags() {
     // --since/--base died with the ORIENT dissolution; the prompt's impact
@@ -1405,9 +1414,15 @@ fn impact_refuses_the_retired_diff_flags() {
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
-    for flag in [&["impact", "--since", "HEAD~1"][..], &["impact", "--base", "main"][..]] {
+    for flag in [
+        &["impact", "--since", "HEAD~1"][..],
+        &["impact", "--base", "main"][..],
+    ] {
         let (code, out, err) = run(flag, &repo, &store);
-        assert_eq!(code, 64, "retired flag must be a usage error; stdout={out} stderr={err}");
+        assert_eq!(
+            code, 64,
+            "retired flag must be a usage error; stdout={out} stderr={err}"
+        );
         assert!(
             out.contains("unexpected argument") || err.contains("unexpected argument"),
             "the refusal names the unexpected argument; stdout={out} stderr={err}"
@@ -1554,7 +1569,10 @@ fn brief_refuses_an_ambiguous_name_with_addresses_not_bodies() {
 fn brief_reports_a_missing_symbol() {
     let (repo, store) = index_fixture("brief-missing");
     let (code, out, err) = run(&["brief", "no_such_symbol"], &repo, &store);
-    assert_eq!(code, 1, "brief must exit 1 for an unknown name; stderr={err}");
+    assert_eq!(
+        code, 1,
+        "brief must exit 1 for an unknown name; stderr={err}"
+    );
     assert!(
         out.contains("no symbol `no_such_symbol`"),
         "brief must say the name does not resolve; got: {out}"
@@ -1568,7 +1586,10 @@ fn brief_refuses_a_second_symbol() {
     // error, like any malformed invocation.
     let (repo, store) = index_fixture("brief-two-symbols");
     let (code, out, err) = run(&["brief", "caller", "do_it"], &repo, &store);
-    assert_eq!(code, 64, "a second symbol must be a usage error; stderr={err}");
+    assert_eq!(
+        code, 64,
+        "a second symbol must be a usage error; stderr={err}"
+    );
     assert!(
         !out.contains("== caller ==") && !out.contains("== do_it =="),
         "the multi-symbol bundle must never print; got: {out}"
@@ -1592,7 +1613,10 @@ fn brief_refuses_a_name_that_has_nothing_to_sketch() {
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
     let (code, out, err) = run(&["brief", "LIMIT"], &repo, &store);
-    assert_eq!(code, 1, "brief LIMIT must refuse; stderr={err}\nstdout={out}");
+    assert_eq!(
+        code, 1,
+        "brief LIMIT must refuse; stderr={err}\nstdout={out}"
+    );
     assert!(
         out.contains("`LIMIT` is a ") && out.contains("not a function"),
         "brief must print the kind line for a name with no body; got: {out}"

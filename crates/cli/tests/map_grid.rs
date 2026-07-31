@@ -378,7 +378,9 @@ fn entry_points_obey_the_fractal_size_law() {
     assert_eq!(code, 0, "JSON failed: {stderr}");
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     assert_eq!(
-        value["orientation"]["entry_points"].as_array().map(Vec::len),
+        value["orientation"]["entry_points"]
+            .as_array()
+            .map(Vec::len),
         Some(shown + remainder),
         "JSON still carries the full list: {json}"
     );

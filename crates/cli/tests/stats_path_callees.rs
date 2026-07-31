@@ -260,7 +260,7 @@ fn callees_lists_what_symbol_calls() {
         "callees must print the callee's file:line (src/mid.rs); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callees)"),
+        !out.contains("no callees"),
         "entry calls middle, so callees must be non-empty; got: {out:?}"
     );
 }
@@ -271,9 +271,9 @@ fn callees_reports_no_callees_for_leaf() {
     // `leaf` calls nothing.
     let (code, out, _err) = run(&["callees", "leaf"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callees)"),
-        "leaf calls nothing, so callees must be empty; got: {out:?}"
+    assert_eq!(
+        out, "no callees\n",
+        "leaf calls nothing, so callees must say so; got: {out:?}"
     );
 }
 
@@ -282,9 +282,9 @@ fn callees_reports_missing_symbol() {
     let (repo, store) = index_fixture("callees-missing");
     let (code, out, _err) = run(&["callees", "does_not_exist_xyz"], &repo, &store);
     assert_eq!(code, 1, "missing symbol must exit 1; got out={out:?}");
-    assert!(
-        out.contains("symbol not found"),
-        "missing symbol must report not-found; got: {out:?}"
+    assert_eq!(
+        out, "no symbol `does_not_exist_xyz`\n",
+        "missing symbol must identify the absent name; got: {out:?}"
     );
 }
 
@@ -554,6 +554,9 @@ fn path_rejects_edge_names_the_store_does_not_use() {
             code, 64,
             "invalid --edge {edge}; stdout={out}\nstderr={err}"
         );
-        assert!(err.contains("invalid value"), "stderr={err:?}");
+        assert!(
+            out.contains("invalid value"),
+            "usage refusal belongs on stdout; stdout={out:?}; stderr={err:?}"
+        );
     }
 }

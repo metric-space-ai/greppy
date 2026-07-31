@@ -162,7 +162,7 @@ fn graph_grid_ruby_who_calls_finds_cross_file_caller() {
         "who-calls must print the caller's file:line (app.rb); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callers)"),
+        !out.contains("no callers"),
         "who-calls must find at least one caller for do_it; got: {out:?}"
     );
 }
@@ -178,8 +178,8 @@ fn graph_grid_ruby_who_calls_empty_for_uncalled() {
     // `Marker` is a class definition — nothing CALLS it.
     let (code, out, _err) = run(&["who-calls", "Marker"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
+    assert_eq!(
+        out, "no callers\n",
         "who-calls on an uncalled class must report no callers; got: {out:?}"
     );
 }
@@ -203,7 +203,7 @@ fn graph_grid_ruby_callees_lists_cross_file_target() {
         "callees must print the callee's file path (helper.rb); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callees)"),
+        !out.contains("no callees"),
         "callees must not be empty for caller; got: {out:?}"
     );
 }
@@ -225,33 +225,33 @@ fn graph_grid_ruby_impact_transitive_reaches_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. search-symbols finds every definition across the repo.
+// 7. search-symbol finds every definition across the repo.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_ruby_search_symbols_finds_all_definitions() {
+fn graph_grid_ruby_search_symbol_finds_all_definitions() {
     let (repo, store) = index_fixture("symbols");
 
     for needle in [
         "caller", "render", "build", "do_it", "Widget", "Marker", "Helper",
     ] {
-        let (code, out, err) = run(&["search-symbols", needle], &repo, &store);
+        let (code, out, err) = run(&["search-symbol", needle], &repo, &store);
         assert_eq!(
             code, 0,
-            "search-symbols {needle} should exit 0; stderr={err}\nstdout={out}"
+            "search-symbol {needle} should exit 0; stderr={err}\nstdout={out}"
         );
         assert!(
             out.contains(needle),
-            "search-symbols {needle} must include the name; got: {out:?}"
+            "search-symbol {needle} must include the name; got: {out:?}"
         );
     }
 
     // `do_it` is owned by `Helper` so its file_path must be helper.rb.
-    let (code, out, err) = run(&["search-symbols", "do_it"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "do_it"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}");
     assert!(
         out.contains("helper.rb:"),
-        "search-symbols do_it must print the definition file:line (helper.rb); got: {out:?}"
+        "search-symbol do_it must print the definition file:line (helper.rb); got: {out:?}"
     );
 }
 
@@ -384,16 +384,14 @@ fn graph_grid_ruby_declarative_or_edge_case() {
     let (repo, store) = index_fixture("singleton");
 
     // The CALLS target is `Helper.do_it`, a singleton method owned by the
-    // module. search-symbols must locate the definition.
-    let (code, out, err) = run(&["search-symbols", "do_it"], &repo, &store);
+    // module. search-symbol must locate the definition.
+    let (code, out, err) = run(&["search-symbol", "do_it"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols do_it should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol do_it should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
         out.contains("helper.rb:"),
-        "search-symbols do_it must find the singleton method definition in helper.rb; got: {out:?}"
+        "search-symbol do_it must find the singleton method definition in helper.rb; got: {out:?}"
     );
-
-
 }

@@ -213,7 +213,10 @@ fn dead_edit_prefix_is_refused_and_double_dash_preserves_hyphen_payloads() {
     let refused = fixture.run(&["edit", "replace", "--file", "x", "--old", "a"]);
     let refusal = combined(&refused);
     assert_eq!(refused.status.code(), Some(64), "{refusal}");
-    assert!(refusal.contains("unrecognized subcommand 'edit'"), "{refusal}");
+    assert!(
+        refusal.contains("unrecognized subcommand 'edit'"),
+        "{refusal}"
+    );
 
     let written = fixture.run(&["write", "--", "-name.txt", "-payload"]);
     let receipt = combined(&written);

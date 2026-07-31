@@ -114,7 +114,7 @@ fn graph_grid_elixir_who_calls_finds_cross_file_caller() {
         out.contains("caller") && out.contains("lib/main.ex:"),
         "{out}"
     );
-    assert!(!out.contains("(no callers)"), "{out}");
+    assert!(!out.contains("no callers"), "{out}");
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn graph_grid_elixir_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-empty");
     let (code, out, err) = run(&["who-calls", "uncalled"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}");
-    assert!(out.contains("(no callers)"), "{out}");
+    assert_eq!(out, "no callers\n");
 }
 
 #[test]
@@ -141,11 +141,11 @@ fn graph_grid_elixir_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
     let (code, out, err) = run(&["impact", "do_it"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
-    assert!(out.contains("caller") && out.contains("hop 1"), "{out}");
+    assert_eq!(out, "lib/main.ex:6  caller\n");
 }
 
 #[test]
-fn graph_grid_elixir_search_symbols_finds_all_definitions() {
+fn graph_grid_elixir_search_symbol_finds_all_definitions() {
     let (repo, store) = index_fixture("symbols");
     for (name, file) in [
         ("caller", "lib/main.ex:"),
@@ -153,7 +153,7 @@ fn graph_grid_elixir_search_symbols_finds_all_definitions() {
         ("Widget", "lib/widget.ex:"),
         ("Helper", "lib/helper.ex:"),
     ] {
-        let (code, out, err) = run(&["search-symbols", name], &repo, &store);
+        let (code, out, err) = run(&["search-symbol", name], &repo, &store);
         assert_eq!(code, 0, "{name}: stderr={err}\nstdout={out}");
         assert!(out.contains(name) && out.contains(file), "{name}: {out}");
     }
@@ -183,12 +183,9 @@ fn graph_grid_elixir_path_connects_caller_to_helper() {
         &store,
     );
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
-    let caller = out.find("caller").expect("path start");
-    let helper = out.find("do_it").expect("path end");
-    assert!(caller < helper, "{out}");
-    assert!(
-        out.contains("lib/main.ex:") && out.contains("lib/helper.ex:"),
-        "{out}"
+    assert_eq!(
+        out, "lib/main.ex:6  caller\n  lib/main.ex:7  do_it\n",
+        "path must use the call site in main.ex for the indented step"
     );
 }
 
@@ -240,10 +237,10 @@ fn graph_grid_elixir_declarative_or_edge_case() {
         "{out}"
     );
 
-    let (code, symbols, err) = run(&["search-symbols", "private_value"], &repo, &store);
+    let (code, symbols, err) = run(&["search-symbol", "private_value"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}\nstdout={symbols}");
     assert!(
-        symbols.contains("Function") && symbols.contains("private_value"),
+        symbols.contains("function") && symbols.contains("private_value"),
         "{symbols}"
     );
 }

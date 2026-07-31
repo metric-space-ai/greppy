@@ -14283,11 +14283,7 @@ fn zig_module_basename(path: &str) -> &str {
 /// Emit the current source file's importable namespace. The shared resolver
 /// intentionally excludes synthetic Module nodes, so Zig uses the same
 /// importable-Class technique as other language-specific module passes.
-fn emit_zig_file_namespace(
-    root: Node<'_>,
-    file_path: &str,
-    result: &mut ExtractionResult,
-) {
+fn emit_zig_file_namespace(root: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
     let module_name = zig_module_basename(file_path);
     if module_name.is_empty() {
         return;
@@ -20840,13 +20836,12 @@ end
     }
 
     #[test]
-    fn elixir_calls_sourced_from_file_module_by_bare_name() {
-        // The CALLS source is the file Module (`<file>::__file__`,
-        // Elixir defs are `call` nodes, never a func kind, so the enclosing-func
-        // lookup falls back to the module). The callee is the bare name — the
-        // trailing segment of a dotted `Mod.fun` call — so cross-module calls
-        // resolve to the project Function by name. Keyword callees (`def`,
-        // builtins) never become CALLS candidates.
+    fn elixir_calls_are_sourced_from_the_enclosing_function() {
+        // Elixir definitions are extracted as Function nodes, so calls in a
+        // `def` body belong to that function rather than the file anchor. A
+        // dotted `Mod.fun` call keeps the bare trailing function name for
+        // cross-module resolution, while definition macros are not emitted as
+        // calls from the function body.
         const SRC: &str = r#"
 defmodule Shop.Cart do
   def add_to_cart(cart, product) do
@@ -20875,37 +20870,22 @@ end
             })
             .collect();
 
-        // Dotted call → bare trailing name; every CALLS is sourced from the file
-        // Module node, never from the enclosing def.
         assert!(
-            callees.contains(&("lib/cart.ex::__file__".into(), "product_label".into())),
-            "dotted Product.product_label → bare `product_label` from file Module: {callees:?}"
+            callees.contains(&(
+                "lib/cart.ex::Function::add_to_cart".into(),
+                "product_label".into()
+            )),
+            "dotted Product.product_label must belong to add_to_cart: {callees:?}"
         );
         assert!(
-            callees.contains(&("lib/cart.ex::__file__".into(), "sum_prices".into())),
-            "bare sum_prices call: {callees:?}"
+            callees.contains(&("lib/cart.ex::Function::total".into(), "sum_prices".into())),
+            "bare sum_prices must belong to total: {callees:?}"
         );
-        // `def` (a keyword) is never a CALLS candidate — the def-header inner
-        // call (`add_to_cart(cart, product)`) IS, and resolves to the
-        // Function by name; but the outer `def` macro callee is keyword-filtered.
         assert!(
-            !callees.iter().any(|(_, c)| c == "def"),
-            "the `def` macro callee is keyword-filtered: {callees:?}"
-        );
-        // `defmodule` is NOT keyword-filtered here (it is not in the generic
-        // keyword table), so it appears as a candidate — but the indexer's name
-        // resolver drops it (no project Function named `defmodule`).
-        assert!(
-            callees.iter().any(|(_, c)| c == "add_to_cart"),
-            "def-header self-call resolves to the Function: {callees:?}"
-        );
-        // Every CALLS edge is sourced from the file Module.
-        assert!(
-            r.edges
+            !callees
                 .iter()
-                .filter(|e| e.edge_type == "CALLS")
-                .all(|e| e.source_qualified_name == "lib/cart.ex::__file__"),
-            "all CALLS sourced from the file Module"
+                .any(|(_, callee)| matches!(callee.as_str(), "def" | "add_to_cart" | "total")),
+            "definition forms must not become body calls: {callees:?}"
         );
     }
 

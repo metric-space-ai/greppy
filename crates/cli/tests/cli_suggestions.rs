@@ -109,8 +109,7 @@ fn miss_normalizes_case_and_underscores() {
     // Equal after lowercasing and removing underscores — the near-certain
     // tier, one exact row and nothing else.
     assert_eq!(
-        text,
-        "no symbol `parse_config`\n\nsimilar names:\nsrc/lib.rs:1  parseConfig\n",
+        text, "no symbol `parse_config`\n\nsimilar names:\nsrc/lib.rs:1  parseConfig\n",
         "{text}"
     );
     assert_eq!(similar_name_rows(&text).len(), 1, "{text}");
@@ -132,8 +131,7 @@ fn miss_after_rename_offers_the_new_name() {
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
     assert_eq!(
-        text,
-        "no symbol `fooBar`\n\nsimilar names:\nsrc/lib.rs:1  fooBaz\n",
+        text, "no symbol `fooBar`\n\nsimilar names:\nsrc/lib.rs:1  fooBaz\n",
         "{text}"
     );
     assert_eq!(similar_name_rows(&text).len(), 1, "{text}");
@@ -155,8 +153,7 @@ fn miss_on_qualified_name_offers_the_bare_definition() {
     let text = combined(&result);
     assert_eq!(result.0, 1, "{text}");
     assert_eq!(
-        text,
-        "no symbol `Foo::bar`\n\nsimilar names:\nsrc/lib.rs:1  bar\n",
+        text, "no symbol `Foo::bar`\n\nsimilar names:\nsrc/lib.rs:1  bar\n",
         "{text}"
     );
     assert_eq!(similar_name_rows(&text).len(), 1, "{text}");

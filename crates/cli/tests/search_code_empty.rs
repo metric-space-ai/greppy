@@ -84,8 +84,11 @@ fn empty_search_pattern_names_the_path_filter_without_teaching() {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
 
-    let (code, stdout, _stderr) =
-        run(&repo, &store, &["search-pattern", "absent_value", "--path", "src"]);
+    let (code, stdout, _stderr) = run(
+        &repo,
+        &store,
+        &["search-pattern", "absent_value", "--path", "src"],
+    );
 
     assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
     assert_eq!(

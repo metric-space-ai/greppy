@@ -102,7 +102,11 @@ fn who_calls_path_filtering_is_a_flag_and_empty_scope_is_an_answer() {
     assert!(stderr.contains("--path src/inside"), "stderr={stderr}");
 
     // The flag filters to the callers under it.
-    let (code, stdout, stderr) = run(&["who-calls", "target", "--path", "src/inside"], &repo, &store);
+    let (code, stdout, stderr) = run(
+        &["who-calls", "target", "--path", "src/inside"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert_eq!(
         stdout, "src/inside/caller.rs:1  caller_inside\n",
@@ -110,7 +114,11 @@ fn who_calls_path_filtering_is_a_flag_and_empty_scope_is_an_answer() {
     );
 
     // An existing scope with no callers in it is an answer, exit 0.
-    let (code, stdout, stderr) = run(&["who-calls", "target", "--path", "src/api.rs"], &repo, &store);
+    let (code, stdout, stderr) = run(
+        &["who-calls", "target", "--path", "src/api.rs"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert_eq!(
         stdout, "no callers under path filter: src/api.rs\n",
@@ -118,7 +126,11 @@ fn who_calls_path_filtering_is_a_flag_and_empty_scope_is_an_answer() {
     );
 
     // A filter path that does not exist is a usage error, not an empty answer.
-    let (code, stdout, stderr) = run(&["who-calls", "target", "--path", "does/not/exist"], &repo, &store);
+    let (code, stdout, stderr) = run(
+        &["who-calls", "target", "--path", "does/not/exist"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 64, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stderr.contains("--path `does/not/exist` does not exist under"),
@@ -163,8 +175,7 @@ fn symbol_miss_lists_similar_names_and_nothing_else() {
     // deletes the `try: greppy …` discovery instructions: the commands are
     // documented once in the prompt, never repeated under a miss.
     assert_eq!(
-        stdout,
-        "no symbol `startswith`\n\nsimilar names:\nsrc/api.rs:5  startsWith\n",
+        stdout, "no symbol `startswith`\n\nsimilar names:\nsrc/api.rs:5  startsWith\n",
         "stdout={stdout}"
     );
     assert!(!stdout.contains("try:"), "stdout={stdout}");
@@ -197,8 +208,18 @@ fn limit_max_aliases_hold_and_paths_are_flag_only() {
     // positional argument is always a symbol, so a path there is refused and
     // the refusal teaches `--path`; the flag performs the filter.
     for (command, query, path, want_row) in [
-        ("who-calls", "target", "src/inside", "src/inside/caller.rs:1  caller_inside\n"),
-        ("callees", "caller_inside", "src/api.rs", "src/api.rs:2  target\n"),
+        (
+            "who-calls",
+            "target",
+            "src/inside",
+            "src/inside/caller.rs:1  caller_inside\n",
+        ),
+        (
+            "callees",
+            "caller_inside",
+            "src/api.rs",
+            "src/api.rs:2  target\n",
+        ),
     ] {
         let (code, _stdout, stderr) = run(&[command, query, path], &repo, &store);
         assert_eq!(

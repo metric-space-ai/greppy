@@ -165,13 +165,13 @@ fn graph_grid_scala_who_calls_finds_cross_file_caller() {
         "who-calls must print the caller's file:line (src/main.scala); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callers)"),
+        !out.contains("no callers"),
         "who-calls must find at least one caller; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 2 — who-calls: an uncalled symbol reports "(no callers)".
+// 2 — who-calls: an uncalled symbol reports "no callers".
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -180,8 +180,8 @@ fn graph_grid_scala_who_calls_empty_for_uncalled() {
     // `render` is defined in main.scala but never called from anywhere.
     let (code, out, _err) = run(&["who-calls", "render"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
+    assert_eq!(
+        out, "no callers\n",
         "render is uncalled, who-calls must report no callers; got: {out:?}"
     );
 }
@@ -213,39 +213,35 @@ fn graph_grid_scala_impact_transitive_reaches_caller() {
     // single-command answer to "what breaks if I change doIt?".
     let (code, out, err) = run(&["impact", "doIt"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}\nstdout={out}");
-    assert!(
-        out.contains("caller"),
-        "impact doIt must reach `caller` at hop 1; got: {out:?}"
-    );
-    assert!(
-        out.contains("hop 1"),
-        "impact must report hop distance for direct callers; got: {out:?}"
+    assert_eq!(
+        out, "src/main.scala:9  MainFlow::caller\n",
+        "impact doIt must render its caller as a plain navigation row"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 7 — search-symbols: finds all definitions of a symbol across the repo.
+// 7 — search-symbol: finds all definitions of a symbol across the repo.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_scala_search_symbols_finds_all_definitions() {
-    let (repo, store) = index_fixture("search-symbols");
-    let (code, out, err) = run(&["search-symbols", "doIt"], &repo, &store);
+fn graph_grid_scala_search_symbol_finds_all_definitions() {
+    let (repo, store) = index_fixture("search-symbol");
+    let (code, out, err) = run(&["search-symbol", "doIt"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
         out.contains("doIt"),
-        "search-symbols doIt must find the doIt symbol; got: {out:?}"
+        "search-symbol doIt must find the doIt symbol; got: {out:?}"
     );
     assert!(
         out.contains("src/helper.scala:"),
-        "search-symbols must print the symbol's file:line (src/helper.scala); got: {out:?}"
+        "search-symbol must print the symbol's file:line (src/helper.scala); got: {out:?}"
     );
     assert!(
-        out.contains("Method") || out.contains("Function"),
-        "search-symbols must print the node label (Method or Function for SCALA defs); got: {out:?}"
+        out.contains("  function") || out.contains("  method"),
+        "search-symbol must print lowercase kind words for Scala definitions; got: {out:?}"
     );
 }
 
@@ -277,26 +273,14 @@ fn graph_grid_scala_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     // `path --from caller --to doIt` over CALLS must find the single-hop
     // path caller -> doIt.
-    let (code, out, err) = run(
-        &["path", "--from", "caller", "--to", "doIt"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["path", "--from", "caller", "--to", "doIt"], &repo, &store);
     assert_eq!(
         code, 0,
         "path caller->doIt should exist and exit 0; stderr={err}\nstdout={out}"
     );
-    let caller_idx = out
-        .find("caller")
-        .expect("path must include start `caller`");
-    let callee_idx = out.find("doIt").expect("path must include goal `doIt`");
-    assert!(
-        caller_idx < callee_idx,
-        "path steps must be ordered caller -> doIt; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/main.scala:") && out.contains("src/helper.scala:"),
-        "path steps must carry file:line for both endpoints; got: {out:?}"
+    assert_eq!(
+        out, "src/main.scala:9  MainFlow::caller\n  src/main.scala:10  Helper::doIt\n",
+        "path must print the Scala call site in MainFlow::caller"
     );
 }
 
@@ -392,7 +376,7 @@ object Sink {
 // werden zu "Interface" (siehe `scala_type_label` für `trait_definition`).
 // Dieser Test verifiziert die Scala-spezifische Umbenennung, indem ein
 // zusätzliches `object Sink` in helper.scala deklariert und über
-// search-symbols als Class-Definition aufgefunden werden muss.
+// search-symbol als Class-Definition aufgefunden werden muss.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -400,17 +384,15 @@ fn graph_grid_scala_declarative_object_labelled_as_class() {
     let (repo, store) = index_fixture("scala-object");
     // A `object Sink` declaration is a Scala-specific singleton; the parser
     // maps it to the "Class" label so it is discoverable as a typed graph
-    // node. search-symbols must locate the definition with that exact label.
-    let (code, out, err) = run(&["search-symbols", "Sink", "--json"], &repo, &store);
+    // node. search-symbol must locate the definition with that exact label.
+    let (code, out, err) = run(&["search-symbol", "Sink", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols Sink should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol Sink should exit 0; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid search-symbols json: {e}; stdout={out:?}"));
-    let hits = v["hits"]
-        .as_array()
-        .expect("search-symbols hits array");
+        .unwrap_or_else(|e| panic!("invalid search-symbol json: {e}; stdout={out:?}"));
+    let hits = v["hits"].as_array().expect("search-symbol hits array");
     assert!(
         hits.iter().any(|hit| {
             hit["label"] == "Class"

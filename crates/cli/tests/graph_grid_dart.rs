@@ -173,13 +173,13 @@ fn graph_grid_dart_who_calls_finds_cross_file_caller() {
         "who-calls must print the caller's file:line (lib/main.dart); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callers)"),
+        !out.contains("no callers"),
         "who-calls must find at least one caller; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 2 — who-calls: an uncalled symbol reports "(no callers)".
+// 2 — who-calls: an uncalled symbol reports "no callers".
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -188,8 +188,8 @@ fn graph_grid_dart_who_calls_empty_for_uncalled() {
     // `uncalled` is defined in main.dart but never called from anywhere.
     let (code, out, _err) = run(&["who-calls", "uncalled"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
+    assert_eq!(
+        out, "no callers\n",
         "uncalled is uncalled, who-calls must report no callers; got: {out:?}"
     );
 }
@@ -222,38 +222,38 @@ fn graph_grid_dart_impact_transitive_reaches_caller() {
     let (code, out, err) = run(&["impact", "do_it"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}\nstdout={out}");
     assert!(
-        out.contains("caller"),
-        "impact do_it must reach `caller` at hop 1; got: {out:?}"
+        out.starts_with("lib/main.dart:4  caller\n"),
+        "impact do_it must reach caller as a plain navigation row; got: {out:?}"
     );
     assert!(
-        out.contains("hop 1"),
-        "impact must report hop distance for direct callers; got: {out:?}"
+        !out.contains("hop ") && !out.contains("Function::") && !out.contains("Expand:"),
+        "impact depth is represented by the tree, not legacy prefixes; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 7 — search-symbols: finds all definitions of a symbol across the repo.
+// 7 — search-symbol: finds all definitions of a symbol across the repo.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_dart_search_symbols_finds_all_definitions() {
-    let (repo, store) = index_fixture("search-symbols");
-    let (code, out, err) = run(&["search-symbols", "do_it"], &repo, &store);
+fn graph_grid_dart_search_symbol_finds_all_definitions() {
+    let (repo, store) = index_fixture("search-symbol");
+    let (code, out, err) = run(&["search-symbol", "do_it"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
         out.contains("do_it"),
-        "search-symbols do_it must find the do_it symbol; got: {out:?}"
+        "search-symbol do_it must find the do_it symbol; got: {out:?}"
     );
     assert!(
         out.contains("lib/helper.dart:"),
-        "search-symbols must print the symbol's file:line (lib/helper.dart); got: {out:?}"
+        "search-symbol must print the symbol's file:line (lib/helper.dart); got: {out:?}"
     );
     assert!(
-        out.contains("Function"),
-        "search-symbols must print the node label (Function for DART defs); got: {out:?}"
+        out.contains("  function"),
+        "search-symbol must print the lowercase kind word for Dart definitions; got: {out:?}"
     );
 }
 
@@ -294,17 +294,13 @@ fn graph_grid_dart_path_connects_caller_to_helper() {
         code, 0,
         "path caller->do_it should exist and exit 0; stderr={err}\nstdout={out}"
     );
-    let caller_idx = out
-        .find("caller")
-        .expect("path must include start `caller`");
-    let callee_idx = out.find("do_it").expect("path must include goal `do_it`");
-    assert!(
-        caller_idx < callee_idx,
-        "path steps must be ordered caller -> do_it; got: {out:?}"
+    assert_eq!(
+        out, "lib/main.dart:4  caller\n  lib/main.dart:5  do_it\n",
+        "path must print the start definition then the indented call site"
     );
     assert!(
-        out.contains("lib/main.dart:") && out.contains("lib/helper.dart:"),
-        "path steps must carry file:line for both endpoints; got: {out:?}"
+        !out.contains("lib/helper.dart"),
+        "path addresses calls, not the callee definition; got: {out:?}"
     );
 }
 

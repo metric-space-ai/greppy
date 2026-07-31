@@ -186,25 +186,25 @@ fn graph_grid_lua_who_calls_finds_cross_file_caller() {
         "who-calls must print the caller's file:line (src/main.lua); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callers)"),
+        !out.contains("no callers"),
         "who-calls must find at least one caller; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 2 — who-calls: uncalled symbol reports "(no callers)".
+// 2 — who-calls: uncalled symbol reports "no callers".
 // ---------------------------------------------------------------------------
 
 #[test]
 fn graph_grid_lua_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-none");
 
-    // `Marker` is a Variable; nothing CALLS it.
-    let (code, out, _err) = run(&["who-calls", "Marker"], &repo, &store);
+    // `uncalled` is defined in main.lua and has no incoming references.
+    let (code, out, _err) = run(&["who-calls", "uncalled"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
-        "who-calls on a never-called Variable must report no callers; got: {out:?}"
+    assert_eq!(
+        out, "no callers\n",
+        "who-calls on an unreferenced function must say so; got: {out:?}"
     );
 }
 
@@ -228,7 +228,7 @@ fn graph_grid_lua_callees_lists_cross_file_target() {
         "callees must print the callee's file:line (src/helper.lua); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callees)"),
+        !out.contains("no callees"),
         "callees must not be empty for caller; got: {out:?}"
     );
 }
@@ -257,33 +257,33 @@ fn graph_grid_lua_impact_transitive_reaches_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// 7 — search-symbols: finds every Lua definition across the repo.
+// 7 — search-symbol: finds every Lua definition across the repo.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_lua_search_symbols_finds_all_definitions() {
+fn graph_grid_lua_search_symbol_finds_all_definitions() {
     let (repo, store) = index_fixture("symbols");
 
     for needle in [
         "caller", "render", "build", "do_it", "Widget", "Marker", "LIMIT",
     ] {
-        let (code, out, err) = run(&["search-symbols", needle], &repo, &store);
+        let (code, out, err) = run(&["search-symbol", needle], &repo, &store);
         assert_eq!(
             code, 0,
-            "search-symbols {needle} should exit 0; stderr={err}\nstdout={out}"
+            "search-symbol {needle} should exit 0; stderr={err}\nstdout={out}"
         );
         assert!(
             out.contains(needle),
-            "search-symbols {needle} must include the name; got: {out:?}"
+            "search-symbol {needle} must include the name; got: {out:?}"
         );
     }
 
     // The fully-qualified dotted def `helper.do_it` lives in helper.lua.
-    let (code, out, err) = run(&["search-symbols", "helper.do_it"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "helper.do_it"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}");
     assert!(
         out.contains("src/helper.lua:"),
-        "search-symbols helper.do_it must print the definition file:line (src/helper.lua); got: {out:?}"
+        "search-symbol helper.do_it must print the definition file:line (src/helper.lua); got: {out:?}"
     );
 }
 

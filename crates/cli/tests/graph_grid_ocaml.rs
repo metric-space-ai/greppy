@@ -107,7 +107,7 @@ fn graph_grid_ocaml_who_calls_empty_for_uncalled() {
     let (r, s) = index_fixture("none");
     let (c, o, _) = run(&["who-calls", "uncalled"], &r, &s);
     assert_eq!(c, 0);
-    assert!(o.contains("(no callers)"), "{o}");
+    assert_eq!(o, "no callers\n");
 }
 #[test]
 fn graph_grid_ocaml_callees_lists_cross_file_target() {
@@ -121,10 +121,10 @@ fn graph_grid_ocaml_impact_transitive_reaches_caller() {
     let (r, s) = index_fixture("impact");
     let (c, o, e) = run(&["impact", "do_it"], &r, &s);
     assert_eq!(c, 0, "{e}");
-    assert!(o.contains("caller") && o.contains("hop 1"), "{o}");
+    assert_eq!(o, "src/main.ml:4  caller\n");
 }
 #[test]
-fn graph_grid_ocaml_search_symbols_finds_all_definitions() {
+fn graph_grid_ocaml_search_symbol_finds_all_definitions() {
     let (r, s) = index_fixture("symbols");
     for n in [
         "caller",
@@ -135,7 +135,7 @@ fn graph_grid_ocaml_search_symbols_finds_all_definitions() {
         "widget",
         "status",
     ] {
-        let (c, o, e) = run(&["search-symbols", n], &r, &s);
+        let (c, o, e) = run(&["search-symbol", n], &r, &s);
         assert_eq!(c, 0, "{e}");
         assert!(o.contains(n), "missing {n}: {o}");
     }
@@ -155,10 +155,7 @@ fn graph_grid_ocaml_path_connects_caller_to_helper() {
     let (r, s) = index_fixture("path");
     let (c, o, e) = run(&["path", "--from", "caller", "--to", "do_it"], &r, &s);
     assert_eq!(c, 0, "{e}\n{o}");
-    assert!(
-        o.contains("caller") && o.contains("do_it") && o.contains("src/helper.ml:"),
-        "{o}"
-    );
+    assert_eq!(o, "src/main.ml:4  caller\n  src/main.ml:5  do_it\n");
 }
 #[test]
 fn graph_grid_ocaml_graph_survives_reindex() {
@@ -189,7 +186,7 @@ fn graph_grid_ocaml_declarative_or_edge_case() {
     // OCaml-specific: a variant type declaration must remain discoverable as a
     // definition even though its constructors are declarative alternatives.
     let (r, s) = index_fixture("variant");
-    let v = json(&["search-symbols", "status", "--json"], &r, &s);
+    let v = json(&["search-symbol", "status", "--json"], &r, &s);
     assert!(
         v["hits"]
             .as_array()

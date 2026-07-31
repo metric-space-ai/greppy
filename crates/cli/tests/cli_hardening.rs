@@ -302,7 +302,10 @@ fn index_dot_then_search_from_root_and_subdir() {
 
     // RV-011: search-pattern from the repo root finds current source content.
     let (code, out, err) = run(&["search-pattern", "alpha_unique_marker"], &repo, &store);
-    assert_eq!(code, 0, "search-pattern from root should exit 0; stderr={err}");
+    assert_eq!(
+        code, 0,
+        "search-pattern from root should exit 0; stderr={err}"
+    );
     assert!(
         out.contains("alpha_unique_marker"),
         "search-pattern from root must find source content (RV-011); got: {out:?}"
@@ -474,8 +477,10 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
 
 #[test]
 fn provider_policy_require_complete_does_not_block_search_pattern_json() {
-    let (repo, store, _scratch) =
-        make_repo("provider-policy-search-pattern", "provider_policy_code_marker");
+    let (repo, store, _scratch) = make_repo(
+        "provider-policy-search-pattern",
+        "provider_policy_code_marker",
+    );
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,

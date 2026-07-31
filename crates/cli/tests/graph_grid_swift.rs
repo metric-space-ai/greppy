@@ -134,8 +134,9 @@ fn assert_index_succeeds(repo: &Path, store: &Path) {
 
 fn run_json(args: &[&str], repo: &Path, store: &Path) -> (i32, Value, String, String) {
     let (code, out, err) = run(args, repo, store);
-    let value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid JSON for {args:?}: {e}; stderr={err:?}; stdout={out:?}"));
+    let value = serde_json::from_str(&out).unwrap_or_else(|e| {
+        panic!("invalid JSON for {args:?}: {e}; stderr={err:?}; stdout={out:?}")
+    });
     (code, value, out, err)
 }
 
@@ -146,8 +147,9 @@ fn run_json_with_env(
     envs: &[(&str, &str)],
 ) -> (i32, Value, String, String) {
     let (code, out, err) = run_with_env(args, repo, store, envs);
-    let value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid JSON for {args:?}: {e}; stderr={err:?}; stdout={out:?}"));
+    let value = serde_json::from_str(&out).unwrap_or_else(|e| {
+        panic!("invalid JSON for {args:?}: {e}; stderr={err:?}; stdout={out:?}")
+    });
     (code, value, out, err)
 }
 
@@ -173,11 +175,8 @@ fn hit_names(value: &Value) -> Vec<&str> {
 #[test]
 fn graph_grid_swift_who_calls_finds_cross_file_caller() {
     let (repo, store) = index_fixture("who-calls");
-    let (code, value, out, err) = run_json(
-        &["who-calls", "helperFunction", "--json"],
-        &repo,
-        &store,
-    );
+    let (code, value, out, err) =
+        run_json(&["who-calls", "helperFunction", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "who-calls helperFunction must succeed; stderr={err}\nstdout={out}"
@@ -194,11 +193,8 @@ fn graph_grid_swift_who_calls_finds_cross_file_caller() {
 #[test]
 fn graph_grid_swift_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-empty");
-    let (code, value, out, err) = run_json(
-        &["who-calls", "uncalledFunction", "--json"],
-        &repo,
-        &store,
-    );
+    let (code, value, out, err) =
+        run_json(&["who-calls", "uncalledFunction", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "who-calls uncalledFunction must succeed; stderr={err}\nstdout={out}"
@@ -213,8 +209,7 @@ fn graph_grid_swift_who_calls_empty_for_uncalled() {
 #[test]
 fn graph_grid_swift_callees_lists_cross_file_target() {
     let (repo, store) = index_fixture("callees");
-    let (code, value, out, err) =
-        run_json(&["callees", "caller", "--json"], &repo, &store);
+    let (code, value, out, err) = run_json(&["callees", "caller", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "callees caller must succeed; stderr={err}\nstdout={out}"
@@ -233,8 +228,7 @@ fn graph_grid_swift_callees_lists_cross_file_target() {
 #[test]
 fn graph_grid_swift_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
-    let (code, value, out, err) =
-        run_json(&["impact", "helperFunction", "--json"], &repo, &store);
+    let (code, value, out, err) = run_json(&["impact", "helperFunction", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "impact helperFunction must succeed; stderr={err}\nstdout={out}"
@@ -251,7 +245,7 @@ fn graph_grid_swift_impact_transitive_reaches_caller() {
 }
 
 #[test]
-fn graph_grid_swift_search_symbols_finds_all_definitions() {
+fn graph_grid_swift_search_symbol_finds_all_definitions() {
     let (repo, store) = index_fixture("symbols");
     let expected = [
         ("caller", "Function", "src/Main.swift"),
@@ -266,11 +260,10 @@ fn graph_grid_swift_search_symbols_finds_all_definitions() {
     ];
 
     for (name, label, file) in expected {
-        let (code, value, out, err) =
-            run_json(&["search-symbols", name, "--json"], &repo, &store);
+        let (code, value, out, err) = run_json(&["search-symbol", name, "--json"], &repo, &store);
         assert_eq!(
             code, 0,
-            "search-symbols {name} must succeed; stderr={err}\nstdout={out}"
+            "search-symbol {name} must succeed; stderr={err}\nstdout={out}"
         );
         assert!(
             hits(&value).iter().any(|hit| {

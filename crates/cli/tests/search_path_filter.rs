@@ -161,12 +161,7 @@ fn search_pattern_path_with_no_hit_says_so_and_exits_1() {
     let (code, out, err) = run(
         &repo,
         &store,
-        &[
-            "search-pattern",
-            "fn parse_widget",
-            "--path",
-            "no-such-dir",
-        ],
+        &["search-pattern", "fn parse_widget", "--path", "no-such-dir"],
     );
 
     assert_eq!(code, 1, "stdout={out}\nstderr={err}");

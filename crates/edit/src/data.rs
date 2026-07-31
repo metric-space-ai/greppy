@@ -368,8 +368,7 @@ fn widen_to_entry(content: &[u8], start: usize, end: usize, ext: &str) -> (usize
     let before = text[..entry_start]
         .char_indices()
         .rev()
-        .find(|(_, c)| !c.is_whitespace())
-        .map(|(i, c)| (i, c));
+        .find(|(_, c)| !c.is_whitespace());
     if let Some((index, ',')) = before {
         return (index, end);
     }

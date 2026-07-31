@@ -189,13 +189,13 @@ fn graph_grid_zig_who_calls_finds_cross_file_caller() {
         "who-calls must print the caller's file:line (src/main.zig); got: {out:?}"
     );
     assert!(
-        !out.contains("(no callers)"),
+        !out.contains("no callers"),
         "who-calls must find at least one caller; got: {out:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 2 — who-calls: an uncalled symbol reports "(no callers)".
+// 2 — who-calls: an uncalled symbol reports "no callers".
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -204,8 +204,8 @@ fn graph_grid_zig_who_calls_empty_for_uncalled() {
     // `render` is defined in main.zig but never called from anywhere.
     let (code, out, _err) = run(&["who-calls", "render"], &repo, &store);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("(no callers)"),
+    assert_eq!(
+        out, "no callers\n",
         "render is uncalled, who-calls must report no callers; got: {out:?}"
     );
 }
@@ -239,23 +239,19 @@ fn graph_grid_zig_impact_transitive_reaches_caller() {
     // `impact doIt` must report `caller` as incoming CALLS dependent.
     let (code, out, err) = run(&["impact", "doIt"], &repo, &store);
     assert_eq!(code, 0, "impact should exit 0; stderr={err}\nstdout={out}");
-    assert!(
-        out.contains("caller"),
-        "impact doIt must reach `caller` at hop 1; got: {out:?}"
-    );
-    assert!(
-        out.contains("hop 1"),
-        "impact must report hop distance for direct callers; got: {out:?}"
+    assert_eq!(
+        out, "src/main.zig:5  caller\n",
+        "impact doIt must render its direct caller as a plain row"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 7 — search-symbols: finds every definition across the repo.
+// 7 — search-symbol: finds every definition across the repo.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn graph_grid_zig_search_symbols_finds_all_definitions() {
-    let (repo, store) = index_fixture("search-symbols");
+fn graph_grid_zig_search_symbol_finds_all_definitions() {
+    let (repo, store) = index_fixture("search-symbol");
     for needle in [
         "caller",
         "render",
@@ -264,25 +260,25 @@ fn graph_grid_zig_search_symbols_finds_all_definitions() {
         "Widget",
         "uncalled",
     ] {
-        let (code, out, err) = run(&["search-symbols", needle], &repo, &store);
+        let (code, out, err) = run(&["search-symbol", needle], &repo, &store);
         assert_eq!(
             code, 0,
-            "search-symbols {needle} should exit 0; stderr={err}\nstdout={out}"
+            "search-symbol {needle} should exit 0; stderr={err}\nstdout={out}"
         );
         assert!(
             out.contains(needle),
-            "search-symbols {needle} must include the name; got: {out:?}"
+            "search-symbol {needle} must include the name; got: {out:?}"
         );
     }
     // `doIt` lives in helper.zig — the file_path must reflect that.
-    let (code, out, err) = run(&["search-symbols", "doIt"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "doIt"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols doIt should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol doIt should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
         out.contains("src/helper.zig:"),
-        "search-symbols doIt must print the definition file:line (src/helper.zig); got: {out:?}"
+        "search-symbol doIt must print the definition file:line (src/helper.zig); got: {out:?}"
     );
 }
 
@@ -319,17 +315,9 @@ fn graph_grid_zig_path_connects_caller_to_helper() {
         code, 0,
         "path caller->doIt should exist and exit 0; stderr={err}\nstdout={out}"
     );
-    let caller_idx = out
-        .find("caller")
-        .expect("path must include start `caller`");
-    let callee_idx = out.find("doIt").expect("path must include goal `doIt`");
-    assert!(
-        caller_idx < callee_idx,
-        "path steps must be ordered caller -> doIt; got: {out:?}"
-    );
-    assert!(
-        out.contains("src/main.zig:") && out.contains("src/helper.zig:"),
-        "path steps must carry file:line for both endpoints; got: {out:?}"
+    assert_eq!(
+        out, "src/main.zig:5  caller\n  src/main.zig:6  doIt\n",
+        "path must print the Zig call site inside caller"
     );
 }
 
@@ -417,7 +405,7 @@ pub const HELPER_VALUE: u32 = 7;
 // Begründung: In `crates/parser/src/extract.rs` (`emit_zig_variables`) wird
 // jede `variable_declaration` am File-Root als **Variable**-Knoten erfasst —
 // auch `pub const X = struct { … };`. Damit hat ZIG **keine** Type/Class/
-// Struct-Knoten; Typen leben als Variablen. `search-symbols Widget` muss
+// Struct-Knoten; Typen leben als Variablen. `search-symbol Widget` muss
 // daher den Label **„Variable"** tragen (nicht „Type", „Struct" oder „Class"),
 // und das `file_path` muss `src/types.zig` sein — sonst fehlt die
 // Klassifikation, die der Resolver für die `USAGE`-Auflösung der
@@ -430,16 +418,16 @@ fn graph_grid_zig_declarative_struct_labelled_as_variable() {
     // `pub const Widget = struct { value: u32 };` is a Zig algebraic-data-
     // type literal. The bespoke `extract_zig` emits it as a "Variable" node
     // (`emit_zig_variables` walks every `variable_declaration` child of the
-    // file root, no class-def/struct-def path). `search-symbols` must
+    // file root, no class-def/struct-def path). `search-symbol` must
     // surface it as a Variable in types.zig.
-    let (code, out, err) = run(&["search-symbols", "Widget", "--json"], &repo, &store);
+    let (code, out, err) = run(&["search-symbol", "Widget", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
-        "search-symbols Widget should exit 0; stderr={err}\nstdout={out}"
+        "search-symbol Widget should exit 0; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("invalid search-symbols json: {e}; stdout={out:?}"));
-    let hits = v["hits"].as_array().expect("search-symbols hits array");
+        .unwrap_or_else(|e| panic!("invalid search-symbol json: {e}; stdout={out:?}"));
+    let hits = v["hits"].as_array().expect("search-symbol hits array");
     assert!(
         hits.iter().any(|hit| {
             hit["label"] == "Variable"
