@@ -96,39 +96,36 @@ EXPLORER_POLICY = (
     "available to you, then implement and verify the fix."
 )
 
+AGENTS_MD = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+# Both greppy arms serve the SHIPPED manual verbatim. The previous templates
+# were written against the retired M4 grammar (`edit replace-body`,
+# `edit text-cas`, `edit apply --plan`, `edit rename-symbol`,
+# `edit change-signature`) and the retired search verbs — every one of them is
+# refused by 0.3.0, so the edit arm would have scored a near-zero against its
+# own harness rather than against the product. The arms still differ in their
+# TREATMENT (navigate-only vs edit-through-greppy); only the vocabulary now
+# comes from one source of truth.
 GREPPY_EDIT_POLICY_TEMPLATE = (
-    "This system does not ship grep, ripgrep, or a patch utility for source files. "
-    "Greppy replaces all of them; the executable is {greppy}, always with `--root .`. "
-    "If you need original grep behavior, call greppy exactly like grep (byte-exact "
-    "passthrough). "
-    "NAVIGATE: `semantic-search QUERY` for behavior questions; `brief SYMBOL`, "
-    "`who-calls`, `callees`, `find-usages` for known symbols. "
-    "READ: code here is read by symbol - `read SYMBOL --handle --json` returns the "
-    "definition's exact source span plus a HANDLE; do not open whole source files to "
-    "find a definition. "
-    "EDIT source files transactionally through greppy (no manual patching, no apply_patch). "
-    "The workflow is read -> edit; five verbs cover almost everything: "
-    "`edit replace-body --symbol S --content-file F` (replace a definition's body with the code in F), "
-    "`edit text-cas --file F --old 'OLD' --new 'NEW'` (exact text swap; add --expect N if OLD occurs N times), "
-    "`edit apply --plan P` for many edits at once — a plan is just "
-    "{{\"operations\":[{{\"file\":\"a.rs\",\"old\":\"x\",\"new\":\"y\"}}]}}, applied all-or-nothing, "
-    "`edit rename-symbol --symbol S --new-name N` and `edit change-signature --symbol S --spec '{{...}}'` "
-    "for a change that spans many call sites (one transaction instead of many text edits). "
-    "For any verb and its exact form, run `greppy edit --help` and `greppy edit VERB --help` "
-    "(each prints a working example). "
-    "Every edit prints a certificate whose `result_span` IS the written state — do not re-read "
-    "the file after a successful edit. "
-    "Verify the final result with the supplied verification command."
+    "This system does not ship grep, ripgrep, or a patch utility for source "
+    "files. Greppy replaces all of them; the executable is {greppy}, always "
+    "with `--root .`. If you need original grep behavior, call greppy exactly "
+    "like grep (byte-exact passthrough).\n"
+    "Navigate and READ with greppy instead of opening whole files, and make "
+    "every source change THROUGH greppy's EDIT verbs — no manual patching, no "
+    "apply_patch. A refused edit is information: it tells you the file or the "
+    "target moved; re-read and retry deliberately.\n"
+    "Verify the final result with the supplied verification command.\n\n"
+    "Greppy's manual:\n\n" + AGENTS_MD
 )
 
 GREPPY_POLICY_TEMPLATE = (
-    "Use Greppy as the primary code-navigation surface before opening source files. "
-    "The executable is {greppy}. Always pass `--root .`. For behavior questions use "
-    "`semantic-search QUERY`; for known symbols use `brief SYMBOL`, `who-calls SYMBOL`, "
-    "`callees SYMBOL`, `find-usages SYMBOL`, or `impact SYMBOL`; for partial names use "
-    "`search-symbols NAME`; for literals use `search-code TEXT`. Inspect the returned "
-    "source evidence, then implement and verify the fix. If one Greppy call fails, use "
-    "at most one documented fallback and continue with the evidence available."
+    "Use Greppy as the primary code-navigation surface before opening source "
+    "files. The executable is {greppy}. Always pass `--root .`. Inspect the "
+    "returned source evidence, then implement and verify the fix. If one "
+    "Greppy call fails, use at most one documented fallback and continue with "
+    "the evidence available.\n\n"
+    "Greppy's manual:\n\n" + AGENTS_MD
 )
 
 
