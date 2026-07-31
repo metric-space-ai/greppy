@@ -19,6 +19,7 @@ Usage:
     python3 bench/agent_efficiency/verify_tasks.py --index   # (re)index first
 """
 import json
+import re
 import pathlib
 import subprocess
 import sys
@@ -107,7 +108,49 @@ def check_task(root, chk):
         )
     if kind in ("search_code", "search_symbols"):
         sub = "search-pattern" if kind == "search_code" else "search-symbol"
-        data, raw = gp_json(root, sub, chk["query"])
+        query = chk["query"]
+        tokens = query.split()
+        if kind == "search_code" and len(tokens) > 1:
+            # 0.3.0's search-pattern takes a REGEX, where the retired
+            # search-code took loose multi-term text. The check's intent is
+            # "these terms locate that file" — order-free. A joined regex is
+            # order-DEPENDENT (`const rec = normalizeRecord(...)` puts the
+            # second term first), and the engine has no lookahead, so verify
+            # per token and require the file in EVERY term's results.
+            literal_ok = True
+            literal_detail = ""
+            for token in tokens:
+                data, raw = gp_json(root, sub, token)
+                if data is None:
+                    literal_ok, literal_detail = False, raw
+                    break
+                hits = data.get("hits") or []
+                joined = "\n".join(json.dumps(hit, sort_keys=True) for hit in hits)
+                if chk["expect_file"] not in joined:
+                    literal_ok = False
+                    literal_detail = (
+                        f"{sub} '{token}' (of '{query}'): "
+                        f"{chk['expect_file']} not in {len(hits)} shown results"
+                    )
+                    break
+            if literal_ok:
+                return True, f"{sub} every term of '{query}': hit {chk['expect_file']}"
+            # The bank files literal identifiers AND English descriptions
+            # ("Fold byte array checksum") under one check kind. 0.3.0 splits
+            # those routes: literal text is search-pattern, meaning is search.
+            # A task counts as answerable if EITHER route finds the file.
+            data, raw = gp_json(root, "search", query)
+            if data is None:
+                return False, literal_detail or raw
+            hits = data.get("hits") or []
+            joined = "\n".join(json.dumps(hit, sort_keys=True) for hit in hits)
+            if chk["expect_file"] in joined:
+                return True, f"search '{query}' (meaning): hit {chk['expect_file']}"
+            return False, (
+                f"{literal_detail}; search '{query}' also missed it "
+                f"in {len(hits)} shown results"
+            )
+        data, raw = gp_json(root, sub, query)
         if data is None:
             return False, raw
         hits = data.get("hits") or []
