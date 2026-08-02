@@ -4,9 +4,9 @@
 #
 # Why this script exists: the other battle
 # scripts assert the graph by querying graph.db directly with sqlite3 and
-# NEVER run `who-calls` / `find-usages` / `trace`. So a *resolution* bug —
-# the CLI resolving a symbol name to the wrong node and printing
-# "(no usages)" for a symbol that is demonstrably used — sailed straight
+# NEVER run `who-calls` / `trace`. So a *resolution* bug — the CLI resolving
+# a symbol name to the wrong node and printing "no callers" for a symbol that
+# is demonstrably used — sailed straight
 # through a green suite. A black-box harness that only inspects the DB can
 # never catch a bug in the layer that maps a user's symbol name onto that
 # DB. This script closes that hole: it builds a fixture with a KNOWN
@@ -17,16 +17,17 @@
 # Invariants asserted (all on COMMAND OUTPUT, not raw SQL):
 #   * who-calls <callee>      lists the real caller's qualified_name
 #   * who-calls <unique-fn>   lists every real caller (cross-file)
-#   * find-usages <Struct>    is NOT "(no usages)" and names the real
-#                             referencing symbols — even though an Impl
-#                             block shares the struct's name (resolution
-#                             must land on the node that actually has the
-#                             incoming USES/TYPE_REF edges)
+#   * who-calls <Struct>      is NOT "no callers" and names a real
+#                             referencing symbol — even though an Impl block
+#                             shares the struct's name (resolution must land
+#                             on the node that actually has the incoming
+#                             USAGE edges)
 #   * trace <caller> outgoing reaches the callee across files
 #
 # Black-box: drives the built binary only; touches no crate source.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+[[ "$GREPPY_BIN" = /* ]] || GREPPY_BIN="$WORKSPACE_ROOT/$GREPPY_BIN"
 
 NAME="navigation"
 
@@ -52,7 +53,7 @@ export GREPPY_STORE_DIR="$WORK/store"
 #   * `Widget` (the STRUCT) is referenced by `caller` (USES) and by
 #     `make` (TYPE_REF + USES)                        (>=2 referrers)
 #   * the Impl named `Widget` has NO incoming usage edges — so resolving
-#     "Widget" to the Impl would print "(no usages)" (the bug we guard).
+#     "Widget" to the Impl would print "no callers" (the bug we guard).
 # ---------------------------------------------------------------------------
 mkdir -p "$CORPUS/src"
 cat > "$CORPUS/Cargo.toml" <<'EOF'
@@ -128,8 +129,8 @@ nav() {
 # ---- who-calls <callee> : the cross-file caller is named ------------------
 wc_out="$(nav who-calls do_it)"
 echo "[navigation] who-calls do_it ->"; echo "$wc_out" | sed 's/^/    /'
-if grep -q '(no callers)' <<<"$wc_out"; then
-    fail "who-calls do_it finds its caller (got '(no callers)')"
+if [[ "$wc_out" == "no callers" ]]; then
+    fail "who-calls do_it finds its caller (got 'no callers')"
 elif grep -q 'caller' <<<"$wc_out"; then
     pass "who-calls do_it names the real caller 'caller'"
 else
@@ -143,40 +144,41 @@ else
     fail "who-calls do_it surfaces the cross-file caller's location (lib.rs) (got: $wc_out)"
 fi
 
-# ---- find-usages <Struct> : THE regression guard --------------------------
-# `Widget` names BOTH a Struct and an Impl. The incoming USAGE
-# edges all land on the Struct; the Impl has none. If symbol resolution
-# picks the Impl, the command prints "(no usages)" for a symbol that is
-# very much used. This is the exact bug the DB-only harness missed.
-fu_out="$(nav find-usages Widget)"
-echo "[navigation] find-usages Widget ->"; echo "$fu_out" | sed 's/^/    /'
-if grep -q '(no usages)' <<<"$fu_out"; then
-    fail "find-usages Widget is NOT '(no usages)' — Widget IS used (resolution bug: resolved to the Impl, not the Struct)"
+# ---- who-calls <Struct> : THE regression guard ---------------------------
+# `Widget` names BOTH a Struct and an Impl. The incoming USAGE edges all land
+# on the Struct; the Impl has none. If symbol resolution picks the Impl, the
+# command prints exactly "no callers" for a symbol that is very much used.
+# This is the exact bug the DB-only harness missed.
+fu_out="$(nav who-calls Widget)"
+echo "[navigation] who-calls Widget ->"; echo "$fu_out" | sed 's/^/    /'
+if [[ "$fu_out" == "no callers" ]]; then
+    fail "who-calls Widget is NOT 'no callers' — Widget IS used (resolution bug: resolved to the Impl, not the Struct)"
 else
-    pass "find-usages Widget is NOT '(no usages)'"
+    pass "who-calls Widget is NOT 'no callers'"
 fi
-# Content assertions: the real referrers are `caller` and `make`, both through
-# the unified USAGE edge model. At least one must appear; ideally both.
-fu_hits=0
-grep -q 'caller' <<<"$fu_out" && fu_hits=$((fu_hits + 1))
-grep -q 'make'   <<<"$fu_out" && fu_hits=$((fu_hits + 1))
-assert_ge "$fu_hits" 1 "find-usages Widget names a real referrer (caller/make)"
-# The edge kind must be one the command claims to report.
-if grep -q 'USAGE' <<<"$fu_out"; then
-    pass "find-usages Widget reports a USAGE edge kind"
+# The 0.3.0 output omits edge-kind labels, so pin the real incoming USAGE
+# result itself: `make` at its source location. Resolving to the Impl returns
+# "no callers" and therefore fails both this assertion and the one above.
+if grep -qE '^src/widget\.rs:[0-9]+  make$' <<<"$fu_out"; then
+    pass "who-calls Widget names referrer 'make' at its source location"
 else
-    fail "find-usages Widget reports a USAGE edge kind (got: $fu_out)"
+    fail "who-calls Widget names referrer 'make' at its source location (got: $fu_out)"
 fi
 
-# Sanity counter-case: a symbol with genuinely no usages must still say so
-# (proves the "(no usages)" path is a real signal, not always-fail).
-nu_out="$(nav find-usages this_symbol_does_not_exist_anywhere)"
-# Match the substring, not a rigid parenthesised form: the message reads
-# "(symbol not found: `X`; no usages and no indexed content matches)".
-if grep -qiE 'no usages|symbol not found' <<<"$nu_out"; then
-    pass "find-usages on an absent symbol reports no usages / not found"
+# Counter-cases pin both distinct empty outcomes in the 0.3.0 surface: a known
+# symbol without incoming edges says "no callers"; an absent symbol says
+# "no symbol `S`". The fixture's top-level `caller` function is uncalled.
+nc_out="$(nav who-calls caller)"
+if [[ "$nc_out" == "no callers" ]]; then
+    pass "who-calls on an uncalled symbol reports exactly 'no callers'"
 else
-    fail "find-usages on an absent symbol reports no usages / not found (got: $nu_out)"
+    fail "who-calls on an uncalled symbol reports exactly 'no callers' (got: $nc_out)"
+fi
+nu_out="$(nav who-calls this_symbol_does_not_exist_anywhere)"
+if [[ "$nu_out" == 'no symbol `this_symbol_does_not_exist_anywhere`' ]]; then
+    pass "who-calls on an absent symbol reports the exact no-symbol message"
+else
+    fail "who-calls on an absent symbol reports the exact no-symbol message (got: $nu_out)"
 fi
 
 # ---- trace <caller> outgoing : reaches the callee across files ------------

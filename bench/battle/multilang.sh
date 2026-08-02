@@ -20,17 +20,17 @@
 #   * For EACH language that supports it, the graph contains a TRULY
 #     cross-file edge of the expected kind:
 #       - cross-file CALLS:   Rust, Python, JavaScript, TypeScript, Go, Ruby
-#       - cross-file IMPORTS: Rust, Python, JavaScript, TypeScript
-#         (Go/Ruby emit Import *nodes* but their package/relative-path
-#          import targets do not resolve to a node, so no cross-file
-#          IMPORTS edge is produced — asserted as a known characteristic.)
+#       - cross-file IMPORTS: Rust, Python, JavaScript, TypeScript, Ruby
+#         (Go's package import target does not resolve to a node, while Ruby's
+#          relative require now resolves directly without a standalone Import
+#          node — both characteristics are asserted below.)
 #   * `stats` RESULT CONTENT: per-label node counts and per-type edge
 #     counts match the graph.db ground truth exactly.
 #   * `who-calls` / `callees` / `path` resolve the known caller/callee for
 #     a representative symbol IN EACH language and print the right symbol.
-#   * `find-usages` on a Rust struct that is used by TYPE_REF lands on the
-#     struct (the node with the incoming edges), not a same-named node.
-#   * `search-symbols` / `search-code` find known symbols / content across
+#   * `who-calls` on a Rust struct that has an incoming USAGE edge lands on
+#     the struct (the node with the incoming edge), not a same-named node.
+#   * `search-symbol` / `search-pattern` find known symbols / content across
 #     all six languages.
 #   * the byte-exact grep passthrough still holds on this mixed repo (`greppy
 #     -R` vs the system grep, byte-exact, on several queries).
@@ -40,6 +40,7 @@
 #     as unsupported, no panic, no node rows for it).
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+[[ "$GREPPY_BIN" = /* ]] || GREPPY_BIN="$WORKSPACE_ROOT/$GREPPY_BIN"
 
 NAME="multilang"
 
@@ -60,7 +61,7 @@ export GREPPY_STORE_DIR="$WORK/store"
 # CALLS edge; a bare `rb_helper` is parsed as an identifier, not a call).
 #
 # Additionally, the Rust side defines a `Widget` struct that `make()` returns
-# by value (TYPE_REF) so `find-usages` has a real referenced type to land on.
+# by value (TYPE_REF) so `who-calls` has a real referenced type to land on.
 # ---------------------------------------------------------------------------
 build_corpus() {
     local C="$1"
@@ -265,22 +266,22 @@ for lang in "rust:rust/%" "python:py/%" "javascript:js/%" "typescript:ts/%" "go:
     assert_ge "${c:-0}" 1 "cross-file CALLS edge present for $name"
 done
 
-# Cross-file IMPORTS resolve for Rust, Python, JS, TS.
-for lang in "rust:rust/%" "python:py/%" "javascript:js/%" "typescript:ts/%"; do
+# Cross-file IMPORTS resolve for Rust, Python, JS, TS, and Ruby.
+for lang in "rust:rust/%" "python:py/%" "javascript:js/%" "typescript:ts/%" "ruby:rb/%"; do
     name="${lang%%:*}"; prefix="${lang##*:}"
     c="$(xfile_edges IMPORTS "$prefix")"
     assert_ge "${c:-0}" 1 "cross-file IMPORTS edge present for $name"
 done
 
-# Go/Ruby package/relative imports currently do not resolve to a graph target.
-# They are not represented as standalone Import nodes either.
-for lang in "go:go/%" "ruby:rb/%"; do
-    name="${lang%%:*}"; prefix="${lang##*:}"
-    imp_nodes="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE label='Import' AND file_path LIKE '$prefix';" 2>/dev/null || echo 0)"
-    assert_eq "0" "${imp_nodes:-0}" "$name emits no standalone Import node"
-    c="$(xfile_edges IMPORTS "$prefix")"
-    assert_eq "0" "${c:-0}" "$name has no resolved cross-file IMPORTS edge (known: package/relative target unresolved)"
-done
+# Go's package import remains unresolved and emits no standalone Import node.
+imp_nodes="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE label='Import' AND file_path LIKE 'go/%';" 2>/dev/null || echo 0)"
+assert_eq "0" "${imp_nodes:-0}" "go emits no standalone Import node"
+c="$(xfile_edges IMPORTS 'go/%')"
+assert_eq "0" "${c:-0}" "go has no resolved cross-file IMPORTS edge (known: package target unresolved)"
+
+# Ruby's relative require resolves directly, also without an Import node.
+imp_nodes="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE label='Import' AND file_path LIKE 'rb/%';" 2>/dev/null || echo 0)"
+assert_eq "0" "${imp_nodes:-0}" "ruby emits no standalone Import node"
 
 # ---------------------------------------------------------------------------
 # `stats` RESULT CONTENT — assert the printed per-label / per-type counts
@@ -341,8 +342,8 @@ for row in \
     "ruby:rb_helper:rb_caller:rb/main.rb"; do
     IFS=: read -r lang helper caller cfile <<<"$row"
     out="$(nav who-calls "$helper")"
-    if grep -q '(no callers)' <<<"$out"; then
-        fail "who-calls $helper ($lang) finds its caller (got '(no callers)')"
+    if [[ "$out" == "no callers" ]]; then
+        fail "who-calls $helper ($lang) finds its caller (got 'no callers')"
     elif grep -q "$caller" <<<"$out" && grep -q "$cfile" <<<"$out"; then
         pass "who-calls $helper ($lang) names caller '$caller' in $cfile"
     else
@@ -382,34 +383,35 @@ for row in \
     fi
 done
 
-# find-usages on the Rust Widget struct (referenced by USAGE from make()).
+# who-calls on the Rust Widget struct (referenced by USAGE from make()).
 # This guards the symbol-resolution layer: Widget names a struct used by a
 # USAGE edge; resolution must land on the struct node that carries that
-# incoming edge.
-fu_out="$(nav find-usages Widget)"
-echo "[multilang] find-usages Widget ->"; echo "$fu_out" | sed 's/^/    /'
-if grep -q '(no usages)' <<<"$fu_out"; then
-    fail "find-usages Widget is NOT '(no usages)' — Widget IS referenced via USAGE"
-elif grep -qE 'USAGE|TYPE_REF|USES' <<<"$fu_out" && grep -q 'make' <<<"$fu_out"; then
-    pass "find-usages Widget names referrer 'make' with a usage edge"
+# incoming edge. The 0.3.0 text omits edge-kind labels, so pin the known
+# referrer and its source location; a wrong same-name resolution says exactly
+# "no callers" and cannot satisfy this assertion.
+fu_out="$(nav who-calls Widget)"
+echo "[multilang] who-calls Widget ->"; echo "$fu_out" | sed 's/^/    /'
+if [[ "$fu_out" == "no callers" ]]; then
+    fail "who-calls Widget is NOT 'no callers' — Widget IS referenced via USAGE"
+elif grep -qE '^rust/src/lib\.rs:[0-9]+  make$' <<<"$fu_out"; then
+    pass "who-calls Widget names referrer 'make' at its source location"
 else
-    fail "find-usages Widget names referrer 'make' with a usage edge (got: $fu_out)"
+    fail "who-calls Widget names referrer 'make' at its source location (got: $fu_out)"
 fi
-# Counter-case: a genuinely-absent symbol must still report no usages.
-nu_out="$(nav find-usages this_symbol_does_not_exist_anywhere)"
-# Match the substring, not a rigid parenthesised form: the message reads
-# "(symbol not found: `X`; no usages and no indexed content matches)".
-if grep -qiE 'no usages|symbol not found' <<<"$nu_out"; then
-    pass "find-usages on an absent symbol reports no usages / not found"
+# A genuinely-absent symbol has its own exact 0.3.0 message.
+nu_out="$(nav who-calls this_symbol_does_not_exist_anywhere)"
+if [[ "$nu_out" == 'no symbol `this_symbol_does_not_exist_anywhere`' ]]; then
+    pass "who-calls on an absent symbol reports the exact no-symbol message"
 else
-    fail "find-usages on an absent symbol reports no usages / not found (got: $nu_out)"
+    fail "who-calls on an absent symbol reports the exact no-symbol message (got: $nu_out)"
 fi
 
 # ---------------------------------------------------------------------------
-# search-symbols / search-code — find known symbols/content across languages.
+# search-symbol / search-pattern — find known symbols/content across languages.
 # ---------------------------------------------------------------------------
-# search-symbols "helper" must surface the helper Function in EVERY language.
-ss_out="$(nav search-symbols helper)"
+# search-symbol is case-sensitive in 0.3.0. Query both source spellings so the
+# helper Function must still surface in EVERY language.
+ss_out="$(nav search-symbol helper --all; nav search-symbol Helper --all)"
 for row in \
     "rust:rust_helper" \
     "python:py_helper" \
@@ -418,35 +420,35 @@ for row in \
     "go:GoHelper" \
     "ruby:rb_helper"; do
     IFS=: read -r lang sym <<<"$row"
-    if grep -qE "Function .*::$sym " <<<"$ss_out"; then
-        pass "search-symbols 'helper' finds the $lang Function symbol $sym"
+    if grep -qE "^[^ ]+:[0-9]+  $sym  function$" <<<"$ss_out"; then
+        pass "search-symbol 'helper' finds the $lang Function symbol $sym"
     else
-        fail "search-symbols 'helper' finds the $lang Function symbol $sym (missing)"
+        fail "search-symbol 'helper' finds the $lang Function symbol $sym (missing)"
     fi
 done
 
-# search-code "caller" must surface the caller definition line in each
+# search-pattern "caller" must surface the caller definition line in each
 # language whose helper-call site mentions "caller" textually. (Rust/Python/
 # Ruby write `..._caller`; JS/TS/Go write `..Caller` — all contain "caller"
-# case-insensitively, but search-code is case-sensitive, so assert the three
+# case-insensitively, but search-pattern is case-sensitive, so assert the three
 # snake_case ones whose source literally contains the lowercase token.)
-sc_out="$(nav search-code caller)"
-echo "[multilang] search-code caller ->"; echo "$sc_out" | sed 's/^/    /'
+sc_out="$(nav search-pattern caller)"
+echo "[multilang] search-pattern caller ->"; echo "$sc_out" | sed 's/^/    /'
 for row in \
     "rust:rust/src/lib.rs" \
     "python:py/main.py" \
     "ruby:rb/main.rb"; do
     IFS=: read -r lang f <<<"$row"
     if grep -q "$f" <<<"$sc_out"; then
-        pass "search-code 'caller' finds a match in the $lang file ($f)"
+        pass "search-pattern 'caller' finds a match in the $lang file ($f)"
     else
-        fail "search-code 'caller' finds a match in the $lang file ($f) (got: $sc_out)"
+        fail "search-pattern 'caller' finds a match in the $lang file ($f) (got: $sc_out)"
     fi
 done
-# search-code for a body token shared by several languages ("return 7").
-sc7_out="$(nav search-code "return 7")"
+# search-pattern for a body token shared by several languages ("return 7").
+sc7_out="$(nav search-pattern "return 7")"
 sc7_hits="$(grep -cE 'helper\.(py|js|ts|go)' <<<"$sc7_out")"
-assert_ge "${sc7_hits:-0}" 2 "search-code 'return 7' finds the body across multiple languages"
+assert_ge "${sc7_hits:-0}" 2 "search-pattern 'return 7' finds the body across multiple languages"
 
 # ---------------------------------------------------------------------------
 # Grep-compatible passthrough contract on the mixed repo. A fresh index is in
