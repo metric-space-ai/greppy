@@ -179,16 +179,42 @@ def gp_sys(root: str) -> str:
     )
 
 
+# A call budget the paper's frontier needs and natural stop cannot show.
+# `pi` has no max-tool-call flag, so the cap is stated in the prompt — and it is
+# appended at the ONE place every arm's system prompt passes through, so the
+# added bytes are identical across arms by construction rather than by three
+# parallel edits that could drift. CALL_BUDGET is part of the recorded prompt
+# contract; a run at a budget therefore has a different, provable contract hash
+# than the natural-stop run it must not be pooled with.
+CALL_BUDGET: int | None = None
+
+
+def budget_clause() -> str:
+    if CALL_BUDGET is None:
+        return ""
+    return (
+        f" You may make at most {CALL_BUDGET} tool call"
+        f"{'' if CALL_BUDGET == 1 else 's'} in total. "
+        "After that you must answer immediately with whatever you have found; "
+        "an incomplete answer is expected and preferred over further calls."
+    )
+
+
+def with_budget(system: str) -> str:
+    return system + budget_clause()
+
+
 def prompt_contract() -> dict:
     """Stable hashes recorded in every result row and acceptance manifest."""
     prompts = {
-        "grep": GREP_SYS,
-        "greppy": gp_sys("{ROOT}"),
-        "explorer": EXPLORER_SYS,
+        "grep": with_budget(GREP_SYS),
+        "greppy": with_budget(gp_sys("{ROOT}")),
+        "explorer": with_budget(EXPLORER_SYS),
     }
     return {
         "version": BENCHMARK_PROMPT_VERSION,
         "arm_order": ARM_ORDER_VERSION,
+        "call_budget": CALL_BUDGET,
         "sha256": {
             name: hashlib.sha256(text.encode("utf-8")).hexdigest()
             for name, text in prompts.items()
@@ -775,6 +801,16 @@ def main() -> None:
         report(results_path, classes_path)
         return
 
+    global CALL_BUDGET
+    if "--budget" in args:
+        i = args.index("--budget")
+        raw_budget = args[i + 1]
+        if raw_budget != "natural":
+            if not raw_budget.isdigit() or int(raw_budget) < 1:
+                sys.exit("--budget takes a positive integer or 'natural'")
+            CALL_BUDGET = int(raw_budget)
+        del args[i:i + 2]
+
     global PROVIDER
     if "--llm-provider" in args:
         i = args.index("--llm-provider")
@@ -911,7 +947,7 @@ def main() -> None:
                 res = row[agent]
                 print(f"   {label:<10}resume existing result", file=sys.stderr)
             else:
-                res = run_pi(agent_prompts[agent](root), t["q"], cwd=root,
+                res = run_pi(with_budget(agent_prompts[agent](root)), t["q"], cwd=root,
                              raw_path=raw(agent))
                 row[agent] = res
                 if raw_root:
