@@ -61,9 +61,45 @@ claim survived: `bash_smart` sorts before `edit_*`, which sorts before
      0.3.0 touches **none** of them, so a merge does **not** trigger it, and
      `release.yml` would refuse the tag with no obvious cause.
 
+## Status of items 1-5: all four local gates are green
+
+Measured on `3a89549`:
+
+```
+CI=true cargo test --workspace --features greppy/ci-test-assets --no-fail-fast
+                                                    no failing targets
+CI=true cargo clippy --workspace --all-targets -- -D warnings        0 errors
+cargo fmt --check                                                     clean
+python3 dev/smoke_pass.py target/debug/greppy               SMOKE: 33 ok, 0 fail
+```
+
+Two further defects surfaced while getting there, neither of them a test
+problem:
+
+7. **greppy was not byte-exact with grep.** `dispatch_grep_os` inserted `-r`
+   whenever a file operand was an existing directory, so `greppy -q PATTERN src`
+   returned matches and exit 0 where real grep reports "Is a directory" and
+   exits 2 — against the frozen prompt's promise of "byte-identical output,
+   grep's exit codes". Two suites encoded opposite contracts; the prompt breaks
+   the tie. Fixed in `9c42876`.
+8. **`greppy-qwen35-native` could never compile for Windows.**
+   `cuda/mod.rs` gates `pub mod model` on `target_os = "linux"` while `model.rs`
+   gated the `Cuda` variant on `any(linux, windows)`. Fixed in `19173ce`;
+   verified on the real target — `cargo check -p greppy --target
+   x86_64-pc-windows-gnu` now fails with the design's own "no GPU backend …
+   build with --features cpu-only" and succeeds with that feature.
+9. **`read-smart --path` accepted the filter and ignored it.** Clippy's
+   `unused variable: paths` on `dispatch_read_smart` was the evidence. Fixed and
+   covered by `read_smart_applies_path_filters_before_ambiguity_resolution`.
+
+What remains genuinely unverifiable locally is the Linux job's *nvcc-present*
+path: whether the CUDA toolkit step actually compiles the vendored kernels. The
+nvcc-absent path is proven via the Windows target — it is the same code.
+
 ## The tag sequence, in the only order that works
 
-1. Get `ci.yml` green on the release subject (items 1-5).
+1. ~~Get `ci.yml` green on the release subject (items 1-5).~~ Done locally;
+   confirmation requires a CI run on the pushed SHA.
 2. Land the work on `main` — this is what makes `ci`, `codeql` and
    `security-audit` run on the release SHA.
 3. **Dispatch `task-bank-audit.yml` manually on the release SHA.** It cannot
