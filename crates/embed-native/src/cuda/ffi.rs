@@ -1212,9 +1212,25 @@ pub unsafe fn gp_embed_q6k(
 mod tests {
     use super::*;
 
+    /// Hardware-conditional: these kernels can only be exercised where a CUDA
+    /// device and the bundled backend are both present. Where they are not —
+    /// every GPU-less CI runner — the test says why and passes rather than
+    /// failing the build for absent hardware. On a CUDA machine it runs in full.
+    macro_rules! cuda_device_or_skip {
+        () => {
+            match CudaDevice::new(0) {
+                Ok(dev) => dev,
+                Err(err) => {
+                    eprintln!("skipped: no usable CUDA device ({err})");
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn embed_q4k_dequantizes_one_row_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let mut raw = Vec::with_capacity(144);
         raw.extend_from_slice(&0x3c00u16.to_le_bytes());
         raw.extend_from_slice(&0u16.to_le_bytes());
@@ -1262,7 +1278,7 @@ mod tests {
 
     #[test]
     fn mmvq_q8_0_matvec_matches_known_dot_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let mut raw = Vec::with_capacity(2 * 34);
         for row in 0..2i8 {
             raw.extend_from_slice(&0x3c00u16.to_le_bytes());
@@ -1312,7 +1328,7 @@ mod tests {
 
     #[test]
     fn mmvq_q4k_matvec_matches_known_dot_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let mut raw = Vec::with_capacity(2 * 144);
         let mut expected = [0.0f32; 2];
         for row in 0..2u8 {
@@ -1364,7 +1380,7 @@ mod tests {
 
     #[test]
     fn mmvq_q5k_matvec_matches_known_dot_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let blocks_per_row = 4usize;
         let mut raw = Vec::with_capacity(2 * blocks_per_row * 176);
         let mut expected = [0.0f32; 2];
@@ -1420,7 +1436,7 @@ mod tests {
 
     #[test]
     fn mmq_q5k_matmul_matches_known_dot_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let blocks_per_row = 4usize;
         let mut raw = Vec::with_capacity(2 * blocks_per_row * 176);
         let mut expected = [0.0f32; 2];
@@ -1482,7 +1498,7 @@ mod tests {
 
     #[test]
     fn qwen_rms_norm_uses_gguf_weight_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let src_host = [3.0f32, 4.0, -2.0, 1.0, -1.5, 0.5, 2.5, -3.5];
         let weight_host = [0.25f32, -0.5, 1.0, 0.0];
         let src = dev.alloc(std::mem::size_of_val(&src_host)).unwrap();
@@ -1525,7 +1541,7 @@ mod tests {
 
     #[test]
     fn qwen_add_rms_norm_matches_cpu_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let lhs_host = [3.0f32, 4.0, -2.0, 1.0, -1.5, 0.5, 2.5, -3.5];
         let rhs_host = [-1.0f32, 0.25, 0.5, 2.0, 1.25, -0.75, 0.5, 1.0];
         let weight_host = [0.25f32, -0.5, 1.0, 0.0];
@@ -1586,7 +1602,7 @@ mod tests {
 
     #[test]
     fn qwen_causal_conv1d_silu_matches_cpu_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let mut values_host = [1.0f32, -2.0, 0.5];
         let weights_host = [
             0.25f32, -0.5, 0.75, 1.0, -1.0, 0.5, 0.25, -0.25, 0.1, 0.2, -0.3, 0.4,
@@ -1633,7 +1649,7 @@ mod tests {
 
     #[test]
     fn qwen_normalize_linear_qk_matches_cpu_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let mut q_host = [1.0f32, -2.0, 3.0, -4.0, 0.5, 1.5, -2.5, 3.5];
         let mut k_host = [-1.0f32, 2.5, -3.5, 4.5, 2.0, -1.0, 0.25, -0.75];
         let mut expected_q = q_host;
@@ -1669,7 +1685,7 @@ mod tests {
 
     #[test]
     fn qwen_swiglu_and_silu_gate_match_cpu_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let gate_host = [-4.0f32, -1.0, 0.0, 0.5, 2.0, 5.0];
         let up_host = [1.5f32, -2.0, 3.0, -4.0, 0.25, 0.75];
         let gate = dev.alloc(std::mem::size_of_val(&gate_host)).unwrap();
@@ -1730,7 +1746,7 @@ mod tests {
 
     #[test]
     fn qwen_argmax_selects_highest_logit_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let mut logits = vec![-1.0f32; 777];
         logits[19] = 4.0;
         logits[511] = 8.0;
@@ -1767,7 +1783,7 @@ mod tests {
 
     #[test]
     fn qwen_deltanet_decode_matches_cpu_on_cuda() {
-        let dev = CudaDevice::new(0).expect("CUDA device");
+        let dev = cuda_device_or_skip!();
         let heads = 2usize;
         let head_dim = 4usize;
         let q_host = patterned(heads * head_dim, 0.13);
