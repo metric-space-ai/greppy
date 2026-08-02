@@ -24,7 +24,12 @@ for i in $(seq 0 $((count - 1))); do
   file="$(jq -r ".assets[$i].hf_file" "$MANIFEST")"
   dest="$(jq -r ".assets[$i].dest" "$MANIFEST")"
   want="$(jq -r ".assets[$i].sha256" "$MANIFEST")"
-  url="$HF_HOST/$repo/resolve/$REV/$file"
+  # Per-asset revision: `main` is a moving branch, so a re-upload silently
+  # changes what a release fetches and only the digest guard notices — which
+  # is exactly what happened on 2026-07-25. An immutable commit makes the
+  # fetch reproducible and leaves the digest as a second line of defence.
+  rev="$(jq -r ".assets[$i].revision // \"$REV\"" "$MANIFEST")"
+  url="$HF_HOST/$repo/resolve/$rev/$file"
 
   if [ -f "$dest" ]; then
     got="$($HASH "$dest" | awk '{print $1}')"

@@ -7,25 +7,29 @@
       "hf_repo": "metricspace/greppy-qwen35-mtp-q4km",
       "hf_file": "Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
       "dest": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
-      "sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4"
+      "sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+      "revision": "e9b68576b80e4b0dcda55638b7f5d941a739aacf"
     },
     {
       "hf_repo": "metricspace/greppy-qwen35-mtp-q4km",
       "hf_file": "tokenizer.json",
       "dest": "crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json",
-      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+      "revision": "e889ca56d5e2ad36b51df8bf96ad124fea09ac83"
     },
     {
       "hf_repo": "metricspace/embeddinggemma-300m-q4k",
       "hf_file": "embeddinggemma-300M-Q4_K.gguf",
       "dest": "crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf",
-      "sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2"
+      "sha256": "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2",
+      "revision": "2c85ca142040bc24de9cbdebd7efae2e4ee656dd"
     },
     {
       "hf_repo": "metricspace/embeddinggemma-300m-q4k",
       "hf_file": "tokenizer.json",
       "dest": "crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json",
-      "sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+      "sha256": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e",
+      "revision": "2c85ca142040bc24de9cbdebd7efae2e4ee656dd"
     }
   ]
 }
