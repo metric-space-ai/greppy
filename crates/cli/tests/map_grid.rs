@@ -187,7 +187,7 @@ fn json_carries_the_same_code_census_without_empty_expand_rows() {
     let (repo, store) = fresh_repo("json");
     index(&repo, &store);
 
-    let (code, stdout, stderr) = run(&repo, &store, &["where-am-i", "--json"]);
+    let (code, stdout, stderr) = run(&repo, &store, &["where-am-i", "--json", "--diagnostics"]);
     assert_eq!(
         code, 0,
         "where-am-i JSON failed\nstdout={stdout}\nstderr={stderr}"
@@ -374,7 +374,7 @@ fn entry_points_obey_the_fractal_size_law() {
         "the pack lists every entry point:\n{pack}"
     );
 
-    let (code, json, stderr) = run(&repo, &store, &["where-am-i", "--json"]);
+    let (code, json, stderr) = run(&repo, &store, &["where-am-i", "--json", "--diagnostics"]);
     assert_eq!(code, 0, "JSON failed: {stderr}");
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     assert_eq!(

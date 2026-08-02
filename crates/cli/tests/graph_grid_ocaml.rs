@@ -96,7 +96,7 @@ fn has_qname(v: &serde_json::Value, needle: &str) -> bool {
 #[test]
 fn graph_grid_ocaml_who_calls_finds_cross_file_caller() {
     let (r, s) = index_fixture("who");
-    let v = json(&["who-calls", "do_it", "--json"], &r, &s);
+    let v = json(&["who-calls", "do_it", "--json", "--diagnostics"], &r, &s);
     assert!(
         has_qname(&v, "::Function::caller"),
         "expected actual caller node, not footer/file module: {v:?}"
@@ -177,7 +177,11 @@ fn graph_grid_ocaml_stale_edit_detected() {
         "let helper_value = 7\nlet do_it_renamed x = x + helper_value\n",
     )
     .unwrap();
-    let v = json(&["who-calls", "do_it_renamed", "--json"], &r, &s);
+    let v = json(
+        &["who-calls", "do_it_renamed", "--json", "--diagnostics"],
+        &r,
+        &s,
+    );
     assert_eq!(v["fresh"], true, "{v:?}");
     assert_eq!(v["symbol_found"], true, "{v:?}");
 }
@@ -186,7 +190,11 @@ fn graph_grid_ocaml_declarative_or_edge_case() {
     // OCaml-specific: a variant type declaration must remain discoverable as a
     // definition even though its constructors are declarative alternatives.
     let (r, s) = index_fixture("variant");
-    let v = json(&["search-symbol", "status", "--json"], &r, &s);
+    let v = json(
+        &["search-symbol", "status", "--json", "--diagnostics"],
+        &r,
+        &s,
+    );
     assert!(
         v["hits"]
             .as_array()

@@ -197,6 +197,7 @@ thread_local! {
     static CLI_RESULT_OFFSET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CLI_INVOCATION: std::cell::RefCell<Vec<std::ffi::OsString>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static CLI_JSON_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OUTPUT_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -214,6 +215,14 @@ fn cli_inference_override() -> CliInferenceOverride {
 fn set_cli_result_window(limit: Option<usize>, offset: usize) {
     CLI_RESULT_LIMIT.with(|value| value.set(limit));
     CLI_RESULT_OFFSET.with(|value| value.set(offset));
+}
+
+fn set_cli_json_output(enabled: bool) {
+    CLI_JSON_OUTPUT.with(|value| value.set(enabled));
+}
+
+fn cli_json_output() -> bool {
+    CLI_JSON_OUTPUT.with(std::cell::Cell::get)
 }
 
 fn cli_result_offset() -> usize {
@@ -1152,6 +1161,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
             || token_lossy.starts_with("--max-bytes=")
             || token_lossy.starts_with("--offset=")
             || tok == "--no-gpu"
+            || tok == "--diagnostics"
         {
             i += 1;
             continue;
@@ -1191,6 +1201,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         return Err(Error::Invalid("--max-bytes must be at least 1".into()));
     }
     set_cli_result_window(cli.limit, cli.offset);
+    set_cli_json_output(command_requests_json(cli.command.as_ref()));
     let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
     if !no_gpu {
         configure_explicit_cuda_device(configured_device.as_deref())?;
@@ -6941,7 +6952,7 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
 /// operand is present we append DIR so the search still covers what was asked.
 fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
     const VALUE_FLAGS: [&str; 2] = ["--root", "--device"];
-    const BARE_FLAGS: [&str; 1] = ["--no-gpu"];
+    const BARE_FLAGS: [&str; 2] = ["--no-gpu", "--diagnostics"];
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     let mut root: Option<std::ffi::OsString> = None;
     let mut removed = false;
@@ -7866,6 +7877,33 @@ fn open_directory_for_sync(path: &std::path::Path) -> std::io::Result<std::fs::F
     std::fs::File::open(path)
 }
 
+fn command_requests_json(command: Option<&Command>) -> bool {
+    match command {
+        Some(Command::SearchGraph { json, .. })
+        | Some(Command::Trace { json, .. })
+        | Some(Command::Impact { json, .. })
+        | Some(Command::Brief { json, .. })
+        | Some(Command::Expand { json, .. })
+        | Some(Command::Read { json, .. })
+        | Some(Command::WhoCalls { json, .. })
+        | Some(Command::Callees { json, .. })
+        | Some(Command::FanIn { json, .. })
+        | Some(Command::FanOut { json, .. })
+        | Some(Command::GraphLocate { json, .. })
+        | Some(Command::Path { json, .. })
+        | Some(Command::SearchPattern { json, .. })
+        | Some(Command::SearchSymbol { json, .. })
+        | Some(Command::Plus { json, .. })
+        | Some(Command::Search { json, .. })
+        | Some(Command::Context { json, .. }) => *json,
+        _ => false,
+    }
+}
+
+fn compact_default_json_requested(cli: &Cli) -> bool {
+    !cli.diagnostics && command_requests_json(cli.command.as_ref())
+}
+
 #[derive(Debug, Clone)]
 struct OutputBudgetSpec {
     command: &'static str,
@@ -8016,6 +8054,331 @@ fn exact_result_total(value: &serde_json::Value, available: usize, offset: usize
         .unwrap_or_else(|| offset.saturating_add(available))
 }
 
+fn json_value_is_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => values.is_empty(),
+        serde_json::Value::String(value) => value.is_empty(),
+        _ => false,
+    }
+}
+
+fn json_answer_warning(value: &serde_json::Value) -> Option<String> {
+    let mut warnings = Vec::new();
+    let freshness = value.get("freshness");
+    let fresh = value
+        .get("fresh")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            freshness
+                .and_then(|freshness| freshness.get("fresh"))
+                .and_then(serde_json::Value::as_bool)
+        });
+    if fresh == Some(false) {
+        let state = freshness
+            .and_then(|freshness| freshness.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("stale");
+        let stale_files = freshness
+            .and_then(|freshness| freshness.get("stale_file_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if stale_files > 0 {
+            warnings.push(format!("index {state}: {stale_files} stale files"));
+        } else {
+            warnings.push(format!("index {state}"));
+        }
+    }
+    if let Some(providers) = value
+        .get("incomplete_providers")
+        .and_then(serde_json::Value::as_array)
+        .filter(|providers| !providers.is_empty())
+    {
+        let mut names = providers
+            .iter()
+            .filter_map(|provider| provider.get("language"))
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        let count = if names.is_empty() {
+            providers.len()
+        } else {
+            names.len()
+        };
+        warnings.push(format!(
+            "{count} incomplete provider{}; answer may be partial",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+    (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
+fn compact_result_row(value: &mut serde_json::Value, keep_target: bool) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if !object.contains_key("file") {
+        if let Some(file) = object
+            .get("file_path")
+            .or_else(|| object.get("path"))
+            .cloned()
+        {
+            object.insert("file".into(), file);
+        }
+    }
+    if !object.contains_key("line") {
+        if let Some(line) = object.get("start_line").cloned() {
+            object.insert("line".into(), line);
+        }
+    }
+    for key in ["node_id", "rank", "schema_version", "file_path", "path"] {
+        object.remove(key);
+    }
+    if !keep_target {
+        object.remove("target");
+    }
+    object.retain(|_, value| !value.is_null());
+}
+
+fn compact_result_arrays(value: &mut serde_json::Value, keep_target: bool) {
+    for key in BUDGET_ARRAY_FIELDS {
+        if let Some(rows) = value
+            .get_mut(*key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for row in rows {
+                compact_result_row(row, keep_target);
+            }
+        }
+    }
+    if let Some(candidates) = value
+        .get_mut("candidates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for candidate in candidates {
+            compact_result_row(candidate, false);
+        }
+    }
+}
+
+fn compact_nav_json(value: &mut serde_json::Value) {
+    let multi_target = value
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|targets| targets.len() > 1);
+    compact_result_arrays(value, multi_target);
+    let status = value.get("status").cloned().unwrap_or_else(|| {
+        match value
+            .get("symbol_found")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(false) => serde_json::json!("not_found"),
+            _ => serde_json::json!("ok"),
+        }
+    });
+    let mut compact = serde_json::Map::new();
+    compact.insert("status".into(), status);
+    for key in ["total_exact", "shown", "omitted", "truncated", "expand"] {
+        if let Some(field) = value.get(key).cloned() {
+            compact.insert(key.into(), field);
+        }
+    }
+    if multi_target {
+        if let Some(targets) = value.get("targets").cloned() {
+            compact.insert("targets".into(), targets);
+        }
+    }
+    for key in ["suggestions", "next", "warning", "hits"] {
+        if let Some(field) = value.get(key).cloned() {
+            compact.insert(key.into(), field);
+        }
+    }
+    *value = serde_json::Value::Object(compact);
+}
+
+fn compact_search_symbol_json(value: &mut serde_json::Value) {
+    compact_result_arrays(value, false);
+    if let Some(hits) = value
+        .get_mut("hits")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for hit in hits {
+            if let Some(object) = hit.as_object_mut() {
+                object.retain(|key, _| {
+                    matches!(
+                        key.as_str(),
+                        "qualified_name"
+                            | "file"
+                            | "line"
+                            | "start_line"
+                            | "end_line"
+                            | "source_available"
+                    )
+                });
+            }
+        }
+    }
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "status",
+        "total_exact",
+        "shown",
+        "omitted",
+        "truncated",
+        "warning",
+        "hits",
+        "suggestions",
+        "next",
+    ] {
+        if let Some(field) = value.get(key).cloned() {
+            compact.insert(key.into(), field);
+        }
+    }
+    if value.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        if let Some(query) = value.get("query").cloned() {
+            compact.insert("query".into(), query);
+        }
+    }
+    if let Some(filters) = value
+        .get("path_filters")
+        .filter(|value| !json_value_is_empty(value))
+    {
+        compact.insert("path_filters".into(), filters.clone());
+    }
+    *value = serde_json::Value::Object(compact);
+}
+
+fn compact_read_json(value: &mut serde_json::Value) {
+    compact_result_arrays(value, false);
+    compact_result_row(value, false);
+    let status = value
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("ok"));
+    let candidate_count = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let hit_count = value
+        .get("hits")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len);
+    let total_exact = value
+        .get("total_exact")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| match status.as_str() {
+            Some("ok") => hit_count.unwrap_or(1) as u64,
+            Some("ambiguous") => candidate_count as u64,
+            _ => 0,
+        });
+    let shown = value
+        .get("shown")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| match status.as_str() {
+            Some("ok") => hit_count.unwrap_or(1) as u64,
+            Some("ambiguous") => candidate_count as u64,
+            _ => 0,
+        });
+    let mut compact = serde_json::Map::new();
+    compact.insert("status".into(), status);
+    compact.insert("total_exact".into(), total_exact.into());
+    compact.insert("shown".into(), shown.into());
+    for key in [
+        "qualified_name",
+        "file",
+        "line",
+        "start_line",
+        "end_line",
+        "source",
+        "handle",
+        "hits",
+        "candidates",
+        "query",
+        "warning",
+    ] {
+        if let Some(field) = value.get(key).filter(|value| !value.is_null()).cloned() {
+            compact.insert(key.into(), field);
+        }
+    }
+    *value = serde_json::Value::Object(compact);
+}
+
+fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let command = value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(warning) = json_answer_warning(&value) {
+        value["warning"] = warning.into();
+    }
+    match command.as_deref() {
+        Some("who-calls" | "callees") => compact_nav_json(&mut value),
+        Some("search-symbol") => compact_search_symbol_json(&mut value),
+        Some("read") => compact_read_json(&mut value),
+        _ => {
+            compact_result_arrays(&mut value, true);
+            if let Some(object) = value.as_object_mut() {
+                for key in [
+                    "command",
+                    "project",
+                    "fresh",
+                    "freshness",
+                    "provider_complete",
+                    "incomplete_provider_count",
+                    "incomplete_providers",
+                    "discover_scope",
+                    "discover_scope_env",
+                    "elapsed_ms",
+                    "ttl_hit",
+                ] {
+                    object.remove(key);
+                }
+                if object.get("omitted").and_then(serde_json::Value::as_u64) == Some(0) {
+                    object.remove("omitted");
+                }
+                if object.get("truncated").and_then(serde_json::Value::as_bool) == Some(false) {
+                    object.remove("truncated");
+                }
+                if object.get("all").and_then(serde_json::Value::as_bool) == Some(false) {
+                    object.remove("all");
+                }
+                if object.get("path_filters").is_some_and(json_value_is_empty) {
+                    object.remove("path_filters");
+                }
+                // `search-pattern` is the one legacy polymorphic search shape:
+                // its stable smoke contract uses `command` to distinguish live
+                // filesystem matches from the other search backends.
+                if command.as_deref() == Some("search-pattern") {
+                    object.insert("command".into(), serde_json::json!("search-pattern"));
+                }
+                if !object.contains_key("status")
+                    && BUDGET_ARRAY_FIELDS
+                        .iter()
+                        .any(|key| object.contains_key(*key))
+                {
+                    object.insert("status".into(), serde_json::json!("ok"));
+                }
+            }
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        if object.get("omitted").and_then(serde_json::Value::as_u64) == Some(0) {
+            object.remove("omitted");
+        }
+        if object.get("truncated").and_then(serde_json::Value::as_bool) == Some(false) {
+            object.remove("truncated");
+        }
+    }
+    let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
+    rendered.push(b'\n');
+    Some(rendered)
+}
+
 fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let available = result_item_count(&value);
@@ -8160,7 +8523,8 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
     let budget = output_budget_spec(&cli);
-    if budget.is_some() {
+    let compact_json = compact_default_json_requested(&cli);
+    if budget.is_some() || compact_json {
         begin_output_capture();
     }
     let code = match dispatch(cli) {
@@ -8175,8 +8539,8 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
             error_exit_code(&e)
         }
     };
-    if let Some(spec) = &budget {
-        finish_output_capture(spec, code);
+    if budget.is_some() || compact_json {
+        finish_output_capture(budget.as_ref(), compact_json, code);
     }
     code
 }

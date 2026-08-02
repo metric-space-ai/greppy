@@ -244,7 +244,14 @@ fn graph_grid_csharp_callees_lists_cross_file_target() {
 fn graph_grid_csharp_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
     let (code, value, err) = run_json(
-        &["impact", "helper", "--edge", "CALLS", "--json"],
+        &[
+            "impact",
+            "helper",
+            "--edge",
+            "CALLS",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -287,7 +294,11 @@ fn graph_grid_csharp_search_symbol_finds_all_definitions() {
     ];
 
     for (name, label, file) in expected {
-        let (code, value, err) = run_json(&["search-symbol", name, "--json"], &repo, &store);
+        let (code, value, err) = run_json(
+            &["search-symbol", name, "--json", "--diagnostics"],
+            &repo,
+            &store,
+        );
         assert_eq!(
             code, 0,
             "search-symbol {name} failed; stderr={err}; json={value}"
@@ -321,7 +332,15 @@ fn graph_grid_csharp_brief_shows_definition_with_callers() {
 fn graph_grid_csharp_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
     let (code, value, err) = run_json(
-        &["path", "--from", "caller", "--to", "helper", "--json"],
+        &[
+            "path",
+            "--from",
+            "caller",
+            "--to",
+            "helper",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -346,7 +365,11 @@ fn graph_grid_csharp_graph_survives_reindex() {
         stats_code, 0,
         "stats before reindex failed; stderr={stats_err}"
     );
-    let calls_before = nav_hit_signature(&["callees", "caller", "--json"], &repo, &store);
+    let calls_before = nav_hit_signature(
+        &["callees", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
 
     // Required second index run over unchanged source. Incremental reporting is
     // allowed to say zero files changed; the graph itself must remain intact.
@@ -357,7 +380,11 @@ fn graph_grid_csharp_graph_survives_reindex() {
         stats_code, 0,
         "stats after reindex failed; stderr={stats_err}"
     );
-    let calls_after = nav_hit_signature(&["callees", "caller", "--json"], &repo, &store);
+    let calls_after = nav_hit_signature(
+        &["callees", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
 
     assert_eq!(
         stats_before, stats_after,
@@ -379,8 +406,11 @@ fn graph_grid_csharp_stale_edit_detected() {
 
     // Establish that the indexed generation really contains the edge whose
     // stale escape this cell guards against.
-    let (baseline_code, baseline, baseline_err) =
-        run_json(&["who-calls", "helper", "--json"], &repo, &store);
+    let (baseline_code, baseline, baseline_err) = run_json(
+        &["who-calls", "helper", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         baseline_code, 0,
         "baseline who-calls failed; stderr={baseline_err}; json={baseline}"
@@ -420,7 +450,7 @@ namespace Fixture.App
     .expect("edit Main.cs after index");
 
     let (code, out, err) = run_with_env(
-        &["who-calls", "helper", "--json"],
+        &["who-calls", "helper", "--json", "--diagnostics"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],

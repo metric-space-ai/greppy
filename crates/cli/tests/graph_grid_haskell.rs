@@ -340,7 +340,11 @@ marker _ = HELPER_VALUE
     )
     .unwrap();
 
-    let (code, out, err) = run(&["who-calls", "doIt_renamed", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "doIt_renamed", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     // Heal-in-band contract (1b7135b): a healable drift is reindexed in-band
     // and served fresh — the renamed symbol resolves against the NEW graph.
     assert_eq!(
@@ -378,7 +382,11 @@ fn graph_grid_haskell_declarative_data_labelled_as_class() {
     // haskell extractor (`extract_haskell`) emits it as a "Class" node
     // (Haskell has no Enum / Interface / Struct / Type label); search-symbol
     // must surface it as such.
-    let (code, out, err) = run(&["search-symbol", "Widget", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "Widget", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "search-symbol Widget should exit 0; stderr={err}\nstdout={out}"

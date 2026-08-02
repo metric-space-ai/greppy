@@ -52,6 +52,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 0, value_name = "N")]
     pub offset: usize,
 
+    /// Restore the full machine-readable diagnostics envelope for `--json`.
+    /// Default JSON carries only the answer, counts, and actionable warnings.
+    #[arg(long, global = true)]
+    pub diagnostics: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 

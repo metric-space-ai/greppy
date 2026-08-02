@@ -388,7 +388,11 @@ class HelperTools {
     )
     .unwrap();
 
-    let (code, out, err) = run(&["who-calls", "do_it_renamed", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "do_it_renamed", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     // Heal-in-band contract (1b7135b): a healable drift is reindexed in-band
     // and served fresh — the renamed symbol resolves against the NEW graph.
     assert_eq!(

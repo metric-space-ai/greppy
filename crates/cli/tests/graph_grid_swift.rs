@@ -175,8 +175,11 @@ fn hit_names(value: &Value) -> Vec<&str> {
 #[test]
 fn graph_grid_swift_who_calls_finds_cross_file_caller() {
     let (repo, store) = index_fixture("who-calls");
-    let (code, value, out, err) =
-        run_json(&["who-calls", "helperFunction", "--json"], &repo, &store);
+    let (code, value, out, err) = run_json(
+        &["who-calls", "helperFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "who-calls helperFunction must succeed; stderr={err}\nstdout={out}"
@@ -193,8 +196,11 @@ fn graph_grid_swift_who_calls_finds_cross_file_caller() {
 #[test]
 fn graph_grid_swift_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-empty");
-    let (code, value, out, err) =
-        run_json(&["who-calls", "uncalledFunction", "--json"], &repo, &store);
+    let (code, value, out, err) = run_json(
+        &["who-calls", "uncalledFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "who-calls uncalledFunction must succeed; stderr={err}\nstdout={out}"
@@ -209,7 +215,11 @@ fn graph_grid_swift_who_calls_empty_for_uncalled() {
 #[test]
 fn graph_grid_swift_callees_lists_cross_file_target() {
     let (repo, store) = index_fixture("callees");
-    let (code, value, out, err) = run_json(&["callees", "caller", "--json"], &repo, &store);
+    let (code, value, out, err) = run_json(
+        &["callees", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "callees caller must succeed; stderr={err}\nstdout={out}"
@@ -228,7 +238,11 @@ fn graph_grid_swift_callees_lists_cross_file_target() {
 #[test]
 fn graph_grid_swift_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
-    let (code, value, out, err) = run_json(&["impact", "helperFunction", "--json"], &repo, &store);
+    let (code, value, out, err) = run_json(
+        &["impact", "helperFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "impact helperFunction must succeed; stderr={err}\nstdout={out}"
@@ -260,7 +274,11 @@ fn graph_grid_swift_search_symbol_finds_all_definitions() {
     ];
 
     for (name, label, file) in expected {
-        let (code, value, out, err) = run_json(&["search-symbol", name, "--json"], &repo, &store);
+        let (code, value, out, err) = run_json(
+            &["search-symbol", name, "--json", "--diagnostics"],
+            &repo,
+            &store,
+        );
         assert_eq!(
             code, 0,
             "search-symbol {name} must succeed; stderr={err}\nstdout={out}"
@@ -302,6 +320,7 @@ fn graph_grid_swift_path_connects_caller_to_helper() {
             "--to",
             "helperFunction",
             "--json",
+            "--diagnostics",
         ],
         &repo,
         &store,
@@ -345,7 +364,7 @@ public func entryPoint() -> Payload {
     .expect("edit Main.swift after indexing");
 
     let (first_code, first, first_out, first_err) = run_json_with_env(
-        &["who-calls", "helperFunction", "--json"],
+        &["who-calls", "helperFunction", "--json", "--diagnostics"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "1")],
@@ -376,7 +395,7 @@ public func entryPoint() -> Payload {
     );
 
     let (second_code, second, second_out, second_err) = run_json_with_env(
-        &["who-calls", "helperFunction", "--json"],
+        &["who-calls", "helperFunction", "--json", "--diagnostics"],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "1")],
@@ -403,6 +422,7 @@ fn graph_grid_swift_declarative_or_edge_case() {
             "--edge",
             "IMPLEMENTS",
             "--json",
+            "--diagnostics",
         ],
         &repo,
         &store,

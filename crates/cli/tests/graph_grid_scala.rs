@@ -348,7 +348,11 @@ object Sink {
     )
     .unwrap();
 
-    let (code, out, err) = run(&["who-calls", "doIt_renamed", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "doIt_renamed", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     // Heal-in-band contract (1b7135b): a healable drift is reindexed in-band
     // and served fresh — the renamed symbol resolves against the NEW graph.
     assert_eq!(
@@ -385,7 +389,11 @@ fn graph_grid_scala_declarative_object_labelled_as_class() {
     // A `object Sink` declaration is a Scala-specific singleton; the parser
     // maps it to the "Class" label so it is discoverable as a typed graph
     // node. search-symbol must locate the definition with that exact label.
-    let (code, out, err) = run(&["search-symbol", "Sink", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "Sink", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "search-symbol Sink should exit 0; stderr={err}\nstdout={out}"

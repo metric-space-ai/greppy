@@ -521,7 +521,9 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if !path.exists() {
         let shown_root = root.unwrap_or(".");
         if auto_reindex_enabled() {
-            eprintln!("greppy: indexing {} (first use)…", effective_root.display());
+            if !cli_json_output() {
+                eprintln!("greppy: indexing {} (first use)…", effective_root.display());
+            }
             if try_auto_index_inline(root) && path.exists() {
                 // Index built: fall through to the normal read-only open.
             } else {

@@ -349,7 +349,12 @@ fn search_pattern_json_reports_exact_counts_and_truncation_metadata() {
     );
 
     let (code, out, err) = run(
-        &["search-pattern", "--json", "json_unique_marker"],
+        &[
+            "search-pattern",
+            "--json",
+            "--diagnostics",
+            "json_unique_marker",
+        ],
         &repo,
         &store,
     );
@@ -405,7 +410,12 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
     .unwrap();
 
     let (code, out, err) = run(
-        &["search-pattern", "--json", "old_json_stale_marker"],
+        &[
+            "search-pattern",
+            "--json",
+            "--diagnostics",
+            "old_json_stale_marker",
+        ],
         &repo,
         &store,
     );
@@ -422,7 +432,12 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
 
     let (code, out, err) = run(
-        &["search-pattern", "--json", "new_json_stale_marker"],
+        &[
+            "search-pattern",
+            "--json",
+            "--diagnostics",
+            "new_json_stale_marker",
+        ],
         &repo,
         &store,
     );
@@ -456,7 +471,12 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     .unwrap();
 
     let (code, out, err) = run_with_env(
-        &["search-pattern", "--json", "old_labeled_stale_marker"],
+        &[
+            "search-pattern",
+            "--json",
+            "--diagnostics",
+            "old_labeled_stale_marker",
+        ],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -488,7 +508,12 @@ fn provider_policy_require_complete_does_not_block_search_pattern_json() {
     );
 
     let (code, out, err) = run_with_env(
-        &["search-pattern", "--json", "provider_policy_code_marker"],
+        &[
+            "search-pattern",
+            "--json",
+            "--diagnostics",
+            "provider_policy_code_marker",
+        ],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -523,7 +548,12 @@ fn provider_policy_require_complete_blocks_search_symbol_json() {
     );
 
     let (code, out, err) = run_with_env(
-        &["search-symbol", "--json", "provider_policy_symbol_marker"],
+        &[
+            "search-symbol",
+            "--json",
+            "--diagnostics",
+            "provider_policy_symbol_marker",
+        ],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -561,7 +591,12 @@ fn provider_policy_require_complete_blocks_context_json() {
     );
 
     let (code, out, err) = run_with_env(
-        &["context", "--json", "provider_policy_context_marker"],
+        &[
+            "context",
+            "--json",
+            "--diagnostics",
+            "provider_policy_context_marker",
+        ],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -599,6 +634,7 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
         &[
             "search",
             "--json",
+            "--diagnostics",
             "find provider policy semantic vector marker",
         ],
         &repo,
@@ -630,7 +666,12 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
     assert_eq!(code, 0, "index failed; stdout={out} stderr={err}");
 
     let (code, out, err) = run(
-        &["search", "--json", "find semantic progress marker"],
+        &[
+            "search",
+            "--json",
+            "--diagnostics",
+            "find semantic progress marker",
+        ],
         &repo,
         &store,
     );
@@ -703,7 +744,12 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
     drop(graph);
 
     let (code, out, err) = run(
-        &["search", "--json", "find semantic progress marker"],
+        &[
+            "search",
+            "--json",
+            "--diagnostics",
+            "find semantic progress marker",
+        ],
         &repo,
         &store,
     );
@@ -724,7 +770,12 @@ fn provider_policy_require_complete_blocks_plus_vectors_before_model_config() {
     );
 
     let (code, out, err) = run_with_env(
-        &["plus", "provider_policy_plus_marker", "--json"],
+        &[
+            "plus",
+            "provider_policy_plus_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -880,7 +931,12 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     insert_default_model_vectors(&store_dir, 2);
 
     let (code, out, err) = run_with_env(
-        &["search", "--json", "find vector guard marker"],
+        &[
+            "search",
+            "--json",
+            "--diagnostics",
+            "find vector guard marker",
+        ],
         &repo,
         &store_dir,
         &[("GREPPY_VECTOR_EXACT_CANDIDATE_LIMIT", "1")],
@@ -941,7 +997,12 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
     let _writer = hold_index_before_publish(&repo, &store_dir, "semantic-vector-stale");
 
     let (code, out, err) = run_with_env(
-        &["search", "--json", "find vector stale marker"],
+        &[
+            "search",
+            "--json",
+            "--diagnostics",
+            "find vector stale marker",
+        ],
         &repo,
         &store_dir,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -984,7 +1045,7 @@ fn semantic_stale_index_refuses_vector_hits() {
     let _writer = hold_index_before_publish(&repo, &store_dir, "semantic-stale");
 
     let (code, out, err) = run_with_env(
-        &["search", "--json", "semantic_stale_marker"],
+        &["search", "--json", "--diagnostics", "semantic_stale_marker"],
         &repo,
         &store_dir,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -1013,7 +1074,7 @@ fn diagnostics_json_exposes_provider_incompleteness() {
         "index . should succeed; stderr={err}\nstdout={out}"
     );
 
-    let (code, out, err) = run(&["diagnostics", "--json"], &repo, &store);
+    let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 73,
         "diagnostics must be non-zero while providers are incomplete; stderr={err}\nstdout={out}"
@@ -1064,7 +1125,7 @@ fn doctor_json_reports_missing_index_as_structured_status() {
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let store = root.join("store");
 
-    let (code, out, err) = run(&["doctor", "--json"], &repo, &store);
+    let (code, out, err) = run(&["doctor", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 1,
         "doctor --json without an index should return status code 1; stderr={err}\nstdout={out}"
@@ -1108,7 +1169,11 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
         "index . should succeed; stderr={err}\nstdout={out}"
     );
 
-    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["index", "status", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "index status --json should stay healthy when indexed code has no file failures; stderr={err}\nstdout={out}"
@@ -1154,7 +1219,11 @@ fn index_status_is_unhealthy_for_real_provider_file_failures() {
         .expect("inject supported-provider file failure");
     drop(graph);
 
-    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["index", "status", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 73,
         "a real provider file failure must fail health; stderr={err}\nstdout={out}"
@@ -1208,7 +1277,11 @@ fn index_status_json_exposes_dirty_overlay_breakdown() {
     .unwrap();
     std::fs::write(repo.join("ignored.log"), "generated\n").unwrap();
 
-    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["index", "status", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 73,
         "dirty index status should be unhealthy; stderr={err}\nstdout={out}"
@@ -1336,7 +1409,12 @@ fn discover_scope_env_controls_index_and_query_freshness() {
     );
 
     let (code, out, err) = run_with_env(
-        &["search-symbol", "clean_committed_marker", "--json"],
+        &[
+            "search-symbol",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
         &scope_env,
@@ -1360,7 +1438,12 @@ fn discover_scope_env_controls_index_and_query_freshness() {
     );
 
     let (code, out, err) = run(
-        &["search-symbol", "clean_committed_marker", "--json"],
+        &[
+            "search-symbol",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -1409,7 +1492,12 @@ fn pure_head_drift_refreshes_metadata_without_reindexing() {
     assert_ne!(before.head_oid, committed.head_oid);
 
     let (code, out, err) = run(
-        &["search-symbol", "clean_committed_marker", "--json"],
+        &[
+            "search-symbol",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store_dir,
     );
@@ -1532,7 +1620,12 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
     // The text miss cascade echoes the query and similar names, so the
     // no-leak property is pinned on the JSON hit set itself.
     let (code, out, err) = run(
-        &["search-symbol", "old_atomic_marker", "--json"],
+        &[
+            "search-symbol",
+            "old_atomic_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -1600,7 +1693,12 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         "unchanged file's graph rows must be preserved by incremental temp snapshot; got {out:?}"
     );
     let (code, out, err) = run(
-        &["search-symbol", "old_incremental_marker", "--json"],
+        &[
+            "search-symbol",
+            "old_incremental_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -1649,7 +1747,12 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
     // The old snapshot remains physically valid but is stale relative to the
     // worktree, so graph queries must refuse it.
     let (code, out, err) = run_with_env(
-        &["search-symbol", "old_failure_marker", "--json"],
+        &[
+            "search-symbol",
+            "old_failure_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -1669,7 +1772,12 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
     // The failed temp graph must never become visible: its new symbol
     // is absent from the preserved active index.
     let (code, out, err) = run_with_env(
-        &["search-symbol", "new_failure_marker", "--json"],
+        &[
+            "search-symbol",
+            "new_failure_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -1724,7 +1832,7 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
         "new symbol must be visible after corrupt-active recovery; got {out:?}"
     );
 
-    let (code, out, err) = run(&["diagnostics", "--json"], &repo, &store);
+    let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 73,
         "diagnostics should still report provider incompleteness, not store corruption; stderr={err}\nstdout={out}"
@@ -1849,7 +1957,12 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         "new symbol must be visible after recovery index; got {out:?}"
     );
     let (code, out, err) = run(
-        &["search-symbol", "old_kill_marker", "--json"],
+        &[
+            "search-symbol",
+            "old_kill_marker",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -1944,7 +2057,12 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
         ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
     ];
     let (code, out, err) = run_with_env(
-        &["search-symbol", "--json", "old_large_drift_marker"],
+        &[
+            "search-symbol",
+            "--json",
+            "--diagnostics",
+            "old_large_drift_marker",
+        ],
         &repo,
         &store,
         &envs,
@@ -1972,7 +2090,12 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
     assert_eq!(first_job["state"], "refreshing");
 
     let (code, out, err) = run_with_env(
-        &["search-symbol", "--json", "old_large_drift_marker"],
+        &[
+            "search-symbol",
+            "--json",
+            "--diagnostics",
+            "old_large_drift_marker",
+        ],
         &repo,
         &store,
         &envs,

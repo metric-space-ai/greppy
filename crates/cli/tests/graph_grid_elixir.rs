@@ -220,7 +220,11 @@ end
 "#,
     )
     .expect("rewrite helper.ex");
-    let (code, out, err) = run(&["who-calls", "do_it_renamed", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "do_it_renamed", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
     let value: serde_json::Value = serde_json::from_str(&out).expect("who-calls json");
     assert_eq!(value["fresh"], true, "{value}");

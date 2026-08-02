@@ -253,7 +253,7 @@ fn limit_max_aliases_hold_and_paths_are_flag_only() {
 fn global_output_flags_work_before_and_after_subcommand() {
     let (repo, store) = indexed_repo("global-flags");
 
-    for flag in ["--json", "--code", "--all"] {
+    for flag in ["--json", "--diagnostics", "--code", "--all"] {
         let before = run(&[flag, "who-calls", "target"], &repo, &store);
         let after = run(&["who-calls", "target", flag], &repo, &store);
         if flag == "--json" {

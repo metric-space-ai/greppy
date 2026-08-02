@@ -353,7 +353,11 @@ fn graph_grid_ruby_stale_edit_detected() {
 
     // Heal-in-band contract (1b7135b): a healable drift is reindexed in-band
     // and served fresh against the updated graph.
-    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "healable stale edit must be healed in-band and served; stderr={err}\nstdout={out}"

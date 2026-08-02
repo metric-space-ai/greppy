@@ -313,7 +313,15 @@ fn path_json_reports_shortest_path_counts_and_metadata() {
     let (repo, store) = index_fixture("path-json");
 
     let (code, out, err) = run(
-        &["path", "--from", "entry", "--to", "leaf", "--json"],
+        &[
+            "path",
+            "--from",
+            "entry",
+            "--to",
+            "leaf",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -358,7 +366,15 @@ fn provider_policy_require_complete_blocks_path_json() {
     let (repo, store) = index_fixture("provider-policy-path-json");
 
     let (code, out, err) = run_with_env(
-        &["path", "--from", "entry", "--to", "leaf", "--json"],
+        &[
+            "path",
+            "--from",
+            "entry",
+            "--to",
+            "leaf",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -396,7 +412,15 @@ fn path_json_refuses_stale_steps_when_auto_reindex_disabled() {
     .unwrap();
 
     let (code, out, err) = run_with_env(
-        &["path", "--from", "entry", "--to", "leaf", "--json"],
+        &[
+            "path",
+            "--from",
+            "entry",
+            "--to",
+            "leaf",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
         &[("GREPPY_AUTO_REINDEX", "0")],
@@ -438,7 +462,15 @@ fn path_json_auto_reindexes_small_stale_drift() {
     .unwrap();
 
     let (first_code, first_out, first_err) = run(
-        &["path", "--from", "entry", "--to", "leaf", "--json"],
+        &[
+            "path",
+            "--from",
+            "entry",
+            "--to",
+            "leaf",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -454,7 +486,15 @@ fn path_json_auto_reindexes_small_stale_drift() {
     assert!(first["steps"].as_array().unwrap().is_empty());
 
     let (code, out, err) = run(
-        &["path", "--from", "entry", "--to", "leaf", "--json"],
+        &[
+            "path",
+            "--from",
+            "entry",
+            "--to",
+            "leaf",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -486,7 +526,15 @@ fn path_json_reports_no_path_without_text_parsing() {
     let (repo, store) = index_fixture("path-json-none");
 
     let (code, out, _err) = run(
-        &["path", "--from", "leaf", "--to", "entry", "--json"],
+        &[
+            "path",
+            "--from",
+            "leaf",
+            "--to",
+            "entry",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );

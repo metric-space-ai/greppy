@@ -343,7 +343,11 @@ fn context_lines_flag_prefixes_line_numbers() {
 fn context_json_reports_source_and_budget_metadata() {
     let (repo, store) = index_fixture("ctx-json");
 
-    let (code, out, err) = run(&["context", "do_it", "--json", "--k", "1"], &repo, &store);
+    let (code, out, err) = run(
+        &["context", "do_it", "--json", "--diagnostics", "--k", "1"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "context --json should exit 0; stderr={err}\nstdout={out}"
@@ -407,7 +411,14 @@ fn context_json_reports_span_truncation_metadata() {
     );
 
     let (code, out, err) = run(
-        &["context", "long_context_target", "--json", "--k", "1"],
+        &[
+            "context",
+            "long_context_target",
+            "--json",
+            "--diagnostics",
+            "--k",
+            "1",
+        ],
         &repo,
         &store,
     );
@@ -547,7 +558,11 @@ fn plus_outputs_grep_like_signal_rows() {
 fn plus_json_reports_budget_and_ranked_hits_without_changing_text_default() {
     let (repo, store) = index_fixture("plus-json");
 
-    let (code, out, err) = run(&["plus", "do_it", "--json", "--k", "1"], &repo, &store);
+    let (code, out, err) = run(
+        &["plus", "do_it", "--json", "--diagnostics", "--k", "1"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "plus --json should exit 0; stderr={err}\nstdout={out}"
@@ -599,7 +614,11 @@ fn plus_json_reports_budget_and_ranked_hits_without_changing_text_default() {
 fn plus_vectors_json_skips_embedding_on_literal_control_before_model_load() {
     let (repo, store) = index_fixture("plus-vector-literal-control");
 
-    let (code, out, err) = run(&["plus", "do_it", "--json", "--k", "1"], &repo, &store);
+    let (code, out, err) = run(
+        &["plus", "do_it", "--json", "--diagnostics", "--k", "1"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "literal plus should skip vector model load and still return exact plus hits; stderr={err}\nstdout={out}"
@@ -631,7 +650,14 @@ fn plus_vectors_json_skips_embedding_on_graph_control_before_model_load() {
     let (repo, store) = index_fixture("plus-vector-graph-control");
 
     let (code, out, err) = run(
-        &["plus", "Who calls DoIt", "--json", "--k", "1"],
+        &[
+            "plus",
+            "Who calls DoIt",
+            "--json",
+            "--diagnostics",
+            "--k",
+            "1",
+        ],
         &repo,
         &store,
     );
@@ -690,7 +716,11 @@ fn plus_json_refuses_current_request_while_small_drift_refreshes() {
     )
     .unwrap();
 
-    let (code, out, err) = run(&["plus", "do_it", "--json", "--k", "3"], &repo, &store);
+    let (code, out, err) = run(
+        &["plus", "do_it", "--json", "--diagnostics", "--k", "3"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 75,
         "refreshing plus must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
@@ -809,7 +839,11 @@ fn who_calls_without_code_omits_body() {
 fn brief_json_preserves_definition_and_expand_contract() {
     let (repo, store) = index_fixture("brief-json-contract");
 
-    let (code, out, err) = run(&["brief", "caller", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["brief", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "brief --json should exit 0; stderr={err}");
     let value: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("brief JSON invalid: {e}: {out}"));
@@ -832,8 +866,11 @@ fn brief_json_preserves_definition_and_expand_contract() {
     let expand_id = value["expand_id"]
         .as_str()
         .expect("brief JSON must return a stored expand id");
-    let (expand_code, expand_out, expand_err) =
-        run(&["expand", expand_id, "--json"], &repo, &store);
+    let (expand_code, expand_out, expand_err) = run(
+        &["expand", expand_id, "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         expand_code, 0,
         "brief expand handle must be immediately readable; stderr={expand_err}"

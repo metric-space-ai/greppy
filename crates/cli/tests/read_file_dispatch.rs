@@ -216,7 +216,11 @@ fn read_handle_is_compact_and_existing_json_shape_survives() {
     std::fs::write(repo.join("lib.rs"), "pub fn target() {}\n").unwrap();
     index(&repo, &store);
 
-    let (code, stdout, stderr) = run(&repo, &store, &["read", "target", "--handle", "--json"]);
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read", "target", "--handle", "--json", "--diagnostics"],
+    );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["schema_version"], "greppy.read.v1");

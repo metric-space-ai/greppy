@@ -406,7 +406,11 @@ local LIMIT = 99
     // and served fresh against the new graph. Both accepted spellings of the
     // renamed dotted symbol must resolve (the first query performs the heal).
     for symbol in ["do_it_renamed", "helper.do_it_renamed"] {
-        let (code, out, err) = run(&["who-calls", symbol, "--json"], &repo, &store);
+        let (code, out, err) = run(
+            &["who-calls", symbol, "--json", "--diagnostics"],
+            &repo,
+            &store,
+        );
         assert_eq!(
             code, 0,
             "healable stale edit for {symbol} must be healed in-band and served; stderr={err}\nstdout={out}"

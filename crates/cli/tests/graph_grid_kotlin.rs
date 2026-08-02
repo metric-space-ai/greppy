@@ -145,7 +145,11 @@ fn edge_keys(value: &serde_json::Value) -> Vec<(String, String, String)> {
 #[test]
 fn graph_grid_kotlin_who_calls_finds_cross_file_caller() {
     let (repo, store) = index_fixture("who-calls");
-    let (code, out, err) = run(&["who-calls", "helperFunction", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "helperFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "who-calls should succeed; stderr={err}\nstdout={out}"
@@ -164,7 +168,11 @@ fn graph_grid_kotlin_who_calls_finds_cross_file_caller() {
 #[test]
 fn graph_grid_kotlin_who_calls_empty_for_uncalled() {
     let (repo, store) = index_fixture("who-calls-empty");
-    let (code, out, err) = run(&["who-calls", "uncalledHelper", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "uncalledHelper", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "uncalled symbol should be a valid query; stderr={err}\nstdout={out}"
@@ -187,7 +195,11 @@ fn graph_grid_kotlin_who_calls_empty_for_uncalled() {
 #[test]
 fn graph_grid_kotlin_callees_lists_cross_file_target() {
     let (repo, store) = index_fixture("callees");
-    let (code, out, err) = run(&["callees", "caller", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["callees", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "callees should succeed; stderr={err}\nstdout={out}"
@@ -206,7 +218,11 @@ fn graph_grid_kotlin_callees_lists_cross_file_target() {
 #[test]
 fn graph_grid_kotlin_impact_transitive_reaches_caller() {
     let (repo, store) = index_fixture("impact");
-    let (code, out, err) = run(&["impact", "helperFunction", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["impact", "helperFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "impact should succeed; stderr={err}\nstdout={out}");
     let value = json(&out, "impact helperFunction");
     assert!(
@@ -235,7 +251,11 @@ fn graph_grid_kotlin_search_symbol_finds_all_definitions() {
         "markerValue",
         "Payload",
     ] {
-        let (code, out, err) = run(&["search-symbol", symbol, "--json"], &repo, &store);
+        let (code, out, err) = run(
+            &["search-symbol", symbol, "--json", "--diagnostics"],
+            &repo,
+            &store,
+        );
         assert_eq!(
             code, 0,
             "search-symbol {symbol} should succeed; stderr={err}\nstdout={out}"
@@ -305,8 +325,11 @@ fn graph_grid_kotlin_graph_survives_reindex() {
         "second Kotlin index should succeed; stderr={first_index_err}\nstdout={first_index_out}"
     );
 
-    let (code, first_out, first_err) =
-        run(&["who-calls", "helperFunction", "--json"], &repo, &store);
+    let (code, first_out, first_err) = run(
+        &["who-calls", "helperFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "references after reindex should succeed; stderr={first_err}"
@@ -319,8 +342,11 @@ fn graph_grid_kotlin_graph_survives_reindex() {
         code, 0,
         "third Kotlin index should succeed; stderr={second_index_err}\nstdout={second_index_out}"
     );
-    let (code, second_out, second_err) =
-        run(&["who-calls", "helperFunction", "--json"], &repo, &store);
+    let (code, second_out, second_err) = run(
+        &["who-calls", "helperFunction", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "references after second reindex should succeed; stderr={second_err}"
@@ -360,7 +386,11 @@ fun render(payload: Payload): Int = payload.value
     )
     .unwrap();
 
-    let (code, out, err) = run(&["callees", "caller", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["callees", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert!(
         code == 0 || code == 75,
         "stale graph query must either heal or report freshness, got code={code}; stderr={err}\nstdout={out}"
@@ -388,7 +418,11 @@ fn graph_grid_kotlin_declarative_or_edge_case() {
     // Kotlin `object` is a singleton declaration rather than a class keyword,
     // but it is still a named, importable type in the graph.  Certification
     // requires the definition to remain searchable as a Class node.
-    let (code, out, err) = run(&["search-symbol", "KotlinMarker", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "KotlinMarker", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "Kotlin object search should succeed; stderr={err}\nstdout={out}"

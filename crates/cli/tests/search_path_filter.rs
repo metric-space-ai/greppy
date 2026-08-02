@@ -103,7 +103,14 @@ fn search_symbol_path_json_counts_the_filtered_set() {
     let (code, out, err) = run(
         &repo,
         &store,
-        &["search-symbol", "parse_widget", "--path", "src", "--json"],
+        &[
+            "search-symbol",
+            "parse_widget",
+            "--path",
+            "src",
+            "--json",
+            "--diagnostics",
+        ],
     );
 
     assert_eq!(code, 0, "stdout={out}\nstderr={err}");
@@ -135,6 +142,7 @@ fn search_pattern_path_filters_rows_before_counting() {
             "--path",
             "src",
             "--json",
+            "--diagnostics",
         ],
     );
 

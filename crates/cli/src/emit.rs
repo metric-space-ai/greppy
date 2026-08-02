@@ -892,14 +892,23 @@ pub(crate) fn print_semantic_fallback_commands(query: &str, paths: &[String], ro
     }
 }
 
-pub(crate) fn finish_output_capture(spec: &OutputBudgetSpec, exit_code: u8) {
+pub(crate) fn finish_output_capture(
+    budget: Option<&OutputBudgetSpec>,
+    compact_json: bool,
+    exit_code: u8,
+) {
     use std::io::Write as _;
 
     let captured = OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default());
-    let rendered = if spec.json {
-        budget_json_output(&captured, spec).unwrap_or(captured)
+    let captured = if compact_json {
+        compact_default_json_output(&captured).unwrap_or(captured)
     } else {
-        budget_text_output(&captured, spec, exit_code)
+        captured
+    };
+    let rendered = match budget {
+        Some(spec) if spec.json => budget_json_output(&captured, spec).unwrap_or(captured),
+        Some(spec) => budget_text_output(&captured, spec, exit_code),
+        None => captured,
     };
     let _ = std::io::stdout().lock().write_all(&rendered);
 }

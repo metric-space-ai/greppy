@@ -327,7 +327,7 @@ fn direct_navigation_json_reports_exact_counts() {
     ];
 
     for (cmd, symbol, expected_qname, expected_edge) in cases {
-        let (code, out, err) = run(&[cmd, symbol, "--json"], &repo, &store);
+        let (code, out, err) = run(&[cmd, symbol, "--json", "--diagnostics"], &repo, &store);
         assert_eq!(
             code, 0,
             "{cmd} --json should exit 0; stderr={err}\nstdout={out}"
@@ -389,6 +389,95 @@ fn direct_navigation_json_reports_exact_counts() {
     }
 }
 
+#[test]
+fn default_json_is_answer_only_and_diagnostics_restores_the_envelope() {
+    let (repo, store) = index_fixture("answer-only-json");
+
+    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("compact who-calls JSON");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["total_exact"], 1);
+    assert_eq!(value["shown"], 1);
+    assert!(value.get("omitted").is_none(), "{value}");
+    assert!(value.get("truncated").is_none(), "{value}");
+    for dropped in [
+        "command",
+        "project",
+        "fresh",
+        "freshness",
+        "provider_complete",
+        "incomplete_provider_count",
+        "incomplete_providers",
+    ] {
+        assert!(value.get(dropped).is_none(), "{dropped} leaked: {value}");
+    }
+    let hit = &value["hits"][0];
+    for required in ["qualified_name", "file", "line", "start_line", "end_line"] {
+        assert!(hit.get(required).is_some(), "missing {required}: {value}");
+    }
+    for dropped in ["file_path", "node_id", "rank", "schema_version"] {
+        assert!(hit.get(dropped).is_none(), "{dropped} leaked: {value}");
+    }
+    assert!(
+        value["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("incomplete provider")),
+        "provider incompleteness must survive as one short warning: {value}"
+    );
+
+    let (code, out, err) = run(&["search-symbol", "do_it", "--json"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("compact search JSON");
+    let hit = &value["hits"][0];
+    assert_eq!(value["status"], "ok");
+    for dropped in ["command", "freshness", "node_id", "rank"] {
+        assert!(
+            value.get(dropped).is_none() && hit.get(dropped).is_none(),
+            "{dropped} leaked: {value}"
+        );
+    }
+
+    let (code, out, err) = run(&["read", "do_it", "--json"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("compact read JSON");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["total_exact"], 1);
+    assert_eq!(value["shown"], 1);
+    assert_eq!(value["file"], "src/helper.rs");
+    assert!(value["source"]
+        .as_str()
+        .is_some_and(|source| source.contains("answer = 42")));
+    for dropped in ["schema_version", "command", "byte_start", "byte_end"] {
+        assert!(value.get(dropped).is_none(), "{dropped} leaked: {value}");
+    }
+
+    let (code, out, err) = run(
+        &["who-calls", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("diagnostic who-calls JSON");
+    assert_eq!(value["command"], "who-calls");
+    assert_eq!(value["freshness"]["state"], "fresh");
+    assert!(value["incomplete_providers"].is_array());
+}
+
+#[test]
+fn first_use_json_is_one_parseable_document_without_progress_noise() {
+    let (repo, store) = make_graph_repo("first-use-json");
+    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    assert!(
+        !err.contains("first use") && !out.contains("greppy: indexing"),
+        "JSON first use must suppress progress noise; stderr={err:?} stdout={out:?}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).expect("first-use JSON document");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["total_exact"], 1);
+}
+
 /// Small drift heals in-band (1b7135b): the triggering request reindexes and
 /// serves the POST-drift truth with `fresh: true` — never the old generation.
 #[test]
@@ -413,7 +502,11 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
     )
     .unwrap();
 
-    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "healable small drift must serve fresh results; stderr={err}\nstdout={out}"
@@ -468,7 +561,11 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
     )
     .unwrap();
 
-    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "healable multi-file drift must serve fresh results; stderr={err}\nstdout={out}"
@@ -492,7 +589,11 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
 
     // The same healed generation must also know the symbol added in the
     // SECOND drifted file, with its post-drift caller.
-    let (code, out, err) = run(&["who-calls", "late_helper", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["who-calls", "late_helper", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "the healed generation must resolve the symbol added in helper.rs; stderr={err}\nstdout={out}"
@@ -558,22 +659,26 @@ fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
 
     let json_cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
-            vec!["search-graph", "--name", "do_it", "--json"],
+            vec!["search-graph", "--name", "do_it", "--json", "--diagnostics"],
             "search-graph",
             "hits",
         ),
         (
-            vec!["trace", "--symbol", "caller", "--json"],
+            vec!["trace", "--symbol", "caller", "--json", "--diagnostics"],
             "trace",
             "steps",
         ),
         (
-            vec!["graph-locate", "src/helper.rs:1", "--json"],
+            vec!["graph-locate", "src/helper.rs:1", "--json", "--diagnostics"],
             "graph-locate",
             "hits",
         ),
-        (vec!["impact", "do_it", "--json"], "impact", "hits"),
-        (vec!["fan-in", "--json"], "fan-in", "hits"),
+        (
+            vec!["impact", "do_it", "--json", "--diagnostics"],
+            "impact",
+            "hits",
+        ),
+        (vec!["fan-in", "--json", "--diagnostics"], "fan-in", "hits"),
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
         let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
@@ -679,7 +784,11 @@ fn trace_outgoing_default_walks_to_callee() {
 fn trace_json_reports_steps_counts_and_metadata() {
     let (repo, store) = index_fixture("trace-json");
 
-    let (code, out, err) = run(&["trace", "--symbol", "caller", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["trace", "--symbol", "caller", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "trace --json should exit 0; stderr={err}\nstdout={out}"
@@ -766,7 +875,11 @@ fn search_symbols_prints_label_and_file_line() {
 fn search_symbols_json_reports_exact_counts_and_metadata() {
     let (repo, store) = index_fixture("symbols-json");
 
-    let (code, out, err) = run(&["search-symbol", "Widget", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "Widget", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "search-symbol --json should exit 0; stderr={err}\nstdout={out}"
@@ -818,7 +931,11 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     )
     .unwrap();
 
-    let (code, out, err) = run(&["search-symbol", "WidgetRenamed", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["search-symbol", "WidgetRenamed", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 0,
         "search-symbol must heal one-file drift in-band; stderr={err}\nstdout={out}"
@@ -872,7 +989,7 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
         "indexer did not reach the publication failpoint"
     );
 
-    let (code, out, err) = run(&["read", "do_it", "--json"], &repo, &store);
+    let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 0,
         "read must wait for the edit-owned refresh; stderr={err}\nstdout={out}"
@@ -905,7 +1022,13 @@ fn search_graph_json_reports_exact_counts_and_metadata() {
     let (repo, store) = index_fixture("search-graph-json");
 
     let (code, out, err) = run(
-        &["search-graph", "--name", "Widget", "--json"],
+        &[
+            "search-graph",
+            "--name",
+            "Widget",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
@@ -940,24 +1063,42 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
 
     let cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
-            vec!["search-graph", "--name", "Widget", "--json"],
+            vec![
+                "search-graph",
+                "--name",
+                "Widget",
+                "--json",
+                "--diagnostics",
+            ],
             "search-graph",
             "hits",
         ),
         (
-            vec!["trace", "--symbol", "caller", "--json"],
+            vec!["trace", "--symbol", "caller", "--json", "--diagnostics"],
             "trace",
             "steps",
         ),
-        (vec!["who-calls", "do_it", "--json"], "who-calls", "hits"),
-        (vec!["who-calls", "Widget", "--json"], "who-calls", "hits"),
         (
-            vec!["graph-locate", "src/lib.rs:6", "--json"],
+            vec!["who-calls", "do_it", "--json", "--diagnostics"],
+            "who-calls",
+            "hits",
+        ),
+        (
+            vec!["who-calls", "Widget", "--json", "--diagnostics"],
+            "who-calls",
+            "hits",
+        ),
+        (
+            vec!["graph-locate", "src/lib.rs:6", "--json", "--diagnostics"],
             "graph-locate",
             "hits",
         ),
-        (vec!["impact", "do_it", "--json"], "impact", "hits"),
-        (vec!["fan-in", "--json"], "fan-in", "hits"),
+        (
+            vec!["impact", "do_it", "--json", "--diagnostics"],
+            "impact",
+            "hits",
+        ),
+        (vec!["fan-in", "--json", "--diagnostics"], "fan-in", "hits"),
     ];
 
     for (args, command, empty_field) in cases {
@@ -1034,6 +1175,7 @@ fn graph_locate_json_reports_metadata_and_no_match() {
             "--line",
             "9",
             "--json",
+            "--diagnostics",
         ],
         &repo,
         &store,
@@ -1064,7 +1206,11 @@ fn graph_locate_json_reports_metadata_and_no_match() {
         .unwrap_or("")
         .contains("render"));
 
-    let (code, out, err) = run(&["graph-locate", "src/lib.rs:4", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["graph-locate", "src/lib.rs:4", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(
         code, 1,
         "graph-locate no-match should exit 1; stderr={err}\nstdout={out}"
@@ -1224,7 +1370,11 @@ fn fan_degree_json_reports_exact_counts_and_metadata() {
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
-    let (code, out, err) = run(&["fan-in", "--limit", "3", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["fan-in", "--limit", "3", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "fan-in --json should exit 0; stderr={err}");
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid fan-in json: {e}; stdout={out:?}"));
@@ -1244,7 +1394,11 @@ fn fan_degree_json_reports_exact_counts_and_metadata() {
         .unwrap_or("")
         .contains("hub"));
 
-    let (code, out, err) = run(&["fan-out", "--limit", "3", "--json"], &repo, &store);
+    let (code, out, err) = run(
+        &["fan-out", "--limit", "3", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
     assert_eq!(code, 0, "fan-out --json should exit 0; stderr={err}");
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid fan-out json: {e}; stdout={out:?}"));
@@ -1312,7 +1466,7 @@ fn impact_json_reports_exact_scope_counts_and_metadata() {
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
-    let (code, out, err) = run(&["impact", "hub", "--json"], &repo, &store);
+    let (code, out, err) = run(&["impact", "hub", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 0,
         "impact --json should exit 0; stderr={err}\nstdout={out}"
@@ -1359,7 +1513,14 @@ fn impact_json_explicit_calls_edge_is_not_remapped_to_all_references() {
     assert_eq!(code, 0, "index must succeed; stderr={err}\nstdout={out}");
 
     let (code, out, err) = run(
-        &["impact", "hub", "--edge", "CALLS", "--json"],
+        &[
+            "impact",
+            "hub",
+            "--edge",
+            "CALLS",
+            "--json",
+            "--diagnostics",
+        ],
         &repo,
         &store,
     );
