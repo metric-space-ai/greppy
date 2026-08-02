@@ -116,3 +116,24 @@ pair, not the run failing. Raw Pi traces are NOT kept in `--output-dir`.
    `bash`, so `git log --all -p` can be read instead of solving the task.
 
 Until 1-3 are repaired, coding-bench numbers are not a release proof.
+
+## gpu3 environment for the agent benches (agent_efficiency)
+
+A non-interactive `ssh gpu3 '...'` shell does NOT get the right toolchain and
+the failure is silent in the results file: every arm records `return_code 1`,
+zero tokens, zero tool calls, and `error: None`. Read as "8/8 budget
+compliance" that is really "nothing ran".
+
+```
+export PATH=$HOME/.nvm/versions/node/v22.23.1/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH
+set -a; . ~/.config/secrets/minimax.env; set +a
+```
+
+- **`pi` requires Node 22.** The system node is v12.22.9 and the nvm default is
+  v20.20.1; both crash inside undici with
+  `TypeError: webidl.util.markAsUncloneable is not a function`. Verify with
+  `pi --version` (expect 0.80.2) before trusting any run.
+- `pi` itself lives at `~/.local/bin/pi`, the provider key at
+  `~/.config/secrets/minimax.env` (never echo it).
+- Always check a finished run for `return_code` and non-zero token counts
+  before computing any ratio from it.
