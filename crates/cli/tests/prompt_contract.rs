@@ -357,7 +357,7 @@ fn the_prompt_is_frozen_byte_for_byte() {
     use std::fmt::Write as _;
 
     const APPROVED_SHA256: &str =
-        "9972c50e5fdc82cb40a6a62db92a7be763a128f14f7c71b97d8c32462b33dbb8";
+        "bbf88347d8956d3587dac408f9e59ef04cd5d94f8e2b7c06d116cb42dad58321";
 
     let text = prompt();
     let digest = {

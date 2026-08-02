@@ -79,6 +79,12 @@ EDIT:
   --verify                   runs the build or linter for the touched files and
                              reports the diagnostics against symbols and spans
 
+RUN:
+  bash-smart -- CMD …        runs CMD untouched — same bytes, env and exit code;
+                             long output arrives as its head and tail with one
+                             line naming the hidden range, and `greppy expand ID`
+                             prints exactly those lines
+
 CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
   greppy search-symbol NAME --json | greppy read -
   greppy callees S --json | greppy read -

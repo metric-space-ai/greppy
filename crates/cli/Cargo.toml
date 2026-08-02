@@ -48,11 +48,13 @@ windows-sys = { workspace = true, features = [
 # build bakes both models and tokenizers into the binary. The only inference
 # build choices are the accelerated backends; CPU is always available.
 [features]
-default = []
-# bash-smart is 0.4.0 work: the training-free v1 layers are built and tested,
-# but the classifier head that makes them "smart" is not. 0.3.0 must not ship a
-# command whose name promises more than the release delivers, so the verb is
-# compiled out by default and the suites run with --features bash-smart.
+default = ["bash-smart"]
+# bash-smart ships in 0.3.0. The v1 layers are training-free by construction —
+# byte-preserving capture, mechanical skeletons, arithmetic repetition collapse,
+# hash-guarded paged expansion — so they need no classifier head. The 250k
+# EmbeddingGemma adapter that will lift signal lines is a later improvement to
+# an already-shipping command, not a precondition for it. The prompt therefore
+# promises the mechanics and says nothing about classification.
 bash-smart = []
 # Internal debug/CI fixture mode. It replaces the 827 MB payloads with four
 # SHA-verified sentinels so non-inference integration tests can start quickly.

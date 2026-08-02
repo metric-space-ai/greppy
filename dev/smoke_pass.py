@@ -61,6 +61,13 @@ CASES = {
     "footer-json-search": (["search-pattern", "fn parse_path", "--json"], {0}, [r'"command": "search-pattern"']),
     "footer-limit-nav": (["who-calls", "parse_path", "--limit", "1"], {0}, [r"^\S+:\d+  \S+"]),
     "footer-path-read": (["read", "parse_path", "--path", "edit-src"], {0}, []),
+    # bash-smart ships in 0.3.0. The prompt promises: argv untouched, same exit
+    # code, long output folded to head+tail with one line naming the true hidden
+    # range and an expand id. Each clause is checked against the binary.
+    "run-passthrough-exit": (["bash-smart", "--", "sh", "-c", "echo hi; exit 3"], {3}, [r"^hi$"]),
+    "run-fold-true-count": (["bash-smart", "--", "sh", "-c",
+                             "for i in $(seq 1 2000); do echo line $i; done"], {0},
+                            [r"lines 22-1970", r"greppy expand [0-9a-f]{8,}"]),
 }
 
 REMOVED = ["find-usages", "references", "map", "outline", "changes", "verify",
@@ -68,7 +75,7 @@ REMOVED = ["find-usages", "references", "map", "outline", "changes", "verify",
 
 # Compiled out of 0.3.0 (feature `bash-smart`): not retired vocabulary, so it
 # is not refused — it is simply not a greppy verb and falls through to grep.
-NOT_IN_THIS_RELEASE = ["bash-smart"]
+NOT_IN_THIS_RELEASE = []
 
 
 def run(binary: str, tail: list[str]) -> tuple[int, str]:
