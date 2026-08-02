@@ -265,7 +265,7 @@ def plus_sys(root: str) -> str:
 RATE_LIMIT_BACKOFFS_S = (45, 90, 180)
 
 
-def _greppy_on_path_env() -> dict:
+def _greppy_on_path_env(allow_greppy: bool) -> dict:
     """The agent must be able to spell `greppy` the way the manual does.
 
     AGENTS.md — which IS the greppy arm's prompt — writes `greppy who-calls S`.
@@ -273,8 +273,18 @@ def _greppy_on_path_env() -> dict:
     path, so the agent burned calls on `greppy: command not found` before
     falling back. That is harness friction charged to the product. A symlink
     in a run-local bin dir, prepended to PATH, makes the bench match
-    deployment. Only the greppy arm gets it (the baselines have no greppy).
+    deployment.
+
+    Only the greppy arm may have it. This used to be a claim in this docstring
+    while the call site passed the same env to every arm, so the baselines had
+    greppy on PATH and used it: in the 2026-07-31 run the uncoached `explorer`
+    baseline invoked greppy in 88 of 115 tasks (461 verb calls) and the
+    restricted `grep` arm in 41. That makes the contrast measure greppy against
+    a partly-greppy baseline and understates the difference. The invariant is
+    now an argument, and `assert_arm_isolation` re-checks it from the traces.
     """
+    if not allow_greppy:
+        return dict(os.environ)
     bindir = pathlib.Path(tempfile.gettempdir()) / "greppy-bench-bin"
     bindir.mkdir(parents=True, exist_ok=True)
     link = bindir / "greppy"
@@ -295,6 +305,7 @@ def run_pi(
     cwd: str,
     timeout: int = 240,
     raw_path: pathlib.Path | None = None,
+    allow_greppy: bool = False,
 ) -> dict:
     """Drive the pi.dev agent once. Returns separated input/output token usage,
     tool-call count, wall-clock, answer, and any error.
@@ -324,7 +335,7 @@ def run_pi(
         t0 = time.time()
         try:
             p = subprocess.run(
-                cmd, cwd=cwd, stdin=subprocess.DEVNULL, env=_greppy_on_path_env(),
+                cmd, cwd=cwd, stdin=subprocess.DEVNULL, env=_greppy_on_path_env(allow_greppy),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
             )
             out = p.stdout.decode("utf-8", "replace")
@@ -948,7 +959,8 @@ def main() -> None:
                 print(f"   {label:<10}resume existing result", file=sys.stderr)
             else:
                 res = run_pi(with_budget(agent_prompts[agent](root)), t["q"], cwd=root,
-                             raw_path=raw(agent))
+                             raw_path=raw(agent),
+                             allow_greppy=agent in ("greppy", "plus"))
                 row[agent] = res
                 if raw_root:
                     raw_paths[agent] = str(raw(agent))
