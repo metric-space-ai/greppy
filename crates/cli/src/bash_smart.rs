@@ -553,7 +553,7 @@ fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
-        return status.signal().map(|signal| 128 + signal).unwrap_or(1);
+        status.signal().map(|signal| 128 + signal).unwrap_or(1)
     }
     #[cfg(not(unix))]
     {
@@ -898,10 +898,10 @@ fn pack_line_ranges(pack: &greppy_store::ExpandPack, line_count: usize) -> Vec<(
         .collect()
 }
 
-fn take_range_page(
-    ranges: &[(usize, usize)],
-    page_lines: usize,
-) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+/// Inclusive 1-based line ranges, the shape every expansion page speaks in.
+type LineRanges = Vec<(usize, usize)>;
+
+fn take_range_page(ranges: &[(usize, usize)], page_lines: usize) -> (LineRanges, LineRanges) {
     let mut page = Vec::new();
     let mut remaining = Vec::new();
     let mut available = page_lines;
