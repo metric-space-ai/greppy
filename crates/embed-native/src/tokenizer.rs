@@ -142,6 +142,16 @@ impl PromptTokenizer {
             .map_err(|e| Error::Tokenizer(e.to_string()))
     }
 
+    /// Encode a text FRAGMENT: no special tokens. A line inside a window is not
+    /// a standalone prompt; per-line BOS/EOS would put two foreign tokens into
+    /// every line span the head pools over.
+    pub fn encode_fragment_ids(&self, text: &str) -> Result<Vec<u32>> {
+        self.raw_tokenizer
+            .encode(text, false)
+            .map(|enc| enc.get_ids().to_vec())
+            .map_err(|e| Error::Tokenizer(e.to_string()))
+    }
+
     /// Number of tokens in a single prompt without padding or truncation.
     pub fn token_len(&self, text: &str) -> Result<usize> {
         self.encode_ids(text).map(|ids| ids.len())

@@ -297,7 +297,7 @@ impl EmbeddingGemma {
             .max(64);
         let mut encoded: Vec<Vec<u32>> = Vec::with_capacity(lines.len());
         for line in lines {
-            let mut tokens = self.tokenizer.encode_ids(line)?;
+            let mut tokens = self.tokenizer.encode_fragment_ids(line)?;
             if tokens.is_empty() {
                 tokens.push(0);
             }
