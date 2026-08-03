@@ -34,7 +34,7 @@ pub use sampler::{
     TRIAGE_GENERATION_PARAMS,
 };
 
-pub const MODEL_ID: &str = "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11";
+pub const MODEL_ID: &str = "greppy/qwen35-0.8b-function-purpose-mtp-q4km-944k-2026-07-25";
 pub const DIAGNOSTIC_TARGET_PREFILL_TOKENS: usize = 512;
 pub const DIAGNOSTIC_MAX_OUTPUT_TOKENS: usize = 128;
 

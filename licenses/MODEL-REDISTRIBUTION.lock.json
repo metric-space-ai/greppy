@@ -57,12 +57,12 @@
       ]
     },
     {
-      "id": "greppy-qwen35-function-purpose-2026-07-11",
+      "id": "greppy-qwen35-function-purpose-944k-2026-07-25",
       "release_ready": true,
       "assets": [
         {
           "path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
-          "sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
+          "sha256": "b36838d6969d415e08e7f91ab4aa069dcc260ec0801ea1d00bb5dab234181200",
           "size": 529297152
         },
         {
@@ -72,8 +72,8 @@
         },
         {
           "path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf.sha256",
-          "sha256": "4b706e274c13ce8cae516abdde80b1a3ec06b08d8586886c8838093baa1c02e3",
-          "size": 65
+          "sha256": "9671e3b6c0a58280e2745f60955096d4fb0b9d905d2564fdf82343dc62168cad",
+          "size": 64
         },
         {
           "path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json.sha256",

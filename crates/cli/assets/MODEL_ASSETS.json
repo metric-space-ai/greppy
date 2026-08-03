@@ -7,8 +7,8 @@
       "hf_repo": "metricspace/greppy-qwen35-mtp-q4km",
       "hf_file": "Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
       "dest": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
-      "sha256": "97c034cb9408ed2b2241171343dc7d46a08acb9cfa38683473d045180986eff4",
-      "revision": "e9b68576b80e4b0dcda55638b7f5d941a739aacf"
+      "sha256": "b36838d6969d415e08e7f91ab4aa069dcc260ec0801ea1d00bb5dab234181200",
+      "revision": "080231e8daee32cc185dd6070e2ca8095c6746bd"
     },
     {
       "hf_repo": "metricspace/greppy-qwen35-mtp-q4km",
