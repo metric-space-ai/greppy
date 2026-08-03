@@ -64,6 +64,17 @@ CASES = {
     # bash-smart ships in 0.3.0. The prompt promises: argv untouched, same exit
     # code, long output folded to head+tail with one line naming the true hidden
     # range and an expand id. Each clause is checked against the binary.
+    # The verdict grammar, owner-approved 2026-08-03: line 1 is the verdict,
+    # three forms, true counts, singular/plural. -e matches print as LINE  content.
+    "verdict-ok": (["bash-smart", "--", "sh", "-c", "echo hi"], {0},
+                   [r"^ok \u2014 exit 0$"]),
+    "verdict-warn": (["bash-smart", "--", "sh", "-c", "echo 'warning: unused import'"], {0},
+                     [r"^ok \u2014 exit 0, 1 warning$"]),
+    "verdict-failed": (["bash-smart", "--", "sh", "-c", "echo 'error[E0308]: boom'; exit 101"], {101},
+                       [r"^FAILED \u2014 exit 101: 1 error, 0 warnings$"]),
+    "verdict-match": (["bash-smart", "-e", "needle_xyz", "--", "sh", "-c",
+                       "for i in $(seq 1 200); do echo line $i; done; echo needle_xyz found"], {0},
+                      [r"^\d+  needle_xyz found$"]),
     "run-passthrough-exit": (["bash-smart", "--", "sh", "-c", "echo hi; exit 3"], {3}, [r"^hi$"]),
     "run-fold-true-count": (["bash-smart", "--", "sh", "-c",
                              "for i in $(seq 1 2000); do echo line $i; done"], {0},

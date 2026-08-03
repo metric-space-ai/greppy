@@ -80,10 +80,12 @@ EDIT:
                              reports the diagnostics against symbols and spans
 
 RUN:
-  bash-smart -- CMD …        runs CMD untouched — same bytes, env and exit code;
-                             long output arrives as its head and tail with one
-                             line naming the hidden range, and `greppy expand ID`
-                             prints exactly those lines
+  bash-smart [-e REGEX] -- CMD …   runs CMD unchanged, same exit code. Line 1 is
+                             the verdict: `ok — exit 0` or `ok — exit 0,
+                             3 warnings` or `FAILED — exit 101: 2 errors,
+                             1 warning`. Then each error and warning block and
+                             every REGEX match as `LINE  content`; the rest
+                             compacted, any part of the original printable.
 
 CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
   greppy search-symbol NAME --json | greppy read -
