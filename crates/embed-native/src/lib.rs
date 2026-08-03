@@ -295,9 +295,19 @@ impl EmbeddingGemma {
             .min(self.cfg_max_positions())
             .saturating_sub(8)
             .max(64);
+        // Per-line special tokens are DELIBERATE. Measured on the same
+        // 250-output ablation (error PR-AUC / recall at 50% precision):
+        //   per-line specials      0.52 / 0.50   <- this construction
+        //   newline framing + BOS  0.32 / 0.15
+        //   one BOS per window     0.16 / 0.00
+        //   bare fragments         0.14 / 0.02
+        // The per-line BOS/EOS act as per-line anchor tokens — a CLS per line
+        // whose state carries line-local information into the span mean. What
+        // looks like foreign tokens in the span is the best representation by
+        // a wide margin; do not "clean" it away again.
         let mut encoded: Vec<Vec<u32>> = Vec::with_capacity(lines.len());
         for line in lines {
-            let mut tokens = self.tokenizer.encode_fragment_ids(line)?;
+            let mut tokens = self.tokenizer.encode_ids(line)?;
             if tokens.is_empty() {
                 tokens.push(0);
             }
@@ -310,7 +320,7 @@ impl EmbeddingGemma {
             let mut ids: Vec<u32> = Vec::new();
             let mut spans: Vec<(usize, usize)> = Vec::new();
             while cursor < encoded.len()
-                && (ids.is_empty() || ids.len() + encoded[cursor].len() <= budget)
+                && (spans.is_empty() || ids.len() + encoded[cursor].len() <= budget)
             {
                 let start = ids.len();
                 ids.extend_from_slice(&encoded[cursor]);
