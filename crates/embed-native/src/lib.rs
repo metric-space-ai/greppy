@@ -309,7 +309,9 @@ impl EmbeddingGemma {
         while cursor < encoded.len() {
             let mut ids: Vec<u32> = Vec::new();
             let mut spans: Vec<(usize, usize)> = Vec::new();
-            while cursor < encoded.len() && (ids.is_empty() || ids.len() + encoded[cursor].len() <= budget) {
+            while cursor < encoded.len()
+                && (ids.is_empty() || ids.len() + encoded[cursor].len() <= budget)
+            {
                 let start = ids.len();
                 ids.extend_from_slice(&encoded[cursor]);
                 spans.push((start, ids.len()));
