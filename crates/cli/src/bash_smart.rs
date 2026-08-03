@@ -243,12 +243,19 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         stderr_lines.len() > STDERR_VERBATIM_LINES || (interrupted && !stderr_lines.is_empty());
     let stdout_all_groups = collapse_groups(&stdout_lines);
     let stderr_all_groups = collapse_groups(&stderr_lines);
-    let mut lifted_stdout = if stdout_lines.len() > SHORT_TOTAL_LINES {
+    // The embedding lift runs only when the command FAILED. On success the
+    // agent reads the tail confirmation and moves on — spending model time
+    // there buys lines nobody asked for; on failure it is exactly where the
+    // attention belongs. (Owner-approved gating, 2026-08-03. Skeleton and
+    // expand id are unaffected; the block classifier will replace this
+    // heuristic behind the same gate.)
+    let lift_worthwhile = exit_code != 0;
+    let mut lifted_stdout = if lift_worthwhile && stdout_lines.len() > SHORT_TOTAL_LINES {
         novelty_lifts(&stdout_lines, &stdout_all_groups, root)
     } else {
         Vec::new()
     };
-    let mut lifted_stderr = if stderr_folded {
+    let mut lifted_stderr = if lift_worthwhile && stderr_folded {
         novelty_lifts(&stderr_lines, &stderr_all_groups, root)
     } else {
         Vec::new()
