@@ -59,8 +59,17 @@ PROVIDERS = {
 }
 PROVIDER = "minimax"  # overridden by --llm-provider in main()
 BIN = os.environ.get("GREPPY_BENCH_BIN") or str(REPO / "target" / "release" / "greppy")
-CORPUS = HERE / "corpus"
-REALCORPUS = HERE / "realcorpus"
+# The corpora must live OUTSIDE the greppy checkout. They used to sit under
+# bench/agent_efficiency/, i.e. inside the repository that also contains
+# target/release/greppy — so a baseline agent denied greppy on PATH simply ran
+# `find . -name greppy -type f`, found the 1.1 GB binary two directories up and
+# used it. Measured in the 2026-08-02 smoke: 21 greppy calls in 5 vanilla tasks,
+# with the model visibly hunting for it (`which greppy; find / -name greppy`).
+# Denying PATH is not enough while the tool is lying in the working tree.
+_CORPUS_HOME = pathlib.Path(
+    os.environ.get("GREPPY_BENCH_CORPUS_HOME") or (HERE / "_corpora"))
+CORPUS = _CORPUS_HOME / "corpus"
+REALCORPUS = _CORPUS_HOME / "realcorpus"
 TASKS = HERE / "tasks_v2.json"
 RESULTS = HERE / "results.json"
 RAW_ROOT = HERE / "raw_runs"
@@ -140,20 +149,25 @@ def repo_meta(repo: str) -> tuple[str, str]:
     to ('mixed', 'real') instead of crashing on a missing REPO_META key."""
     return REPO_META.get(repo, ("mixed", "real"))
 
-GREP_SYS = (
-    "You are answering a question about the code in this repository. You may use "
-    "the shell ONLY for /usr/bin/grep and plain file viewing (cat/head/sed/wc), "
-    "plus the read tool. You do NOT have greppy, ripgrep, ctags, or any code "
-    "index -- work like a plain-grep user. Be efficient: stop as soon as you can "
-    "answer. End with the final answer."
-)
+# The baseline is vanilla pi: pi's own coding-agent system prompt, its own tool
+# definitions (--tools bash,read), same model. The harness appends NOTHING to it.
+#
+# It used to append a paragraph that enumerated "grep, cat, sed, head, find, wc"
+# — tools are defined by --tools, so the list was redundant and, worse, implied
+# a smaller shell than bash actually gives — framed every task as answering a
+# question although the suite contains edit tasks, and told this arm to be
+# "thorough" while the greppy arm was told to "Be efficient". That is an
+# instruction asymmetry on the exact axis the benchmark measures, and it
+# flattered greppy for free. Both sentences are gone; neither arm is coached.
+EXPLORER_SYS = ""
 
-# Realistic baseline: a normal coding agent with grep + read and NO efficiency
-# coaching — how an agent without code-intelligence actually explores code.
-EXPLORER_SYS = (
-    "You are a coding agent answering a question about this repository. You have "
-    "the shell (grep, cat, sed, head, find, wc) and a read tool. Explore the code "
-    "as needed to give a thorough, correct answer. End with the final answer."
+# Kept only for the historical three-arm runs. It is an artificial condition —
+# a plain-grep user forbidden the index and told to stop early — not a product
+# baseline, and it is not part of the 0.3.0 release contrast.
+GREP_SYS = (
+    "You may use the shell ONLY for /usr/bin/grep and plain file viewing "
+    "(cat/head/sed/wc), plus the read tool. You do NOT have greppy, ripgrep, "
+    "ctags, or any code index -- work like a plain-grep user."
 )
 
 
@@ -167,16 +181,15 @@ def gp_sys(root: str) -> str:
     copy drifted once (nav-v4 still advertised four removed verbs against the
     0.3.0 binary — every such call would have died in the vocabulary refusal
     and the bench would have measured an agent with a lying manual). The
-    preamble carries only what the file cannot know: the binary path, the
-    repository root, and the --root requirement.
+    There is no preamble. The two arms must differ by exactly one thing — the
+    AGENTS.md appendix — so anything else in the greppy arm's prompt would be a
+    second difference and a second explanation for any measured gap. The path
+    is handled by the environment (greppy on PATH) and the root by greppy
+    itself: the manual says it "finds the current one by itself", and the agent
+    already runs with cwd set to the repository.
     """
-    return (
-        f"Answer the question about the code at {root} using the `greppy` "
-        f"command; pass `--root {root}` on every call. Its manual:\n\n"
-        + AGENTS_MD
-        + "\nBe efficient, inspect enough returned evidence to answer "
-        "correctly, and end with the final answer."
-    )
+    del root  # greppy detects the repository from the agent's cwd itself
+    return AGENTS_MD
 
 
 # A call budget the paper's frontier needs and natural stop cannot show.
@@ -284,8 +297,17 @@ def _greppy_on_path_env(allow_greppy: bool) -> dict:
     now an argument, and `assert_arm_isolation` re-checks it from the traces.
     """
     if not allow_greppy:
-        return dict(os.environ)
-    bindir = pathlib.Path(tempfile.gettempdir()) / "greppy-bench-bin"
+        # Strip every PATH entry that holds a greppy executable — an install,
+        # or the symlink dir a previous greppy-arm run left behind. Denying the
+        # symlink but leaving it findable is not denial.
+        env = dict(os.environ)
+        keep = [d for d in env.get("PATH", "").split(os.pathsep)
+                if d and not (pathlib.Path(d) / "greppy").exists()]
+        env["PATH"] = os.pathsep.join(keep)
+        return env
+    # Run-local, so it cannot outlive this process and be found by a later
+    # baseline run. The old fixed /tmp/greppy-bench-bin persisted for days.
+    bindir = pathlib.Path(tempfile.gettempdir()) / f"greppy-bench-bin-{os.getpid()}"
     bindir.mkdir(parents=True, exist_ok=True)
     link = bindir / "greppy"
     target = pathlib.Path(BIN).resolve()
@@ -327,8 +349,13 @@ def run_pi(
         "--provider", PROVIDER,
         "--model", PROVIDERS[PROVIDER]["model"], "--mode", "json", "--no-session",
         "--thinking", "off", "--tools", "bash,read",
-        "--append-system-prompt", system, question,
     ]
+    # An empty system string means the vanilla agent: pi's own coding-agent
+    # prompt, untouched. Passing an empty --append-system-prompt would still be
+    # a harness fingerprint, so the flag is omitted entirely.
+    if system:
+        cmd += ["--append-system-prompt", system]
+    cmd.append(question)
     attempts = 0
     for backoff_s in RATE_LIMIT_BACKOFFS_S + (None,):
         attempts += 1
