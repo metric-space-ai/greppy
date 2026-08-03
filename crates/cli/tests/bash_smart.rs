@@ -9,7 +9,7 @@
 #![cfg(all(unix, feature = "bash-smart"))]
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -163,6 +163,72 @@ fn repeated_middle_is_collapsed_arithmetically() {
     assert!(expanded.stderr.is_empty(), "{}", text(&expanded.stderr));
     assert_eq!(expanded.stdout, "hello\n".repeat(249).as_bytes());
     assert_eq!(text(&expanded.stdout).lines().count(), 249);
+}
+
+#[test]
+fn signal_forwards_to_child_group_and_keeps_expandable_partial_output() {
+    let workspace = fresh_workspace("signal");
+    let _ = command(&workspace)
+        .args(["bash-smart", "--", "true"])
+        .output()
+        .expect("warmup bash-smart");
+
+    let child_pid_path = workspace.base.join("child.pid");
+    let script = format!(
+        "echo $$ > {}; i=1; while [ $i -le 100000 ]; do echo line $i; i=$((i + 1)); sleep 0.01; done",
+        child_pid_path.display()
+    );
+    let started = Instant::now();
+    let greppy = command(&workspace)
+        .args(["bash-smart", "--", "sh", "-c", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn signal bash-smart");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !child_pid_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let child_pid = std::fs::read_to_string(&child_pid_path)
+        .expect("child pid file")
+        .trim()
+        .parse::<i32>()
+        .expect("numeric child pid");
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(unsafe { libc::kill(greppy.id() as i32, libc::SIGINT) }, 0);
+
+    let output = greppy
+        .wait_with_output()
+        .expect("wait for signal bash-smart");
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert!(started.elapsed() < Duration::from_secs(2), "{stderr}");
+    assert_eq!(output.status.code(), Some(130), "stderr={stderr}");
+    assert!(stdout.contains("line 1\n"), "{stdout}");
+    let id = expand_id(&stdout);
+    assert!(
+        stderr.contains("bash-smart: interrupted by signal 2; partial output stored as"),
+        "{stderr}"
+    );
+
+    let expanded = run(&workspace, &["expand", id]);
+    assert_eq!(expanded.status.code(), Some(0));
+    assert!(text(&expanded.stdout).contains("line "));
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while unsafe { libc::kill(-child_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        unsafe { libc::kill(-child_pid, 0) },
+        -1,
+        "child process group {child_pid} survived"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[test]

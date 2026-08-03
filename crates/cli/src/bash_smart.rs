@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::LazyLock;
 
 const SHORT_TOTAL_LINES: usize = 80;
 const STDERR_VERBATIM_LINES: usize = 40;
@@ -20,6 +23,21 @@ const NOVELTY_DISTANCE_FLOOR: f32 = 0.12;
 const PACK_SCHEMA_VERSION: u64 = 1;
 const PACK_HEAD_BYTES: u64 = 32 * 1024 * 1024;
 const PACK_TAIL_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(unix)]
+const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+static PATH_TEMPLATE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?x)(?:[A-Za-z]:[\\/]|\.{0,2}/|/)[^\s`'\"]+"#)
+        .expect("bash-smart path template regex")
+});
+static HEX_TEMPLATE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:0x)?[0-9a-f]{6,}\b").expect("bash-smart hex template regex")
+});
+static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
+
+#[cfg(unix)]
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Clone, Copy)]
 struct RawLine<'a> {
@@ -55,12 +73,69 @@ struct StoredRaw {
     payload: serde_json::Value,
 }
 
+#[cfg(unix)]
+extern "C" fn record_signal(signal: libc::c_int) {
+    let _ = PENDING_SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+struct SignalGuard {
+    previous_int: libc::sighandler_t,
+    previous_term: libc::sighandler_t,
+}
+
+#[cfg(unix)]
+impl SignalGuard {
+    fn install() -> std::io::Result<Self> {
+        PENDING_SIGNAL.store(0, Ordering::Relaxed);
+        let handler = record_signal as *const () as libc::sighandler_t;
+        let previous_int = unsafe { libc::signal(libc::SIGINT, handler) };
+        if previous_int == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+        let previous_term = unsafe { libc::signal(libc::SIGTERM, handler) };
+        if previous_term == libc::SIG_ERR {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::signal(libc::SIGINT, previous_int);
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            previous_int,
+            previous_term,
+        })
+    }
+
+    fn take() -> Option<i32> {
+        match PENDING_SIGNAL.swap(0, Ordering::Relaxed) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_int);
+            libc::signal(libc::SIGTERM, self.previous_term);
+        }
+        PENDING_SIGNAL.store(0, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     if argv.is_empty() {
         return Err(Error::Invalid(
             "bash-smart requires a command after `--`".into(),
         ));
     }
+
+    #[cfg(unix)]
+    let _signal_guard = SignalGuard::install()
+        .map_err(|error| Error::io("install bash-smart signal handlers", error))?;
 
     // Open the pack namespace before spawning: both pipe-drainer threads write
     // straight into this directory while the child runs. The completed output
@@ -107,20 +182,26 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
         .filter(|value| *value > 0);
     let started = std::time::Instant::now();
     let mut timed_out = false;
+    let mut forwarded_signal = None;
     let status = loop {
+        #[cfg(unix)]
+        if let Some(signal) = SignalGuard::take() {
+            forwarded_signal = Some(signal);
+            break wait_after_forwarded_signal(&mut child, signal)
+                .map_err(|error| Error::io("wait for interrupted bash-smart command", error))?;
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None)
-                if timeout_ms
-                    .is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) =>
-            {
-                timed_out = true;
-                kill_child_tree(&mut child);
-                break child
-                    .wait()
-                    .map_err(|error| Error::io("wait for timed-out bash-smart command", error))?;
+            Ok(None) => {
+                if timeout_ms.is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) {
+                    timed_out = true;
+                    kill_child_tree(&mut child);
+                    break child.wait().map_err(|error| {
+                        Error::io("wait for timed-out bash-smart command", error)
+                    })?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Err(error) => return Err(Error::io("wait for bash-smart command", error)),
         }
     };
@@ -133,14 +214,16 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     let timeout_stderr_line = timed_out
         .then(|| line_before_largest_gap(&stderr_capture.timestamps_path, capture_end_micros))
         .flatten();
-    let exit_code = child_exit_code(&status);
+    let exit_code = forwarded_signal
+        .map(|signal| 128 + signal)
+        .unwrap_or_else(|| child_exit_code(&status));
     let raw = StoredRaw::from_capture(stdout_capture, stderr_capture)?;
     let stdout_lines = split_lines(&raw.stdout);
     let stderr_lines = split_lines(&raw.stderr);
 
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
-    let interrupted = timed_out || status.code().is_none();
+    let interrupted = timed_out || forwarded_signal.is_some() || status.code().is_none();
     let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
 
     // Kills and timeouts always receive an id, even when the partial wall is
@@ -158,21 +241,25 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     let stdout_folded = !short || interrupted;
     let stderr_folded =
         stderr_lines.len() > STDERR_VERBATIM_LINES || (interrupted && !stderr_lines.is_empty());
+    let stdout_all_groups = collapse_groups(&stdout_lines);
+    let stderr_all_groups = collapse_groups(&stderr_lines);
     let mut lifted_stdout = if stdout_lines.len() > SHORT_TOTAL_LINES {
-        novelty_lifts(&stdout_lines, root)
+        novelty_lifts(&stdout_lines, &stdout_all_groups, root)
     } else {
         Vec::new()
     };
     let mut lifted_stderr = if stderr_folded {
-        novelty_lifts(&stderr_lines, root)
+        novelty_lifts(&stderr_lines, &stderr_all_groups, root)
     } else {
         Vec::new()
     };
     push_line_lift(&mut lifted_stdout, &stdout_lines, timeout_stdout_line);
     push_line_lift(&mut lifted_stderr, &stderr_lines, timeout_stderr_line);
 
-    let stdout_ranges = expansion_ranges(&stdout_lines, exit_code, &lifted_stdout);
-    let stderr_ranges = expansion_ranges(&stderr_lines, exit_code, &lifted_stderr);
+    let stdout_groups = folded_middle_groups(&stdout_lines, exit_code, &stdout_all_groups);
+    let stderr_groups = folded_middle_groups(&stderr_lines, exit_code, &stderr_all_groups);
+    let stdout_ranges = expansion_ranges(&stdout_lines, exit_code, &stdout_groups, &lifted_stdout);
+    let stderr_ranges = expansion_ranges(&stderr_lines, exit_code, &stderr_groups, &lifted_stderr);
     let stdout_id = store.as_ref().and_then(|store| {
         insert_pack(store, &project, &query, &raw, "stdout", &stdout_ranges).ok()
     });
@@ -187,7 +274,7 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     if stdout_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stdout_id.as_deref()) {
             let gated = byte_gate(store, id, "stdout", &lifted_stdout);
-            render_folded(false, &stdout_lines, exit_code, id, &gated);
+            render_folded(false, &stdout_lines, exit_code, id, &stdout_groups, &gated);
         } else {
             write_stream(false, &raw.stdout);
         }
@@ -198,7 +285,7 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     if stderr_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stderr_id.as_deref()) {
             let gated = byte_gate(store, id, "stderr", &lifted_stderr);
-            render_folded(true, &stderr_lines, exit_code, id, &gated);
+            render_folded(true, &stderr_lines, exit_code, id, &stderr_groups, &gated);
         } else {
             write_stream(true, &raw.stderr);
         }
@@ -220,6 +307,12 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
             std::io::stderr(),
             "bash-smart: timed out after {} ms; partial output stored as {}",
             timeout_ms.unwrap_or_default(),
+            stdout_id.as_deref().unwrap_or("unavailable")
+        );
+    } else if let Some(signal) = forwarded_signal {
+        let _ = writeln!(
+            std::io::stderr(),
+            "bash-smart: interrupted by signal {signal}; partial output stored as {}",
             stdout_id.as_deref().unwrap_or("unavailable")
         );
     } else if status.code().is_none() {
@@ -533,6 +626,42 @@ fn command_for_argv(argv: &[String]) -> std::process::Command {
     }
 }
 
+#[cfg(unix)]
+fn wait_after_forwarded_signal(
+    child: &mut std::process::Child,
+    signal: i32,
+) -> std::io::Result<std::process::ExitStatus> {
+    let process_group = child.id() as i32;
+    if unsafe { libc::kill(-process_group, signal) } != 0 {
+        let _ = unsafe { libc::kill(process_group, signal) };
+    }
+
+    let deadline = std::time::Instant::now() + SIGNAL_GRACE;
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        let group_is_gone = unsafe { libc::kill(-process_group, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if group_is_gone {
+            if let Some(status) = status.take() {
+                return Ok(status);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // A descendant may ignore the forwarded signal while retaining a pipe.
+    // Reap the whole dedicated process group before joining either drainer.
+    let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if let Some(status) = status {
+        Ok(status)
+    } else {
+        child.wait()
+    }
+}
+
 fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -799,15 +928,36 @@ fn folded_middle_bounds(lines: &[RawLine<'_>], exit_code: i32) -> (usize, usize)
     (head_end, tail_start)
 }
 
+fn folded_middle_groups(
+    lines: &[RawLine<'_>],
+    exit_code: i32,
+    all_groups: &[CollapseGroup],
+) -> Vec<CollapseGroup> {
+    let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
+    all_groups
+        .iter()
+        .filter_map(|group| {
+            let start = group.start.max(head_end + 1);
+            let end = group.end.min(tail_start);
+            (start <= end).then(|| CollapseGroup {
+                start: start - head_end,
+                end: end - head_end,
+                representative: lines[start - 1].raw.to_vec(),
+                template: group.template.clone(),
+            })
+        })
+        .collect()
+}
+
 fn displayed_middle_lines(
     lines: &[RawLine<'_>],
     exit_code: i32,
+    groups: &[CollapseGroup],
     lifted: &[LiftedLine],
 ) -> Vec<usize> {
     let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
-    let middle = &lines[head_end..tail_start];
-    let mut displayed = collapse_groups(middle)
-        .into_iter()
+    let mut displayed = groups
+        .iter()
         .filter(|group| group.count() > 1)
         .map(|group| head_end + group.start)
         .collect::<Vec<_>>();
@@ -854,10 +1004,11 @@ fn full_line_range(lines: &[RawLine<'_>]) -> Vec<(usize, usize)> {
 fn expansion_ranges(
     lines: &[RawLine<'_>],
     exit_code: i32,
+    groups: &[CollapseGroup],
     lifted: &[LiftedLine],
 ) -> Vec<(usize, usize)> {
     let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
-    let displayed = displayed_middle_lines(lines, exit_code, lifted);
+    let displayed = displayed_middle_lines(lines, exit_code, groups, lifted);
     let hidden = hidden_middle_ranges(head_end, tail_start, &displayed);
     if hidden.is_empty() {
         full_line_range(lines)
@@ -960,6 +1111,7 @@ fn render_folded(
     lines: &[RawLine<'_>],
     exit_code: i32,
     id: &str,
+    groups: &[CollapseGroup],
     lifted: &[LiftedLine],
 ) {
     let mut writer: Box<dyn Write> = if stderr {
@@ -976,8 +1128,6 @@ fn render_folded(
     }
     ensure_newline_after_raw(&mut writer, lines, head_end.checked_sub(1));
 
-    let middle = &lines[head_end..tail_start];
-    let groups = collapse_groups(middle);
     for group in groups.iter().filter(|group| group.count() > 1) {
         let _ = writer.write_all(&group.representative);
         if !group.representative.ends_with(b"\n") {
@@ -993,7 +1143,7 @@ fn render_folded(
         let _ = writer.write_all(b"\n");
     }
 
-    let displayed = displayed_middle_lines(lines, exit_code, lifted);
+    let displayed = displayed_middle_lines(lines, exit_code, groups, lifted);
     let hidden_ranges = hidden_middle_ranges(head_end, tail_start, &displayed);
     if !hidden_ranges.is_empty() {
         let hidden_count = hidden_ranges
@@ -1038,7 +1188,18 @@ fn ensure_newline_after_raw(
     }
 }
 
-fn novelty_lifts(lines: &[RawLine<'_>], root: Option<&str>) -> Vec<LiftedLine> {
+fn novelty_lifts(
+    lines: &[RawLine<'_>],
+    groups: &[CollapseGroup],
+    root: Option<&str>,
+) -> Vec<LiftedLine> {
+    let middle_end = lines.len().saturating_sub(SUCCESS_TAIL_LINES);
+    if !groups
+        .iter()
+        .any(|group| group.count() == 1 && group.start > HEAD_LINES && group.start <= middle_end)
+    {
+        return Vec::new();
+    }
     if test_inference_skipped() {
         return Vec::new();
     }
@@ -1067,7 +1228,6 @@ fn novelty_lifts(lines: &[RawLine<'_>], root: Option<&str>) -> Vec<LiftedLine> {
         let Ok(model) = load_embedding_model(&cfg, cache_dir) else {
             return Vec::new();
         };
-        let groups = collapse_groups(lines);
         let mut embedded = Vec::<(usize, Vec<f32>)>::new();
         for chunk in groups.chunks(EMBED_BATCH_LINES) {
             let texts = chunk
@@ -1090,10 +1250,10 @@ fn novelty_lifts(lines: &[RawLine<'_>], root: Option<&str>) -> Vec<LiftedLine> {
                 return Vec::new();
             }
             for ((index, _), vector) in valid.into_iter().zip(vectors) {
-                embedded.push((groups_index(&groups, chunk, index), vector));
+                embedded.push((groups_index(groups, chunk, index), vector));
             }
         }
-        rank_novelty(lines, &groups, &embedded)
+        rank_novelty(lines, groups, &embedded)
     }
 }
 
@@ -1216,12 +1376,9 @@ fn collapse_groups(lines: &[RawLine<'_>]) -> Vec<CollapseGroup> {
 
 fn normalized_template(line: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(line).ok()?;
-    let path_re = regex::Regex::new(r#"(?x)(?:[A-Za-z]:[\\/]|\.{0,2}/|/)[^\s`'\"]+"#).ok()?;
-    let hex_re = regex::Regex::new(r"(?i)\b(?:0x)?[0-9a-f]{6,}\b").ok()?;
-    let digits_re = regex::Regex::new(r"\d+").ok()?;
-    let masked = path_re.replace_all(text, "<PATH>");
-    let masked = hex_re.replace_all(&masked, "<HEX>");
-    let masked = digits_re.replace_all(&masked, "<N>");
+    let masked = PATH_TEMPLATE_RE.replace_all(text, "<PATH>");
+    let masked = HEX_TEMPLATE_RE.replace_all(&masked, "<HEX>");
+    let masked = DIGITS_TEMPLATE_RE.replace_all(&masked, "<N>");
     // A wall of bare counters (`seq 1 500`) contains no stable shape worth
     // collapsing. Keep enough alphabetic context to distinguish a template
     // from values that merely happen to share a primitive type.
@@ -1349,6 +1506,31 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].count(), 3);
         assert_eq!(groups[0].template, "routine line …");
+    }
+
+    #[test]
+    fn folded_groups_clipped_from_full_collapse_match_direct_middle_collapse() {
+        let mut raw = Vec::new();
+        for line in 1..=100 {
+            if line <= 25 || line >= 70 {
+                writeln!(raw, "routine line {line}").unwrap();
+            } else {
+                writeln!(raw, "steady state").unwrap();
+            }
+        }
+        let lines = split_lines(&raw);
+        let all_groups = collapse_groups(&lines);
+        let clipped = folded_middle_groups(&lines, 0, &all_groups);
+        let (head_end, tail_start) = folded_middle_bounds(&lines, 0);
+        let direct = collapse_groups(&lines[head_end..tail_start]);
+
+        assert_eq!(clipped.len(), direct.len());
+        for (clipped, direct) in clipped.iter().zip(&direct) {
+            assert_eq!(clipped.start, direct.start);
+            assert_eq!(clipped.end, direct.end);
+            assert_eq!(clipped.representative, direct.representative);
+            assert_eq!(clipped.template, direct.template);
+        }
     }
 
     #[test]
