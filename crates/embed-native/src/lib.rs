@@ -264,6 +264,119 @@ impl EmbeddingGemma {
         self.tokenizer.max_length()
     }
 
+    /// One state per input line from ONE forward pass over the whole window.
+    ///
+    /// The pooled sentence vector keeps semantics and discards position, so a
+    /// head fitted to it cannot localise a block; measured, that path scores
+    /// 6-8% precision on the rare classes. bash-smart's classifier needs the
+    /// per-line states the spec asks for: "a small head reads the hidden state
+    /// at each line-end token — ONE forward pass per window".
+    ///
+    /// Lines are tokenized individually so the token span of each line is known
+    /// by construction, then concatenated into a single sequence. The final
+    /// layer's states are mean-pooled over each line's span.
+    ///
+    /// CPU only: `forward_stages` is implemented on `CpuEmbeddingModel` alone.
+    /// Metal and CUDA compute the same intermediates but do not surface them,
+    /// so shipping a head that needs them requires exposing them there too.
+    pub fn line_states(&self, lines: &[String]) -> Result<Vec<Vec<f32>>> {
+        let EmbeddingBackend::Cpu(model) = &self.backend else {
+            return Err(Error::InvalidGguf(
+                "line_states needs per-token states, which only the CPU backend exposes".into(),
+            ));
+        };
+        // The window is a TOKEN budget, not a line count. 64 lines of build
+        // output measured 4600 tokens against a 2048 position limit — lines are
+        // the unit the product speaks in, tokens are the unit the model can
+        // hold, and only the second one is a hard wall.
+        let budget = self
+            .tokenizer
+            .max_length()
+            .min(self.cfg_max_positions())
+            .saturating_sub(8)
+            .max(64);
+        let mut encoded: Vec<Vec<u32>> = Vec::with_capacity(lines.len());
+        for line in lines {
+            let mut tokens = self.tokenizer.encode_ids(line)?;
+            if tokens.is_empty() {
+                tokens.push(0);
+            }
+            tokens.truncate(budget);
+            encoded.push(tokens);
+        }
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(lines.len());
+        let mut cursor = 0usize;
+        while cursor < encoded.len() {
+            let mut ids: Vec<u32> = Vec::new();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            while cursor < encoded.len() && (ids.is_empty() || ids.len() + encoded[cursor].len() <= budget) {
+                let start = ids.len();
+                ids.extend_from_slice(&encoded[cursor]);
+                spans.push((start, ids.len()));
+                cursor += 1;
+            }
+            out.extend(self.states_for_chunk(model, &ids, &spans)?);
+        }
+        return Ok(out);
+    }
+
+    fn cfg_max_positions(&self) -> usize {
+        2048
+    }
+
+    fn states_for_chunk(
+        &self,
+        model: &CpuEmbeddingModel,
+        ids: &[u32],
+        spans: &[(usize, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mask = vec![1u32; ids.len()];
+        let stages = model.forward_stages(ids, &mask)?;
+        // Which layer to read is a measured choice, not an obvious one: the
+        // final layer of a retrieval-tuned encoder is anisotropic — on a sample
+        // wall every pairwise cosine sat between 0.977 and 1.000, which leaves a
+        // linear head almost no room. GREPPY_HEAD_LAYER selects; the default
+        // stays the last so behaviour is unchanged unless asked.
+        let wanted = std::env::var("GREPPY_HEAD_LAYER").ok();
+        let plain: Vec<_> = stages
+            .iter()
+            .filter(|s| {
+                s.name.starts_with("layer_") && s.name[6..].chars().all(|c| c.is_ascii_digit())
+            })
+            .collect();
+        let last = match wanted.as_deref() {
+            Some(index) => plain
+                .iter()
+                .find(|s| s.name == format!("layer_{index}"))
+                .copied(),
+            None => plain.last().copied(),
+        }
+        .ok_or_else(|| Error::InvalidGguf("no layer stage captured".into()))?;
+        let dim = last.values.len() / ids.len().max(1);
+        if dim == 0 {
+            return Err(Error::InvalidGguf("empty layer stage".into()));
+        }
+        let mut out = Vec::with_capacity(spans.len());
+        for &(start, end) in spans {
+            let mut acc = vec![0f32; dim];
+            let count = (end - start).max(1) as f32;
+            for token in start..end {
+                let base = token * dim;
+                for (slot, value) in acc.iter_mut().zip(&last.values[base..base + dim]) {
+                    *slot += *value;
+                }
+            }
+            for slot in acc.iter_mut() {
+                *slot /= count;
+            }
+            out.push(acc);
+        }
+        Ok(out)
+    }
+
     pub fn embedding_dim(&self) -> usize {
         EMBEDDING_DIM
     }
