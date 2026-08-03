@@ -1379,7 +1379,7 @@ fn dispatch_subcommand(
             dispatch_brief(targets.first().map(String::as_str), &path_opts, json, root)
         }
         #[cfg(feature = "bash-smart")]
-        Command::BashSmart { argv } => bash_smart::run(&argv, root),
+        Command::BashSmart { regexes, argv } => bash_smart::run(&argv, &regexes, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             symbols,

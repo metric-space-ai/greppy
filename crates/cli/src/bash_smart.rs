@@ -1,6 +1,6 @@
 //! Training-free `bash-smart`: byte-preserving command capture, mechanical
-//! skeletons, arithmetic repetition collapse, optional embedding novelty, and
-//! hash-guarded paged expansion.
+//! diagnostic blocks, regex lifts, skeletons, arithmetic repetition collapse,
+//! optional embedding novelty, and hash-guarded paged expansion.
 
 use super::*;
 use sha2::{Digest, Sha256};
@@ -35,6 +35,16 @@ static HEX_TEMPLATE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
+static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|assert(?:ion)? ?(?:failed|error)|E:)",
+    )
+    .expect("bash-smart error marker regex")
+});
+static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
+        .expect("bash-smart warning marker regex")
+});
 
 #[cfg(unix)]
 static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -63,6 +73,37 @@ impl CollapseGroup {
 struct LiftedLine {
     line: usize,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone)]
+struct AnswerLine {
+    stream: OutputStream,
+    line: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticBlock {
+    kind: BlockKind,
+    lines: Vec<AnswerLine>,
+}
+
+#[derive(Debug, Clone)]
+struct MatchGroup {
+    representative: AnswerLine,
+    count: usize,
 }
 
 #[derive(Clone)]
@@ -126,12 +167,13 @@ impl Drop for SignalGuard {
     }
 }
 
-pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
+pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Result<i32> {
     if argv.is_empty() {
         return Err(Error::Invalid(
             "bash-smart requires a command after `--`".into(),
         ));
     }
+    let matchers = compile_matchers(regexes)?;
 
     #[cfg(unix)]
     let _signal_guard = SignalGuard::install()
@@ -159,16 +201,20 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            let exit_code = if error.kind() == std::io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{}", verdict_line(exit_code, 0, 0, None));
+            let _ = stdout.flush();
             let _ = writeln!(
                 std::io::stderr(),
                 "bash-smart: failed to run {}: {error}",
                 argv[0]
             );
-            return Ok(if error.kind() == std::io::ErrorKind::NotFound {
-                127
-            } else {
-                126
-            });
+            return Ok(exit_code);
         }
     };
     let stdout = child.stdout.take().expect("piped child stdout");
@@ -220,6 +266,21 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     let raw = StoredRaw::from_capture(stdout_capture, stderr_capture)?;
     let stdout_lines = split_lines(&raw.stdout);
     let stderr_lines = split_lines(&raw.stderr);
+    let blocks = detect_blocks(&stdout_lines, &stderr_lines);
+    let matches = collect_matches(&stdout_lines, &stderr_lines, &matchers);
+    let error_count = blocks
+        .iter()
+        .filter(|block| block.kind == BlockKind::Error)
+        .count();
+    let warning_count = blocks.len().saturating_sub(error_count);
+    let annotation = termination_annotation(timed_out, forwarded_signal, &status);
+    render_answer_prefix(
+        &stdout_lines,
+        &stderr_lines,
+        &blocks,
+        &matches,
+        &verdict_line(exit_code, error_count, warning_count, annotation.as_deref()),
+    );
 
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
@@ -227,7 +288,8 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
 
     // Kills and timeouts always receive an id, even when the partial wall is
-    // short. Normal short output remains exactly byte-for-byte output only.
+    // short. Normal short output keeps its raw skeleton bytes after the answer
+    // prefix.
     if short && !interrupted {
         if let Some(store) = store.as_ref() {
             let ranges = full_line_range(&stdout_lines);
@@ -342,6 +404,317 @@ pub(crate) fn run(argv: &[String], root: Option<&str>) -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+fn compile_matchers(patterns: &[String]) -> Result<Vec<regex::bytes::Regex>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            regex::bytes::Regex::new(pattern).map_err(|error| {
+                Error::Invalid(format!("invalid bash-smart -e regex {pattern:?}: {error}"))
+            })
+        })
+        .collect()
+}
+
+fn plural(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn verdict_line(
+    exit_code: i32,
+    errors: usize,
+    warnings: usize,
+    annotation: Option<&str>,
+) -> String {
+    if exit_code == 0 {
+        let mut counts = Vec::new();
+        if errors > 0 {
+            counts.push(plural(errors, "error", "errors"));
+        }
+        if warnings > 0 {
+            counts.push(plural(warnings, "warning", "warnings"));
+        }
+        if counts.is_empty() {
+            "ok — exit 0".into()
+        } else {
+            format!("ok — exit 0, {}", counts.join(", "))
+        }
+    } else {
+        let mut line = format!(
+            "FAILED — exit {exit_code}: {}, {}",
+            plural(errors, "error", "errors"),
+            plural(warnings, "warning", "warnings")
+        );
+        if let Some(annotation) = annotation {
+            line.push_str(" (");
+            line.push_str(annotation);
+            line.push(')');
+        }
+        line
+    }
+}
+
+fn termination_annotation(
+    timed_out: bool,
+    forwarded_signal: Option<i32>,
+    status: &std::process::ExitStatus,
+) -> Option<String> {
+    if timed_out {
+        return Some("timeout".into());
+    }
+    if let Some(signal) = forwarded_signal {
+        return Some(signal_name(signal));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return Some(signal_name(signal));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = status;
+    None
+}
+
+fn signal_name(signal: i32) -> String {
+    #[cfg(unix)]
+    let name = match signal {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGILL => Some("SIGILL"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGFPE => Some("SIGFPE"),
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGPIPE => Some("SIGPIPE"),
+        libc::SIGALRM => Some("SIGALRM"),
+        libc::SIGTERM => Some("SIGTERM"),
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let name: Option<&str> = None;
+    name.map(str::to_owned)
+        .unwrap_or_else(|| format!("signal {signal}"))
+}
+
+/// Mechanical v1 diagnostic detection. This is deliberately the sole function
+/// that decides whether lines form error or warning blocks, so a classifier
+/// head can replace it without changing the rendering interface. stderr is
+/// retained as an origin signal on every line, but never starts a block by
+/// itself; an ambiguous stderr singleton therefore cannot be promoted solely
+/// because of its stream.
+fn detect_blocks(
+    stdout_lines: &[RawLine<'_>],
+    stderr_lines: &[RawLine<'_>],
+) -> Vec<DiagnosticBlock> {
+    fn indentation(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count()
+    }
+
+    fn blank(bytes: &[u8]) -> bool {
+        bytes.iter().all(u8::is_ascii_whitespace)
+    }
+
+    fn detail_prefix(bytes: &[u8]) -> bool {
+        let trimmed = bytes
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|start| &bytes[start..])
+            .unwrap_or_default();
+        let lower = trimmed
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        lower.starts_with(b"at ") || lower.starts_with(b"...") || lower.starts_with(b"caused by")
+    }
+
+    let mut blocks = Vec::new();
+    for (stream, lines) in [
+        (OutputStream::Stdout, stdout_lines),
+        (OutputStream::Stderr, stderr_lines),
+    ] {
+        let mut index = 0usize;
+        while index < lines.len() {
+            let kind = if ERROR_MARKER_RE.is_match(lines[index].content) {
+                Some(BlockKind::Error)
+            } else if WARNING_MARKER_RE.is_match(lines[index].content) {
+                Some(BlockKind::Warning)
+            } else {
+                None
+            };
+            let Some(kind) = kind else {
+                index += 1;
+                continue;
+            };
+
+            let marker_indent = indentation(lines[index].content);
+            let mut end = index + 1;
+            while end < lines.len() {
+                let content = lines[end].content;
+                if indentation(content) > marker_indent || blank(content) || detail_prefix(content)
+                {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(DiagnosticBlock {
+                kind,
+                lines: (index..end)
+                    .map(|line_index| AnswerLine {
+                        stream,
+                        line: line_index + 1,
+                        bytes: lines[line_index].content.to_vec(),
+                    })
+                    .collect(),
+            });
+            index = end;
+        }
+    }
+    blocks
+}
+
+fn collect_matches(
+    stdout_lines: &[RawLine<'_>],
+    stderr_lines: &[RawLine<'_>],
+    matchers: &[regex::bytes::Regex],
+) -> Vec<MatchGroup> {
+    if matchers.is_empty() {
+        return Vec::new();
+    }
+    let mut matching = Vec::new();
+    for (stream, lines) in [
+        (OutputStream::Stdout, stdout_lines),
+        (OutputStream::Stderr, stderr_lines),
+    ] {
+        matching.extend(
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    matchers
+                        .iter()
+                        .any(|matcher| matcher.is_match(line.content))
+                })
+                .map(|(index, line)| AnswerLine {
+                    stream,
+                    line: index + 1,
+                    bytes: line.content.to_vec(),
+                }),
+        );
+    }
+
+    let mut groups: Vec<MatchGroup> = Vec::new();
+    for line in matching {
+        let joins_previous = groups.last().is_some_and(|group| {
+            group.representative.stream == line.stream
+                && group.representative.line + group.count == line.line
+                && template_identical(&group.representative.bytes, &line.bytes)
+        });
+        if joins_previous {
+            groups.last_mut().expect("checked match group").count += 1;
+        } else {
+            groups.push(MatchGroup {
+                representative: line,
+                count: 1,
+            });
+        }
+    }
+    groups
+}
+
+fn template_identical(left: &[u8], right: &[u8]) -> bool {
+    left == right
+        || normalized_template(left)
+            .zip(normalized_template(right))
+            .is_some_and(|(left, right)| left.0 == right.0)
+}
+
+fn answer_line_is_gated(
+    stdout_lines: &[RawLine<'_>],
+    stderr_lines: &[RawLine<'_>],
+    line: &AnswerLine,
+) -> bool {
+    let lines = match line.stream {
+        OutputStream::Stdout => stdout_lines,
+        OutputStream::Stderr => stderr_lines,
+    };
+    lines
+        .get(line.line.saturating_sub(1))
+        .is_some_and(|stored| stored.content == line.bytes)
+}
+
+fn write_answer_line(
+    writer: &mut dyn Write,
+    stdout_lines: &[RawLine<'_>],
+    stderr_lines: &[RawLine<'_>],
+    line: &AnswerLine,
+) {
+    if !answer_line_is_gated(stdout_lines, stderr_lines, line) {
+        return;
+    }
+    let _ = write!(writer, "{}  ", line.line);
+    let _ = writer.write_all(&line.bytes);
+    let _ = writer.write_all(b"\n");
+}
+
+fn write_answer_prefix(
+    writer: &mut dyn Write,
+    stdout_lines: &[RawLine<'_>],
+    stderr_lines: &[RawLine<'_>],
+    blocks: &[DiagnosticBlock],
+    matches: &[MatchGroup],
+    verdict: &str,
+) {
+    let _ = writeln!(writer, "{verdict}");
+    for kind in [BlockKind::Error, BlockKind::Warning] {
+        for block in blocks.iter().filter(|block| block.kind == kind) {
+            for line in &block.lines {
+                write_answer_line(writer, stdout_lines, stderr_lines, line);
+            }
+        }
+    }
+    for group in matches {
+        let line = &group.representative;
+        if !answer_line_is_gated(stdout_lines, stderr_lines, line) {
+            continue;
+        }
+        let _ = write!(writer, "{}  ", line.line);
+        let _ = writer.write_all(&line.bytes);
+        if group.count > 1 {
+            let _ = write!(writer, " ({} matches)", group.count);
+        }
+        let _ = writer.write_all(b"\n");
+    }
+}
+
+fn render_answer_prefix(
+    stdout_lines: &[RawLine<'_>],
+    stderr_lines: &[RawLine<'_>],
+    blocks: &[DiagnosticBlock],
+    matches: &[MatchGroup],
+    verdict: &str,
+) {
+    let mut stdout = std::io::stdout().lock();
+    write_answer_prefix(
+        &mut stdout,
+        stdout_lines,
+        stderr_lines,
+        blocks,
+        matches,
+        verdict,
+    );
+    let _ = stdout.flush();
 }
 
 pub(crate) fn expand(
@@ -1557,6 +1930,115 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].content, b"building 90%");
         assert_eq!(lines[0].raw, b"building 10%\rbuilding 90%\r\n");
+    }
+
+    #[test]
+    fn verdict_ok_without_diagnostics_omits_zero_counts() {
+        assert_eq!(verdict_line(0, 0, 0, None), "ok — exit 0");
+    }
+
+    #[test]
+    fn verdict_ok_with_warnings_prints_warning_count() {
+        assert_eq!(verdict_line(0, 0, 3, None), "ok — exit 0, 3 warnings");
+    }
+
+    #[test]
+    fn verdict_ok_with_error_blocks_is_still_ok() {
+        let stdout = split_lines(b"error: marked despite success\n");
+        let blocks = detect_blocks(&stdout, &[]);
+        let errors = blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::Error)
+            .count();
+        assert_eq!(
+            verdict_line(0, errors, 3, None),
+            "ok — exit 0, 1 error, 3 warnings"
+        );
+    }
+
+    #[test]
+    fn verdict_failed_always_prints_both_counts() {
+        assert_eq!(
+            verdict_line(101, 2, 1, None),
+            "FAILED — exit 101: 2 errors, 1 warning"
+        );
+        assert_eq!(
+            verdict_line(1, 0, 0, None),
+            "FAILED — exit 1: 0 errors, 0 warnings"
+        );
+    }
+
+    #[test]
+    fn verdict_signal_is_annotated() {
+        assert_eq!(
+            verdict_line(130, 0, 0, Some("SIGINT")),
+            "FAILED — exit 130: 0 errors, 0 warnings (SIGINT)"
+        );
+        assert_eq!(
+            verdict_line(137, 0, 0, Some("timeout")),
+            "FAILED — exit 137: 0 errors, 0 warnings (timeout)"
+        );
+    }
+
+    #[test]
+    fn verdict_uses_singular_and_plural_nouns() {
+        assert_eq!(
+            verdict_line(2, 1, 1, None),
+            "FAILED — exit 2: 1 error, 1 warning"
+        );
+        assert_eq!(
+            verdict_line(2, 2, 2, None),
+            "FAILED — exit 2: 2 errors, 2 warnings"
+        );
+    }
+
+    #[test]
+    fn traceback_indented_and_caused_by_details_join_one_block() {
+        let stdout = split_lines(
+            b"Traceback (most recent call last):\n  File \"main.py\", line 3\n    run()\ncaused by missing fixture\nordinary tail\n",
+        );
+        let blocks = detect_blocks(&stdout, &[]);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Error);
+        assert_eq!(blocks[0].lines.len(), 4);
+        assert_eq!(blocks[0].lines[3].bytes, b"caused by missing fixture");
+    }
+
+    #[test]
+    fn stderr_origin_alone_does_not_create_a_block() {
+        let stderr = split_lines(b"compiler stopped here\n");
+        assert!(detect_blocks(&[], &stderr).is_empty());
+    }
+
+    #[test]
+    fn warning_marker_inside_error_detail_stays_in_error_block() {
+        let stdout = split_lines(b"error: outer\n  warning: nested context\nwarning: separate\n");
+        let blocks = detect_blocks(&stdout, &[]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, BlockKind::Error);
+        assert_eq!(blocks[0].lines.len(), 2);
+        assert_eq!(blocks[1].kind, BlockKind::Warning);
+    }
+
+    #[test]
+    fn repeated_e_patterns_or_together_and_collapse_consecutive_templates() {
+        let stdout = split_lines(
+            b"test_toml case 1 passed\ntest_toml case 2 passed\nunrelated\njson fixture passed\n",
+        );
+        let matchers = compile_matchers(&["test_toml".into(), "json".into()]).unwrap();
+        let groups = collect_matches(&stdout, &[], &matchers);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].representative.line, 1);
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(groups[1].representative.line, 4);
+        assert_eq!(groups[1].count, 1);
+
+        let mut rendered = Vec::new();
+        write_answer_prefix(&mut rendered, &stdout, &[], &[], &groups, "ok — exit 0");
+        assert_eq!(
+            rendered,
+            b"ok \xe2\x80\x94 exit 0\n1  test_toml case 1 passed (2 matches)\n4  json fixture passed\n"
+        );
     }
 
     #[test]

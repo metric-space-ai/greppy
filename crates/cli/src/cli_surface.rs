@@ -201,6 +201,9 @@ pub enum Command {
     #[cfg(feature = "bash-smart")]
     #[command(name = "bash-smart")]
     BashSmart {
+        /// Lift lines matching REGEX into the answer section. Repeatable.
+        #[arg(short = 'e', value_name = "REGEX", action = clap::ArgAction::Append)]
+        regexes: Vec<String>,
         /// Command argv after `--`.
         #[arg(
             value_name = "CMD",

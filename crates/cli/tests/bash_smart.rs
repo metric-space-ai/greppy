@@ -71,7 +71,7 @@ fn expand_id(stdout: &str) -> &str {
 }
 
 #[test]
-fn short_output_is_verbatim_and_exit_code_passes_through() {
+fn short_output_follows_verdict_and_exit_code_passes_through() {
     let workspace = fresh_workspace("short");
     let output = run(
         &workspace,
@@ -85,7 +85,10 @@ fn short_output_is_verbatim_and_exit_code_passes_through() {
     );
 
     assert_eq!(output.status.code(), Some(3));
-    assert_eq!(output.stdout, b"out\n");
+    assert_eq!(
+        output.stdout,
+        b"FAILED \xe2\x80\x94 exit 3: 0 errors, 0 warnings\nout\n"
+    );
     assert_eq!(output.stderr, b"err\n");
 }
 
@@ -109,8 +112,8 @@ fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
     assert!(stderr.is_empty(), "{stderr}");
 
     let id = expand_id(&stdout);
-    let expected = (1..=21)
-        .map(|line| format!("line {line}\n"))
+    let expected = std::iter::once("ok — exit 0\n".to_string())
+        .chain((1..=21).map(|line| format!("line {line}\n")))
         .chain(std::iter::once(format!(
             "… lines 22-170 (149 collapsed `line …` repeats) — greppy expand {id}\n"
         )))
@@ -147,7 +150,7 @@ fn repeated_middle_is_collapsed_arithmetically() {
 
     let id = expand_id(&stdout);
     let expected = format!(
-        "{}… lines 22-270 (249 collapsed `hello` repeats) — greppy expand {id}\n{}",
+        "ok — exit 0\n{}… lines 22-270 (249 collapsed `hello` repeats) — greppy expand {id}\n{}",
         "hello\n".repeat(21),
         "hello\n".repeat(30)
     );
@@ -205,6 +208,10 @@ fn signal_forwards_to_child_group_and_keeps_expandable_partial_output() {
     let stderr = text(&output.stderr);
     assert!(started.elapsed() < Duration::from_secs(2), "{stderr}");
     assert_eq!(output.status.code(), Some(130), "stderr={stderr}");
+    assert_eq!(
+        stdout.lines().next(),
+        Some("FAILED — exit 130: 0 errors, 0 warnings (SIGINT)")
+    );
     assert!(stdout.contains("line 1\n"), "{stdout}");
     let id = expand_id(&stdout);
     assert!(
@@ -256,7 +263,10 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
         started.elapsed()
     );
     assert_eq!(output.status.code(), Some(137), "stderr={stderr}");
-    assert!(stdout.starts_with("partial\n"), "{stdout}");
+    assert!(
+        stdout.starts_with("FAILED — exit 137: 0 errors, 0 warnings (timeout)\npartial\n"),
+        "{stdout}"
+    );
     assert!(stdout.contains("greppy expand "), "{stdout}");
     assert!(
         stderr.contains("bash-smart: partial output ends with an unterminated line\n"),
