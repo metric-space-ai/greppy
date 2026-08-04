@@ -539,7 +539,8 @@ def _await_summaries(
 
 
 def _sanitize_brief(value: dict[str, Any], phase: str) -> dict[str, Any]:
-    if _string(value.get("command"), phase, "command") != "brief":
+    command = value.get("command")
+    if command is not None and _string(command, phase, "command") != "brief":
         raise MeasurementError(f"{phase}: unexpected command JSON")
     if _string(value.get("schema_version"), phase, "schema_version") != "greppy.brief.v1":
         raise MeasurementError(f"{phase}: unsupported brief schema")
