@@ -457,7 +457,8 @@ def _sanitize_cache(value: dict[str, Any], phase: str) -> dict[str, Any]:
 
 
 def _sanitize_semantic(value: dict[str, Any], phase: str) -> dict[str, Any]:
-    if _string(value.get("command"), phase, "command") not in ("search", "semantic-search"):
+    command = value.get("command")
+    if command is not None and _string(command, phase, "command") not in ("search", "semantic-search"):
         raise MeasurementError(f"{phase}: unexpected command JSON")
     if _string(value.get("schema_version"), phase, "schema_version") != "greppy.semantic-search.v1":
         raise MeasurementError(f"{phase}: unsupported semantic schema")
@@ -476,7 +477,10 @@ def _sanitize_semantic(value: dict[str, Any], phase: str) -> dict[str, Any]:
             raise MeasurementError(f"{phase}: invalid semantic summary")
         summary_count += int(bool(summaries))
         summary_line_count += len(summaries)
-    if summary_count == 0:
+    if summary_count == 0 and phase != "semantic_first":
+        # Purpose summaries are produced lazily by the summary daemon in the
+        # 0.3.0 CLI; the FIRST query may legitimately return hits before any
+        # summary exists. Warm queries must prove summaries were exercised.
         raise MeasurementError(f"{phase}: semantic result did not exercise purpose summaries")
     result: dict[str, Any] = {
         "status": status,
