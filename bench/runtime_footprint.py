@@ -505,6 +505,38 @@ def _sanitize_semantic(value: dict[str, Any], phase: str) -> dict[str, Any]:
     return result
 
 
+
+def _await_summaries(
+    argv: Sequence[str],
+    sanitize: Any,
+    phase: str,
+    env: dict[str, str],
+    timeout_seconds: float,
+    publication_replacements: dict[str, str],
+    records: list[dict[str, Any]],
+) -> None:
+    """Poll until the lazily generated purpose summaries appear (bounded).
+
+    The polls double as cache warmers; they are recorded but never counted as
+    warm samples. Gives up after 24 polls (~2 minutes) and lets the warm-phase
+    sanitizer raise the honest error."""
+    for attempt in range(1, 25):
+        run = _run_command(
+            argv,
+            phase=f"{phase}_summary_wait",
+            env=env,
+            timeout_seconds=timeout_seconds,
+            iteration=attempt,
+            publication_replacements=publication_replacements,
+        )
+        records.append(run.record)
+        try:
+            sanitize(_json_object(run.stdout, f"{phase}_warm_probe"), f"{phase}_warm_probe")
+            return
+        except MeasurementError:
+            time.sleep(5.0)
+
+
 def _sanitize_brief(value: dict[str, Any], phase: str) -> dict[str, Any]:
     if _string(value.get("command"), phase, "command") != "brief":
         raise MeasurementError(f"{phase}: unexpected command JSON")
@@ -523,7 +555,9 @@ def _sanitize_brief(value: dict[str, Any], phase: str) -> dict[str, Any]:
             raise MeasurementError(f"{phase}: invalid brief summary")
         definitions_with_summary += int(bool(summaries))
         summary_line_count += len(summaries)
-    if definitions_with_summary == 0:
+    if definitions_with_summary == 0 and phase != "brief_first":
+        # Purpose summaries are produced lazily by the summary daemon in the
+        # 0.3.0 CLI; the first brief may run before the symbol is summarized.
         raise MeasurementError(f"{phase}: brief did not exercise purpose summaries")
     result = {
         "status": status,
@@ -903,6 +937,10 @@ def measure(config: Config) -> dict[str, Any]:
         semantic_result = _sanitize_semantic(
             _json_object(semantic_first_run.stdout, "semantic_first"), "semantic_first"
         )
+        _await_summaries(
+            semantic_argv, _sanitize_semantic, "semantic", env,
+            config.timeout_seconds, publication_replacements, command_records,
+        )
         semantic_warm: list[float] = []
         for iteration in range(1, config.warm_repeats + 1):
             run = _run_command(
@@ -958,6 +996,10 @@ def measure(config: Config) -> dict[str, Any]:
         command_records.append(brief_first_run.record)
         brief_result = _sanitize_brief(
             _json_object(brief_first_run.stdout, "brief_first"), "brief_first"
+        )
+        _await_summaries(
+            brief_argv, _sanitize_brief, "brief", env,
+            config.timeout_seconds, publication_replacements, command_records,
         )
         brief_warm: list[float] = []
         for iteration in range(1, config.warm_repeats + 1):
