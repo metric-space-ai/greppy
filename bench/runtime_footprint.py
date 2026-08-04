@@ -457,7 +457,7 @@ def _sanitize_cache(value: dict[str, Any], phase: str) -> dict[str, Any]:
 
 
 def _sanitize_semantic(value: dict[str, Any], phase: str) -> dict[str, Any]:
-    if _string(value.get("command"), phase, "command") != "semantic-search":
+    if _string(value.get("command"), phase, "command") not in ("search", "semantic-search"):
         raise MeasurementError(f"{phase}: unexpected command JSON")
     if _string(value.get("schema_version"), phase, "schema_version") != "greppy.semantic-search.v1":
         raise MeasurementError(f"{phase}: unsupported semantic schema")
@@ -882,7 +882,7 @@ def measure(config: Config) -> dict[str, Any]:
 
         semantic_argv = [
             binary,
-            "semantic-search",
+            "search",
             config.semantic_query,
             "--json",
             "--root",
