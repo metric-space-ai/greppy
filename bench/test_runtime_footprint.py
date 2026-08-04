@@ -151,11 +151,11 @@ if command == "index":
     print("TOP SECRET INDEX STDOUT")
     raise SystemExit(0)
 
-if command == "semantic-search":
+if command == "search":
     query = args[1]
     print(json.dumps({
         "schema_version": "greppy.semantic-search.v1",
-        "command": "semantic-search",
+        "command": "search",
         "status": "ok",
         "mode": "vector",
         "query": query,
@@ -304,7 +304,7 @@ class RuntimeFootprintTests(unittest.TestCase):
         stderr = io.StringIO()
         with mock.patch.dict(
             os.environ,
-            {"FAKE_AUDIT_PATH": str(self.audit), "FAKE_FAIL_PHASE": "semantic-search"},
+            {"FAKE_AUDIT_PATH": str(self.audit), "FAKE_FAIL_PHASE": "search"},
             clear=False,
         ), contextlib.redirect_stderr(stderr):
             self.assertEqual(runtime_footprint.main(self._argv()), 1)
