@@ -14,7 +14,9 @@ use crate::wire::{to_messages_request_body, SseItem, SseParser};
 
 /// Default hard cap on total SSE body bytes (64 MiB).
 pub const DEFAULT_STREAM_BYTE_CAP: usize = 64 * 1024 * 1024;
-/// Default hard cap on total SSE events (recognized + terminal).
+/// Default hard cap on completed SSE records (every parsed `event:`/`data:`
+/// record, whether or not it emits a model event — pings, silent starts, and
+/// unknown types count).
 pub const DEFAULT_STREAM_EVENT_CAP: usize = 100_000;
 
 /// Result of a completed streaming turn.
@@ -319,17 +321,13 @@ fn handle_sse_item(
 ) -> Result<(), ClientError> {
     match item {
         SseItem::Event(ev) => {
-            assembler.observe(&ev);
-            if let Some(err) = assembler.take_stream_error() {
-                return Err(ClientError::Stream(err));
-            }
+            assembler.observe(&ev)?;
             on_event(ev);
             Ok(())
         }
-        SseItem::MessageStop => {
-            assembler.observe_message_stop();
-            Ok(())
-        }
+        SseItem::MessageStop => assembler.observe_message_stop(),
+        // Counted toward the event cap by the caller; nothing to assemble.
+        SseItem::Ignored => Ok(()),
         SseItem::Malformed { event_type, detail } => Err(ClientError::Stream(format!(
             "malformed {event_type} event: {detail}"
         ))),
@@ -358,9 +356,11 @@ fn truncate(s: &str, max: usize) -> &str {
 enum OpenBlock {
     None,
     Text {
+        index: usize,
         text: String,
     },
     Thinking {
+        index: usize,
         text: String,
     },
     Tool {
@@ -374,8 +374,10 @@ enum OpenBlock {
 /// Accumulates stream events into a final assistant message.
 ///
 /// Anthropic streams content blocks sequentially, so at most one block is
-/// open at a time. Requires a seen `message_start` and a terminal stop
-/// (`message_delta` with stop_reason, or `message_stop`).
+/// open at a time. The wire parser enforces ordered protocol states; this
+/// assembler refuses to silently flush half-finished blocks. Requires a seen
+/// `message_start` and a terminal stop (`message_delta` with stop_reason, or
+/// `message_stop`).
 #[derive(Debug)]
 struct TurnAssembler {
     open: OpenBlock,
@@ -383,9 +385,11 @@ struct TurnAssembler {
     parts: Vec<(usize, ContentPart)>,
     stop_reason: Option<StopReason>,
     usage: Usage,
-    stream_error: Option<String>,
     seen_message_start: bool,
     seen_terminal: bool,
+    /// Index of the next text/thinking block opened by a delta (silent starts
+    /// do not carry an index into the assembler; we track via BlockFinished).
+    next_soft_index: usize,
 }
 
 impl TurnAssembler {
@@ -395,36 +399,41 @@ impl TurnAssembler {
             parts: Vec::new(),
             stop_reason: None,
             usage: Usage::default(),
-            stream_error: None,
             seen_message_start: false,
             seen_terminal: false,
+            next_soft_index: 0,
         }
     }
 
-    fn observe(&mut self, ev: &StreamEvent) {
+    fn observe(&mut self, ev: &StreamEvent) -> Result<(), ClientError> {
+        if self.seen_terminal {
+            return Err(ClientError::Stream("event after terminal stop".to_string()));
+        }
         match ev {
             StreamEvent::Started { .. } => {
+                if self.seen_message_start {
+                    return Err(ClientError::Stream("duplicate message_start".to_string()));
+                }
                 self.seen_message_start = true;
+                Ok(())
             }
             StreamEvent::TextDelta { text } => {
                 if text.is_empty() {
-                    return;
+                    return Ok(());
                 }
-                self.append_text(text);
+                self.append_text(text)
             }
             StreamEvent::ThinkingDelta { text } => {
                 if text.is_empty() {
-                    return;
+                    return Ok(());
                 }
-                self.append_thinking(text);
+                self.append_thinking(text)
             }
             StreamEvent::ToolCallStarted { index, id, name } => {
                 if !matches!(self.open, OpenBlock::None) {
-                    let idx = match &self.open {
-                        OpenBlock::Tool { index, .. } => *index,
-                        _ => index.saturating_sub(1),
-                    };
-                    self.flush_open(idx);
+                    return Err(ClientError::Stream(
+                        "tool_use start while a content block is open".to_string(),
+                    ));
                 }
                 self.open = OpenBlock::Tool {
                     index: *index,
@@ -432,72 +441,130 @@ impl TurnAssembler {
                     name: name.clone(),
                     args_json: String::new(),
                 };
+                // Soft indices track the highest seen block index + 1.
+                self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
+                Ok(())
             }
             StreamEvent::ToolCallArgumentsDelta {
-                index: _,
+                index,
                 json_fragment,
-            } => {
-                if let OpenBlock::Tool { args_json, .. } = &mut self.open {
+            } => match &mut self.open {
+                OpenBlock::Tool {
+                    index: open_idx,
+                    args_json,
+                    ..
+                } => {
+                    if *open_idx != *index {
+                        return Err(ClientError::Stream(format!(
+                            "tool argument index mismatch: open={open_idx}, delta={index}"
+                        )));
+                    }
                     args_json.push_str(json_fragment);
+                    Ok(())
                 }
-            }
-            StreamEvent::BlockFinished { index } => {
-                self.flush_open(*index);
-            }
+                _ => Err(ClientError::Stream(
+                    "tool argument delta without an open tool block".to_string(),
+                )),
+            },
+            StreamEvent::BlockFinished { index } => self.flush_open(*index),
             StreamEvent::Finished { stop_reason, usage } => {
-                // message_delta terminal: record stop_reason (even if Other)
-                // and mark terminal. Empty Other("") still counts as terminal
-                // because the event itself is the stop signal.
+                if !matches!(self.open, OpenBlock::None) {
+                    return Err(ClientError::Stream(
+                        "terminal event while a content block is open".to_string(),
+                    ));
+                }
                 self.stop_reason = Some(stop_reason.clone());
                 self.usage = *usage;
                 self.seen_terminal = true;
+                Ok(())
             }
-            StreamEvent::Error { message } => {
-                self.stream_error = Some(message.clone());
-            }
+            StreamEvent::Error { message } => Err(ClientError::Stream(message.clone())),
         }
     }
 
-    fn observe_message_stop(&mut self) {
+    fn observe_message_stop(&mut self) -> Result<(), ClientError> {
+        if !matches!(self.open, OpenBlock::None) {
+            return Err(ClientError::Stream(
+                "terminal event while a content block is open".to_string(),
+            ));
+        }
         self.seen_terminal = true;
+        Ok(())
     }
 
-    fn append_text(&mut self, text: &str) {
-        if let OpenBlock::Text { text: acc } = &mut self.open {
-            acc.push_str(text);
-            return;
-        }
-        if !matches!(self.open, OpenBlock::None) {
-            let idx = self.parts.len();
-            self.flush_open(idx);
-        }
-        self.open = OpenBlock::Text {
-            text: text.to_string(),
-        };
-    }
-
-    fn append_thinking(&mut self, text: &str) {
-        if let OpenBlock::Thinking { text: acc } = &mut self.open {
-            acc.push_str(text);
-            return;
-        }
-        if !matches!(self.open, OpenBlock::None) {
-            let idx = self.parts.len();
-            self.flush_open(idx);
-        }
-        self.open = OpenBlock::Thinking {
-            text: text.to_string(),
-        };
-    }
-
-    fn flush_open(&mut self, index: usize) {
-        match std::mem::replace(&mut self.open, OpenBlock::None) {
-            OpenBlock::None => {}
-            OpenBlock::Text { text } => {
-                self.parts.push((index, ContentPart::Text { text }));
+    fn append_text(&mut self, text: &str) -> Result<(), ClientError> {
+        match &mut self.open {
+            OpenBlock::Text { text: acc, .. } => {
+                acc.push_str(text);
+                Ok(())
             }
-            OpenBlock::Thinking { text } => {
+            OpenBlock::None => {
+                let index = self.next_soft_index;
+                self.open = OpenBlock::Text {
+                    index,
+                    text: text.to_string(),
+                };
+                Ok(())
+            }
+            _ => Err(ClientError::Stream(
+                "text delta while a non-text content block is open".to_string(),
+            )),
+        }
+    }
+
+    fn append_thinking(&mut self, text: &str) -> Result<(), ClientError> {
+        match &mut self.open {
+            OpenBlock::Thinking { text: acc, .. } => {
+                acc.push_str(text);
+                Ok(())
+            }
+            OpenBlock::None => {
+                let index = self.next_soft_index;
+                self.open = OpenBlock::Thinking {
+                    index,
+                    text: text.to_string(),
+                };
+                Ok(())
+            }
+            _ => Err(ClientError::Stream(
+                "thinking delta while a non-thinking content block is open".to_string(),
+            )),
+        }
+    }
+
+    fn flush_open(&mut self, index: usize) -> Result<(), ClientError> {
+        match std::mem::replace(&mut self.open, OpenBlock::None) {
+            OpenBlock::None => {
+                // Silent text/thinking start may produce a BlockFinished with
+                // no deltas; treat as an empty text part so indices stay coherent.
+                self.parts.push((
+                    index,
+                    ContentPart::Text {
+                        text: String::new(),
+                    },
+                ));
+                self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
+                Ok(())
+            }
+            OpenBlock::Text {
+                index: open_idx,
+                text,
+            } => {
+                if open_idx != index && !text.is_empty() {
+                    // Soft-opened text used next_soft_index; accept the stop's index.
+                }
+                self.parts.push((index, ContentPart::Text { text }));
+                self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
+                Ok(())
+            }
+            OpenBlock::Thinking {
+                index: open_idx,
+                text,
+            } => {
+                let _ = open_idx;
                 self.parts.push((index, ContentPart::Thinking { text }));
+                self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
+                Ok(())
             }
             OpenBlock::Tool {
                 index: tool_index,
@@ -505,6 +572,11 @@ impl TurnAssembler {
                 name,
                 args_json,
             } => {
+                if tool_index != index {
+                    return Err(ClientError::Stream(format!(
+                        "block stop index mismatch: open={tool_index}, stop={index}"
+                    )));
+                }
                 let arguments = parse_arguments(&args_json);
                 self.parts.push((
                     tool_index,
@@ -514,22 +586,19 @@ impl TurnAssembler {
                         arguments,
                     },
                 ));
-                let _ = index;
+                self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
+                Ok(())
             }
         }
     }
 
-    fn take_stream_error(&mut self) -> Option<String> {
-        self.stream_error.take()
-    }
-
     fn finish(mut self) -> Result<TurnResult, ClientError> {
+        // Never silently flush a half-finished block (especially tool_use): an
+        // unfinished tool call must not finalize a turn.
         if !matches!(self.open, OpenBlock::None) {
-            let idx = match &self.open {
-                OpenBlock::Tool { index, .. } => *index,
-                _ => self.parts.len(),
-            };
-            self.flush_open(idx);
+            return Err(ClientError::Stream(
+                "stream ended with an open content block".to_string(),
+            ));
         }
 
         if !self.seen_message_start {
@@ -728,7 +797,9 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[test]
-    fn missing_message_start_is_incomplete() {
+    fn missing_message_start_is_stream_error() {
+        // State machine rejects content before message_start as a stream error
+        // (not a successful Incomplete after the fact).
         let body = concat!(
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n",
@@ -742,7 +813,14 @@ data: {\"type\":\"message_stop\"}
             DEFAULT_STREAM_BYTE_CAP,
             DEFAULT_STREAM_EVENT_CAP,
         )
-        .expect_err("must be incomplete");
+        .expect_err("must be stream error");
+        assert!(matches!(err, ClientError::Stream(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_stream_is_incomplete_missing_start() {
+        let err = consume_sse_for_test(b"", DEFAULT_STREAM_BYTE_CAP, DEFAULT_STREAM_EVENT_CAP)
+            .expect_err("must be incomplete");
         assert!(matches!(err, ClientError::Incomplete(_)), "got {err:?}");
         assert!(err.to_string().contains("message_start"));
     }
@@ -774,6 +852,10 @@ data: {\"type\":\"message_stop\"}
         let mut body = String::from(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n",
         );
+        // Open a block so content_block_delta is legal under the state machine.
+        body.push_str(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
         for _ in 0..20 {
             body.push_str(
                 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
@@ -788,6 +870,75 @@ data: {\"type\":\"message_stop\"}
             }
             other => panic!("expected Stream, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_event_cap_counts_ping_flood() {
+        // Pings do not emit StreamEvents but must still count toward the cap.
+        let mut body = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n",
+        );
+        for _ in 0..20 {
+            body.push_str("event: ping\ndata: {}\n\n");
+        }
+        let err = consume_sse_for_test(body.as_bytes(), DEFAULT_STREAM_BYTE_CAP, 5)
+            .expect_err("must hit event cap on pings");
+        match err {
+            ClientError::Stream(m) => {
+                assert!(m.contains("stream cap exceeded"), "msg={m}");
+                assert!(m.contains("events"), "msg={m}");
+            }
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_event_cap_counts_unknown_event_flood() {
+        // Unknown event types are ignored for protocol but still count.
+        let mut body = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n",
+        );
+        for _ in 0..20 {
+            body.push_str("event: something_novel\ndata: {\"foo\":1}\n\n");
+        }
+        let err = consume_sse_for_test(body.as_bytes(), DEFAULT_STREAM_BYTE_CAP, 5)
+            .expect_err("must hit event cap on unknown events");
+        match err {
+            ClientError::Stream(m) => {
+                assert!(m.contains("stream cap exceeded"), "msg={m}");
+                assert!(m.contains("events"), "msg={m}");
+            }
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_open_block_is_stream_error_not_silent_flush() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"c\"}}\n",
+            "\n",
+            // Stream ends mid-block — no stop, no terminal.
+        );
+        let err = consume_sse_for_test(
+            body.as_bytes(),
+            DEFAULT_STREAM_BYTE_CAP,
+            DEFAULT_STREAM_EVENT_CAP,
+        )
+        .expect_err("must not silently finalize open tool block");
+        // Either Incomplete (no terminal) or Stream (open block) is correct;
+        // silent success is not.
+        assert!(
+            matches!(err, ClientError::Stream(_) | ClientError::Incomplete(_)),
+            "got {err:?}"
+        );
+        assert!(!matches!(err, ClientError::Transport(_)), "got {err:?}");
     }
 
     #[test]

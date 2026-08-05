@@ -187,11 +187,20 @@ impl GreppyEnv {
 /// Prepare a tool subprocess environment: strip credential env vars and mark
 /// the process tree as an agent run so `greppy -p` refuses to nest (the
 /// bash tool could otherwise launch a second agent).
+///
+/// `env_remove` wins over any prior command-scoped `.env(...)` entries and over
+/// process inheritance, so secrets injected for tests (or accidentally set on
+/// the `Command`) cannot leak into the child.
 fn prepare_tool_env(cmd: &mut Command) {
+    scrub_credential_env(cmd);
+    cmd.env(crate::AGENT_RUN_ENV, "1");
+}
+
+/// Strip credential / secret env vars from a tool `Command`.
+fn scrub_credential_env(cmd: &mut Command) {
     for key in CREDENTIAL_ENV_BLOCKLIST {
         cmd.env_remove(key);
     }
-    cmd.env(crate::AGENT_RUN_ENV, "1");
 }
 
 impl ExecutionEnv for GreppyEnv {
@@ -667,10 +676,11 @@ exit 2
 
     #[test]
     fn credential_env_blocklist_stripped_from_tool_subprocesses() {
-        // Parent process env (what we inherit) has secrets set. The stub
-        // prints selected vars; scrubbed ones must be empty while PATH/HOME
-        // survive.
-        let (mut env, _, _) = env_with_stub(
+        // Parallel-safe: no global set_var/remove_var. Inject secrets only as
+        // command-scoped `.env(...)` entries, then apply prepare_tool_env and
+        // assert env_remove wins (vars absent in the child) while PATH/HOME
+        // still inherit.
+        let bin = write_stub(
             r#"
 printf 'GREPPY_API_KEY=%s\n' "${GREPPY_API_KEY-}"
 printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
@@ -680,66 +690,98 @@ printf 'PATH_SET=%s\n' "${PATH:+yes}"
 printf 'HOME_SET=%s\n' "${HOME:+yes}"
 "#,
         );
-        // Inject secrets into *this* process so the child would inherit them
-        // without scrubbing. Safe: process-local, restored after the test.
-        let keys = [
+        let root = temp_root();
+
+        // Build a greppy-tool-shaped Command with secrets set command-locally
+        // *before* prepare_tool_env runs — env_remove must win over .env().
+        let mut cmd = Command::new(&bin);
+        cmd.args(["who-calls", "x"])
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("GREPPY_API_KEY", "sekrit")
+            .env("ANTHROPIC_API_KEY", "sekrit")
+            .env("OPENAI_API_KEY", "sekrit")
+            .env("GITHUB_TOKEN", "sekrit");
+        prepare_tool_env(&mut cmd);
+
+        // Command-scoped view: blocklisted keys must be Clear (env_remove),
+        // agent-run marker must be set.
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in [
             "GREPPY_API_KEY",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GITHUB_TOKEN",
-        ];
-        let saved: Vec<(String, Option<String>)> = keys
-            .iter()
-            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        ] {
+            let entry = envs.iter().find(|(k, _)| k == key);
+            assert!(
+                matches!(entry, Some((_, None))),
+                "expected env_remove for {key}, got {entry:?}; all={envs:?}"
+            );
+        }
+        let marker = envs.iter().find(|(k, _)| k == crate::AGENT_RUN_ENV);
+        assert_eq!(
+            marker.map(|(_, v)| v.as_deref()),
+            Some(Some("1")),
+            "agent run marker missing; envs={envs:?}"
+        );
+
+        let captured = run_capture(&mut cmd, Some(Duration::from_secs(5))).expect("spawn");
+        let body = merge_stdio(&captured.stdout, &captured.stderr);
+        assert!(captured.success, "body={body}");
+        assert!(body.contains("GREPPY_API_KEY=\n"), "body={body}");
+        assert!(body.contains("ANTHROPIC_API_KEY=\n"), "body={body}");
+        assert!(body.contains("OPENAI_API_KEY=\n"), "body={body}");
+        assert!(body.contains("GITHUB_TOKEN=\n"), "body={body}");
+        assert!(
+            body.contains("PATH_SET=yes"),
+            "PATH must survive; body={body}"
+        );
+        assert!(
+            body.contains("HOME_SET=yes"),
+            "HOME must survive; body={body}"
+        );
+
+        // Same scrubbing on the bash-tool-shaped Command path.
+        let mut bash_cmd = Command::new(&bin);
+        bash_cmd
+            .args(["bash-smart", "--", "bash", "-lc", "true"])
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("GREPPY_API_KEY", "sekrit")
+            .env("ANTHROPIC_API_KEY", "sekrit");
+        prepare_tool_env(&mut bash_cmd);
+        let bash_envs: Vec<(String, Option<String>)> = bash_cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
             .collect();
-        for k in &keys {
-            // SAFETY: single-threaded test; we restore below.
-            unsafe { std::env::set_var(k, "secret-should-not-leak") };
-        }
-
-        let out = env.call_tool("greppy", &json!({"args": ["who-calls", "x"]}));
-        assert!(!out.is_error, "content={}", out.content);
         assert!(
-            out.content.contains("GREPPY_API_KEY=\n"),
-            "content={}",
-            out.content
+            matches!(
+                bash_envs.iter().find(|(k, _)| k == "GREPPY_API_KEY"),
+                Some((_, None))
+            ),
+            "bash path must env_remove GREPPY_API_KEY; envs={bash_envs:?}"
         );
-        assert!(
-            out.content.contains("ANTHROPIC_API_KEY=\n"),
-            "content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("OPENAI_API_KEY=\n"),
-            "content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("GITHUB_TOKEN=\n"),
-            "content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("PATH_SET=yes"),
-            "PATH must survive; content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("HOME_SET=yes"),
-            "HOME must survive; content={}",
-            out.content
-        );
-
-        // Also cover the bash tool path (same scrubbing).
-        let out_bash = env.call_tool("bash", &json!({"command": "true"}));
-        assert!(!out_bash.is_error, "content={}", out_bash.content);
-
-        for (k, prev) in saved {
-            match prev {
-                Some(v) => unsafe { std::env::set_var(&k, v) },
-                None => unsafe { std::env::remove_var(&k) },
-            }
-        }
+        let bash_cap =
+            run_capture(&mut bash_cmd, Some(Duration::from_secs(5))).expect("bash spawn");
+        assert!(bash_cap.success, "bash scrub path failed");
     }
 
     #[test]
