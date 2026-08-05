@@ -356,8 +356,10 @@ fn the_header_leads_with_the_product() {
 fn the_prompt_is_frozen_byte_for_byte() {
     use std::fmt::Write as _;
 
+    // 05.08.2026: owner approved the AGENT: section (greppy -p delegation
+    // block) for 0.3.1 — wording frozen in the same review.
     const APPROVED_SHA256: &str =
-        "6bd9de97a4285c6503faaa027346a1f1e099ae0ef499425e13af85a787a2ed55";
+        "0a53dcf9b3584a57017f1994c70e816b092cb43f340ab7de9fe17547ae2ed0ce";
 
     let text = prompt();
     let digest = {
