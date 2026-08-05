@@ -69,11 +69,22 @@ impl std::fmt::Display for ProbeError {
 impl std::error::Error for ProbeError {}
 
 /// Blocking client for a single model against a localhost Messages gateway.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
     base_url: String,
     model: String,
     api_key: Option<String>,
+}
+
+// Manual impl: the api key must never reach logs or error output.
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Client {

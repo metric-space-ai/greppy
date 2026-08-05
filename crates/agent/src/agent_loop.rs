@@ -289,7 +289,12 @@ pub fn run_agent_loop(
     })
 }
 
-/// Stream a turn; on a pure transport error, retry exactly once.
+/// Stream a turn; on a retryable failure, retry exactly once.
+///
+/// Retryable: pure transport/connect errors, and gateway-side transient
+/// HTTP statuses (429 and the 5xx family, incl. Anthropic's 529). Client
+/// errors (4xx other than 429) are surfaced immediately — retrying a bad
+/// request or auth failure only burns quota.
 fn stream_turn_with_retry(
     model: &mut dyn ModelStream,
     req: &ModelRequest,
@@ -297,13 +302,24 @@ fn stream_turn_with_retry(
 ) -> Result<TurnResult, LoopError> {
     match call_model(model, req, on_event) {
         Ok(t) => Ok(t),
-        Err(ClientError::Transport(_first)) => {
-            // One immediate retry on transport/connect failures.
+        Err(first) if is_retryable(&first) => {
+            // One immediate retry at the loop boundary.
             // Deviation from pi: pi's session-level auto-retry is configurable
-            // and delayed; we do a single immediate retry at the loop boundary.
+            // and delayed; we do a single immediate retry.
+            std::thread::sleep(std::time::Duration::from_secs(2));
             call_model(model, req, on_event).map_err(LoopError::from)
         }
         Err(other) => Err(LoopError::from(other)),
+    }
+}
+
+fn is_retryable(err: &ClientError) -> bool {
+    match err {
+        // 4xx (other than 429) means the request itself is wrong; everything
+        // else — transport failures, 429/5xx, mid-stream error events,
+        // truncated streams — is worth one retry.
+        ClientError::Http { status, .. } => *status == 429 || *status >= 500,
+        _ => true,
     }
 }
 
@@ -784,20 +800,57 @@ mod tests {
     }
 
     #[test]
-    fn http_error_does_not_retry() {
+    fn http_client_error_does_not_retry() {
         let mut model = FakeModel::new(vec![ScriptedTurn {
             events: vec![],
             result: Err(ClientError::Http {
-                status: 500,
-                body: "nope".into(),
+                status: 400,
+                body: "bad request".into(),
             }),
         }]);
         let mut env = FakeEnv::new(vec![]);
         let config = AgentConfig::default().with_model("mock");
 
         let err = run(&mut model, &mut env, &config, "hi").expect_err("http fatal");
-        assert!(matches!(err, LoopError::Http { status: 500, .. }));
+        assert!(matches!(err, LoopError::Http { status: 400, .. }));
         assert_eq!(model.calls, 1);
+    }
+
+    #[test]
+    fn http_5xx_retries_once_then_fails() {
+        let scripted = || ScriptedTurn {
+            events: vec![],
+            result: Err(ClientError::Http {
+                status: 503,
+                body: "overloaded".into(),
+            }),
+        };
+        let mut model = FakeModel::new(vec![scripted(), scripted()]);
+        let mut env = FakeEnv::new(vec![]);
+        let config = AgentConfig::default().with_model("mock");
+
+        let err = run(&mut model, &mut env, &config, "hi").expect_err("http fatal");
+        assert!(matches!(err, LoopError::Http { status: 503, .. }));
+        assert_eq!(model.calls, 2);
+    }
+
+    #[test]
+    fn stream_error_retries_once_and_recovers() {
+        let mut model = FakeModel::new(vec![
+            ScriptedTurn {
+                events: vec![],
+                result: Err(ClientError::Stream(
+                    "Service temporarily unavailable.".into(),
+                )),
+            },
+            text_turn("recovered", usage(1, 1)),
+        ]);
+        let mut env = FakeEnv::new(vec![]);
+        let config = AgentConfig::default().with_model("mock");
+
+        let (result, _events) = run(&mut model, &mut env, &config, "hi").expect("recovers");
+        assert_eq!(result.final_text, "recovered");
+        assert_eq!(model.calls, 2);
     }
 
     #[test]
