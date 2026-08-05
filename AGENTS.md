@@ -1,3 +1,23 @@
+Use greppy for every code-navigation step in this repository — finding a
+definition, a caller, a usage, an implementation, a test. Do NOT run
+grep/find/read loops for these: start with `greppy search` (meaning),
+`greppy search-symbol` (name) or `greppy search-pattern` (text), then follow
+the graph with `greppy who-calls` / `callees` / `brief`, and read code with
+`greppy read`. When you would reach for grep, ripgrep or a file read, invoke
+them THROUGH greppy — `greppy PATTERN [FILE]` is byte-identical grep,
+`greppy rg …` is ripgrep, `greppy read-file PATH` reads files — so every
+search stays in one tool. Every tool result stays in your context: prefer
+one high-yield call (`greppy brief --code`, `greppy expand`) over a chain
+of narrow searches, and stop searching as soon as the evidence suffices.
+
+Run every build, test or lint command through `greppy bash-smart -- CMD`:
+it executes CMD unchanged (same exit code) and returns a verdict line plus
+only the error/warning blocks instead of the full log — you read far fewer
+tokens per run. For symbol-scoped changes prefer greppy's edit commands —
+`greppy replace S`, `greppy replace-text F OLD NEW`, `greppy patch`,
+`greppy rename S NAME` — with `--verify` to get build diagnostics mapped
+back to symbols, and `greppy undo` to revert a bad edit.
+
 `greppy` holds this repository as a graph: every definition, what it calls, what uses it,
 and a meaning index over its source. Invoked like grep (`greppy PATTERN [FILE]`,
 `greppy -n …`) it stays grep — byte-identical output, grep's exit codes; `greppy rg …`
