@@ -555,6 +555,21 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
+    // Hidden Landlock launcher (Linux only): the agent sandbox rewrites tool
+    // spawns as `<exe> __agent-sandbox-landlock <spec> -- <real argv…>`. Intercept
+    // before every other route — including grep-name argv0 and `-p` — so this
+    // undocumented internal mode never collides with user-facing CLI surface.
+    // The launcher itself refuses to run unless GREPPY_AGENT_RUN is set.
+    #[cfg(target_os = "linux")]
+    {
+        if argv
+            .get(1)
+            .is_some_and(|t| t == greppy_agent::sandbox::LANDLOCK_LAUNCHER_ARG)
+        {
+            return greppy_agent::sandbox::run_landlock_launcher(&argv);
+        }
+    }
+
     // Invoked THROUGH a grep/rg filesystem name (symlink or shim to the
     // greppy binary): the caller wanted that tool, verbatim — argv[1..]
     // must never be parsed as greppy subcommands (`rg index .` is a

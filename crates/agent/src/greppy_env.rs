@@ -765,7 +765,9 @@ printf 'HOME_SET=%s\n' "${HOME:+yes}"
             "agent run marker missing; envs={envs:?}"
         );
 
-        let captured = run_capture(&mut cmd, Some(Duration::from_secs(5))).expect("spawn");
+        // Generous wall-clock margin: under concurrent host load the 5 s budget
+        // flaked once in review. Happy path is still near-instant.
+        let captured = run_capture(&mut cmd, Some(Duration::from_secs(30))).expect("spawn");
         let body = merge_stdio(&captured.stdout, &captured.stderr);
         assert!(captured.success, "body={body}");
         assert!(body.contains("GREPPY_API_KEY=\n"), "body={body}");
@@ -809,7 +811,7 @@ printf 'HOME_SET=%s\n' "${HOME:+yes}"
             "bash path must env_remove GREPPY_API_KEY; envs={bash_envs:?}"
         );
         let bash_cap =
-            run_capture(&mut bash_cmd, Some(Duration::from_secs(5))).expect("bash spawn");
+            run_capture(&mut bash_cmd, Some(Duration::from_secs(30))).expect("bash spawn");
         assert!(bash_cap.success, "bash scrub path failed");
     }
 
@@ -1107,6 +1109,74 @@ exit 0
             assert!(!out.is_error, "Off-mode outside write: {}", out.content);
             assert!(probe.exists(), "Off mode must allow the outside touch");
             let _ = fs::remove_file(&probe);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// S4 permanent regression (reviewer-verified escape): with only the
+        /// worktree + canonical `temp_dir()` roots allowed, a write under
+        /// `$TMPDIR/../C/…` must be DENIED. The removed blanket
+        /// `/private/var/folders` rule is what previously permitted this.
+        #[test]
+        fn enforce_tmpdir_sibling_c_escape_denied() {
+            if !sandbox_exec_available() {
+                return;
+            }
+            let root = temp_root();
+            let tmp = std::env::temp_dir();
+            let bin = write_stub(real_bash_stub_body());
+            let mut env = GreppyEnv::with_binary(bin, root.clone())
+                .unwrap()
+                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
+                    writable_roots: vec![root.clone(), tmp.clone()],
+                }));
+
+            let probe_dir = tmp.join("..").join("C");
+            let _ = fs::create_dir_all(&probe_dir);
+            let probe = probe_dir.join(format!(
+                "greppy-sandbox-escape-c-env-{}-{}",
+                std::process::id(),
+                STUB_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_file(&probe);
+            let out = env.call_tool(
+                "bash",
+                &json!({"command": format!("touch '{}'", probe.display())}),
+            );
+            assert!(
+                out.is_error,
+                "TMPDIR/../C escape must be an error; content={}",
+                out.content
+            );
+            assert!(
+                !probe.exists(),
+                "escape probe must not exist after sandboxed touch: {}",
+                probe.display()
+            );
+            // Defensive cleanup.
+            let _ = fs::remove_file(&probe);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// S4(f) / device plumbing: shell redirection to `/dev/null` must work
+        /// under Enforce (explicit `/dev/null` allow, not via a broad /dev rule).
+        #[test]
+        fn enforce_dev_null_redirect_ok() {
+            if !sandbox_exec_available() {
+                return;
+            }
+            let root = temp_root();
+            let bin = write_stub(real_bash_stub_body());
+            let mut env = GreppyEnv::with_binary(bin, root.clone())
+                .unwrap()
+                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
+                    writable_roots: vec![root.clone(), std::env::temp_dir()],
+                }));
+            let out = env.call_tool("bash", &json!({"command": "echo x >/dev/null"}));
+            assert!(
+                !out.is_error,
+                "echo x >/dev/null under sandbox: {}",
+                out.content
+            );
             let _ = fs::remove_dir_all(&root);
         }
     }
