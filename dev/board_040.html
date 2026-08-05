@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Implementierung KOMPLETT + E2E-bewiesen. WP7b-Review läuft mit SOL (Owner-Regel 05.08.: Autor Grok → Reviewer Sol; ersetzt den Kimi-Wartepunkt).</p>
+  <p class="headline">WP8-Reparaturen (alle 10 Sol-Findings) gelandet + verifiziert. Sol-RE-Review läuft — bei grünem Verdict ist der Agent 0.3.1-ready (Owner-Plan: 0.3.1, nicht 0.3.0).</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -121,6 +121,28 @@
       byte-exakt als <code>crates/agent/src/prompt.rs</code> im WP5-Commit.</p>
     </div>
     <div class="card done">
+      <h3>WP8 — Alle 10 Sol-Findings repariert + verifiziert</h3>
+      <p>Commit <code>f0dd0db</code> (~1.1k Zeilen): Credential-Blockliste an beiden Tool-Spawns,
+      --apply-Preflight + korrekte Abort-Logik, --root=-Guard + bash-smart-Sperre + ehrlicher Hilfetext,
+      HEAD-feste Proposals via write-tree/commit-tree, strikte SSE (Garbage→Fehler, fehlender Abschluss→Incomplete),
+      zeilenweise UTF-8-Dekodierung, Stream-Caps (64 MiB/100k Events) + greppy-Tool-Timeout,
+      truncate-Boundary-Fix, override_help, -e -p-Escape dokumentiert+getestet.
+      Orchestrator-verifiziert: <strong>63/63 Agent-Tests</strong>, volle CLI-Suite seriell 0 FAILED,
+      Fix-Stellen im Code gegengelesen. Verhaltens-Smoke nach WP8: 6,7 s, korrekt.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp8-grok.log</code></p>
+    </div>
+    <div class="card done">
+      <h3>WP7b — Sol-Review: do-not-ship mit 10 Findings (wertvoll)</h3>
+      <p>3 critical (Env-Leak, --apply-Dirty, Guard-Bypässe), 4 major (HEAD-Abhängigkeit, SSE-Laxheit,
+      UTF-8-Splits, fehlende Caps), 3 minor. Volle Liste: <code>~/greppy-040-logs/wp7b-sol.log</code>.
+      Bewusst verschoben (Owner-Backlog): Container-Sandbox, Env-Allowlist, Turn-Deadline.</p>
+    </div>
+    <div class="card done">
+      <h3>Warm-Store-Beweis (WP7a-Nachtrag)</h3>
+      <p>Auf frisch indiziertem greppy-040 (12.554 Defs): <code>seeded index from main checkout</code>,
+      Gesamtlauf <strong>4,3 s</strong>. Seeding-Pfad E2E-bestätigt.</p>
+    </div>
+    <div class="card done">
       <h3>WP7a — E2E gegen lebenden cli-proxy: BEWIESEN</h3>
       <p><strong>Lauf 1 (20 s) + Lauf 3 (55 s) ERFOLG:</strong> where-am-i → search-symbol → read →
       insert-lines → cargo test (3/3) → sauberes Proposal (nur src/main.rs + Cargo.lock).
@@ -162,10 +184,11 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP7b — Unabhängiges Review durch SOL <span class="k">(claude-sol, läuft)</span></h3>
-      <p>Owner-Regel 05.08.: Autor Grok → Reviewer Sol. Read-only-Review der Serie
-      <code>729b399..0ae9dfb</code> (SSE/Loop, Isolation, Injection/Key, Robustheit, Passthrough, Qualität).</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp7b-sol.log</code> · Sol 1/3 · Fertig = VERDICT-Report</p>
+      <h3>WP8-Re-Review durch SOL <span class="k">(claude-sol, läuft)</span></h3>
+      <p>Prüft jeden Fix F1–F10 in <code>f0dd0db</code> gegen das Original-Finding (RESOLVED/PARTIAL/NOT)
+      + sucht neue Defekte im Reparatur-Diff. Verdict-Messlatte: 0.3.1-Feature unter dokumentiertem
+      Threat-Model (kooperativer Agent, Worktree+Review-Patch, noch keine Prozess-Sandbox).</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp8-rereview-sol.log</code> · Sol 1/3 · Parallel: Verhaltens-Smoke nach WP8</p>
     </div>
   </div></div>
 
