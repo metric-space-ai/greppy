@@ -237,3 +237,30 @@ fn greppy_e_dash_p_is_not_intercepted_as_agent() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn nested_agent_run_is_refused() {
+    // GREPPY_AGENT_RUN is set in every tool subprocess of a running agent;
+    // a second `greppy -p` must refuse before doing any work. Command-scoped
+    // env only — parallel-test safe.
+    let dir = unique_temp("nested");
+    let output = Command::new(binary_path())
+        .args(["-p", "do something", "--model", "m"])
+        .env("GREPPY_AGENT_RUN", "1")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn greppy");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("refusing a nested agent run"),
+        "stderr={stderr}"
+    );
+    // Refusal must happen before gateway probing or workspace creation.
+    assert!(
+        !stderr.contains("needs a local model gateway"),
+        "stderr={stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

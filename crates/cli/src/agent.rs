@@ -114,6 +114,15 @@ pub fn is_agent_p_invocation(argv: &[std::ffi::OsString]) -> bool {
 
 /// Parse and run `greppy -p …`. Caller must have verified [`is_agent_p_invocation`].
 pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
+    // Set for every tool subprocess of a running agent: refuse nesting on
+    // every path (greppy tool AND bash tool).
+    if std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() {
+        eprintln!(
+            "greppy -p: refusing a nested agent run — you are already inside an \
+             agent; carry out the task directly."
+        );
+        return EXIT_USAGE;
+    }
     let rest = super::grep_passthrough_args(argv);
     debug_assert!(rest.first().is_some_and(|t| t == "-p"));
     let after_p: Vec<std::ffi::OsString> = rest.iter().skip(1).cloned().collect();

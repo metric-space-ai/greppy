@@ -18,6 +18,11 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
+/// Env marker set in every tool subprocess of a running agent. `greppy -p`
+/// refuses to start while it is present, so agents cannot nest — not through
+/// the greppy tool, and not through the unsandboxed bash tool either.
+pub const AGENT_RUN_ENV: &str = "GREPPY_AGENT_RUN";
+
 pub mod agent_loop;
 pub mod client;
 pub mod env;

@@ -155,7 +155,7 @@ impl GreppyEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        scrub_credential_env(&mut cmd);
+        prepare_tool_env(&mut cmd);
 
         match run_capture(&mut cmd, Some(self.greppy_timeout)) {
             Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
@@ -175,7 +175,7 @@ impl GreppyEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        scrub_credential_env(&mut cmd);
+        prepare_tool_env(&mut cmd);
 
         match run_capture(&mut cmd, Some(self.bash_timeout)) {
             Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
@@ -184,11 +184,14 @@ impl GreppyEnv {
     }
 }
 
-/// Strip credential env vars from a tool subprocess command.
-fn scrub_credential_env(cmd: &mut Command) {
+/// Prepare a tool subprocess environment: strip credential env vars and mark
+/// the process tree as an agent run so `greppy -p` refuses to nest (the
+/// bash tool could otherwise launch a second agent).
+fn prepare_tool_env(cmd: &mut Command) {
     for key in CREDENTIAL_ENV_BLOCKLIST {
         cmd.env_remove(key);
     }
+    cmd.env(crate::AGENT_RUN_ENV, "1");
 }
 
 impl ExecutionEnv for GreppyEnv {
@@ -214,7 +217,8 @@ fn greppy_guard(args: &[String]) -> Option<String> {
     let first = args[0].as_str();
     if first == "-p" || first == "agent" {
         return Some(format!(
-            "greppy tool forbids recursive agent invocation (first arg {first:?})"
+            "nested agent runs are not supported (first arg {first:?}) — you are \
+             the agent; carry out the task directly with the other greppy commands"
         ));
     }
     if first == "bash-smart" {
@@ -639,6 +643,26 @@ exit 2
         assert!(out.is_error);
         assert_eq!(out.content, "use the bash tool");
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn agent_run_marker_present_in_tool_subprocesses() {
+        // Command-scoped env only — no global set_var (parallel-test safe).
+        let (mut env, _, _) =
+            env_with_stub(r#"printf 'GREPPY_AGENT_RUN=%s\n' "${GREPPY_AGENT_RUN-}""#);
+        let greppy = env.call_tool("greppy", &json!({"args": ["x"]}));
+        assert!(!greppy.is_error, "{}", greppy.content);
+        assert!(
+            greppy.content.contains("GREPPY_AGENT_RUN=1"),
+            "{}",
+            greppy.content
+        );
+        let bash = env.call_tool("bash", &json!({"command": "irrelevant"}));
+        assert!(
+            bash.content.contains("GREPPY_AGENT_RUN=1"),
+            "{}",
+            bash.content
+        );
     }
 
     #[test]
