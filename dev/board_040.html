@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Kritischer Pfad: WP2 Loop+ExecutionEnv (Grok, läuft) → WP3 Tools ∥ WP4 Isolation → WP5 CLI → WP7 E2E+Review. WP1 gelandet + verifiziert.</p>
+  <p class="headline">Kritischer Pfad: WP3 Tool-Adapter (Grok, läuft) → WP4 Isolation → WP5 CLI → WP7 E2E+Review. WP1+WP2 gelandet + verifiziert. Toolset-Entscheid: 2 Tools (greppy, bash).</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -86,6 +86,15 @@
       <p><code>~/pi-audit-0201806a</code> am Pin <code>0201806ad</code> (Release v0.80.2). Verifiziert via git log.</p>
     </div>
     <div class="card done">
+      <h3>WP2 — Agent-Loop-Port gelandet + verifiziert</h3>
+      <p>Commit <code>3ed85a0</code>: pi-Loop-Semantik portiert (Tool-Dispatch in Reihenfolge,
+      tool_results in einer User-Message, Fehler ≠ Abbruch, max_turns, 1× Transport-Retry),
+      <code>ExecutionEnv</code>- + <code>ModelStream</code>-Traits, THIRD_PARTY + PI-LICENSE.
+      Orchestrator-verifiziert: <strong>24/24 Tests</strong> selbst gelaufen, fmt/clippy grün, Scope = Whitelist.
+      Dokumentierte pi-Abweichungen: kein Parallel-Tooling, keine Steering-Queues (v1-bewusst).</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp2-grok.log</code></p>
+    </div>
+    <div class="card done">
       <h3>0.3.0-Toolfläche gesichtet → WP3 schrumpft</h3>
       <p>0.3.0-AGENTS.md: voller EDIT-Satz (<code>replace/replace-span/patch/write/rename/undo</code>,
       <code>--dry-run/--verify</code>) + <code>bash-smart</code> + SEARCH/NAVIGATE/READ mit Handles &amp; Pipe-Chaining.
@@ -95,22 +104,16 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP2 — Agent-Loop-Port + ExecutionEnv <span class="k">(claude-grok)</span></h3>
-      <p>pi <code>agent-loop</code> (aus <code>~/pi-audit-0201806a</code>, MIT) nach Rust: Turn-Schleife,
-      Tool-Dispatch über <code>ExecutionEnv</code>-Trait, Stop-Bedingungen, testbar via ModelStream-Trait.
-      Inkl. THIRD_PARTY-Eintrag für pi.</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp2-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
-      <code>agent: WP2 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
+      <h3>WP3 — Tool-Adapter: 2 Tools (greppy, bash) <span class="k">(claude-grok)</span></h3>
+      <p><code>GreppyEnv</code> implementiert ExecutionEnv mit genau zwei Tools:
+      <code>greppy</code> (eine greppy-Kommandozeile, bevorzugt in-process über die CLI-Dispatch-Lib,
+      Fallback current_exe-Subprozess) und <code>bash</code> (via bash-smart, cwd = Arbeitsverzeichnis).</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp3-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
+      <code>agent: WP3 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
     </div>
   </div></div>
 
   <div class="col"><h2>To-Do</h2><div class="cards">
-    <div class="card">
-      <h3>WP3 — Tool-Adapter auf greppy-0.3.0-Kommandos <span class="k">(Grok)</span></h3>
-      <p>Tools = in-process Aufrufe der eigenen Crates: search/navigate/read, EDIT-Suite (mit undo-Journal), bash-smart.
-      Alles läuft durch ExecutionEnv.</p>
-      <p class="trigger">Trigger: WP2 gelandet</p>
-    </div>
     <div class="card">
       <h3>WP4 — Isolation: Worktree + Review-Patch <span class="k">(Grok)</span></h3>
       <p>Pro <code>-p</code>-Lauf isolierter git-Worktree; Edits über greppy-Engine; Ergebnis = Diff/Commit-Vorschlag,
