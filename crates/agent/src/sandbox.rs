@@ -12,12 +12,14 @@
 //!   `/usr/bin/sandbox-exec -p <seatbelt-profile> <bin> <args…>`. Profile
 //!   generation is fail-closed: a rejected profile is [`SandboxError`].
 //! - **Linux** — rewrite the invocation as a **launcher mode**:
-//!   `<current_exe> __agent-sandbox-landlock <spec> -- <bin> <args…>`. That
-//!   hidden internal process (already post-exec, single-threaded) opens the
-//!   roots, builds and applies a Landlock ruleset requiring at least ABI V3
-//!   write rights (including `Truncate`), verifies full enforcement, then
-//!   `exec`s the real command. No Landlock work happens in `pre_exec`. If the
-//!   kernel cannot fully enforce the requested rights,
+//!   `<current_exe> __agent-sandbox-landlock <fd-spec> -- <bin> <args…>`.
+//!   The **trusted parent** opens each already-validated root as a directory
+//!   FD (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`), clears `FD_CLOEXEC` in a
+//!   minimal `pre_exec` hook, and passes the raw FD numbers in the launcher
+//!   JSON. The launcher never re-resolves pathnames: it builds
+//!   `PathBeneath` rules directly from the inherited FDs, applies Landlock
+//!   (ABI ≥ V3 write floor, including `Truncate`), then `exec`s the real
+//!   command. If the kernel cannot fully enforce the requested rights,
 //!   [`SandboxError::Unsupported`] is returned so the CLI can warn once and
 //!   continue unsandboxed.
 //! - **other** — [`SandboxError::Unsupported`] under `Enforce`.
@@ -25,7 +27,9 @@
 //! Writable roots are prepared **exactly once** per agent run (CLI preflight),
 //! producing a canonical [`SandboxSpec`]. Per-tool `apply` trusts those roots
 //! verbatim — no `exists` / `create_dir_all` / `canonicalize` / re-validation
-//! that could re-authorize an attacker-swapped symlink.
+//! that could re-authorize an attacker-swapped symlink. On Linux the parent
+//! further pins each root to an open directory FD so the launcher cannot be
+//! raced into authorizing a post-validation symlink target.
 
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
@@ -166,8 +170,14 @@ pub fn resolve_enforce_spec(raw_roots: &[PathBuf]) -> Result<SandboxMode, Sandbo
 /// Linux Landlock launcher entry point (CLI intercept).
 ///
 /// Expected argv shape (as received by the process):
-/// `argv[0]=exe`, `argv[1]=__agent-sandbox-landlock`, `argv[2]=<spec-json>`,
+/// `argv[0]=exe`, `argv[1]=__agent-sandbox-landlock`, `argv[2]=<fd-spec-json>`,
 /// `argv[3]=--`, `argv[4…]=real program + args`.
+///
+/// The fd-spec is JSON of the form
+/// `{"root_fds":[3,4,…],"dev_null_fd":N|null}`: FD numbers that the trusted
+/// parent opened (`O_DIRECTORY|O_NOFOLLOW` for roots, plain open for
+/// `/dev/null`) and made inheritable. The launcher **never** resolves a
+/// pathname for Landlock authorization — only the inherited FDs are used.
 ///
 /// Refuses to run unless [`crate::AGENT_RUN_ENV`] is present (set by
 /// `prepare_tool_env` on the parent-spawned launcher command). On success this
@@ -191,21 +201,25 @@ fn run_landlock_launcher_inner(argv: &[OsString]) -> Result<(), String> {
             "refusing to run outside an agent tool subprocess (missing GREPPY_AGENT_RUN)".into(),
         );
     }
-    // argv: [exe, launcher_arg, spec, "--", real_bin, real_args…]
+    // argv: [exe, launcher_arg, fd_spec, "--", real_bin, real_args…]
     if argv.len() < 5 || argv.get(3).map(OsString::as_os_str) != Some(OsStr::new("--")) {
         return Err(format!(
-            "bad launcher argv (want: {LANDLOCK_LAUNCHER_ARG} <spec> -- <bin> <args…>)"
+            "bad launcher argv (want: {LANDLOCK_LAUNCHER_ARG} <fd-spec> -- <bin> <args…>)"
         ));
     }
     let spec_arg = argv[2]
         .to_str()
         .ok_or_else(|| "launcher spec is not valid UTF-8".to_string())?;
-    let roots = decode_landlock_spec(spec_arg).map_err(|e| format!("spec: {e}"))?;
-    // Roots were prepared in the trusted parent; re-validate existence/type here
-    // without create_dir_all (we must not create new write targets post-fork of
-    // the policy decision — only open what the parent already staged).
-    let roots = validate_existing_roots(&roots).map_err(|e| e.to_string())?;
-    landlock_restrict(&roots).map_err(|e| e.to_string())?;
+    let fd_spec = decode_landlock_fd_spec(spec_arg).map_err(|e| format!("spec: {e}"))?;
+    // Adopt the inherited FDs as OwnedFd. From this point the launcher owns
+    // them; PathBeneath will close them when the ruleset is dropped after
+    // restrict_self (the real command never needs these FDs open).
+    let root_fds = adopt_inherited_fds(&fd_spec.root_fds)?;
+    let dev_null_fd = match fd_spec.dev_null_fd {
+        Some(n) => Some(adopt_inherited_fd(n)?),
+        None => None,
+    };
+    landlock_restrict_fds(&root_fds, dev_null_fd.as_ref()).map_err(|e| e.to_string())?;
 
     let real_bin = PathBuf::from(&argv[4]);
     let real_args: Vec<&OsStr> = argv[5..].iter().map(OsString::as_os_str).collect();
@@ -270,17 +284,17 @@ fn preflight_enforce(spec: &SandboxSpec) -> Result<(), SandboxError> {
 ///
 /// Belt-and-braces against symlink-ancestor escape:
 /// 1. Make the path absolute (join `current_dir` when relative).
-/// 2. `create_dir_all` so missing trailing components exist **before** the walk.
-/// 3. Walk every component with `symlink_metadata` and **reject** if any existing
+/// 2. Expand a **fixed allowlist** of known platform system aliases (macOS
+///    `/var`→`/private/var`, `/tmp`→`/private/tmp`, `/etc`→`/private/etc`) so
+///    legitimate host paths still resolve. Any other symlink in any component
+///    is a hard rejection on both platforms — no `access(W_OK)` heuristic,
+///    no ownership probe, no exceptions.
+/// 3. `create_dir_all` so missing trailing components exist **before** the walk.
+/// 4. Walk every component with `symlink_metadata` and **reject** if any existing
 ///    component is a symlink (names the offending component) or if the final
 ///    path is not a directory.
-/// 4. `canonicalize` the validated path (now free of symlinks; result is the
+/// 5. `canonicalize` the validated path (now free of symlinks; result is the
 ///    stable identity used for the rest of the run).
-///
-/// System symlink prefixes that a non-root user cannot replace (e.g. macOS
-/// `/var` → `/private/var`, `/tmp` → `/private/tmp`) are expanded before the
-/// reject-walk so legitimate host paths still work; any symlink whose parent
-/// directory is writable by the current user is refused.
 ///
 /// Called exactly once per agent run (via [`resolve_enforce_spec`]); never from
 /// per-tool [`apply`].
@@ -288,15 +302,20 @@ pub fn prepare_writable_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Sandbox
     let mut out = Vec::with_capacity(roots.len());
     for r in roots {
         let abs = make_absolute(r)?;
-        // Expand immutable system-symlink prefixes (e.g. /var → /private/var)
-        // first, so the reject-walk below only sees user-controllable components.
-        let abs = expand_immutable_symlink_prefixes(&abs)?;
-        // Create missing components first, then re-walk to validate. create_dir_all
-        // follows intermediate symlinks for creation; the subsequent walk rejects
-        // any remaining symlink component (attacker-planted under a writable parent).
-        // If the path already exists as a non-directory, create_dir_all errors with
-        // AlreadyExists / "File exists" — fall through so the type check below
-        // reports "not a directory" cleanly.
+        // Expand known system-alias prefixes (e.g. /var → /private/var) first,
+        // so the reject-walk below only sees non-allowlisted components.
+        let abs = expand_system_alias_prefixes(&abs)?;
+        // BEFORE create_dir_all: reject any symlink already present in an
+        // existing prefix. create_dir_all follows intermediate symlinks, so a
+        // user-planted link (even under a currently-0555 parent) would otherwise
+        // create the trailing components under the outside target before the
+        // post-create reject walk could fire — leaving an outside child behind
+        // even on an Err return.
+        reject_existing_symlink_prefix(&abs)?;
+        // Create missing trailing components, then re-walk the full path.
+        // If the path already exists as a non-directory, create_dir_all errors
+        // with AlreadyExists / "File exists" — fall through so the type check
+        // below reports "not a directory" cleanly.
         match std::fs::create_dir_all(&abs) {
             Ok(()) => {}
             Err(e)
@@ -364,129 +383,150 @@ fn make_absolute(path: &Path) -> Result<PathBuf, SandboxError> {
     Ok(cwd.join(path))
 }
 
-/// Expand leading symlink components whose parent dir the current user cannot
-/// write (system layout links like `/var` → `/private/var`). Stops at the first
-/// missing component or the first symlink under a user-writable parent (those
-/// are left for [`reject_symlink_components`] to refuse).
-fn expand_immutable_symlink_prefixes(path: &Path) -> Result<PathBuf, SandboxError> {
-    // Iteratively resolve: walk components; when a symlink sits under a
-    // non-writable parent, replace the accumulated path with its canonical
-    // form and continue with the unprocessed suffix.
-    let components: Vec<Component<'_>> = path.components().collect();
-    let mut out = PathBuf::new();
-    let mut i = 0;
-    while i < components.len() {
-        match components[i] {
-            Component::Prefix(p) => {
-                out.push(p.as_os_str());
-                i += 1;
+/// Fixed allowlist of known platform system aliases that may appear as a
+/// leading path component of a requested writable root.
+///
+/// Empirically verified on this macOS host (`readlink` of each source):
+/// - `/var` → `private/var` (resolves to `/private/var`)
+/// - `/tmp` → `private/tmp` (resolves to `/private/tmp`)
+/// - `/etc` → `private/etc` (resolves to `/private/etc`)
+///
+/// These three are the only top-level aliases needed for real agent roots
+/// (`std::env::temp_dir()` is under `/var/folders/…`) to resolve. Any other
+/// symlink — including user-owned `0555` directories containing attacker
+/// links, or `/home` on modern macOS — is a hard rejection. Empty on
+/// non-macOS: Linux agent roots live under real directories.
+#[cfg(target_os = "macos")]
+const SYSTEM_ALIAS_ALLOWLIST: &[(&str, &str)] = &[
+    ("/var", "/private/var"),
+    ("/tmp", "/private/tmp"),
+    ("/etc", "/private/etc"),
+];
+
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_ALIAS_ALLOWLIST: &[(&str, &str)] = &[];
+
+/// Expand a leading path component when (and only when) it matches the fixed
+/// [`SYSTEM_ALIAS_ALLOWLIST`]. Returns the rewritten absolute path; any other
+/// symlink is left for [`reject_symlink_components`] to refuse.
+///
+/// Only the **first** path component after the root is considered for
+/// expansion (the three macOS aliases are all single top-level names). Nested
+/// allowlisted names do not appear in practice and would be rejected by the
+/// subsequent component walk if they did.
+fn expand_system_alias_prefixes(path: &Path) -> Result<PathBuf, SandboxError> {
+    if SYSTEM_ALIAS_ALLOWLIST.is_empty() {
+        return Ok(path.to_path_buf());
+    }
+    // Identify the first Normal component after RootDir / Prefix.
+    let mut comps = path.components();
+    let mut prefix = PathBuf::new();
+    let first_normal = loop {
+        match comps.next() {
+            Some(Component::Prefix(p)) => prefix.push(p.as_os_str()),
+            Some(Component::RootDir) => prefix.push(Component::RootDir.as_os_str()),
+            Some(Component::CurDir) => continue,
+            Some(Component::ParentDir) => {
+                // Leading `..` after root is still root; keep walking.
                 continue;
             }
-            Component::RootDir => {
-                out.push(components[i].as_os_str());
-                i += 1;
-            }
-            Component::CurDir => {
-                i += 1;
-                continue;
-            }
-            Component::ParentDir => {
-                let _ = out.pop();
-                i += 1;
-                continue;
-            }
-            Component::Normal(s) => {
-                out.push(s);
-                i += 1;
-            }
+            Some(Component::Normal(s)) => break Some(s),
+            None => return Ok(path.to_path_buf()),
         }
-        match std::fs::symlink_metadata(&out) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                let parent = out.parent().unwrap_or_else(|| Path::new("/"));
-                if dir_is_writable_by_user(parent) {
-                    // User-controllable symlink: leave as-is for reject walk.
-                    // Rejoin the remaining components onto `out` and return.
-                    while i < components.len() {
-                        out.push(components[i].as_os_str());
-                        i += 1;
-                    }
-                    return Ok(out);
-                }
-                // Immutable system symlink: resolve and keep walking.
-                let resolved = std::fs::canonicalize(&out).map_err(|e| {
-                    SandboxError::Io(format!(
-                        "cannot resolve system symlink prefix {}: {e}",
-                        out.display()
-                    ))
-                })?;
-                out = resolved;
-            }
-            Ok(_) => {
-                // Real directory/file — keep walking.
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Remaining suffix will be created by create_dir_all.
-                while i < components.len() {
-                    out.push(components[i].as_os_str());
-                    i += 1;
-                }
-                return Ok(out);
-            }
-            Err(e) => {
+    };
+    let Some(name) = first_normal else {
+        return Ok(path.to_path_buf());
+    };
+    // Build the candidate absolute first-component path (e.g. "/var").
+    let mut head = prefix;
+    if head.as_os_str().is_empty() {
+        // Relative paths were made absolute by make_absolute; still be safe.
+        return Ok(path.to_path_buf());
+    }
+    head.push(name);
+    let head_str = head.to_string_lossy();
+    let Some(&(_, target)) = SYSTEM_ALIAS_ALLOWLIST
+        .iter()
+        .find(|(src, _)| *src == head_str.as_ref())
+    else {
+        // Not an allowlisted alias. Leave intact for reject_symlink_components.
+        return Ok(path.to_path_buf());
+    };
+    // Verify the alias still points where we expect before expanding — a
+    // host that rewrote the system layout must not silently authorize a
+    // different target. We compare the *lexical* readlink text (relative or
+    // absolute) against the known destination, accepting either the relative
+    // form macOS uses (`private/var`) or the absolute form (`/private/var`).
+    match std::fs::read_link(&head) {
+        Ok(link) => {
+            let link_os = link.as_os_str();
+            let expected_rel = target.trim_start_matches('/');
+            let ok = link_os == OsStr::new(target)
+                || link_os == OsStr::new(expected_rel)
+                || link == Path::new(target);
+            if !ok {
                 return Err(SandboxError::Io(format!(
-                    "cannot stat path component {}: {e}",
-                    out.display()
+                    "system alias {} no longer points at {} (readlink={}); refusing",
+                    head.display(),
+                    target,
+                    link.display()
                 )));
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Alias missing entirely — leave for later create/reject.
+            return Ok(path.to_path_buf());
+        }
+        Err(e) => {
+            // Not a symlink (or unreadable): do not expand.
+            // EINVAL / "Invalid argument" from read_link means not a symlink.
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                return Ok(path.to_path_buf());
+            }
+            return Err(SandboxError::Io(format!(
+                "cannot read system alias {}: {e}",
+                head.display()
+            )));
+        }
+    }
+    let mut out = PathBuf::from(target);
+    for c in comps {
+        out.push(c.as_os_str());
     }
     Ok(out)
 }
 
-/// True when the current process can create entries in `dir` (i.e. an attacker
-/// running as this user could plant a symlink there).
-fn dir_is_writable_by_user(dir: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        // access(W_OK) reflects the effective credentials — exactly the
-        // capability an in-sandbox tool (same uid) would have to swap a name.
-        let Ok(c) = CString::new(dir.as_os_str().as_bytes()) else {
-            return true; // fail closed: treat weird paths as writable
-        };
-        // SAFETY: c is a valid NUL-terminated path; access is a pure query.
-        let rc = unsafe {
-            libc_access(c.as_ptr(), 2 /* W_OK */)
-        };
-        rc == 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        // Non-unix: we don't have a seatbelt/landlock backend either; treat as
-        // writable so any symlink component is rejected.
-        true
-    }
+/// Walk every *existing* component of `path` with `symlink_metadata` and reject
+/// if any is a symlink. Stops cleanly at the first missing component (so the
+/// caller may still `create_dir_all` the trailing suffix). Lexical `..` is
+/// applied without resolving across links.
+///
+/// Used **before** `create_dir_all` so we never follow a user-planted symlink
+/// and materialize directories outside the intended root.
+fn reject_existing_symlink_prefix(path: &Path) -> Result<(), SandboxError> {
+    walk_components(path, MissingComponent::Stop)
 }
 
-/// Thin libc access(2) wrapper (avoid a libc crate dep on non-linux targets).
-#[cfg(unix)]
-unsafe fn libc_access(path: *const std::os::raw::c_char, mode: i32) -> i32 {
-    // libc is not a direct dep of greppy-agent on macOS; declare the symbol.
-    unsafe extern "C" {
-        fn access(path: *const std::os::raw::c_char, mode: i32) -> i32;
-    }
-    unsafe { access(path, mode) }
-}
-
-/// Walk every existing component of `path` with `symlink_metadata` and reject if
-/// any is a symlink. Also rejects empty paths. Lexical `..` is applied without
-/// resolving across links.
+/// Walk every component of `path` with `symlink_metadata` and reject if any is
+/// a symlink. Also rejects empty paths and missing components (post-create
+/// fail-closed). Lexical `..` is applied without resolving across links.
 ///
 /// Naming: the error mentions the first offending component path so operators
 /// can see which ancestor was swapped for a symlink.
 fn reject_symlink_components(path: &Path) -> Result<(), SandboxError> {
+    walk_components(path, MissingComponent::Error)
+}
+
+/// How [`walk_components`] treats a `NotFound` intermediate.
+#[derive(Clone, Copy)]
+enum MissingComponent {
+    /// Pre-create: missing suffix is fine (will be created next).
+    Stop,
+    /// Post-create: missing component is a race — fail closed.
+    Error,
+}
+
+fn walk_components(path: &Path, on_missing: MissingComponent) -> Result<(), SandboxError> {
     let mut cur = PathBuf::new();
     let mut saw_root = false;
     for comp in path.components() {
@@ -521,14 +561,15 @@ fn reject_symlink_components(path: &Path) -> Result<(), SandboxError> {
                     )));
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // create_dir_all should have made the full path; a missing
-                // intermediate after that is a race/TOCTOU — fail closed.
-                return Err(SandboxError::Io(format!(
-                    "writable root component missing after create: {}: {e}",
-                    cur.display()
-                )));
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match on_missing {
+                MissingComponent::Stop => return Ok(()),
+                MissingComponent::Error => {
+                    return Err(SandboxError::Io(format!(
+                        "writable root component missing after create: {}: {e}",
+                        cur.display()
+                    )));
+                }
+            },
             Err(e) => {
                 return Err(SandboxError::Io(format!(
                     "cannot stat writable root component {}: {e}",
@@ -543,43 +584,6 @@ fn reject_symlink_components(path: &Path) -> Result<(), SandboxError> {
         ));
     }
     Ok(())
-}
-
-/// Re-validate roots that the parent already prepared (launcher path).
-///
-/// Unlike [`prepare_writable_roots`], this does **not** create directories and
-/// does **not** re-canonicalize into a new identity: it only checks that each
-/// pre-resolved absolute path still exists as a non-symlink directory, then
-/// returns the input paths unchanged. That keeps the Landlock ruleset pointed
-/// at the original canonical roots even if an attacker swapped names on disk.
-#[cfg(target_os = "linux")]
-fn validate_existing_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, SandboxError> {
-    let mut out = Vec::with_capacity(roots.len());
-    for r in roots {
-        let meta = std::fs::symlink_metadata(r).map_err(|e| {
-            SandboxError::Io(format!(
-                "writable root missing at enforce time {}: {e}",
-                r.display()
-            ))
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(SandboxError::Io(format!(
-                "writable root is a symlink (refusing): {}",
-                r.display()
-            )));
-        }
-        if !meta.is_dir() {
-            return Err(SandboxError::Io(format!(
-                "writable root is not a directory: {}",
-                r.display()
-            )));
-        }
-        // Keep the pre-resolved path verbatim — do not re-canonicalize.
-        if !out.contains(r) {
-            out.push(r.clone());
-        }
-    }
-    Ok(out)
 }
 
 // ── macOS (Seatbelt / sandbox-exec) ─────────────────────────────────────────
@@ -691,49 +695,30 @@ fn escape_sbpl_string(s: &str) -> String {
     out
 }
 
-// ── Linux (Landlock launcher) ───────────────────────────────────────────────
+// ── Linux (Landlock launcher over inherited trusted FDs) ────────────────────
+//
+// Design invariant: the launcher never resolves a pathname for authorization.
+// The trusted parent opens each prepared root with
+//   open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+// (and `/dev/null` without O_DIRECTORY/O_NOFOLLOW), clears FD_CLOEXEC on those
+// FDs inside a pre_exec hook (so only the launcher child inherits them — not
+// other concurrent forks), and encodes the raw FD numbers in the launcher
+// argv JSON. The launcher adopts those FDs and builds PathBeneath rules
+// directly from them. A background process that swaps a directory for a
+// symlink after preparation cannot redirect Landlock: the FD already points
+// at the original directory inode.
 
+/// JSON payload passed as argv[2] of the Landlock launcher.
+///
+/// `root_fds` are directory FDs opened by the parent with
+/// `O_DIRECTORY|O_NOFOLLOW`. `dev_null_fd` is optional (absent when
+/// `/dev/null` could not be opened in the parent — rare, non-fatal).
 #[cfg(target_os = "linux")]
-fn apply_linux(
-    cmd: &mut Command,
-    bin: &Path,
-    args: &[impl AsRef<OsStr>],
-    roots: &[PathBuf],
-) -> Result<(), SandboxError> {
-    // Validate the ruleset can be built under the V3 write floor. The actual
-    // restrict_self runs in the already-exec'd launcher process (async-signal-
-    // safe: no path open / allocation / ruleset work in pre_exec).
-    preflight_linux(roots)?;
-
-    let launcher = std::env::current_exe()
-        .map_err(|e| SandboxError::Io(format!("current_exe for landlock launcher: {e}")))?;
-    let spec = encode_landlock_spec(roots)?;
-
-    *cmd = Command::new(launcher);
-    cmd.arg(LANDLOCK_LAUNCHER_ARG);
-    cmd.arg(spec);
-    cmd.arg("--");
-    cmd.arg(bin);
-    cmd.args(args.iter().map(AsRef::as_ref));
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn preflight_linux(roots: &[PathBuf]) -> Result<(), SandboxError> {
-    // Build once under HardRequirement (does not restrict the parent). Kernel
-    // missing Landlock or below the V3 write floor → Unsupported so the CLI
-    // warns once and continues unsandboxed.
-    landlock_build_ruleset(roots).map(|_| ())
-}
-
-#[cfg(target_os = "linux")]
-fn encode_landlock_spec(roots: &[PathBuf]) -> Result<String, SandboxError> {
-    serde_json::to_string(roots).map_err(|e| SandboxError::Io(format!("encode spec: {e}")))
-}
-
-#[cfg(target_os = "linux")]
-fn decode_landlock_spec(s: &str) -> Result<Vec<PathBuf>, String> {
-    serde_json::from_str(s).map_err(|e| format!("decode spec: {e}"))
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LandlockFdSpec {
+    root_fds: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dev_null_fd: Option<i32>,
 }
 
 /// Minimum Landlock ABI we require: V3 mediates `truncate` / `ftruncate` /
@@ -742,21 +727,303 @@ fn decode_landlock_spec(s: &str) -> Result<Vec<PathBuf>, String> {
 #[cfg(target_os = "linux")]
 const LANDLOCK_ABI_FLOOR: landlock::ABI = landlock::ABI::V3;
 
+/// Linux open(2) flags used by the trusted parent. Declared locally so we do
+/// not need a direct `libc` crate dep (values stable on x86_64 / aarch64 /
+/// riscv64 Linux UAPI).
 #[cfg(target_os = "linux")]
-fn landlock_build_ruleset(roots: &[PathBuf]) -> Result<landlock::RulesetCreated, SandboxError> {
-    use landlock::{
-        path_beneath_rules, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
-        RulesetAttr, RulesetCreatedAttr,
+mod open_flags {
+    pub const O_RDONLY: i32 = 0;
+    pub const O_DIRECTORY: i32 = 0o200_000;
+    pub const O_NOFOLLOW: i32 = 0o400_000;
+    pub const O_CLOEXEC: i32 = 0o2_000_000;
+    pub const F_GETFD: i32 = 1;
+    pub const F_SETFD: i32 = 2;
+    pub const FD_CLOEXEC: i32 = 1;
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux(
+    cmd: &mut Command,
+    bin: &Path,
+    args: &[impl AsRef<OsStr>],
+    roots: &[PathBuf],
+) -> Result<(), SandboxError> {
+    // Probe Landlock support without opening paths (empty-FD ruleset). The
+    // actual restrict_self runs in the already-exec'd launcher process.
+    preflight_linux(roots)?;
+
+    // Open each prepared root as a directory FD that refuses to follow a
+    // final-component symlink. Holding the FD pins the inode; a later
+    // directory→symlink swap cannot redirect this descriptor.
+    let root_fds = open_trusted_root_fds(roots)?;
+    // /dev/null is opened the same way (plain open, no path re-resolution in
+    // the launcher). Failure is non-fatal — shells rarely need it, and the
+    // launcher simply omits the rule.
+    let dev_null_fd = open_trusted_dev_null_fd().ok();
+
+    let root_raw: Vec<i32> = root_fds.iter().map(|f| f.as_raw_fd_i32()).collect();
+    let null_raw = dev_null_fd.as_ref().map(|f| f.as_raw_fd_i32());
+    let spec = encode_landlock_fd_spec(&LandlockFdSpec {
+        root_fds: root_raw.clone(),
+        dev_null_fd: null_raw,
+    })?;
+
+    let launcher = std::env::current_exe()
+        .map_err(|e| SandboxError::Io(format!("current_exe for landlock launcher: {e}")))?;
+
+    *cmd = Command::new(launcher);
+    cmd.arg(LANDLOCK_LAUNCHER_ARG);
+    cmd.arg(spec);
+    cmd.arg("--");
+    cmd.arg(bin);
+    cmd.args(args.iter().map(AsRef::as_ref));
+
+    // Keep the OwnedFds alive across the spawn by moving them into the
+    // pre_exec closure (which also clears FD_CLOEXEC). The parent still
+    // holds them until spawn returns; the child inherits the raw numbers.
+    install_inheritable_fds(cmd, root_fds, dev_null_fd)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_linux(_roots: &[PathBuf]) -> Result<(), SandboxError> {
+    // Build a ruleset with no path rules under HardRequirement. This is enough
+    // to detect "kernel missing Landlock / below V3 write floor" without
+    // re-opening pathnames (path opens happen only in apply_linux, once the
+    // parent is about to spawn).
+    landlock_build_ruleset_empty().map(|_| ())
+}
+
+/// Open every prepared root with `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`.
+///
+/// `O_NOFOLLOW` makes a final-component symlink a hard open error rather than
+/// a silent redirect. Combined with the once-per-run preparation that already
+/// rejected symlink *ancestors*, the resulting FD is a trusted handle on the
+/// intended directory inode.
+#[cfg(target_os = "linux")]
+fn open_trusted_root_fds(roots: &[PathBuf]) -> Result<Vec<OwnedDirFd>, SandboxError> {
+    let mut out = Vec::with_capacity(roots.len());
+    for r in roots {
+        out.push(OwnedDirFd::open_dir_nofollow(r)?);
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn open_trusted_dev_null_fd() -> Result<OwnedDirFd, SandboxError> {
+    OwnedDirFd::open_file(Path::new("/dev/null"))
+}
+
+/// Thin owned-FD wrapper so we can clear CLOEXEC / adopt raw numbers without
+/// depending on a `libc` crate. Drop closes the FD (parent side).
+#[cfg(target_os = "linux")]
+struct OwnedDirFd {
+    fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl OwnedDirFd {
+    fn open_dir_nofollow(path: &Path) -> Result<Self, SandboxError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            SandboxError::Io(format!(
+                "writable root path contains interior NUL: {}",
+                path.display()
+            ))
+        })?;
+        let flags = open_flags::O_RDONLY
+            | open_flags::O_DIRECTORY
+            | open_flags::O_NOFOLLOW
+            | open_flags::O_CLOEXEC;
+        // SAFETY: c is a valid NUL-terminated path; open returns -1 or a fresh FD.
+        let fd = unsafe { sys_open(c.as_ptr(), flags, 0) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(SandboxError::Io(format!(
+                "cannot open trusted root FD for {}: {err}",
+                path.display()
+            )));
+        }
+        Ok(Self { fd })
+    }
+
+    fn open_file(path: &Path) -> Result<Self, SandboxError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            SandboxError::Io(format!("path contains interior NUL: {}", path.display()))
+        })?;
+        let flags = open_flags::O_RDONLY | open_flags::O_CLOEXEC;
+        // SAFETY: c is a valid NUL-terminated path.
+        let fd = unsafe { sys_open(c.as_ptr(), flags, 0) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(SandboxError::Io(format!(
+                "cannot open {}: {err}",
+                path.display()
+            )));
+        }
+        Ok(Self { fd })
+    }
+
+    fn as_raw_fd_i32(&self) -> i32 {
+        self.fd
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedDirFd {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            // SAFETY: close a FD we own; ignore EINTR/EBADF on drop.
+            unsafe {
+                sys_close(self.fd);
+            }
+            self.fd = -1;
+        }
+    }
+}
+
+// Raw syscall wrappers (avoid a libc crate dep). Linux x86_64/aarch64 UAPI.
+#[cfg(target_os = "linux")]
+unsafe fn sys_open(path: *const std::os::raw::c_char, flags: i32, mode: i32) -> i32 {
+    unsafe extern "C" {
+        fn open(path: *const std::os::raw::c_char, flags: i32, mode: i32) -> i32;
+    }
+    unsafe { open(path, flags, mode) }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    unsafe { fcntl(fd, cmd, arg) }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn sys_close(fd: i32) -> i32 {
+    unsafe extern "C" {
+        fn close(fd: i32) -> i32;
+    }
+    unsafe { close(fd) }
+}
+
+/// Attach opened root FDs to `cmd` so the child inherits them.
+///
+/// Implementation: `pre_exec` clears `FD_CLOEXEC` on every FD (async-signal-
+/// safe: only `fcntl`). The `OwnedDirFd` values are moved into the closure so
+/// they stay alive until after `spawn`/`exec` completes in the parent; the
+/// child receives the same integer FD numbers referenced by the JSON spec.
+///
+/// We deliberately open with CLOEXEC and only clear it in `pre_exec`, so a
+/// concurrent `Command::spawn` elsewhere in the process cannot accidentally
+/// inherit these privileged directory FDs.
+#[cfg(target_os = "linux")]
+fn install_inheritable_fds(
+    cmd: &mut Command,
+    root_fds: Vec<OwnedDirFd>,
+    dev_null_fd: Option<OwnedDirFd>,
+) -> Result<(), SandboxError> {
+    use std::os::unix::process::CommandExt;
+
+    // Capture raw numbers for the closure; move ownership of the wrappers so
+    // Drop runs only after the spawn path releases the closure (keeps FDs open
+    // across fork). pre_exec itself only calls fcntl (async-signal-safe).
+    let all_fds: Vec<OwnedDirFd> = {
+        let mut v = root_fds;
+        if let Some(n) = dev_null_fd {
+            v.push(n);
+        }
+        v
     };
+    let raw_list: Vec<i32> = all_fds.iter().map(|f| f.as_raw_fd_i32()).collect();
+    // SAFETY: pre_exec runs in the child between fork and exec. We only call
+    // fcntl (async-signal-safe). We must not allocate / take locks here.
+    unsafe {
+        cmd.pre_exec(move || {
+            // Move all_fds into the closure so Drop runs after spawn returns
+            // in the parent (and after exec in the child success path the
+            // FDs are simply inherited — Drop does not run in the child
+            // after a successful exec).
+            let _keep = &all_fds;
+            for &fd in &raw_list {
+                let flags = sys_fcntl(fd, open_flags::F_GETFD, 0);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let new_flags = flags & !open_flags::FD_CLOEXEC;
+                if sys_fcntl(fd, open_flags::F_SETFD, new_flags) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
 
-    // Write accesses for the V3 floor (includes Truncate + Refer). Hard
-    // requirement: if the running kernel cannot enforce these rights, map to
-    // Unsupported rather than partially confining.
+#[cfg(target_os = "linux")]
+fn encode_landlock_fd_spec(spec: &LandlockFdSpec) -> Result<String, SandboxError> {
+    serde_json::to_string(spec).map_err(|e| SandboxError::Io(format!("encode fd-spec: {e}")))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_landlock_fd_spec(s: &str) -> Result<LandlockFdSpec, String> {
+    serde_json::from_str(s).map_err(|e| format!("decode fd-spec: {e}"))
+}
+
+/// Adopt a raw inherited FD number as an `OwnedFd` without re-opening.
+///
+/// The parent guaranteed these FDs are live and refer to the prepared roots
+/// / `/dev/null`. We check the FD is open (`F_GETFD`) and that the count of
+/// root FDs is non-zero when expected; a closed/invalid number is fail-closed.
+#[cfg(target_os = "linux")]
+fn adopt_inherited_fd(raw: i32) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if raw < 0 {
+        return Err(format!("invalid inherited fd number {raw}"));
+    }
+    // SAFETY: F_GETFD on a candidate FD; returns -1 if not open.
+    let flags = unsafe { sys_fcntl(raw, open_flags::F_GETFD, 0) };
+    if flags < 0 {
+        return Err(format!(
+            "inherited fd {raw} is not open in launcher: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: parent opened this FD and passed the number in the fd-spec;
+    // F_GETFD confirmed it is open. We take ownership so PathBeneath / Drop
+    // will close it after restrict_self.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+#[cfg(target_os = "linux")]
+fn adopt_inherited_fds(raws: &[i32]) -> Result<Vec<std::os::fd::OwnedFd>, String> {
+    if raws.is_empty() {
+        return Err("fd-spec root_fds is empty".into());
+    }
+    // Reject duplicates — a confused parent must not hand the same FD twice
+    // (would double-close under OwnedFd Drop).
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(raws.len());
+    for &n in raws {
+        if !seen.insert(n) {
+            return Err(format!("fd-spec has duplicate root fd {n}"));
+        }
+        out.push(adopt_inherited_fd(n)?);
+    }
+    Ok(out)
+}
+
+/// Build a Landlock ruleset with no path rules — used only for preflight
+/// capability probing in the parent.
+#[cfg(target_os = "linux")]
+fn landlock_build_ruleset_empty() -> Result<landlock::RulesetCreated, SandboxError> {
+    use landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+
     let write = AccessFs::from_write(LANDLOCK_ABI_FLOOR);
-
-    // handle_access under HardRequirement: only CompatError variants (ABI /
-    // access-right insufficiency) are possible. Map those to Unsupported so
-    // the CLI can warn-once and continue; never treat them as Landlock.
     let created = match Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(write)
@@ -764,29 +1031,61 @@ fn landlock_build_ruleset(roots: &[PathBuf]) -> Result<landlock::RulesetCreated,
         Ok(r) => r,
         Err(e) => return Err(classify_ruleset_error(e)),
     };
-    // create() can fail with:
-    //   - CreateRulesetError::MissingHandledAccess — HardRequirement + kernel
-    //     too old (compat state Dummy/No) → Unsupported
-    //   - CreateRulesetError::CreateRulesetCall { source } —
-    //       ENOSYS / EOPNOTSUPP → Unsupported (no Landlock)
-    //       anything else (ENOMEM, EMFILE, EPERM, …) → Landlock (fail closed)
+    match created.create() {
+        Ok(r) => Ok(r),
+        Err(e) => Err(classify_ruleset_error(e)),
+    }
+}
+
+/// Build a Landlock ruleset whose PathBeneath rules reference already-open
+/// FDs (never pathnames).
+///
+/// `PathBeneath::new` accepts any `AsFd`; we pass `OwnedFd` directly so the
+/// landlock crate never opens anything on its own.
+#[cfg(target_os = "linux")]
+fn landlock_build_ruleset_from_fds(
+    root_fds: &[std::os::fd::OwnedFd],
+    dev_null_fd: Option<&std::os::fd::OwnedFd>,
+) -> Result<landlock::RulesetCreated, SandboxError> {
+    use landlock::{
+        AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    };
+
+    let write = AccessFs::from_write(LANDLOCK_ABI_FLOOR);
+
+    let created = match Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(write)
+    {
+        Ok(r) => r,
+        Err(e) => return Err(classify_ruleset_error(e)),
+    };
     let mut ruleset = match created.create() {
         Ok(r) => r,
         Err(e) => return Err(classify_ruleset_error(e)),
     };
-    ruleset = ruleset
-        .add_rules(path_beneath_rules(
-            roots.iter().map(PathBuf::as_path),
-            write,
-        ))
-        .map_err(|e| SandboxError::Landlock(format!("add_rules: {e}")))?;
 
-    // Narrow device-node allowances (never all of /dev). Only the write rights
-    // applicable to a non-directory file — WriteFile + Truncate.
-    let dev_write = AccessFs::WriteFile | AccessFs::Truncate;
-    if let Ok(null_fd) = PathFd::new("/dev/null") {
+    for fd in root_fds {
+        // PathBeneath::new accepts any AsFd (OwnedFd implements it). Use
+        // try_clone so each rule owns an independent FD (PathBeneath closes
+        // its parent_fd on drop). Cloning is a pure fcntl(F_DUPFD_CLOEXEC).
+        let owned = fd
+            .try_clone()
+            .map_err(|e| SandboxError::Landlock(format!("clone root fd: {e}")))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(null_fd, dev_write))
+            .add_rule(PathBeneath::new(owned, write))
+            .map_err(|e| SandboxError::Landlock(format!("add_rule root fd: {e}")))?;
+    }
+
+    // Narrow device-node allowance (never all of /dev). Only the write rights
+    // applicable to a non-directory file — WriteFile + Truncate.
+    if let Some(null_fd) = dev_null_fd {
+        let dev_write = AccessFs::WriteFile | AccessFs::Truncate;
+        let owned = null_fd
+            .try_clone()
+            .map_err(|e| SandboxError::Landlock(format!("clone /dev/null fd: {e}")))?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(owned, dev_write))
             .map_err(|e| SandboxError::Landlock(format!("add_rule /dev/null: {e}")))?;
     }
 
@@ -862,10 +1161,13 @@ mod libc_errno {
 }
 
 #[cfg(target_os = "linux")]
-fn landlock_restrict(roots: &[PathBuf]) -> Result<(), SandboxError> {
+fn landlock_restrict_fds(
+    root_fds: &[std::os::fd::OwnedFd],
+    dev_null_fd: Option<&std::os::fd::OwnedFd>,
+) -> Result<(), SandboxError> {
     use landlock::RulesetStatus;
 
-    let ruleset = landlock_build_ruleset(roots)?;
+    let ruleset = landlock_build_ruleset_from_fds(root_fds, dev_null_fd)?;
     let status = ruleset
         .restrict_self()
         .map_err(|e| SandboxError::Landlock(format!("restrict_self: {e}")))?;
@@ -1098,11 +1400,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Same T1(ii) property on Linux: the landlock launcher JSON spec must keep
-    /// the original canonical root after a post-resolve symlink swap.
+    /// T1(ii) on Linux under the trusted-FD design: after a post-resolve directory
+    /// → symlink swap, `apply` either fails closed (open of the original path
+    /// hits the symlink via O_NOFOLLOW / non-dir) or succeeds with an FD-spec
+    /// that contains **only FD numbers** — never a pathname that could be
+    /// re-resolved to the outside target. Pathnames are gone from the launcher
+    /// contract entirely.
     #[cfg(target_os = "linux")]
     #[test]
-    fn apply_linux_uses_pre_resolved_roots_after_symlink_swap() {
+    fn apply_linux_fd_spec_has_no_pathnames_after_symlink_swap() {
         let base = unique("swap-ll");
         std::fs::create_dir_all(&base).unwrap();
         let root = base.join("root");
@@ -1138,23 +1444,167 @@ mod tests {
                     .collect();
                 assert_eq!(got[0], LANDLOCK_LAUNCHER_ARG);
                 let spec_json = &got[1];
+                // Spec is FD-only JSON: must parse as LandlockFdSpec and must
+                // NOT contain any pathname (neither original nor outside).
+                let decoded: LandlockFdSpec =
+                    serde_json::from_str(spec_json).expect("fd-spec json");
                 assert!(
-                    spec_json.contains(original.to_str().unwrap()),
-                    "launcher spec must keep original canonical root {original:?}; got {spec_json}"
+                    !decoded.root_fds.is_empty(),
+                    "fd-spec must carry at least one root fd: {spec_json}"
+                );
+                assert!(
+                    !spec_json.contains(original.to_str().unwrap()),
+                    "fd-spec must not embed pathnames; got {spec_json}"
                 );
                 let outside_canon = std::fs::canonicalize(&outside).unwrap();
-                // Only fail if outside leaked in as a distinct path.
-                if outside_canon != original {
+                if let Some(s) = outside_canon.to_str() {
                     assert!(
-                        !spec_json.contains(outside_canon.to_str().unwrap()),
-                        "launcher spec must not re-resolve to symlink target {outside_canon:?}; got {spec_json}"
+                        !spec_json.contains(s),
+                        "fd-spec must not re-resolve to symlink target; got {spec_json}"
                     );
                 }
+            }
+            // Fail-closed is also correct: O_NOFOLLOW/O_DIRECTORY open of a
+            // path whose final component is now a symlink (or whose directory
+            // was renamed away) must not authorize the outside target.
+            Err(SandboxError::Io(msg)) => {
+                assert!(
+                    msg.contains("trusted root") || msg.contains("symlink") || msg.contains("open"),
+                    "unexpected Io error after swap: {msg}"
+                );
             }
             Err(SandboxError::Unsupported) => {}
             Err(e) => panic!("unexpected: {e}"),
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// U1: user-owned 0555 directory containing a symlink must be REJECTED by
+    /// the public `prepare_writable_roots` API. The previous `access(W_OK)`
+    /// heuristic treated "not writable right now" as "immutable system link"
+    /// and authorized the outside target — that hole must stay closed.
+    ///
+    /// Also asserts the outside child does **not** exist afterwards (prepare
+    /// must not create anything under the symlink target).
+    #[cfg(unix)]
+    #[test]
+    fn prepare_rejects_symlink_under_user_owned_0555_dir() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let base = unique("u1-0555");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_child = outside.join("child");
+        // Ensure the probe target does not exist before the call.
+        let _ = std::fs::remove_dir_all(&outside_child);
+        let _ = std::fs::remove_file(&outside_child);
+        assert!(!outside_child.exists());
+
+        let gate = base.join("gate");
+        std::fs::create_dir_all(&gate).unwrap();
+        // Plant the symlink while the parent is still writable.
+        let link = gate.join("link");
+        symlink(&outside, &link).unwrap();
+        // Drop write bits: access(W_OK) would now fail, which is exactly the
+        // misclassification the old heuristic made.
+        let mut perms = std::fs::metadata(&gate).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&gate, perms).unwrap();
+
+        let requested = link.join("child");
+        let result = prepare_writable_roots(std::slice::from_ref(&requested));
+
+        // Restore writability so cleanup can proceed even on assertion failure.
+        let mut perms = std::fs::metadata(&gate).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&gate, perms);
+
+        match result {
+            Ok(roots) => {
+                let _ = std::fs::remove_dir_all(&base);
+                panic!("user-owned 0555 dir + symlink must be REJECTED; got roots={roots:?}");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("symlink"),
+                    "expected symlink rejection, got: {msg}"
+                );
+            }
+        }
+        assert!(
+            !outside_child.exists(),
+            "outside child must NOT exist after rejected prepare: {}",
+            outside_child.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// U1: a plain user-created symlink used as a writable root is rejected
+    /// (no allowlist entry covers user paths).
+    #[cfg(unix)]
+    #[test]
+    fn prepare_rejects_plain_user_symlink_root() {
+        use std::os::unix::fs::symlink;
+        let base = unique("u1-user-sym");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = base.join("link");
+        symlink(&target, &link).unwrap();
+        let err = prepare_writable_roots(std::slice::from_ref(&link)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlink"),
+            "plain user symlink root must be rejected: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// U1: `/var/...`-style system-alias roots still resolve via the fixed
+    /// allowlist (macOS). On other platforms this is a no-op of the temp-dir
+    /// acceptance already covered elsewhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_expands_macos_var_system_alias() {
+        // temp_dir() on macOS is under /var/folders/… which must expand through
+        // the fixed /var → /private/var allowlist entry.
+        let tmp = std::env::temp_dir();
+        assert!(
+            tmp.starts_with("/var") || tmp.starts_with("/private/var"),
+            "expected macOS temp_dir under /var, got {}",
+            tmp.display()
+        );
+        let roots = prepare_writable_roots(std::slice::from_ref(&tmp)).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert!(
+            roots[0].starts_with("/private/var"),
+            "canonical root must live under /private/var, got {}",
+            roots[0].display()
+        );
+        // Direct /var/folders request (pre-expansion form) must also work.
+        if tmp.starts_with("/var") {
+            let via_var = prepare_writable_roots(std::slice::from_ref(&tmp)).unwrap();
+            assert_eq!(via_var[0], roots[0]);
+        }
+    }
+
+    /// U1 unit: expand_system_alias_prefixes rewrites only allowlisted heads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn expand_system_alias_only_allowlisted() {
+        let expanded = expand_system_alias_prefixes(Path::new("/var/folders/x")).unwrap();
+        assert_eq!(expanded, PathBuf::from("/private/var/folders/x"));
+        let expanded = expand_system_alias_prefixes(Path::new("/tmp/foo")).unwrap();
+        assert_eq!(expanded, PathBuf::from("/private/tmp/foo"));
+        let expanded = expand_system_alias_prefixes(Path::new("/etc/hosts")).unwrap();
+        assert_eq!(expanded, PathBuf::from("/private/etc/hosts"));
+        // Non-allowlisted: returned unchanged (reject walk will catch symlinks).
+        let unchanged = expand_system_alias_prefixes(Path::new("/Users/someone")).unwrap();
+        assert_eq!(unchanged, PathBuf::from("/Users/someone"));
+        let unchanged = expand_system_alias_prefixes(Path::new("/home/someone")).unwrap();
+        assert_eq!(unchanged, PathBuf::from("/home/someone"));
     }
 
     #[test]
@@ -1335,7 +1785,7 @@ mod tests {
         let _ = std::fs::remove_file(&probe);
     }
 
-    /// Linux-only: ruleset construction from a temp root must not panic and
+    /// Linux-only: empty-FD ruleset construction (preflight) must not panic and
     /// must return Unsupported (not Landlock error) when the kernel lacks the
     /// V3 write floor.
     #[cfg(target_os = "linux")]
@@ -1345,7 +1795,7 @@ mod tests {
         let roots = prepare_writable_roots(std::slice::from_ref(&root)).unwrap();
         match preflight_linux(&roots) {
             Ok(()) => {
-                let _ = landlock_build_ruleset(&roots).unwrap();
+                let _ = landlock_build_ruleset_empty().unwrap();
             }
             Err(SandboxError::Unsupported) => {}
             Err(e) => panic!("unexpected: {e}"),
@@ -1353,9 +1803,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// U2: apply rewrites to the landlock launcher with an FD-spec JSON
+    /// (not a pathname list). Shape:
+    ///   argv = [LANDLOCK_LAUNCHER_ARG, <fd-spec-json>, "--", bin, args…]
     #[cfg(target_os = "linux")]
     #[test]
-    fn apply_linux_rewrites_to_landlock_launcher() {
+    fn apply_linux_rewrites_to_landlock_launcher_with_fd_spec() {
         let root = unique("apply-ll");
         std::fs::create_dir_all(&root).unwrap();
         let spec = resolved_spec(std::slice::from_ref(&root));
@@ -1373,8 +1826,31 @@ mod tests {
                     .map(|s| s.to_string_lossy().into_owned())
                     .collect();
                 assert_eq!(got[0], LANDLOCK_LAUNCHER_ARG);
-                // got[1] is the JSON spec
-                assert!(got[1].starts_with('['), "spec={}", got[1]);
+                // got[1] is the FD-spec JSON object (not a bare path array).
+                assert!(
+                    got[1].starts_with('{'),
+                    "fd-spec must be a JSON object, got {}",
+                    got[1]
+                );
+                let decoded: LandlockFdSpec =
+                    serde_json::from_str(&got[1]).expect("fd-spec parses");
+                assert_eq!(
+                    decoded.root_fds.len(),
+                    1,
+                    "one prepared root → one FD: {:?}",
+                    decoded.root_fds
+                );
+                assert!(
+                    decoded.root_fds[0] >= 0,
+                    "FD numbers must be non-negative: {:?}",
+                    decoded.root_fds
+                );
+                // No pathnames in the spec.
+                assert!(
+                    !got[1].contains(root.to_str().unwrap_or("\0")),
+                    "fd-spec must not embed pathnames: {}",
+                    got[1]
+                );
                 assert_eq!(got[2], "--");
                 assert_eq!(got[3], "/bin/echo");
                 assert_eq!(got[4], "hi");
@@ -1383,6 +1859,101 @@ mod tests {
             Err(e) => panic!("unexpected: {e}"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// U2: fd-spec encode/decode round-trip (platform-independent logic,
+    /// compiled only on Linux where the type lives).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_fd_spec_roundtrip() {
+        let spec = LandlockFdSpec {
+            root_fds: vec![7, 8, 9],
+            dev_null_fd: Some(10),
+        };
+        let s = encode_landlock_fd_spec(&spec).unwrap();
+        let back = decode_landlock_fd_spec(&s).unwrap();
+        assert_eq!(back, spec);
+
+        let spec2 = LandlockFdSpec {
+            root_fds: vec![3],
+            dev_null_fd: None,
+        };
+        let s2 = encode_landlock_fd_spec(&spec2).unwrap();
+        assert!(
+            !s2.contains("dev_null_fd"),
+            "None dev_null_fd should be omitted: {s2}"
+        );
+        let back2 = decode_landlock_fd_spec(&s2).unwrap();
+        assert_eq!(back2, spec2);
+    }
+
+    /// U2: launcher refuses to run without GREPPY_AGENT_RUN (when the marker is
+    /// not already set on the process). Avoids mutating process-global env so
+    /// the parallel test runner stays sound.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_launcher_refuses_without_marker() {
+        if std::env::var_os(crate::AGENT_RUN_ENV).is_some() {
+            // Another test (or the harness) left the marker set; skip rather
+            // than race on process-global env.
+            return;
+        }
+        let argv = vec![
+            OsString::from("greppy"),
+            OsString::from(LANDLOCK_LAUNCHER_ARG),
+            OsString::from(r#"{"root_fds":[3]}"#),
+            OsString::from("--"),
+            OsString::from("/bin/true"),
+        ];
+        let rc = run_landlock_launcher(&argv);
+        assert_eq!(
+            rc, LANDLOCK_LAUNCHER_EXIT_SETUP,
+            "launcher must refuse without GREPPY_AGENT_RUN"
+        );
+    }
+
+    /// U2: fd-count / validity helpers reject empty, duplicate, and closed FDs.
+    /// Pure validation — no Landlock syscalls, no env mutation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_fd_adoption_rejects_empty_dup_closed() {
+        let empty = adopt_inherited_fds(&[]);
+        assert!(empty.is_err(), "empty root_fds must fail");
+        assert!(
+            empty.unwrap_err().contains("empty"),
+            "error should mention empty"
+        );
+
+        let dup = adopt_inherited_fds(&[3, 3]);
+        assert!(dup.is_err(), "duplicate root fds must fail");
+        assert!(
+            dup.unwrap_err().contains("duplicate"),
+            "error should mention duplicate"
+        );
+
+        // 1023 is almost certainly closed in a unit-test process.
+        let closed = adopt_inherited_fd(1023);
+        assert!(closed.is_err(), "closed inherited fd must fail");
+
+        let neg = adopt_inherited_fd(-1);
+        assert!(neg.is_err(), "negative fd must fail");
+    }
+
+    /// U2: bad launcher argv shape is rejected (when marker is present via the
+    /// inner function's first check — we only exercise the argv branch by
+    /// calling the pure length/`--` guard through decode + docs; the
+    /// full launcher path is covered by `landlock_launcher_refuses_without_marker`
+    /// for the marker and by the adoption helpers for the fd-spec).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_fd_spec_decode_rejects_garbage() {
+        assert!(decode_landlock_fd_spec("not-json").is_err());
+        assert!(decode_landlock_fd_spec("[]").is_err());
+        assert!(decode_landlock_fd_spec(r#"{"root_fds":"x"}"#).is_err());
+        // Valid minimal object.
+        let ok = decode_landlock_fd_spec(r#"{"root_fds":[4,5]}"#).unwrap();
+        assert_eq!(ok.root_fds, vec![4, 5]);
+        assert_eq!(ok.dev_null_fd, None);
     }
 
     /// T2: classify_ruleset_error maps true compat failures to Unsupported and
@@ -1438,5 +2009,15 @@ mod tests {
         // without a real ruleset, so we only re-check the documented helper).
         let eperm = std::io::Error::from_raw_os_error(1); // EPERM
         assert!(!is_compat_io_error(&eperm), "EPERM must be fail-closed");
+    }
+
+    /// Platform-independent: system-alias allowlist is empty on non-macOS, so
+    /// expand is a pure identity.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn expand_system_alias_is_identity_off_macos() {
+        let p = PathBuf::from("/var/folders/x");
+        let out = expand_system_alias_prefixes(&p).unwrap();
+        assert_eq!(out, p);
     }
 }
