@@ -102,7 +102,7 @@ impl GreppyEnv {
     ///
     /// Defaults to [`SandboxMode::Off`] so non-`-p` callers are unchanged.
     /// `greppy -p` enables [`SandboxMode::Enforce`] with the run's writable
-    /// roots (worktree, temp, store, `~/.cargo`, platform cache).
+    /// roots (worktree, temp, greppy data root, `~/.cargo`, platform cache).
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
         self

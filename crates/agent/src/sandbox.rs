@@ -2,7 +2,7 @@
 //!
 //! Both the `greppy` and `bash` tools spawn a child process. When
 //! [`SandboxMode::Enforce`] is active, that child may **write** only under an
-//! explicit allowlist of roots (the run worktree, temp dir, greppy store,
+//! explicit allowlist of roots (the run worktree, temp dir, greppy data root,
 //! `~/.cargo`, and the platform user cache). **Reads stay unrestricted** so
 //! builds can reach system headers and package registries; **network stays
 //! open** in this iteration (needed for `cargo fetch`).

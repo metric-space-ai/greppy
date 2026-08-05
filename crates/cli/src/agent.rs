@@ -14,7 +14,6 @@ use greppy_agent::{
     LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
     WorkspaceError, SYSTEM_PROMPT,
 };
-use greppy_core::workspace as workspace_locator;
 
 /// Exit: success (clean, proposal, or applied).
 pub const EXIT_OK: u8 = 0;
@@ -36,7 +35,7 @@ delivers a proposal ref (refs/greppy/agent/<run_id>); inspect with `git show`
 or apply with `git cherry-pick -n`. The agent has exactly one tool — `greppy`
 — covering search/navigate/read/edit; commands run through that tool as
 `bash-smart -- CMD`. The tool is write-confined to the worktree, temp,
-greppy store, ~/.cargo and the platform cache; reads and network stay open.
+greppy data root, ~/.cargo and the platform cache; reads and network stay open.
 Pass --no-sandbox (or GREPPY_NO_SANDBOX=1) to disable.
 
 Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
@@ -549,18 +548,28 @@ fn resolve_sandbox_mode(args: &AgentArgs, worktree_path: &Path) -> Result<Sandbo
 
 /// Writable roots for a sandboxed `-p` tool subprocess.
 ///
-/// 1. the run's worktree,
-/// 2. `std::env::temp_dir()`,
-/// 3. the worktree's greppy store dir,
-/// 4. `~/.cargo` (registry/build caches; respects `CARGO_HOME`),
+/// Keep this list minimal. Each root needs an explicit reason to be writable:
+/// 1. the run's worktree — agent edits and worktree-local builds land here,
+/// 2. `std::env::temp_dir()` — process temp / intermediate files,
+/// 3. greppy's data root — owns `locks/`, `trash/`, and `workspaces/` (index-
+///    backed commands acquire lifecycle leases under `locks/` and open
+///    `graph.db` under `workspaces/`; one root covers them all),
+/// 4. `~/.cargo` — registry/build caches (respects `CARGO_HOME`),
 /// 5. the platform user cache dir (`~/Library/Caches` on macOS,
-///    `$XDG_CACHE_HOME` or `~/.cache` on Linux).
+///    `$XDG_CACHE_HOME` or `~/.cache` on Linux) — model/download caches.
 fn writable_roots_for(worktree_path: &Path) -> Vec<std::path::PathBuf> {
     vec![
+        // Agent proposal edits and worktree-local builds land here.
         worktree_path.to_path_buf(),
+        // Process temp (and macOS TMPDIR) for intermediate files.
         std::env::temp_dir(),
-        workspace_locator::store_dir(worktree_path),
+        // Greppy's data root owns locks/, trash/, and workspaces/ — index-backed
+        // commands acquire lifecycle leases under locks/ and open graph.db under
+        // workspaces/. One root covers them all (see greppy_core::cache).
+        greppy_core::cache::data_root(),
+        // Cargo registry / git / target build caches (respects CARGO_HOME).
         cargo_home_dir(),
+        // Platform user cache (e.g. model downloads; XDG cache on Linux).
         platform_user_cache_dir(),
     ]
 }
@@ -866,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_roots_include_worktree_temp_store_cargo_cache() {
+    fn writable_roots_include_worktree_temp_data_root_cargo_cache() {
         let wt = unique("roots-wt");
         fs::create_dir_all(&wt).unwrap();
         let roots = writable_roots_for(&wt);
@@ -878,10 +887,21 @@ mod tests {
             roots.iter().any(|r| r == &std::env::temp_dir()),
             "temp missing: {roots:?}"
         );
-        let store = workspace_locator::store_dir(&wt);
+        let data = greppy_core::cache::data_root();
         assert!(
-            roots.iter().any(|r| r == &store),
-            "store missing: {roots:?}"
+            roots.iter().any(|r| r == &data),
+            "greppy data root missing: {roots:?}"
+        );
+        // Workspace store / locks / trash all live under data_root; granting the
+        // parent is enough (and required for lifecycle leases).
+        let store = greppy_core::workspace::store_dir(&wt);
+        assert!(
+            store.starts_with(&data),
+            "store_dir {store:?} must live under data_root {data:?}"
+        );
+        assert!(
+            greppy_core::cache::locks_root().starts_with(&data),
+            "locks_root must live under data_root"
         );
         assert!(
             roots
