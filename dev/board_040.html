@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Kritischer Pfad: WP1 Wire-Client (Grok, läuft) → WP2 Loop+ExecutionEnv → WP3 Tools ∥ WP4 Isolation → WP5 CLI → WP7 E2E+Review.</p>
+  <p class="headline">Kritischer Pfad: WP2 Loop+ExecutionEnv (Grok, läuft) → WP3 Tools ∥ WP4 Isolation → WP5 CLI → WP7 E2E+Review. WP1 gelandet + verifiziert.</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -75,6 +75,17 @@
       Kein HTTP-Client im Cargo-Tree → WP1 nutzt <code>ureq</code> (minimal, kein TLS — localhost http).</p>
     </div>
     <div class="card done">
+      <h3>WP1 — Wire-Client gelandet + verifiziert</h3>
+      <p>Commit <code>729b399</code>: <code>crates/agent</code> (greppy-agent) mit Protokolltypen,
+      Messages-Serialisierung, SSE-Parser, blocking Client + Probe. Orchestrator-verifiziert:
+      fmt/clippy grün, <strong>13/13 Tests</strong> selbst gelaufen, Diff-Scope = Whitelist, kein TLS, keine Netz-Tests.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp1-grok.log</code></p>
+    </div>
+    <div class="card done">
+      <h3>pi-Audit-Checkout steht</h3>
+      <p><code>~/pi-audit-0201806a</code> am Pin <code>0201806ad</code> (Release v0.80.2). Verifiziert via git log.</p>
+    </div>
+    <div class="card done">
       <h3>0.3.0-Toolfläche gesichtet → WP3 schrumpft</h3>
       <p>0.3.0-AGENTS.md: voller EDIT-Satz (<code>replace/replace-span/patch/write/rename/undo</code>,
       <code>--dry-run/--verify</code>) + <code>bash-smart</code> + SEARCH/NAVIGATE/READ mit Handles &amp; Pipe-Chaining.
@@ -84,27 +95,16 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP1 — Wire-Client <span class="k">(claude-grok)</span></h3>
-      <p>Neues Crate <code>crates/agent</code> (<code>greppy-agent</code>): neutrale Protokolltypen,
-      Anthropic-Messages-Serialisierung, SSE-Parser → StreamEvent, blocking Client (ureq), Probe <code>GET /v1/models</code>.</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp1-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
-      <code>agent: WP1 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
-    </div>
-    <div class="card work">
-      <h3>pi-Audit-Checkout</h3>
-      <p><code>~/pi-audit-0201806a</code> — Clone von earendil-works/pi, Checkout am Pin
-      <code>0201806a</code>. Quelle für WP2-Port (dist-JS im ctox-Sidecar bleibt Fallback).</p>
-      <p class="k">Fertig = git log zeigt Pin-Commit</p>
+      <h3>WP2 — Agent-Loop-Port + ExecutionEnv <span class="k">(claude-grok)</span></h3>
+      <p>pi <code>agent-loop</code> (aus <code>~/pi-audit-0201806a</code>, MIT) nach Rust: Turn-Schleife,
+      Tool-Dispatch über <code>ExecutionEnv</code>-Trait, Stop-Bedingungen, testbar via ModelStream-Trait.
+      Inkl. THIRD_PARTY-Eintrag für pi.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp2-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
+      <code>agent: WP2 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
     </div>
   </div></div>
 
   <div class="col"><h2>To-Do</h2><div class="cards">
-    <div class="card">
-      <h3>WP2 — Agent-Loop-Port + ExecutionEnv-Trait <span class="k">(Grok)</span></h3>
-      <p>pi <code>agent-loop</code> (packages/agent) nach Rust: Turn-Schleife, Tool-Dispatch,
-      Stop-Bedingungen. Tool-Grenze als <code>ExecutionEnv</code>-Trait (Vorbild: ctox-Sidecar-Vertrag, nur Struktur, kein Code).</p>
-      <p class="trigger">Trigger: WP1 gelandet + orchestrator-verifiziert</p>
-    </div>
     <div class="card">
       <h3>WP3 — Tool-Adapter auf greppy-0.3.0-Kommandos <span class="k">(Grok)</span></h3>
       <p>Tools = in-process Aufrufe der eigenen Crates: search/navigate/read, EDIT-Suite (mit undo-Journal), bash-smart.
