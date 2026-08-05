@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">OWNER-Entscheid: Prozess-Sandbox kommt in 0.3.1 (nicht 0.4.x) — WP11 läuft (Grok). Danach Sol-Review + E2E, dann wieder SHIP-Stand. Übriger Trigger: 0.3.0-Tag.</p>
+  <p class="headline">Sandbox-Schleife: WP11 gelandet + Live-E2E (Escape geblockt), Sol-Review fand 6 echte Löcher (do-not-ship) → WP12-Reparatur läuft (Grok). Danach Sol-Re-Check → SHIP.</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -120,8 +120,19 @@
       Stop-Disziplin, Stdin-Fußnote. Quelle: Scratchpad <code>wp6-system-prompt.md</code>; landet
       byte-exakt als <code>crates/agent/src/prompt.rs</code> im WP5-Commit.</p>
     </div>
+    <div class="card done neg">
+      <h3>WP11 — Sandbox gelandet, Live-E2E ok — Sol-Review: do-not-ship (6 Findings)</h3>
+      <p>Commit <code>aac49c0</code> (sandbox.rs, Seatbelt+Landlock, --no-sandbox). Mein E2E: Escape
+      <code>touch $HOME/…</code> geblockt, Worktree-Write als Proposal, 104/104 Tests ×2.
+      ABER Sol: (1) CRITICAL Linux-Backend kompiliert nicht (landlock 0.4.7 hat kein
+      <code>ABI::new_current()</code> — macOS-Builds sehen cfg(linux) nie!), (2) pre_exec nicht
+      async-signal-safe, (3) Truncate-Lücke ABI&lt;V3, (4) Blanket-/private/var/folders — Sol hat den
+      Escape LIVE reproduziert, (5) stille Root-Auslassung, (6) /dev/null fehlt auf Linux.
+      → WP12. Lehre: cross-platform cfg-Code braucht cross-target cargo check im Gate.</p>
+      <p class="k">Logs: <code>wp11-grok.log</code>, <code>wp11-review-sol.log</code></p>
+    </div>
     <div class="card done">
-      <h3>SHIP — Review-Kreislauf geschlossen (Sol, final)</h3>
+      <h3>SHIP (vor Sandbox-Nachtrag) — Review-Kreislauf geschlossen (Sol)</h3>
       <p>Re-Review <code>f0dd0db</code>: ship-with-fixes (F1–F10: 9 RESOLVED, F5 partial; 3 neue Findings).
       WP9 <code>f842787</code>: SSE-Zustandsmaschine, parallel-sicherer Env-Test (Flake weg, 3× parallel grün),
       ehrlicher Event-Cap. WP10 <code>31eaeaa</code>: Block-Kind-Tracking, Pflichtfelder, Stopped-Zustand.
@@ -199,11 +210,12 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP11 — Prozess-Sandbox für Tool-Subprozesse <span class="k">(claude-grok)</span></h3>
-      <p>OWNER 05.08. spät: in 0.3.1 vorgezogen. Schreib-Confinement auf Worktree + tmp + Build-Caches:
-      macOS <code>sandbox-exec</code> (generiertes Seatbelt-Profil), Linux Landlock (Fallback: Warnung).
-      Netz bleibt offen (cargo fetch), <code>--no-sandbox</code> als Escape. Hilfetext + CHANGELOG angepasst.</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp11-grok.log</code> · Danach: Sol-Review + Sandbox-E2E · Grok 1/3</p>
+      <h3>WP12 — Sandbox-Reparaturen S1–S7 <span class="k">(claude-grok)</span></h3>
+      <p>Landlock-API-Fix (kompilierte nie — jetzt cargo check gegen x86_64-linux im Gate),
+      Launcher-Mode statt pre_exec (Async-Signal-Safety), ABI-Floor V3 (Truncate) sonst Unsupported,
+      Blanket-<code>/private/var/folders</code> raus + empirische Re-Matrix (a–f) inkl. Sols Escape als Dauertest,
+      Root-Pre-Create im Parent, /dev/null auf Linux, Test-Timeout-Marge.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp12-grok.log</code> · Fertig = alle Gates grün + Commit · Grok 1/3</p>
     </div>
   </div></div>
 
