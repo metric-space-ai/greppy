@@ -40,6 +40,9 @@ gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The standard is
 CLIProxyAPI, which translates all major chat formats/providers to that wire.
 Any compatible server works — e.g. a local llama.cpp/ollama behind such a
 gateway. GREPPY_MODEL / --model is the model id passed through unchanged.
+If the gateway requires an API key (CLIProxyAPI usually does), set
+GREPPY_API_KEY; it is sent as x-api-key and Authorization: Bearer. There is
+no key flag on purpose — keys do not belong on the command line.
 
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
@@ -165,13 +168,24 @@ fn run_agent(args: AgentArgs) -> u8 {
     let endpoint = args.endpoint.trim().to_string();
 
     let mut client = Client::new(&endpoint, &model);
+    if let Ok(key) = std::env::var("GREPPY_API_KEY") {
+        client = client.with_api_key(key);
+    }
     match client.probe() {
         Ok(()) => {}
-        Err(ProbeError::Unreachable(_)) | Err(ProbeError::BadResponse(_)) => {
+        Err(ProbeError::Unreachable(_)) => {
             eprintln!(
                 "greppy -p needs a local model gateway and found none at {endpoint}.\n\
                  Start one (standard: CLIProxyAPI on 127.0.0.1:8317) or set\n\
                  GREPPY_ENDPOINT / --endpoint. Details: greppy -p --help"
+            );
+            return EXIT_USAGE;
+        }
+        Err(ProbeError::BadResponse(detail)) => {
+            eprintln!(
+                "greppy -p reached {endpoint}, but the gateway rejected the probe:\n\
+                 {detail}\n\
+                 If it requires an API key, set GREPPY_API_KEY. Details: greppy -p --help"
             );
             return EXIT_USAGE;
         }

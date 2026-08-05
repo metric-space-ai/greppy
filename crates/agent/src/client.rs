@@ -73,6 +73,7 @@ impl std::error::Error for ProbeError {}
 pub struct Client {
     base_url: String,
     model: String,
+    api_key: Option<String>,
 }
 
 impl Client {
@@ -84,6 +85,25 @@ impl Client {
         Self {
             base_url: normalize_base_url(base_url),
             model: model.to_string(),
+            api_key: None,
+        }
+    }
+
+    /// Attach a gateway API key, sent as both `x-api-key` and
+    /// `Authorization: Bearer` on every request (gateways accept either).
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        self.api_key = if key.is_empty() { None } else { Some(key) };
+        self
+    }
+
+    /// Apply the configured auth headers, if any, to a request.
+    fn authed(&self, req: ureq::Request) -> ureq::Request {
+        match &self.api_key {
+            Some(key) => req
+                .set("x-api-key", key)
+                .set("Authorization", &format!("Bearer {key}")),
+            None => req,
         }
     }
 
@@ -118,7 +138,7 @@ impl Client {
             .timeout(Duration::from_secs(2))
             .build();
 
-        match agent.get(&url).call() {
+        match self.authed(agent.get(&url)).call() {
             Ok(resp) => {
                 // Drain body so the connection is not left half-open; ignore content.
                 let _ = resp.into_string();
@@ -156,8 +176,8 @@ impl Client {
             .timeout_read(Duration::from_secs(600))
             .build();
 
-        let response = match agent
-            .post(&url)
+        let response = match self
+            .authed(agent.post(&url))
             .set("Content-Type", "application/json")
             .set("Accept", "text/event-stream")
             .send_string(&body_str)
