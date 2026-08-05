@@ -10,7 +10,7 @@
 //! - [`env`] — [`ExecutionEnv`] tool boundary (agent proposes, host executes).
 //! - [`greppy_env`] — production [`GreppyEnv`]: single `greppy` tool over self-invocation.
 //! - [`sandbox`] — write-confinement for tool subprocesses (Seatbelt / Landlock).
-//! - [`workspace`] — per-run git worktree isolation and review-patch proposals.
+//! - [`workspace`] — per-repository agent worktree isolation and review-patch proposals.
 //! - [`agent_loop`] — ported multi-turn agent loop (pi v0.80.2 semantics, MIT).
 //!
 //! Dependencies are deliberately minimal (`serde` / `serde_json` / plain-HTTP

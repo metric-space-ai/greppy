@@ -12,12 +12,14 @@ one tool — `greppy` (search/navigate/read/edit, plus commands via
 `bash-smart -- CMD` so output arrives compacted) — and an agent loop ported
 from pi v0.80.2 (MIT; see THIRD_PARTY.md and licenses/PI-LICENSE.txt).
 
-Every run works in a disposable git worktree seeded from the repository's
-index (embeddings are content-addressed, so the copy starts warm) and ends as
-exactly one commit on `refs/greppy/agent/<run_id>`, built from the base tree
-regardless of what happened to HEAD in the worktree — nothing is edited in
-place. `git show <ref>` reviews it, `git cherry-pick -n <ref>` applies it;
-`--apply` does so directly but refuses a checkout with uncommitted changes.
+Every run works in a per-repository agent worktree under the platform cache
+(reset to HEAD before each run; its own greppy index is built on first use and
+incrementally updated afterwards) and ends as exactly one commit on
+`refs/greppy/agent/<run_id>`, built from the base tree regardless of what
+happened to HEAD in the worktree — nothing is edited in place. `git show <ref>`
+reviews it, `git cherry-pick -n <ref>` applies it; `--apply` does so directly
+but refuses a checkout with uncommitted changes. Concurrent `-p` runs fall
+back to a disposable temp worktree when the stable tree is locked.
 
 Inference is localhost-only (plain HTTP, no TLS stack in the client): an
 Anthropic-Messages-compatible gateway (standard: CLIProxyAPI on

@@ -1,22 +1,59 @@
-//! Per-run isolation: disposable git worktrees and review-patch proposals.
+//! Per-run isolation: git worktrees and review-patch proposals.
 //!
 //! Every agent run works in a detached worktree of the target repo. The agent
 //! never writes to the user's checkout. The run's outcome is a **proposal**: a
 //! commit preserved on `refs/greppy/agent/<run_id>` plus a printable patch.
 //! Applying it to a real checkout is a separate, explicit host-side step.
+//!
+//! # Worktree placement
+//!
+//! By default the worktree is **stable per repository**:
+//!
+//! ```text
+//! <platform-cache>/greppy/agent-worktrees/<16-hex sha256 of canonical repo root>
+//! ```
+//!
+//! (`~/Library/Caches` on macOS; `$XDG_CACHE_HOME` or `~/.cache` elsewhere.)
+//! Reusing that path keeps the greppy store (and thus the semantic index) warm
+//! across runs: each run resets the tree to a pristine `HEAD` without deleting
+//! the directory. Concurrent `-p` runs never share a stable tree — an exclusive
+//! lock on a sibling `.lock` file is required; if the lock is held the run falls
+//! back to a disposable `$TMPDIR/greppy-agent/<run_id>` worktree (and says so on
+//! stderr).
+//!
+//! [`AgentWorkspace::cleanup`] **does not** delete a stable worktree (that would
+//! destroy the warm store); it only resets it to pristine `HEAD`. Fallback temp
+//! worktrees are force-removed as before. `--keep-worktree` leaves a temp tree
+//! on disk; for a stable tree the directory already survives cleanup.
 
 use std::fmt;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Disposable worktree isolation for a single agent run.
-#[derive(Debug, Clone)]
+use sha2::{Digest, Sha256};
+
+/// Per-run git worktree isolation for an agent invocation.
+#[derive(Debug)]
 pub struct AgentWorkspace {
     repo_root: PathBuf,
     worktree: PathBuf,
     run_id: String,
     base_commit: String,
+    /// Stable (cache-dir) placement vs disposable temp fallback.
+    kind: WorktreeKind,
+    /// Held exclusive lock for the stable worktree (released on drop).
+    _lock: Option<FileLock>,
+}
+
+/// How the worktree directory was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeKind {
+    /// Reused or created under the platform cache; survives [`AgentWorkspace::cleanup`].
+    Stable,
+    /// Per-run temp tree under `$TMPDIR/greppy-agent/<run_id>`; removed on cleanup.
+    Temp,
 }
 
 /// Outcome of [`AgentWorkspace::finish`].
@@ -123,14 +160,36 @@ impl From<io::Error> for WorkspaceError {
     }
 }
 
+/// OS advisory lock held for the lifetime of a stable worktree.
+struct FileLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl fmt::Debug for FileLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileLock")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        unlock_file(&self.file);
+    }
+}
+
 impl AgentWorkspace {
     /// Create a detached worktree for `run_id` from `repo_root`'s `HEAD`.
     ///
+    /// Prefers a **stable** path under the platform user cache (one tree per
+    /// repository). If that tree is already locked by another `-p` run, falls
+    /// back to `$TMPDIR/greppy-agent/<run_id>` and prints one stderr line.
+    ///
     /// The user's checkout state is irrelevant — the worktree is always created
-    /// from `HEAD`. The worktree lives under
-    /// `std::env::temp_dir()/greppy-agent/<run_id>`.
+    /// (or reset) from `HEAD`.
     pub fn create(repo_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
-        // Verify repo_root is inside a git work tree and capture the toplevel.
         let toplevel = match git_ok(repo_root, &["rev-parse", "--show-toplevel"]) {
             Ok(t) => PathBuf::from(t),
             Err(WorkspaceError::GitFailed { stderr, .. }) => {
@@ -147,46 +206,40 @@ impl AgentWorkspace {
         };
 
         let base_commit = git_ok(&toplevel, &["rev-parse", "HEAD"])?;
+        let stable_dir = stable_worktree_dir(&toplevel);
+        let lock_path = stable_lock_path(&stable_dir);
 
-        let worktree = std::env::temp_dir().join("greppy-agent").join(run_id);
-        if let Some(parent) = worktree.parent() {
-            std::fs::create_dir_all(parent)?;
+        match try_acquire_lock(&lock_path)? {
+            Some(lock) => {
+                prepare_stable_worktree(&toplevel, &stable_dir, &base_commit)?;
+                Ok(Self {
+                    repo_root: toplevel,
+                    worktree: stable_dir,
+                    run_id: run_id.to_string(),
+                    base_commit,
+                    kind: WorktreeKind::Stable,
+                    _lock: Some(lock),
+                })
+            }
+            None => {
+                // Concurrent holder — disposable temp so two runs never share a tree.
+                eprintln!(
+                    "greppy -p: agent worktree in use for this repository — using a temporary worktree"
+                );
+                let worktree = create_temp_worktree(&toplevel, run_id, &base_commit)?;
+                Ok(Self {
+                    repo_root: toplevel,
+                    worktree,
+                    run_id: run_id.to_string(),
+                    base_commit,
+                    kind: WorktreeKind::Temp,
+                    _lock: None,
+                })
+            }
         }
-        // Refuse to clobber an existing path — create must be clean.
-        if worktree.exists() {
-            return Err(WorkspaceError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("worktree path already exists: {}", worktree.display()),
-            )));
-        }
-
-        // Detached HEAD at the recorded base commit. Use the OID (not the
-        // symbolic HEAD) so the worktree is unambiguously pinned.
-        git_ok(
-            &toplevel,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                worktree.to_str().ok_or_else(|| {
-                    WorkspaceError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "worktree path is not valid UTF-8",
-                    ))
-                })?,
-                &base_commit,
-            ],
-        )?;
-
-        Ok(Self {
-            repo_root: toplevel,
-            worktree,
-            run_id: run_id.to_string(),
-            base_commit,
-        })
     }
 
-    /// Absolute path of the disposable worktree (becomes [`crate::GreppyEnv`]'s root).
+    /// Absolute path of the worktree (becomes [`crate::GreppyEnv`]'s root).
     pub fn worktree_path(&self) -> &Path {
         &self.worktree
     }
@@ -196,7 +249,7 @@ impl AgentWorkspace {
         &self.repo_root
     }
 
-    /// Run id used for the worktree directory and the durable proposal ref.
+    /// Run id used for the durable proposal ref (and temp worktree directory).
     pub fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -204,6 +257,11 @@ impl AgentWorkspace {
     /// `HEAD` OID recorded at create time.
     pub fn base_commit(&self) -> &str {
         &self.base_commit
+    }
+
+    /// True when this run uses the stable per-repository worktree.
+    pub fn is_stable(&self) -> bool {
+        self.kind == WorktreeKind::Stable
     }
 
     /// Durable ref name for this run's proposal (`refs/greppy/agent/<run_id>`).
@@ -358,25 +416,287 @@ impl AgentWorkspace {
         })
     }
 
-    /// Force-remove the disposable worktree. Proposal refs are **not** deleted.
+    /// End the run's hold on the worktree.
+    ///
+    /// - **Stable** worktree: reset to pristine `HEAD` and release the lock.
+    ///   The directory (and its greppy store) stay on disk for the next run.
+    /// - **Temp** worktree: force-remove via `git worktree remove --force`.
+    ///
+    /// Proposal refs are **never** deleted.
     pub fn cleanup(self) -> Result<(), WorkspaceError> {
-        let wt = self
-            .worktree
-            .to_str()
-            .ok_or_else(|| {
-                WorkspaceError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "worktree path is not valid UTF-8",
-                ))
-            })?
-            .to_string();
-        git_ok(&self.repo_root, &["worktree", "remove", "--force", &wt])?;
-        Ok(())
+        match self.kind {
+            WorktreeKind::Stable => {
+                // Reset so the next run (or a post-run inspection) starts clean.
+                // Failures here are still errors — a half-dirty stable tree is
+                // worse than surfacing the problem.
+                reset_worktree_pristine(&self.worktree, &self.base_commit)?;
+                // Lock drops with `self`.
+                Ok(())
+            }
+            WorktreeKind::Temp => {
+                let wt = self
+                    .worktree
+                    .to_str()
+                    .ok_or_else(|| {
+                        WorkspaceError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "worktree path is not valid UTF-8",
+                        ))
+                    })?
+                    .to_string();
+                git_ok(&self.repo_root, &["worktree", "remove", "--force", &wt])?;
+                Ok(())
+            }
+        }
     }
 }
 
 // Drop intentionally does NOT auto-remove: an unapplied proposal's worktree may
 // still need inspection. Cleanup is always explicit via [`AgentWorkspace::cleanup`].
+
+/// Stable worktree directory for `repo_root` under the platform user cache.
+///
+/// Public so callers/tests can reason about the path without creating a tree.
+pub fn stable_worktree_dir(repo_root: &Path) -> PathBuf {
+    let canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    platform_user_cache_dir()
+        .join("greppy")
+        .join("agent-worktrees")
+        .join(repo_root_hash(&canon))
+}
+
+fn stable_lock_path(stable_dir: &Path) -> PathBuf {
+    // Sibling of the worktree dir: `<parent>/<hash>.lock`
+    let parent = stable_dir.parent().unwrap_or_else(|| Path::new("."));
+    let name = stable_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("worktree");
+    parent.join(format!("{name}.lock"))
+}
+
+fn repo_root_hash(canonical_root: &Path) -> String {
+    let mut h = Sha256::new();
+    h.update(canonical_root.to_string_lossy().as_bytes());
+    let digest = h.finalize();
+    format!("{:x}", digest).chars().take(16).collect()
+}
+
+fn platform_user_cache_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().join("Library").join("Caches")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(xdg);
+        }
+        home_dir().join(".cache")
+    }
+}
+
+fn home_dir() -> PathBuf {
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h);
+    }
+    PathBuf::from("/")
+}
+
+/// Create or reuse `stable_dir` as a detached worktree at `base_commit`.
+fn prepare_stable_worktree(
+    repo_root: &Path,
+    stable_dir: &Path,
+    base_commit: &str,
+) -> Result<(), WorkspaceError> {
+    if let Some(parent) = stable_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if stable_dir.exists() {
+        if is_valid_worktree_of(stable_dir, repo_root) {
+            reset_worktree_pristine(stable_dir, base_commit)?;
+            return Ok(());
+        }
+        // Stale / foreign: prune registration, remove, recreate.
+        let _ = git_run(repo_root, &["worktree", "prune"]);
+        // Best-effort remove; fall through to add.
+        if let Err(e) = fs::remove_dir_all(stable_dir) {
+            // If still present and non-empty after failure, surface the error.
+            if stable_dir.exists() {
+                return Err(WorkspaceError::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot remove stale agent worktree {}: {e}",
+                        stable_dir.display()
+                    ),
+                )));
+            }
+        }
+    }
+
+    let path_str = stable_dir.to_str().ok_or_else(|| {
+        WorkspaceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worktree path is not valid UTF-8",
+        ))
+    })?;
+
+    git_ok(
+        repo_root,
+        &["worktree", "add", "--detach", path_str, base_commit],
+    )?;
+    Ok(())
+}
+
+/// True when `dir` is a registered worktree of `repo_root` (same git dir).
+fn is_valid_worktree_of(dir: &Path, repo_root: &Path) -> bool {
+    // Must look like a git worktree at all.
+    let inside = git_run(dir, &["rev-parse", "--is-inside-work-tree"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !inside {
+        return false;
+    }
+    // Common git-dir means it belongs to this repository (covers linked worktrees).
+    let Ok(dir_git_common) = git_ok(dir, &["rev-parse", "--git-common-dir"]) else {
+        return false;
+    };
+    let Ok(repo_git_common) = git_ok(repo_root, &["rev-parse", "--git-common-dir"]) else {
+        return false;
+    };
+    let dir_common = resolve_maybe_relative(dir, &dir_git_common);
+    let repo_common = resolve_maybe_relative(repo_root, &repo_git_common);
+    match (dir_common.canonicalize(), repo_common.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => dir_common == repo_common,
+    }
+}
+
+fn resolve_maybe_relative(cwd: &Path, p: &str) -> PathBuf {
+    let path = PathBuf::from(p);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Detach at `base_commit`, hard-reset, and clean untracked files.
+fn reset_worktree_pristine(worktree: &Path, base_commit: &str) -> Result<(), WorkspaceError> {
+    git_ok(worktree, &["checkout", "-q", "--detach", base_commit])?;
+    git_ok(worktree, &["reset", "-q", "--hard"])?;
+    git_ok(worktree, &["clean", "-qfd"])?;
+    Ok(())
+}
+
+fn create_temp_worktree(
+    repo_root: &Path,
+    run_id: &str,
+    base_commit: &str,
+) -> Result<PathBuf, WorkspaceError> {
+    let worktree = std::env::temp_dir().join("greppy-agent").join(run_id);
+    if let Some(parent) = worktree.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if worktree.exists() {
+        return Err(WorkspaceError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("worktree path already exists: {}", worktree.display()),
+        )));
+    }
+    let path_str = worktree.to_str().ok_or_else(|| {
+        WorkspaceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worktree path is not valid UTF-8",
+        ))
+    })?;
+    git_ok(
+        repo_root,
+        &["worktree", "add", "--detach", path_str, base_commit],
+    )?;
+    Ok(worktree)
+}
+
+/// Try to take an exclusive non-blocking lock on `lock_path`.
+///
+/// Returns `Ok(None)` when another process holds the lock (caller should fall
+/// back to a temp worktree). The lock file itself is never deleted.
+fn try_acquire_lock(lock_path: &Path) -> Result<Option<FileLock>, WorkspaceError> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(lock_path)
+        .map_err(WorkspaceError::Io)?;
+    // Record pid for humans inspecting a stuck lock (best-effort).
+    let _ = writeln!(file, "{}", std::process::id());
+    let _ = file.flush();
+    match try_lock_exclusive(&file)? {
+        true => Ok(Some(FileLock {
+            file,
+            path: lock_path.to_path_buf(),
+        })),
+        false => Ok(None),
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    // SAFETY: flock only operates on the valid fd owned by `file`.
+    let rc = unsafe { libc_flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    // EWOULDBLOCK / EAGAIN both mean "held by someone else" under LOCK_NB.
+    if matches!(err.kind(), io::ErrorKind::WouldBlock) || is_eagain_or_ewouldblock(&err) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(unix)]
+fn is_eagain_or_ewouldblock(err: &io::Error) -> bool {
+    match err.raw_os_error() {
+        // Linux EAGAIN/EWOULDBLOCK = 11; macOS EAGAIN = 35, EWOULDBLOCK = 35.
+        Some(11) | Some(35) => true,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    use std::os::fd::AsRawFd;
+    const LOCK_UN: i32 = 8;
+    // SAFETY: best-effort unlock of the valid fd owned by `file`.
+    let _ = unsafe { libc_flock(file.as_raw_fd(), LOCK_UN) };
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "flock"]
+    fn libc_flock(fd: i32, operation: i32) -> i32;
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
+    // Non-unix: no flock; allow the stable path (single-user assumption).
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn unlock_file(_file: &File) {}
 
 fn git_run(cwd: &Path, args: &[&str]) -> Result<Output, WorkspaceError> {
     Command::new("git")
@@ -485,6 +805,28 @@ mod tests {
         dst
     }
 
+    /// Force-remove a stable worktree registration + directory after a test.
+    fn destroy_stable(repo: &Path, ws_path: &Path) {
+        let _ = git_run(repo, &["worktree", "prune"]);
+        if ws_path.exists() {
+            let _ = Command::new("git")
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    ws_path.to_str().unwrap_or(""),
+                ])
+                .current_dir(repo)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output();
+            let _ = fs::remove_dir_all(ws_path);
+        }
+        // Drop the lock file too so the next test starts clean.
+        let lock = stable_lock_path(ws_path);
+        let _ = fs::remove_file(lock);
+    }
+
     #[test]
     fn create_makes_detached_worktree_at_base_leaving_checkout_untouched() {
         let repo = init_fixture("greppy-ws-create");
@@ -502,6 +844,7 @@ mod tests {
         assert_eq!(ws.base_commit(), head_before);
         assert!(ws.worktree_path().is_dir());
         assert!(ws.worktree_path().join("hello.txt").is_file());
+        assert!(ws.is_stable(), "default placement must be stable");
 
         // Detached HEAD at base_commit.
         let wt_head = git_c(ws.worktree_path(), &["rev-parse", "HEAD"]);
@@ -517,7 +860,200 @@ mod tests {
         assert_eq!(git_c(&repo, &["rev-parse", "HEAD"]), head_before);
         assert!(!git_c(&repo, &["status", "--porcelain"]).is_empty());
 
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn stable_path_derived_from_repo_root() {
+        let repo = init_fixture("greppy-ws-stable-path");
+        let expected = stable_worktree_dir(&repo);
+        let run_id = unique_tag("run-stable-path");
+        let ws = AgentWorkspace::create(&repo, &run_id).expect("create");
+        assert_eq!(ws.worktree_path(), expected);
+        // Hash is 16 hex chars.
+        let name = expected.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 16);
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        // Under greppy/agent-worktrees.
+        let s = expected.to_string_lossy();
+        assert!(
+            s.contains("agent-worktrees"),
+            "path missing agent-worktrees: {s}"
+        );
+        let wt = ws.worktree_path().to_path_buf();
+        ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn reuse_resets_to_pristine_head() {
+        let repo = init_fixture("greppy-ws-reuse");
+        let run_a = unique_tag("run-reuse-a");
+        let ws_a = AgentWorkspace::create(&repo, &run_a).expect("create a");
+        let wt = ws_a.worktree_path().to_path_buf();
+        // Simulate a previous run leaving a dirty file behind (without cleanup).
+        std::fs::write(wt.join("leftover.txt"), b"from previous run\n").unwrap();
+        assert!(wt.join("leftover.txt").is_file());
+        // Drop without cleanup — next create must still scrub it via reuse path.
+        drop(ws_a);
+
+        let run_b = unique_tag("run-reuse-b");
+        let ws_b = AgentWorkspace::create(&repo, &run_b).expect("create b");
+        assert_eq!(ws_b.worktree_path(), &wt);
+        assert!(
+            !ws_b.worktree_path().join("leftover.txt").exists(),
+            "reuse must clean leftover from previous run"
+        );
+        let hello = std::fs::read_to_string(ws_b.worktree_path().join("hello.txt")).unwrap();
+        assert_eq!(hello, "hello\n");
+        ws_b.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn foreign_stale_directory_is_recreated() {
+        let repo = init_fixture("greppy-ws-foreign");
+        let stable = stable_worktree_dir(&repo);
+        if let Some(parent) = stable.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        // Plant a non-worktree directory at the stable path.
+        fs::create_dir_all(&stable).unwrap();
+        fs::write(stable.join("not-a-git-worktree.txt"), b"junk\n").unwrap();
+
+        let run_id = unique_tag("run-foreign");
+        let ws = AgentWorkspace::create(&repo, &run_id).expect("create over foreign");
+        assert_eq!(ws.worktree_path(), &stable);
+        assert!(ws.worktree_path().join("hello.txt").is_file());
+        assert!(!ws.worktree_path().join("not-a-git-worktree.txt").exists());
+        // Must be a real detached worktree of this repo.
+        assert!(is_valid_worktree_of(ws.worktree_path(), &repo));
+        let wt = ws.worktree_path().to_path_buf();
+        ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn concurrent_lock_falls_back_to_temp() {
+        let repo = init_fixture("greppy-ws-lock");
+        let stable = stable_worktree_dir(&repo);
+        let lock_path = stable_lock_path(&stable);
+        // Hold the exclusive lock as if another -p run were in progress.
+        let held = try_acquire_lock(&lock_path)
+            .expect("lock io")
+            .expect("must acquire lock for test");
+
+        let run_id = unique_tag("run-lock-fallback");
+        let ws = AgentWorkspace::create(&repo, &run_id).expect("create under lock");
+        assert!(!ws.is_stable(), "must fall back to temp");
+        assert!(
+            ws.worktree_path()
+                .starts_with(std::env::temp_dir().join("greppy-agent")),
+            "temp path unexpected: {}",
+            ws.worktree_path().display()
+        );
+        // Proposals still land on the shared ref.
+        std::fs::write(ws.worktree_path().join("hello.txt"), b"from temp\n").unwrap();
+        let outcome = ws.finish("temp proposal").expect("finish");
+        let (commit, ref_name) = match outcome {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("expected Proposal"),
+        };
+        assert_eq!(ref_name, format!("refs/greppy/agent/{run_id}"));
+        assert_eq!(git_c(&repo, &["rev-parse", &ref_name]), commit);
+
+        let wt = ws.worktree_path().to_path_buf();
+        ws.cleanup().expect("cleanup temp");
+        assert!(!wt.exists(), "temp worktree must be removed");
+        drop(held);
+        let _ = fs::remove_file(lock_path);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn cleanup_keeps_stable_removes_temp() {
+        let repo = init_fixture("greppy-ws-cleanup-modes");
+
+        // Stable: cleanup keeps the directory.
+        let run_stable = unique_tag("run-cleanup-stable");
+        let ws_s = AgentWorkspace::create(&repo, &run_stable).expect("create stable");
+        assert!(ws_s.is_stable());
+        let stable_path = ws_s.worktree_path().to_path_buf();
+        std::fs::write(stable_path.join("scratch.txt"), b"scratch\n").unwrap();
+        ws_s.cleanup().expect("cleanup stable");
+        assert!(stable_path.exists(), "stable worktree must survive cleanup");
+        assert!(
+            !stable_path.join("scratch.txt").exists(),
+            "cleanup must reset stable tree to pristine"
+        );
+
+        // Temp: force by holding the lock, then cleanup must remove.
+        let lock = try_acquire_lock(&stable_lock_path(&stable_path))
+            .expect("lock io")
+            .expect("acquire");
+        let run_temp = unique_tag("run-cleanup-temp");
+        let ws_t = AgentWorkspace::create(&repo, &run_temp).expect("create temp");
+        assert!(!ws_t.is_stable());
+        let temp_path = ws_t.worktree_path().to_path_buf();
+        assert!(temp_path.exists());
+        ws_t.cleanup().expect("cleanup temp");
+        assert!(!temp_path.exists(), "temp worktree must be gone");
+        drop(lock);
+
+        destroy_stable(&repo, &stable_path);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn proposals_land_on_ref_in_both_modes() {
+        let repo = init_fixture("greppy-ws-refs-both");
+
+        // Stable mode proposal.
+        let run_s = unique_tag("run-ref-stable");
+        let ws_s = AgentWorkspace::create(&repo, &run_s).expect("create stable");
+        assert!(ws_s.is_stable());
+        std::fs::write(ws_s.worktree_path().join("s.txt"), b"stable\n").unwrap();
+        let out_s = ws_s.finish("stable prop").expect("finish stable");
+        let (c_s, r_s) = match out_s {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("expected Proposal"),
+        };
+        assert_eq!(r_s, format!("refs/greppy/agent/{run_s}"));
+        assert_eq!(git_c(&repo, &["rev-parse", &r_s]), c_s);
+        let stable_path = ws_s.worktree_path().to_path_buf();
+        ws_s.cleanup().expect("cleanup stable");
+
+        // Temp mode proposal (hold lock).
+        let lock = try_acquire_lock(&stable_lock_path(&stable_path))
+            .expect("lock")
+            .expect("acquire");
+        let run_t = unique_tag("run-ref-temp");
+        let ws_t = AgentWorkspace::create(&repo, &run_t).expect("create temp");
+        assert!(!ws_t.is_stable());
+        std::fs::write(ws_t.worktree_path().join("t.txt"), b"temp\n").unwrap();
+        let out_t = ws_t.finish("temp prop").expect("finish temp");
+        let (c_t, r_t) = match out_t {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("expected Proposal"),
+        };
+        assert_eq!(r_t, format!("refs/greppy/agent/{run_t}"));
+        assert_eq!(git_c(&repo, &["rev-parse", &r_t]), c_t);
+        ws_t.cleanup().expect("cleanup temp");
+        drop(lock);
+
+        destroy_stable(&repo, &stable_path);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -532,6 +1068,7 @@ mod tests {
 
         // Worktree still removable; no proposal ref was written.
         let ref_name = ws.ref_name();
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
         let refs = Command::new("git")
             .args(["show-ref", "--verify", "--quiet", &ref_name])
@@ -540,6 +1077,7 @@ mod tests {
             .expect("show-ref");
         assert!(!refs.success(), "Clean finish must not create a ref");
 
+        destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -589,11 +1127,13 @@ mod tests {
         assert_eq!(user_hello, "hello\n");
         assert!(!repo.join("new.txt").exists());
 
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
         // Ref survives cleanup.
         let ref_oid_after = git_c(&repo, &["rev-parse", &ref_name]);
         assert_eq!(ref_oid_after, commit);
 
+        destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -637,7 +1177,9 @@ mod tests {
         let extra = std::fs::read_to_string(target.join("extra.txt")).unwrap();
         assert_eq!(extra, "extra\n");
 
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&target);
     }
@@ -708,7 +1250,9 @@ mod tests {
         let ref_oid = git_c(&repo, &["rev-parse", &ref_name]);
         assert_eq!(ref_oid, commit);
 
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&target);
     }
@@ -776,7 +1320,9 @@ mod tests {
             .expect("rev-parse");
         assert!(!cp.success());
 
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&target);
     }
@@ -855,34 +1401,11 @@ mod tests {
         );
 
         let _ = ref_name;
+        let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&target);
-    }
-
-    #[test]
-    fn cleanup_removes_worktree_dir_but_ref_survives() {
-        let repo = init_fixture("greppy-ws-cleanup");
-        let run_id = unique_tag("run-cleanup");
-        let ws = AgentWorkspace::create(&repo, &run_id).expect("create");
-        std::fs::write(ws.worktree_path().join("x.txt"), b"x\n").unwrap();
-        let outcome = ws.finish("keep ref").expect("finish");
-        let (commit, ref_name) = match outcome {
-            RunOutcome::Proposal {
-                commit, ref_name, ..
-            } => (commit, ref_name),
-            RunOutcome::Clean => panic!("expected Proposal"),
-        };
-
-        let wt = ws.worktree_path().to_path_buf();
-        assert!(wt.exists());
-        ws.cleanup().expect("cleanup");
-        assert!(!wt.exists(), "worktree dir must be gone");
-
-        let ref_oid = git_c(&repo, &["rev-parse", &ref_name]);
-        assert_eq!(ref_oid, commit);
-
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -916,10 +1439,7 @@ mod tests {
         };
         assert!(wt_path.exists(), "Drop must NOT auto-remove the worktree");
         // Explicit cleanup via git from the main repo.
-        git_c(
-            &repo,
-            &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
-        );
+        destroy_stable(&repo, &wt_path);
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

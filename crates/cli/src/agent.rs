@@ -3,7 +3,6 @@
 //! Intercepted in [`crate::run_os`] before grep-passthrough routing so that
 //! ordinary `greppy -R …` / pattern invocations remain byte-exact real-grep.
 
-use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
@@ -31,10 +30,11 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-One-shot coding agent. Works in a disposable git worktree and delivers a
-proposal ref (refs/greppy/agent/<run_id>); inspect with `git show` or apply
-with `git cherry-pick -n`. The agent has exactly one tool — `greppy` —
-covering search/navigate/read/edit; commands run through that tool as
+One-shot coding agent. Works in a per-repository agent worktree (reset to
+HEAD each run; greppy index built on first use and kept warm afterwards) and
+delivers a proposal ref (refs/greppy/agent/<run_id>); inspect with `git show`
+or apply with `git cherry-pick -n`. The agent has exactly one tool — `greppy`
+— covering search/navigate/read/edit; commands run through that tool as
 `bash-smart -- CMD`. The tool is write-confined to the worktree, temp,
 greppy store, ~/.cargo and the platform cache; reads and network stay open.
 Pass --no-sandbox (or GREPPY_NO_SANDBOX=1) to disable.
@@ -65,7 +65,7 @@ Flags:
   --apply             Cherry-pick the proposal into the current checkout
                       (staged, not committed)
   --diff              Print the full proposal patch after the stat
-  --keep-worktree     Leave the disposable worktree on disk after success
+  --keep-worktree     Leave a temporary fallback worktree on disk after success
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
 
 Exit codes:
@@ -107,7 +107,7 @@ pub struct AgentArgs {
     #[arg(long)]
     pub diff: bool,
 
-    /// Keep the disposable worktree after a successful run.
+    /// Keep a temporary fallback worktree after a successful run.
     #[arg(long)]
     pub keep_worktree: bool,
 
@@ -238,10 +238,8 @@ fn run_agent(args: AgentArgs) -> u8 {
         }
     };
 
-    seed_store_from_main(workspace.repo_root(), workspace.worktree_path());
-
-    // Fail-closed prewarm: make the worktree's semantic index complete before
-    // the first model turn so search does not open as a retryable status.
+    // Prewarm: build/refresh the worktree's own greppy index before the first
+    // model turn so search/where-am-i do not open empty.
     ensure_semantic_index(workspace.worktree_path());
 
     let sandbox_mode = match resolve_sandbox_mode(&args, workspace.worktree_path()) {
@@ -553,7 +551,7 @@ fn resolve_sandbox_mode(args: &AgentArgs, worktree_path: &Path) -> Result<Sandbo
 ///
 /// 1. the run's worktree,
 /// 2. `std::env::temp_dir()`,
-/// 3. the worktree's greppy store dir (same computation as seeding),
+/// 3. the worktree's greppy store dir,
 /// 4. `~/.cargo` (registry/build caches; respects `CARGO_HOME`),
 /// 5. the platform user cache dir (`~/Library/Caches` on macOS,
 ///    `$XDG_CACHE_HOME` or `~/.cache` on Linux).
@@ -596,12 +594,13 @@ fn home_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/")
 }
 
-/// Ensure the worktree's semantic index is complete before the first agent turn.
+/// Ensure the worktree's greppy index is usable before the first agent turn.
 ///
-/// Skips when `doctor --json` already reports `embedding_complete: true`.
-/// Otherwise runs `<current_exe> index` (incremental) with credential scrub
-/// and no sandbox. Failure warns and continues — the agent can still work via
-/// name/text search while embeddings catch up.
+/// Skips quietly when `doctor --json` already reports `embedding_complete:
+/// true` (warm tree). Otherwise prints one cold-tree line, runs
+/// `<current_exe> index` (incremental) with credential scrub and no sandbox,
+/// then re-checks doctor. Failure warns with the consequence and continues —
+/// the agent can still work via name/text search while embeddings catch up.
 fn ensure_semantic_index(worktree_path: &Path) {
     if doctor_reports_embedding_complete(worktree_path) {
         return;
@@ -615,7 +614,7 @@ fn ensure_semantic_index(worktree_path: &Path) {
         return;
     };
 
-    eprintln!("greppy -p: ensuring semantic index…");
+    eprintln!("indexing the agent worktree (first run for this repository)…");
 
     let mut cmd = Command::new(&bin);
     cmd.arg("index")
@@ -624,7 +623,14 @@ fn ensure_semantic_index(worktree_path: &Path) {
     scrub_credential_env(&mut cmd);
 
     match cmd.status() {
-        Ok(status) if status.success() => {}
+        Ok(status) if status.success() => {
+            if !doctor_reports_embedding_complete(worktree_path) {
+                eprintln!(
+                    "greppy -p: index finished but doctor reports not complete — continuing; \
+                     semantic search may report building until the index finishes"
+                );
+            }
+        }
         Ok(status) => {
             eprintln!(
                 "greppy -p: index prewarm exited {status} — continuing; \
@@ -691,88 +697,11 @@ fn scrub_credential_env(cmd: &mut Command) {
     }
 }
 
-/// Seed the worktree's cold store from the main checkout's store, if present.
-///
-/// Prints one stderr line describing the outcome. On macOS prefers
-/// `/bin/cp -Rc` (APFS clonefile); falls back to a recursive `std::fs` copy.
-pub fn seed_store_from_main(main_root: &Path, worktree_path: &Path) {
-    let src = workspace_locator::store_dir(main_root);
-    // Dest AFTER the worktree exists so canonicalize/hash is correct.
-    let dst = workspace_locator::store_dir(worktree_path);
-
-    if !src.exists() {
-        eprintln!("no index to seed — first run will build cold");
-        return;
-    }
-    if dst.exists() {
-        // Already present (unusual for a fresh worktree hash); leave it.
-        eprintln!("seeded index from main checkout");
-        return;
-    }
-
-    if let Some(parent) = dst.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!("no index to seed — first run will build cold ({e})");
-            return;
-        }
-    }
-
-    let copied = try_seed_copy(&src, &dst);
-    if copied {
-        eprintln!("seeded index from main checkout");
-    } else {
-        // Best-effort: leave dest absent so the agent rebuilds.
-        let _ = fs::remove_dir_all(&dst);
-        eprintln!("no index to seed — first run will build cold");
-    }
-}
-
-fn try_seed_copy(src: &Path, dst: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if try_cp_clonefile(src, dst) {
-            return true;
-        }
-    }
-    copy_dir_recursive(src, dst).is_ok()
-}
-
-#[cfg(target_os = "macos")]
-fn try_cp_clonefile(src: &Path, dst: &Path) -> bool {
-    let Some(src_s) = src.to_str() else {
-        return false;
-    };
-    let Some(dst_s) = dst.to_str() else {
-        return false;
-    };
-    match Command::new("/bin/cp").args(["-Rc", src_s, dst_s]).status() {
-        Ok(status) => status.success(),
-        Err(_) => false,
-    }
-}
-
-/// Recursive directory copy used as the portable seed fallback.
-pub fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else if file_type.is_file() {
-            fs::copy(&from, &to)?;
-        }
-        // Symlinks and specials are skipped deliberately.
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1041,25 +970,6 @@ mod tests {
         // F9: `-e -p` is a grep passthrough spelling, not the agent.
         assert!(!is_agent_p_invocation(&mk(&["greppy", "-e", "-p", "X"])));
         assert!(!is_agent_p_invocation(&mk(&["greppy", "foo", "-p"])));
-    }
-
-    #[test]
-    fn copy_dir_recursive_copies_nested_files() {
-        let src = unique("copy-src");
-        let dst = unique("copy-dst");
-        fs::create_dir_all(src.join("nested")).unwrap();
-        fs::write(src.join("a.txt"), b"alpha").unwrap();
-        fs::write(src.join("nested/b.txt"), b"beta").unwrap();
-
-        copy_dir_recursive(&src, &dst).expect("copy");
-        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha");
-        assert_eq!(
-            fs::read_to_string(dst.join("nested/b.txt")).unwrap(),
-            "beta"
-        );
-
-        let _ = fs::remove_dir_all(&src);
-        let _ = fs::remove_dir_all(&dst);
     }
 
     #[test]
