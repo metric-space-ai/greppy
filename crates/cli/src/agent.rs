@@ -33,8 +33,8 @@ const TOOL_LINE_MAX: usize = 120;
 const LONG_HELP: &str = "\
 One-shot coding agent. Works in a disposable git worktree and delivers a
 proposal ref (refs/greppy/agent/<run_id>); inspect with `git show` or apply
-with `git cherry-pick -n`. Tool subprocesses (greppy + bash) are
-write-confined to the worktree, temp, greppy store, ~/.cargo and the
+with `git cherry-pick -n`. The single greppy tool (including bash-smart)
+is write-confined to the worktree, temp, greppy store, ~/.cargo and the
 platform cache; reads and network stay open. Pass --no-sandbox (or
 GREPPY_NO_SANDBOX=1) to disable.
 
@@ -133,7 +133,7 @@ pub fn is_agent_p_invocation(argv: &[std::ffi::OsString]) -> bool {
 /// Parse and run `greppy -p …`. Caller must have verified [`is_agent_p_invocation`].
 pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
     // Set for every tool subprocess of a running agent: refuse nesting on
-    // every path (greppy tool AND bash tool).
+    // every path (plain greppy argv and bash-smart).
     if std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() {
         eprintln!(
             "greppy -p: refusing a nested agent run — you are already inside an \
@@ -238,6 +238,10 @@ fn run_agent(args: AgentArgs) -> u8 {
 
     seed_store_from_main(workspace.repo_root(), workspace.worktree_path());
 
+    // Fail-closed prewarm: make the worktree's semantic index complete before
+    // the first model turn so search does not open as a retryable status.
+    ensure_semantic_index(workspace.worktree_path());
+
     let sandbox_mode = match resolve_sandbox_mode(&args, workspace.worktree_path()) {
         Ok(mode) => mode,
         Err(code) => {
@@ -265,8 +269,12 @@ fn run_agent(args: AgentArgs) -> u8 {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     let mut tool_line_open = false;
+    let mut turns: u64 = 0;
 
     let loop_result = run_agent_loop(&mut client, &mut env, &config, &task, &mut |event| {
+        if matches!(event, LoopEvent::TurnComplete { .. }) {
+            turns = turns.saturating_add(1);
+        }
         handle_loop_event(event, &mut stdout, &mut stderr, &mut tool_line_open);
     });
 
@@ -282,6 +290,18 @@ fn run_agent(args: AgentArgs) -> u8 {
             return EXIT_AGENT;
         }
     };
+
+    // Token accounting (stderr only; zero values print as zero).
+    let usage = &loop_result.usage;
+    let _ = writeln!(
+        stderr,
+        "tokens: in {} out {} (cache read {}, write {}) over {} turns",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        turns
+    );
 
     // Ensure a trailing newline after streamed assistant text.
     if !loop_result.final_text.is_empty() && !loop_result.final_text.ends_with('\n') {
@@ -441,13 +461,6 @@ fn format_tool_start(name: &str, arguments: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("→ greppy {joined}")
         }
-        "bash" => {
-            let cmd = arguments
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("→ bash {cmd}")
-        }
         other => {
             let raw = arguments.to_string();
             format!("→ {other} {raw}")
@@ -558,6 +571,101 @@ fn home_dir() -> std::path::PathBuf {
     }
     // Last-resort fallback; should not matter on real agent hosts.
     std::path::PathBuf::from("/")
+}
+
+/// Ensure the worktree's semantic index is complete before the first agent turn.
+///
+/// Skips when `doctor --json` already reports `embedding_complete: true`.
+/// Otherwise runs `<current_exe> index` (incremental) with credential scrub
+/// and no sandbox. Failure warns and continues — the agent can still work via
+/// name/text search while embeddings catch up.
+fn ensure_semantic_index(worktree_path: &Path) {
+    if doctor_reports_embedding_complete(worktree_path) {
+        return;
+    }
+
+    let Ok(bin) = std::env::current_exe() else {
+        eprintln!(
+            "greppy -p: cannot resolve current binary to prewarm index — \
+             semantic search may report building until index finishes"
+        );
+        return;
+    };
+
+    eprintln!("greppy -p: ensuring semantic index…");
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("index")
+        .current_dir(worktree_path)
+        .stdin(std::process::Stdio::null());
+    scrub_credential_env(&mut cmd);
+
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!(
+                "greppy -p: index prewarm exited {status} — continuing; \
+                 semantic search may report building until the index finishes"
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "greppy -p: index prewarm failed to start ({e}) — continuing; \
+                 semantic search may report building until the index finishes"
+            );
+        }
+    }
+}
+
+/// Cheap completeness signal: `doctor --json` → `embedding_complete == true`.
+///
+/// Any spawn/parse failure means "not known complete" so the caller runs index.
+fn doctor_reports_embedding_complete(worktree_path: &Path) -> bool {
+    let Ok(bin) = std::env::current_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(bin);
+    cmd.arg("doctor")
+        .arg("--json")
+        .current_dir(worktree_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    scrub_credential_env(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    value
+        .get("embedding_complete")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Credential env vars stripped from agent-spawned greppy subprocesses
+/// (prewarm index / doctor). Mirrors the greppy-agent tool blocklist so
+/// API keys held by the agent process never leak into children.
+const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
+    "GREPPY_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "SSH_AUTH_SOCK",
+];
+
+fn scrub_credential_env(cmd: &mut Command) {
+    for key in CREDENTIAL_ENV_BLOCKLIST {
+        cmd.env_remove(key);
+    }
 }
 
 /// Seed the worktree's cold store from the main checkout's store, if present.
@@ -920,9 +1028,9 @@ mod tests {
     #[test]
     fn format_tool_start_truncates() {
         let long = "x".repeat(200);
-        let args = serde_json::json!({"command": long});
-        let line = format_tool_start("bash", &args);
-        assert!(line.starts_with("→ bash "));
+        let args = serde_json::json!({"args": ["bash-smart", "--", "echo", long]});
+        let line = format_tool_start("greppy", &args);
+        assert!(line.starts_with("→ greppy "));
         assert!(line.chars().count() <= TOOL_LINE_MAX);
         assert!(line.ends_with('…'));
     }

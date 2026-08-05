@@ -8,7 +8,7 @@
 //!   (CLIProxyAPI-style, default `http://127.0.0.1:8317`).
 //! - [`model`] — [`ModelStream`] trait so the loop is testable without network.
 //! - [`env`] — [`ExecutionEnv`] tool boundary (agent proposes, host executes).
-//! - [`greppy_env`] — production [`GreppyEnv`]: `greppy` + `bash` tools over self-invocation.
+//! - [`greppy_env`] — production [`GreppyEnv`]: single `greppy` tool over self-invocation.
 //! - [`sandbox`] — write-confinement for tool subprocesses (Seatbelt / Landlock).
 //! - [`workspace`] — per-run git worktree isolation and review-patch proposals.
 //! - [`agent_loop`] — ported multi-turn agent loop (pi v0.80.2 semantics, MIT).
@@ -21,7 +21,7 @@
 
 /// Env marker set in every tool subprocess of a running agent. `greppy -p`
 /// refuses to start while it is present, so agents cannot nest — not through
-/// the greppy tool, and not through the bash tool either.
+/// a greppy invocation and not through `bash-smart`.
 pub const AGENT_RUN_ENV: &str = "GREPPY_AGENT_RUN";
 
 pub mod agent_loop;

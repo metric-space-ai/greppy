@@ -1,9 +1,10 @@
-//! Production [`ExecutionEnv`](crate::env::ExecutionEnv): two tools over self-invocation.
+//! Production [`ExecutionEnv`](crate::env::ExecutionEnv): one tool over self-invocation.
 //!
-//! The model sees exactly two tools — `greppy` and `bash`. Both dispatch by
-//! spawning the greppy binary as a subprocess with captured stdio (self-invocation).
-//! In production the binary is `std::env::current_exe()`; tests inject a stub
-//! via [`GreppyEnv::with_binary`].
+//! The model sees exactly one tool — `greppy`. It dispatches by spawning the
+//! greppy binary as a subprocess with captured stdio (self-invocation). Command
+//! execution goes through the same tool as `bash-smart -- CMD`. In production
+//! the binary is `std::env::current_exe()`; tests inject a stub via
+//! [`GreppyEnv::with_binary`].
 //!
 //! Capture policy: stdout is read fully, then stderr is appended after stdout
 //! (separated by a newline only when both are non-empty). This is deterministic
@@ -21,10 +22,10 @@ use crate::env::{ExecutionEnv, ToolOutcome};
 use crate::protocol::ToolDefinition;
 use crate::sandbox::{self, SandboxMode};
 
-/// Default wall-clock budget for the `bash` tool (300 s).
+/// Default wall-clock budget for `greppy bash-smart` invocations (300 s).
 pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default wall-clock budget for the `greppy` tool (120 s).
+/// Default wall-clock budget for non-`bash-smart` greppy invocations (120 s).
 pub const DEFAULT_GREPPY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default combined stdout+stderr cap (64 KiB).
@@ -50,7 +51,7 @@ const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// Production execution environment: `greppy` + `bash` over self-invocation.
+/// Production execution environment: single `greppy` tool over self-invocation.
 #[derive(Debug, Clone)]
 pub struct GreppyEnv {
     greppy_bin: PathBuf,
@@ -79,13 +80,13 @@ impl GreppyEnv {
         })
     }
 
-    /// Override the `bash` tool wall-clock timeout.
+    /// Override the wall-clock timeout used for `bash-smart` greppy invocations.
     pub fn with_bash_timeout(mut self, timeout: Duration) -> Self {
         self.bash_timeout = timeout;
         self
     }
 
-    /// Override the `greppy` tool wall-clock timeout.
+    /// Override the wall-clock timeout used for non-`bash-smart` greppy invocations.
     pub fn with_greppy_timeout(mut self, timeout: Duration) -> Self {
         self.greppy_timeout = timeout;
         self
@@ -125,7 +126,7 @@ impl GreppyEnv {
     fn greppy_tool_def() -> ToolDefinition {
         ToolDefinition {
             name: "greppy".to_string(),
-            description: "Run one greppy command. Pass argv as an array, e.g. [\"who-calls\", \"my_func\", \"--code\"]. All search, navigate, read and edit commands are available.".to_string(),
+            description: "Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -140,23 +141,6 @@ impl GreppyEnv {
         }
     }
 
-    fn bash_tool_def() -> ToolDefinition {
-        ToolDefinition {
-            name: "bash".to_string(),
-            description: "Run a shell command in the repository root. Output is compacted: verdict line, then errors/warnings.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to run via bash -lc."
-                    }
-                },
-                "required": ["command"]
-            }),
-        }
-    }
-
     fn call_greppy(&self, arguments: &Value) -> ToolOutcome {
         let args = match parse_string_array(arguments, "args") {
             Ok(args) => args,
@@ -166,6 +150,12 @@ impl GreppyEnv {
         if let Some(msg) = greppy_guard(&args) {
             return ToolOutcome::err(msg);
         }
+
+        let timeout = if args.first().map(String::as_str) == Some("bash-smart") {
+            self.bash_timeout
+        } else {
+            self.greppy_timeout
+        };
 
         let mut cmd = Command::new(&self.greppy_bin);
         if let Err(e) = sandbox::apply(&mut cmd, &self.greppy_bin, &args, &self.sandbox) {
@@ -177,36 +167,7 @@ impl GreppyEnv {
             .stderr(Stdio::piped());
         prepare_tool_env(&mut cmd);
 
-        match run_capture(&mut cmd, Some(self.greppy_timeout)) {
-            Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
-            Err(msg) => ToolOutcome::err(msg),
-        }
-    }
-
-    fn call_bash(&self, arguments: &Value) -> ToolOutcome {
-        let command = match parse_string_field(arguments, "command") {
-            Ok(c) => c,
-            Err(msg) => return ToolOutcome::err(msg),
-        };
-
-        let bash_args = [
-            "bash-smart".to_string(),
-            "--".to_string(),
-            "bash".to_string(),
-            "-lc".to_string(),
-            command,
-        ];
-        let mut cmd = Command::new(&self.greppy_bin);
-        if let Err(e) = sandbox::apply(&mut cmd, &self.greppy_bin, &bash_args, &self.sandbox) {
-            return ToolOutcome::err(format!("sandbox: {e}"));
-        }
-        cmd.current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        prepare_tool_env(&mut cmd);
-
-        match run_capture(&mut cmd, Some(self.bash_timeout)) {
+        match run_capture(&mut cmd, Some(timeout)) {
             Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
             Err(msg) => ToolOutcome::err(msg),
         }
@@ -214,8 +175,8 @@ impl GreppyEnv {
 }
 
 /// Prepare a tool subprocess environment: strip credential env vars and mark
-/// the process tree as an agent run so `greppy -p` refuses to nest (the
-/// bash tool could otherwise launch a second agent).
+/// the process tree as an agent run so `greppy -p` refuses to nest (a nested
+/// `greppy -p` could otherwise launch a second agent).
 ///
 /// `env_remove` wins over any prior command-scoped `.env(...)` entries and over
 /// process inheritance, so secrets injected for tests (or accidentally set on
@@ -234,13 +195,12 @@ fn scrub_credential_env(cmd: &mut Command) {
 
 impl ExecutionEnv for GreppyEnv {
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![Self::greppy_tool_def(), Self::bash_tool_def()]
+        vec![Self::greppy_tool_def()]
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome {
         match name {
             "greppy" => self.call_greppy(arguments),
-            "bash" => self.call_bash(arguments),
             other => ToolOutcome::unknown_tool(other),
         }
     }
@@ -259,9 +219,8 @@ fn greppy_guard(args: &[String]) -> Option<String> {
              the agent; carry out the task directly with the other greppy commands"
         ));
     }
-    if first == "bash-smart" {
-        return Some("use the bash tool".to_string());
-    }
+    // `bash-smart` is the sanctioned command-execution path under the single
+    // greppy tool surface — deliberately allowed here.
     // Reject both `--root` and `--root=…` so the model cannot re-root the
     // execution environment via either spelling.
     if args
@@ -294,19 +253,6 @@ fn parse_string_array(arguments: &Value, field: &str) -> Result<Vec<String>, Str
         out.push(s.to_string());
     }
     Ok(out)
-}
-
-fn parse_string_field(arguments: &Value, field: &str) -> Result<String, String> {
-    let obj = arguments
-        .as_object()
-        .ok_or_else(|| format!("tool arguments must be a JSON object (missing {field})"))?;
-    let value = obj
-        .get(field)
-        .ok_or_else(|| format!("missing required field: {field}"))?;
-    value
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("field {field} must be a string"))
 }
 
 struct Captured {
@@ -437,12 +383,41 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
     }
 
     let body = merge_stdio(&captured.stdout, &captured.stderr);
+    // Narrow detection of the retryable semantic-index build status greppy
+    // prints on stdout when embeddings are incomplete (exit 1). That status
+    // must never reach the model as an error — the agent should retry soon
+    // and use name/text search meanwhile.
+    //
+    // Detected form (exact prefix + span counts): `semantic index building —
+    // N/M spans, ETA …` (see greppy embedding_progress_text).
+    if is_retryable_semantic_index_building(&body) {
+        let mut msg = body;
+        if !msg.is_empty() && !msg.ends_with('\n') {
+            msg.push('\n');
+        }
+        msg.push_str(
+            "semantic index still building — not an error. Retry this same command              shortly; meanwhile use search-symbol or search-pattern for name/text matches.",
+        );
+        let msg = truncate_output(msg, max_output_bytes);
+        return ToolOutcome::ok(msg);
+    }
+
     let body = truncate_output(body, max_output_bytes);
     if captured.success {
         ToolOutcome::ok(body)
     } else {
         ToolOutcome::err(body)
     }
+}
+
+/// True when tool output is the retryable "semantic index building" status.
+///
+/// Matches greppy's text form: a line containing both
+/// `semantic index building —` and `spans` (with the em dash U+2014). Exit
+/// code is ignored — the status prints with exit 1, which would otherwise
+/// surface as a tool error.
+fn is_retryable_semantic_index_building(body: &str) -> bool {
+    body.contains("semantic index building —") && body.contains("spans")
 }
 
 /// Deterministic merge: stdout first, then stderr appended (with a separating
@@ -535,22 +510,21 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_exactly_two_named_greppy_and_bash() {
+    fn tool_definitions_exactly_one_named_greppy() {
         let (env, _, _) = env_with_stub("exit 0");
         let defs = env.tool_definitions();
-        assert_eq!(defs.len(), 2);
+        assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "greppy");
-        assert_eq!(defs[1].name, "bash");
 
         let greppy_schema = &defs[0].input_schema;
         assert_eq!(greppy_schema["type"], "object");
         assert!(greppy_schema["properties"].get("args").is_some());
         assert_eq!(greppy_schema["required"], json!(["args"]));
-
-        let bash_schema = &defs[1].input_schema;
-        assert_eq!(bash_schema["type"], "object");
-        assert!(bash_schema["properties"].get("command").is_some());
-        assert_eq!(bash_schema["required"], json!(["command"]));
+        assert!(
+            defs[0].description.contains("bash-smart"),
+            "description must teach bash-smart: {}",
+            defs[0].description
+        );
     }
 
     #[test]
@@ -669,7 +643,7 @@ exit 2
     }
 
     #[test]
-    fn guard_bash_smart_first_arg_does_not_invoke_stub() {
+    fn bash_smart_argv_is_allowed_and_spawns() {
         let sentinel = std::env::temp_dir().join(format!(
             "greppy-env-sentinel-bash-smart-{}",
             std::process::id()
@@ -677,10 +651,94 @@ exit 2
         let _ = fs::remove_file(&sentinel);
         let stub = format!("touch '{}'\nexit 0\n", sentinel.display());
         let (mut env, _, _) = env_with_stub(&stub);
-        let out = env.call_tool("greppy", &json!({"args": ["bash-smart", "ls"]}));
-        assert!(out.is_error);
-        assert_eq!(out.content, "use the bash tool");
-        assert!(!sentinel.exists());
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["bash-smart", "--", "cargo", "test"]}),
+        );
+        assert!(!out.is_error, "content={}", out.content);
+        assert!(
+            sentinel.exists(),
+            "bash-smart is the sanctioned path and must spawn the stub"
+        );
+        let _ = fs::remove_file(&sentinel);
+    }
+
+    #[test]
+    fn bash_smart_uses_bash_timeout_budget() {
+        // sleep 5 under a 1s bash budget → timeout; greppy budget stays long.
+        let (env, _, _) = env_with_stub("sleep 5\nexit 0\n");
+        let mut env = env
+            .with_bash_timeout(Duration::from_secs(1))
+            .with_greppy_timeout(Duration::from_secs(30));
+        let start = Instant::now();
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["bash-smart", "--", "sleep", "5"]}),
+        );
+        let elapsed = start.elapsed();
+        assert!(out.is_error, "content={}", out.content);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "elapsed too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn plain_greppy_uses_greppy_timeout_budget() {
+        let (env, _, _) = env_with_stub("sleep 5\nexit 0\n");
+        let mut env = env
+            .with_greppy_timeout(Duration::from_secs(1))
+            .with_bash_timeout(Duration::from_secs(30));
+        let start = Instant::now();
+        let out = env.call_tool("greppy", &json!({"args": ["hang"]}));
+        let elapsed = start.elapsed();
+        assert!(out.is_error, "content={}", out.content);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "elapsed too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn retryable_semantic_index_building_is_non_error() {
+        // Stub prints the exact greppy status line and exits 1 (retryable).
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'semantic index building — 3/12 spans, ETA ~9s (backend cuda)\n'
+exit 1
+"#,
+        );
+        let out = env.call_tool("greppy", &json!({"args": ["search", "retry flow"]}));
+        assert!(
+            !out.is_error,
+            "retryable building status must be non-error; content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("semantic index building —"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("search-symbol") || out.content.contains("search-pattern"),
+            "must advise interim name/text search; content={}",
+            out.content
+        );
+        assert!(
+            out.content.to_ascii_lowercase().contains("retry"),
+            "must tell the model to retry; content={}",
+            out.content
+        );
     }
 
     #[test]
@@ -695,11 +753,12 @@ exit 2
             "{}",
             greppy.content
         );
-        let bash = env.call_tool("bash", &json!({"command": "irrelevant"}));
+        // bash-smart path is the same spawn helper — marker must still land.
+        let smart = env.call_tool("greppy", &json!({"args": ["bash-smart", "--", "true"]}));
         assert!(
-            bash.content.contains("GREPPY_AGENT_RUN=1"),
+            smart.content.contains("GREPPY_AGENT_RUN=1"),
             "{}",
-            bash.content
+            smart.content
         );
     }
 
@@ -835,8 +894,8 @@ printf 'HOME_SET=%s\n' "${HOME:+yes}"
     }
 
     #[test]
-    fn bash_routes_through_bash_smart_with_cwd_root() {
-        // Record argv and cwd.
+    fn bash_smart_argv_passthrough_with_cwd_root() {
+        // Record argv and cwd for a bash-smart greppy invocation.
         let record =
             std::env::temp_dir().join(format!("greppy-env-bash-record-{}", std::process::id()));
         let _ = fs::remove_file(&record);
@@ -850,42 +909,25 @@ exit 0
             record = record.display()
         );
         let (mut env, _, root) = env_with_stub(&stub);
-        let out = env.call_tool("bash", &json!({"command": "echo hi"}));
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["bash-smart", "--", "echo", "hi"]}),
+        );
         assert!(!out.is_error, "content={}", out.content);
 
         let recorded = fs::read_to_string(&record).expect("record");
         let lines: Vec<&str> = recorded.lines().collect();
-        // argv: bash-smart -- bash -lc <cmd>
-        assert!(lines.len() >= 5, "recorded={recorded:?}");
+        // argv: bash-smart -- echo hi
+        assert!(lines.len() >= 4, "recorded={recorded:?}");
         assert_eq!(lines[0], "bash-smart");
         assert_eq!(lines[1], "--");
-        assert_eq!(lines[2], "bash");
-        assert_eq!(lines[3], "-lc");
-        assert_eq!(lines[4], "echo hi");
+        assert_eq!(lines[2], "echo");
+        assert_eq!(lines[3], "hi");
         let cwd_line = lines.iter().find(|l| l.starts_with("cwd=")).expect("cwd");
         let cwd = cwd_line.trim_start_matches("cwd=");
         let got = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
         let want = fs::canonicalize(&root).unwrap_or(root);
         assert_eq!(got, want);
-    }
-
-    #[test]
-    fn bash_timeout_kills_and_reports() {
-        let (env, _, _) = env_with_stub("sleep 5\nexit 0\n");
-        let mut env = env.with_bash_timeout(Duration::from_secs(1));
-        let start = Instant::now();
-        let out = env.call_tool("bash", &json!({"command": "sleep 5"}));
-        let elapsed = start.elapsed();
-        assert!(out.is_error, "content={}", out.content);
-        assert!(
-            out.content.contains("timed out after 1s"),
-            "content={}",
-            out.content
-        );
-        assert!(
-            elapsed < Duration::from_secs(4),
-            "elapsed too long: {elapsed:?}"
-        );
     }
 
     #[test]
@@ -951,8 +993,9 @@ exit 0
         use crate::sandbox::SandboxSpec;
         use std::path::Path;
 
-        /// Stub that, for the bash tool argv shape (`bash-smart -- bash -lc CMD`),
-        /// execs the real shell so sandbox write checks exercise genuine syscalls.
+        /// Stub that, for the bash-smart argv shape (`bash-smart -- bash -lc CMD`
+        /// or `bash-smart -- CMD…`), execs the real shell so sandbox write checks
+        /// exercise genuine syscalls.
         fn real_bash_stub_body() -> &'static str {
             r#"
 if [ "$1" = "bash-smart" ]; then
@@ -985,8 +1028,8 @@ exit 0
             let marker = root.join("inside-ok.txt");
             let _ = fs::remove_file(&marker);
             let out = env.call_tool(
-                "bash",
-                &json!({"command": format!("touch '{}'", marker.display())}),
+                "greppy",
+                &json!({"args": ["bash-smart", "--", "bash", "-lc", format!("touch '{}'", marker.display())]}),
             );
             assert!(!out.is_error, "content={}", out.content);
             assert!(marker.exists(), "inside write must create the file");
@@ -1016,8 +1059,8 @@ exit 0
             ));
             let _ = fs::remove_file(&escape);
             let out = env.call_tool(
-                "bash",
-                &json!({"command": format!("touch '{}'", escape.display())}),
+                "greppy",
+                &json!({"args": ["bash-smart", "--", "bash", "-lc", format!("touch '{}'", escape.display())]}),
             );
             assert!(
                 out.is_error,
@@ -1082,9 +1125,15 @@ exit 0
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(spec));
             let out = env.call_tool(
-                "bash",
+                "greppy",
                 &json!({
-                    "command": "git -c user.email=t@t.com -c user.name=t commit -am second"
+                    "args": [
+                        "bash-smart",
+                        "--",
+                        "bash",
+                        "-lc",
+                        "git -c user.email=t@t.com -c user.name=t commit -am second"
+                    ]
                 }),
             );
             assert!(!out.is_error, "git commit under sandbox: {}", out.content);
@@ -1109,8 +1158,8 @@ exit 0
             ));
             let _ = fs::remove_file(&probe);
             let out = env.call_tool(
-                "bash",
-                &json!({"command": format!("touch '{}'", probe.display())}),
+                "greppy",
+                &json!({"args": ["bash-smart", "--", "bash", "-lc", format!("touch '{}'", probe.display())]}),
             );
             assert!(!out.is_error, "Off-mode outside write: {}", out.content);
             assert!(probe.exists(), "Off mode must allow the outside touch");
@@ -1146,8 +1195,8 @@ exit 0
             ));
             let _ = fs::remove_file(&probe);
             let out = env.call_tool(
-                "bash",
-                &json!({"command": format!("touch '{}'", probe.display())}),
+                "greppy",
+                &json!({"args": ["bash-smart", "--", "bash", "-lc", format!("touch '{}'", probe.display())]}),
             );
             assert!(
                 out.is_error,
@@ -1180,7 +1229,10 @@ exit 0
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(spec));
-            let out = env.call_tool("bash", &json!({"command": "echo x >/dev/null"}));
+            let out = env.call_tool(
+                "greppy",
+                &json!({"args": ["bash-smart", "--", "bash", "-lc", "echo x >/dev/null"]}),
+            );
             assert!(
                 !out.is_error,
                 "echo x >/dev/null under sandbox: {}",
