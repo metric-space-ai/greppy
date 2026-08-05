@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Kritischer Pfad: WP3 Tool-Adapter (Grok, läuft) → WP4 Isolation → WP5 CLI → WP7 E2E+Review. WP1+WP2 gelandet + verifiziert. Toolset-Entscheid: 2 Tools (greppy, bash).</p>
+  <p class="headline">Kritischer Pfad: WP4 Isolation (Grok, läuft) ∥ WP6 Prompt (Orchestrator) → WP5 CLI → WP7 E2E+Review. WP1–WP3 gelandet + verifiziert.</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -95,6 +95,14 @@
       <p class="k">Log: <code>~/greppy-040-logs/wp2-grok.log</code></p>
     </div>
     <div class="card done">
+      <h3>WP3 — GreppyEnv (2 Tools) gelandet + verifiziert</h3>
+      <p>Commit <code>3f4a8b8</code>: Tools <code>greppy</code> (argv-Array) + <code>bash</code> (via bash-smart),
+      Selbst-Invocation mit Pipe-Capture, Guards (kein -p/agent/--root), 64-KiB-Kappung,
+      Timeout mit Prozessgruppen-Kill (killpg-FFI, keine libc-Dep).
+      Orchestrator-verifiziert: <strong>36/36 Tests</strong> selbst gelaufen, fmt/clippy grün, Scope = 2 Dateien.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp3-grok.log</code></p>
+    </div>
+    <div class="card done">
       <h3>0.3.0-Toolfläche gesichtet → WP3 schrumpft</h3>
       <p>0.3.0-AGENTS.md: voller EDIT-Satz (<code>replace/replace-span/patch/write/rename/undo</code>,
       <code>--dry-run/--verify</code>) + <code>bash-smart</code> + SEARCH/NAVIGATE/READ mit Handles &amp; Pipe-Chaining.
@@ -104,32 +112,26 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP3 — Tool-Adapter: 2 Tools (greppy, bash) <span class="k">(claude-grok)</span></h3>
-      <p><code>GreppyEnv</code> implementiert ExecutionEnv mit genau zwei Tools:
-      <code>greppy</code> (eine greppy-Kommandozeile, bevorzugt in-process über die CLI-Dispatch-Lib,
-      Fallback current_exe-Subprozess) und <code>bash</code> (via bash-smart, cwd = Arbeitsverzeichnis).</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp3-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
-      <code>agent: WP3 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
+      <h3>WP4 — Worktree-Isolation + Review-Patch <span class="k">(claude-grok)</span></h3>
+      <p><code>AgentWorkspace</code>: pro Lauf <code>git worktree add --detach</code>, Agent-Root = Worktree,
+      Ergebnis als Patch + Commit auf <code>refs/greppy/agent/&lt;id&gt;</code>, Host wendet nach Accept an.
+      MUSS klären: Store-Auflösung für Linked Worktrees (Cold-Store-Falle!).</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp4-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
+      <code>agent: WP4 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
+    </div>
+    <div class="card work">
+      <h3>WP6 — Minimal-Systemprompt <span class="k">(Orchestrator)</span></h3>
+      <p>Entwurf in Arbeit (Scratchpad): ~40–80 Zeilen aus der 0.3.0-AGENTS.md kondensiert,
+      abgestimmt auf das 2-Tool-Schema. Landet mit WP5-Wiring im Repo.</p>
     </div>
   </div></div>
 
   <div class="col"><h2>To-Do</h2><div class="cards">
     <div class="card">
-      <h3>WP4 — Isolation: Worktree + Review-Patch <span class="k">(Grok)</span></h3>
-      <p>Pro <code>-p</code>-Lauf isolierter git-Worktree; Edits über greppy-Engine; Ergebnis = Diff/Commit-Vorschlag,
-      Host wendet nach Accept an (Hypoport/ctox-Prinzip: Agent schlägt vor, Host entscheidet).</p>
-      <p class="trigger">Trigger: WP2 gelandet (parallel zu WP3 möglich, getrennte Dateien)</p>
-    </div>
-    <div class="card">
       <h3>WP5 — CLI-Integration <span class="k">(Grok)</span></h3>
       <p><code>greppy -p "aufgabe"</code>, Flags <code>--endpoint/--model</code>, <code>-p --help</code> mit Localhost-Vertragstext,
       sauberer Abbruch ohne Server (Probe).</p>
       <p class="trigger">Trigger: WP2 + WP3 gelandet</p>
-    </div>
-    <div class="card">
-      <h3>WP6 — Minimal-Systemprompt <span class="k">(Orchestrator)</span></h3>
-      <p>~40–80 Zeilen, kondensiert aus der 0.3.0-AGENTS.md; Toolliste muss mit WP3-Adaptern übereinstimmen.</p>
-      <p class="trigger">Trigger: WP3-Toolliste fix</p>
     </div>
     <div class="card">
       <h3>WP7 — E2E + Kimi-Review</h3>
