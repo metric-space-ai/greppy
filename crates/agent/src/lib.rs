@@ -23,6 +23,7 @@ pub mod client;
 pub mod env;
 pub mod greppy_env;
 pub mod model;
+pub mod prompt;
 pub mod protocol;
 pub mod wire;
 pub mod workspace;
@@ -32,6 +33,7 @@ pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
 pub use greppy_env::GreppyEnv;
 pub use model::ModelStream;
+pub use prompt::SYSTEM_PROMPT;
 pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,
     Usage,

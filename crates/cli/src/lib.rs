@@ -82,6 +82,7 @@ use passthrough::*;
 mod bash_smart;
 mod context;
 use context::*;
+mod agent;
 
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
@@ -591,6 +592,13 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     }
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
+    // `greppy -p` is a structured agent invocation. Intercept before
+    // unknown-verb / grep-passthrough so `-p` never becomes a real-grep
+    // pattern, and so grep flags like `-p` (Perl regex on GNU grep) still
+    // work for non-leading positions via ordinary passthrough.
+    if agent::is_agent_p_invocation(&argv) {
+        return agent::run_agent_p(&argv);
+    }
     if let Some(message) = unknown_verb_refusal(&argv) {
         println!("{message}");
         return EXIT_USAGE;

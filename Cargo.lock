@@ -680,6 +680,7 @@ name = "greppy"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "greppy-agent",
  "greppy-core",
  "greppy-discover",
  "greppy-edit",
