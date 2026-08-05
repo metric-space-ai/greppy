@@ -1,0 +1,175 @@
+<title>greppy 0.4.0 — Agent-Port Board</title>
+<style>
+  :root {
+    --bg: #FAFAF8; --surface: #FFFFFF; --line: #DDDDD6; --ink: #1A1D23;
+    --mut: #5B6472; --acc: #0F766E; --acc-soft: #0F766E1A;
+    --done: #15803D; --work: #B45309; --todo: #5B6472; --owner: #7C3AED;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171C; --surface: #1C2027; --line: #2A2F38; --ink: #E6E4DE;
+      --mut: #9AA3AF; --acc: #2DD4BF; --acc-soft: #2DD4BF1F;
+      --done: #4ADE80; --work: #FBBF24; --todo: #9AA3AF; --owner: #C4B5FD; }
+  }
+  :root[data-theme="dark"] { --bg: #14171C; --surface: #1C2027; --line: #2A2F38; --ink: #E6E4DE;
+    --mut: #9AA3AF; --acc: #2DD4BF; --acc-soft: #2DD4BF1F;
+    --done: #4ADE80; --work: #FBBF24; --todo: #9AA3AF; --owner: #C4B5FD; }
+  :root[data-theme="light"] { --bg: #FAFAF8; --surface: #FFFFFF; --line: #DDDDD6; --ink: #1A1D23;
+    --mut: #5B6472; --acc: #0F766E; --acc-soft: #0F766E1A;
+    --done: #15803D; --work: #B45309; --todo: #5B6472; --owner: #7C3AED; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, sans-serif;
+    margin: 0; padding: 1.25rem; }
+  header { border-bottom: 2px solid var(--acc); padding-bottom: .75rem; margin-bottom: 1rem; }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  .headline { color: var(--acc); font-weight: 600; }
+  .meta { color: var(--mut); font-size: .8rem; }
+  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: .9rem; align-items: start; }
+  .col h2 { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--mut); margin: 0 0 .5rem; }
+  .col { display: flex; flex-direction: column; gap: 0; }
+  .cards { display: flex; flex-direction: column; gap: .6rem; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+    padding: .6rem .7rem .6rem .8rem; border-left: 4px solid var(--todo); }
+  .card h3 { font-size: .85rem; margin: 0 0 .3rem; }
+  .card p { margin: .25rem 0; font-size: .8rem; }
+  .card .k { color: var(--mut); }
+  .done > .card, .card.done { border-left-color: var(--done); }
+  .work > .card, .card.work { border-left-color: var(--work); }
+  .card.owner { border-left-color: var(--owner); }
+  .card.neg { opacity: .85; }
+  code { font-family: var(--mono); font-size: .75rem; background: var(--acc-soft);
+    padding: 0 .25em; border-radius: 3px; overflow-wrap: anywhere; }
+  .trigger { font-size: .75rem; color: var(--work); font-weight: 600; }
+  .sections { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: .9rem; margin-top: 1.5rem; }
+  .sec { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: .7rem .9rem; }
+  .sec h2 { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; color: var(--acc); margin: 0 0 .4rem; }
+  .sec ul { margin: 0; padding-left: 1.1rem; font-size: .8rem; }
+  .sec li { margin: .3rem 0; }
+</style>
+
+<header>
+  <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
+  <p class="headline">Kritischer Pfad: WP1 Wire-Client (Grok, läuft) → WP2 Loop+ExecutionEnv → WP3 Tools ∥ WP4 Isolation → WP5 CLI → WP7 E2E+Review.</p>
+  <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
+</header>
+
+<div class="board">
+  <div class="col done"><h2>Done</h2><div class="cards">
+    <div class="card done">
+      <h3>Architektur-Entscheide (Owner, 05.08.2026)</h3>
+      <p>Rust-PORT des pi-Codes (ersetzt npm-Pin-Entscheid). v1-Scope: NUR one-shot headless.
+      Wire: <code>/v1/messages</code> gegen <code>127.0.0.1:8317</code> (cli-proxy übersetzt alle Formate).
+      Keine eigene Auth/API. Hauptworker: claude-grok; Kimi Review.</p>
+      <p class="k">Verifiziert: Memory <code>greppy-040-agent-architecture.md</code></p>
+    </div>
+    <div class="card done">
+      <h3>Lizenz-Gate geklärt</h3>
+      <p>greppy = Apache-2.0. pi = MIT (<code>github.com/earendil-works/pi</code>, Pin <code>0201806a</code>) → Port ok, THIRD_PARTY-Eintrag nötig.
+      ctox-cliproxyapi-Adaptionen = AGPL-3.0-only → <strong>niemals vendoren</strong>, nur Referenz.</p>
+    </div>
+    <div class="card done">
+      <h3>Verkabelung verifiziert</h3>
+      <p>claude-grok-Wrapper vorhanden, cli-proxy antwortet auf 8317, xAI-Credential im Proxy.
+      Kein HTTP-Client im Cargo-Tree → WP1 nutzt <code>ureq</code> (minimal, kein TLS — localhost http).</p>
+    </div>
+    <div class="card done">
+      <h3>0.3.0-Toolfläche gesichtet → WP3 schrumpft</h3>
+      <p>0.3.0-AGENTS.md: voller EDIT-Satz (<code>replace/replace-span/patch/write/rename/undo</code>,
+      <code>--dry-run/--verify</code>) + <code>bash-smart</code> + SEARCH/NAVIGATE/READ mit Handles &amp; Pipe-Chaining.
+      Agent-Tools = In-Process-Adapter auf diese Kommandos, kein eigener Tool-Zoo.</p>
+    </div>
+  </div></div>
+
+  <div class="col work"><h2>Working</h2><div class="cards">
+    <div class="card work">
+      <h3>WP1 — Wire-Client <span class="k">(claude-grok)</span></h3>
+      <p>Neues Crate <code>crates/agent</code> (<code>greppy-agent</code>): neutrale Protokolltypen,
+      Anthropic-Messages-Serialisierung, SSE-Parser → StreamEvent, blocking Client (ureq), Probe <code>GET /v1/models</code>.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp1-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
+      <code>agent: WP1 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
+    </div>
+    <div class="card work">
+      <h3>pi-Audit-Checkout</h3>
+      <p><code>~/pi-audit-0201806a</code> — Clone von earendil-works/pi, Checkout am Pin
+      <code>0201806a</code>. Quelle für WP2-Port (dist-JS im ctox-Sidecar bleibt Fallback).</p>
+      <p class="k">Fertig = git log zeigt Pin-Commit</p>
+    </div>
+  </div></div>
+
+  <div class="col"><h2>To-Do</h2><div class="cards">
+    <div class="card">
+      <h3>WP2 — Agent-Loop-Port + ExecutionEnv-Trait <span class="k">(Grok)</span></h3>
+      <p>pi <code>agent-loop</code> (packages/agent) nach Rust: Turn-Schleife, Tool-Dispatch,
+      Stop-Bedingungen. Tool-Grenze als <code>ExecutionEnv</code>-Trait (Vorbild: ctox-Sidecar-Vertrag, nur Struktur, kein Code).</p>
+      <p class="trigger">Trigger: WP1 gelandet + orchestrator-verifiziert</p>
+    </div>
+    <div class="card">
+      <h3>WP3 — Tool-Adapter auf greppy-0.3.0-Kommandos <span class="k">(Grok)</span></h3>
+      <p>Tools = in-process Aufrufe der eigenen Crates: search/navigate/read, EDIT-Suite (mit undo-Journal), bash-smart.
+      Alles läuft durch ExecutionEnv.</p>
+      <p class="trigger">Trigger: WP2 gelandet</p>
+    </div>
+    <div class="card">
+      <h3>WP4 — Isolation: Worktree + Review-Patch <span class="k">(Grok)</span></h3>
+      <p>Pro <code>-p</code>-Lauf isolierter git-Worktree; Edits über greppy-Engine; Ergebnis = Diff/Commit-Vorschlag,
+      Host wendet nach Accept an (Hypoport/ctox-Prinzip: Agent schlägt vor, Host entscheidet).</p>
+      <p class="trigger">Trigger: WP2 gelandet (parallel zu WP3 möglich, getrennte Dateien)</p>
+    </div>
+    <div class="card">
+      <h3>WP5 — CLI-Integration <span class="k">(Grok)</span></h3>
+      <p><code>greppy -p "aufgabe"</code>, Flags <code>--endpoint/--model</code>, <code>-p --help</code> mit Localhost-Vertragstext,
+      sauberer Abbruch ohne Server (Probe).</p>
+      <p class="trigger">Trigger: WP2 + WP3 gelandet</p>
+    </div>
+    <div class="card">
+      <h3>WP6 — Minimal-Systemprompt <span class="k">(Orchestrator)</span></h3>
+      <p>~40–80 Zeilen, kondensiert aus der 0.3.0-AGENTS.md; Toolliste muss mit WP3-Adaptern übereinstimmen.</p>
+      <p class="trigger">Trigger: WP3-Toolliste fix</p>
+    </div>
+    <div class="card">
+      <h3>WP7 — E2E + Kimi-Review</h3>
+      <p>Echter Lauf gegen lebenden cli-proxy (Grok/Kimi-Modelle), dann unabhängiges Kimi-Review der Gesamtintegration.</p>
+      <p class="trigger">Trigger: WP1–WP5 gelandet</p>
+    </div>
+  </div></div>
+
+  <div class="col"><h2>Backlog + Owner</h2><div class="cards">
+    <div class="card owner">
+      <h3>OWNER: Prozess-Sandbox-Härtung</h3>
+      <p>Worktree+Review-Patch isoliert Schreibzugriffe, aber <code>bash-smart</code> kann weiterhin Host/Netz erreichen.
+      Echte Prozess-Sandbox (macOS sandbox-exec / Linux Landlock) als 0.4.x-Härtung — Umfang vom Owner zu bestätigen.</p>
+    </div>
+    <div class="card">
+      <h3>THIRD_PARTY.md: pi-Attribution</h3>
+      <p>MIT-Attribution für portierten pi-Code beim ersten Port-Commit (WP2) eintragen.</p>
+    </div>
+    <div class="card">
+      <h3>Batch-Inferenz (aus 0.3.x übernommen)</h3>
+      <p>Owner-Vermerk aus Inference-Lifecycle: Batch-Summaries → 0.4.0. Getrennt vom Agent-Port einplanen.</p>
+    </div>
+  </div></div>
+</div>
+
+<div class="sections">
+  <div class="sec"><h2>Environment-Traps</h2><ul>
+    <li><code>~/greppy-030</code> ist ein geteilter Live-Worktree — NICHT anfassen; 0.4.0-Arbeit nur in <code>~/greppy-040</code>.</li>
+    <li><code>~/greppy-040</code> ist dediziert für diesen Port: max. 1 Worker gleichzeitig darin (git-Index-Race).</li>
+    <li>Sol-Concurrency: 4. Stream killt ältere Läufe — hartes Cap 3, jeden Start zählen. Grok läuft über cli-proxy, zählt nicht gegen Sol.</li>
+    <li>cli-proxy muss laufen (<code>brew services start cliproxyapi</code>); Sol-Auth-Ablauf = User-Aktion (<code>cliproxyapi -codex-login</code>).</li>
+    <li>AGPL-Grenze: ctox-cliproxyapi-Code nur lesen, nie kopieren.</li>
+  </ul></div>
+  <div class="sec"><h2>Error-Patterns</h2><ul>
+    <li>#1 Bei unerwartetem Verhalten ERST Setup diffen, dann übers Produkt theoretisieren (Bench-Lektion 0.2.1).</li>
+    <li>#2 Session-Start-AGENTS.md kann veraltet sein — Toolflächen immer gegen den Ziel-Checkout prüfen (0.3.0 ≠ 0.2.1).</li>
+  </ul></div>
+  <div class="sec"><h2>Evidence-Map</h2><ul>
+    <li>Entscheide: <code>~/.claude/projects/-Users-michaelwelsch-greppy/memory/greppy-040-agent-architecture.md</code></li>
+    <li>pi-Quelle: <code>~/pi-audit-0201806a</code> (Pin) · dist-JS: <code>ctox/src/core/coding_agents/pi-sidecar/node_modules/@earendil-works/</code></li>
+    <li>Turn-Vertrag: <code>ctox/src/core/coding_agents/pi-sidecar/PORTING.md</code></li>
+    <li>Wire-Referenz: <code>ctox/src/core/execution/cliproxyapi/protocol/mod.rs</code> + <code>internal/api/server_routes.rs</code> (AGPL — nur lesen)</li>
+    <li>0.3.0-Toolfläche: <code>~/greppy-040/AGENTS.md</code></li>
+    <li>WP1-Log: <code>~/greppy-040-logs/wp1-grok.log</code></li>
+  </ul></div>
+</div>
