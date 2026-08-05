@@ -195,3 +195,45 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// F9: leading `-p` is reserved for the agent, but `greppy -e -p X` must reach
+/// the grep passthrough (not the agent interceptor).
+#[test]
+fn greppy_e_dash_p_is_not_intercepted_as_agent() {
+    let dir = unique_temp("e-dash-p");
+    std::fs::write(dir.join("hay.txt"), b"alpha\n-p needle line\nbeta\n").unwrap();
+
+    let output = Command::new(binary_path())
+        .current_dir(&dir)
+        .env("GREPPY_STORE_DIR", unique_temp("e-dash-p-store"))
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args(["-e", "-p", "hay.txt"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn greppy -e -p");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Must NOT be the agent path (which would complain about missing TASK/model/gateway).
+    assert!(
+        !stderr.contains("greppy -p needs a local model gateway")
+            && !stderr.contains("missing TASK")
+            && !stderr.contains("--model is required"),
+        "was intercepted as agent:\nstdout={stdout}\nstderr={stderr}"
+    );
+    // Grep for the literal pattern `-p` should match the haystack line.
+    assert!(
+        stdout.contains("-p needle line"),
+        "expected grep hit for literal -p; stdout={stdout}\nstderr={stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

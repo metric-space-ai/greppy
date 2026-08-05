@@ -48,7 +48,13 @@ pub enum WorkspaceError {
         stderr: String,
         status: Option<i32>,
     },
-    /// `apply_to` hit a cherry-pick conflict; the cherry-pick was aborted.
+    /// `apply_to` refused because the target checkout has uncommitted changes.
+    DirtyTarget {
+        /// Ref the user can still apply from once the target is clean.
+        ref_name: String,
+        detail: String,
+    },
+    /// `apply_to` hit a cherry-pick conflict; restoration was attempted.
     Conflict {
         /// Ref the user can resolve from manually (`refs/greppy/agent/<run_id>`).
         ref_name: String,
@@ -83,10 +89,17 @@ impl fmt::Display for WorkspaceError {
                 }
                 Ok(())
             }
+            Self::DirtyTarget { ref_name, detail } => {
+                write!(
+                    f,
+                    "target checkout has uncommitted changes — commit or stash first; \
+                     the proposal remains at {ref_name}: {detail}"
+                )
+            }
             Self::Conflict { ref_name, detail } => {
                 write!(
                     f,
-                    "cherry-pick conflict while applying proposal; aborted. \
+                    "cherry-pick conflict while applying proposal. \
                      Resolve manually from {ref_name}: {detail}"
                 )
             }
@@ -199,24 +212,26 @@ impl AgentWorkspace {
     }
 
     /// Stage everything in the worktree and either return [`RunOutcome::Clean`]
-    /// or commit + pin a proposal ref in the shared repo.
+    /// or pin a single proposal commit (parent = [`Self::base_commit`]) via
+    /// plumbing so model-made commits/resets cannot corrupt the proposal.
     pub fn finish(&self, message: &str) -> Result<RunOutcome, WorkspaceError> {
         git_ok(&self.worktree, &["add", "-A"])?;
 
-        // Exit 0 = no staged diff; exit 1 = staged changes present.
-        let staged = git_run(&self.worktree, &["diff", "--cached", "--quiet"])?;
-        if staged.status.success() {
+        // Capture the final filesystem state as a tree, independent of HEAD.
+        let tree = git_ok(&self.worktree, &["write-tree"])?;
+        let base_tree = git_ok(
+            &self.worktree,
+            &["rev-parse", &format!("{}^{{tree}}", self.base_commit)],
+        )?;
+        if tree == base_tree {
             return Ok(RunOutcome::Clean);
         }
-        // Any status other than 0/1 is a real failure (diff --quiet uses 1 for
-        // "differences found").
-        if staged.status.code() != Some(1) {
-            return Err(git_failed("git diff --cached --quiet", &staged));
-        }
 
-        // Author/committer fixed for every agent proposal.
+        // Author/committer fixed for every agent proposal. Build the commit
+        // with plumbing so parent is always base_commit regardless of whatever
+        // the model did to HEAD inside the worktree.
         let commit_out = Command::new("git")
-            .args(["commit", "--allow-empty-message", "-m", message])
+            .args(["commit-tree", &tree, "-p", &self.base_commit, "-m", message])
             .current_dir(&self.worktree)
             .env("GIT_AUTHOR_NAME", "greppy agent")
             .env("GIT_AUTHOR_EMAIL", "agent@greppy.local")
@@ -229,10 +244,22 @@ impl AgentWorkspace {
             .output()
             .map_err(WorkspaceError::Io)?;
         if !commit_out.status.success() {
-            return Err(git_failed("git commit -m <message>", &commit_out));
+            return Err(git_failed(
+                "git commit-tree <tree> -p <base> -m <message>",
+                &commit_out,
+            ));
+        }
+        let commit = String::from_utf8_lossy(&commit_out.stdout)
+            .trim_end()
+            .to_string();
+        if commit.is_empty() {
+            return Err(WorkspaceError::GitFailed {
+                command: "git commit-tree <tree> -p <base> -m <message>".into(),
+                stderr: "commit-tree produced empty OID".into(),
+                status: commit_out.status.code(),
+            });
         }
 
-        let commit = git_ok(&self.worktree, &["rev-parse", "HEAD"])?;
         let ref_name = self.ref_name();
 
         // Pin the proposal in the *shared* repo so it survives worktree removal.
@@ -251,35 +278,83 @@ impl AgentWorkspace {
 
     /// Cherry-pick `commit` into `target_checkout` with `--no-commit`.
     ///
-    /// On conflict the cherry-pick is aborted and a typed [`WorkspaceError::Conflict`]
-    /// is returned (ref name included so the user can resolve manually).
+    /// Refuses a dirty target before attempting the cherry-pick. On conflict
+    /// restoration is attempted carefully: `cherry-pick --abort` only when
+    /// `CHERRY_PICK_HEAD` is present, otherwise a positively chosen
+    /// `reset --merge`. Both exit codes are checked so the error does not
+    /// claim a clean abort when restoration failed.
     pub fn apply_to(&self, target_checkout: &Path, commit: &str) -> Result<(), WorkspaceError> {
+        // Preflight: refuse uncommitted changes so we never start a
+        // cherry-pick that could mash a dirty worktree.
+        let status = git_run(target_checkout, &["status", "--porcelain=v1", "-z"])?;
+        if !status.status.success() {
+            return Err(git_failed("git status --porcelain=v1 -z", &status));
+        }
+        if !status.stdout.is_empty() {
+            return Err(WorkspaceError::DirtyTarget {
+                ref_name: self.ref_name(),
+                detail: "git status --porcelain is non-empty".into(),
+            });
+        }
+
         let result = git_run(target_checkout, &["cherry-pick", "--no-commit", commit])?;
         if result.status.success() {
             return Ok(());
         }
 
-        // Leave the target clean. With a normal (committing) cherry-pick,
-        // `cherry-pick --abort` works. With `--no-commit`, git never records
-        // CHERRY_PICK_HEAD on conflict, so `--abort` is a no-op / error and we
-        // fall back to `reset --merge` which clears the unmerged index entries
-        // and restores the pre-cherry-pick tree.
-        let abort = git_run(target_checkout, &["cherry-pick", "--abort"])?;
-        if !abort.status.success() {
-            let _ = git_run(target_checkout, &["reset", "--merge"])?;
+        let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        let conflict_detail = if stderr.trim().is_empty() {
+            format!(
+                "git cherry-pick --no-commit {commit} failed (exit {:?})",
+                result.status.code()
+            )
+        } else {
+            stderr.trim().to_string()
+        };
+
+        // Restore carefully. Prefer --abort only when CHERRY_PICK_HEAD exists
+        // (normal committing cherry-pick); with --no-commit git often never
+        // records it, so we positively choose reset --merge instead.
+        let has_cp_head = git_run(
+            target_checkout,
+            &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"],
+        )?
+        .status
+        .success();
+
+        let mut restore_notes = Vec::new();
+        if has_cp_head {
+            let abort = git_run(target_checkout, &["cherry-pick", "--abort"])?;
+            if !abort.status.success() {
+                restore_notes.push(format!(
+                    "cherry-pick --abort failed (exit {:?}): {}",
+                    abort.status.code(),
+                    String::from_utf8_lossy(&abort.stderr).trim()
+                ));
+            }
+        } else {
+            let reset = git_run(target_checkout, &["reset", "--merge"])?;
+            if !reset.status.success() {
+                restore_notes.push(format!(
+                    "reset --merge failed (exit {:?}): {}",
+                    reset.status.code(),
+                    String::from_utf8_lossy(&reset.stderr).trim()
+                ));
+            }
         }
 
-        let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        let detail = if restore_notes.is_empty() {
+            conflict_detail
+        } else {
+            format!(
+                "{conflict_detail}; restoration incomplete: {}",
+                restore_notes.join("; ")
+            )
+        };
+
         Err(WorkspaceError::Conflict {
             ref_name: self.ref_name(),
-            detail: if stderr.trim().is_empty() {
-                format!(
-                    "git cherry-pick --no-commit {commit} failed (exit {:?})",
-                    result.status.code()
-                )
-            } else {
-                stderr.trim().to_string()
-            },
+            detail,
         })
     }
 
@@ -588,6 +663,7 @@ mod tests {
         git_c(&target, &["add", "hello.txt"]);
         git_c(&target, &["commit", "-m", "user change"]);
         let head_before = git_c(&target, &["rev-parse", "HEAD"]);
+        let hello_before = std::fs::read_to_string(target.join("hello.txt")).unwrap();
 
         let err = ws.apply_to(&target, &commit).expect_err("must conflict");
         match &err {
@@ -597,11 +673,18 @@ mod tests {
             } => {
                 assert_eq!(rn, &ref_name);
                 assert!(!detail.is_empty());
+                // Must not claim a clean abort when restoration may have used
+                // reset --merge (no CHERRY_PICK_HEAD with --no-commit).
+                assert!(
+                    !detail.to_lowercase().contains("aborted")
+                        || detail.contains("restoration incomplete"),
+                    "error text must not falsely claim abort: {detail}"
+                );
             }
             other => panic!("expected Conflict, got {other}"),
         }
 
-        // Cherry-pick aborted: no CHERRY_PICK_HEAD, HEAD unchanged, clean tree
+        // Restored: no CHERRY_PICK_HEAD, HEAD unchanged, clean tree
         // (the user's committed state).
         let cp = Command::new("git")
             .args(["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"])
@@ -610,19 +693,168 @@ mod tests {
             .expect("rev-parse CHERRY_PICK_HEAD");
         assert!(
             !cp.success(),
-            "CHERRY_PICK_HEAD must not remain after abort"
+            "CHERRY_PICK_HEAD must not remain after restore"
         );
         assert_eq!(git_c(&target, &["rev-parse", "HEAD"]), head_before);
         let status = git_c(&target, &["status", "--porcelain"]);
         assert!(
             status.is_empty(),
-            "target should be clean after abort; status={status:?}"
+            "target should be clean after restore; status={status:?}"
         );
+        let hello_after = std::fs::read_to_string(target.join("hello.txt")).unwrap();
+        assert_eq!(hello_after, hello_before, "file content must be restored");
 
         // Proposal ref still present in the main repo.
         let ref_oid = git_c(&repo, &["rev-parse", &ref_name]);
         assert_eq!(ref_oid, commit);
 
+        ws.cleanup().expect("cleanup");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn apply_to_dirty_target_refused_untouched() {
+        let repo = init_fixture("greppy-ws-dirty");
+        let run_id = unique_tag("run-dirty");
+        let ws = AgentWorkspace::create(&repo, &run_id).expect("create");
+
+        std::fs::write(ws.worktree_path().join("hello.txt"), b"from agent\n").unwrap();
+        let outcome = ws.finish("proposal for dirty target").expect("finish");
+        let (commit, ref_name) = match outcome {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("expected Proposal"),
+        };
+
+        let target = clone_fixture(&repo);
+        // Leave uncommitted changes in the target.
+        std::fs::write(target.join("hello.txt"), b"dirty local edit\n").unwrap();
+        std::fs::write(target.join("scratch.txt"), b"untracked\n").unwrap();
+        let status_before = git_c(&target, &["status", "--porcelain"]);
+        assert!(!status_before.is_empty());
+        let head_before = git_c(&target, &["rev-parse", "HEAD"]);
+        let hello_before = std::fs::read_to_string(target.join("hello.txt")).unwrap();
+
+        let err = ws
+            .apply_to(&target, &commit)
+            .expect_err("must refuse dirty");
+        match &err {
+            WorkspaceError::DirtyTarget {
+                ref_name: rn,
+                detail,
+            } => {
+                assert_eq!(rn, &ref_name);
+                assert!(!detail.is_empty());
+            }
+            other => panic!("expected DirtyTarget, got {other}"),
+        }
+        // Display message is the user-facing contract.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("uncommitted changes") && msg.contains(&ref_name),
+            "display={msg}"
+        );
+
+        // Target completely untouched: same HEAD, same dirty status, same file.
+        assert_eq!(git_c(&target, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            git_c(&target, &["status", "--porcelain"]),
+            status_before,
+            "dirty status must be unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("hello.txt")).unwrap(),
+            hello_before
+        );
+        // No cherry-pick residue.
+        let cp = Command::new("git")
+            .args(["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"])
+            .current_dir(&target)
+            .status()
+            .expect("rev-parse");
+        assert!(!cp.success());
+
+        ws.cleanup().expect("cleanup");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn finish_ignores_model_mid_run_commit_and_captures_full_delta() {
+        let repo = init_fixture("greppy-ws-midcommit");
+        let base = git_c(&repo, &["rev-parse", "HEAD"]);
+        let run_id = unique_tag("run-midcommit");
+        let ws = AgentWorkspace::create(&repo, &run_id).expect("create");
+        assert_eq!(ws.base_commit(), base);
+
+        // Model makes an intermediate commit that would otherwise become the
+        // parent of a naive `git commit` proposal.
+        std::fs::write(ws.worktree_path().join("mid.txt"), b"mid-run\n").unwrap();
+        git_c(ws.worktree_path(), &["add", "mid.txt"]);
+        // Use the same author config as the fixture helper.
+        git_c(
+            ws.worktree_path(),
+            &["commit", "-m", "model mid-run commit"],
+        );
+        let mid_head = git_c(ws.worktree_path(), &["rev-parse", "HEAD"]);
+        assert_ne!(mid_head, base, "model commit must move HEAD");
+
+        // Further filesystem changes after the mid-run commit.
+        std::fs::write(ws.worktree_path().join("hello.txt"), b"final hello\n").unwrap();
+        std::fs::write(ws.worktree_path().join("late.txt"), b"late file\n").unwrap();
+
+        let outcome = ws.finish("head-proof proposal").expect("finish");
+        let (commit, ref_name, patch, _stat) = match outcome {
+            RunOutcome::Proposal {
+                commit,
+                ref_name,
+                patch,
+                stat,
+            } => (commit, ref_name, patch, stat),
+            RunOutcome::Clean => panic!("expected Proposal"),
+        };
+
+        // Proposal parent is base_commit, not the model's mid-run commit.
+        let parents = git_c(&repo, &["rev-list", "--parents", "-n", "1", &commit]);
+        // Format: "<commit> <parent>..."
+        let mut parts = parents.split_whitespace();
+        assert_eq!(parts.next(), Some(commit.as_str()));
+        assert_eq!(parts.next(), Some(base.as_str()));
+        assert_eq!(parts.next(), None, "proposal must be exactly one parent");
+
+        // Full delta from base: mid.txt, hello.txt edit, late.txt all present.
+        assert!(
+            patch.contains("mid.txt") && patch.contains("mid-run"),
+            "patch missing mid-run file: {patch}"
+        );
+        assert!(
+            patch.contains("final hello") || patch.contains("+final hello"),
+            "patch missing final hello edit: {patch}"
+        );
+        assert!(
+            patch.contains("late.txt") && patch.contains("late file"),
+            "patch missing late file: {patch}"
+        );
+
+        // Applying the proposal onto a clean base yields the full final state.
+        let target = clone_fixture(&repo);
+        ws.apply_to(&target, &commit).expect("apply full delta");
+        assert_eq!(
+            std::fs::read_to_string(target.join("hello.txt")).unwrap(),
+            "final hello\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("mid.txt")).unwrap(),
+            "mid-run\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("late.txt")).unwrap(),
+            "late file\n"
+        );
+
+        let _ = ref_name;
         ws.cleanup().expect("cleanup");
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&target);

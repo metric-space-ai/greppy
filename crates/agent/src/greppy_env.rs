@@ -23,8 +23,31 @@ use crate::protocol::ToolDefinition;
 /// Default wall-clock budget for the `bash` tool (300 s).
 pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Default wall-clock budget for the `greppy` tool (120 s).
+pub const DEFAULT_GREPPY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Default combined stdout+stderr cap (64 KiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
+
+/// Credential / secret env vars stripped from every tool subprocess.
+///
+/// This is a **blocklist**, not a sandbox: PATH, HOME, and everything else
+/// still pass through. Tool children must not inherit API keys or tokens
+/// that the agent process itself may hold.
+const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
+    "GREPPY_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "SSH_AUTH_SOCK",
+];
 
 /// Production execution environment: `greppy` + `bash` over self-invocation.
 #[derive(Debug, Clone)]
@@ -32,6 +55,7 @@ pub struct GreppyEnv {
     greppy_bin: PathBuf,
     root: PathBuf,
     bash_timeout: Duration,
+    greppy_timeout: Duration,
     max_output_bytes: usize,
 }
 
@@ -47,6 +71,7 @@ impl GreppyEnv {
             greppy_bin,
             root,
             bash_timeout: DEFAULT_BASH_TIMEOUT,
+            greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         })
     }
@@ -54,6 +79,12 @@ impl GreppyEnv {
     /// Override the `bash` tool wall-clock timeout.
     pub fn with_bash_timeout(mut self, timeout: Duration) -> Self {
         self.bash_timeout = timeout;
+        self
+    }
+
+    /// Override the `greppy` tool wall-clock timeout.
+    pub fn with_greppy_timeout(mut self, timeout: Duration) -> Self {
+        self.greppy_timeout = timeout;
         self
     }
 
@@ -124,8 +155,9 @@ impl GreppyEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        scrub_credential_env(&mut cmd);
 
-        match run_capture(&mut cmd, None) {
+        match run_capture(&mut cmd, Some(self.greppy_timeout)) {
             Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
             Err(msg) => ToolOutcome::err(msg),
         }
@@ -143,11 +175,19 @@ impl GreppyEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        scrub_credential_env(&mut cmd);
 
         match run_capture(&mut cmd, Some(self.bash_timeout)) {
             Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
             Err(msg) => ToolOutcome::err(msg),
         }
+    }
+}
+
+/// Strip credential env vars from a tool subprocess command.
+fn scrub_credential_env(cmd: &mut Command) {
+    for key in CREDENTIAL_ENV_BLOCKLIST {
+        cmd.env_remove(key);
     }
 }
 
@@ -177,7 +217,15 @@ fn greppy_guard(args: &[String]) -> Option<String> {
             "greppy tool forbids recursive agent invocation (first arg {first:?})"
         ));
     }
-    if args.iter().any(|a| a == "--root") {
+    if first == "bash-smart" {
+        return Some("use the bash tool".to_string());
+    }
+    // Reject both `--root` and `--root=…` so the model cannot re-root the
+    // execution environment via either spelling.
+    if args
+        .iter()
+        .any(|a| a == "--root" || a.starts_with("--root="))
+    {
         return Some(
             "greppy tool forbids --root (the execution environment owns the repository root)"
                 .to_string(),
@@ -558,6 +606,135 @@ exit 2
         assert!(out.is_error);
         assert!(out.content.contains("--root"), "content={}", out.content);
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn guard_root_equals_form_does_not_invoke_stub() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "greppy-env-sentinel-root-eq-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&sentinel);
+        let stub = format!("touch '{}'\nexit 0\n", sentinel.display());
+        let (mut env, _, _) = env_with_stub(&stub);
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["who-calls", "foo", "--root=/tmp"]}),
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("--root"), "content={}", out.content);
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn guard_bash_smart_first_arg_does_not_invoke_stub() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "greppy-env-sentinel-bash-smart-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&sentinel);
+        let stub = format!("touch '{}'\nexit 0\n", sentinel.display());
+        let (mut env, _, _) = env_with_stub(&stub);
+        let out = env.call_tool("greppy", &json!({"args": ["bash-smart", "ls"]}));
+        assert!(out.is_error);
+        assert_eq!(out.content, "use the bash tool");
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn credential_env_blocklist_stripped_from_tool_subprocesses() {
+        // Parent process env (what we inherit) has secrets set. The stub
+        // prints selected vars; scrubbed ones must be empty while PATH/HOME
+        // survive.
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'GREPPY_API_KEY=%s\n' "${GREPPY_API_KEY-}"
+printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
+printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-}"
+printf 'GITHUB_TOKEN=%s\n' "${GITHUB_TOKEN-}"
+printf 'PATH_SET=%s\n' "${PATH:+yes}"
+printf 'HOME_SET=%s\n' "${HOME:+yes}"
+"#,
+        );
+        // Inject secrets into *this* process so the child would inherit them
+        // without scrubbing. Safe: process-local, restored after the test.
+        let keys = [
+            "GREPPY_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+        ];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        for k in &keys {
+            // SAFETY: single-threaded test; we restore below.
+            unsafe { std::env::set_var(k, "secret-should-not-leak") };
+        }
+
+        let out = env.call_tool("greppy", &json!({"args": ["who-calls", "x"]}));
+        assert!(!out.is_error, "content={}", out.content);
+        assert!(
+            out.content.contains("GREPPY_API_KEY=\n"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("ANTHROPIC_API_KEY=\n"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("OPENAI_API_KEY=\n"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("GITHUB_TOKEN=\n"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("PATH_SET=yes"),
+            "PATH must survive; content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("HOME_SET=yes"),
+            "HOME must survive; content={}",
+            out.content
+        );
+
+        // Also cover the bash tool path (same scrubbing).
+        let out_bash = env.call_tool("bash", &json!({"command": "true"}));
+        assert!(!out_bash.is_error, "content={}", out_bash.content);
+
+        for (k, prev) in saved {
+            match prev {
+                Some(v) => unsafe { std::env::set_var(&k, v) },
+                None => unsafe { std::env::remove_var(&k) },
+            }
+        }
+    }
+
+    #[test]
+    fn greppy_timeout_kills_and_reports() {
+        let (env, _, _) = env_with_stub("sleep 5\nexit 0\n");
+        let mut env = env.with_greppy_timeout(Duration::from_secs(1));
+        let start = Instant::now();
+        let out = env.call_tool("greppy", &json!({"args": ["hang"]}));
+        let elapsed = start.elapsed();
+        assert!(out.is_error, "content={}", out.content);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "elapsed too long: {elapsed:?}"
+        );
     }
 
     #[test]

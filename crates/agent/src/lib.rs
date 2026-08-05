@@ -38,5 +38,5 @@ pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,
     Usage,
 };
-pub use wire::{to_messages_request_body, SseParser};
+pub use wire::{to_messages_request_body, SseItem, SseParser};
 pub use workspace::{AgentWorkspace, RunOutcome, WorkspaceError};

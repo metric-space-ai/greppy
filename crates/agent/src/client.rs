@@ -10,7 +10,12 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::protocol::{ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, Usage};
-use crate::wire::{to_messages_request_body, SseParser};
+use crate::wire::{to_messages_request_body, SseItem, SseParser};
+
+/// Default hard cap on total SSE body bytes (64 MiB).
+pub const DEFAULT_STREAM_BYTE_CAP: usize = 64 * 1024 * 1024;
+/// Default hard cap on total SSE events (recognized + terminal).
+pub const DEFAULT_STREAM_EVENT_CAP: usize = 100_000;
 
 /// Result of a completed streaming turn.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +79,10 @@ pub struct Client {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    /// Injectable stream byte cap (tests use a small value).
+    stream_byte_cap: usize,
+    /// Injectable stream event cap (tests use a small value).
+    stream_event_cap: usize,
 }
 
 // Manual impl: the api key must never reach logs or error output.
@@ -83,6 +92,8 @@ impl std::fmt::Debug for Client {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("stream_byte_cap", &self.stream_byte_cap)
+            .field("stream_event_cap", &self.stream_event_cap)
             .finish()
     }
 }
@@ -97,6 +108,8 @@ impl Client {
             base_url: normalize_base_url(base_url),
             model: model.to_string(),
             api_key: None,
+            stream_byte_cap: DEFAULT_STREAM_BYTE_CAP,
+            stream_event_cap: DEFAULT_STREAM_EVENT_CAP,
         }
     }
 
@@ -105,6 +118,13 @@ impl Client {
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         let key = key.into();
         self.api_key = if key.is_empty() { None } else { Some(key) };
+        self
+    }
+
+    /// Override the SSE stream byte / event caps (tests).
+    pub fn with_stream_caps(mut self, byte_cap: usize, event_cap: usize) -> Self {
+        self.stream_byte_cap = byte_cap;
+        self.stream_event_cap = event_cap;
         self
     }
 
@@ -204,37 +224,115 @@ impl Client {
         };
 
         let mut reader = response.into_reader();
+        self.consume_sse(&mut reader, on_event)
+    }
+
+    /// Parse an SSE body from any `Read` (production HTTP body or test fixture).
+    ///
+    /// Buffers raw bytes, splits on `\n`, UTF-8-decodes only complete lines
+    /// (so multi-byte characters that straddle a read boundary are safe),
+    /// and enforces stream byte / event caps.
+    pub(crate) fn consume_sse(
+        &self,
+        reader: &mut dyn Read,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> Result<TurnResult, ClientError> {
         let mut parser = SseParser::new();
         let mut assembler = TurnAssembler::new();
-        let mut buf = [0u8; 4096];
+        let mut byte_buf: Vec<u8> = Vec::new();
+        let mut total_bytes: usize = 0;
+        let mut total_events: usize = 0;
+        let mut read_buf = [0u8; 4096];
 
         loop {
             let n = reader
-                .read(&mut buf)
+                .read(&mut read_buf)
                 .map_err(|e| ClientError::Transport(e.to_string()))?;
             if n == 0 {
                 break;
             }
-            let chunk = std::str::from_utf8(&buf[..n])
-                .map_err(|e| ClientError::Stream(format!("invalid utf-8 in SSE body: {e}")))?;
-            for ev in parser.feed(chunk) {
-                assembler.observe(&ev);
-                on_event(ev);
+            total_bytes = total_bytes.saturating_add(n);
+            if total_bytes > self.stream_byte_cap {
+                return Err(ClientError::Stream(format!(
+                    "stream cap exceeded: more than {} bytes",
+                    self.stream_byte_cap
+                )));
             }
-            if let Some(err) = assembler.take_stream_error() {
-                return Err(ClientError::Stream(err));
+            byte_buf.extend_from_slice(&read_buf[..n]);
+
+            // Split on '\n'; leave a trailing partial line in byte_buf.
+            while let Some(nl) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=nl).collect();
+                // Drop the trailing '\n'.
+                let line_bytes = &line_bytes[..line_bytes.len() - 1];
+                let line = std::str::from_utf8(line_bytes)
+                    .map_err(|e| ClientError::Stream(format!("invalid utf-8 in SSE line: {e}")))?;
+                for item in parser.feed_line(line) {
+                    total_events = total_events.saturating_add(1);
+                    if total_events > self.stream_event_cap {
+                        return Err(ClientError::Stream(format!(
+                            "stream cap exceeded: more than {} events",
+                            self.stream_event_cap
+                        )));
+                    }
+                    handle_sse_item(item, &mut assembler, on_event)?;
+                }
             }
         }
 
-        for ev in parser.finish() {
-            assembler.observe(&ev);
-            on_event(ev);
+        // Trailing partial line (no final newline).
+        if !byte_buf.is_empty() {
+            let line = std::str::from_utf8(&byte_buf)
+                .map_err(|e| ClientError::Stream(format!("invalid utf-8 in SSE line: {e}")))?;
+            for item in parser.feed_line(line) {
+                total_events = total_events.saturating_add(1);
+                if total_events > self.stream_event_cap {
+                    return Err(ClientError::Stream(format!(
+                        "stream cap exceeded: more than {} events",
+                        self.stream_event_cap
+                    )));
+                }
+                handle_sse_item(item, &mut assembler, on_event)?;
+            }
+            byte_buf.clear();
         }
-        if let Some(err) = assembler.take_stream_error() {
-            return Err(ClientError::Stream(err));
+
+        for item in parser.finish() {
+            total_events = total_events.saturating_add(1);
+            if total_events > self.stream_event_cap {
+                return Err(ClientError::Stream(format!(
+                    "stream cap exceeded: more than {} events",
+                    self.stream_event_cap
+                )));
+            }
+            handle_sse_item(item, &mut assembler, on_event)?;
         }
 
         assembler.finish()
+    }
+}
+
+fn handle_sse_item(
+    item: SseItem,
+    assembler: &mut TurnAssembler,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<(), ClientError> {
+    match item {
+        SseItem::Event(ev) => {
+            assembler.observe(&ev);
+            if let Some(err) = assembler.take_stream_error() {
+                return Err(ClientError::Stream(err));
+            }
+            on_event(ev);
+            Ok(())
+        }
+        SseItem::MessageStop => {
+            assembler.observe_message_stop();
+            Ok(())
+        }
+        SseItem::Malformed { event_type, detail } => Err(ClientError::Stream(format!(
+            "malformed {event_type} event: {detail}"
+        ))),
     }
 }
 
@@ -245,10 +343,14 @@ pub(crate) fn normalize_base_url(base: &str) -> String {
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
-        s
-    } else {
-        &s[..max]
+        return s;
     }
+    // Back off to a char boundary so we never panic on multibyte UTF-8.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Currently-open content block while streaming.
@@ -272,7 +374,8 @@ enum OpenBlock {
 /// Accumulates stream events into a final assistant message.
 ///
 /// Anthropic streams content blocks sequentially, so at most one block is
-/// open at a time.
+/// open at a time. Requires a seen `message_start` and a terminal stop
+/// (`message_delta` with stop_reason, or `message_stop`).
 #[derive(Debug)]
 struct TurnAssembler {
     open: OpenBlock,
@@ -281,6 +384,8 @@ struct TurnAssembler {
     stop_reason: Option<StopReason>,
     usage: Usage,
     stream_error: Option<String>,
+    seen_message_start: bool,
+    seen_terminal: bool,
 }
 
 impl TurnAssembler {
@@ -291,16 +396,26 @@ impl TurnAssembler {
             stop_reason: None,
             usage: Usage::default(),
             stream_error: None,
+            seen_message_start: false,
+            seen_terminal: false,
         }
     }
 
     fn observe(&mut self, ev: &StreamEvent) {
         match ev {
-            StreamEvent::Started { .. } => {}
+            StreamEvent::Started { .. } => {
+                self.seen_message_start = true;
+            }
             StreamEvent::TextDelta { text } => {
+                if text.is_empty() {
+                    return;
+                }
                 self.append_text(text);
             }
             StreamEvent::ThinkingDelta { text } => {
+                if text.is_empty() {
+                    return;
+                }
                 self.append_thinking(text);
             }
             StreamEvent::ToolCallStarted { index, id, name } => {
@@ -330,13 +445,21 @@ impl TurnAssembler {
                 self.flush_open(*index);
             }
             StreamEvent::Finished { stop_reason, usage } => {
+                // message_delta terminal: record stop_reason (even if Other)
+                // and mark terminal. Empty Other("") still counts as terminal
+                // because the event itself is the stop signal.
                 self.stop_reason = Some(stop_reason.clone());
                 self.usage = *usage;
+                self.seen_terminal = true;
             }
             StreamEvent::Error { message } => {
                 self.stream_error = Some(message.clone());
             }
         }
+    }
+
+    fn observe_message_stop(&mut self) {
+        self.seen_terminal = true;
     }
 
     fn append_text(&mut self, text: &str) {
@@ -409,12 +532,23 @@ impl TurnAssembler {
             self.flush_open(idx);
         }
 
+        if !self.seen_message_start {
+            return Err(ClientError::Incomplete("missing message_start".to_string()));
+        }
+        if !self.seen_terminal {
+            return Err(ClientError::Incomplete(
+                "missing terminal stop (message_delta/message_stop)".to_string(),
+            ));
+        }
+
         self.parts.sort_by_key(|(i, _)| *i);
         let content: Vec<ContentPart> = self.parts.into_iter().map(|(_, p)| p).collect();
 
+        // message_delta supplies the real stop_reason; message_stop alone is still
+        // a valid terminal (no fabrication of "missing_stop_reason").
         let stop_reason = self
             .stop_reason
-            .unwrap_or(StopReason::Other("missing_stop_reason".to_string()));
+            .unwrap_or(StopReason::Other("message_stop".to_string()));
 
         Ok(TurnResult {
             message: Message {
@@ -444,10 +578,24 @@ pub fn classify_probe_http_status(status: u16, body: &str) -> ProbeError {
     ProbeError::BadResponse(format!("HTTP {status}: {}", truncate(body, 200)))
 }
 
+/// Drive the SSE consumer over an in-memory body (tests).
+#[cfg(test)]
+pub(crate) fn consume_sse_for_test(
+    body: &[u8],
+    byte_cap: usize,
+    event_cap: usize,
+) -> Result<(TurnResult, Vec<StreamEvent>), ClientError> {
+    let client = Client::new("http://127.0.0.1:9", "test").with_stream_caps(byte_cap, event_cap);
+    let mut events = Vec::new();
+    let mut cursor = std::io::Cursor::new(body);
+    let turn = client.consume_sse(&mut cursor, &mut |ev| events.push(ev))?;
+    Ok((turn, events))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{map_stop_reason, SseParser};
+    use crate::wire::map_stop_reason;
 
     #[test]
     fn normalize_base_url_strips_trailing_slashes() {
@@ -485,9 +633,7 @@ mod tests {
         assert!(b.to_string().contains("503"));
     }
 
-    #[test]
-    fn assemble_turn_from_happy_path_events() {
-        const SSE: &str = "\
+    const HAPPY_PATH_SSE: &str = "\
 event: message_start
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}
 
@@ -522,15 +668,15 @@ event: message_stop
 data: {\"type\":\"message_stop\"}
 
 ";
-        let mut parser = SseParser::new();
-        let mut assembler = TurnAssembler::new();
-        for ev in parser.feed(SSE) {
-            assembler.observe(&ev);
-        }
-        for ev in parser.finish() {
-            assembler.observe(&ev);
-        }
-        let turn = assembler.finish().expect("assemble");
+
+    #[test]
+    fn assemble_turn_from_happy_path_events() {
+        let (turn, _) = consume_sse_for_test(
+            HAPPY_PATH_SSE.as_bytes(),
+            DEFAULT_STREAM_BYTE_CAP,
+            DEFAULT_STREAM_EVENT_CAP,
+        )
+        .expect("assemble");
         assert_eq!(turn.stop_reason, StopReason::ToolUse);
         assert_eq!(turn.usage.output_tokens, 42);
         assert_eq!(turn.usage.input_tokens, 100);
@@ -555,6 +701,179 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[test]
+    fn garbage_json_on_recognized_event_is_stream_error() {
+        let body = b"event: message_start\ndata: {not-json\n\n";
+        let err = consume_sse_for_test(body, DEFAULT_STREAM_BYTE_CAP, DEFAULT_STREAM_EVENT_CAP)
+            .expect_err("must fail");
+        assert!(matches!(err, ClientError::Stream(_)), "got {err:?}");
+        assert!(err.to_string().contains("malformed") || err.to_string().contains("message_start"));
+    }
+
+    #[test]
+    fn truncated_stream_is_incomplete() {
+        // message_start only — no terminal stop.
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n",
+            "\n",
+        );
+        let err = consume_sse_for_test(
+            body.as_bytes(),
+            DEFAULT_STREAM_BYTE_CAP,
+            DEFAULT_STREAM_EVENT_CAP,
+        )
+        .expect_err("must be incomplete");
+        assert!(matches!(err, ClientError::Incomplete(_)), "got {err:?}");
+        assert!(err.to_string().contains("terminal") || err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn missing_message_start_is_incomplete() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n",
+            "\n",
+        );
+        let err = consume_sse_for_test(
+            body.as_bytes(),
+            DEFAULT_STREAM_BYTE_CAP,
+            DEFAULT_STREAM_EVENT_CAP,
+        )
+        .expect_err("must be incomplete");
+        assert!(matches!(err, ClientError::Incomplete(_)), "got {err:?}");
+        assert!(err.to_string().contains("message_start"));
+    }
+
+    #[test]
+    fn stream_byte_cap_exceeded() {
+        // Build a stream larger than a tiny cap.
+        let mut body = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n",
+        );
+        for _ in 0..50 {
+            body.push_str(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"xxxxxxxx\"}}\n\n",
+            );
+        }
+        let err = consume_sse_for_test(body.as_bytes(), 200, DEFAULT_STREAM_EVENT_CAP)
+            .expect_err("must hit byte cap");
+        match err {
+            ClientError::Stream(m) => {
+                assert!(m.contains("stream cap exceeded"), "msg={m}");
+                assert!(m.contains("bytes"), "msg={m}");
+            }
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_event_cap_exceeded() {
+        let mut body = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n",
+        );
+        for _ in 0..20 {
+            body.push_str(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            );
+        }
+        let err = consume_sse_for_test(body.as_bytes(), DEFAULT_STREAM_BYTE_CAP, 5)
+            .expect_err("must hit event cap");
+        match err {
+            ClientError::Stream(m) => {
+                assert!(m.contains("stream cap exceeded"), "msg={m}");
+                assert!(m.contains("events"), "msg={m}");
+            }
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multibyte_utf8_at_every_byte_split_is_stable() {
+        // Multibyte text that straddles many read boundaries.
+        let text = "héllo wörld → ✓";
+        let escaped = text; // already valid JSON string content
+        let body = format!(
+            "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"m\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\
+\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\
+\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\
+\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":3}}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\
+\n"
+        );
+        let bytes = body.as_bytes();
+
+        let (baseline_turn, baseline_events) =
+            consume_sse_for_test(bytes, DEFAULT_STREAM_BYTE_CAP, DEFAULT_STREAM_EVENT_CAP)
+                .expect("baseline");
+        match &baseline_turn.message.content[0] {
+            ContentPart::Text { text: t } => assert_eq!(t, text),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // Chunking reader: deliver the body in fixed-size chunks of every
+        // size 1..16, and also at every mid-body split for size 1.
+        for chunk_size in 1..=16 {
+            struct Chunked<'a> {
+                data: &'a [u8],
+                chunk: usize,
+            }
+            impl Read for Chunked<'_> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    if self.data.is_empty() {
+                        return Ok(0);
+                    }
+                    let n = self.chunk.min(self.data.len()).min(buf.len());
+                    buf[..n].copy_from_slice(&self.data[..n]);
+                    self.data = &self.data[n..];
+                    Ok(n)
+                }
+            }
+            let client = Client::new("http://127.0.0.1:9", "test")
+                .with_stream_caps(DEFAULT_STREAM_BYTE_CAP, DEFAULT_STREAM_EVENT_CAP);
+            let mut events = Vec::new();
+            let mut reader = Chunked {
+                data: bytes,
+                chunk: chunk_size,
+            };
+            let turn = client
+                .consume_sse(&mut reader, &mut |ev| events.push(ev))
+                .unwrap_or_else(|e| panic!("chunk_size={chunk_size}: {e}"));
+            assert_eq!(turn, baseline_turn, "chunk_size={chunk_size}");
+            assert_eq!(events, baseline_events, "chunk_size={chunk_size}");
+        }
+    }
+
+    #[test]
+    fn truncate_backs_off_char_boundary() {
+        // "é" is two bytes (0xC3 0xA9). Cutting at 1 would panic without backoff.
+        let s = "héllo";
+        // max=2 lands inside 'é' (bytes: h=1, é=2..3).
+        // "h" is byte 0; "é" is bytes 1..2 (0-indexed: h at 0, é at 1-2).
+        assert_eq!(s.as_bytes()[0], b'h');
+        // Cut at 2: inside é → back off to 1 → "h".
+        assert_eq!(truncate(s, 2), "h");
+        // Cut at 3: on boundary after é → "hé".
+        assert_eq!(truncate(s, 3), "hé");
+        // Cut past end.
+        assert_eq!(truncate(s, 100), "héllo");
+    }
+
+    #[test]
     fn map_stop_reasons() {
         assert_eq!(map_stop_reason("end_turn"), StopReason::EndTurn);
         assert_eq!(map_stop_reason("tool_use"), StopReason::ToolUse);
@@ -563,5 +882,19 @@ data: {\"type\":\"message_stop\"}
             map_stop_reason("refusal"),
             StopReason::Other("refusal".to_string())
         );
+    }
+
+    #[test]
+    fn invalid_utf8_complete_line_is_stream_error() {
+        // Build a complete line with invalid UTF-8 bytes.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"event: message_start\n");
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(&[0xff, 0xff, 0xff]);
+        body.extend_from_slice(b"\n\n");
+        let err = consume_sse_for_test(&body, DEFAULT_STREAM_BYTE_CAP, DEFAULT_STREAM_EVENT_CAP)
+            .expect_err("must fail");
+        assert!(matches!(err, ClientError::Stream(_)), "got {err:?}");
+        assert!(err.to_string().contains("utf-8") || err.to_string().contains("utf8"));
     }
 }

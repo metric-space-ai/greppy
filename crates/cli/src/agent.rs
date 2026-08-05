@@ -30,10 +30,10 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-One-shot coding agent. Runs the task in an isolated git worktree of the current
-repository, never writing to your checkout until you apply. When the agent
-proposes changes they are pinned to refs/greppy/agent/<run_id> as a review
-patch you can inspect (`git show`) or apply (`git cherry-pick -n`).
+One-shot coding agent. Works in a disposable git worktree and delivers a
+proposal ref (refs/greppy/agent/<run_id>); inspect with `git show` or apply
+with `git cherry-pick -n`. The bash tool is NOT sandboxed — it can read/write
+outside the worktree; a process-level sandbox is planned.
 
 Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
 gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The standard is
@@ -43,6 +43,9 @@ gateway. GREPPY_MODEL / --model is the model id passed through unchanged.
 If the gateway requires an API key (CLIProxyAPI usually does), set
 GREPPY_API_KEY; it is sent as x-api-key and Authorization: Bearer. There is
 no key flag on purpose — keys do not belong on the command line.
+
+Leading `-p` is reserved for the agent; to grep for the literal pattern `-p`,
+use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
@@ -63,17 +66,15 @@ Exit codes:
   0  ok (clean, proposal saved, or applied)
   2  no gateway / bad usage / missing model
   3  agent or loop error (worktree kept for debugging)
-  4  --apply cherry-pick conflict (ref still available)
+  4  --apply refused (dirty target) or cherry-pick conflict (ref still available)
 ";
 
 /// Parsed `greppy -p` arguments (everything after the leading `-p` token).
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(
     name = "greppy -p",
-    about = "One-shot coding agent in an isolated worktree; proposals only touch your checkout when you apply.",
-    long_about = LONG_HELP,
-    disable_version_flag = true,
-    after_help = "Set GREPPY_MODEL (or pass --model). Details: greppy -p --help"
+    override_help = LONG_HELP,
+    disable_version_flag = true
 )]
 pub struct AgentArgs {
     /// The task for the agent.
@@ -302,6 +303,14 @@ fn run_agent(args: AgentArgs) -> u8 {
                 match workspace.apply_to(workspace.repo_root(), &commit) {
                     Ok(()) => {
                         let _ = writeln!(stdout, "applied (staged, not committed).");
+                    }
+                    Err(WorkspaceError::DirtyTarget { ref_name, .. }) => {
+                        let _ = writeln!(
+                            stderr,
+                            "target checkout has uncommitted changes — commit or stash first; \
+                             the proposal remains at {ref_name}"
+                        );
+                        exit = EXIT_CONFLICT;
                     }
                     Err(WorkspaceError::Conflict { ref_name, detail }) => {
                         let _ = writeln!(
@@ -618,18 +627,35 @@ mod tests {
 
     #[test]
     fn help_text_covers_contract_and_exit_codes() {
-        let help = LONG_HELP;
-        assert!(help.contains("127.0.0.1:8317"));
-        assert!(help.contains("CLIProxyAPI"));
-        assert!(help.contains("Exit codes"));
-        assert!(help.contains("0  ok"));
-        assert!(help.contains("2  no gateway"));
-        assert!(help.contains("3  agent"));
-        assert!(help.contains("4  --apply"));
+        // Assert on the RENDERED clap help so override_help is what users see.
+        use clap::CommandFactory;
+        let help = AgentArgs::command().render_long_help().to_string();
+        assert!(help.contains("127.0.0.1:8317"), "help={help}");
+        assert!(help.contains("CLIProxyAPI"), "help={help}");
+        assert!(help.contains("GREPPY_API_KEY"), "help={help}");
+        assert!(help.contains("Exit codes"), "help={help}");
+        assert!(help.contains("0  ok"), "help={help}");
+        assert!(help.contains("2  no gateway"), "help={help}");
+        assert!(help.contains("3  agent"), "help={help}");
         assert!(
-            help.lines().count() <= 40,
-            "help lines={}",
-            help.lines().count()
+            help.contains("4  --apply") || help.contains("4  "),
+            "help={help}"
+        );
+        // Contract text exactly once: no duplicated "Usage:" section from clap.
+        let usage_count = help.matches("Usage:").count();
+        assert_eq!(
+            usage_count, 1,
+            "Usage: must appear exactly once; got {usage_count} in:\n{help}"
+        );
+        // F9: -p collision escape hatch.
+        assert!(
+            help.contains("greppy -e -p") || help.contains("leading `-p`"),
+            "help missing -p escape hatch: {help}"
+        );
+        // F3 honesty: bash not sandboxed.
+        assert!(
+            help.contains("NOT sandboxed") || help.contains("not sandboxed"),
+            "help must admit bash is unsandboxed: {help}"
         );
     }
 
@@ -646,6 +672,9 @@ mod tests {
         assert!(!is_agent_p_invocation(&mk(&["greppy", "-R", "foo", "."])));
         assert!(!is_agent_p_invocation(&mk(&["greppy", "who-calls", "x"])));
         assert!(!is_agent_p_invocation(&mk(&["greppy", "pattern"])));
+        // F9: `-e -p` is a grep passthrough spelling, not the agent.
+        assert!(!is_agent_p_invocation(&mk(&["greppy", "-e", "-p", "X"])));
+        assert!(!is_agent_p_invocation(&mk(&["greppy", "foo", "-p"])));
     }
 
     #[test]

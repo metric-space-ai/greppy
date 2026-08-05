@@ -101,16 +101,30 @@ fn map_content(parts: &[ContentPart]) -> Vec<Value> {
         .collect()
 }
 
+/// One item produced by the SSE parser: a stream event, or a hard parse error
+/// for a *recognized* event type whose payload is malformed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SseItem {
+    Event(StreamEvent),
+    /// `message_stop` — terminal marker with no stop_reason payload.
+    MessageStop,
+    /// Recognized event type with unparsable / malformed JSON payload.
+    Malformed {
+        event_type: String,
+        detail: String,
+    },
+}
+
 /// Incremental SSE parser for Anthropic Messages streams.
 ///
-/// Chunk boundaries may split lines and events arbitrarily. Call
-/// [`SseParser::feed`] with each chunk; completed [`StreamEvent`]s are
-/// returned. Call [`SseParser::finish`] after the last byte to flush a
-/// trailing event that lacks a final blank line.
+/// Call [`SseParser::feed_line`] with each complete UTF-8 line (trailing
+/// newline already stripped). Call [`SseParser::finish`] after the last byte
+/// to flush a trailing event that lacks a final blank line.
+///
+/// Recognized event types with malformed JSON become [`SseItem::Malformed`]
+/// (caller must treat as stream error). Unknown event types are ignored.
 #[derive(Debug, Default)]
 pub struct SseParser {
-    /// Unconsumed bytes that do not yet form a complete line.
-    buf: String,
     /// Accumulated `event:` field for the current SSE event.
     event_name: Option<String>,
     /// Accumulated `data:` fields (joined with `\n` per the SSE spec).
@@ -126,71 +140,49 @@ impl SseParser {
         Self::default()
     }
 
-    /// Feed the next chunk of the HTTP response body.
+    /// Feed one complete line of the SSE body (newline already stripped; a
+    /// trailing `\r` is accepted and dropped).
     ///
-    /// Returns every complete event that became available from this chunk
-    /// (possibly empty). Unknown event types are ignored.
-    pub fn feed(&mut self, chunk: &str) -> Vec<StreamEvent> {
-        self.buf.push_str(chunk);
+    /// Returns every complete item that became available from this line
+    /// (usually zero or one).
+    pub fn feed_line(&mut self, line: &str) -> Vec<SseItem> {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let mut out = Vec::new();
 
-        while let Some(nl) = self.buf.find('\n') {
-            let mut line = self.buf.drain(..=nl).collect::<String>();
-            // Drop the trailing '\n' we just drained; also strip a preceding '\r'.
-            if line.ends_with('\n') {
-                line.pop();
+        if line.is_empty() {
+            if let Some(item) = self.dispatch_event() {
+                out.push(item);
             }
-            if line.ends_with('\r') {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                if let Some(ev) = self.dispatch_event() {
-                    out.push(ev);
-                }
-                continue;
-            }
-
-            // SSE comments start with ':' — ignore.
-            if line.starts_with(':') {
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("event:") {
-                self.event_name = Some(rest.trim_start().to_string());
-            } else if let Some(rest) = line.strip_prefix("data:") {
-                // One optional leading space after the colon is conventional.
-                let data = rest.strip_prefix(' ').unwrap_or(rest);
-                self.data_lines.push(data.to_string());
-            }
-            // Other fields (id:, retry:) are ignored.
+            return out;
         }
+
+        // SSE comments start with ':' — ignore.
+        if line.starts_with(':') {
+            return out;
+        }
+
+        if let Some(rest) = line.strip_prefix("event:") {
+            self.event_name = Some(rest.trim_start().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            // One optional leading space after the colon is conventional.
+            let data = rest.strip_prefix(' ').unwrap_or(rest);
+            self.data_lines.push(data.to_string());
+        }
+        // Other fields (id:, retry:) are ignored.
 
         out
     }
 
     /// Flush any pending event after the body ends.
-    pub fn finish(&mut self) -> Vec<StreamEvent> {
+    pub fn finish(&mut self) -> Vec<SseItem> {
         let mut out = Vec::new();
-        if !self.buf.is_empty() {
-            let trailing = std::mem::take(&mut self.buf);
-            let line = trailing.trim_end_matches('\r');
-            if !line.is_empty() && !line.starts_with(':') {
-                if let Some(rest) = line.strip_prefix("event:") {
-                    self.event_name = Some(rest.trim_start().to_string());
-                } else if let Some(rest) = line.strip_prefix("data:") {
-                    let data = rest.strip_prefix(' ').unwrap_or(rest);
-                    self.data_lines.push(data.to_string());
-                }
-            }
-        }
-        if let Some(ev) = self.dispatch_event() {
-            out.push(ev);
+        if let Some(item) = self.dispatch_event() {
+            out.push(item);
         }
         out
     }
 
-    fn dispatch_event(&mut self) -> Option<StreamEvent> {
+    fn dispatch_event(&mut self) -> Option<SseItem> {
         let name = self.event_name.take().unwrap_or_default();
         let data = self.data_lines.join("\n");
         self.data_lines.clear();
@@ -205,62 +197,87 @@ impl SseParser {
         }
 
         match name.as_str() {
-            "message_start" => {
-                if let Some((model, usage)) = parse_message_start(&data) {
-                    self.pending_input_usage = usage;
-                    Some(StreamEvent::Started { model })
-                } else {
-                    None
-                }
-            }
+            "message_start" => Some(parse_message_start(&data, &mut self.pending_input_usage)),
             "content_block_start" => parse_content_block_start(&data),
-            "content_block_delta" => parse_content_block_delta(&data),
-            "content_block_stop" => parse_content_block_stop(&data),
-            "message_delta" => parse_message_delta(&data, &self.pending_input_usage),
-            "message_stop" => None,
+            "content_block_delta" => Some(parse_content_block_delta(&data)),
+            "content_block_stop" => Some(parse_content_block_stop(&data)),
+            "message_delta" => Some(parse_message_delta(&data, &self.pending_input_usage)),
+            "message_stop" => Some(SseItem::MessageStop),
             "ping" => None,
-            "error" => parse_error_event(&data),
+            "error" => Some(parse_error_event(&data)),
+            // Unknown event TYPES stay ignored.
             _ => None,
         }
     }
 }
 
-fn parse_json(data: &str) -> Option<Value> {
-    serde_json::from_str(data).ok()
+fn parse_json(data: &str) -> Result<Value, String> {
+    serde_json::from_str(data).map_err(|e| e.to_string())
 }
 
-fn parse_message_start(data: &str) -> Option<(String, Usage)> {
-    let v = parse_json(data)?;
-    let model = v
-        .pointer("/message/model")
+fn malformed(event_type: &str, detail: impl Into<String>) -> SseItem {
+    SseItem::Malformed {
+        event_type: event_type.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn parse_message_start(data: &str, pending: &mut Usage) -> SseItem {
+    let v = match parse_json(data) {
+        Ok(v) => v,
+        Err(e) => return malformed("message_start", format!("invalid JSON: {e}")),
+    };
+    // Require a message object with a model field so garbage does not slip by.
+    let message = match v.get("message") {
+        Some(m) if m.is_object() => m,
+        _ => {
+            return malformed(
+                "message_start",
+                "missing or non-object message field".to_string(),
+            )
+        }
+    };
+    let model = message
+        .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let usage = Usage {
-        input_tokens: v
-            .pointer("/message/usage/input_tokens")
+    *pending = Usage {
+        input_tokens: message
+            .pointer("/usage/input_tokens")
             .and_then(|n| n.as_u64())
             .unwrap_or(0),
-        output_tokens: v
-            .pointer("/message/usage/output_tokens")
+        output_tokens: message
+            .pointer("/usage/output_tokens")
             .and_then(|n| n.as_u64())
             .unwrap_or(0),
-        cache_read_input_tokens: v
-            .pointer("/message/usage/cache_read_input_tokens")
+        cache_read_input_tokens: message
+            .pointer("/usage/cache_read_input_tokens")
             .and_then(|n| n.as_u64())
             .unwrap_or(0),
-        cache_creation_input_tokens: v
-            .pointer("/message/usage/cache_creation_input_tokens")
+        cache_creation_input_tokens: message
+            .pointer("/usage/cache_creation_input_tokens")
             .and_then(|n| n.as_u64())
             .unwrap_or(0),
     };
-    Some((model, usage))
+    SseItem::Event(StreamEvent::Started { model })
 }
 
-fn parse_content_block_start(data: &str) -> Option<StreamEvent> {
-    let v = parse_json(data)?;
+/// Parse content_block_start. `None` = recognized & silent (text/thinking start).
+fn parse_content_block_start(data: &str) -> Option<SseItem> {
+    let v = match parse_json(data) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(malformed(
+                "content_block_start",
+                format!("invalid JSON: {e}"),
+            ))
+        }
+    };
     let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-    let block = v.get("content_block")?;
+    let Some(block) = v.get("content_block") else {
+        return Some(malformed("content_block_start", "missing content_block"));
+    };
     let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match block_type {
@@ -277,16 +294,30 @@ fn parse_content_block_start(data: &str) -> Option<StreamEvent> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(StreamEvent::ToolCallStarted { index, id, name })
+            Some(SseItem::Event(StreamEvent::ToolCallStarted {
+                index,
+                id,
+                name,
+            }))
         }
+        "" => Some(malformed(
+            "content_block_start",
+            "missing content_block.type",
+        )),
+        // Unknown block type inside a recognized event type: ignore silently.
         _ => None,
     }
 }
 
-fn parse_content_block_delta(data: &str) -> Option<StreamEvent> {
-    let v = parse_json(data)?;
+fn parse_content_block_delta(data: &str) -> SseItem {
+    let v = match parse_json(data) {
+        Ok(v) => v,
+        Err(e) => return malformed("content_block_delta", format!("invalid JSON: {e}")),
+    };
     let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-    let delta = v.get("delta")?;
+    let Some(delta) = v.get("delta") else {
+        return malformed("content_block_delta", "missing delta");
+    };
     let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match delta_type {
@@ -296,7 +327,7 @@ fn parse_content_block_delta(data: &str) -> Option<StreamEvent> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(StreamEvent::TextDelta { text })
+            SseItem::Event(StreamEvent::TextDelta { text })
         }
         "thinking_delta" => {
             let text = delta
@@ -304,7 +335,7 @@ fn parse_content_block_delta(data: &str) -> Option<StreamEvent> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(StreamEvent::ThinkingDelta { text })
+            SseItem::Event(StreamEvent::ThinkingDelta { text })
         }
         "input_json_delta" => {
             let json_fragment = delta
@@ -312,23 +343,35 @@ fn parse_content_block_delta(data: &str) -> Option<StreamEvent> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(StreamEvent::ToolCallArgumentsDelta {
+            SseItem::Event(StreamEvent::ToolCallArgumentsDelta {
                 index,
                 json_fragment,
             })
         }
-        _ => None,
+        "" => malformed("content_block_delta", "missing delta.type"),
+        _ => {
+            // Unknown delta type on a recognized event: ignore.
+            SseItem::Event(StreamEvent::TextDelta {
+                text: String::new(),
+            })
+        }
     }
 }
 
-fn parse_content_block_stop(data: &str) -> Option<StreamEvent> {
-    let v = parse_json(data)?;
+fn parse_content_block_stop(data: &str) -> SseItem {
+    let v = match parse_json(data) {
+        Ok(v) => v,
+        Err(e) => return malformed("content_block_stop", format!("invalid JSON: {e}")),
+    };
     let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-    Some(StreamEvent::BlockFinished { index })
+    SseItem::Event(StreamEvent::BlockFinished { index })
 }
 
-fn parse_message_delta(data: &str, pending_input: &Usage) -> Option<StreamEvent> {
-    let v = parse_json(data)?;
+fn parse_message_delta(data: &str, pending_input: &Usage) -> SseItem {
+    let v = match parse_json(data) {
+        Ok(v) => v,
+        Err(e) => return malformed("message_delta", format!("invalid JSON: {e}")),
+    };
     let stop_reason = v
         .pointer("/delta/stop_reason")
         .and_then(|s| s.as_str())
@@ -357,21 +400,22 @@ fn parse_message_delta(data: &str, pending_input: &Usage) -> Option<StreamEvent>
         usage.cache_creation_input_tokens = n;
     }
 
-    Some(StreamEvent::Finished { stop_reason, usage })
+    SseItem::Event(StreamEvent::Finished { stop_reason, usage })
 }
 
-fn parse_error_event(data: &str) -> Option<StreamEvent> {
-    let v = parse_json(data);
-    let message = v
-        .as_ref()
-        .and_then(|v| {
-            v.pointer("/error/message")
+fn parse_error_event(data: &str) -> SseItem {
+    match parse_json(data) {
+        Ok(v) => {
+            let message = v
+                .pointer("/error/message")
                 .or_else(|| v.get("message"))
                 .and_then(|m| m.as_str())
-        })
-        .unwrap_or(data)
-        .to_string();
-    Some(StreamEvent::Error { message })
+                .unwrap_or("error event")
+                .to_string();
+            SseItem::Event(StreamEvent::Error { message })
+        }
+        Err(e) => malformed("error", format!("invalid JSON: {e}")),
+    }
 }
 
 pub(crate) fn map_stop_reason(s: &str) -> StopReason {
@@ -563,37 +607,61 @@ data: {\"type\":\"message_stop\"}
         ]
     }
 
-    fn parse_all(fixture: &str) -> Vec<StreamEvent> {
+    fn parse_all(fixture: &str) -> Result<Vec<StreamEvent>, String> {
         let mut p = SseParser::new();
-        let mut events = p.feed(fixture);
-        events.extend(p.finish());
-        events
+        let mut events = Vec::new();
+        for line in fixture.split_inclusive('\n') {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            for item in p.feed_line(line) {
+                match item {
+                    SseItem::Event(ev) => events.push(ev),
+                    SseItem::MessageStop => {}
+                    SseItem::Malformed { event_type, detail } => {
+                        return Err(format!("malformed {event_type}: {detail}"));
+                    }
+                }
+            }
+        }
+        for item in p.finish() {
+            match item {
+                SseItem::Event(ev) => events.push(ev),
+                SseItem::MessageStop => {}
+                SseItem::Malformed { event_type, detail } => {
+                    return Err(format!("malformed {event_type}: {detail}"));
+                }
+            }
+        }
+        Ok(events)
     }
 
     #[test]
     fn sse_happy_path_one_chunk() {
-        let events = parse_all(HAPPY_PATH_SSE);
+        let events = parse_all(HAPPY_PATH_SSE).expect("parse");
         assert_eq!(events, expected_happy_path_events());
     }
 
     #[test]
-    fn sse_happy_path_seven_byte_chunks() {
+    fn sse_happy_path_line_by_line() {
         let mut p = SseParser::new();
         let mut events = Vec::new();
-        for chunk in HAPPY_PATH_SSE.as_bytes().chunks(7) {
-            // Chunks may split multi-byte UTF-8; the fixture is ASCII so this is fine.
-            let s = std::str::from_utf8(chunk).expect("fixture is valid utf-8");
-            events.extend(p.feed(s));
+        for line in HAPPY_PATH_SSE.lines() {
+            for item in p.feed_line(line) {
+                if let SseItem::Event(ev) = item {
+                    events.push(ev);
+                }
+            }
         }
-        events.extend(p.finish());
+        for item in p.finish() {
+            if let SseItem::Event(ev) = item {
+                events.push(ev);
+            }
+        }
         assert_eq!(events, expected_happy_path_events());
     }
 
     #[test]
     fn sse_input_json_delta_fragments_assemble() {
-        // The wire layer only emits fragments; assembly lives in the client.
-        // Here we assert the fragments themselves are correct and concatenable.
-        let events = parse_all(HAPPY_PATH_SSE);
+        let events = parse_all(HAPPY_PATH_SSE).expect("parse");
         let mut acc = String::new();
         for ev in &events {
             if let StreamEvent::ToolCallArgumentsDelta {
@@ -622,7 +690,7 @@ event: content_block_delta
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}
 
 ";
-        let events = parse_all(fixture);
+        let events = parse_all(fixture).expect("parse");
         assert_eq!(
             events,
             vec![
@@ -643,13 +711,39 @@ event: error
 data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}
 
 ";
-        let events = parse_all(fixture);
+        let events = parse_all(fixture).expect("parse");
         assert_eq!(
             events,
             vec![StreamEvent::Error {
                 message: "Overloaded".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn sse_recognized_event_with_garbage_json_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {not-json
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("message_start"), "err={err}");
+        assert!(
+            err.contains("invalid JSON") || err.contains("malformed"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_content_block_delta_garbage_is_malformed() {
+        let fixture = "\
+event: content_block_delta
+data: not-json-at-all
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
     }
 
     #[test]
