@@ -99,19 +99,29 @@ impl Qwen35Summarizer {
         let prompt = brief_prompt(path, source);
         let model_prompt = crate::prompt::brief_chat_prompt(path, source);
         let raw = self.generate_raw(&model_prompt, BRIEF_GENERATION_PARAMS)?;
-        let bullets = postprocess_brief_output(&raw, &prompt);
-        log_summary_debug("primary", &raw, &bullets);
-        let bullets = filter_brief_bullets_by_quality(bullets, path, source);
-        log_filtered_summary_debug("primary", &bullets);
-        if !bullets.is_empty() {
-            return Ok(bullets);
+        let primary = postprocess_brief_output(&raw, &prompt);
+        log_summary_debug("primary", &raw, &primary);
+        let filtered_primary = filter_brief_bullets_by_quality(primary.clone(), path, source);
+        log_filtered_summary_debug("primary", &filtered_primary);
+        if !filtered_primary.is_empty() {
+            return Ok(filtered_primary);
         }
+
+        // A filtered or EOS-empty primary gets exactly one sampled retry. Keep
+        // the unfiltered, postprocessed candidates so the final guard can
+        // distinguish a useful decode from a quality-filter false positive.
         let fallback_raw = self.generate_raw(&model_prompt, BRIEF_FALLBACK_GENERATION_PARAMS)?;
         let fallback = postprocess_brief_output(&fallback_raw, &prompt);
         log_summary_debug("fallback", &fallback_raw, &fallback);
-        let fallback = filter_brief_bullets_by_quality(fallback, path, source);
-        log_filtered_summary_debug("fallback", &fallback);
-        Ok(fallback)
+        let filtered_fallback = filter_brief_bullets_by_quality(fallback.clone(), path, source);
+        log_filtered_summary_debug("fallback", &filtered_fallback);
+        if !filtered_fallback.is_empty() {
+            return Ok(filtered_fallback);
+        }
+
+        let guarded = never_empty_brief(primary, fallback);
+        log_filtered_summary_debug("never-empty-guard", &guarded);
+        Ok(guarded)
     }
 
     pub fn triage_span(
@@ -397,6 +407,22 @@ fn brief_bullets_pass_quality(bullets: &[String], path: &str, source: &str) -> b
     bullets.iter().all(|bullet| {
         brief_bullet_passes_quality(bullet, &path_lower, &source_terms, &source_identifiers)
     })
+}
+
+const NEVER_EMPTY_BRIEF: &str = "Provides behavior for the selected definition.";
+
+/// Product output for a non-empty definition must never disappear solely
+/// because the conservative quality filter rejected a valid paraphrase. Prefer
+/// the greedy decode, then the one sampled retry; only use a grounded generic
+/// sentence when both decodes were EOS-empty or malformed after postprocessing.
+fn never_empty_brief(primary: Vec<String>, fallback: Vec<String>) -> Vec<String> {
+    if !primary.is_empty() {
+        primary
+    } else if !fallback.is_empty() {
+        fallback
+    } else {
+        vec![NEVER_EMPTY_BRIEF.to_string()]
+    }
 }
 
 fn filter_brief_bullets_by_quality(bullets: Vec<String>, path: &str, source: &str) -> Vec<String> {
@@ -836,6 +862,26 @@ mod triage_guard_tests {
         assert_eq!(
             filtered,
             vec!["Adds a user's name to a list of strings.".to_string()]
+        );
+    }
+
+    #[test]
+    fn never_empty_guard_prefers_primary_then_retry() {
+        assert_eq!(
+            never_empty_brief(vec!["Primary.".into()], vec!["Retry.".into()]),
+            vec!["Primary.".to_string()]
+        );
+        assert_eq!(
+            never_empty_brief(Vec::new(), vec!["Retry.".into()]),
+            vec!["Retry.".to_string()]
+        );
+    }
+
+    #[test]
+    fn never_empty_guard_has_mechanical_last_resort() {
+        assert_eq!(
+            never_empty_brief(Vec::new(), Vec::new()),
+            vec![NEVER_EMPTY_BRIEF.to_string()]
         );
     }
 
