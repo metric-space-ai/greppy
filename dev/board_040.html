@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Kritischer Pfad: WP4 Isolation (Grok, läuft) ∥ WP6 Prompt (Orchestrator) → WP5 CLI → WP7 E2E+Review. WP1–WP3 gelandet + verifiziert.</p>
+  <p class="headline">Kritischer Pfad: WP5 CLI-Integration (Grok, läuft) → WP7 E2E+Kimi-Review. WP1–WP4 gelandet + verifiziert; WP6-Prompt fertig, landet mit WP5.</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -103,6 +103,24 @@
       <p class="k">Log: <code>~/greppy-040-logs/wp3-grok.log</code></p>
     </div>
     <div class="card done">
+      <h3>WP4 — Worktree-Isolation gelandet + verifiziert · STORE-BEFUND</h3>
+      <p>Commit <code>1669bb2</code>: <code>AgentWorkspace</code> (detached worktree, Proposal-Commit auf
+      <code>refs/greppy/agent/&lt;id&gt;</code>, cherry-pick-Apply mit Konflikt-Abbruch, explizites Cleanup).
+      Orchestrator-verifiziert: <strong>44/44 Tests</strong>, fmt/clippy grün, Scope = 2 Dateien.</p>
+      <p><strong>Store-Befund (Grok, von mir bestätigt):</strong> Worktree = eigener workspace_hash
+      (<code>core/src/workspace.rs:44-58</code>, Fingerprint-Test 287-308) → COLD.
+      Aber: Store nutzt rel_paths, Embeddings content-adressiert
+      (<code>store/migrations/0010:25</code> UNIQUE mit content_sha256) → Seeding per Verzeichnis-Clone
+      macht den Worktree warm. WP5 wired das; empirische Prüfung in WP7.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp4-grok.log</code></p>
+    </div>
+    <div class="card done">
+      <h3>WP6 — Minimal-Systemprompt fertig (Orchestrator)</h3>
+      <p>~58 Zeilen, statisch/cache-stabil, 0.3.0-Kommandotabelle kondensiert, Methoden- und
+      Stop-Disziplin, Stdin-Fußnote. Quelle: Scratchpad <code>wp6-system-prompt.md</code>; landet
+      byte-exakt als <code>crates/agent/src/prompt.rs</code> im WP5-Commit.</p>
+    </div>
+    <div class="card done">
       <h3>0.3.0-Toolfläche gesichtet → WP3 schrumpft</h3>
       <p>0.3.0-AGENTS.md: voller EDIT-Satz (<code>replace/replace-span/patch/write/rename/undo</code>,
       <code>--dry-run/--verify</code>) + <code>bash-smart</code> + SEARCH/NAVIGATE/READ mit Handles &amp; Pipe-Chaining.
@@ -112,31 +130,22 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP4 — Worktree-Isolation + Review-Patch <span class="k">(claude-grok)</span></h3>
-      <p><code>AgentWorkspace</code>: pro Lauf <code>git worktree add --detach</code>, Agent-Root = Worktree,
-      Ergebnis als Patch + Commit auf <code>refs/greppy/agent/&lt;id&gt;</code>, Host wendet nach Accept an.
-      MUSS klären: Store-Auflösung für Linked Worktrees (Cold-Store-Falle!).</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp4-grok.log</code> · Fertig = fmt/clippy/test grün + Commit
-      <code>agent: WP4 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
-    </div>
-    <div class="card work">
-      <h3>WP6 — Minimal-Systemprompt <span class="k">(Orchestrator)</span></h3>
-      <p>Entwurf in Arbeit (Scratchpad): ~40–80 Zeilen aus der 0.3.0-AGENTS.md kondensiert,
-      abgestimmt auf das 2-Tool-Schema. Landet mit WP5-Wiring im Repo.</p>
+      <h3>WP5 — CLI-Integration: greppy -p <span class="k">(claude-grok)</span></h3>
+      <p><code>-p TASK</code> + <code>--model/--endpoint/--apply/--diff/--keep-worktree/--max-turns</code>,
+      Probe-Abbruch mit Hilfe-Hinweis, Store-Seeding (cp -Rc Clone des Haupt-Stores in den Worktree-Hash),
+      Streaming-UX, Proposal-Ausgabe (stat + ref, --apply = cherry-pick), <code>prompt.rs</code> mit WP6-Text byte-exakt.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp5-grok.log</code> · Fertig = fmt/clippy/test grün + Binary baut + Commit
+      <code>agent: WP5 — …</code> · Provider: Grok 1/3, Sol 0/3</p>
     </div>
   </div></div>
 
   <div class="col"><h2>To-Do</h2><div class="cards">
     <div class="card">
-      <h3>WP5 — CLI-Integration <span class="k">(Grok)</span></h3>
-      <p><code>greppy -p "aufgabe"</code>, Flags <code>--endpoint/--model</code>, <code>-p --help</code> mit Localhost-Vertragstext,
-      sauberer Abbruch ohne Server (Probe).</p>
-      <p class="trigger">Trigger: WP2 + WP3 gelandet</p>
-    </div>
-    <div class="card">
       <h3>WP7 — E2E + Kimi-Review</h3>
-      <p>Echter Lauf gegen lebenden cli-proxy (Grok/Kimi-Modelle), dann unabhängiges Kimi-Review der Gesamtintegration.</p>
-      <p class="trigger">Trigger: WP1–WP5 gelandet</p>
+      <p>Echter Lauf gegen lebenden cli-proxy (Grok/Kimi-Modelle) auf einem echten Repo,
+      dabei MESSEN: Erst-Antwortzeit im geseedeten Worktree (Store-Warm-Beweis).
+      Danach unabhängiges Kimi-Review der Gesamtintegration.</p>
+      <p class="trigger">Trigger: WP5 gelandet + verifiziert</p>
     </div>
   </div></div>
 
