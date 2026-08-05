@@ -108,6 +108,14 @@ impl GreppyEnv {
         self
     }
 
+    /// Run the startup self-check through this env's production tool path.
+    ///
+    /// See [`run_startup_self_check`]. Kept as a method so call sites read
+    /// naturally next to the env they just built.
+    pub fn startup_self_check(&mut self) -> Result<SelfCheckOk, SelfCheckError> {
+        run_startup_self_check(self)
+    }
+
     /// Repository root this env operates on.
     pub fn root(&self) -> &Path {
         &self.root
@@ -527,6 +535,195 @@ fn truncation_marker(max_output_bytes: usize) -> String {
     } else {
         format!("\n[output truncated at {max_output_bytes} bytes]")
     }
+}
+
+/// Cap for self-check diagnostic tool output (chars, not bytes).
+const SELFCHECK_OUTPUT_CHARS: usize = 500;
+
+/// Successful startup self-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfCheckOk {
+    /// True when `where-am-i` succeeded but its census line could not be
+    /// parsed for a file count. Treated as a pass (never fail on formatting
+    /// drift); callers should mention it on the success diagnostic line.
+    pub unrecognized_census_shape: bool,
+}
+
+/// Failed startup self-check probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfCheckError {
+    /// Human probe name (`where-am-i` or `bash-smart write probe`).
+    pub probe: &'static str,
+    /// Verbatim tool output (already truncated for display).
+    pub output: String,
+    /// Most likely operator-actionable cause.
+    pub likely_cause: String,
+}
+
+impl SelfCheckError {
+    /// One multi-line diagnostic suitable for stderr before aborting.
+    pub fn diagnostic(&self) -> String {
+        format!(
+            "greppy -p: self-check failed on `{}`\n\
+             output:\n{}\n\
+             likely cause: {}",
+            self.probe, self.output, self.likely_cause
+        )
+    }
+}
+
+/// Run the agent startup self-check through the production tool path.
+///
+/// Two probes, both via [`GreppyEnv::call_tool`] with the env's current
+/// [`SandboxMode`] (never a raw `Command`):
+/// 1. index-backed navigation: `greppy where-am-i` — must succeed and must
+///    not report an empty repository (`N files` == 0). Unrecognized census
+///    shape is a pass (formatting drift must not abort).
+/// 2. write probe inside the worktree:
+///    `bash-smart -- sh -c 'printf ok > .greppy-selfcheck && rm -f .greppy-selfcheck'`.
+///
+/// On any failure the caller must abort the run (exit 3) and never start the
+/// model loop.
+pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCheckError> {
+    // (a) index-backed navigation.
+    let where_out = env.call_tool("greppy", &json!({"args": ["where-am-i"]}));
+    if where_out.is_error {
+        return Err(SelfCheckError {
+            probe: "where-am-i",
+            output: truncate_chars_for_diag(&where_out.content, SELFCHECK_OUTPUT_CHARS),
+            likely_cause: likely_cause_tool_error("where-am-i", &where_out.content),
+        });
+    }
+    let mut unrecognized_census_shape = false;
+    match parse_where_am_i_file_count(&where_out.content) {
+        Some(0) => {
+            return Err(SelfCheckError {
+                probe: "where-am-i",
+                output: truncate_chars_for_diag(&where_out.content, SELFCHECK_OUTPUT_CHARS),
+                likely_cause: "the worktree index is empty (0 files) while the tool exited \
+                     successfully — prewarm did not produce a usable index (invalid seed, \
+                     wrong store, or sandbox blocked greppy data root)"
+                    .to_string(),
+            });
+        }
+        Some(_) => {}
+        None => {
+            unrecognized_census_shape = true;
+        }
+    }
+
+    // (b) write probe inside the worktree.
+    let write_out = env.call_tool(
+        "greppy",
+        &json!({
+            "args": [
+                "bash-smart",
+                "--",
+                "sh",
+                "-c",
+                "printf ok > .greppy-selfcheck && rm -f .greppy-selfcheck"
+            ]
+        }),
+    );
+    if write_out.is_error {
+        return Err(SelfCheckError {
+            probe: "bash-smart write probe",
+            output: truncate_chars_for_diag(&write_out.content, SELFCHECK_OUTPUT_CHARS),
+            likely_cause: likely_cause_tool_error("bash-smart write probe", &write_out.content),
+        });
+    }
+
+    Ok(SelfCheckOk {
+        unrecognized_census_shape,
+    })
+}
+
+/// Parse the hub census file count from `where-am-i` text output.
+///
+/// Looks for a line mentioning both `files` and `definitions` and extracts
+/// the integer immediately before ` files` (commas allowed). Returns
+/// `None` when no such shape is recognized — callers treat that as a pass.
+pub fn parse_where_am_i_file_count(output: &str) -> Option<u64> {
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Census root lines always mention both words today; require both so
+        // inventory lines like "2 files · 30 defs" cannot false-match.
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("files") || !lower.contains("definitions") {
+            continue;
+        }
+        if let Some(count) = extract_count_before_files(line) {
+            return Some(count);
+        }
+        // Line has the words but no parseable count — formatting drift.
+        return None;
+    }
+    None
+}
+
+/// Extract the integer immediately before the first ` files` token.
+fn extract_count_before_files(line: &str) -> Option<u64> {
+    // Case-insensitive locate of " files".
+    let lower = line.to_ascii_lowercase();
+    let idx = lower.find(" files")?;
+    let before = &line[..idx];
+    // Take the trailing run of digits and thousand-separator commas.
+    let token: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if token.is_empty() {
+        return None;
+    }
+    let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn likely_cause_tool_error(probe: &str, output: &str) -> String {
+    if looks_like_permission_failure(output) {
+        return "a write the agent needs is outside the sandbox roots — re-run with \
+                --no-sandbox to confirm, and report the path"
+            .to_string();
+    }
+    if probe == "where-am-i" {
+        "index-backed navigation failed through the sandboxed tool path — check greppy \
+         data root permissions and that prewarm succeeded"
+            .to_string()
+    } else {
+        "worktree write probe failed through the sandboxed tool path — re-run with \
+         --no-sandbox to confirm, and report the path"
+            .to_string()
+    }
+}
+
+fn looks_like_permission_failure(output: &str) -> bool {
+    if output.contains("Operation not permitted")
+        || output.contains("EACCES")
+        || output.contains("EPERM")
+    {
+        return true;
+    }
+    let lower = output.to_ascii_lowercase();
+    lower.contains("permission denied") || lower.contains("write-confined")
+}
+
+fn truncate_chars_for_diag(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(all(test, unix))]
@@ -1164,6 +1361,132 @@ exit 0
             crate::sandbox::SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
         let env = env.with_sandbox(SandboxMode::Enforce(spec));
         assert!(matches!(env.sandbox(), SandboxMode::Enforce(_)));
+    }
+
+    #[test]
+    fn parse_where_am_i_file_count_reads_census() {
+        let out = "/tmp/repo — rust, 12 files, 34 definitions\n\nsrc/ — 3 files · 10 defs\n";
+        assert_eq!(parse_where_am_i_file_count(out), Some(12));
+        let empty = "/tmp/repo — 0 files, 0 definitions\n";
+        assert_eq!(parse_where_am_i_file_count(empty), Some(0));
+        let commas = "/tmp/repo — 1,234 files, 5,678 definitions\n";
+        assert_eq!(parse_where_am_i_file_count(commas), Some(1234));
+        let drift = "orientation complete; nothing looks like a census\n";
+        assert_eq!(parse_where_am_i_file_count(drift), None);
+        // Inventory-only lines without "definitions" must not match.
+        let inv = "src/ — 2 files · 30 defs — hub\n";
+        assert_eq!(parse_where_am_i_file_count(inv), None);
+    }
+
+    #[test]
+    fn self_check_passes_on_healthy_stub() {
+        // where-am-i → non-empty census; bash-smart → success (any exit 0).
+        let (mut env, _, _) = env_with_stub(
+            r#"
+if [ "$1" = "where-am-i" ]; then
+  printf '/tmp/fixture — rust, 3 files, 7 definitions\n'
+  exit 0
+fi
+if [ "$1" = "bash-smart" ]; then
+  printf 'ok — exit 0\n'
+  exit 0
+fi
+printf 'unexpected argv: %s\n' "$*" >&2
+exit 2
+"#,
+        );
+        let ok = run_startup_self_check(&mut env).expect("self-check must pass");
+        assert!(!ok.unrecognized_census_shape);
+    }
+
+    #[test]
+    fn self_check_fails_on_tool_error() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'Operation not permitted: locks/\n' >&2
+exit 1
+"#,
+        );
+        let err = run_startup_self_check(&mut env).expect_err("must fail");
+        assert_eq!(err.probe, "where-am-i");
+        assert!(
+            err.likely_cause.contains("--no-sandbox"),
+            "permission failure must point at --no-sandbox; cause={}",
+            err.likely_cause
+        );
+        assert!(
+            err.output.contains("Operation not permitted"),
+            "output={}",
+            err.output
+        );
+        let diag = err.diagnostic();
+        assert!(diag.contains("self-check failed"), "diag={diag}");
+        assert!(diag.contains("where-am-i"), "diag={diag}");
+    }
+
+    #[test]
+    fn self_check_empty_index_is_failure() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+if [ "$1" = "where-am-i" ]; then
+  printf '/tmp/fixture — 0 files, 0 definitions\n'
+  exit 0
+fi
+printf 'ok\n'
+exit 0
+"#,
+        );
+        let err = run_startup_self_check(&mut env).expect_err("empty index must fail");
+        assert_eq!(err.probe, "where-am-i");
+        assert!(
+            err.likely_cause.contains("0 files") || err.likely_cause.contains("empty"),
+            "cause={}",
+            err.likely_cause
+        );
+        assert!(err.output.contains("0 files"), "output={}", err.output);
+    }
+
+    #[test]
+    fn self_check_unrecognized_shape_passes() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+if [ "$1" = "where-am-i" ]; then
+  printf 'repo orientation complete (shape drifted)\n'
+  exit 0
+fi
+if [ "$1" = "bash-smart" ]; then
+  printf 'ok — exit 0\n'
+  exit 0
+fi
+exit 0
+"#,
+        );
+        let ok = run_startup_self_check(&mut env).expect("unrecognized shape must pass");
+        assert!(
+            ok.unrecognized_census_shape,
+            "must flag unrecognized census shape"
+        );
+    }
+
+    #[test]
+    fn self_check_write_probe_failure_aborts() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+if [ "$1" = "where-am-i" ]; then
+  printf '/tmp/fixture — 2 files, 4 definitions\n'
+  exit 0
+fi
+printf 'touch: .greppy-selfcheck: Permission denied (EACCES)\n' >&2
+exit 1
+"#,
+        );
+        let err = run_startup_self_check(&mut env).expect_err("write probe must fail");
+        assert_eq!(err.probe, "bash-smart write probe");
+        assert!(
+            err.likely_cause.contains("--no-sandbox") || err.likely_cause.contains("sandbox"),
+            "cause={}",
+            err.likely_cause
+        );
     }
 
     #[cfg(target_os = "macos")]

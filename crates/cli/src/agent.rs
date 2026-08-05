@@ -54,6 +54,7 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--apply] [--diff] [--keep-worktree] [--no-sandbox]
+                   [--skip-selfcheck]
   greppy -p --help
 
 Flags:
@@ -66,6 +67,7 @@ Flags:
   --diff              Print the full proposal patch after the stat
   --keep-worktree     Leave a temporary fallback worktree on disk after success
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
+  --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
 
 Exit codes:
   0  ok (clean, proposal saved, or applied)
@@ -123,6 +125,22 @@ pub struct AgentArgs {
         require_equals = false,
     )]
     pub no_sandbox: bool,
+
+    /// Skip the startup capability self-check (index answers + worktree writable).
+    ///
+    /// Also set by env `GREPPY_SKIP_SELFCHECK=1` (Boolish: 1/true/yes/y/on).
+    /// Deliberate bypass only — a failed self-check means the agent would
+    /// silently degrade to a shell-only fallback.
+    #[arg(
+        long,
+        env = "GREPPY_SKIP_SELFCHECK",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = false,
+    )]
+    pub skip_selfcheck: bool,
 }
 
 /// True when argv (after greppy-owned globals) starts with `-p`.
@@ -257,6 +275,27 @@ fn run_agent(args: AgentArgs) -> u8 {
             return EXIT_AGENT;
         }
     };
+
+    // Capability self-check: fail loudly before the model loop rather than
+    // silently degrading to a shell-only agent when index or sandbox is broken.
+    if !args.skip_selfcheck {
+        match env.startup_self_check() {
+            Ok(ok) => {
+                if ok.unrecognized_census_shape {
+                    eprintln!(
+                        "self-check ok — index answers (census shape unrecognized), worktree writable"
+                    );
+                } else {
+                    eprintln!("self-check ok — index answers, worktree writable");
+                }
+            }
+            Err(err) => {
+                eprintln!("{}", err.diagnostic());
+                keep_worktree_on_error(&workspace);
+                return EXIT_AGENT;
+            }
+        }
+    }
 
     let config = AgentConfig {
         max_turns: args.max_turns,
@@ -781,6 +820,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_skip_selfcheck_flag() {
+        let a = parse(&["do it", "--model", "m", "--skip-selfcheck"]).expect("parse");
+        assert!(a.skip_selfcheck);
+        let b = parse(&["do it", "--model", "m"]).expect("parse");
+        assert!(!b.skip_selfcheck);
+    }
+
+    #[test]
     fn validate_missing_task_errors() {
         let a = parse(&["--model", "m"]).expect("parse allows absent task");
         assert!(a.task.is_none());
@@ -799,6 +846,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             no_sandbox: false,
+            skip_selfcheck: false,
         };
         assert_eq!(validate_args(&a), Err(EXIT_USAGE));
     }
@@ -814,6 +862,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             no_sandbox: false,
+            skip_selfcheck: false,
         };
         assert_eq!(validate_args(&a), Err(EXIT_USAGE));
     }
@@ -853,6 +902,10 @@ mod tests {
         assert!(
             help.contains("--no-sandbox") || help.contains("no-sandbox"),
             "help must mention --no-sandbox: {help}"
+        );
+        assert!(
+            help.contains("--skip-selfcheck") || help.contains("skip-selfcheck"),
+            "help must mention --skip-selfcheck: {help}"
         );
         assert!(
             help.contains("network") || help.contains("reads and network"),
@@ -929,6 +982,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             no_sandbox: true,
+            skip_selfcheck: false,
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
@@ -948,6 +1002,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             no_sandbox: false,
+            skip_selfcheck: false,
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();

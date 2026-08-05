@@ -38,7 +38,9 @@ pub mod workspace;
 pub use agent_loop::{run_agent_loop, AgentConfig, LoopError, LoopEvent, LoopResult, LoopStop};
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
-pub use greppy_env::GreppyEnv;
+pub use greppy_env::{
+    parse_where_am_i_file_count, run_startup_self_check, GreppyEnv, SelfCheckError, SelfCheckOk,
+};
 pub use model::ModelStream;
 pub use prompt::SYSTEM_PROMPT;
 pub use protocol::{

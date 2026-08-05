@@ -167,6 +167,9 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
             &endpoint,
             "--max-turns",
             "2",
+            // Self-check is covered by agent_selfcheck.rs; keep this test on the
+            // gateway/loop contract without depending on a warm index.
+            "--skip-selfcheck",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
