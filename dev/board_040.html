@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">SHIP — Sol-Verdict final (alle Findings RESOLVED, keine neuen). Agent komplett, reviewt, E2E-bewiesen, Release-Docs drin: 0.3.1-READY. Wartet nur noch auf den 0.3.0-Tag der Nachbar-Session.</p>
+  <p class="headline">OWNER-Entscheid: Prozess-Sandbox kommt in 0.3.1 (nicht 0.4.x) — WP11 läuft (Grok). Danach Sol-Review + E2E, dann wieder SHIP-Stand. Übriger Trigger: 0.3.0-Tag.</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -199,9 +199,11 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>— nichts in Arbeit. Nächster Trigger: 0.3.0-Tag der Nachbar-Session → Merge als 0.3.1</h3>
-      <p>Merge-Plan: dev-0.4.0 (<code>729b399..31eaeaa</code>) auf den 0.3.0-Tag rebasen (erwartet klein,
-      Release-Stand = inhaltlich 67b81e3), Release-Build mit echten Assets, 0.3.1 taggen.</p>
+      <h3>WP11 — Prozess-Sandbox für Tool-Subprozesse <span class="k">(claude-grok)</span></h3>
+      <p>OWNER 05.08. spät: in 0.3.1 vorgezogen. Schreib-Confinement auf Worktree + tmp + Build-Caches:
+      macOS <code>sandbox-exec</code> (generiertes Seatbelt-Profil), Linux Landlock (Fallback: Warnung).
+      Netz bleibt offen (cargo fetch), <code>--no-sandbox</code> als Escape. Hilfetext + CHANGELOG angepasst.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp11-grok.log</code> · Danach: Sol-Review + Sandbox-E2E · Grok 1/3</p>
     </div>
   </div></div>
 
@@ -222,10 +224,10 @@
       reviewt Sol (Memory: <code>review-rule-sol-when-grok-authored.md</code>). Kimi bleibt erste Wahl,
       wenn verfügbar und nicht Autor.</p>
     </div>
-    <div class="card owner">
-      <h3>OWNER: Prozess-Sandbox-Härtung</h3>
-      <p>Worktree+Review-Patch isoliert Schreibzugriffe, aber <code>bash-smart</code> kann weiterhin Host/Netz erreichen.
-      Echte Prozess-Sandbox (macOS sandbox-exec / Linux Landlock) als 0.4.x-Härtung — Umfang vom Owner zu bestätigen.</p>
+    <div class="card done neg">
+      <h3>ERLEDIGT durch Owner-Entscheid: Sandbox in 0.3.1 vorgezogen</h3>
+      <p>KORREKTUR zum früheren Backlog-Eintrag „0.4.x-Härtung": Owner 05.08. spät — Sandbox kommt in 0.3.1.
+      Umsetzung als WP11 (siehe Working). Netzwerk-Confinement bleibt 0.4.x (cargo fetch braucht Netz).</p>
     </div>
     <div class="card">
       <h3>THIRD_PARTY.md: pi-Attribution</h3>
