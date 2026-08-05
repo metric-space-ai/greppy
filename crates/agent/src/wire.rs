@@ -120,9 +120,25 @@ pub enum SseItem {
     },
 }
 
+/// Declared content-block kind while a block is open.
+///
+/// Used to reject cross-kind deltas (`text_delta` into a thinking block, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    ToolUse,
+    /// Forward-compat unknown `content_block.type` — stop may still close it.
+    Unknown,
+}
+
 /// Ordered protocol states for an Anthropic Messages SSE stream.
 ///
-/// `AwaitingStart → InMessage → (InBlock ↔ InMessage) → Terminal`.
+/// `AwaitingStart → InMessage → (InBlock ↔ InMessage) → Terminal → Stopped`.
+///
+/// `message_delta` with a stop_reason moves to `Terminal`. `message_stop` is
+/// legal exactly once (from `InMessage` or `Terminal`) and moves to `Stopped`.
+/// Any recognized event after `Stopped` is a protocol error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ProtocolState {
     #[default]
@@ -130,8 +146,12 @@ enum ProtocolState {
     InMessage,
     InBlock {
         index: usize,
+        kind: BlockKind,
     },
+    /// After `message_delta` with stop_reason; trailing `message_stop` still ok.
     Terminal,
+    /// After `message_stop`; stream is fully closed.
+    Stopped,
 }
 
 /// Incremental SSE parser for Anthropic Messages streams.
@@ -221,6 +241,23 @@ impl SseParser {
         // `[DONE]` terminator used by some OpenAI-compatible proxies — ignore.
         if data.trim() == "[DONE]" {
             return Some(SseItem::Ignored);
+        }
+
+        // After Stopped the stream is fully closed: any recognized event (including
+        // a second message_stop) is a protocol error. ping/unknown keep-alives
+        // remain ignored for forward compatibility.
+        if matches!(self.state, ProtocolState::Stopped) {
+            return Some(match name.as_str() {
+                "ping" => SseItem::Ignored,
+                "message_start"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+                | "message_delta"
+                | "message_stop"
+                | "error" => malformed(&name, "event after stream stopped".to_string()),
+                _ => SseItem::Ignored,
+            });
         }
 
         // After Terminal, only a trailing message_stop (Anthropic's normal trailer
@@ -331,6 +368,12 @@ impl SseParser {
                     "event after terminal stop".to_string(),
                 )
             }
+            ProtocolState::Stopped => {
+                return malformed(
+                    "content_block_start",
+                    "event after stream stopped".to_string(),
+                )
+            }
         }
         let v = match parse_json(data) {
             Ok(v) => v,
@@ -348,37 +391,63 @@ impl SseParser {
         };
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-        self.state = ProtocolState::InBlock { index };
-
         match block_type {
             // Text / thinking starts are silent; deltas carry the payload.
-            "text" | "thinking" => SseItem::Ignored,
+            "text" => {
+                self.state = ProtocolState::InBlock {
+                    index,
+                    kind: BlockKind::Text,
+                };
+                SseItem::Ignored
+            }
+            "thinking" => {
+                self.state = ProtocolState::InBlock {
+                    index,
+                    kind: BlockKind::Thinking,
+                };
+                SseItem::Ignored
+            }
             "tool_use" => {
-                let id = block
-                    .get("id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = block
-                    .get("name")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                // Require real string id/name — no "" substitution.
+                let id = match block.get("id").and_then(|s| s.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return malformed(
+                            "content_block_start",
+                            "missing or non-string content_block.id".to_string(),
+                        )
+                    }
+                };
+                let name = match block.get("name").and_then(|s| s.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return malformed(
+                            "content_block_start",
+                            "missing or non-string content_block.name".to_string(),
+                        )
+                    }
+                };
+                self.state = ProtocolState::InBlock {
+                    index,
+                    kind: BlockKind::ToolUse,
+                };
                 SseItem::Event(StreamEvent::ToolCallStarted { index, id, name })
             }
-            "" => {
-                // Roll back the open-block transition on hard malformation.
-                self.state = ProtocolState::InMessage;
-                malformed("content_block_start", "missing content_block.type")
-            }
+            "" => malformed("content_block_start", "missing content_block.type"),
             // Unknown block type: keep the block open so stop can close it.
-            _ => SseItem::Ignored,
+            _ => {
+                self.state = ProtocolState::InBlock {
+                    index,
+                    kind: BlockKind::Unknown,
+                };
+                SseItem::Ignored
+            }
         }
     }
 
     fn handle_content_block_delta(&mut self, data: &str) -> SseItem {
-        let open_index = match self.state {
-            ProtocolState::InBlock { index } => index,
+        let (open_index, open_kind) = match self.state {
+            ProtocolState::InBlock { index, kind } => (index, kind),
             ProtocolState::InMessage | ProtocolState::AwaitingStart => {
                 return malformed(
                     "content_block_delta",
@@ -389,6 +458,12 @@ impl SseParser {
                 return malformed(
                     "content_block_delta",
                     "event after terminal stop".to_string(),
+                )
+            }
+            ProtocolState::Stopped => {
+                return malformed(
+                    "content_block_delta",
+                    "event after stream stopped".to_string(),
                 )
             }
         };
@@ -416,27 +491,58 @@ impl SseParser {
 
         match delta_type {
             "text_delta" => {
-                let text = delta
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                if open_kind != BlockKind::Text {
+                    return malformed(
+                        "content_block_delta",
+                        format!("text_delta into non-text block ({open_kind:?})"),
+                    );
+                }
+                // Require a present string field; empty string is legal.
+                let text = match delta.get("text").and_then(|t| t.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        return malformed(
+                            "content_block_delta",
+                            "missing or non-string delta.text".to_string(),
+                        )
+                    }
+                };
                 SseItem::Event(StreamEvent::TextDelta { text })
             }
             "thinking_delta" => {
-                let text = delta
-                    .get("thinking")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                if open_kind != BlockKind::Thinking {
+                    return malformed(
+                        "content_block_delta",
+                        format!("thinking_delta into non-thinking block ({open_kind:?})"),
+                    );
+                }
+                let text = match delta.get("thinking").and_then(|t| t.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        return malformed(
+                            "content_block_delta",
+                            "missing or non-string delta.thinking".to_string(),
+                        )
+                    }
+                };
                 SseItem::Event(StreamEvent::ThinkingDelta { text })
             }
             "input_json_delta" => {
-                let json_fragment = delta
-                    .get("partial_json")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                if open_kind != BlockKind::ToolUse {
+                    return malformed(
+                        "content_block_delta",
+                        format!("input_json_delta into non-tool_use block ({open_kind:?})"),
+                    );
+                }
+                let json_fragment = match delta.get("partial_json").and_then(|t| t.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        return malformed(
+                            "content_block_delta",
+                            "missing or non-string delta.partial_json".to_string(),
+                        )
+                    }
+                };
                 SseItem::Event(StreamEvent::ToolCallArgumentsDelta {
                     index,
                     json_fragment,
@@ -450,7 +556,7 @@ impl SseParser {
 
     fn handle_content_block_stop(&mut self, data: &str) -> SseItem {
         let open_index = match self.state {
-            ProtocolState::InBlock { index } => index,
+            ProtocolState::InBlock { index, .. } => index,
             ProtocolState::InMessage | ProtocolState::AwaitingStart => {
                 return malformed(
                     "content_block_stop",
@@ -461,6 +567,12 @@ impl SseParser {
                 return malformed(
                     "content_block_stop",
                     "event after terminal stop".to_string(),
+                )
+            }
+            ProtocolState::Stopped => {
+                return malformed(
+                    "content_block_stop",
+                    "event after stream stopped".to_string(),
                 )
             }
         };
@@ -502,6 +614,9 @@ impl SseParser {
             }
             ProtocolState::Terminal => {
                 return malformed("message_delta", "event after terminal stop".to_string())
+            }
+            ProtocolState::Stopped => {
+                return malformed("message_delta", "event after stream stopped".to_string())
             }
         }
         let v = match parse_json(data) {
@@ -557,6 +672,8 @@ impl SseParser {
 
     fn handle_message_stop(&mut self, data: &str) -> SseItem {
         match self.state {
+            // Legal exactly once: from InMessage (stop without message_delta)
+            // or Terminal (Anthropic trailer after message_delta).
             ProtocolState::InMessage | ProtocolState::Terminal => {}
             ProtocolState::InBlock { .. } => {
                 return malformed(
@@ -570,6 +687,9 @@ impl SseParser {
                     "terminal event before message_start".to_string(),
                 )
             }
+            ProtocolState::Stopped => {
+                return malformed("message_stop", "event after stream stopped".to_string())
+            }
         }
         let v = match parse_json(data) {
             Ok(v) => v,
@@ -581,7 +701,7 @@ impl SseParser {
         if let Err(e) = expect_type(&v, "message_stop") {
             return malformed("message_stop", e);
         }
-        self.state = ProtocolState::Terminal;
+        self.state = ProtocolState::Stopped;
         SseItem::MessageStop
     }
 }
@@ -1222,5 +1342,314 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\"}}
         req.tool_choice = ToolChoice::None;
         let body = to_messages_request_body(&req);
         assert_eq!(body["tool_choice"], json!({"type": "none"}));
+    }
+
+    // --- WP10 residual strictness: block kinds, required fields, Stopped ---
+
+    #[test]
+    fn sse_thinking_delta_into_text_block_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"nope\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(
+            err.contains("thinking_delta") || err.contains("non-thinking"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_text_delta_into_thinking_block_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"nope\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(
+            err.contains("text_delta") || err.contains("non-text"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_input_json_delta_into_text_block_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(
+            err.contains("input_json_delta") || err.contains("non-tool_use"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_text_delta_into_tool_use_block_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"nope\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(
+            err.contains("text_delta") || err.contains("non-text"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_tool_use_start_missing_id_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"name\":\"bash\",\"input\":{}}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_start"), "err={err}");
+        assert!(err.contains("id"), "err={err}");
+    }
+
+    #[test]
+    fn sse_tool_use_start_missing_name_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"input\":{}}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_start"), "err={err}");
+        assert!(err.contains("name"), "err={err}");
+    }
+
+    #[test]
+    fn sse_tool_use_start_non_string_id_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":123,\"name\":\"bash\",\"input\":{}}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_start"), "err={err}");
+        assert!(err.contains("id"), "err={err}");
+    }
+
+    #[test]
+    fn sse_text_delta_missing_text_field_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(err.contains("text"), "err={err}");
+    }
+
+    #[test]
+    fn sse_thinking_delta_missing_thinking_field_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(err.contains("thinking"), "err={err}");
+    }
+
+    #[test]
+    fn sse_input_json_delta_missing_partial_json_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_delta"), "err={err}");
+        assert!(err.contains("partial_json"), "err={err}");
+    }
+
+    #[test]
+    fn sse_empty_string_delta_fields_remain_legal() {
+        // Present empty strings are legal (distinct from missing/non-string).
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}
+
+event: content_block_stop
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\"}}
+
+event: content_block_stop
+data: {\"type\":\"content_block_stop\",\"index\":1}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}
+
+event: content_block_stop
+data: {\"type\":\"content_block_stop\",\"index\":2}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        let events = parse_all(fixture).expect("parse");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { text } if text.is_empty())));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ThinkingDelta { text } if text.is_empty())));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallArgumentsDelta {
+                json_fragment,
+                ..
+            } if json_fragment.is_empty()
+        )));
+    }
+
+    #[test]
+    fn sse_double_message_stop_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("message_stop"), "err={err}");
+        assert!(
+            err.contains("stopped") || err.contains("after"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_event_after_stopped_is_malformed() {
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("content_block_start"), "err={err}");
+        assert!(
+            err.contains("stopped") || err.contains("after"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn sse_message_delta_after_stopped_is_malformed() {
+        // message_stop alone moves to Stopped; a late message_delta is illegal.
+        let fixture = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}
+
+";
+        let err = parse_all(fixture).expect_err("must fail");
+        assert!(err.contains("message_delta"), "err={err}");
+        assert!(
+            err.contains("stopped") || err.contains("after"),
+            "err={err}"
+        );
     }
 }
