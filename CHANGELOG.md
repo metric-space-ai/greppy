@@ -4,6 +4,34 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### `greppy -p` — a built-in coding agent
+
+`greppy -p "TASK" [--model M]` runs a one-shot coding agent over the current
+repository. The harness is greppy itself: a ~60-line static system prompt,
+two tools — `greppy` (the full search/navigate/read/edit surface as one
+self-invocation) and `bash` (routed through `bash-smart`, so output arrives
+compacted) — and an agent loop ported from pi v0.80.2 (MIT; see
+THIRD_PARTY.md and licenses/PI-LICENSE.txt).
+
+Every run works in a disposable git worktree seeded from the repository's
+index (embeddings are content-addressed, so the copy starts warm) and ends as
+exactly one commit on `refs/greppy/agent/<run_id>`, built from the base tree
+regardless of what happened to HEAD in the worktree — nothing is edited in
+place. `git show <ref>` reviews it, `git cherry-pick -n <ref>` applies it;
+`--apply` does so directly but refuses a checkout with uncommitted changes.
+
+Inference is localhost-only: an Anthropic-Messages-compatible gateway
+(standard: CLIProxyAPI on 127.0.0.1:8317; `GREPPY_ENDPOINT`, `GREPPY_MODEL`,
+`GREPPY_API_KEY`) with strict SSE validation, transient-failure retry, and
+stream caps. No provider SDKs, no stored credentials. The bash tool is not
+sandboxed; tool subprocesses are stripped of known credential variables and
+agent runs refuse to nest (`GREPPY_AGENT_RUN`). A process-level sandbox is
+future work.
+
+`AGENTS.md` gains an `AGENT:` section documenting `-p` as a delegation
+primitive for host agents; the frozen-prompt hash moved with that approved
+change.
+
 ## [0.3.0] — unreleased
 
 A breaking release: greppy stops being a navigator that hands you file paths
