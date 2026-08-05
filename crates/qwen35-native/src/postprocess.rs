@@ -20,6 +20,13 @@ const PREFIXES: &[&str] = &[
 ];
 
 pub fn postprocess_brief_output(raw: &str, prompt: &str) -> Vec<String> {
+    // The base model occasionally leaks a chat-template <think> block despite
+    // the no-think finetune (~8% of briefs in the 2026-08 audit). The answer
+    // that follows the block is usually fine, so strip the block and keep
+    // processing; discarding the whole output turned every leak into an
+    // empty brief.
+    let stripped = strip_think_blocks(raw);
+    let raw = stripped.as_str();
     if looks_like_thinking_output(raw) {
         return Vec::new();
     }
@@ -315,6 +322,36 @@ fn looks_like_triage_prompt_echo(statement: &str, prompt: &str) -> bool {
         || statement.trim() == prompt.lines().next().unwrap_or_default().trim()
 }
 
+/// Remove well-formed `<think>…</think>` spans (any case) and a leading
+/// unclosed `<think>…` that is terminated by a stray `</think>` later in the
+/// stream. Text outside the spans is preserved verbatim. An output that is
+/// nothing but an unterminated think block strips to empty and stays empty.
+fn strip_think_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let lower = raw.to_ascii_lowercase();
+    let mut pos = 0;
+    let mut saw_block = false;
+    while let Some(start_rel) = lower[pos..].find("<think>") {
+        let start = pos + start_rel;
+        out.push_str(&raw[pos..start]);
+        match lower[start..].find("</think>") {
+            Some(end_rel) => {
+                saw_block = true;
+                pos = start + end_rel + "</think>".len();
+            }
+            None => return out, // unterminated block: drop the rest
+        }
+    }
+    out.push_str(&raw[pos..]);
+    // A stray closing tag without any opener (model resumed mid-stream).
+    if !saw_block {
+        if let Some(close) = out.to_ascii_lowercase().find("</think>") {
+            return out[close + "</think>".len()..].to_string();
+        }
+    }
+    out
+}
+
 fn looks_like_thinking_output(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     lower.contains("<think>")
@@ -434,6 +471,28 @@ fn cap_line(line: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::brief_prompt;
+
+    #[test]
+    fn think_leak_keeps_the_answer() {
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
+        // full block before the answer
+        let raw = "<think>\nlet me look at dispatch_brief\n</think>\nDispatches the brief subcommand for dispatch_brief.";
+        let out = postprocess_brief_output(raw, &prompt);
+        assert!(!out.is_empty(), "answer after think block must survive: {out:?}");
+        // stray closing tag only (resumed mid-stream)
+        let raw = "reasoning tail</think>\nDispatches the brief subcommand for dispatch_brief.";
+        let out = postprocess_brief_output(raw, &prompt);
+        assert!(!out.is_empty(), "answer after stray closer must survive: {out:?}");
+    }
+
+    #[test]
+    fn pure_think_output_still_empty() {
+        let prompt = brief_prompt("src/cli.rs", "fn dispatch_brief() {}\n");
+        let raw = "<think>\nendless reasoning without an answer";
+        assert!(postprocess_brief_output(raw, &prompt).is_empty());
+        let raw = "<think>only reasoning</think>";
+        assert!(postprocess_brief_output(raw, &prompt).is_empty());
+    }
 
     #[test]
     fn cleans_prefixes_and_limits_to_two_lines() {
