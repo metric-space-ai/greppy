@@ -9,6 +9,7 @@
 //! - [`model`] — [`ModelStream`] trait so the loop is testable without network.
 //! - [`env`] — [`ExecutionEnv`] tool boundary (agent proposes, host executes).
 //! - [`greppy_env`] — production [`GreppyEnv`]: `greppy` + `bash` tools over self-invocation.
+//! - [`sandbox`] — write-confinement for tool subprocesses (Seatbelt / Landlock).
 //! - [`workspace`] — per-run git worktree isolation and review-patch proposals.
 //! - [`agent_loop`] — ported multi-turn agent loop (pi v0.80.2 semantics, MIT).
 //!
@@ -20,7 +21,7 @@
 
 /// Env marker set in every tool subprocess of a running agent. `greppy -p`
 /// refuses to start while it is present, so agents cannot nest — not through
-/// the greppy tool, and not through the unsandboxed bash tool either.
+/// the greppy tool, and not through the bash tool either.
 pub const AGENT_RUN_ENV: &str = "GREPPY_AGENT_RUN";
 
 pub mod agent_loop;
@@ -30,6 +31,7 @@ pub mod greppy_env;
 pub mod model;
 pub mod prompt;
 pub mod protocol;
+pub mod sandbox;
 pub mod wire;
 pub mod workspace;
 
@@ -43,5 +45,6 @@ pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,
     Usage,
 };
+pub use sandbox::{SandboxError, SandboxMode, SandboxSpec};
 pub use wire::{to_messages_request_body, SseItem, SseParser};
 pub use workspace::{AgentWorkspace, RunOutcome, WorkspaceError};

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::env::{ExecutionEnv, ToolOutcome};
 use crate::protocol::ToolDefinition;
+use crate::sandbox::{self, SandboxMode};
 
 /// Default wall-clock budget for the `bash` tool (300 s).
 pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -57,6 +58,7 @@ pub struct GreppyEnv {
     bash_timeout: Duration,
     greppy_timeout: Duration,
     max_output_bytes: usize,
+    sandbox: SandboxMode,
 }
 
 impl GreppyEnv {
@@ -73,6 +75,7 @@ impl GreppyEnv {
             bash_timeout: DEFAULT_BASH_TIMEOUT,
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            sandbox: SandboxMode::Off,
         })
     }
 
@@ -94,6 +97,16 @@ impl GreppyEnv {
         self
     }
 
+    /// Set the write-confinement sandbox applied to every tool subprocess.
+    ///
+    /// Defaults to [`SandboxMode::Off`] so non-`-p` callers are unchanged.
+    /// `greppy -p` enables [`SandboxMode::Enforce`] with the run's writable
+    /// roots (worktree, temp, store, `~/.cargo`, platform cache).
+    pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
+        self.sandbox = mode;
+        self
+    }
+
     /// Repository root this env operates on.
     pub fn root(&self) -> &Path {
         &self.root
@@ -102,6 +115,11 @@ impl GreppyEnv {
     /// Path to the greppy binary (or test stub) that tools re-invoke.
     pub fn greppy_bin(&self) -> &Path {
         &self.greppy_bin
+    }
+
+    /// Current sandbox mode.
+    pub fn sandbox(&self) -> &SandboxMode {
+        &self.sandbox
     }
 
     fn greppy_tool_def() -> ToolDefinition {
@@ -150,8 +168,10 @@ impl GreppyEnv {
         }
 
         let mut cmd = Command::new(&self.greppy_bin);
-        cmd.args(&args)
-            .current_dir(&self.root)
+        if let Err(e) = sandbox::apply(&mut cmd, &self.greppy_bin, &args, &self.sandbox) {
+            return ToolOutcome::err(format!("sandbox: {e}"));
+        }
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -169,9 +189,18 @@ impl GreppyEnv {
             Err(msg) => return ToolOutcome::err(msg),
         };
 
+        let bash_args = [
+            "bash-smart".to_string(),
+            "--".to_string(),
+            "bash".to_string(),
+            "-lc".to_string(),
+            command,
+        ];
         let mut cmd = Command::new(&self.greppy_bin);
-        cmd.args(["bash-smart", "--", "bash", "-lc", &command])
-            .current_dir(&self.root)
+        if let Err(e) = sandbox::apply(&mut cmd, &self.greppy_bin, &bash_args, &self.sandbox) {
+            return ToolOutcome::err(format!("sandbox: {e}"));
+        }
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -900,5 +929,185 @@ exit 0
         let out = env.call_tool("greppy", &json!({"args": ["x"]}));
         assert!(!out.is_error, "content={}", out.content);
         assert_eq!(out.content, "OUT\nERR\n");
+    }
+
+    #[test]
+    fn with_sandbox_defaults_to_off_and_is_settable() {
+        let (env, _, _) = env_with_stub("exit 0");
+        assert!(matches!(env.sandbox(), SandboxMode::Off));
+        let env = env.with_sandbox(SandboxMode::Enforce(crate::sandbox::SandboxSpec {
+            writable_roots: vec![std::env::temp_dir()],
+        }));
+        assert!(matches!(env.sandbox(), SandboxMode::Enforce(_)));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod sandbox_integration {
+        use super::*;
+        use crate::sandbox::SandboxSpec;
+        use std::path::Path;
+
+        /// Stub that, for the bash tool argv shape (`bash-smart -- bash -lc CMD`),
+        /// execs the real shell so sandbox write checks exercise genuine syscalls.
+        fn real_bash_stub_body() -> &'static str {
+            r#"
+if [ "$1" = "bash-smart" ]; then
+  shift
+  if [ "$1" = "--" ]; then shift; fi
+  exec "$@"
+fi
+printf 'ok\n'
+exit 0
+"#
+        }
+
+        fn sandbox_exec_available() -> bool {
+            Path::new("/usr/bin/sandbox-exec").exists()
+        }
+
+        #[test]
+        fn enforce_write_inside_worktree_succeeds() {
+            if !sandbox_exec_available() {
+                return;
+            }
+            let root = temp_root();
+            let bin = write_stub(real_bash_stub_body());
+            let mut env = GreppyEnv::with_binary(bin, root.clone())
+                .unwrap()
+                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
+                    writable_roots: vec![root.clone()],
+                }));
+            let marker = root.join("inside-ok.txt");
+            let _ = fs::remove_file(&marker);
+            let out = env.call_tool(
+                "bash",
+                &json!({"command": format!("touch '{}'", marker.display())}),
+            );
+            assert!(!out.is_error, "content={}", out.content);
+            assert!(marker.exists(), "inside write must create the file");
+            let _ = fs::remove_file(&marker);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn enforce_write_outside_home_is_denied() {
+            if !sandbox_exec_available() {
+                return;
+            }
+            let root = temp_root();
+            let bin = write_stub(real_bash_stub_body());
+            let mut env = GreppyEnv::with_binary(bin, root.clone())
+                .unwrap()
+                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
+                    writable_roots: vec![root.clone()],
+                }));
+
+            let home = std::env::var_os("HOME").expect("HOME");
+            let escape = PathBuf::from(&home).join(format!(
+                ".greppy-sandbox-escape-proof-env-{}-{}",
+                std::process::id(),
+                STUB_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_file(&escape);
+            let out = env.call_tool(
+                "bash",
+                &json!({"command": format!("touch '{}'", escape.display())}),
+            );
+            assert!(
+                out.is_error,
+                "outside write must be an error; content={}",
+                out.content
+            );
+            assert!(
+                !escape.exists(),
+                "escape file must not exist after sandboxed touch"
+            );
+            let _ = fs::remove_file(&escape);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn enforce_git_commit_inside_worktree_succeeds() {
+            if !sandbox_exec_available() {
+                return;
+            }
+            let root = temp_root();
+            // Fixture worktree with an initial commit ready for a second one.
+            let init = Command::new("git")
+                .args(["init"])
+                .current_dir(&root)
+                .output()
+                .expect("git init");
+            assert!(init.status.success(), "git init");
+            fs::write(root.join("file.txt"), b"hello\n").unwrap();
+            let add = Command::new("git")
+                .args(["add", "file.txt"])
+                .current_dir(&root)
+                .output()
+                .expect("git add");
+            assert!(add.status.success(), "git add");
+            // First commit outside the sandbox (setup).
+            let c1 = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@t.com",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-m",
+                    "init",
+                ])
+                .current_dir(&root)
+                .output()
+                .expect("git commit setup");
+            assert!(
+                c1.status.success(),
+                "setup commit: {}",
+                String::from_utf8_lossy(&c1.stderr)
+            );
+
+            fs::write(root.join("file.txt"), b"hello\nworld\n").unwrap();
+            let bin = write_stub(real_bash_stub_body());
+            let mut env = GreppyEnv::with_binary(bin, root.clone())
+                .unwrap()
+                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
+                    writable_roots: vec![root.clone(), std::env::temp_dir()],
+                }));
+            let out = env.call_tool(
+                "bash",
+                &json!({
+                    "command": "git -c user.email=t@t.com -c user.name=t commit -am second"
+                }),
+            );
+            assert!(!out.is_error, "git commit under sandbox: {}", out.content);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn off_mode_outside_write_succeeds() {
+            // Proves the test harness can distinguish Enforce from Off: the
+            // same outside touch that Enforce blocks must succeed with Off.
+            let root = temp_root();
+            let bin = write_stub(real_bash_stub_body());
+            let mut env = GreppyEnv::with_binary(bin, root.clone())
+                .unwrap()
+                .with_sandbox(SandboxMode::Off);
+
+            let home = std::env::var_os("HOME").expect("HOME");
+            let probe = PathBuf::from(&home).join(format!(
+                ".greppy-sandbox-off-probe-{}-{}",
+                std::process::id(),
+                STUB_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_file(&probe);
+            let out = env.call_tool(
+                "bash",
+                &json!({"command": format!("touch '{}'", probe.display())}),
+            );
+            assert!(!out.is_error, "Off-mode outside write: {}", out.content);
+            assert!(probe.exists(), "Off mode must allow the outside touch");
+            let _ = fs::remove_file(&probe);
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 }

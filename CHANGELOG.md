@@ -23,10 +23,12 @@ place. `git show <ref>` reviews it, `git cherry-pick -n <ref>` applies it;
 Inference is localhost-only: an Anthropic-Messages-compatible gateway
 (standard: CLIProxyAPI on 127.0.0.1:8317; `GREPPY_ENDPOINT`, `GREPPY_MODEL`,
 `GREPPY_API_KEY`) with strict SSE validation, transient-failure retry, and
-stream caps. No provider SDKs, no stored credentials. The bash tool is not
-sandboxed; tool subprocesses are stripped of known credential variables and
-agent runs refuse to nest (`GREPPY_AGENT_RUN`). A process-level sandbox is
-future work.
+stream caps. No provider SDKs, no stored credentials. Tool subprocesses
+(`greppy` and `bash`) are write-confined to the run worktree, temp dir, greppy
+store, `~/.cargo`, and the platform user cache (Seatbelt on macOS, Landlock on
+Linux; `--no-sandbox` / `GREPPY_NO_SANDBOX=1` disables). Reads and network stay
+open — network confinement remains future work. Credential env vars are
+stripped from tool children and agent runs refuse to nest (`GREPPY_AGENT_RUN`).
 
 `AGENTS.md` gains an `AGENT:` section documenting `-p` as a delegation
 primitive for host agents; the frozen-prompt hash moved with that approved

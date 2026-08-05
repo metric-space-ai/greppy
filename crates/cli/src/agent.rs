@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop, AgentConfig, AgentWorkspace, Client, GreppyEnv, LoopEvent, ProbeError,
-    RunOutcome, StreamEvent, WorkspaceError, SYSTEM_PROMPT,
+    run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
+    LoopEvent, ProbeError, RunOutcome, SandboxError, SandboxMode, SandboxSpec, StreamEvent,
+    WorkspaceError, SYSTEM_PROMPT,
 };
 use greppy_core::workspace as workspace_locator;
 
@@ -32,8 +33,10 @@ const TOOL_LINE_MAX: usize = 120;
 const LONG_HELP: &str = "\
 One-shot coding agent. Works in a disposable git worktree and delivers a
 proposal ref (refs/greppy/agent/<run_id>); inspect with `git show` or apply
-with `git cherry-pick -n`. The bash tool is NOT sandboxed — it can read/write
-outside the worktree; a process-level sandbox is planned.
+with `git cherry-pick -n`. Tool subprocesses (greppy + bash) are
+write-confined to the worktree, temp, greppy store, ~/.cargo and the
+platform cache; reads and network stay open. Pass --no-sandbox (or
+GREPPY_NO_SANDBOX=1) to disable.
 
 Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
 gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The standard is
@@ -49,7 +52,7 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
-                   [--apply] [--diff] [--keep-worktree]
+                   [--apply] [--diff] [--keep-worktree] [--no-sandbox]
   greppy -p --help
 
 Flags:
@@ -61,6 +64,7 @@ Flags:
                       (staged, not committed)
   --diff              Print the full proposal patch after the stat
   --keep-worktree     Leave the disposable worktree on disk after success
+  --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
 
 Exit codes:
   0  ok (clean, proposal saved, or applied)
@@ -104,6 +108,20 @@ pub struct AgentArgs {
     /// Keep the disposable worktree after a successful run.
     #[arg(long)]
     pub keep_worktree: bool,
+
+    /// Disable the write-confinement sandbox for tool subprocesses.
+    ///
+    /// Also set by env `GREPPY_NO_SANDBOX=1` (Boolish: 1/true/yes/y/on).
+    #[arg(
+        long,
+        env = "GREPPY_NO_SANDBOX",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = false,
+    )]
+    pub no_sandbox: bool,
 }
 
 /// True when argv (after greppy-owned globals) starts with `-p`.
@@ -220,8 +238,16 @@ fn run_agent(args: AgentArgs) -> u8 {
 
     seed_store_from_main(workspace.repo_root(), workspace.worktree_path());
 
+    let sandbox_mode = match resolve_sandbox_mode(&args, workspace.worktree_path()) {
+        Ok(mode) => mode,
+        Err(code) => {
+            keep_worktree_on_error(&workspace);
+            return code;
+        }
+    };
+
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env,
+        Ok(env) => env.with_sandbox(sandbox_mode),
         Err(e) => {
             eprintln!("greppy -p: cannot build greppy env: {e}");
             keep_worktree_on_error(&workspace);
@@ -455,6 +481,82 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Resolve the sandbox mode for a `-p` run.
+///
+/// `--no-sandbox` / `GREPPY_NO_SANDBOX` → `Off` (one stderr line).
+/// Otherwise build an `Enforce` spec from the worktree's writable roots and
+/// preflight it: `Unsupported` (Linux without Landlock) warns once and falls
+/// back to `Off`; any other error aborts with [`EXIT_AGENT`].
+fn resolve_sandbox_mode(args: &AgentArgs, worktree_path: &Path) -> Result<SandboxMode, u8> {
+    if args.no_sandbox {
+        eprintln!("sandbox disabled");
+        return Ok(SandboxMode::Off);
+    }
+    let mode = SandboxMode::Enforce(SandboxSpec {
+        writable_roots: writable_roots_for(worktree_path),
+    });
+    match agent_sandbox::preflight(&mode) {
+        Ok(()) => Ok(mode),
+        Err(SandboxError::Unsupported) => {
+            eprintln!(
+                "greppy -p: sandbox unsupported on this kernel/platform — continuing unsandboxed"
+            );
+            Ok(SandboxMode::Off)
+        }
+        Err(e) => {
+            eprintln!("greppy -p: sandbox setup failed: {e}");
+            Err(EXIT_AGENT)
+        }
+    }
+}
+
+/// Writable roots for a sandboxed `-p` tool subprocess.
+///
+/// 1. the run's worktree,
+/// 2. `std::env::temp_dir()`,
+/// 3. the worktree's greppy store dir (same computation as seeding),
+/// 4. `~/.cargo` (registry/build caches; respects `CARGO_HOME`),
+/// 5. the platform user cache dir (`~/Library/Caches` on macOS,
+///    `$XDG_CACHE_HOME` or `~/.cache` on Linux).
+fn writable_roots_for(worktree_path: &Path) -> Vec<std::path::PathBuf> {
+    vec![
+        worktree_path.to_path_buf(),
+        std::env::temp_dir(),
+        workspace_locator::store_dir(worktree_path),
+        cargo_home_dir(),
+        platform_user_cache_dir(),
+    ]
+}
+
+fn cargo_home_dir() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        return std::path::PathBuf::from(home);
+    }
+    home_dir().join(".cargo")
+}
+
+fn platform_user_cache_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().join("Library").join("Caches")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            return std::path::PathBuf::from(xdg);
+        }
+        home_dir().join(".cache")
+    }
+}
+
+fn home_dir() -> std::path::PathBuf {
+    if let Some(h) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    // Last-resort fallback; should not matter on real agent hosts.
+    std::path::PathBuf::from("/")
+}
+
 /// Seed the worktree's cold store from the main checkout's store, if present.
 ///
 /// Prints one stderr line describing the outcome. On macOS prefers
@@ -584,6 +686,7 @@ mod tests {
         assert!(a.apply);
         assert!(a.diff);
         assert!(a.keep_worktree);
+        assert!(!a.no_sandbox);
     }
 
     #[test]
@@ -596,6 +699,13 @@ mod tests {
         assert!(!a.apply);
         assert!(!a.diff);
         assert!(!a.keep_worktree);
+        assert!(!a.no_sandbox);
+    }
+
+    #[test]
+    fn parse_no_sandbox_flag() {
+        let a = parse(&["do it", "--model", "m", "--no-sandbox"]).expect("parse");
+        assert!(a.no_sandbox);
     }
 
     #[test]
@@ -616,6 +726,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            no_sandbox: false,
         };
         assert_eq!(validate_args(&a), Err(EXIT_USAGE));
     }
@@ -630,6 +741,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            no_sandbox: false,
         };
         assert_eq!(validate_args(&a), Err(EXIT_USAGE));
     }
@@ -661,11 +773,100 @@ mod tests {
             help.contains("greppy -e -p") || help.contains("leading `-p`"),
             "help missing -p escape hatch: {help}"
         );
-        // F3 honesty: bash not sandboxed.
+        // Write-confinement honesty: roots listed, network open, --no-sandbox.
         assert!(
-            help.contains("NOT sandboxed") || help.contains("not sandboxed"),
-            "help must admit bash is unsandboxed: {help}"
+            help.contains("write-confined") || help.contains("write-confinement"),
+            "help must describe write-confinement: {help}"
         );
+        assert!(
+            help.contains("--no-sandbox") || help.contains("no-sandbox"),
+            "help must mention --no-sandbox: {help}"
+        );
+        assert!(
+            help.contains("network") || help.contains("reads and network"),
+            "help must note network stays open: {help}"
+        );
+    }
+
+    #[test]
+    fn writable_roots_include_worktree_temp_store_cargo_cache() {
+        let wt = unique("roots-wt");
+        fs::create_dir_all(&wt).unwrap();
+        let roots = writable_roots_for(&wt);
+        assert!(
+            roots.iter().any(|r| r == &wt),
+            "worktree missing: {roots:?}"
+        );
+        assert!(
+            roots.iter().any(|r| r == &std::env::temp_dir()),
+            "temp missing: {roots:?}"
+        );
+        let store = workspace_locator::store_dir(&wt);
+        assert!(
+            roots.iter().any(|r| r == &store),
+            "store missing: {roots:?}"
+        );
+        assert!(
+            roots
+                .iter()
+                .any(|r| r.ends_with(".cargo") || r == &cargo_home_dir()),
+            "cargo home missing: {roots:?}"
+        );
+        assert!(
+            roots
+                .iter()
+                .any(|r| r.ends_with("Caches") || r.ends_with(".cache")),
+            "platform cache missing: {roots:?}"
+        );
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_sandbox_mode_no_sandbox_is_off() {
+        let a = AgentArgs {
+            task: Some("t".into()),
+            model: Some("m".into()),
+            endpoint: DEFAULT_ENDPOINT.into(),
+            max_turns: 40,
+            apply: false,
+            diff: false,
+            keep_worktree: false,
+            no_sandbox: true,
+        };
+        let wt = unique("sb-off");
+        fs::create_dir_all(&wt).unwrap();
+        let mode = resolve_sandbox_mode(&a, &wt).expect("ok");
+        assert!(matches!(mode, SandboxMode::Off));
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_sandbox_mode_default_is_enforce() {
+        let a = AgentArgs {
+            task: Some("t".into()),
+            model: Some("m".into()),
+            endpoint: DEFAULT_ENDPOINT.into(),
+            max_turns: 40,
+            apply: false,
+            diff: false,
+            keep_worktree: false,
+            no_sandbox: false,
+        };
+        let wt = unique("sb-on");
+        fs::create_dir_all(&wt).unwrap();
+        let mode = resolve_sandbox_mode(&a, &wt).expect("ok");
+        match mode {
+            SandboxMode::Enforce(spec) => {
+                assert!(!spec.writable_roots.is_empty());
+                assert!(spec.writable_roots.iter().any(|r| r == &wt));
+            }
+            SandboxMode::Off => {
+                // Only acceptable if preflight reported Unsupported (non-mac/linux).
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                panic!("expected Enforce on macOS/Linux");
+            }
+        }
+        let _ = fs::remove_dir_all(&wt);
     }
 
     #[test]
