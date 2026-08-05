@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Implementierung KOMPLETT + E2E-bewiesen (WP1–WP7a, Selbst-Review-Fixes gelandet). Einziger offener Punkt: formales Kimi-Review zurückgestellt — Kimi-Quota erschöpft (OWNER).</p>
+  <p class="headline">Implementierung KOMPLETT + E2E-bewiesen. WP7b-Review läuft mit SOL (Owner-Regel 05.08.: Autor Grok → Reviewer Sol; ersetzt den Kimi-Wartepunkt).</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -162,9 +162,10 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>— nichts in Arbeit; wartet auf OWNER-Entscheid (Kimi-Review)</h3>
-      <p>Alle Implementierungs-WPs gelandet und orchestrator-verifiziert. Nächster Schritt hängt am
-      OWNER-Backlog rechts.</p>
+      <h3>WP7b — Unabhängiges Review durch SOL <span class="k">(claude-sol, läuft)</span></h3>
+      <p>Owner-Regel 05.08.: Autor Grok → Reviewer Sol. Read-only-Review der Serie
+      <code>729b399..0ae9dfb</code> (SSE/Loop, Isolation, Injection/Key, Robustheit, Passthrough, Qualität).</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp7b-sol.log</code> · Sol 1/3 · Fertig = VERDICT-Report</p>
     </div>
   </div></div>
 
@@ -179,15 +180,11 @@
   </div></div>
 
   <div class="col"><h2>Backlog + Owner</h2><div class="cards">
-    <div class="card owner">
-      <h3>OWNER: Kimi-Review nachholen — Quota erschöpft (05.08.)</h3>
-      <p>Kimi 403: Zyklus-Limit erreicht. Optionen: Extra-Quota kaufen / auf nächsten Zyklus warten.
-      Review-Brief liegt fertig im Scratchpad; bis dahin gilt: Implementierung selbst-reviewt, formal ungeprüft.</p>
-    </div>
-    <div class="card">
-      <h3>WP7b-Re-Run — Trigger: Kimi wieder erreichbar</h3>
-      <p>Brief: <code>wp7b-kimi-review-brief.md</code> (Serie <code>729b399..0ae9dfb</code>), Read-only,
-      Report-Form VERDICT/FINDINGS/TESTED.</p>
+    <div class="card done neg">
+      <h3>ERLEDIGT durch Owner-Entscheid: Review-Rolle bei Grok-Arbeit → SOL</h3>
+      <p>KORREKTUR zum früheren OWNER-Punkt „Kimi-Quota": Owner-Regel 05.08. — wenn Grok Autor war,
+      reviewt Sol (Memory: <code>review-rule-sol-when-grok-authored.md</code>). Kimi bleibt erste Wahl,
+      wenn verfügbar und nicht Autor.</p>
     </div>
     <div class="card owner">
       <h3>OWNER: Prozess-Sandbox-Härtung</h3>
