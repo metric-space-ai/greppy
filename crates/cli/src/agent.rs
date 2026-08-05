@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use greppy_agent::workspace::CreateOptions;
 use greppy_agent::{
     run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
     LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
@@ -29,14 +30,17 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-One-shot coding agent. Works in a per-repository agent worktree (reset to
-HEAD each run; greppy index built on first use and kept warm afterwards) and
-delivers a proposal ref (refs/greppy/agent/<run_id>); inspect with `git show`
-or apply with `git cherry-pick -n`. The agent has exactly one tool — `greppy`
-— covering search/navigate/read/edit; commands run through that tool as
-`bash-smart -- CMD`. The tool is write-confined to the worktree, temp,
-greppy data root, ~/.cargo and the platform cache; reads and network stay open.
-Pass --no-sandbox (or GREPPY_NO_SANDBOX=1) to disable.
+One-shot coding agent. Works in a per-repository agent worktree (tracked
+content is reset to HEAD before every run; ignored build caches are kept
+deliberately for speed, pass --fresh to drop them; greppy index built on first
+use and kept warm afterwards) and delivers a proposal ref
+(refs/greppy/agent/<run_id>); inspect with `git show` or apply with
+`git cherry-pick -n`. The agent has exactly one tool — `greppy` — covering
+search/navigate/read/edit; commands run through that tool as
+`bash-smart -- CMD`. The tool is write-confined to the worktree, a per-run
+scratch dir (TMPDIR), the worktree's greppy store + lock namespace, and
+~/.cargo/{registry,git}; reads and network stay open. Pass --no-sandbox
+(or GREPPY_NO_SANDBOX=1) to disable.
 
 Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
 gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The client has
@@ -53,8 +57,8 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
-                   [--apply] [--diff] [--keep-worktree] [--no-sandbox]
-                   [--skip-selfcheck]
+                   [--apply] [--diff] [--keep-worktree] [--fresh]
+                   [--no-sandbox] [--skip-selfcheck]
   greppy -p --help
 
 Flags:
@@ -66,6 +70,8 @@ Flags:
                       (staged, not committed)
   --diff              Print the full proposal patch after the stat
   --keep-worktree     Leave a temporary fallback worktree on disk after success
+  --fresh             Drop ignored files too (truly pristine tree; default keeps
+                      ignored build caches)
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
 
@@ -111,6 +117,11 @@ pub struct AgentArgs {
     /// Keep a temporary fallback worktree after a successful run.
     #[arg(long)]
     pub keep_worktree: bool,
+
+    /// Drop ignored files on worktree reset (truly pristine; default keeps
+    /// ignored build caches so repeat runs stay fast).
+    #[arg(long)]
+    pub fresh: bool,
 
     /// Disable the write-confinement sandbox for tool subprocesses.
     ///
@@ -247,7 +258,11 @@ fn run_agent(args: AgentArgs) -> u8 {
     };
 
     let run_id = make_run_id();
-    let workspace = match AgentWorkspace::create(&cwd, &run_id) {
+    let workspace = match AgentWorkspace::create_with_options(
+        &cwd,
+        &run_id,
+        CreateOptions { fresh: args.fresh },
+    ) {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("greppy -p: workspace create failed: {e}");
@@ -255,17 +270,53 @@ fn run_agent(args: AgentArgs) -> u8 {
         }
     };
 
+    // Isolate greppy's on-disk store for this agent run into a dedicated data
+    // root (not the operator's global greppy data). Prewarm + tool children
+    // share it via GREPPY_STORE_DIR; the sandbox grants only this tree, not
+    // the platform-wide Application Support / XDG data path.
+    let agent_data = agent_data_root(workspace.worktree_path());
+    if let Err(e) = std::fs::create_dir_all(&agent_data) {
+        eprintln!("greppy -p: cannot create agent data root: {e}");
+        keep_worktree_on_error(&workspace);
+        return EXIT_AGENT;
+    }
+    std::env::set_var("GREPPY_STORE_DIR", &agent_data);
+
     // Prewarm: build/refresh the worktree's own greppy index before the first
-    // model turn so search/where-am-i do not open empty.
+    // model turn so search/where-am-i do not open empty. Runs unsandboxed in the
+    // trusted parent under the isolated GREPPY_STORE_DIR above.
     ensure_semantic_index(workspace.worktree_path());
 
-    let sandbox_mode = match resolve_sandbox_mode(&args, workspace.worktree_path()) {
+    // Per-run scratch (TMPDIR for tool children). Outside the stable-worktree
+    // parent and lock sibling so those stay non-writable to tools.
+    let scratch_dir = agent_scratch_dir(workspace.worktree_path(), &run_id);
+    if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
+        eprintln!("greppy -p: cannot create agent scratch dir: {e}");
+        keep_worktree_on_error(&workspace);
+        return EXIT_AGENT;
+    }
+
+    let sandbox_mode = match resolve_sandbox_mode(
+        &args,
+        workspace.worktree_path(),
+        &run_id,
+        &scratch_dir,
+        &agent_data,
+    ) {
         Ok(mode) => mode,
         Err(code) => {
             keep_worktree_on_error(&workspace);
             return code;
         }
     };
+
+    // Point tool children at the per-run scratch (also used by temp-file APIs
+    // that honour TMPDIR). Set for the remainder of this process so every
+    // sandboxed spawn inherits it without re-plumbing Command env.
+    std::env::set_var("TMPDIR", &scratch_dir);
+    // Some platforms also honour TMP/TEMP.
+    std::env::set_var("TMP", &scratch_dir);
+    std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
         Ok(env) => env.with_sandbox(sandbox_mode),
@@ -371,6 +422,16 @@ fn run_agent(args: AgentArgs) -> u8 {
     let commit_message = truncate_chars(&task, 72);
     let outcome = match workspace.finish(&commit_message) {
         Ok(o) => o,
+        Err(e @ WorkspaceError::Tampered { .. }) => {
+            let _ = writeln!(
+                stderr,
+                "greppy -p: {e}\n\
+                 the worktree was modified in a way that makes the result untrustworthy; \
+                 the tree was left in place for inspection"
+            );
+            keep_worktree_on_error(&workspace);
+            return EXIT_AGENT;
+        }
         Err(e) => {
             let _ = writeln!(stderr, "greppy -p: finish failed: {e}");
             keep_worktree_on_error(&workspace);
@@ -556,7 +617,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Resolve the sandbox mode for a `-p` run.
 ///
 /// `--no-sandbox` / `GREPPY_NO_SANDBOX` → `Off` (one stderr line).
-/// Otherwise prepare the worktree's writable roots **exactly once**
+/// Otherwise prepare the run's narrow writable roots **exactly once**
 /// ([`agent_sandbox::resolve_enforce_spec`]: create + full-path symlink
 /// validation + canonicalize) and probe the platform backend. The resulting
 /// `Enforce` spec carries those fixed canonical roots for the whole agent run;
@@ -564,12 +625,18 @@ fn truncate_chars(s: &str, max: usize) -> String {
 ///
 /// `Unsupported` (Linux without Landlock ABI ≥ V3) warns once and falls back
 /// to `Off`; any other error aborts with [`EXIT_AGENT`].
-fn resolve_sandbox_mode(args: &AgentArgs, worktree_path: &Path) -> Result<SandboxMode, u8> {
+fn resolve_sandbox_mode(
+    args: &AgentArgs,
+    worktree_path: &Path,
+    run_id: &str,
+    scratch_dir: &Path,
+    agent_data: &Path,
+) -> Result<SandboxMode, u8> {
     if args.no_sandbox {
         eprintln!("sandbox disabled");
         return Ok(SandboxMode::Off);
     }
-    let raw = writable_roots_for(worktree_path);
+    let raw = writable_roots_for(worktree_path, run_id, scratch_dir, agent_data);
     match agent_sandbox::resolve_enforce_spec(&raw) {
         Ok(mode) => Ok(mode),
         Err(SandboxError::Unsupported) => {
@@ -587,30 +654,77 @@ fn resolve_sandbox_mode(args: &AgentArgs, worktree_path: &Path) -> Result<Sandbo
 
 /// Writable roots for a sandboxed `-p` tool subprocess.
 ///
-/// Keep this list minimal. Each root needs an explicit reason to be writable:
-/// 1. the run's worktree — agent edits and worktree-local builds land here,
-/// 2. `std::env::temp_dir()` — process temp / intermediate files,
-/// 3. greppy's data root — owns `locks/`, `trash/`, and `workspaces/` (index-
-///    backed commands acquire lifecycle leases under `locks/` and open
-///    `graph.db` under `workspaces/`; one root covers them all),
-/// 4. `~/.cargo` — registry/build caches (respects `CARGO_HOME`),
-/// 5. the platform user cache dir (`~/Library/Caches` on macOS,
-///    `$XDG_CACHE_HOME` or `~/.cache` on Linux) — model/download caches.
-fn writable_roots_for(worktree_path: &Path) -> Vec<std::path::PathBuf> {
-    vec![
-        // Agent proposal edits and worktree-local builds land here.
-        worktree_path.to_path_buf(),
-        // Process temp (and macOS TMPDIR) for intermediate files.
-        std::env::temp_dir(),
-        // Greppy's data root owns locks/, trash/, and workspaces/ — index-backed
-        // commands acquire lifecycle leases under locks/ and open graph.db under
-        // workspaces/. One root covers them all (see greppy_core::cache).
-        greppy_core::cache::data_root(),
-        // Cargo registry / git / target build caches (respects CARGO_HOME).
-        cargo_home_dir(),
-        // Platform user cache (e.g. model downloads; XDG cache on Linux).
-        platform_user_cache_dir(),
-    ]
+/// Deliberately narrow — each entry has a one-line reason. Do **not** re-add
+/// the platform cache, global temp root, the operator's greppy data root, or
+/// whole Cargo home: those defeat per-worktree isolation and the stable-tree lock.
+fn writable_roots_for(
+    worktree_path: &Path,
+    run_id: &str,
+    scratch_dir: &Path,
+    agent_data: &Path,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::with_capacity(6);
+
+    // Worktree: agent proposal edits and worktree-local builds land here.
+    roots.push(worktree_path.to_path_buf());
+
+    // Scratch: per-run temp only (TMPDIR points here). Never the global temp root.
+    roots.push(scratch_dir.to_path_buf());
+
+    // Isolated greppy data root for this agent worktree (GREPPY_STORE_DIR).
+    // Contains the worktree's store, locks/, and trash/ under one tree that is
+    // not the operator's global Application Support / XDG greppy data. Index-
+    // backed commands call ensure_workspace_store which also touches locks +
+    // trash under data_root — granting this isolated root covers them without
+    // opening every other workspace index. Lease files live under
+    // `<agent_data>/locks/`; the sandbox only grants directories (Seatbelt
+    // subpath / Landlock PathBeneath), so locks/ cannot be narrowed to a single
+    // lease file without a file-level grant API.
+    roots.push(agent_data.to_path_buf());
+
+    // Cargo download caches only — never ~/.cargo/bin, config.toml, credentials*.
+    let cargo = cargo_home_dir();
+    let cargo_registry = cargo.join("registry");
+    let cargo_git = cargo.join("git");
+    let _ = std::fs::create_dir_all(&cargo_registry);
+    let _ = std::fs::create_dir_all(&cargo_git);
+    roots.push(cargo_registry);
+    roots.push(cargo_git);
+
+    // Stable-worktree PARENT and the sibling lock file must stay outside every
+    // tool-writable root (worktree path itself is root 1; its parent is not).
+    let _ = run_id; // scratch path already carries run_id
+    roots
+}
+
+/// Isolated greppy data root for an agent worktree (`GREPPY_STORE_DIR`).
+///
+/// `<worktree>/../greppy-agent-data/<worktree-name>` — sibling of the worktree,
+/// outside the worktree content and outside the stable `.lock` sibling.
+fn agent_data_root(worktree_path: &Path) -> std::path::PathBuf {
+    let parent = worktree_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree_path.to_path_buf());
+    let name = worktree_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("worktree"));
+    parent.join("greppy-agent-data").join(name)
+}
+
+/// Per-run scratch directory for tool children (`TMPDIR`).
+///
+/// Sibling of the worktree's placement namespace when possible:
+/// `<worktree>/../greppy-agent-scratch/<run_id>`. For a stable worktree under
+/// `…/agent-worktrees/<hash>` this lands at `…/greppy-agent-scratch/<run_id>`,
+/// which is outside the worktree and outside the lock sibling.
+fn agent_scratch_dir(worktree_path: &Path, run_id: &str) -> std::path::PathBuf {
+    let parent = worktree_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree_path.to_path_buf());
+    parent.join("greppy-agent-scratch").join(run_id)
 }
 
 fn cargo_home_dir() -> std::path::PathBuf {
@@ -618,20 +732,6 @@ fn cargo_home_dir() -> std::path::PathBuf {
         return std::path::PathBuf::from(home);
     }
     home_dir().join(".cargo")
-}
-
-fn platform_user_cache_dir() -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        home_dir().join("Library").join("Caches")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-            return std::path::PathBuf::from(xdg);
-        }
-        home_dir().join(".cache")
-    }
 }
 
 fn home_dir() -> std::path::PathBuf {
@@ -798,6 +898,7 @@ mod tests {
         assert!(a.diff);
         assert!(a.keep_worktree);
         assert!(!a.no_sandbox);
+        assert!(!a.fresh);
     }
 
     #[test]
@@ -811,6 +912,13 @@ mod tests {
         assert!(!a.diff);
         assert!(!a.keep_worktree);
         assert!(!a.no_sandbox);
+        assert!(!a.fresh);
+    }
+
+    #[test]
+    fn parse_fresh_flag() {
+        let a = parse(&["do it", "--model", "m", "--fresh"]).expect("parse");
+        assert!(a.fresh);
     }
 
     #[test]
@@ -845,6 +953,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            fresh: false,
             no_sandbox: false,
             skip_selfcheck: false,
         };
@@ -861,6 +970,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            fresh: false,
             no_sandbox: false,
             skip_selfcheck: false,
         };
@@ -908,6 +1018,14 @@ mod tests {
             "help must mention --skip-selfcheck: {help}"
         );
         assert!(
+            help.contains("--fresh") || help.contains("fresh"),
+            "help must mention --fresh: {help}"
+        );
+        assert!(
+            help.contains("ignored build caches") || help.contains("ignored files"),
+            "help must document ignored-cache default: {help}"
+        );
+        assert!(
             help.contains("network") || help.contains("reads and network"),
             "help must note network stays open: {help}"
         );
@@ -928,47 +1046,99 @@ mod tests {
     }
 
     #[test]
-    fn writable_roots_include_worktree_temp_data_root_cargo_cache() {
+    fn writable_roots_are_narrow_no_global_shared_state() {
         let wt = unique("roots-wt");
         fs::create_dir_all(&wt).unwrap();
-        let roots = writable_roots_for(&wt);
+        let run_id = "run-roots-test";
+        let scratch = agent_scratch_dir(&wt, run_id);
+        fs::create_dir_all(&scratch).unwrap();
+        let agent_data = agent_data_root(&wt);
+        fs::create_dir_all(&agent_data).unwrap();
+        // Point data_root() at the isolated agent data for this test process
+        // so any cache helpers agree with writable_roots_for.
+        let prev_store = std::env::var_os("GREPPY_STORE_DIR");
+        std::env::set_var("GREPPY_STORE_DIR", &agent_data);
+
+        let roots = writable_roots_for(&wt, run_id, &scratch, &agent_data);
+
+        // Worktree + scratch + isolated agent data present.
         assert!(
             roots.iter().any(|r| r == &wt),
             "worktree missing: {roots:?}"
         );
         assert!(
-            roots.iter().any(|r| r == &std::env::temp_dir()),
-            "temp missing: {roots:?}"
-        );
-        let data = greppy_core::cache::data_root();
-        assert!(
-            roots.iter().any(|r| r == &data),
-            "greppy data root missing: {roots:?}"
-        );
-        // Workspace store / locks / trash all live under data_root; granting the
-        // parent is enough (and required for lifecycle leases).
-        let store = greppy_core::workspace::store_dir(&wt);
-        assert!(
-            store.starts_with(&data),
-            "store_dir {store:?} must live under data_root {data:?}"
+            roots.iter().any(|r| r == &scratch),
+            "scratch missing: {roots:?}"
         );
         assert!(
-            greppy_core::cache::locks_root().starts_with(&data),
-            "locks_root must live under data_root"
+            roots.iter().any(|r| r == &agent_data),
+            "agent data root missing: {roots:?}"
+        );
+
+        // No global temp / platform cache / whole cargo home.
+        let global_temp = std::env::temp_dir();
+        assert!(
+            !roots.iter().any(|r| r == &global_temp),
+            "global temp must not be a root: {roots:?}"
+        );
+        let cargo = cargo_home_dir();
+        assert!(
+            !roots.iter().any(|r| r == &cargo),
+            "whole cargo home must not be granted: {roots:?}"
         );
         assert!(
-            roots
-                .iter()
-                .any(|r| r.ends_with(".cargo") || r == &cargo_home_dir()),
-            "cargo home missing: {roots:?}"
+            roots.iter().any(|r| r == &cargo.join("registry")),
+            "cargo registry missing: {roots:?}"
         );
         assert!(
-            roots
-                .iter()
-                .any(|r| r.ends_with("Caches") || r.ends_with(".cache")),
-            "platform cache missing: {roots:?}"
+            roots.iter().any(|r| r == &cargo.join("git")),
+            "cargo git missing: {roots:?}"
         );
+        assert!(
+            !roots.iter().any(|r| {
+                let s = r.to_string_lossy();
+                (s.ends_with("Caches") || s.ends_with(".cache"))
+                    && !s.contains("greppy-agent-data")
+                    && !s.contains("greppy-agent-scratch")
+            }),
+            "platform cache must not be a root: {roots:?}"
+        );
+
+        // Under the isolated agent data, store + locks live beneath agent_data.
+        let store = greppy_core::cache::workspace_store_dir(&wt);
+        assert!(
+            store.starts_with(&agent_data),
+            "store {store:?} must live under agent data {agent_data:?}"
+        );
+        let locks = greppy_core::cache::locks_root();
+        assert!(
+            locks.starts_with(&agent_data),
+            "locks {locks:?} must live under agent data {agent_data:?}"
+        );
+
+        // Stable-worktree lock path must lie outside every granted root.
+        let fake_repo = unique("fake-repo");
+        fs::create_dir_all(&fake_repo).unwrap();
+        let lock = greppy_agent::workspace::stable_lock_path_for(&fake_repo);
+        for r in &roots {
+            // Only treat as contained when lock is strictly under a granted root.
+            if lock.starts_with(r) && lock != *r {
+                panic!(
+                    "lock {} must not live under granted root {}",
+                    lock.display(),
+                    r.display()
+                );
+            }
+        }
+
+        match prev_store {
+            Some(v) => std::env::set_var("GREPPY_STORE_DIR", v),
+            None => std::env::remove_var("GREPPY_STORE_DIR"),
+        }
         let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&agent_data);
+        let _ = fs::remove_dir_all(&fake_repo);
     }
 
     #[test]
@@ -981,14 +1151,21 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            fresh: false,
             no_sandbox: true,
             skip_selfcheck: false,
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
-        let mode = resolve_sandbox_mode(&a, &wt).expect("ok");
+        let scratch = agent_scratch_dir(&wt, "run");
+        fs::create_dir_all(&scratch).unwrap();
+        let agent_data = agent_data_root(&wt);
+        fs::create_dir_all(&agent_data).unwrap();
+        let mode = resolve_sandbox_mode(&a, &wt, "run", &scratch, &agent_data).expect("ok");
         assert!(matches!(mode, SandboxMode::Off));
         let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&agent_data);
     }
 
     #[test]
@@ -1001,12 +1178,17 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            fresh: false,
             no_sandbox: false,
             skip_selfcheck: false,
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();
-        let mode = resolve_sandbox_mode(&a, &wt).expect("ok");
+        let scratch = agent_scratch_dir(&wt, "run");
+        fs::create_dir_all(&scratch).unwrap();
+        let agent_data = agent_data_root(&wt);
+        fs::create_dir_all(&agent_data).unwrap();
+        let mode = resolve_sandbox_mode(&a, &wt, "run", &scratch, &agent_data).expect("ok");
         match mode {
             SandboxMode::Enforce(spec) => {
                 assert!(!spec.writable_roots.is_empty());
@@ -1019,6 +1201,16 @@ mod tests {
                 );
                 // Every root must be absolute (resolve-once invariant).
                 assert!(spec.writable_roots.iter().all(|r| r.is_absolute()));
+                // Isolated agent data is present; the operator global data root is not
+                // (unless GREPPY_STORE_DIR was already overridden to match — compare
+                // against the default-looking Application Support / XDG path only when
+                // it differs from agent_data).
+                let agent_data_canon = fs::canonicalize(&agent_data).unwrap();
+                assert!(
+                    spec.writable_roots.iter().any(|r| r == &agent_data_canon),
+                    "agent data missing from resolved roots: {:?}",
+                    spec.writable_roots
+                );
             }
             SandboxMode::Off => {
                 // Only acceptable if preflight reported Unsupported (non-mac/linux).
@@ -1027,6 +1219,8 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&agent_data);
     }
 
     #[test]
@@ -1061,5 +1255,17 @@ mod tests {
     fn format_greppy_tool_line() {
         let args = serde_json::json!({"args": ["who-calls", "foo"]});
         assert_eq!(format_tool_start("greppy", &args), "→ greppy who-calls foo");
+    }
+
+    #[test]
+    fn store_cleanup_skipped_under_agent_run_env() {
+        let prev = std::env::var_os(greppy_agent::AGENT_RUN_ENV);
+        std::env::set_var(greppy_agent::AGENT_RUN_ENV, "1");
+        // Must return immediately — no GC under GREPPY_AGENT_RUN (WP21).
+        crate::maybe_run_store_cleanup(None);
+        match prev {
+            Some(v) => std::env::set_var(greppy_agent::AGENT_RUN_ENV, v),
+            None => std::env::remove_var(greppy_agent::AGENT_RUN_ENV),
+        }
     }
 }

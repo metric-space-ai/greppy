@@ -646,7 +646,9 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     // Structured Greppy commands perform throttled cache maintenance. This
     // intentionally runs after passthrough detection so an ordinary grep
     // invocation cannot touch Greppy state.
-    if !is_trial_invocation(&argv) {
+    // Skip under GREPPY_AGENT_RUN: agent tool children only have write access to
+    // their own store + lock namespace, not trash/other workspaces that GC needs.
+    if !is_trial_invocation(&argv) && std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_none() {
         maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
     }
     // Structured subcommand (or help/version): clap can parse it. Any
@@ -842,6 +844,12 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
 /// age-based eviction, not the independent quota) — see
 /// [`greppy_core::workspace::store_ttl_secs`].
 pub fn maybe_run_store_cleanup(root: Option<&str>) {
+    // Agent tool children only have write access to their own store + lock
+    // namespace (WP21). GC touches trash/ and other workspaces — skip entirely
+    // while GREPPY_AGENT_RUN is set (also gated at the run_os call site).
+    if std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() {
+        return;
+    }
     let effective = resolve_root(root).ok();
     if greppy_core::cache::maybe_gc(effective.as_deref()).is_ok_and(|report| !report.throttled) {
         cleanup_verified_legacy_trash();
