@@ -279,6 +279,14 @@ fn run_agent(args: AgentArgs) -> u8 {
             if !stat.ends_with('\n') {
                 let _ = writeln!(stdout);
             }
+            let binary_files = stat.lines().filter(|l| l.contains("| Bin")).count();
+            if binary_files > 0 {
+                let _ = writeln!(
+                    stderr,
+                    "note: proposal contains {binary_files} binary file(s), likely build \
+                     artifacts from verification — is the repo's .gitignore complete?"
+                );
+            }
             let _ = writeln!(stdout, "proposal saved: {ref_name}");
             let _ = writeln!(stdout, "inspect: git show {ref_name}");
             let _ = writeln!(stdout, "apply:   git cherry-pick -n {ref_name}");
