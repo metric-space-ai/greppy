@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use greppy_agent::{
     run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
-    LoopEvent, ProbeError, RunOutcome, SandboxError, SandboxMode, SandboxSpec, StreamEvent,
-    WorkspaceError, SYSTEM_PROMPT,
+    LoopEvent, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent, WorkspaceError,
+    SYSTEM_PROMPT,
 };
 use greppy_core::workspace as workspace_locator;
 
@@ -484,19 +484,22 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Resolve the sandbox mode for a `-p` run.
 ///
 /// `--no-sandbox` / `GREPPY_NO_SANDBOX` → `Off` (one stderr line).
-/// Otherwise build an `Enforce` spec from the worktree's writable roots and
-/// preflight it: `Unsupported` (Linux without Landlock) warns once and falls
-/// back to `Off`; any other error aborts with [`EXIT_AGENT`].
+/// Otherwise prepare the worktree's writable roots **exactly once**
+/// ([`agent_sandbox::resolve_enforce_spec`]: create + full-path symlink
+/// validation + canonicalize) and probe the platform backend. The resulting
+/// `Enforce` spec carries those fixed canonical roots for the whole agent run;
+/// per-tool `apply` never re-resolves them.
+///
+/// `Unsupported` (Linux without Landlock ABI ≥ V3) warns once and falls back
+/// to `Off`; any other error aborts with [`EXIT_AGENT`].
 fn resolve_sandbox_mode(args: &AgentArgs, worktree_path: &Path) -> Result<SandboxMode, u8> {
     if args.no_sandbox {
         eprintln!("sandbox disabled");
         return Ok(SandboxMode::Off);
     }
-    let mode = SandboxMode::Enforce(SandboxSpec {
-        writable_roots: writable_roots_for(worktree_path),
-    });
-    match agent_sandbox::preflight(&mode) {
-        Ok(()) => Ok(mode),
+    let raw = writable_roots_for(worktree_path);
+    match agent_sandbox::resolve_enforce_spec(&raw) {
+        Ok(mode) => Ok(mode),
         Err(SandboxError::Unsupported) => {
             eprintln!(
                 "greppy -p: sandbox unsupported on this kernel/platform — continuing unsandboxed"
@@ -858,7 +861,15 @@ mod tests {
         match mode {
             SandboxMode::Enforce(spec) => {
                 assert!(!spec.writable_roots.is_empty());
-                assert!(spec.writable_roots.iter().any(|r| r == &wt));
+                // Roots are pre-resolved (canonical); match via canonicalize.
+                let wt_canon = fs::canonicalize(&wt).unwrap();
+                assert!(
+                    spec.writable_roots.iter().any(|r| r == &wt_canon),
+                    "worktree missing from resolved roots: {:?} (want {wt_canon:?})",
+                    spec.writable_roots
+                );
+                // Every root must be absolute (resolve-once invariant).
+                assert!(spec.writable_roots.iter().all(|r| r.is_absolute()));
             }
             SandboxMode::Off => {
                 // Only acceptable if preflight reported Unsupported (non-mac/linux).

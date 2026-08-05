@@ -937,8 +937,10 @@ exit 0
     fn with_sandbox_defaults_to_off_and_is_settable() {
         let (env, _, _) = env_with_stub("exit 0");
         assert!(matches!(env.sandbox(), SandboxMode::Off));
+        let roots = crate::sandbox::prepare_writable_roots(&[std::env::temp_dir()])
+            .expect("prepare temp root");
         let env = env.with_sandbox(SandboxMode::Enforce(crate::sandbox::SandboxSpec {
-            writable_roots: vec![std::env::temp_dir()],
+            writable_roots: roots,
         }));
         assert!(matches!(env.sandbox(), SandboxMode::Enforce(_)));
     }
@@ -974,10 +976,12 @@ exit 0
             }
             let root = temp_root();
             let bin = write_stub(real_bash_stub_body());
+            let roots = crate::sandbox::prepare_writable_roots(std::slice::from_ref(&root))
+                .expect("prepare roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: vec![root.clone()],
+                    writable_roots: roots,
                 }));
             let marker = root.join("inside-ok.txt");
             let _ = fs::remove_file(&marker);
@@ -998,10 +1002,12 @@ exit 0
             }
             let root = temp_root();
             let bin = write_stub(real_bash_stub_body());
+            let roots = crate::sandbox::prepare_writable_roots(std::slice::from_ref(&root))
+                .expect("prepare roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: vec![root.clone()],
+                    writable_roots: roots,
                 }));
 
             let home = std::env::var_os("HOME").expect("HOME");
@@ -1070,10 +1076,13 @@ exit 0
 
             fs::write(root.join("file.txt"), b"hello\nworld\n").unwrap();
             let bin = write_stub(real_bash_stub_body());
+            let roots =
+                crate::sandbox::prepare_writable_roots(&[root.clone(), std::env::temp_dir()])
+                    .expect("prepare roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: vec![root.clone(), std::env::temp_dir()],
+                    writable_roots: roots,
                 }));
             let out = env.call_tool(
                 "bash",
@@ -1124,10 +1133,12 @@ exit 0
             let root = temp_root();
             let tmp = std::env::temp_dir();
             let bin = write_stub(real_bash_stub_body());
+            let roots = crate::sandbox::prepare_writable_roots(&[root.clone(), tmp.clone()])
+                .expect("prepare roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: vec![root.clone(), tmp.clone()],
+                    writable_roots: roots,
                 }));
 
             let probe_dir = tmp.join("..").join("C");
@@ -1166,10 +1177,13 @@ exit 0
             }
             let root = temp_root();
             let bin = write_stub(real_bash_stub_body());
+            let roots =
+                crate::sandbox::prepare_writable_roots(&[root.clone(), std::env::temp_dir()])
+                    .expect("prepare roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
                 .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: vec![root.clone(), std::env::temp_dir()],
+                    writable_roots: roots,
                 }));
             let out = env.call_tool("bash", &json!({"command": "echo x >/dev/null"}));
             assert!(
