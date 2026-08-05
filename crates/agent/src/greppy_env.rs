@@ -939,9 +939,9 @@ exit 0
         assert!(matches!(env.sandbox(), SandboxMode::Off));
         let roots = crate::sandbox::prepare_writable_roots(&[std::env::temp_dir()])
             .expect("prepare temp root");
-        let env = env.with_sandbox(SandboxMode::Enforce(crate::sandbox::SandboxSpec {
-            writable_roots: roots,
-        }));
+        let spec =
+            crate::sandbox::SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
+        let env = env.with_sandbox(SandboxMode::Enforce(spec));
         assert!(matches!(env.sandbox(), SandboxMode::Enforce(_)));
     }
 
@@ -978,11 +978,10 @@ exit 0
             let bin = write_stub(real_bash_stub_body());
             let roots = crate::sandbox::prepare_writable_roots(std::slice::from_ref(&root))
                 .expect("prepare roots");
+            let spec = SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
-                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: roots,
-                }));
+                .with_sandbox(SandboxMode::Enforce(spec));
             let marker = root.join("inside-ok.txt");
             let _ = fs::remove_file(&marker);
             let out = env.call_tool(
@@ -1004,11 +1003,10 @@ exit 0
             let bin = write_stub(real_bash_stub_body());
             let roots = crate::sandbox::prepare_writable_roots(std::slice::from_ref(&root))
                 .expect("prepare roots");
+            let spec = SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
-                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: roots,
-                }));
+                .with_sandbox(SandboxMode::Enforce(spec));
 
             let home = std::env::var_os("HOME").expect("HOME");
             let escape = PathBuf::from(&home).join(format!(
@@ -1079,11 +1077,10 @@ exit 0
             let roots =
                 crate::sandbox::prepare_writable_roots(&[root.clone(), std::env::temp_dir()])
                     .expect("prepare roots");
+            let spec = SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
-                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: roots,
-                }));
+                .with_sandbox(SandboxMode::Enforce(spec));
             let out = env.call_tool(
                 "bash",
                 &json!({
@@ -1135,11 +1132,10 @@ exit 0
             let bin = write_stub(real_bash_stub_body());
             let roots = crate::sandbox::prepare_writable_roots(&[root.clone(), tmp.clone()])
                 .expect("prepare roots");
+            let spec = SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
-                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: roots,
-                }));
+                .with_sandbox(SandboxMode::Enforce(spec));
 
             let probe_dir = tmp.join("..").join("C");
             let _ = fs::create_dir_all(&probe_dir);
@@ -1180,11 +1176,10 @@ exit 0
             let roots =
                 crate::sandbox::prepare_writable_roots(&[root.clone(), std::env::temp_dir()])
                     .expect("prepare roots");
+            let spec = SandboxSpec::from_prepared_roots(roots).expect("open prepared roots");
             let mut env = GreppyEnv::with_binary(bin, root.clone())
                 .unwrap()
-                .with_sandbox(SandboxMode::Enforce(SandboxSpec {
-                    writable_roots: roots,
-                }));
+                .with_sandbox(SandboxMode::Enforce(spec));
             let out = env.call_tool("bash", &json!({"command": "echo x >/dev/null"}));
             assert!(
                 !out.is_error,

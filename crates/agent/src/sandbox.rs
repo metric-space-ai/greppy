@@ -28,8 +28,10 @@
 //! producing a canonical [`SandboxSpec`]. Per-tool `apply` trusts those roots
 //! verbatim — no `exists` / `create_dir_all` / `canonicalize` / re-validation
 //! that could re-authorize an attacker-swapped symlink. On Linux the parent
-//! further pins each root to an open directory FD so the launcher cannot be
-//! raced into authorizing a post-validation symlink target.
+//! further pins each root to an open directory FD **at preparation time** (not
+//! per tool call) so a post-validation ancestor→symlink swap cannot redirect a
+//! later pathname open into an unauthorized target; every spawn reuses (dups)
+//! those same held descriptors.
 
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
@@ -37,6 +39,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// Hidden CLI argv token for the Linux Landlock launcher process.
 ///
@@ -50,19 +53,102 @@ pub const LANDLOCK_LAUNCHER_ARG: &str = "__agent-sandbox-landlock";
 /// to an unrestricted real command).
 pub const LANDLOCK_LAUNCHER_EXIT_SETUP: u8 = 172;
 
+/// Canonical roots prepared once per agent run, plus (on Linux) the directory
+/// FDs opened at preparation time.
+///
+/// **Equality compares paths only.** FD identity is deliberately not part of
+/// equality: two preparations of the same roots compare equal even when their
+/// held descriptors differ.
+#[derive(Debug)]
+struct PreparedRoots {
+    paths: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    root_fds: Vec<OwnedDirFd>,
+    #[cfg(target_os = "linux")]
+    dev_null_fd: Option<OwnedDirFd>,
+}
+
+impl PartialEq for PreparedRoots {
+    fn eq(&self, other: &Self) -> bool {
+        self.paths == other.paths
+    }
+}
+
+impl Eq for PreparedRoots {}
+
+impl PreparedRoots {
+    /// Open every prepared root (and `/dev/null` on Linux) exactly once.
+    ///
+    /// On non-Linux hosts this only stores the paths — Seatbelt resolves at
+    /// access time and does not need held FDs.
+    fn new(roots: &[PathBuf]) -> Result<Self, SandboxError> {
+        #[cfg(target_os = "linux")]
+        {
+            let root_fds = open_trusted_root_fds(roots)?;
+            let dev_null_fd = open_trusted_dev_null_fd().ok();
+            Ok(Self {
+                paths: roots.to_vec(),
+                root_fds,
+                dev_null_fd,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self {
+                paths: roots.to_vec(),
+            })
+        }
+    }
+}
+
 /// Writable-root allowlist for a sandboxed tool subprocess.
 ///
 /// **Invariant:** under [`SandboxMode::Enforce`], `writable_roots` must already
 /// be the output of [`prepare_writable_roots`] (absolute canonical directories,
 /// every ancestor component validated, no symlinks). Per-tool [`apply`] uses
-/// these paths verbatim and never re-resolves them. Callers that build a spec
-/// from raw paths must run [`resolve_enforce_spec`] (or equivalent) once before
-/// the agent loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// these paths verbatim and never re-resolves them. On Linux the companion
+/// [`PreparedRoots`] FDs were opened at the same preparation step and are
+/// duplicated into each child — no pathname is opened again after prepare.
+/// Callers that build a spec from raw paths must run [`resolve_enforce_spec`]
+/// (or [`SandboxSpec::from_prepared_roots`]) once before the agent loop.
+///
+/// **Equality / hashing note:** `PartialEq`/`Eq` compare `writable_roots`
+/// only. Held FD identity is not part of equality (see `PreparedRoots`).
+#[derive(Debug, Clone)]
 pub struct SandboxSpec {
     /// Absolute canonical directories the child may write under.
     /// Pre-resolved; trusted thereafter (see type invariant above).
     pub writable_roots: Vec<PathBuf>,
+    /// Paths + (Linux) directory FDs opened once at preparation. Shared across
+    /// clones of this spec for the whole agent run.
+    prepared: Arc<PreparedRoots>,
+}
+
+impl PartialEq for SandboxSpec {
+    fn eq(&self, other: &Self) -> bool {
+        // Path equality only; FD identity is not part of equality.
+        self.writable_roots == other.writable_roots
+    }
+}
+
+impl Eq for SandboxSpec {}
+
+impl SandboxSpec {
+    /// Build a spec from roots that have already been through
+    /// [`prepare_writable_roots`].
+    ///
+    /// On Linux this also opens each root as a directory FD (`O_DIRECTORY |
+    /// O_NOFOLLOW | O_CLOEXEC`) and `/dev/null` **once**; those descriptors are
+    /// reused (via `dup`) by every subsequent [`apply`]. Call only at
+    /// preparation time — never per tool call. [`SandboxMode::Off`] never
+    /// invokes this, so a disabled sandbox opens nothing.
+    pub fn from_prepared_roots(roots: Vec<PathBuf>) -> Result<Self, SandboxError> {
+        let prepared = PreparedRoots::new(&roots)?;
+        Ok(Self {
+            writable_roots: roots,
+            prepared: Arc::new(prepared),
+        })
+    }
 }
 
 /// Sandbox policy applied to every tool subprocess of a [`crate::GreppyEnv`].
@@ -157,14 +243,10 @@ pub fn preflight(mode: &SandboxMode) -> Result<(), SandboxError> {
 /// the rest of the run (never re-resolved by [`apply`]).
 pub fn resolve_enforce_spec(raw_roots: &[PathBuf]) -> Result<SandboxMode, SandboxError> {
     let roots = prepare_writable_roots(raw_roots)?;
-    let mode = SandboxMode::Enforce(SandboxSpec {
-        writable_roots: roots,
-    });
-    preflight_enforce(match &mode {
-        SandboxMode::Enforce(spec) => spec,
-        SandboxMode::Off => unreachable!("just constructed Enforce"),
-    })?;
-    Ok(mode)
+    // Open trusted root FDs (Linux) here — once per run, before any tool runs.
+    let spec = SandboxSpec::from_prepared_roots(roots)?;
+    preflight_enforce(&spec)?;
+    Ok(SandboxMode::Enforce(spec))
 }
 
 /// Linux Landlock launcher entry point (CLI intercept).
@@ -235,27 +317,32 @@ fn apply_enforce(
     args: &[impl AsRef<OsStr>],
     spec: &SandboxSpec,
 ) -> Result<(), SandboxError> {
-    // Spec roots are pre-resolved by resolve_enforce_spec / prepare_writable_roots
-    // exactly once per agent run. Use them verbatim — no exists/create/canonicalize
-    // that could re-authorize an attacker-swapped symlink between tool calls.
+    // Spec roots (and on Linux their FDs) are prepared exactly once per agent
+    // run. Use them verbatim — no exists/create/canonicalize/open that could
+    // re-authorize an attacker-swapped symlink between tool calls.
     debug_assert!(
         spec.writable_roots
             .iter()
             .all(|r| r.is_absolute() && !r.as_os_str().is_empty()),
         "SandboxSpec.writable_roots must be pre-resolved absolute paths"
     );
-    let roots = &spec.writable_roots;
+    // prepared.paths is the same sequence as writable_roots; reading it keeps
+    // the Arc live and documents that apply trusts the one-shot prepare.
+    debug_assert_eq!(
+        &spec.writable_roots, &spec.prepared.paths,
+        "writable_roots and prepared.paths must stay in lockstep"
+    );
     #[cfg(target_os = "macos")]
     {
-        apply_macos(cmd, bin, args, roots)
+        apply_macos(cmd, bin, args, &spec.prepared.paths)
     }
     #[cfg(target_os = "linux")]
     {
-        apply_linux(cmd, bin, args, roots)
+        apply_linux(cmd, bin, args, spec)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (cmd, bin, args, roots);
+        let _ = (cmd, bin, args, &spec.prepared.paths);
         Err(SandboxError::Unsupported)
     }
 }
@@ -698,15 +785,17 @@ fn escape_sbpl_string(s: &str) -> String {
 // ── Linux (Landlock launcher over inherited trusted FDs) ────────────────────
 //
 // Design invariant: the launcher never resolves a pathname for authorization.
-// The trusted parent opens each prepared root with
+// The trusted parent opens each prepared root **once per agent run** (during
+// `SandboxSpec::from_prepared_roots` / `resolve_enforce_spec`) with
 //   open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-// (and `/dev/null` without O_DIRECTORY/O_NOFOLLOW), clears FD_CLOEXEC on those
-// FDs inside a pre_exec hook (so only the launcher child inherits them — not
-// other concurrent forks), and encodes the raw FD numbers in the launcher
-// argv JSON. The launcher adopts those FDs and builds PathBeneath rules
-// directly from them. A background process that swaps a directory for a
-// symlink after preparation cannot redirect Landlock: the FD already points
-// at the original directory inode.
+// (and `/dev/null` without O_DIRECTORY/O_NOFOLLOW). Every subsequent tool
+// spawn **duplicates** those held FDs, clears FD_CLOEXEC on the dups inside a
+// pre_exec hook (so only the launcher child inherits them — not other
+// concurrent forks), and encodes the raw dup FD numbers in the launcher argv
+// JSON. The launcher adopts those FDs and builds PathBeneath rules directly
+// from them. A background process that swaps a directory for a symlink after
+// preparation cannot redirect Landlock: the held FD already points at the
+// original directory inode, and no pathname is re-opened after preparation.
 
 /// JSON payload passed as argv[2] of the Landlock launcher.
 ///
@@ -746,25 +835,26 @@ fn apply_linux(
     cmd: &mut Command,
     bin: &Path,
     args: &[impl AsRef<OsStr>],
-    roots: &[PathBuf],
+    spec: &SandboxSpec,
 ) -> Result<(), SandboxError> {
     // Probe Landlock support without opening paths (empty-FD ruleset). The
     // actual restrict_self runs in the already-exec'd launcher process.
-    preflight_linux(roots)?;
+    // Path opens are NOT performed here — they happened once at preparation.
+    preflight_linux(&spec.writable_roots)?;
 
-    // Open each prepared root as a directory FD that refuses to follow a
-    // final-component symlink. Holding the FD pins the inode; a later
-    // directory→symlink swap cannot redirect this descriptor.
-    let root_fds = open_trusted_root_fds(roots)?;
-    // /dev/null is opened the same way (plain open, no path re-resolution in
-    // the launcher). Failure is non-fatal — shells rarely need it, and the
-    // launcher simply omits the rule.
-    let dev_null_fd = open_trusted_dev_null_fd().ok();
+    // Duplicate the preparation-time FDs for this spawn. The held originals
+    // stay in `spec.prepared` for the whole run; the dups are made inheritable
+    // and transferred to the child. No pathname is opened.
+    let root_fds = dup_prepared_root_fds(&spec.prepared.root_fds)?;
+    let dev_null_fd = match &spec.prepared.dev_null_fd {
+        Some(fd) => Some(fd.dup()?),
+        None => None,
+    };
 
     let root_raw: Vec<i32> = root_fds.iter().map(|f| f.as_raw_fd_i32()).collect();
     let null_raw = dev_null_fd.as_ref().map(|f| f.as_raw_fd_i32());
-    let spec = encode_landlock_fd_spec(&LandlockFdSpec {
-        root_fds: root_raw.clone(),
+    let fd_spec = encode_landlock_fd_spec(&LandlockFdSpec {
+        root_fds: root_raw,
         dev_null_fd: null_raw,
     })?;
 
@@ -773,14 +863,14 @@ fn apply_linux(
 
     *cmd = Command::new(launcher);
     cmd.arg(LANDLOCK_LAUNCHER_ARG);
-    cmd.arg(spec);
+    cmd.arg(fd_spec);
     cmd.arg("--");
     cmd.arg(bin);
     cmd.args(args.iter().map(AsRef::as_ref));
 
-    // Keep the OwnedFds alive across the spawn by moving them into the
-    // pre_exec closure (which also clears FD_CLOEXEC). The parent still
-    // holds them until spawn returns; the child inherits the raw numbers.
+    // Keep the per-spawn OwnedFd dups alive across the spawn by moving them
+    // into the pre_exec closure (which also clears FD_CLOEXEC). The parent
+    // still holds the preparation-time originals in `spec.prepared`.
     install_inheritable_fds(cmd, root_fds, dev_null_fd)?;
     Ok(())
 }
@@ -789,22 +879,40 @@ fn apply_linux(
 fn preflight_linux(_roots: &[PathBuf]) -> Result<(), SandboxError> {
     // Build a ruleset with no path rules under HardRequirement. This is enough
     // to detect "kernel missing Landlock / below V3 write floor" without
-    // re-opening pathnames (path opens happen only in apply_linux, once the
-    // parent is about to spawn).
+    // opening pathnames. Path opens happen only in PreparedRoots::new (once
+    // per run, during resolve_enforce_spec / from_prepared_roots).
     landlock_build_ruleset_empty().map(|_| ())
 }
 
 /// Open every prepared root with `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`.
 ///
-/// `O_NOFOLLOW` makes a final-component symlink a hard open error rather than
-/// a silent redirect. Combined with the once-per-run preparation that already
-/// rejected symlink *ancestors*, the resulting FD is a trusted handle on the
-/// intended directory inode.
+/// Called **once per run** from [`PreparedRoots::new`] — never from
+/// [`apply_linux`]. `O_NOFOLLOW` makes a final-component symlink a hard open
+/// error rather than a silent redirect. Combined with the once-per-run
+/// preparation that already rejected symlink *ancestors*, the resulting FD is
+/// a trusted handle on the intended directory inode.
 #[cfg(target_os = "linux")]
 fn open_trusted_root_fds(roots: &[PathBuf]) -> Result<Vec<OwnedDirFd>, SandboxError> {
+    #[cfg(test)]
+    TRUSTED_ROOT_OPEN_COUNT.fetch_add(roots.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut out = Vec::with_capacity(roots.len());
     for r in roots {
         out.push(OwnedDirFd::open_dir_nofollow(r)?);
+    }
+    Ok(out)
+}
+
+/// Test-only counter of pathname opens performed by [`open_trusted_root_fds`].
+/// Used to prove `apply_linux` never re-opens roots after preparation.
+#[cfg(all(test, target_os = "linux"))]
+static TRUSTED_ROOT_OPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Duplicate every held root FD for a single spawn (no pathname open).
+#[cfg(target_os = "linux")]
+fn dup_prepared_root_fds(fds: &[OwnedDirFd]) -> Result<Vec<OwnedDirFd>, SandboxError> {
+    let mut out = Vec::with_capacity(fds.len());
+    for f in fds {
+        out.push(f.dup()?);
     }
     Ok(out)
 }
@@ -819,6 +927,13 @@ fn open_trusted_dev_null_fd() -> Result<OwnedDirFd, SandboxError> {
 #[cfg(target_os = "linux")]
 struct OwnedDirFd {
     fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for OwnedDirFd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedDirFd").field("fd", &self.fd).finish()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -869,6 +984,25 @@ impl OwnedDirFd {
 
     fn as_raw_fd_i32(&self) -> i32 {
         self.fd
+    }
+
+    /// Duplicate this FD (`F_DUPFD_CLOEXEC`). Pure descriptor clone — never
+    /// re-resolves a pathname. Used by per-spawn `apply_linux` so the
+    /// preparation-time original can stay held for the whole run.
+    fn dup(&self) -> Result<Self, SandboxError> {
+        // F_DUPFD_CLOEXEC = F_DUPFD (0) | O_CLOEXEC-style flag 1030 on Linux.
+        // Value is stable on Linux UAPI: 1030.
+        const F_DUPFD_CLOEXEC: i32 = 1030;
+        // SAFETY: F_DUPFD_CLOEXEC on an FD we own; returns a fresh FD or -1.
+        let new_fd = unsafe { sys_fcntl(self.fd, F_DUPFD_CLOEXEC, 0) };
+        if new_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(SandboxError::Io(format!(
+                "cannot dup trusted root FD {}: {err}",
+                self.fd
+            )));
+        }
+        Ok(Self { fd: new_fd })
     }
 }
 
@@ -1196,12 +1330,10 @@ mod tests {
         ))
     }
 
-    /// Prepare once (as the CLI does) so Apply sees pre-resolved roots.
+    /// Prepare once (as the CLI does) so Apply sees pre-resolved roots + FDs.
     fn resolved_spec(raw: &[PathBuf]) -> SandboxSpec {
         let roots = prepare_writable_roots(raw).expect("prepare roots");
-        SandboxSpec {
-            writable_roots: roots,
-        }
+        SandboxSpec::from_prepared_roots(roots).expect("open prepared roots")
     }
 
     #[cfg(target_os = "macos")]
@@ -1400,12 +1532,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// T1(ii) on Linux under the trusted-FD design: after a post-resolve directory
-    /// → symlink swap, `apply` either fails closed (open of the original path
-    /// hits the symlink via O_NOFOLLOW / non-dir) or succeeds with an FD-spec
+    /// T1(ii) on Linux under the once-per-run trusted-FD design: after a
+    /// post-resolve directory → symlink swap, `apply` still succeeds (it dups
+    /// the preparation-time FDs; it never re-opens pathnames) with an FD-spec
     /// that contains **only FD numbers** — never a pathname that could be
     /// re-resolved to the outside target. Pathnames are gone from the launcher
-    /// contract entirely.
+    /// contract entirely. An open-count counter proves apply does not open.
     #[cfg(target_os = "linux")]
     #[test]
     fn apply_linux_fd_spec_has_no_pathnames_after_symlink_swap() {
@@ -1415,6 +1547,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
+
+        let opens_before = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
 
         // Resolve once (may be Unsupported on old kernels — then nothing to check).
         let mode = match resolve_enforce_spec(std::slice::from_ref(&root)) {
@@ -1429,6 +1563,17 @@ mod tests {
             panic!("expected Enforce");
         };
         let original = spec.writable_roots[0].clone();
+        let opens_after_prep = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        assert!(
+            opens_after_prep > opens_before,
+            "preparation must open trusted root FDs once"
+        );
+        // Held FDs were opened at prep and stay pinned to the original inodes.
+        assert_eq!(
+            spec.prepared.root_fds.len(),
+            spec.writable_roots.len(),
+            "one held FD per prepared root"
+        );
 
         let aside = base.join("root-aside");
         std::fs::rename(&root, &aside).unwrap();
@@ -1436,47 +1581,114 @@ mod tests {
 
         let mut cmd = Command::new("placeholder");
         let bin = PathBuf::from("/bin/echo");
-        match apply(&mut cmd, &bin, &["hi"][..], &mode) {
-            Ok(()) => {
-                let got: Vec<_> = cmd
-                    .get_args()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .collect();
-                assert_eq!(got[0], LANDLOCK_LAUNCHER_ARG);
-                let spec_json = &got[1];
-                // Spec is FD-only JSON: must parse as LandlockFdSpec and must
-                // NOT contain any pathname (neither original nor outside).
-                let decoded: LandlockFdSpec =
-                    serde_json::from_str(spec_json).expect("fd-spec json");
-                assert!(
-                    !decoded.root_fds.is_empty(),
-                    "fd-spec must carry at least one root fd: {spec_json}"
-                );
-                assert!(
-                    !spec_json.contains(original.to_str().unwrap()),
-                    "fd-spec must not embed pathnames; got {spec_json}"
-                );
-                let outside_canon = std::fs::canonicalize(&outside).unwrap();
-                if let Some(s) = outside_canon.to_str() {
-                    assert!(
-                        !spec_json.contains(s),
-                        "fd-spec must not re-resolve to symlink target; got {spec_json}"
-                    );
-                }
-            }
-            // Fail-closed is also correct: O_NOFOLLOW/O_DIRECTORY open of a
-            // path whose final component is now a symlink (or whose directory
-            // was renamed away) must not authorize the outside target.
-            Err(SandboxError::Io(msg)) => {
-                assert!(
-                    msg.contains("trusted root") || msg.contains("symlink") || msg.contains("open"),
-                    "unexpected Io error after swap: {msg}"
-                );
-            }
-            Err(SandboxError::Unsupported) => {}
-            Err(e) => panic!("unexpected: {e}"),
+        // Apply must succeed: it dups held FDs and never re-opens the (now
+        // swapped) pathnames. A post-prep ancestor swap cannot redirect them.
+        apply(&mut cmd, &bin, &["hi"][..], &mode).expect("apply after swap must use held FDs");
+        let opens_after_apply = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            opens_after_apply, opens_after_prep,
+            "apply must not open any additional trusted-root pathnames"
+        );
+
+        let got: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got[0], LANDLOCK_LAUNCHER_ARG);
+        let spec_json = &got[1];
+        // Spec is FD-only JSON: must parse as LandlockFdSpec and must
+        // NOT contain any pathname (neither original nor outside).
+        let decoded: LandlockFdSpec = serde_json::from_str(spec_json).expect("fd-spec json");
+        assert!(
+            !decoded.root_fds.is_empty(),
+            "fd-spec must carry at least one root fd: {spec_json}"
+        );
+        assert!(
+            !spec_json.contains(original.to_str().unwrap()),
+            "fd-spec must not embed pathnames; got {spec_json}"
+        );
+        let outside_canon = std::fs::canonicalize(&outside).unwrap();
+        if let Some(s) = outside_canon.to_str() {
+            assert!(
+                !spec_json.contains(s),
+                "fd-spec must not re-resolve to symlink target; got {spec_json}"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// FDs are opened exactly once per run: two applies after a single
+    /// preparation do not perform additional pathname opens.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_root_fds_opened_once_per_run_not_per_apply() {
+        let root = unique("open-once");
+        std::fs::create_dir_all(&root).unwrap();
+        let opens_before = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let mode = match resolve_enforce_spec(std::slice::from_ref(&root)) {
+            Ok(m) => m,
+            Err(SandboxError::Unsupported) => {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            Err(e) => panic!("resolve: {e}"),
+        };
+        let opens_after_prep = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            opens_after_prep,
+            opens_before + 1,
+            "one root → exactly one pathname open at prep"
+        );
+
+        let bin = PathBuf::from("/bin/echo");
+        for _ in 0..3 {
+            let mut cmd = Command::new("placeholder");
+            apply(&mut cmd, &bin, &["hi"][..], &mode).expect("apply");
+        }
+        let opens_after_applies = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            opens_after_applies, opens_after_prep,
+            "three applies must not open any additional pathnames"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `SandboxMode::Off` never opens trusted root FDs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_mode_opens_no_trusted_root_fds() {
+        let opens_before = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let mut cmd = Command::new("placeholder");
+        let bin = PathBuf::from("/bin/echo");
+        apply(&mut cmd, &bin, &["hi"][..], &SandboxMode::Off).unwrap();
+        let opens_after = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            opens_after, opens_before,
+            "Off must not open trusted root FDs"
+        );
+        // And constructing Off does not touch PreparedRoots either.
+        let _ = SandboxMode::Off;
+        assert_eq!(
+            TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed),
+            opens_before
+        );
+    }
+
+    /// Spec equality is path-based; two preparations of the same roots compare
+    /// equal even though their held FDs differ.
+    #[test]
+    fn sandbox_spec_eq_compares_paths_not_fds() {
+        let root = unique("eq-paths");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = prepare_writable_roots(std::slice::from_ref(&root)).unwrap();
+        let a = SandboxSpec::from_prepared_roots(roots.clone()).expect("a");
+        let b = SandboxSpec::from_prepared_roots(roots).expect("b");
+        assert_eq!(a, b, "path-equal specs must compare equal");
+        assert_eq!(a.writable_roots, b.writable_roots);
+        // Clone shares the Arc; equality still holds.
+        let c = a.clone();
+        assert_eq!(a, c);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// U1: user-owned 0555 directory containing a symlink must be REJECTED by
