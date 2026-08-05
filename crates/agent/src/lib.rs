@@ -9,6 +9,7 @@
 //! - [`model`] — [`ModelStream`] trait so the loop is testable without network.
 //! - [`env`] — [`ExecutionEnv`] tool boundary (agent proposes, host executes).
 //! - [`greppy_env`] — production [`GreppyEnv`]: `greppy` + `bash` tools over self-invocation.
+//! - [`workspace`] — per-run git worktree isolation and review-patch proposals.
 //! - [`agent_loop`] — ported multi-turn agent loop (pi v0.80.2 semantics, MIT).
 //!
 //! Dependencies are deliberately minimal (`serde` / `serde_json` / plain-HTTP
@@ -24,6 +25,7 @@ pub mod greppy_env;
 pub mod model;
 pub mod protocol;
 pub mod wire;
+pub mod workspace;
 
 pub use agent_loop::{run_agent_loop, AgentConfig, LoopError, LoopEvent, LoopResult, LoopStop};
 pub use client::{Client, ClientError, ProbeError, TurnResult};
@@ -35,3 +37,4 @@ pub use protocol::{
     Usage,
 };
 pub use wire::{to_messages_request_body, SseParser};
+pub use workspace::{AgentWorkspace, RunOutcome, WorkspaceError};
