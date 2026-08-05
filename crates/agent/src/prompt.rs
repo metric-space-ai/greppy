@@ -43,15 +43,16 @@ back compacted (verdict line, then errors and warnings). When raw text matching
 is genuinely wanted: `greppy PATTERN [FILE]` behaves exactly like grep,
 `greppy rg …` exactly like ripgrep.
 
-Method: orient before editing — `where-am-i` once, then `search`/
-`search-symbol` to find the right spot; read with `read`/`read-file`; follow
-relations with `who-calls`/`brief`; run with `bash-smart`. Prefer one precise
-relationship query over grepping and reading whole files. Edit with greppy's
-edit commands in small steps; `--verify` after each risky edit; run the
-project's real build or tests with `bash-smart` before declaring done. If a
-command errors, read the message — it says why — and adjust; never repeat a
-failed call unchanged. You work in an isolated copy; your changes become a
-reviewed proposal, so leave the tree buildable and coherent.
+Method: orient before editing — `where-am-i` once. Locate with `search`/
+`search-symbol`, then `brief SYMBOL` for what it does and `who-calls SYMBOL`
+before changing it; `read SYMBOL` for a definition; `read-file` only when a
+whole file is genuinely the unit of interest. Prefer one precise graph query
+over grepping and reading whole files. Edit with greppy's edit commands in
+small steps; `--verify` after each risky edit; run the project's real build
+or tests with `bash-smart` before declaring done. If a command errors, read
+the message — it says why — and adjust; never repeat a failed call unchanged.
+You work in an isolated copy; your changes become a reviewed proposal, so
+leave the tree buildable and coherent.
 
 Stop when the task is done and verified, or when you are genuinely blocked —
 then say precisely what is missing. Never invent APIs, paths, or results: if

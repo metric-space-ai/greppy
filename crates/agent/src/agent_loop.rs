@@ -40,6 +40,12 @@ pub struct AgentConfig {
     pub max_tokens: u64,
     /// Tool-choice policy. Default: [`ToolChoice::Auto`].
     pub tool_choice: ToolChoice,
+    /// Consecutive failed tool outcomes before an advisory is appended to the
+    /// tool result. Default: 4.
+    pub consecutive_failure_advisory: usize,
+    /// Consecutive failed tool outcomes before the loop stops as
+    /// [`LoopStop::Stuck`]. Default: 8.
+    pub consecutive_failure_stop: usize,
 }
 
 impl Default for AgentConfig {
@@ -50,6 +56,8 @@ impl Default for AgentConfig {
             model: String::new(),
             max_tokens: 8192,
             tool_choice: ToolChoice::Auto,
+            consecutive_failure_advisory: 4,
+            consecutive_failure_stop: 8,
         }
     }
 }
@@ -78,6 +86,18 @@ impl AgentConfig {
         self.max_tokens = n;
         self
     }
+
+    /// Builder: consecutive-failure advisory threshold.
+    pub fn with_consecutive_failure_advisory(mut self, n: usize) -> Self {
+        self.consecutive_failure_advisory = n;
+        self
+    }
+
+    /// Builder: consecutive-failure stop threshold ([`LoopStop::Stuck`]).
+    pub fn with_consecutive_failure_stop(mut self, n: usize) -> Self {
+        self.consecutive_failure_stop = n;
+        self
+    }
 }
 
 /// Why the agent loop stopped successfully.
@@ -89,6 +109,9 @@ pub enum LoopStop {
     MaxTurns,
     /// Model hit its generation token budget.
     MaxTokens,
+    /// Hit [`AgentConfig::consecutive_failure_stop`] failed tool outcomes in a
+    /// row — the agent could not make progress.
+    Stuck,
 }
 
 /// Successful loop outcome.
@@ -192,6 +215,8 @@ pub fn run_agent_loop(
     let mut turns: usize = 0;
     let mut last_stop = LoopStop::EndTurn;
     let mut final_text = String::new();
+    let mut consecutive_failures: usize = 0;
+    let mut turn_budget_advised = false;
 
     // Cap the number of model turns. Each successful stream_turn counts as one.
     while turns < config.max_turns {
@@ -226,13 +251,53 @@ pub fn run_agent_loop(
                 }
 
                 let mut result_parts: Vec<ContentPart> = Vec::with_capacity(tool_calls.len());
+                let mut stuck = false;
                 for (id, name, arguments) in tool_calls {
                     on_event(LoopEvent::ToolStart {
                         call_id: id.clone(),
                         name: name.clone(),
                         arguments: arguments.clone(),
                     });
-                    let outcome = dispatch_tool(env, &name, &arguments);
+                    let mut outcome = dispatch_tool(env, &name, &arguments);
+
+                    if outcome.is_error {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if config.consecutive_failure_advisory > 0
+                            && consecutive_failures == config.consecutive_failure_advisory
+                        {
+                            append_tool_advisory(
+                                &mut outcome.content,
+                                &format!(
+                                    "{} tool calls in a row failed. Change approach: if something the task \
+needs is missing from this environment, stop and report it instead of \
+retrying.",
+                                    config.consecutive_failure_advisory
+                                ),
+                            );
+                        }
+                    } else {
+                        consecutive_failures = 0;
+                    }
+
+                    // Turn-budget awareness: once, when ≤25% of max_turns remain
+                    // and at least one turn was already used.
+                    if !turn_budget_advised
+                        && turns > 0
+                        && config.max_turns > 0
+                        && remaining_turns_at_or_below_quarter(turns, config.max_turns)
+                    {
+                        let remaining = config.max_turns.saturating_sub(turns);
+                        append_tool_advisory(
+                            &mut outcome.content,
+                            &format!(
+                                "{remaining} of {} turns left — wrap up: finish what is verifiable and report \
+the rest.",
+                                config.max_turns
+                            ),
+                        );
+                        turn_budget_advised = true;
+                    }
+
                     on_event(LoopEvent::ToolFinish {
                         call_id: id.clone(),
                         name: name.clone(),
@@ -243,6 +308,13 @@ pub fn run_agent_loop(
                         content: outcome.content,
                         is_error: outcome.is_error,
                     });
+
+                    if config.consecutive_failure_stop > 0
+                        && consecutive_failures >= config.consecutive_failure_stop
+                    {
+                        stuck = true;
+                        break;
+                    }
                 }
 
                 // One user message carrying every tool_result block, in order.
@@ -250,6 +322,11 @@ pub fn run_agent_loop(
                     role: Role::User,
                     content: result_parts,
                 });
+
+                if stuck {
+                    last_stop = LoopStop::Stuck;
+                    break;
+                }
 
                 // Continue the outer loop for the next assistant turn.
                 // If this was the last allowed turn, the while-guard stops us
@@ -277,6 +354,7 @@ pub fn run_agent_loop(
     // If we never broke on a clean EndTurn/MaxTokens (including max_turns == 0
     // or always-tools exhaustion), the provisional MaxTurns stands. When the
     // final turn *did* end cleanly on the last allowed turn, honor that stop.
+    // Stuck already set last_stop and must not be overwritten.
     if turns == 0 {
         last_stop = LoopStop::MaxTurns;
     }
@@ -287,6 +365,24 @@ pub fn run_agent_loop(
         stop: last_stop,
         usage: total_usage,
     })
+}
+
+/// Append one advisory line to a tool result body.
+fn append_tool_advisory(content: &mut String, line: &str) {
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(line);
+}
+
+/// True when turns used leave ≤25% of `max_turns` remaining.
+fn remaining_turns_at_or_below_quarter(turns_used: usize, max_turns: usize) -> bool {
+    if max_turns == 0 {
+        return false;
+    }
+    let remaining = max_turns.saturating_sub(turns_used);
+    // remaining / max_turns <= 0.25  ⇔  remaining * 4 <= max_turns
+    remaining.saturating_mul(4) <= max_turns
 }
 
 /// Stream a turn; on a retryable failure, retry exactly once.
@@ -950,5 +1046,328 @@ mod tests {
         assert_eq!(req.tools.len(), 1);
         assert_eq!(req.tools[0].name, "bash");
         assert_eq!(req.messages.len(), 1);
+    }
+
+    /// Sequence helper: N failing tool turns, optional success, then more fails / end.
+    fn failing_tool_turns(n: usize) -> Vec<ScriptedTurn> {
+        (0..n)
+            .map(|i| {
+                tool_turn(
+                    None,
+                    vec![(&format!("c{i}"), "bash", json!({}))],
+                    usage(1, 1),
+                )
+            })
+            .collect()
+    }
+
+    fn tool_result_contents(result: &LoopResult) -> Vec<(bool, String)> {
+        let mut out = Vec::new();
+        for msg in &result.messages {
+            if msg.role != Role::User {
+                continue;
+            }
+            for part in &msg.content {
+                if let ContentPart::ToolResult {
+                    content, is_error, ..
+                } = part
+                {
+                    out.push((*is_error, content.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn consecutive_failure_counter_resets_on_success() {
+        // 3 fails + 1 success + 3 fails → advisory never fires at threshold 4;
+        // counter reset by the success in the middle.
+        let mut turns = failing_tool_turns(3);
+        turns.push(tool_turn(
+            None,
+            vec![("ok1", "bash", json!({}))],
+            usage(1, 1),
+        ));
+        turns.extend(failing_tool_turns(3));
+        turns.push(text_turn("done", usage(1, 1)));
+
+        // FakeEnv with sequential outcomes via a queue-backed env.
+        struct SeqEnv {
+            tools: Vec<ToolDefinition>,
+            outcomes: VecDeque<ToolOutcome>,
+            calls: usize,
+        }
+        impl ExecutionEnv for SeqEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.tools.clone()
+            }
+            fn call_tool(&mut self, name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.calls += 1;
+                self.outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| ToolOutcome::unknown_tool(name))
+            }
+        }
+
+        let mut outcomes = VecDeque::new();
+        for _ in 0..3 {
+            outcomes.push_back(ToolOutcome::err("fail"));
+        }
+        outcomes.push_back(ToolOutcome::ok("ok"));
+        for _ in 0..3 {
+            outcomes.push_back(ToolOutcome::err("fail"));
+        }
+
+        let mut model = FakeModel::new(turns);
+        let mut env = SeqEnv {
+            tools: vec![bash_tool()],
+            outcomes,
+            calls: 0,
+        };
+        let config = AgentConfig::default()
+            .with_model("mock")
+            .with_max_turns(20)
+            .with_consecutive_failure_advisory(4)
+            .with_consecutive_failure_stop(8);
+
+        let mut events = Vec::new();
+        let result = run_agent_loop(&mut model, &mut env, &config, "x", &mut |e| {
+            events.push(e);
+        })
+        .expect("loop");
+
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(env.calls, 7);
+        let advisory = "4 tool calls in a row failed";
+        let contents = tool_result_contents(&result);
+        assert!(
+            contents.iter().all(|(_, c)| !c.contains(advisory)),
+            "advisory must not fire when streak resets: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_failure_advisory_appears_exactly_once_at_threshold() {
+        // 4 consecutive fails → advisory on the 4th; then end.
+        // Also: after a success, a new streak of 4 gets the advisory again.
+        struct SeqEnv {
+            tools: Vec<ToolDefinition>,
+            outcomes: VecDeque<ToolOutcome>,
+        }
+        impl ExecutionEnv for SeqEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.tools.clone()
+            }
+            fn call_tool(&mut self, name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| ToolOutcome::unknown_tool(name))
+            }
+        }
+
+        // Phase 1: 4 fails → advisory once; model ends.
+        {
+            let mut turns = failing_tool_turns(4);
+            turns.push(text_turn("stopped trying", usage(1, 1)));
+            let mut outcomes = VecDeque::new();
+            for _ in 0..4 {
+                outcomes.push_back(ToolOutcome::err("fail"));
+            }
+            let mut model = FakeModel::new(turns);
+            let mut env = SeqEnv {
+                tools: vec![bash_tool()],
+                outcomes,
+            };
+            let config = AgentConfig::default()
+                .with_model("mock")
+                .with_consecutive_failure_advisory(4)
+                .with_consecutive_failure_stop(8);
+            let result =
+                run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
+            let contents = tool_result_contents(&result);
+            let advisory_hits: Vec<_> = contents
+                .iter()
+                .filter(|(_, c)| c.contains("4 tool calls in a row failed"))
+                .collect();
+            assert_eq!(
+                advisory_hits.len(),
+                1,
+                "advisory exactly once: {contents:?}"
+            );
+            assert!(
+                contents[3].1.contains("4 tool calls in a row failed"),
+                "advisory on 4th: {contents:?}"
+            );
+            // First three must not have it.
+            for (i, (_, c)) in contents.iter().take(3).enumerate() {
+                assert!(
+                    !c.contains("4 tool calls in a row failed"),
+                    "advisory early at {i}: {c}"
+                );
+            }
+        }
+
+        // Phase 2: 4 fails (advisory) + success (reset) + 4 fails (advisory again).
+        {
+            let mut turns = failing_tool_turns(4);
+            turns.push(tool_turn(
+                None,
+                vec![("ok1", "bash", json!({}))],
+                usage(1, 1),
+            ));
+            turns.extend(failing_tool_turns(4));
+            turns.push(text_turn("done", usage(1, 1)));
+
+            let mut outcomes = VecDeque::new();
+            for _ in 0..4 {
+                outcomes.push_back(ToolOutcome::err("fail"));
+            }
+            outcomes.push_back(ToolOutcome::ok("ok"));
+            for _ in 0..4 {
+                outcomes.push_back(ToolOutcome::err("fail"));
+            }
+
+            let mut model = FakeModel::new(turns);
+            let mut env = SeqEnv {
+                tools: vec![bash_tool()],
+                outcomes,
+            };
+            let config = AgentConfig::default()
+                .with_model("mock")
+                .with_max_turns(20)
+                .with_consecutive_failure_advisory(4)
+                .with_consecutive_failure_stop(8);
+            let result =
+                run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
+            let contents = tool_result_contents(&result);
+            let advisory_hits: Vec<_> = contents
+                .iter()
+                .filter(|(_, c)| c.contains("4 tool calls in a row failed"))
+                .collect();
+            assert_eq!(
+                advisory_hits.len(),
+                2,
+                "advisory once per streak: {contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_failure_stuck_at_stop_threshold() {
+        // 8 consecutive fails → Stuck; loop returns what it has (no further model turn).
+        struct SeqEnv {
+            tools: Vec<ToolDefinition>,
+            outcomes: VecDeque<ToolOutcome>,
+            calls: usize,
+        }
+        impl ExecutionEnv for SeqEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.tools.clone()
+            }
+            fn call_tool(&mut self, name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.calls += 1;
+                self.outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| ToolOutcome::unknown_tool(name))
+            }
+        }
+
+        // Provide more scripted turns than needed so Stuck is what stops us.
+        let mut turns = failing_tool_turns(12);
+        turns.push(text_turn("should not reach", usage(1, 1)));
+
+        let mut outcomes = VecDeque::new();
+        for _ in 0..12 {
+            outcomes.push_back(ToolOutcome::err("fail"));
+        }
+
+        let mut model = FakeModel::new(turns);
+        let mut env = SeqEnv {
+            tools: vec![bash_tool()],
+            outcomes,
+            calls: 0,
+        };
+        let config = AgentConfig::default()
+            .with_model("mock")
+            .with_max_turns(20)
+            .with_consecutive_failure_advisory(4)
+            .with_consecutive_failure_stop(8);
+
+        let result = run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
+        assert_eq!(result.stop, LoopStop::Stuck);
+        assert_eq!(env.calls, 8, "must stop after 8th failure");
+        // 8 tool results present in history.
+        let contents = tool_result_contents(&result);
+        assert_eq!(contents.len(), 8);
+        // Advisory at 4th is still present.
+        assert!(
+            contents[3].1.contains("4 tool calls in a row failed"),
+            "advisory on 4th: {:?}",
+            contents[3]
+        );
+    }
+
+    #[test]
+    fn turn_budget_advisory_once_when_quarter_or_less_remain() {
+        // max_turns=4 → after turn 3, remaining=1 → 1*4=4 <= 4, so advise.
+        // Advise once only, even if more tools run in later turns.
+        struct AlwaysOkEnv {
+            tools: Vec<ToolDefinition>,
+        }
+        impl ExecutionEnv for AlwaysOkEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.tools.clone()
+            }
+            fn call_tool(&mut self, _name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                ToolOutcome::ok("ok")
+            }
+        }
+
+        let mut turns = Vec::new();
+        for i in 0..3 {
+            turns.push(tool_turn(
+                None,
+                vec![(&format!("c{i}"), "bash", json!({}))],
+                usage(1, 1),
+            ));
+        }
+        turns.push(text_turn("wrapped up", usage(1, 1)));
+
+        let mut model = FakeModel::new(turns);
+        let mut env = AlwaysOkEnv {
+            tools: vec![bash_tool()],
+        };
+        let config = AgentConfig::default().with_model("mock").with_max_turns(4);
+
+        let result = run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
+        let contents = tool_result_contents(&result);
+        assert_eq!(contents.len(), 3);
+        let budget_hits: Vec<_> = contents
+            .iter()
+            .filter(|(_, c)| c.contains("turns left — wrap up"))
+            .collect();
+        assert_eq!(budget_hits.len(), 1, "budget advisory once: {contents:?}");
+        // Fires on the first tool result of the turn that crosses the threshold
+        // (turn 3 of 4 → remaining 1).
+        assert!(
+            contents[2].1.contains("1 of 4 turns left — wrap up"),
+            "content={}",
+            contents[2].1
+        );
+        // Earlier results must not have it.
+        assert!(!contents[0].1.contains("turns left"));
+        assert!(!contents[1].1.contains("turns left"));
+    }
+
+    #[test]
+    fn remaining_turns_quarter_math() {
+        assert!(!remaining_turns_at_or_below_quarter(1, 40)); // 39 left
+        assert!(remaining_turns_at_or_below_quarter(30, 40)); // 10 left = 25%
+        assert!(remaining_turns_at_or_below_quarter(31, 40)); // 9 left < 25%
+        assert!(!remaining_turns_at_or_below_quarter(29, 40)); // 11 left > 25%
+        assert!(remaining_turns_at_or_below_quarter(3, 4)); // 1 left = 25%
+        assert!(!remaining_turns_at_or_below_quarter(2, 4)); // 2 left = 50%
+        assert!(!remaining_turns_at_or_below_quarter(0, 0));
     }
 }

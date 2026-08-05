@@ -219,6 +219,15 @@ fn greppy_guard(args: &[String]) -> Option<String> {
              the agent; carry out the task directly with the other greppy commands"
         ));
     }
+    // Models sometimes nest the binary name: `["greppy", "rg", …]`. The tool
+    // already *is* greppy — the first argv element must be the subcommand.
+    if first == "greppy" {
+        return Some(
+            "drop the leading \"greppy\" — pass the subcommand directly, \
+             e.g. [\"rg\", \"-n\", \"pattern\"]"
+                .to_string(),
+        );
+    }
     // `bash-smart` is the sanctioned command-execution path under the single
     // greppy tool surface — deliberately allowed here.
     // Reject both `--root` and `--root=…` so the model cannot re-root the
@@ -388,18 +397,35 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
     // must never reach the model as an error — the agent should retry soon
     // and use name/text search meanwhile.
     //
-    // Detected form (exact prefix + span counts): `semantic index building —
-    // N/M spans, ETA …` (see greppy embedding_progress_text).
+    // Emitting site: `embedding_progress_text` in `crates/cli/src/inference.rs`
+    // (also called from search.rs / context.rs / indexing.rs). Stable prefix
+    // is the literal below (em dash U+2014). Match that prefix only — do not
+    // re-derive from JSON fields here (text form is what the tool captures).
     if is_retryable_semantic_index_building(&body) {
         let mut msg = body;
         if !msg.is_empty() && !msg.ends_with('\n') {
             msg.push('\n');
         }
         msg.push_str(
-            "semantic index still building — not an error. Retry this same command              shortly; meanwhile use search-symbol or search-pattern for name/text matches.",
+            "semantic index still building — not an error. Retry this same command \
+             shortly; meanwhile use search-symbol or search-pattern for name/text matches.",
         );
         let msg = truncate_output(msg, max_output_bytes);
         return ToolOutcome::ok(msg);
+    }
+
+    // Sandbox write refusals (macOS Seatbelt / Linux Landlock): surface the
+    // policy in plain language, then keep the original output so the model
+    // still sees the raw errno/path. Narrow — only known refusal signals.
+    if !captured.success && is_sandbox_write_refusal(&body) {
+        let mut msg = String::from(
+            "this run is write-confined to the repository worktree; installing \
+             software or writing outside it is not possible. Work with what the \
+             repository provides, or finish and report the missing tool.\n",
+        );
+        msg.push_str(&body);
+        let msg = truncate_output(msg, max_output_bytes);
+        return ToolOutcome::err(msg);
     }
 
     let body = truncate_output(body, max_output_bytes);
@@ -410,14 +436,53 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
     }
 }
 
+/// Stable prefix of the retryable semantic-index status line.
+///
+/// Must match the format string in `crates/cli/src/inference.rs`
+/// (`embedding_progress_text`): `"semantic index building — {completed}/…"`.
+const SEMANTIC_INDEX_BUILDING_PREFIX: &str = "semantic index building —";
+
 /// True when tool output is the retryable "semantic index building" status.
 ///
-/// Matches greppy's text form: a line containing both
-/// `semantic index building —` and `spans` (with the em dash U+2014). Exit
+/// Matches the CLI's text form by its stable prefix (em dash U+2014). Exit
 /// code is ignored — the status prints with exit 1, which would otherwise
-/// surface as a tool error.
+/// surface as a tool error. Emitting site: `embedding_progress_text` in
+/// `crates/cli/src/inference.rs`.
 fn is_retryable_semantic_index_building(body: &str) -> bool {
-    body.contains("semantic index building —") && body.contains("spans")
+    body.contains(SEMANTIC_INDEX_BUILDING_PREFIX)
+}
+
+/// True when tool output looks like a write-sandbox refusal.
+///
+/// Narrow signals only:
+/// - macOS Seatbelt: `Operation not permitted`
+/// - Linux Landlock / generic POSIX: `Permission denied` with `EACCES`/`EPERM`
+///   text, or bare `EACCES`/`EPERM` errno tokens.
+///
+/// Unrelated failures (compile errors, missing files, non-zero greppy exits)
+/// must not match.
+fn is_sandbox_write_refusal(body: &str) -> bool {
+    // macOS Seatbelt (sandbox-exec) denial text.
+    if body.contains("Operation not permitted") {
+        return true;
+    }
+    // Linux Landlock / openat failures often surface as "Permission denied"
+    // with an errno token nearby. Require both to avoid swallowing ordinary
+    // "permission denied" application messages that lack errno context.
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("permission denied")
+        && (body.contains("EACCES")
+            || body.contains("EPERM")
+            || lower.contains("eacces")
+            || lower.contains("eperm"))
+    {
+        return true;
+    }
+    // Some shells print only the errno name (e.g. `touch: ...: EACCES`).
+    if body.contains("EACCES") || body.contains("EPERM") {
+        return true;
+    }
+    false
 }
 
 /// Deterministic merge: stdout first, then stderr appended (with a separating
@@ -609,6 +674,33 @@ exit 2
     }
 
     #[test]
+    fn guard_leading_greppy_rejected() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "greppy-env-sentinel-nested-greppy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&sentinel);
+        let stub = format!("touch '{}'\nexit 0\n", sentinel.display());
+        let (mut env, _, _) = env_with_stub(&stub);
+        let out = env.call_tool("greppy", &json!({"args": ["greppy", "rg", "--", "429"]}));
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("drop the leading \"greppy\""),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[\"rg\""),
+            "must show the corrected shape; content={}",
+            out.content
+        );
+        assert!(
+            !sentinel.exists(),
+            "stub must not have been invoked for nested greppy argv"
+        );
+    }
+
+    #[test]
     fn guard_root_anywhere_does_not_invoke_stub() {
         let sentinel =
             std::env::temp_dir().join(format!("greppy-env-sentinel-root-{}", std::process::id()));
@@ -711,13 +803,15 @@ exit 2
 
     #[test]
     fn retryable_semantic_index_building_is_non_error() {
-        // Stub prints the exact greppy status line and exits 1 (retryable).
-        let (mut env, _, _) = env_with_stub(
-            r#"
-printf 'semantic index building — 3/12 spans, ETA ~9s (backend cuda)\n'
-exit 1
-"#,
+        // Stub prints the exact greppy status line (emitting site:
+        // crates/cli/src/inference.rs::embedding_progress_text) and exits 1.
+        let exact = "semantic index building — 3/12 spans, ETA ~9s (backend cuda)\n";
+        assert!(
+            exact.starts_with(SEMANTIC_INDEX_BUILDING_PREFIX),
+            "fixture must use the stable CLI prefix"
         );
+        let stub = format!("printf '%s' '{exact}'\nexit 1\n");
+        let (mut env, _, _) = env_with_stub(&stub);
         let out = env.call_tool("greppy", &json!({"args": ["search", "retry flow"]}));
         assert!(
             !out.is_error,
@@ -725,7 +819,7 @@ exit 1
             out.content
         );
         assert!(
-            out.content.contains("semantic index building —"),
+            out.content.contains(SEMANTIC_INDEX_BUILDING_PREFIX),
             "content={}",
             out.content
         );
@@ -737,6 +831,91 @@ exit 1
         assert!(
             out.content.to_ascii_lowercase().contains("retry"),
             "must tell the model to retry; content={}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn sandbox_refusal_macos_seatbelt_is_clarified() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'touch: /Users/x/.local/bin/pytest: Operation not permitted\n' >&2
+exit 1
+"#,
+        );
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["bash-smart", "--", "touch", "/outside"]}),
+        );
+        assert!(out.is_error, "content={}", out.content);
+        assert!(
+            out.content
+                .contains("this run is write-confined to the repository worktree"),
+            "must state the write-confinement rule; content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Operation not permitted"),
+            "must keep the original output; content={}",
+            out.content
+        );
+        // Clarifying sentence comes first.
+        let rule_pos = out
+            .content
+            .find("this run is write-confined")
+            .expect("rule");
+        let raw_pos = out.content.find("Operation not permitted").expect("raw");
+        assert!(
+            rule_pos < raw_pos,
+            "rule before raw; content={}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn sandbox_refusal_linux_eacces_is_clarified() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'pip: install failed: [Errno 13] EACCES: /usr/local/lib\n' >&2
+exit 1
+"#,
+        );
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["bash-smart", "--", "pip", "install", "x"]}),
+        );
+        assert!(out.is_error, "content={}", out.content);
+        assert!(
+            out.content
+                .contains("this run is write-confined to the repository worktree"),
+            "content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("EACCES"),
+            "must keep original; content={}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn ordinary_nonzero_exit_is_not_sandbox_clarified() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'error: no such subcommand\n' >&2
+exit 2
+"#,
+        );
+        let out = env.call_tool("greppy", &json!({"args": ["nope"]}));
+        assert!(out.is_error);
+        assert!(
+            !out.content.contains("write-confined"),
+            "unrelated failures must not get the sandbox rule; content={}",
+            out.content
+        );
+        assert!(
+            out.content.contains("no such subcommand"),
+            "content={}",
             out.content
         );
     }

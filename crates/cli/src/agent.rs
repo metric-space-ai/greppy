@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use greppy_agent::{
     run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
-    LoopEvent, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent, WorkspaceError,
-    SYSTEM_PROMPT,
+    LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
+    WorkspaceError, SYSTEM_PROMPT,
 };
 use greppy_core::workspace as workspace_locator;
 
@@ -33,19 +33,21 @@ const TOOL_LINE_MAX: usize = 120;
 const LONG_HELP: &str = "\
 One-shot coding agent. Works in a disposable git worktree and delivers a
 proposal ref (refs/greppy/agent/<run_id>); inspect with `git show` or apply
-with `git cherry-pick -n`. The single greppy tool (including bash-smart)
-is write-confined to the worktree, temp, greppy store, ~/.cargo and the
-platform cache; reads and network stay open. Pass --no-sandbox (or
-GREPPY_NO_SANDBOX=1) to disable.
+with `git cherry-pick -n`. The agent has exactly one tool — `greppy` —
+covering search/navigate/read/edit; commands run through that tool as
+`bash-smart -- CMD`. The tool is write-confined to the worktree, temp,
+greppy store, ~/.cargo and the platform cache; reads and network stay open.
+Pass --no-sandbox (or GREPPY_NO_SANDBOX=1) to disable.
 
 Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
-gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The standard is
-CLIProxyAPI, which translates all major chat formats/providers to that wire.
-Any compatible server works — e.g. a local llama.cpp/ollama behind such a
-gateway. GREPPY_MODEL / --model is the model id passed through unchanged.
-If the gateway requires an API key (CLIProxyAPI usually does), set
-GREPPY_API_KEY; it is sent as x-api-key and Authorization: Bearer. There is
-no key flag on purpose — keys do not belong on the command line.
+gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The client has
+no TLS stack — only plain-HTTP endpoints (localhost gateways) are reachable;
+https is impossible. The standard is CLIProxyAPI, which translates all major
+chat formats/providers to that wire. GREPPY_MODEL / --model is the model id
+passed through unchanged. If the gateway requires an API key (CLIProxyAPI
+usually does), set GREPPY_API_KEY; it is sent as x-api-key and
+Authorization: Bearer. There is no key flag on purpose — keys do not belong
+on the command line.
 
 Leading `-p` is reserved for the agent; to grep for the literal pattern `-p`,
 use `greppy -e -p …` (or place `-p` later in the invocation).
@@ -308,6 +310,27 @@ fn run_agent(args: AgentArgs) -> u8 {
         let _ = writeln!(stdout);
     }
     let _ = stdout.flush();
+
+    // Stop reason reaches the user BEFORE the proposal block so it is not lost.
+    // MaxTurns / Stuck still produce the proposal (or clean) outcome; exit 0
+    // when a proposal or clean state exists — exit 3 stays for real errors.
+    match &loop_result.stop {
+        LoopStop::MaxTurns => {
+            let _ = writeln!(
+                stderr,
+                "stopped: turn limit reached ({}) — the result may be incomplete",
+                args.max_turns
+            );
+        }
+        LoopStop::Stuck => {
+            let n = config.consecutive_failure_stop;
+            let _ = writeln!(
+                stderr,
+                "stopped: {n} consecutive tool failures — the agent could not make progress"
+            );
+        }
+        LoopStop::EndTurn | LoopStop::MaxTokens => {}
+    }
 
     let commit_message = truncate_chars(&task, 72);
     let outcome = match workspace.finish(&commit_message) {
@@ -896,6 +919,20 @@ mod tests {
         assert!(
             help.contains("network") || help.contains("reads and network"),
             "help must note network stays open: {help}"
+        );
+        // Single-tool surface + bash-smart.
+        assert!(
+            help.contains("exactly one tool") || help.contains("one tool"),
+            "help must describe the single greppy tool surface: {help}"
+        );
+        assert!(
+            help.contains("bash-smart"),
+            "help must mention bash-smart: {help}"
+        );
+        // Plain-HTTP / no-TLS localhost contract (client has no TLS stack).
+        assert!(
+            help.contains("no TLS") || help.contains("plain-HTTP") || help.contains("plain HTTP"),
+            "help must state plain-HTTP/no-TLS: {help}"
         );
     }
 
