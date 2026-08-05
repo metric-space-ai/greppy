@@ -15,8 +15,8 @@ import re
 import subprocess
 import sys
 
-REPO = "/Volumes/tmp/outputs-repo"
-STORE = "/Volumes/tmp/wc-store2"
+REPO = os.environ.get("SMOKE_REPO", "/Volumes/tmp/outputs-repo")
+STORE = os.environ.get("SMOKE_STORE", "/Volumes/tmp/wc-store2")
 
 FORBIDDEN_EVERYWHERE = [
     "::Function::",          # pre-0.3.0 qualified rows

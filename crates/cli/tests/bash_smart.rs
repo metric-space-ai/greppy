@@ -256,9 +256,12 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
 
-    // The contract: the 75ms timeout preempts the child's 5s sleep.
+    // The contract: the 75ms timeout preempts the child's 5s sleep. The
+    // budget covers process startup and store open too, which under machine
+    // load exceed 2s — 4s still proves preemption (a completed sleep would
+    // push the total past 5s).
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(4),
         "kill took {:?} — the timeout did not preempt the child's sleep",
         started.elapsed()
     );
