@@ -51,7 +51,7 @@
 
 <header>
   <h1>greppy 0.4.0 — <code>greppy -p</code> Agent (pi-Rust-Port)</h1>
-  <p class="headline">Kritischer Pfad: WP7 — E2E-Lauf gegen lebenden cli-proxy (läuft) → Kimi-Review → Abschluss. WP1–WP6 vollständig gelandet + verifiziert.</p>
+  <p class="headline">Implementierung KOMPLETT + E2E-bewiesen (WP1–WP7a, Selbst-Review-Fixes gelandet). Einziger offener Punkt: formales Kimi-Review zurückgestellt — Kimi-Quota erschöpft (OWNER).</p>
   <p class="meta">Basis: <code>~/greppy-040</code> · Branch <code>dev-0.4.0</code> ab <code>67b81e3</code> · Stand 05.08.2026 · Board: <code>dev/board_040.html</code> (git-versioniert, event-getrieben)</p>
 </header>
 
@@ -121,6 +121,24 @@
       byte-exakt als <code>crates/agent/src/prompt.rs</code> im WP5-Commit.</p>
     </div>
     <div class="card done">
+      <h3>WP7a — E2E gegen lebenden cli-proxy: BEWIESEN</h3>
+      <p><strong>Lauf 1 (20 s) + Lauf 3 (55 s) ERFOLG:</strong> where-am-i → search-symbol → read →
+      insert-lines → cargo test (3/3) → sauberes Proposal (nur src/main.rs + Cargo.lock).
+      Lauf 2: transienter Gateway-Fehler → Fehlerpfad korrekt (exit 3, Worktree behalten);
+      Ursache-Klasse jetzt retried (<code>0ae9dfb</code>).
+      Nebenbefunde behoben: API-Key-Durchgriff <code>d5b3f01</code>, Binärdatei-Warnung <code>6a5812f</code>,
+      Key-Redaktion in Debug + 429/5xx/Stream-Retry <code>0ae9dfb</code>.
+      Abnahme danach: kompletter Seriallauf beider Pakete — alle Suiten grün (47 agent-Tests).</p>
+      <p class="k">Logs: <code>~/greppy-040-logs/e2e-run{1,2,3}.log</code></p>
+    </div>
+    <div class="card done neg">
+      <h3>WP7b — Kimi-Review: NICHT gelaufen (Quota) → Selbst-Review ersatzweise</h3>
+      <p>claude-kimi antwortete 403 „usage limit reached this billing cycle" — Review-Rolle hat per Regel
+      KEINEN Fallback (Grok schied als Autor aus). Adversariales Selbst-Review des Orchestrators durchgeführt;
+      Funde (Retry-Gap, Debug-Key-Leak) gefixt in <code>0ae9dfb</code>. Formales Kimi-Review bleibt GESCHULDET.</p>
+      <p class="k">Log: <code>~/greppy-040-logs/wp7b-kimi.log</code> · Brief liegt bereit für Re-Run</p>
+    </div>
+    <div class="card done">
       <h3>WP5 + WP6 gelandet + verifiziert</h3>
       <p>Commit <code>84c925e</code>: <code>greppy -p</code> komplett (Intercept vor Passthrough — bestehende
       Suite bleibt grün; Probe-Abbruch; Store-Seeding cp&nbsp;-Rc; Streaming-UX; Proposal-Ausgabe; Loopback-Integrationstest).
@@ -144,19 +162,9 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>WP7a — E2E gegen lebenden cli-proxy <span class="k">(Orchestrator)</span></h3>
-      <p><strong>Lauf 1 ERFOLG (20 s):</strong> where-am-i → search-symbol → read-file → insert-lines →
-      cargo test (3/3 grün) → Proposal-Ref. Nebenbefunde behoben: fehlender API-Key-Durchgriff
-      (<code>d5b3f01</code>, GREPPY_API_KEY) und Binärdatei-Warnung im Proposal (<code>6a5812f</code>).
-      <strong>Lauf 2:</strong> transienter Gateway-5xx nach 4 Calls — Fehlerpfad korrekt (exit 3, Worktree behalten),
-      aber HTTP-5xx wird nicht retried → Fix-Kandidat nach Kimi-Review. Lauf 3 läuft.</p>
-      <p class="k">Logs: <code>~/greppy-040-logs/e2e-run{1,2,3}.log</code></p>
-    </div>
-    <div class="card work">
-      <h3>WP7b — Kimi-Review <span class="k">(claude-kimi, läuft)</span></h3>
-      <p>Unabhängiges Read-only-Review der Serie <code>729b399..HEAD</code>: SSE/Loop-Korrektheit,
-      Worktree-Ausbruchsvektoren, Injection/Key-Leakage, Gateway-Robustheit, Passthrough-Regression, Qualität.</p>
-      <p class="k">Log: <code>~/greppy-040-logs/wp7b-kimi.log</code> · Kimi 1/3</p>
+      <h3>— nichts in Arbeit; wartet auf OWNER-Entscheid (Kimi-Review)</h3>
+      <p>Alle Implementierungs-WPs gelandet und orchestrator-verifiziert. Nächster Schritt hängt am
+      OWNER-Backlog rechts.</p>
     </div>
   </div></div>
 
@@ -171,6 +179,16 @@
   </div></div>
 
   <div class="col"><h2>Backlog + Owner</h2><div class="cards">
+    <div class="card owner">
+      <h3>OWNER: Kimi-Review nachholen — Quota erschöpft (05.08.)</h3>
+      <p>Kimi 403: Zyklus-Limit erreicht. Optionen: Extra-Quota kaufen / auf nächsten Zyklus warten.
+      Review-Brief liegt fertig im Scratchpad; bis dahin gilt: Implementierung selbst-reviewt, formal ungeprüft.</p>
+    </div>
+    <div class="card">
+      <h3>WP7b-Re-Run — Trigger: Kimi wieder erreichbar</h3>
+      <p>Brief: <code>wp7b-kimi-review-brief.md</code> (Serie <code>729b399..0ae9dfb</code>), Read-only,
+      Report-Form VERDICT/FINDINGS/TESTED.</p>
+    </div>
     <div class="card owner">
       <h3>OWNER: Prozess-Sandbox-Härtung</h3>
       <p>Worktree+Review-Patch isoliert Schreibzugriffe, aber <code>bash-smart</code> kann weiterhin Host/Netz erreichen.
@@ -198,6 +216,7 @@
   <div class="sec"><h2>Error-Patterns</h2><ul>
     <li>#1 Bei unerwartetem Verhalten ERST Setup diffen, dann übers Produkt theoretisieren (Bench-Lektion 0.2.1).</li>
     <li>#2 Session-Start-AGENTS.md kann veraltet sein — Toolflächen immer gegen den Ziel-Checkout prüfen (0.3.0 ≠ 0.2.1).</li>
+    <li>#3 NIE zwei cargo-test-Suiten parallel im selben Checkout (Hintergrund-Tasks!) — geteilte Fixtures/Stores erzeugen Phantom-Failures; trial.rs fiel so scheinbar rot aus, allein 4/4 grün.</li>
   </ul></div>
   <div class="sec"><h2>Evidence-Map</h2><ul>
     <li>Entscheide: <code>~/.claude/projects/-Users-michaelwelsch-greppy/memory/greppy-040-agent-architecture.md</code></li>
