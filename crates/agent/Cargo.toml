@@ -1,0 +1,17 @@
+[package]
+name = "greppy-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "greppy agent wire layer: provider-neutral protocol types and Anthropic Messages SSE client"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Plain HTTP only (localhost gateway). No TLS stack.
+ureq = { version = "2", default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }
