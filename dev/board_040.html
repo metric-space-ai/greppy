@@ -228,10 +228,17 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>— nichts in Arbeit. Wartet auf den 0.3.0-Tag der Nachbar-Session</h3>
-      <p>Merge-Freigabe wurde am 06.08. übermittelt (Commit-Bereich, Nachweise, 5 bekannte Grenzen,
-      Hinweis auf den prompt_contract-Hash als einzige Konfliktstelle). Danach: Rebase auf den Tag,
-      Release-Build mit echten Assets, 0.3.1.</p>
+      <h3>— nichts in Arbeit. WARTET auf: 0.3.0 in main</h3>
+      <p><strong>Owner-Entscheid 06.08.:</strong> NICHT jetzt pushen. dev-0.4.0 bleibt lokal in
+      ~/greppy-040, bis die 0.3.0-Linie in main gelandet ist — dann zeigt der PR genau unsere
+      48 Agent-Commits statt 361 (main hinkt der 0.3.0-Arbeit hinterher).</p>
+      <p><strong>Sperre der Nachbar-Session:</strong> AGENTS.md ist deren eingefrorener Bench-Prompt
+      (sha 093fe821…, Commit 880f0eb); der Messlauf läuft 1–2 Tage. Unser AGENT:-Block würde den Hash
+      ändern → Familienläufe stürben fail-closed. Er bleibt bis nach der Messung auf unserem Branch;
+      danach frieren sie bewusst als v3 neu ein.</p>
+      <p class="k">Isoliert in genau 2 Commits: <code>3053355</code> (AGENT:-Block) + <code>f895466</code>
+      (APPROVED_SHA256). Ein Revert dieser beiden landet den Agenten ohne Prompt-Änderung; der Rest hängt
+      nicht daran. Danach: Rebase, Release-Build mit echten Assets, 0.3.1.</p>
     </div>
     <div class="card done">
       <h3>WP22–WP26 — Isolationsgrenze geschlossen</h3>
