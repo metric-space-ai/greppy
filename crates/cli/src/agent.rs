@@ -4,7 +4,7 @@
 //! ordinary `greppy -R …` / pattern invocations remain byte-exact real-grep.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,7 +40,8 @@ search/navigate/read/edit; commands run through that tool as
 `bash-smart -- CMD`. The tool is write-confined to the worktree, a per-run
 scratch dir (TMPDIR), the worktree's greppy store + lock namespace, and
 ~/.cargo/{registry,git}; reads and network stay open. Pass --no-sandbox
-(or GREPPY_NO_SANDBOX=1) to disable.
+(or GREPPY_NO_SANDBOX=1) to disable. Repositories with submodules are not
+supported yet (the agent worktree cannot reset them safely).
 
 Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
 gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The client has
@@ -77,7 +78,7 @@ Flags:
 
 Exit codes:
   0  ok (clean, proposal saved, or applied)
-  2  no gateway / bad usage / missing model
+  2  no gateway / bad usage / missing model / unsupported repository
   3  agent or loop error (worktree kept for debugging)
   4  --apply refused (dirty target) or cherry-pick conflict (ref still available)
 ";
@@ -225,6 +226,50 @@ fn run_agent(args: AgentArgs) -> u8 {
     let model = args.model.as_deref().unwrap_or("").trim().to_string();
     let endpoint = args.endpoint.trim().to_string();
 
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("greppy -p: cannot resolve current directory: {e}");
+            return EXIT_AGENT;
+        }
+    };
+
+    // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
+    // worktree is created and BEFORE contacting the gateway.
+    let run_id = make_run_id();
+    let workspace = match AgentWorkspace::create_with_options(
+        &cwd,
+        &run_id,
+        CreateOptions { fresh: args.fresh },
+    ) {
+        Ok(ws) => ws,
+        Err(WorkspaceError::Unsupported(reason)) => {
+            // Stable user-facing message for the submodule case; fall back to
+            // the typed reason for any future Unsupported variants.
+            if reason.contains("gitmodules") || reason.contains("submodule") {
+                eprintln!(
+                    "greppy -p does not support repositories with submodules yet — \
+                     the agent worktree cannot reset them safely. Run the task \
+                     without -p, or remove the submodule from the working branch."
+                );
+            } else {
+                eprintln!("greppy -p: unsupported repository: {reason}");
+            }
+            return EXIT_USAGE;
+        }
+        Err(e @ WorkspaceError::Tampered { .. }) => {
+            // Create/reuse-reset can surface Tampered when an existing stable
+            // tree fails identity during a path that re-raises rather than
+            // discards; keep the consistent exit-3 shape.
+            report_tampered(&e, None);
+            return EXIT_AGENT;
+        }
+        Err(e) => {
+            eprintln!("greppy -p: workspace create failed: {e}");
+            return EXIT_AGENT;
+        }
+    };
+
     let mut client = Client::new(&endpoint, &model);
     if let Ok(key) = std::env::var("GREPPY_API_KEY") {
         client = client.with_api_key(key);
@@ -237,6 +282,7 @@ fn run_agent(args: AgentArgs) -> u8 {
                  Start one (standard: CLIProxyAPI on 127.0.0.1:8317) or set\n\
                  GREPPY_ENDPOINT / --endpoint. Details: greppy -p --help"
             );
+            keep_worktree_on_error(&workspace);
             return EXIT_USAGE;
         }
         Err(ProbeError::BadResponse(detail)) => {
@@ -245,28 +291,8 @@ fn run_agent(args: AgentArgs) -> u8 {
                  {detail}\n\
                  If it requires an API key, set GREPPY_API_KEY. Details: greppy -p --help"
             );
+            keep_worktree_on_error(&workspace);
             return EXIT_USAGE;
-        }
-    }
-
-    let cwd = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("greppy -p: cannot resolve current directory: {e}");
-            return EXIT_AGENT;
-        }
-    };
-
-    let run_id = make_run_id();
-    let workspace = match AgentWorkspace::create_with_options(
-        &cwd,
-        &run_id,
-        CreateOptions { fresh: args.fresh },
-    ) {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!("greppy -p: workspace create failed: {e}");
-            return EXIT_AGENT;
         }
     };
 
@@ -423,13 +449,9 @@ fn run_agent(args: AgentArgs) -> u8 {
     let outcome = match workspace.finish(&commit_message) {
         Ok(o) => o,
         Err(e @ WorkspaceError::Tampered { .. }) => {
-            let _ = writeln!(
-                stderr,
-                "greppy -p: {e}\n\
-                 the worktree was modified in a way that makes the result untrustworthy; \
-                 the tree was left in place for inspection"
-            );
-            keep_worktree_on_error(&workspace);
+            report_tampered_to(&e, Some(workspace.worktree_path()), &mut stderr);
+            // Tree is already kept by the error path; do not call cleanup.
+            drop(workspace);
             return EXIT_AGENT;
         }
         Err(e) => {
@@ -598,20 +620,51 @@ fn keep_worktree_on_error(workspace: &AgentWorkspace) {
     );
 }
 
+/// Consistent Tampered diagnostic: name the **worktree directory** (not a
+/// nested `.git` control file) and state that it was kept for inspection.
+/// Used by create/reuse-reset, finish, and cleanup paths so exit 3 always has
+/// the same shape.
+fn report_tampered(err: &WorkspaceError, worktree: Option<&Path>) {
+    let mut stderr = io::stderr().lock();
+    report_tampered_to(err, worktree, &mut stderr);
+}
+
+fn report_tampered_to(err: &WorkspaceError, worktree: Option<&Path>, stderr: &mut impl Write) {
+    let kept = match (worktree, err) {
+        (Some(wt), _) => wt.to_path_buf(),
+        (None, WorkspaceError::Tampered { path, .. }) => {
+            // Prefer the worktree directory when the error path is its `.git`.
+            if path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n == ".git")
+            {
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| path.clone())
+            } else {
+                path.clone()
+            }
+        }
+        (None, _) => PathBuf::from("<unknown>"),
+    };
+    let _ = writeln!(
+        stderr,
+        "greppy -p: {err}\n\
+         worktree kept for inspection: {}",
+        kept.display()
+    );
+}
+
 /// Map a cleanup failure to an exit code.
 ///
-/// - [`WorkspaceError::Tampered`] → [`EXIT_AGENT`] (3); message names the path
-///   and states the tree was kept for inspection.
+/// - [`WorkspaceError::Tampered`] → [`EXIT_AGENT`] (3); message names the
+///   worktree directory and states the tree was kept for inspection.
 /// - other errors: log and return `None` so the prior success exit is retained.
 fn map_cleanup_error(err: &WorkspaceError, stderr: &mut impl Write) -> Option<u8> {
     match err {
-        WorkspaceError::Tampered { path, .. } => {
-            let _ = writeln!(
-                stderr,
-                "greppy -p: {err}\n\
-                 worktree kept for inspection: {}",
-                path.display()
-            );
+        WorkspaceError::Tampered { .. } => {
+            report_tampered_to(err, None, stderr);
             Some(EXIT_AGENT)
         }
         other => {
@@ -1296,6 +1349,7 @@ mod tests {
 
     #[test]
     fn cleanup_tampered_maps_to_exit_agent_and_names_path() {
+        // Error path is the worktree directory itself.
         let path = PathBuf::from("/tmp/greppy-agent-wt-inspect");
         let err = WorkspaceError::Tampered {
             path: path.clone(),
@@ -1317,6 +1371,77 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_tampered_names_worktree_when_error_path_is_dot_git() {
+        // Common identity-failure path is `<worktree>/.git`; diagnostic must
+        // still name the worktree directory, not the control file.
+        let wt = PathBuf::from("/tmp/greppy-agent-wt-inspect");
+        let git_file = wt.join(".git");
+        let err = WorkspaceError::Tampered {
+            path: git_file,
+            detail: "pointer mismatch".into(),
+        };
+        let mut stderr = Vec::new();
+        let code = map_cleanup_error(&err, &mut stderr);
+        assert_eq!(code, Some(EXIT_AGENT));
+        let msg = String::from_utf8_lossy(&stderr);
+        assert!(msg.contains("worktree kept for inspection"), "msg={msg}");
+        assert!(
+            msg.contains(wt.to_string_lossy().as_ref()),
+            "msg must name the worktree directory (not only .git): {msg}"
+        );
+        // The "kept for inspection" line should end with the worktree, not `.git`.
+        let kept_line = msg
+            .lines()
+            .find(|l| l.contains("worktree kept for inspection"))
+            .expect("kept line");
+        assert!(
+            !kept_line.trim_end().ends_with(".git"),
+            "kept path must be the worktree dir, got: {kept_line}"
+        );
+    }
+
+    #[test]
+    fn report_tampered_with_explicit_worktree_is_consistent() {
+        // Finish / create paths pass the known worktree directory explicitly.
+        let wt = PathBuf::from("/tmp/greppy-agent-finish-wt");
+        let err = WorkspaceError::Tampered {
+            path: wt.join(".git"),
+            detail: "rewritten pointer".into(),
+        };
+        let mut stderr = Vec::new();
+        report_tampered_to(&err, Some(&wt), &mut stderr);
+        let msg = String::from_utf8_lossy(&stderr);
+        assert!(msg.contains("worktree kept for inspection"), "msg={msg}");
+        assert!(
+            msg.contains(wt.to_string_lossy().as_ref()),
+            "msg must name explicit worktree: {msg}"
+        );
+        assert!(
+            msg.contains("untrustworthy") || msg.contains("rewritten"),
+            "msg={msg}"
+        );
+    }
+
+    #[test]
+    fn report_tampered_create_path_shape() {
+        // Create/reuse-reset path: no separate worktree arg beyond the error.
+        let wt = PathBuf::from("/tmp/greppy-agent-create-wt");
+        let err = WorkspaceError::Tampered {
+            path: wt.clone(),
+            detail: "registration mismatch".into(),
+        };
+        let mut stderr = Vec::new();
+        report_tampered_to(&err, None, &mut stderr);
+        let msg = String::from_utf8_lossy(&stderr);
+        assert!(msg.starts_with("greppy -p: "), "msg={msg}");
+        assert!(msg.contains("worktree kept for inspection"), "msg={msg}");
+        assert!(
+            msg.contains(wt.to_string_lossy().as_ref()),
+            "msg must name worktree: {msg}"
+        );
+    }
+
+    #[test]
     fn cleanup_non_tampered_preserves_success_exit() {
         let err = WorkspaceError::GitFailed {
             command: "git worktree remove".into(),
@@ -1328,5 +1453,13 @@ mod tests {
         assert_eq!(code, None, "non-Tampered cleanup must not force exit 3");
         let msg = String::from_utf8_lossy(&stderr);
         assert!(msg.contains("worktree cleanup failed"), "msg={msg}");
+    }
+
+    #[test]
+    fn long_help_mentions_submodule_limitation() {
+        assert!(
+            LONG_HELP.contains("submodule"),
+            "LONG_HELP must state the submodule limitation"
+        );
     }
 }

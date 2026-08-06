@@ -15,16 +15,17 @@ from pi v0.80.2 (MIT; see THIRD_PARTY.md and licenses/PI-LICENSE.txt).
 Every run works in a per-repository agent worktree under the platform cache.
 Tracked content is reset to HEAD before every run; ignored build caches are
 kept deliberately so repeat runs stay fast (`--fresh` drops them too). Nested
-repositories are removed and submodules are reset when present. The worktree's
-own greppy index is built on first use and kept warm afterwards. The run ends
-as exactly one commit on `refs/greppy/agent/<run_id>`, built from the base
-tree regardless of what happened to HEAD in the worktree — nothing is edited
-in place. `git show <ref>` reviews it, `git cherry-pick -n <ref>` applies it;
-`--apply` does so directly but refuses a checkout with uncommitted changes.
-Concurrent `-p` runs fall back to a disposable temp worktree when the stable
-tree is locked. Host-side git against the worktree pins the linked git
-directory recorded at creation; a rewritten worktree `.git` aborts the run
-(`Tampered`) rather than redirecting into the user checkout.
+repositories are removed; repositories with submodules are refused (the agent
+worktree cannot reset them safely). The worktree's own greppy index is built on
+first use and kept warm afterwards. The run ends as exactly one commit on
+`refs/greppy/agent/<run_id>`, built from the base tree regardless of what
+happened to HEAD in the worktree — nothing is edited in place. `git show <ref>`
+reviews it, `git cherry-pick -n <ref>` applies it; `--apply` does so directly
+but refuses a checkout with uncommitted changes. Concurrent `-p` runs fall
+back to a disposable temp worktree when the stable tree is locked. Host-side
+git against the worktree pins the linked git directory recorded at creation; a
+rewritten worktree `.git` aborts the run (`Tampered`) rather than redirecting
+into the user checkout.
 
 Inference is localhost-only (plain HTTP, no TLS stack in the client): an
 Anthropic-Messages-compatible gateway (standard: CLIProxyAPI on
