@@ -45,10 +45,12 @@ use sha2::{Digest, Sha256};
 pub struct AgentWorkspace {
     repo_root: PathBuf,
     worktree: PathBuf,
-    /// Absolute linked-worktree git directory recorded at creation
-    /// (`git rev-parse --absolute-git-dir`). Every host-side git call against
-    /// the worktree pins this path via `--git-dir` so a poisoned `.git` file
-    /// cannot redirect operations into the user checkout.
+    /// Absolute linked-worktree git directory recorded at creation from the
+    /// **main repository's** worktree registration (`<common>/worktrees/<id>`),
+    /// never rediscovered through the worktree's own `.git` file. Every
+    /// host-side git call against the worktree pins this path via `--git-dir`
+    /// so a poisoned `.git` file cannot redirect operations into the user
+    /// checkout.
     linked_git_dir: PathBuf,
     run_id: String,
     base_commit: String,
@@ -483,7 +485,9 @@ impl AgentWorkspace {
     ///
     /// - **Stable** worktree: reset to HEAD (keeping ignored build caches) and
     ///   release the lock. The directory (and its greppy store) stay on disk.
-    /// - **Temp** worktree: force-remove via `git worktree remove --force`.
+    /// - **Temp** worktree: verify identity, then force-remove via
+    ///   `git worktree remove --force` from the main repo. On
+    ///   [`WorkspaceError::Tampered`] the tree is kept for inspection.
     ///
     /// Proposal refs are **never** deleted.
     pub fn cleanup(self) -> Result<(), WorkspaceError> {
@@ -503,6 +507,9 @@ impl AgentWorkspace {
                 Ok(())
             }
             WorktreeKind::Temp => {
+                // Same identity gate as stable: refuse to act through a tree
+                // whose git pointer no longer matches the main registration.
+                self.verify_identity()?;
                 let wt = path_str(&self.worktree)?.to_string();
                 git_ok_cwd(&self.repo_root, &["worktree", "remove", "--force", &wt])?;
                 Ok(())
@@ -512,12 +519,9 @@ impl AgentWorkspace {
 
     /// Verify the pinned identity still matches the on-disk worktree.
     ///
-    /// Checks, in order:
-    /// 1. `.git` is a regular file whose `gitdir:` target resolves to
-    ///    `linked_git_dir`,
-    /// 2. `git --git-dir=<pinned> --work-tree=<wt> rev-parse --absolute-git-dir`
-    ///    still equals `linked_git_dir`,
-    /// 3. the path is still a registered worktree of `repo_root`.
+    /// Authoritative source is the **main repository's** registration for this
+    /// path; the worktree's `.git` file and a pinned rev-parse are cross-checks
+    /// only. See [`verify_worktree_identity`].
     fn verify_identity(&self) -> Result<(), WorkspaceError> {
         verify_worktree_identity(&self.repo_root, &self.worktree, &self.linked_git_dir)
     }
@@ -605,94 +609,277 @@ fn prepare_stable_worktree(
     }
 
     if stable_dir.exists() {
-        if let Some(linked) = try_existing_linked_git_dir(stable_dir, repo_root) {
-            // Verify before any reset that rediscovers through the tree.
-            verify_worktree_identity(repo_root, stable_dir, &linked)?;
-            reset_worktree_pristine(&linked, stable_dir, base_commit, fresh)?;
-            return Ok(linked);
-        }
-        // Stale / foreign / tampered: prune registration, remove, recreate.
-        let _ = git_run_cwd(repo_root, &["worktree", "prune"]);
-        // Best-effort remove; fall through to add.
-        if let Err(e) = fs::remove_dir_all(stable_dir) {
-            // If still present and non-empty after failure, surface the error.
-            if stable_dir.exists() {
-                return Err(WorkspaceError::Io(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "cannot remove stale agent worktree {}: {e}",
-                        stable_dir.display()
-                    ),
-                )));
+        match try_existing_linked_git_dir(stable_dir, repo_root) {
+            Ok(Some(linked)) => {
+                // Cross-check identity before any reset. Never run git through a
+                // worktree whose pointer no longer matches the main registration.
+                match verify_worktree_identity(repo_root, stable_dir, &linked) {
+                    Ok(()) => {
+                        reset_worktree_pristine(&linked, stable_dir, base_commit, fresh)?;
+                        return Ok(linked);
+                    }
+                    Err(WorkspaceError::Tampered { .. }) => {
+                        // Pointer diverged since last run: discard from the MAIN
+                        // side and recreate. Do NOT run git through the worktree.
+                        eprintln!(
+                            "greppy -p: agent worktree {} discarded — its git pointer no longer matched the main repository registration",
+                            stable_dir.display()
+                        );
+                        discard_worktree_from_main(repo_root, stable_dir)?;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
+            Ok(None) => {
+                // Not registered (or registration unreadable) — discard & recreate.
+                discard_worktree_from_main(repo_root, stable_dir)?;
+            }
+            Err(e) => return Err(e),
         }
     }
 
-    let path_str_s = path_str(stable_dir)?.to_string();
+    add_worktree_and_record(repo_root, stable_dir, base_commit, fresh)
+}
 
+/// Force-remove a (possibly tampered) worktree using only main-repo commands and
+/// plain filesystem removal. Never runs git with the worktree as cwd / via its
+/// `.git` pointer.
+fn discard_worktree_from_main(repo_root: &Path, worktree: &Path) -> Result<(), WorkspaceError> {
+    let wt = path_str(worktree)?.to_string();
+    // Preferred: git worktree remove --force from the main side.
+    let removed = git_run_cwd(repo_root, &["worktree", "remove", "--force", &wt])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !removed {
+        // Registration may be half-broken after a rewritten `.git` (git refuses
+        // remove when the reverse pointer does not match). Wipe the directory
+        // first with plain filesystem ops, then prune the main registry so a
+        // subsequent `worktree add` can re-register the same path.
+        if worktree.exists() {
+            if let Err(e) = fs::remove_dir_all(worktree) {
+                if worktree.exists() {
+                    return Err(WorkspaceError::Io(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot remove stale agent worktree {}: {e}",
+                            worktree.display()
+                        ),
+                    )));
+                }
+            }
+        }
+        let _ = git_run_cwd(repo_root, &["worktree", "prune"]);
+    }
+    Ok(())
+}
+
+fn add_worktree_and_record(
+    repo_root: &Path,
+    worktree: &Path,
+    base_commit: &str,
+    fresh: bool,
+) -> Result<PathBuf, WorkspaceError> {
+    let path_str_s = path_str(worktree)?.to_string();
     git_ok_cwd(
         repo_root,
         &["worktree", "add", "--detach", &path_str_s, base_commit],
     )?;
-    let linked = record_linked_git_dir(stable_dir)?;
-    // Fresh still applies after a brand-new add (clears any ignored material
-    // carried in by sparse/smudge quirks; no-op for a clean tree).
+    // Authoritative pin comes from the MAIN repo registration, never from
+    // rev-parse inside the new worktree.
+    let linked = linked_git_dir_from_main(repo_root, worktree)?.ok_or_else(|| {
+        WorkspaceError::GitFailed {
+            command: "git worktree list --porcelain".into(),
+            stderr: format!(
+                "newly added worktree {} is not registered in the main repository",
+                worktree.display()
+            ),
+            status: None,
+        }
+    })?;
+    // Optional cross-check only: never the source of truth.
+    if let Ok(via_wt) = git_ok_cwd(worktree, &["rev-parse", "--absolute-git-dir"]) {
+        let via = PathBuf::from(&via_wt);
+        let via_canon = via.canonicalize().unwrap_or(via);
+        let linked_canon = linked.canonicalize().unwrap_or_else(|_| linked.clone());
+        if via_canon != linked_canon {
+            return Err(WorkspaceError::GitFailed {
+                command: "git rev-parse --absolute-git-dir".into(),
+                stderr: format!(
+                    "worktree absolute-git-dir {} does not match main registration {}",
+                    via_canon.display(),
+                    linked_canon.display()
+                ),
+                status: None,
+            });
+        }
+    }
     if fresh {
-        reset_worktree_pristine(&linked, stable_dir, base_commit, true)?;
+        reset_worktree_pristine(&linked, worktree, base_commit, true)?;
     }
     Ok(linked)
 }
 
-/// Resolve the linked git dir for an existing on-disk worktree that still
-/// belongs to `repo_root`. Returns `None` when the directory is not a valid
-/// registered worktree (caller will recreate).
-fn try_existing_linked_git_dir(dir: &Path, repo_root: &Path) -> Option<PathBuf> {
-    if !is_valid_worktree_of(dir, repo_root) {
-        return None;
-    }
-    // Safe to rediscover once: is_valid_worktree_of confirmed same common dir.
-    // We still record absolute-git-dir (the *linked* dir, not common) to pin.
-    record_linked_git_dir(dir).ok()
+/// Resolve the linked git dir for an existing on-disk worktree **from the main
+/// repository's registration only**.
+///
+/// Returns:
+/// - `Ok(Some(gitdir))` when the main repo lists this path with a usable gitdir,
+/// - `Ok(None)` when the path is not registered (caller should recreate),
+/// - `Err(_)` on main-repo git failures that prevent a trustworthy answer.
+///
+/// Never reads or runs git through `dir`'s `.git` file.
+fn try_existing_linked_git_dir(
+    dir: &Path,
+    repo_root: &Path,
+) -> Result<Option<PathBuf>, WorkspaceError> {
+    linked_git_dir_from_main(repo_root, dir)
 }
 
-/// Read `git rev-parse --absolute-git-dir` from a freshly created / validated
-/// worktree. Discovery is only used at creation / reuse validation; later
-/// host-side ops use the returned path exclusively.
-fn record_linked_git_dir(worktree: &Path) -> Result<PathBuf, WorkspaceError> {
-    let abs = git_ok_cwd(worktree, &["rev-parse", "--absolute-git-dir"])?;
-    if abs.is_empty() {
-        return Err(WorkspaceError::GitFailed {
-            command: "git rev-parse --absolute-git-dir".into(),
-            stderr: "empty absolute-git-dir".into(),
-            status: None,
-        });
+/// Authoritative linked-git-dir lookup: parse `git worktree list --porcelain`
+/// **in the main repository** and return the `gitdir` belonging to the entry
+/// whose `worktree` path equals `worktree`.
+///
+/// For the main checkout itself porcelain omits an explicit `gitdir` line; that
+/// case returns `None` for agent-worktree purposes. Linked worktrees always
+/// emit a `gitdir` line that points at `<common>/worktrees/<id>` on modern
+/// git; older git may omit it, in which case we recover via a filesystem scan
+/// of `<common>/worktrees/*/gitdir`.
+fn linked_git_dir_from_main(
+    repo_root: &Path,
+    worktree: &Path,
+) -> Result<Option<PathBuf>, WorkspaceError> {
+    let list = git_ok_cwd(repo_root, &["worktree", "list", "--porcelain"])?;
+    let want = worktree
+        .canonicalize()
+        .unwrap_or_else(|_| worktree.to_path_buf());
+
+    // Porcelain entries are blank-line separated blocks:
+    //   worktree <path>
+    //   HEAD <oid>
+    //   branch <ref> | detached
+    //   gitdir <path>            # linked worktrees only (git ≥ 2.36 emits this)
+    //
+    // Older git may omit `gitdir`; fall back to scanning
+    // `<common>/worktrees/*/gitdir` which always records the reverse pointer.
+    let mut current_worktree: Option<PathBuf> = None;
+    let mut current_gitdir: Option<PathBuf> = None;
+    let mut matched_gitdir: Option<Option<PathBuf>> = None;
+
+    let flush = |cw: &mut Option<PathBuf>,
+                 cg: &mut Option<PathBuf>,
+                 matched: &mut Option<Option<PathBuf>>,
+                 want: &Path| {
+        if let Some(wt) = cw.take() {
+            let got = wt.canonicalize().unwrap_or(wt);
+            if path_eq(&got, want) {
+                *matched = Some(cg.take());
+            } else {
+                cg.take();
+            }
+        } else {
+            cg.take();
+        }
+    };
+
+    for line in list.lines() {
+        if line.is_empty() {
+            flush(
+                &mut current_worktree,
+                &mut current_gitdir,
+                &mut matched_gitdir,
+                &want,
+            );
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            // Starting a new entry; flush any previous.
+            flush(
+                &mut current_worktree,
+                &mut current_gitdir,
+                &mut matched_gitdir,
+                &want,
+            );
+            current_worktree = Some(PathBuf::from(rest.trim()));
+        } else if let Some(rest) = line.strip_prefix("gitdir ") {
+            current_gitdir = Some(PathBuf::from(rest.trim()));
+        }
     }
-    let path = PathBuf::from(&abs);
-    // Prefer a canonical form so later equality checks are stable.
-    Ok(path.canonicalize().unwrap_or(path))
+    flush(
+        &mut current_worktree,
+        &mut current_gitdir,
+        &mut matched_gitdir,
+        &want,
+    );
+
+    let Some(gitdir_opt) = matched_gitdir else {
+        return Ok(None);
+    };
+
+    if let Some(gd) = gitdir_opt {
+        let canon = gd.canonicalize().unwrap_or(gd);
+        return Ok(Some(canon));
+    }
+
+    // No explicit gitdir line for this entry. Two possibilities:
+    // 1. This IS the main checkout (porcelain never emits gitdir for it) — not
+    //    an agent worktree; treat as unregistered for reuse purposes.
+    // 2. Older git omitted the line — recover via <common>/worktrees/*/gitdir.
+    if let Some(from_fs) = linked_git_dir_via_common_scan(repo_root, &want)? {
+        return Ok(Some(from_fs));
+    }
+    Ok(None)
 }
 
-/// True when `dir` is a registered worktree of `repo_root` (same git dir).
-fn is_valid_worktree_of(dir: &Path, repo_root: &Path) -> bool {
-    // Must look like a git worktree at all.
-    let inside = git_run_cwd(dir, &["rev-parse", "--is-inside-work-tree"])
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !inside {
-        return false;
+/// Scan `<common-dir>/worktrees/*/gitdir` for a reverse pointer to `worktree`.
+/// Returns the absolute path of the matching worktrees/<id> directory.
+fn linked_git_dir_via_common_scan(
+    repo_root: &Path,
+    worktree_canon: &Path,
+) -> Result<Option<PathBuf>, WorkspaceError> {
+    let common = main_common_dir(repo_root)?;
+    let worktrees_dir = common.join("worktrees");
+    let Ok(entries) = fs::read_dir(&worktrees_dir) else {
+        return Ok(None);
+    };
+    for ent in entries.flatten() {
+        let gitdir_file = ent.path().join("gitdir");
+        let Ok(contents) = fs::read_to_string(&gitdir_file) else {
+            continue;
+        };
+        // Contents are "<worktree-path>/.git\n".
+        let pointed = PathBuf::from(contents.trim());
+        let pointed_wt = pointed
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| pointed.clone());
+        let pointed_canon = pointed_wt
+            .canonicalize()
+            .unwrap_or_else(|_| pointed_wt.clone());
+        if path_eq(&pointed_canon, worktree_canon) {
+            let linked = ent.path();
+            return Ok(Some(linked.canonicalize().unwrap_or(linked)));
+        }
     }
-    // Common git-dir means it belongs to this repository (covers linked worktrees).
-    let Ok(dir_git_common) = git_ok_cwd(dir, &["rev-parse", "--git-common-dir"]) else {
-        return false;
-    };
-    let Ok(repo_git_common) = git_ok_cwd(repo_root, &["rev-parse", "--git-common-dir"]) else {
-        return false;
-    };
-    let dir_common = resolve_maybe_relative(dir, &dir_git_common);
-    let repo_common = resolve_maybe_relative(repo_root, &repo_git_common);
-    match (dir_common.canonicalize(), repo_common.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => dir_common == repo_common,
+    Ok(None)
+}
+
+fn main_common_dir(repo_root: &Path) -> Result<PathBuf, WorkspaceError> {
+    let raw = git_ok_cwd(repo_root, &["rev-parse", "--git-common-dir"])?;
+    let p = resolve_maybe_relative(repo_root, &raw);
+    Ok(p.canonicalize().unwrap_or(p))
+}
+
+fn path_eq(a: &Path, b: &Path) -> bool {
+    // Canonical paths should already be comparable; fall back to component-wise
+    // equality when canonicalize failed earlier.
+    if a == b {
+        return true;
+    }
+    // On macOS /var vs /private/var can still sneak through if only one side
+    // was canonicalized. Try both sides again.
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(aa), Ok(bb)) => aa == bb,
+        _ => false,
     }
 }
 
@@ -706,8 +893,16 @@ fn resolve_maybe_relative(cwd: &Path, p: &str) -> PathBuf {
 }
 
 /// Verify the worktree's control file + registered identity still match the
-/// `linked_git_dir` recorded at creation. On mismatch: typed `Tampered` and no
-/// further git through that tree.
+/// `linked_git_dir` recorded at creation (which itself came from the main
+/// repository registration). On mismatch: typed `Tampered` and no further git
+/// through that tree.
+///
+/// Asserts all three:
+/// (a) the main repo's registration for THIS path yields exactly the recorded
+///     git dir;
+/// (b) the worktree's `.git` control file points at that same git dir;
+/// (c) the recorded git dir exists and lives under the main repo's common dir
+///     (`<common-dir>/worktrees/…`).
 fn verify_worktree_identity(
     repo_root: &Path,
     worktree: &Path,
@@ -718,7 +913,35 @@ fn verify_worktree_identity(
         .canonicalize()
         .unwrap_or_else(|_| linked_git_dir.to_path_buf());
 
-    // 1. `.git` must be a regular file (linked worktrees) pointing at linked_git_dir.
+    // (a) Main-repo registration for this path must yield exactly linked_git_dir.
+    let registered =
+        linked_git_dir_from_main(repo_root, worktree).map_err(|e| WorkspaceError::Tampered {
+            path: worktree.to_path_buf(),
+            detail: format!("cannot read main repository worktree list: {e}"),
+        })?;
+    match registered {
+        Some(reg) => {
+            let reg_canon = reg.canonicalize().unwrap_or(reg);
+            if !path_eq(&reg_canon, &linked_canon) {
+                return Err(WorkspaceError::Tampered {
+                    path: worktree.to_path_buf(),
+                    detail: format!(
+                        "main registration gitdir is {} but run recorded {}",
+                        reg_canon.display(),
+                        linked_canon.display()
+                    ),
+                });
+            }
+        }
+        None => {
+            return Err(WorkspaceError::Tampered {
+                path: worktree.to_path_buf(),
+                detail: "path is no longer a registered worktree of the repository".into(),
+            });
+        }
+    }
+
+    // (b) `.git` must be a regular file pointing at linked_git_dir.
     let meta = fs::symlink_metadata(&git_file).map_err(|e| WorkspaceError::Tampered {
         path: git_file.clone(),
         detail: format!("cannot stat .git control file: {e}"),
@@ -754,7 +977,7 @@ fn verify_worktree_identity(
     let pointed_canon = pointed_abs
         .canonicalize()
         .unwrap_or_else(|_| pointed_abs.clone());
-    if pointed_canon != linked_canon {
+    if !path_eq(&pointed_canon, &linked_canon) {
         return Err(WorkspaceError::Tampered {
             path: git_file,
             detail: format!(
@@ -765,66 +988,58 @@ fn verify_worktree_identity(
         });
     }
 
-    // 2. rev-parse --absolute-git-dir with the pinned flags must still equal the pin.
-    let abs = git_ok_wt(
+    // (c) Recorded git dir must exist and live under <common>/worktrees/.
+    if !linked_canon.is_dir() {
+        return Err(WorkspaceError::Tampered {
+            path: linked_canon.clone(),
+            detail: "recorded linked git dir does not exist or is not a directory".into(),
+        });
+    }
+    let common = main_common_dir(repo_root).map_err(|e| WorkspaceError::Tampered {
+        path: git_file.clone(),
+        detail: format!("cannot resolve main git-common-dir: {e}"),
+    })?;
+    let expected_parent = common.join("worktrees");
+    let expected_parent_canon = expected_parent
+        .canonicalize()
+        .unwrap_or_else(|_| expected_parent.clone());
+    let parent_ok = linked_canon
+        .parent()
+        .map(|p| {
+            let pc = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            path_eq(&pc, &expected_parent_canon)
+        })
+        .unwrap_or(false);
+    if !parent_ok {
+        return Err(WorkspaceError::Tampered {
+            path: linked_canon.clone(),
+            detail: format!(
+                "recorded linked git dir {} is not under {}/worktrees/",
+                linked_canon.display(),
+                common.display()
+            ),
+        });
+    }
+
+    // Cross-check only: pinned rev-parse --absolute-git-dir must agree.
+    // Never used as the source of truth for recording.
+    if let Ok(abs) = git_ok_wt(
         linked_git_dir,
         worktree,
         &["rev-parse", "--absolute-git-dir"],
-    )
-    .map_err(|e| WorkspaceError::Tampered {
-        path: git_file.clone(),
-        detail: format!("pinned rev-parse --absolute-git-dir failed: {e}"),
-    })?;
-    let abs_path = PathBuf::from(&abs);
-    let abs_canon = abs_path.canonicalize().unwrap_or(abs_path);
-    if abs_canon != linked_canon {
-        return Err(WorkspaceError::Tampered {
-            path: git_file.clone(),
-            detail: format!(
-                "pinned absolute-git-dir is {} but run recorded {}",
-                abs_canon.display(),
-                linked_canon.display()
-            ),
-        });
-    }
-
-    // 3. Still a registered worktree of this repository (common dir match).
-    // Use the pinned identity so a poisoned .git cannot fake the answer.
-    let dir_common = git_ok_wt(linked_git_dir, worktree, &["rev-parse", "--git-common-dir"])
-        .map_err(|e| WorkspaceError::Tampered {
-            path: git_file.clone(),
-            detail: format!("pinned rev-parse --git-common-dir failed: {e}"),
-        })?;
-    let repo_common = git_ok_cwd(repo_root, &["rev-parse", "--git-common-dir"]).map_err(|e| {
-        WorkspaceError::Tampered {
-            path: git_file.clone(),
-            detail: format!("repo rev-parse --git-common-dir failed: {e}"),
+    ) {
+        let abs_path = PathBuf::from(&abs);
+        let abs_canon = abs_path.canonicalize().unwrap_or(abs_path);
+        if !path_eq(&abs_canon, &linked_canon) {
+            return Err(WorkspaceError::Tampered {
+                path: git_file,
+                detail: format!(
+                    "pinned absolute-git-dir is {} but run recorded {}",
+                    abs_canon.display(),
+                    linked_canon.display()
+                ),
+            });
         }
-    })?;
-    let dir_common_p = resolve_maybe_relative(worktree, &dir_common);
-    let repo_common_p = resolve_maybe_relative(repo_root, &repo_common);
-    let same = match (dir_common_p.canonicalize(), repo_common_p.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => dir_common_p == repo_common_p,
-    };
-    if !same {
-        return Err(WorkspaceError::Tampered {
-            path: git_file,
-            detail: format!(
-                "worktree common dir {} is not this repository's {}",
-                dir_common_p.display(),
-                repo_common_p.display()
-            ),
-        });
-    }
-
-    // Also require the worktree path to still appear in `git worktree list`
-    // for this repo, so a foreign tree sharing nothing still fails closed.
-    if !is_registered_worktree_path(repo_root, worktree) {
-        return Err(WorkspaceError::Tampered {
-            path: worktree.to_path_buf(),
-            detail: "path is no longer a registered worktree of the repository".into(),
-        });
     }
 
     Ok(())
@@ -844,27 +1059,9 @@ fn parse_gitdir_pointer(contents: &str) -> Option<PathBuf> {
     None
 }
 
-fn is_registered_worktree_path(repo_root: &Path, worktree: &Path) -> bool {
-    let Ok(list) = git_ok_cwd(repo_root, &["worktree", "list", "--porcelain"]) else {
-        return false;
-    };
-    let want = worktree
-        .canonicalize()
-        .unwrap_or_else(|_| worktree.to_path_buf());
-    for line in list.lines() {
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            let p = PathBuf::from(rest.trim());
-            let got = p.canonicalize().unwrap_or(p);
-            if got == want {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Detach at `base_commit`, hard-reset, clean untracked (and nested repos),
-/// and optionally drop ignored files. Submodules are reset when present.
+/// and optionally drop ignored files. Submodules are reset with pinned git
+/// identity (never via `submodule foreach`).
 fn reset_worktree_pristine(
     linked_git_dir: &Path,
     worktree: &Path,
@@ -884,38 +1081,200 @@ fn reset_worktree_pristine(
     } else {
         git_ok_wt(linked_git_dir, worktree, &["clean", "-qffd"])?;
     }
-    // Submodule reset only when the tree has any — a repo without submodules
-    // must not pay the foreach cost (and older git may error without them).
-    // `git submodule` is a script that requires a real working-tree cwd even
-    // when --git-dir/--work-tree are set, so use the cwd-pinned helper.
-    if worktree_has_submodules(worktree) {
-        git_ok_wt_cwd(
-            linked_git_dir,
-            worktree,
-            &[
-                "submodule",
-                "foreach",
-                "--recursive",
-                "git reset --hard && git clean -qffd",
-            ],
-        )?;
-        if fresh {
-            git_ok_wt_cwd(
-                linked_git_dir,
-                worktree,
-                &["submodule", "foreach", "--recursive", "git clean -qffdx"],
-            )?;
-        }
-    }
+    reset_submodules_pinned(linked_git_dir, worktree, fresh)?;
     Ok(())
 }
 
-fn worktree_has_submodules(worktree: &Path) -> bool {
-    // Cheap path: .gitmodules present.
-    if worktree.join(".gitmodules").is_file() {
-        return true;
+/// Reset every submodule with explicitly pinned `--git-dir` / `--work-tree`.
+///
+/// Never uses `git submodule foreach` (which launches nested git that discovers
+/// through each submodule's writable `.git` file). Enumeration is from the
+/// superproject's `.gitmodules` via pinned flags. A submodule whose `.git`
+/// control file does not point at `<linked>/modules/<name>` is removed with
+/// plain filesystem ops and then re-created by a pinned `submodule update`.
+fn reset_submodules_pinned(
+    linked_git_dir: &Path,
+    worktree: &Path,
+    fresh: bool,
+) -> Result<(), WorkspaceError> {
+    let Some(entries) = list_submodule_paths(linked_git_dir, worktree)? else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return Ok(());
     }
-    false
+
+    for (name, rel_path) in &entries {
+        let sub_wt = worktree.join(rel_path);
+        // Trusted module git dir for a linked worktree lives at
+        // <linked_git_dir>/modules/<name>. Nested names keep their slashes
+        // (git stores `modules/vendor/lib`).
+        let trusted_git_dir = linked_git_dir.join("modules").join(name);
+
+        if !sub_wt.exists() {
+            // Missing working directory: let submodule update re-create it.
+            continue;
+        }
+
+        if !submodule_git_points_at(&sub_wt, &trusted_git_dir) {
+            // Do NOT run git inside a redirected submodule. Plain FS removal.
+            if let Err(e) = fs::remove_dir_all(&sub_wt) {
+                if sub_wt.exists() {
+                    return Err(WorkspaceError::Io(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot remove tampered submodule working tree {}: {e}",
+                            sub_wt.display()
+                        ),
+                    )));
+                }
+            }
+            continue;
+        }
+
+        // Trusted pointer: reset with fully pinned flags. No discovery.
+        if trusted_git_dir.is_dir() {
+            let _ = git_ok_wt(&trusted_git_dir, &sub_wt, &["reset", "-q", "--hard"]);
+            if fresh {
+                let _ = git_ok_wt(&trusted_git_dir, &sub_wt, &["clean", "-qffdx"]);
+            } else {
+                let _ = git_ok_wt(&trusted_git_dir, &sub_wt, &["clean", "-qffd"]);
+            }
+        } else {
+            // Module git dir missing: wipe and re-init.
+            let _ = fs::remove_dir_all(&sub_wt);
+        }
+    }
+
+    // Restore superproject gitlinks (and re-create any wiped submodule trees)
+    // with a pinned submodule update. Recursive only when nested modules exist.
+    let recursive = entries.iter().any(|(name, _)| name.contains('/'));
+    let mut args: Vec<&str> = vec!["submodule", "update", "--init", "--force"];
+    if recursive {
+        args.push("--recursive");
+    }
+    // `git submodule` is a shell script that probes cwd even with --git-dir /
+    // --work-tree; keep cwd = worktree, identity still comes from the pin.
+    // protocol.file.allow=always so file:// fixtures (and similar local URLs)
+    // work under modern git defaults.
+    let _ = git_ok_wt_cwd_with_config(
+        linked_git_dir,
+        worktree,
+        &[("protocol.file.allow", "always")],
+        &args,
+    );
+
+    // After update, force-clean again for any trees so a dirty-but-correctly-
+    // pointed submodule that survived the first pass is pristine, and any
+    // re-created tree matches the gitlink.
+    for (name, rel_path) in &entries {
+        let sub_wt = worktree.join(rel_path);
+        let trusted_git_dir = linked_git_dir.join("modules").join(name);
+        if sub_wt.is_dir()
+            && trusted_git_dir.is_dir()
+            && submodule_git_points_at(&sub_wt, &trusted_git_dir)
+        {
+            let _ = git_ok_wt(&trusted_git_dir, &sub_wt, &["reset", "-q", "--hard"]);
+            if fresh {
+                let _ = git_ok_wt(&trusted_git_dir, &sub_wt, &["clean", "-qffdx"]);
+            } else {
+                let _ = git_ok_wt(&trusted_git_dir, &sub_wt, &["clean", "-qffd"]);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Enumerate `(submodule-name, relative-path)` pairs from `.gitmodules` using
+/// pinned superproject flags. Returns `None` when there is no `.gitmodules`.
+fn list_submodule_paths(
+    linked_git_dir: &Path,
+    worktree: &Path,
+) -> Result<Option<Vec<(String, String)>>, WorkspaceError> {
+    if !worktree.join(".gitmodules").is_file() {
+        return Ok(None);
+    }
+    // `git config -f .gitmodules --get-regexp '^submodule\..*\.path$'`
+    // Run with pinned flags + cwd so the relative -f path resolves in the tree.
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(path_str(linked_git_dir)?)
+        .arg("--work-tree")
+        .arg(path_str(worktree)?)
+        .args([
+            "config",
+            "-f",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ])
+        .current_dir(worktree)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .map_err(WorkspaceError::Io)?;
+    if !output.status.success() {
+        // No matches / missing keys → treat as no submodules rather than hard fail.
+        let code = output.status.code();
+        if code == Some(1) {
+            return Ok(Some(Vec::new()));
+        }
+        return Err(git_failed(
+            "git config -f .gitmodules --get-regexp submodule.*.path",
+            &output,
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // Format: "submodule.<name>.path <path>"
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let key = parts.next().unwrap_or("").trim();
+        let path = parts.next().unwrap_or("").trim();
+        if path.is_empty() {
+            continue;
+        }
+        let name = key
+            .strip_prefix("submodule.")
+            .and_then(|s| s.strip_suffix(".path"))
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        out.push((name.to_string(), path.to_string()));
+    }
+    Ok(Some(out))
+}
+
+/// True when `sub_wt/.git` is a regular file whose `gitdir:` target resolves to
+/// `trusted_git_dir`.
+fn submodule_git_points_at(sub_wt: &Path, trusted_git_dir: &Path) -> bool {
+    let git_file = sub_wt.join(".git");
+    let Ok(meta) = fs::symlink_metadata(&git_file) else {
+        return false;
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(contents) = fs::read_to_string(&git_file) else {
+        return false;
+    };
+    let Some(pointed) = parse_gitdir_pointer(&contents) else {
+        return false;
+    };
+    let pointed_abs = if pointed.is_absolute() {
+        pointed
+    } else {
+        sub_wt.join(pointed)
+    };
+    let pointed_canon = pointed_abs
+        .canonicalize()
+        .unwrap_or_else(|_| pointed_abs.clone());
+    let trusted_canon = trusted_git_dir
+        .canonicalize()
+        .unwrap_or_else(|_| trusted_git_dir.to_path_buf());
+    path_eq(&pointed_canon, &trusted_canon)
 }
 
 fn create_temp_worktree(
@@ -934,15 +1293,7 @@ fn create_temp_worktree(
             format!("worktree path already exists: {}", worktree.display()),
         )));
     }
-    let path_s = path_str(&worktree)?.to_string();
-    git_ok_cwd(
-        repo_root,
-        &["worktree", "add", "--detach", &path_s, base_commit],
-    )?;
-    let linked = record_linked_git_dir(&worktree)?;
-    if fresh {
-        reset_worktree_pristine(&linked, &worktree, base_commit, true)?;
-    }
+    let linked = add_worktree_and_record(repo_root, &worktree, base_commit, fresh)?;
     Ok((worktree, linked))
 }
 
@@ -1195,16 +1546,25 @@ fn git_ok_wt(git_dir: &Path, work_tree: &Path, args: &[&str]) -> Result<String, 
 /// Required for `git submodule` (a shell script that probes the cwd working
 /// tree even when `--git-dir`/`--work-tree` are passed). Identity still comes
 /// from the pinned flags, not from rediscovering `.git`.
-fn git_ok_wt_cwd(
+/// Like pinned worktree git with `current_dir = work_tree`, plus optional
+/// `-c key=value` overrides before the subcommand (needed for
+/// `protocol.file.allow=always` on submodule update). Identity still comes
+/// from the pinned flags, not from rediscovering `.git`.
+fn git_ok_wt_cwd_with_config(
     git_dir: &Path,
     work_tree: &Path,
+    config: &[(&str, &str)],
     args: &[&str],
 ) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
-        .arg("--git-dir")
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir")
         .arg(path_str(git_dir)?)
         .arg("--work-tree")
-        .arg(path_str(work_tree)?)
+        .arg(path_str(work_tree)?);
+    for (k, v) in config {
+        cmd.arg("-c").arg(format!("{k}={v}"));
+    }
+    let output = cmd
         .args(args)
         .current_dir(work_tree)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1451,8 +1811,13 @@ mod tests {
         assert_eq!(ws.worktree_path(), &stable);
         assert!(ws.worktree_path().join("hello.txt").is_file());
         assert!(!ws.worktree_path().join("not-a-git-worktree.txt").exists());
-        // Must be a real detached worktree of this repo.
-        assert!(is_valid_worktree_of(ws.worktree_path(), &repo));
+        // Must be a real detached worktree of this repo (main registration).
+        assert!(
+            linked_git_dir_from_main(&repo, ws.worktree_path())
+                .expect("main list")
+                .is_some(),
+            "recreated path must be registered under the main repository"
+        );
         let wt = ws.worktree_path().to_path_buf();
         ws.cleanup().expect("cleanup");
         destroy_stable(&repo, &wt);
@@ -2042,6 +2407,7 @@ mod tests {
         let repo = init_fixture("greppy-ws-tamper-foreign");
         let foreign = init_fixture("greppy-ws-foreign-target");
         let fp_before = main_checkout_fingerprint(&repo);
+        let foreign_fp_before = main_checkout_fingerprint(&foreign);
         let foreign_git = git_c(&foreign, &["rev-parse", "--absolute-git-dir"]);
         let run_id = unique_tag("run-tamper-foreign");
         let ws = AgentWorkspace::create(&repo, &run_id).expect("create");
@@ -2062,17 +2428,14 @@ mod tests {
         );
         assert_eq!(
             main_checkout_fingerprint(&foreign),
-            main_checkout_fingerprint(&foreign), // foreign identity still readable
-            "sanity"
+            foreign_fp_before,
+            "foreign repo HEAD/index must be unchanged after rewrite attack"
         );
-        // Foreign HEAD/index also unchanged relative to its own baseline.
-        let foreign_head = git_c(&foreign, &["rev-parse", "HEAD"]);
         let foreign_index = git_c(&foreign, &["ls-files"]);
         assert!(
             !foreign_index.lines().any(|l| l == "agent-only.txt"),
             "agent content must not stage into foreign"
         );
-        let _ = foreign_head;
 
         destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2211,21 +2574,43 @@ mod tests {
             "hello\n"
         );
 
+        // Also move the submodule HEAD away from the superproject gitlink so
+        // reset must restore the recorded commit, not just files.
+        let gitlink = git_c(ws.worktree_path(), &["rev-parse", "HEAD:vendor/lib"]);
+        git_c(sub_path.as_path(), &["config", "user.name", "fixture"]);
+        git_c(
+            sub_path.as_path(),
+            &["config", "user.email", "fixture@test.local"],
+        );
+        git_c(sub_path.as_path(), &["config", "commit.gpgsign", "false"]);
+        // New commit on a detached HEAD so the gitlink no longer matches.
+        std::fs::write(sub_path.join("hello.txt"), b"moved head\n").unwrap();
+        git_c(sub_path.as_path(), &["add", "hello.txt"]);
+        git_c(sub_path.as_path(), &["commit", "-m", "evil"]);
+        let moved = git_c(sub_path.as_path(), &["rev-parse", "HEAD"]);
+        assert_ne!(moved, gitlink, "precondition: submodule HEAD diverged");
+
         drop(ws);
         let ws2 = AgentWorkspace::create(&repo, &unique_tag("run-submod-2")).expect("reuse");
         let sub2 = ws2.worktree_path().join("vendor/lib");
-        // After reset, submodule content is restored (if still present/initialized).
-        if sub2.join("hello.txt").is_file() {
-            assert_eq!(
-                std::fs::read_to_string(sub2.join("hello.txt")).unwrap(),
-                "hello\n",
-                "submodule tracked file must be reset"
-            );
-            assert!(
-                !sub2.join("extra.txt").exists(),
-                "submodule untracked must be cleaned"
-            );
-        }
+        assert!(
+            sub2.join("hello.txt").is_file(),
+            "submodule must be populated after reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub2.join("hello.txt")).unwrap(),
+            "hello\n",
+            "submodule tracked file must be reset"
+        );
+        assert!(
+            !sub2.join("extra.txt").exists(),
+            "submodule untracked must be cleaned"
+        );
+        let after = git_c(sub2.as_path(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            after, gitlink,
+            "submodule HEAD must match superproject gitlink after reset"
+        );
         ws2.cleanup().expect("cleanup");
         destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2252,5 +2637,317 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- WP22: reuse-time identity from main; submodule pin; temp cleanup ---
+
+    #[test]
+    fn reuse_detects_rewritten_git_to_main_and_recreates_without_touching_main() {
+        let repo = init_fixture("greppy-ws-reuse-main");
+        let fp_before = main_checkout_fingerprint(&repo);
+        let main_git = git_c(&repo, &["rev-parse", "--absolute-git-dir"]);
+        let run_id = unique_tag("run-reuse-main");
+        let ws = AgentWorkspace::create(&repo, &run_id).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        let linked_before = ws.linked_git_dir().to_path_buf();
+        assert!(linked_before.is_dir());
+        // Drop without cleanup so the stable tree (and its lock) is free for reuse.
+        drop(ws);
+
+        // Rewrite .git to the MAIN checkout's .git — deferred attack on next run.
+        std::fs::write(wt.join(".git"), format!("gitdir: {main_git}\n")).unwrap();
+        std::fs::write(wt.join("agent-only.txt"), b"should not stage into main\n").unwrap();
+
+        let ws2 = AgentWorkspace::create(&repo, &unique_tag("run-reuse-main-2")).expect("recreate");
+        assert_eq!(ws2.worktree_path(), &wt);
+        // New registration: linked dir must again live under <common>/worktrees/.
+        let linked2 = ws2.linked_git_dir().to_path_buf();
+        assert!(
+            linked2.is_dir(),
+            "recreated linked git dir must exist: {}",
+            linked2.display()
+        );
+        let common = git_c(&repo, &["rev-parse", "--git-common-dir"]);
+        let common_p = PathBuf::from(&common);
+        let common_abs = if common_p.is_absolute() {
+            common_p
+        } else {
+            repo.join(common_p)
+        };
+        let common_canon = common_abs.canonicalize().unwrap_or(common_abs);
+        let parent = linked2.parent().expect("parent");
+        assert_eq!(
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf()),
+            common_canon.join("worktrees"),
+            "recreated linked dir must live under common/worktrees"
+        );
+        // Worktree content recreated from HEAD — agent-only gone, hello present.
+        assert!(wt.join("hello.txt").is_file());
+        assert!(
+            !wt.join("agent-only.txt").exists(),
+            "agent-only must not survive discard+recreate"
+        );
+        // .git pointer must again target the registration under
+        // <common>/worktrees/, not the main absolute-git-dir itself.
+        let git_contents = std::fs::read_to_string(wt.join(".git")).unwrap();
+        let pointed = parse_gitdir_pointer(&git_contents).expect("gitdir pointer");
+        let pointed_canon = if pointed.is_absolute() {
+            pointed.canonicalize().unwrap_or(pointed)
+        } else {
+            let p = wt.join(&pointed);
+            p.canonicalize().unwrap_or(p)
+        };
+        let main_git_canon = PathBuf::from(main_git.trim())
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(main_git.trim()));
+        assert_ne!(
+            pointed_canon, main_git_canon,
+            ".git must not point at the main absolute-git-dir; contents={git_contents:?}"
+        );
+        assert_eq!(
+            pointed_canon,
+            linked2.canonicalize().unwrap_or(linked2.clone()),
+            ".git must point at the recreated linked git dir"
+        );
+
+        assert_eq!(
+            main_checkout_fingerprint(&repo),
+            fp_before,
+            "main checkout HEAD/symbolic-HEAD/index must be unchanged after reuse recreate"
+        );
+        let index = git_c(&repo, &["ls-files"]);
+        assert!(
+            !index.lines().any(|l| l == "agent-only.txt"),
+            "agent-only.txt must not be staged in main index"
+        );
+
+        ws2.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn reuse_detects_rewritten_git_to_foreign_and_leaves_foreign_untouched() {
+        let repo = init_fixture("greppy-ws-reuse-foreign");
+        let foreign = init_fixture("greppy-ws-reuse-foreign-tgt");
+        let fp_before = main_checkout_fingerprint(&repo);
+        let foreign_fp = main_checkout_fingerprint(&foreign);
+        let foreign_git = git_c(&foreign, &["rev-parse", "--absolute-git-dir"]);
+
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-reuse-foreign")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        drop(ws);
+
+        std::fs::write(wt.join(".git"), format!("gitdir: {foreign_git}\n")).unwrap();
+        std::fs::write(wt.join("agent-only.txt"), b"payload\n").unwrap();
+
+        let ws2 =
+            AgentWorkspace::create(&repo, &unique_tag("run-reuse-foreign-2")).expect("recreate");
+        assert_eq!(ws2.worktree_path(), &wt);
+        assert!(wt.join("hello.txt").is_file());
+        assert!(!wt.join("agent-only.txt").exists());
+
+        assert_eq!(main_checkout_fingerprint(&repo), fp_before);
+        assert_eq!(
+            main_checkout_fingerprint(&foreign),
+            foreign_fp,
+            "foreign repo must be untouched by reuse recovery"
+        );
+        let foreign_index = git_c(&foreign, &["ls-files"]);
+        assert!(!foreign_index.lines().any(|l| l == "agent-only.txt"));
+
+        ws2.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&foreign);
+    }
+
+    #[test]
+    fn finish_tampered_during_run_keeps_tree_and_surfaces_error() {
+        // Same-run tamper is still Tampered (not silent recreate): finish refuses.
+        let repo = init_fixture("greppy-ws-finish-keep");
+        let fp_before = main_checkout_fingerprint(&repo);
+        let main_git = git_c(&repo, &["rev-parse", "--absolute-git-dir"]);
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-finish-keep")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        std::fs::write(wt.join(".git"), format!("gitdir: {main_git}\n")).unwrap();
+        let err = ws.finish("x").expect_err("must Tampered");
+        match err {
+            WorkspaceError::Tampered { path, .. } => {
+                assert!(path.ends_with(".git") || path == wt, "path={path:?}");
+            }
+            other => panic!("expected Tampered, got {other}"),
+        }
+        assert!(wt.exists(), "Tampered must keep the tree for inspection");
+        assert_eq!(main_checkout_fingerprint(&repo), fp_before);
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn cleanup_temp_tampered_keeps_tree_and_errors() {
+        let repo = init_fixture("greppy-ws-temp-tamper");
+        let fp_before = main_checkout_fingerprint(&repo);
+        // Hold the stable lock so create falls back to a temp worktree.
+        let stable = stable_worktree_dir(&repo);
+        let lock_path = stable_lock_path(&stable);
+        let held = try_acquire_lock(&lock_path)
+            .expect("lock io")
+            .expect("must acquire lock");
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-temp-tamper")).expect("temp");
+        assert!(!ws.is_stable(), "must be temp fallback");
+        let wt = ws.worktree_path().to_path_buf();
+        let main_git = git_c(&repo, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(wt.join(".git"), format!("gitdir: {main_git}\n")).unwrap();
+
+        let err = ws.cleanup().expect_err("temp cleanup must Tampered");
+        match err {
+            WorkspaceError::Tampered { .. } => {}
+            other => panic!("expected Tampered, got {other}"),
+        }
+        assert!(
+            wt.exists(),
+            "tampered temp worktree must be kept for inspection"
+        );
+        assert_eq!(main_checkout_fingerprint(&repo), fp_before);
+
+        // Manual cleanup of the abandoned temp tree via main-side discard.
+        discard_worktree_from_main(&repo, &wt).expect("manual discard");
+        drop(held);
+        let _ = fs::remove_file(&lock_path);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn cleanup_stable_tampered_keeps_tree_and_errors() {
+        let repo = init_fixture("greppy-ws-stable-cleanup-tamper");
+        let fp_before = main_checkout_fingerprint(&repo);
+        let ws =
+            AgentWorkspace::create(&repo, &unique_tag("run-stable-cleanup-tamper")).expect("c");
+        let wt = ws.worktree_path().to_path_buf();
+        let main_git = git_c(&repo, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(wt.join(".git"), format!("gitdir: {main_git}\n")).unwrap();
+        let err = ws.cleanup().expect_err("stable cleanup must Tampered");
+        match err {
+            WorkspaceError::Tampered { path, detail } => {
+                assert!(!detail.is_empty());
+                assert!(path.ends_with(".git") || path == wt, "path={path:?}");
+            }
+            other => panic!("expected Tampered, got {other}"),
+        }
+        assert!(wt.exists(), "tampered stable tree kept");
+        assert_eq!(main_checkout_fingerprint(&repo), fp_before);
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn submodule_rewritten_git_is_recreated_not_operated_on() {
+        let repo = init_fixture("greppy-ws-submod-tamper");
+        let sub_src = init_fixture("greppy-ws-submod-tamper-src");
+        let foreign = init_fixture("greppy-ws-submod-foreign");
+        let foreign_fp = main_checkout_fingerprint(&foreign);
+        let foreign_git = git_c(&foreign, &["rev-parse", "--absolute-git-dir"]);
+        let sub_url = format!("file://{}", sub_src.display());
+        git_c(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &sub_url,
+                "vendor/lib",
+            ],
+        );
+        git_c(&repo, &["commit", "-m", "add submodule"]);
+        let gitlink = git_c(&repo, &["rev-parse", "HEAD:vendor/lib"]);
+
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-submod-tamper")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        git_c(
+            wt.as_path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+            ],
+        );
+        let sub_path = wt.join("vendor/lib");
+        assert!(sub_path.join("hello.txt").is_file());
+
+        // Rewrite submodule .git to a foreign repo and plant dirt.
+        std::fs::write(sub_path.join(".git"), format!("gitdir: {foreign_git}\n")).unwrap();
+        std::fs::write(sub_path.join("hello.txt"), b"pwned\n").unwrap();
+        std::fs::write(sub_path.join("extra.txt"), b"extra\n").unwrap();
+
+        drop(ws);
+        let ws2 = AgentWorkspace::create(&repo, &unique_tag("run-submod-tamper-2")).expect("reuse");
+        let sub2 = ws2.worktree_path().join("vendor/lib");
+        // Directory recreated with correct content / gitlink; foreign untouched.
+        assert!(
+            sub2.join("hello.txt").is_file(),
+            "submodule must be re-populated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub2.join("hello.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!sub2.join("extra.txt").exists());
+        let after = git_c(sub2.as_path(), &["rev-parse", "HEAD"]);
+        assert_eq!(after, gitlink, "gitlink restored");
+        // Pointer must not still target the foreign repo.
+        let sub_git = std::fs::read_to_string(sub2.join(".git")).unwrap_or_default();
+        assert!(
+            !sub_git.contains(foreign_git.trim()),
+            "submodule .git must not point at foreign; got {sub_git:?}"
+        );
+        assert_eq!(
+            main_checkout_fingerprint(&foreign),
+            foreign_fp,
+            "foreign redirect target must be unchanged"
+        );
+
+        ws2.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&sub_src);
+        let _ = std::fs::remove_dir_all(&foreign);
+    }
+
+    #[test]
+    fn linked_git_dir_comes_from_main_registration_not_worktree_rev_parse() {
+        let repo = init_fixture("greppy-ws-pin-source");
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-pin-source")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        let linked = ws.linked_git_dir().to_path_buf();
+        // Main registration must agree.
+        let from_main = linked_git_dir_from_main(&repo, &wt)
+            .expect("list")
+            .expect("registered");
+        assert_eq!(
+            linked.canonicalize().unwrap_or(linked.clone()),
+            from_main.canonicalize().unwrap_or(from_main),
+            "pinned linked_git_dir must equal main registration"
+        );
+        // And it must live under common/worktrees.
+        let common = main_common_dir(&repo).expect("common");
+        assert!(
+            linked.starts_with(common.join("worktrees"))
+                || linked
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(common.join("worktrees").canonicalize().unwrap()),
+            "linked={} common={}",
+            linked.display(),
+            common.display()
+        );
+        ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

@@ -509,7 +509,9 @@ fn run_agent(args: AgentArgs) -> u8 {
 
     if exit == EXIT_OK && !args.keep_worktree {
         if let Err(e) = workspace.cleanup() {
-            let _ = writeln!(stderr, "greppy -p: worktree cleanup failed: {e}");
+            if let Some(code) = map_cleanup_error(&e, &mut stderr) {
+                return code;
+            }
         }
     } else if exit != EXIT_OK {
         // Conflict still cleans unless keep — success-path cleanup only when
@@ -594,6 +596,29 @@ fn keep_worktree_on_error(workspace: &AgentWorkspace) {
         "worktree kept for debugging: {}",
         workspace.worktree_path().display()
     );
+}
+
+/// Map a cleanup failure to an exit code.
+///
+/// - [`WorkspaceError::Tampered`] → [`EXIT_AGENT`] (3); message names the path
+///   and states the tree was kept for inspection.
+/// - other errors: log and return `None` so the prior success exit is retained.
+fn map_cleanup_error(err: &WorkspaceError, stderr: &mut impl Write) -> Option<u8> {
+    match err {
+        WorkspaceError::Tampered { path, .. } => {
+            let _ = writeln!(
+                stderr,
+                "greppy -p: {err}\n\
+                 worktree kept for inspection: {}",
+                path.display()
+            );
+            Some(EXIT_AGENT)
+        }
+        other => {
+            let _ = writeln!(stderr, "greppy -p: worktree cleanup failed: {other}");
+            None
+        }
+    }
 }
 
 fn make_run_id() -> String {
@@ -1267,5 +1292,41 @@ mod tests {
             Some(v) => std::env::set_var(greppy_agent::AGENT_RUN_ENV, v),
             None => std::env::remove_var(greppy_agent::AGENT_RUN_ENV),
         }
+    }
+
+    #[test]
+    fn cleanup_tampered_maps_to_exit_agent_and_names_path() {
+        let path = PathBuf::from("/tmp/greppy-agent-wt-inspect");
+        let err = WorkspaceError::Tampered {
+            path: path.clone(),
+            detail: "pointer mismatch".into(),
+        };
+        let mut stderr = Vec::new();
+        let code = map_cleanup_error(&err, &mut stderr);
+        assert_eq!(code, Some(EXIT_AGENT));
+        let msg = String::from_utf8_lossy(&stderr);
+        assert!(msg.contains("worktree kept for inspection"), "msg={msg}");
+        assert!(
+            msg.contains(path.to_string_lossy().as_ref()),
+            "msg must name the worktree path: {msg}"
+        );
+        assert!(
+            msg.contains("untrustworthy") || msg.contains("pointer mismatch"),
+            "msg={msg}"
+        );
+    }
+
+    #[test]
+    fn cleanup_non_tampered_preserves_success_exit() {
+        let err = WorkspaceError::GitFailed {
+            command: "git worktree remove".into(),
+            stderr: "boom".into(),
+            status: Some(128),
+        };
+        let mut stderr = Vec::new();
+        let code = map_cleanup_error(&err, &mut stderr);
+        assert_eq!(code, None, "non-Tampered cleanup must not force exit 3");
+        let msg = String::from_utf8_lossy(&stderr);
+        assert!(msg.contains("worktree cleanup failed"), "msg={msg}");
     }
 }
