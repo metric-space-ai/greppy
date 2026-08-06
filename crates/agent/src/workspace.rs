@@ -358,7 +358,8 @@ impl AgentWorkspace {
         // Author/committer fixed for every agent proposal. Build the commit
         // with plumbing so parent is always base_commit regardless of whatever
         // the model did to HEAD inside the worktree.
-        let commit_out = Command::new("git")
+        let mut commit_cmd = git_command();
+        commit_cmd
             .args([
                 "--git-dir",
                 path_str(&self.linked_git_dir)?,
@@ -378,11 +379,8 @@ impl AgentWorkspace {
             // Neutralise a user template/hooks that might interfere in tests.
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .map_err(WorkspaceError::Io)?;
+            .env("GIT_CONFIG_VALUE_0", "false");
+        let commit_out = commit_cmd.output().map_err(WorkspaceError::Io)?;
         if !commit_out.status.success() {
             return Err(git_failed(
                 "git commit-tree <tree> -p <base> -m <message>",
@@ -724,9 +722,9 @@ fn remove_path_for_discard(worktree: &Path) -> Result<(), WorkspaceError> {
 }
 
 /// `worktree add` for the stable create path, with a single recovery attempt when
-/// git still reports the path as a lingering registration.
+/// the path is still a lingering registration.
 ///
-/// Does **not** use `add -f`. On a registered-path failure: discard via the
+/// Does **not** use `add -f`. On a stale-registration failure: discard via the
 /// main-side helper, then retry the add **exactly once**. Unrelated failures
 /// propagate immediately; the retry cannot loop.
 fn add_worktree_with_stale_recovery(
@@ -737,7 +735,7 @@ fn add_worktree_with_stale_recovery(
 ) -> Result<PathBuf, WorkspaceError> {
     match add_worktree_and_record(repo_root, worktree, base_commit, fresh) {
         Ok(linked) => Ok(linked),
-        Err(e) if is_already_registered_worktree_error(&e) => {
+        Err(e) if should_recover_stale_worktree_add(repo_root, worktree, &e) => {
             discard_worktree_from_main(repo_root, worktree)?;
             // Exactly one retry — no loop.
             add_worktree_and_record(repo_root, worktree, base_commit, fresh)
@@ -746,8 +744,49 @@ fn add_worktree_with_stale_recovery(
     }
 }
 
-/// True when a `worktree add` failed because the path is still registered in the
-/// main repository (missing-on-disk or otherwise).
+/// Decide whether a failed `worktree add` should be recovered by discarding the
+/// path and retrying once.
+///
+/// **Primary (state, locale-independent):** the path is registered in the main
+/// repository (authoritative `worktree list` lookup) but its directory is absent
+/// or not a directory. Recovery triggers on this state regardless of stderr
+/// wording.
+///
+/// **Secondary (hint only):** English stderr fragments such as "already
+/// registered". Git diagnostics are also pinned to the C locale (see
+/// [`configure_git_command`]), so the text match is stable when present, but it
+/// is never required.
+fn should_recover_stale_worktree_add(
+    repo_root: &Path,
+    worktree: &Path,
+    err: &WorkspaceError,
+) -> bool {
+    if is_registered_without_worktree_dir(repo_root, worktree) {
+        return true;
+    }
+    is_already_registered_worktree_error(err)
+}
+
+/// Authoritative state check: main-side registration exists for `worktree`, but
+/// the path is missing or is not a directory (plain file, symlink, etc.).
+fn is_registered_without_worktree_dir(repo_root: &Path, worktree: &Path) -> bool {
+    let registered = match linked_git_dir_from_main(repo_root, worktree) {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(_) => false,
+    };
+    if !registered {
+        return false;
+    }
+    match fs::symlink_metadata(worktree) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(m) => !m.file_type().is_dir(),
+    }
+}
+
+/// Secondary hint: English stderr fragments from a `worktree add` failure.
+/// Locale-pinned git (see [`configure_git_command`]) keeps these stable; the
+/// state-based check above is authoritative.
 fn is_already_registered_worktree_error(err: &WorkspaceError) -> bool {
     match err {
         WorkspaceError::GitFailed {
@@ -776,8 +815,15 @@ fn add_worktree_and_record(
         repo_root,
         &["worktree", "add", "--detach", &path_str_s, base_commit],
     )?;
-    // Authoritative pin comes from the MAIN repo registration, never from
-    // rev-parse inside the new worktree.
+    // Authoritative pin comes from the MAIN repo registration only.
+    //
+    // Chosen (Z2): do **not** run `git rev-parse --absolute-git-dir` with the new
+    // worktree as cwd (discovery through the worktree). The main-side porcelain
+    // lookup below is already authoritative. A create-time cross-check would be
+    // redundant with `verify_worktree_identity`, which pins
+    // `--git-dir=<recorded> --work-tree=<worktree>` before finish/cleanup/reuse
+    // and never records a rediscovered value. Removing the call keeps the create
+    // path free of any worktree-cwd git and free of a second source of truth.
     let linked = linked_git_dir_from_main(repo_root, worktree)?.ok_or_else(|| {
         WorkspaceError::GitFailed {
             command: "git worktree list --porcelain".into(),
@@ -788,23 +834,6 @@ fn add_worktree_and_record(
             status: None,
         }
     })?;
-    // Optional cross-check only: never the source of truth.
-    if let Ok(via_wt) = git_ok_cwd(worktree, &["rev-parse", "--absolute-git-dir"]) {
-        let via = PathBuf::from(&via_wt);
-        let via_canon = via.canonicalize().unwrap_or(via);
-        let linked_canon = linked.canonicalize().unwrap_or_else(|_| linked.clone());
-        if via_canon != linked_canon {
-            return Err(WorkspaceError::GitFailed {
-                command: "git rev-parse --absolute-git-dir".into(),
-                stderr: format!(
-                    "worktree absolute-git-dir {} does not match main registration {}",
-                    via_canon.display(),
-                    linked_canon.display()
-                ),
-                status: None,
-            });
-        }
-    }
     if fresh {
         reset_worktree_pristine(&linked, worktree, base_commit, true)?;
     }
@@ -1455,13 +1484,33 @@ fn path_str(p: &Path) -> Result<&str, WorkspaceError> {
     })
 }
 
+/// Build a `git` Command with diagnostics pinned to the C locale.
+///
+/// Every production git subprocess in this module must go through this helper
+/// (via [`git_run_cwd`] / [`git_run_wt`] or a direct call) so stderr fragments
+/// used for classification stay English regardless of the host `LANG` /
+/// `LC_ALL` / `LANGUAGE`.
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    configure_git_command(&mut cmd);
+    cmd
+}
+
+/// Apply the shared env for every git subprocess this module spawns.
+fn configure_git_command(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Pin diagnostics language so classifiers are not locale-dependent.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env_remove("LANGUAGE");
+}
+
 /// Git against an ordinary checkout (repo root / apply target): discovery via cwd.
 fn git_run_cwd(cwd: &Path, args: &[&str]) -> Result<Output, WorkspaceError> {
-    Command::new("git")
+    git_command()
         .args(args)
         .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .map_err(WorkspaceError::Io)
 }
@@ -1480,14 +1529,12 @@ fn git_ok_cwd(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
 ///
 /// Never relies on cwd discovery of `.git` — a tool can rewrite that file.
 fn git_run_wt(git_dir: &Path, work_tree: &Path, args: &[&str]) -> Result<Output, WorkspaceError> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("--git-dir")
         .arg(path_str(git_dir)?)
         .arg("--work-tree")
         .arg(path_str(work_tree)?)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .args(args);
     cmd.output().map_err(WorkspaceError::Io)
 }
 
@@ -3152,9 +3199,9 @@ gitdir /tmp/second-meta
 
     #[test]
     fn already_registered_error_classifier_and_unrelated_add_failure() {
-        // (c) classifier recognises the registered-path failure messages;
+        // Secondary stderr-hint recognises registered-path failure messages;
         // recovery is non-recursive (calls add once more, never itself) so
-        // retry cannot loop. (d) unrelated worktree-add failures still propagate.
+        // retry cannot loop. Unrelated worktree-add failures still propagate.
         assert!(is_already_registered_worktree_error(&WorkspaceError::GitFailed {
             command: "git worktree add --detach /tmp/x abc".into(),
             stderr: "fatal: '/tmp/x' is a missing but already registered worktree; use 'add -f' to override, or 'prune' or 'remove' to clear\n".into(),
@@ -3186,7 +3233,7 @@ gitdir /tmp/second-meta
             io::Error::other("boom")
         )));
 
-        // (d) Unrelated add failure propagates (invalid base commit OID).
+        // Unrelated add failure propagates (invalid base commit OID).
         let repo = init_fixture("greppy-ws-add-fail");
         let wt = stable_worktree_dir(&repo);
         if let Some(parent) = wt.parent() {
@@ -3213,11 +3260,103 @@ gitdir /tmp/second-meta
                     !is_already_registered_worktree_error(&err),
                     "must be unrelated failure; stderr={stderr}"
                 );
+                assert!(
+                    !should_recover_stale_worktree_add(&repo, &wt, &err),
+                    "unrelated failure must not trigger recovery; stderr={stderr}"
+                );
             }
             other => panic!("expected GitFailed, got {other}"),
         }
         assert!(!wt.exists(), "failed add must not leave a worktree dir");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn state_based_stale_registration_triggers_recovery_without_english_stderr() {
+        // Primary classifier is state, not wording: registration present + path
+        // absent/non-directory => recover, even when the GitFailed stderr is
+        // empty or non-English (locale-independent).
+        let repo = init_fixture("greppy-ws-state-stale");
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-state-stale")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        drop(ws);
+
+        assert!(
+            linked_git_dir_from_main(&repo, &wt)
+                .expect("list")
+                .is_some(),
+            "precondition: registration present"
+        );
+        fs::remove_dir_all(&wt).expect("remove worktree dir");
+        assert!(!wt.exists(), "precondition: directory absent");
+        assert!(
+            is_registered_without_worktree_dir(&repo, &wt),
+            "state classifier must see registration without directory"
+        );
+
+        // Synthetic non-English / empty stderr: text match must NOT be required.
+        let non_english = WorkspaceError::GitFailed {
+            command: "git worktree add --detach /tmp/x abc".into(),
+            stderr: "fatal: «chemin déjà enregistré»\n".into(),
+            status: Some(128),
+        };
+        assert!(
+            !is_already_registered_worktree_error(&non_english),
+            "secondary text match must not fire on non-English wording"
+        );
+        assert!(
+            should_recover_stale_worktree_add(&repo, &wt, &non_english),
+            "state-based recovery must trigger without English stderr"
+        );
+        let empty_stderr = WorkspaceError::GitFailed {
+            command: "git worktree add --detach /tmp/x abc".into(),
+            stderr: String::new(),
+            status: Some(128),
+        };
+        assert!(should_recover_stale_worktree_add(&repo, &wt, &empty_stderr));
+
+        // End-to-end: create recovers via the state path.
+        let ws2 = AgentWorkspace::create(&repo, &unique_tag("run-state-stale-2")).expect("recover");
+        assert_eq!(ws2.worktree_path(), &wt);
+        assert!(wt.is_dir());
+        assert!(wt.join("hello.txt").is_file());
+        ws2.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn git_command_helper_pins_locale_env() {
+        // Every production git Command is built through git_command() /
+        // configure_git_command so diagnostics stay English.
+        let cmd = git_command();
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                let key = k.to_str()?.to_string();
+                match v {
+                    Some(val) => Some((key, val.to_str()?.to_string())),
+                    None => Some((key, String::new())), // env_remove marks as cleared
+                }
+            })
+            .collect();
+        assert_eq!(envs.get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(envs.get("LANG").map(String::as_str), Some("C"));
+        // LANGUAGE must be cleared (present as key with None in Command; we map
+        // that to empty string above, or it may be absent depending on platform
+        // representation — either way it must not carry a non-empty value).
+        match envs.get("LANGUAGE") {
+            None => {}
+            Some(v) => assert!(v.is_empty(), "LANGUAGE must be cleared, got {v:?}"),
+        }
+        assert_eq!(
+            envs.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            envs.get("GIT_CONFIG_NOSYSTEM").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
