@@ -251,15 +251,19 @@ impl AgentWorkspace {
             Err(e) => return Err(e),
         };
 
-        // Refuse repositories with tracked submodules before any worktree is
-        // created or reset. Detection uses the MAIN repository only.
-        if main_tracks_gitmodules(&toplevel)? {
+        // Resolve base_commit FIRST with pinned main-repo flags, then inspect
+        // that exact commit for gitlink entries (mode 160000). Never a second
+        // HEAD lookup — detection and recorded base must be the same object.
+        let main_git_dir =
+            PathBuf::from(git_ok_cwd(&toplevel, &["rev-parse", "--absolute-git-dir"])?);
+        let base_commit = git_ok_wt(&main_git_dir, &toplevel, &["rev-parse", "HEAD"])?;
+        if main_commit_has_gitlinks(&main_git_dir, &toplevel, &base_commit)? {
             return Err(WorkspaceError::Unsupported(
-                "tracked .gitmodules present; greppy -p cannot reset submodules safely".into(),
+                "gitlink entries (submodules) present; greppy -p cannot reset submodules safely"
+                    .into(),
             ));
         }
 
-        let base_commit = git_ok_cwd(&toplevel, &["rev-parse", "HEAD"])?;
         let stable_dir = stable_worktree_dir(&toplevel);
         let lock_path = stable_lock_path(&stable_dir);
 
@@ -682,7 +686,9 @@ fn discard_worktree_from_main(repo_root: &Path, worktree: &Path) -> Result<(), W
                 }
             }
         }
-        let _ = git_run_cwd(repo_root, &["worktree", "prune"]);
+        // Propagate prune failure: a silent prune leave-behind can hide the
+        // original cause of a subsequent `worktree add` failure.
+        git_ok_cwd(repo_root, &["worktree", "prune"])?;
     }
     Ok(())
 }
@@ -753,11 +759,11 @@ fn try_existing_linked_git_dir(
 /// **in the main repository** and return the `gitdir` belonging to the entry
 /// whose `worktree` path equals `worktree`.
 ///
-/// For the main checkout itself porcelain omits an explicit `gitdir` line; that
-/// case returns `None` for agent-worktree purposes. Linked worktrees always
-/// emit a `gitdir` line that points at `<common>/worktrees/<id>` on modern
-/// git; older git may omit it, in which case we recover via a filesystem scan
-/// of `<common>/worktrees/*/gitdir`.
+/// Requires **exactly one** porcelain block matching `worktree`. Zero or many
+/// matching blocks return `None` (same uniqueness rule as the common-dir
+/// reverse scan). For a single match that omits an explicit `gitdir` line
+/// (older git / main checkout), falls through to a reverse scan of
+/// `<common>/worktrees/*/gitdir`.
 fn linked_git_dir_from_main(
     repo_root: &Path,
     worktree: &Path,
@@ -767,81 +773,83 @@ fn linked_git_dir_from_main(
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
 
+    match porcelain_match_gitdir(&list, &want) {
+        PorcelainMatch::None | PorcelainMatch::Ambiguous => Ok(None),
+        PorcelainMatch::One(Some(gd)) => {
+            let canon = gd.canonicalize().unwrap_or(gd);
+            Ok(Some(canon))
+        }
+        PorcelainMatch::One(None) => {
+            // No explicit gitdir line for this entry. Two possibilities:
+            // 1. This IS the main checkout (porcelain never emits gitdir for it)
+            //    — not an agent worktree; treat as unregistered for reuse.
+            // 2. Older git omitted the line — recover via common-dir scan.
+            if let Some(from_fs) = linked_git_dir_via_common_scan(repo_root, &want)? {
+                return Ok(Some(from_fs));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Outcome of matching a worktree path against porcelain `worktree list` output.
+#[derive(Debug, PartialEq, Eq)]
+enum PorcelainMatch {
+    /// Zero matching blocks.
+    None,
+    /// Exactly one matching block; `Some` when it carried an explicit `gitdir`.
+    One(Option<PathBuf>),
+    /// Two or more matching blocks — registration is ambiguous.
+    Ambiguous,
+}
+
+/// Parse `git worktree list --porcelain` text and collect blocks whose
+/// `worktree` path equals `want`. Enforces uniqueness: only exactly one match
+/// is accepted.
+fn porcelain_match_gitdir(list: &str, want: &Path) -> PorcelainMatch {
     // Porcelain entries are blank-line separated blocks:
     //   worktree <path>
     //   HEAD <oid>
     //   branch <ref> | detached
     //   gitdir <path>            # linked worktrees only (git ≥ 2.36 emits this)
-    //
-    // Older git may omit `gitdir`; fall back to scanning
-    // `<common>/worktrees/*/gitdir` which always records the reverse pointer.
     let mut current_worktree: Option<PathBuf> = None;
     let mut current_gitdir: Option<PathBuf> = None;
-    let mut matched_gitdir: Option<Option<PathBuf>> = None;
+    let mut matches: Vec<Option<PathBuf>> = Vec::new();
 
-    let flush = |cw: &mut Option<PathBuf>,
-                 cg: &mut Option<PathBuf>,
-                 matched: &mut Option<Option<PathBuf>>,
-                 want: &Path| {
-        if let Some(wt) = cw.take() {
-            let got = wt.canonicalize().unwrap_or(wt);
-            if path_eq(&got, want) {
-                *matched = Some(cg.take());
+    let flush =
+        |cw: &mut Option<PathBuf>, cg: &mut Option<PathBuf>, matches: &mut Vec<Option<PathBuf>>| {
+            if let Some(wt) = cw.take() {
+                let got = wt.canonicalize().unwrap_or(wt);
+                if path_eq(&got, want) {
+                    matches.push(cg.take());
+                } else {
+                    cg.take();
+                }
             } else {
                 cg.take();
             }
-        } else {
-            cg.take();
-        }
-    };
+        };
 
     for line in list.lines() {
         if line.is_empty() {
-            flush(
-                &mut current_worktree,
-                &mut current_gitdir,
-                &mut matched_gitdir,
-                &want,
-            );
+            flush(&mut current_worktree, &mut current_gitdir, &mut matches);
             continue;
         }
         if let Some(rest) = line.strip_prefix("worktree ") {
             // Starting a new entry; flush any previous.
-            flush(
-                &mut current_worktree,
-                &mut current_gitdir,
-                &mut matched_gitdir,
-                &want,
-            );
+            flush(&mut current_worktree, &mut current_gitdir, &mut matches);
             current_worktree = Some(PathBuf::from(rest.trim()));
         } else if let Some(rest) = line.strip_prefix("gitdir ") {
             current_gitdir = Some(PathBuf::from(rest.trim()));
         }
     }
-    flush(
-        &mut current_worktree,
-        &mut current_gitdir,
-        &mut matched_gitdir,
-        &want,
-    );
+    flush(&mut current_worktree, &mut current_gitdir, &mut matches);
 
-    let Some(gitdir_opt) = matched_gitdir else {
-        return Ok(None);
-    };
-
-    if let Some(gd) = gitdir_opt {
-        let canon = gd.canonicalize().unwrap_or(gd);
-        return Ok(Some(canon));
+    match matches.len() {
+        0 => PorcelainMatch::None,
+        1 => PorcelainMatch::One(matches.remove(0)),
+        _ => PorcelainMatch::Ambiguous,
     }
-
-    // No explicit gitdir line for this entry. Two possibilities:
-    // 1. This IS the main checkout (porcelain never emits gitdir for it) — not
-    //    an agent worktree; treat as unregistered for reuse purposes.
-    // 2. Older git omitted the line — recover via <common>/worktrees/*/gitdir.
-    if let Some(from_fs) = linked_git_dir_via_common_scan(repo_root, &want)? {
-        return Ok(Some(from_fs));
-    }
-    Ok(None)
 }
 
 /// Scan `<common-dir>/worktrees/*/gitdir` for a reverse pointer to `worktree`.
@@ -1100,8 +1108,8 @@ fn parse_gitdir_pointer(contents: &str) -> Option<PathBuf> {
 /// Detach at `base_commit`, hard-reset, and clean untracked (and nested repos).
 /// Optionally drops ignored files (`fresh`). Git failures are always propagated.
 ///
-/// Submodules are **not** handled: create refuses repositories that track
-/// `.gitmodules` (see [`main_tracks_gitmodules`]).
+/// Submodules are **not** handled: create refuses repositories whose recorded
+/// base commit contains gitlink entries (see [`main_commit_has_gitlinks`]).
 fn reset_worktree_pristine(
     linked_git_dir: &Path,
     worktree: &Path,
@@ -1124,33 +1132,45 @@ fn reset_worktree_pristine(
     Ok(())
 }
 
-/// True when the **main** repository's `HEAD` tree tracks a `.gitmodules` file.
+/// True when `base_commit` in the **main** repository contains any gitlink
+/// entry (mode `160000` — a submodule / nested-commit tree entry).
 ///
-/// Detection is pinned to the main repo (`--git-dir` / `--work-tree` of the
-/// operator checkout) and never reads the agent worktree. Used to refuse
-/// create before any worktree is materialised.
-fn main_tracks_gitmodules(repo_root: &Path) -> Result<bool, WorkspaceError> {
-    // `git ls-tree -z --name-only HEAD -- .gitmodules` — empty stdout means not
-    // tracked at HEAD. Exit non-zero (e.g. empty repo without commits) is a
-    // hard error only when the command itself fails; a missing path is success
-    // with empty output.
-    let output = git_run_cwd(
-        repo_root,
-        &["ls-tree", "-z", "--name-only", "HEAD", "--", ".gitmodules"],
+/// Detection is pinned to the main repo (`--git-dir` / `--work-tree`) and
+/// never reads an agent worktree. Uses recursive `ls-tree -r -z` so nested
+/// paths are covered. The commit inspected is the same OID create records as
+/// `base_commit` — never a separate `HEAD` lookup.
+fn main_commit_has_gitlinks(
+    main_git_dir: &Path,
+    work_tree: &Path,
+    base_commit: &str,
+) -> Result<bool, WorkspaceError> {
+    let output = git_run_wt(
+        main_git_dir,
+        work_tree,
+        &["ls-tree", "-r", "-z", base_commit],
     )?;
     if !output.status.success() {
         return Err(git_failed(
-            "git ls-tree -z --name-only HEAD -- .gitmodules",
+            &format!(
+                "git --git-dir={} --work-tree={} ls-tree -r -z {}",
+                main_git_dir.display(),
+                work_tree.display(),
+                base_commit
+            ),
             &output,
         ));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // -z separates entries with NUL; for a single name there may be a trailing
-    // NUL. Any non-empty payload means the path is present at HEAD.
-    Ok(text
-        .as_bytes()
-        .iter()
-        .any(|&b| b != 0 && !b.is_ascii_whitespace()))
+    // Each -z entry is: "<mode> <type> <object>\t<file>\0"
+    // Gitlink (submodule) entries have mode 160000.
+    for entry in output.stdout.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.starts_with(b"160000 ") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn create_temp_worktree(
@@ -2357,8 +2377,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Helper: main git-dir + HEAD for fixture gitlink detection assertions.
+    fn main_git_and_head(repo: &Path) -> (PathBuf, String) {
+        let gd = PathBuf::from(git_c(repo, &["rev-parse", "--absolute-git-dir"]));
+        let head = git_c(repo, &["rev-parse", "HEAD"]);
+        (gd, head)
+    }
+
+    /// Plant a bare gitlink (mode 160000) at `rel_path` without creating
+    /// `.gitmodules`. Uses a real commit OID as the link target.
+    fn plant_gitlink_no_gitmodules(repo: &Path, rel_path: &str, target_oid: &str) {
+        // Three-arg --cacheinfo form is portable across git versions.
+        // No .gitmodules file is written.
+        git_c(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                target_oid,
+                rel_path,
+            ],
+        );
+        git_c(repo, &["commit", "-m", "add bare gitlink"]);
+    }
+
     #[test]
     fn create_refuses_repo_with_tracked_gitmodules() {
+        // Real `git submodule add` path still refuses (gitlinks + .gitmodules).
         let repo = init_fixture("greppy-ws-submod-refuse");
         let sub_src = init_fixture("greppy-ws-submod-refuse-src");
         let sub_url = format!("file://{}", sub_src.display());
@@ -2375,10 +2422,10 @@ mod tests {
         );
         git_c(&repo, &["commit", "-m", "add submodule"]);
 
-        // Precondition: detection sees the tracked .gitmodules.
+        let (gd, head) = main_git_and_head(&repo);
         assert!(
-            main_tracks_gitmodules(&repo).expect("detect"),
-            "fixture must track .gitmodules at HEAD"
+            main_commit_has_gitlinks(&gd, &repo, &head).expect("detect"),
+            "fixture must contain a gitlink at HEAD"
         );
 
         let stable = stable_worktree_dir(&repo);
@@ -2392,15 +2439,14 @@ mod tests {
         match err {
             WorkspaceError::Unsupported(reason) => {
                 assert!(
-                    reason.contains("gitmodules") || reason.contains("submodule"),
+                    reason.contains("gitlink") || reason.contains("submodule"),
                     "reason={reason}"
                 );
             }
             other => panic!("expected Unsupported, got {other}"),
         }
 
-        // Nothing created: no stable worktree, no lock, no temp under greppy-agent
-        // for this run (we never reached prepare).
+        // Nothing created: no stable worktree, no lock.
         assert!(
             !stable.exists(),
             "refused create must not materialise a stable worktree"
@@ -2415,15 +2461,231 @@ mod tests {
     }
 
     #[test]
+    fn create_refuses_gitlink_without_gitmodules() {
+        // A committed mode-160000 entry with NO .gitmodules must still be refused.
+        let repo = init_fixture("greppy-ws-gitlink-no-gm");
+        let sub_src = init_fixture("greppy-ws-gitlink-no-gm-src");
+        let target_oid = git_c(&sub_src, &["rev-parse", "HEAD"]);
+        plant_gitlink_no_gitmodules(&repo, "vendor/lib", &target_oid);
+
+        // Precondition: no .gitmodules, but a gitlink is present.
+        assert!(
+            !repo.join(".gitmodules").exists(),
+            "fixture must not have .gitmodules on disk"
+        );
+        let ls = git_c(&repo, &["ls-tree", "-r", "HEAD"]);
+        assert!(
+            ls.lines().any(|l| l.starts_with("160000 ")),
+            "fixture must contain a gitlink; ls-tree={ls}"
+        );
+        assert!(
+            !ls.contains(".gitmodules"),
+            "fixture tree must not track .gitmodules; ls-tree={ls}"
+        );
+
+        let (gd, head) = main_git_and_head(&repo);
+        assert!(
+            main_commit_has_gitlinks(&gd, &repo, &head).expect("detect"),
+            "detection must see the bare gitlink"
+        );
+
+        let err = AgentWorkspace::create(&repo, &unique_tag("run-gitlink-no-gm"))
+            .expect_err("create must refuse bare-gitlink repos");
+        match err {
+            WorkspaceError::Unsupported(reason) => {
+                assert!(
+                    reason.contains("gitlink") || reason.contains("submodule"),
+                    "reason={reason}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other}"),
+        }
+
+        let stable = stable_worktree_dir(&repo);
+        assert!(!stable.exists(), "refused create must not create worktree");
+        assert!(
+            !stable_lock_path(&stable).exists(),
+            "refused create must not leave a lock"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&sub_src);
+    }
+
+    #[test]
+    fn create_refuses_gitlink_in_subdirectory() {
+        // Nested path (subdir/deep/mod) must be caught by recursive ls-tree -r.
+        let repo = init_fixture("greppy-ws-gitlink-nested");
+        let sub_src = init_fixture("greppy-ws-gitlink-nested-src");
+        let target_oid = git_c(&sub_src, &["rev-parse", "HEAD"]);
+        plant_gitlink_no_gitmodules(&repo, "subdir/deep/mod", &target_oid);
+
+        let (gd, head) = main_git_and_head(&repo);
+        assert!(
+            main_commit_has_gitlinks(&gd, &repo, &head).expect("detect"),
+            "nested gitlink must be detected"
+        );
+
+        let err = AgentWorkspace::create(&repo, &unique_tag("run-gitlink-nested"))
+            .expect_err("create must refuse nested-gitlink repos");
+        match err {
+            WorkspaceError::Unsupported(reason) => {
+                assert!(
+                    reason.contains("gitlink") || reason.contains("submodule"),
+                    "reason={reason}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&sub_src);
+    }
+
+    #[test]
     fn create_unaffected_without_submodules() {
         let repo = init_fixture("greppy-ws-no-submod");
-        assert!(!main_tracks_gitmodules(&repo).expect("detect"));
+        let (gd, head) = main_git_and_head(&repo);
+        assert!(!main_commit_has_gitlinks(&gd, &repo, &head).expect("detect"));
         let ws = AgentWorkspace::create(&repo, &unique_tag("run-no-submod")).expect("create");
+        // Detection commit equals the recorded base_commit.
+        assert_eq!(
+            ws.base_commit(),
+            head,
+            "recorded base_commit must equal the HEAD used for detection"
+        );
         let wt = ws.worktree_path().to_path_buf();
         assert!(wt.join("hello.txt").is_file());
         ws.cleanup().expect("cleanup");
         destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn detection_commit_equals_recorded_base_commit() {
+        // Even with a gitlink present, the OID used for detection is the same
+        // value that would have been recorded (create refuses before writing).
+        let repo = init_fixture("greppy-ws-detect-oid");
+        let sub_src = init_fixture("greppy-ws-detect-oid-src");
+        let target_oid = git_c(&sub_src, &["rev-parse", "HEAD"]);
+        plant_gitlink_no_gitmodules(&repo, "ext", &target_oid);
+
+        let head = git_c(&repo, &["rev-parse", "HEAD"]);
+        let (gd, detect_oid) = main_git_and_head(&repo);
+        assert_eq!(detect_oid, head, "helper HEAD must match rev-parse HEAD");
+        assert!(
+            main_commit_has_gitlinks(&gd, &repo, &detect_oid).expect("detect"),
+            "must detect gitlink at that OID"
+        );
+        // Create refuses; if it had proceeded, base_commit would be that OID.
+        let err =
+            AgentWorkspace::create(&repo, &unique_tag("run-detect-oid")).expect_err("must refuse");
+        assert!(matches!(err, WorkspaceError::Unsupported(_)));
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&sub_src);
+    }
+
+    #[test]
+    fn porcelain_match_enforces_zero_one_many() {
+        // Pure parser test: zero / one / many matching porcelain blocks.
+        let want = PathBuf::from("/tmp/greppy-agent-wt-unique");
+        let want_s = want.to_string_lossy();
+
+        // Zero matches.
+        let zero = "\
+worktree /tmp/other-wt
+HEAD abc
+detached
+gitdir /tmp/other.git
+
+";
+        assert_eq!(
+            porcelain_match_gitdir(zero, &want),
+            PorcelainMatch::None,
+            "zero matching blocks => None"
+        );
+
+        // Exactly one match with explicit gitdir.
+        let one = format!(
+            "\
+worktree {want_s}
+HEAD abc
+detached
+gitdir /tmp/linked-meta
+
+worktree /tmp/other-wt
+HEAD def
+detached
+gitdir /tmp/other.git
+
+"
+        );
+        match porcelain_match_gitdir(&one, &want) {
+            PorcelainMatch::One(Some(gd)) => {
+                assert_eq!(gd, PathBuf::from("/tmp/linked-meta"));
+            }
+            other => panic!("expected One(Some), got {other:?}"),
+        }
+
+        // Exactly one match without gitdir line.
+        let one_no_gd = format!(
+            "\
+worktree {want_s}
+HEAD abc
+detached
+
+"
+        );
+        assert_eq!(
+            porcelain_match_gitdir(&one_no_gd, &want),
+            PorcelainMatch::One(None),
+            "single match without gitdir => One(None)"
+        );
+
+        // Many matches: last-wins must NOT apply; treat as Ambiguous.
+        let many = format!(
+            "\
+worktree {want_s}
+HEAD abc
+detached
+gitdir /tmp/first-meta
+
+worktree {want_s}
+HEAD def
+detached
+gitdir /tmp/second-meta
+
+"
+        );
+        assert_eq!(
+            porcelain_match_gitdir(&many, &want),
+            PorcelainMatch::Ambiguous,
+            "multiple matching blocks => Ambiguous (not last-wins)"
+        );
+    }
+
+    #[test]
+    fn worktree_prune_failure_is_propagated() {
+        // discard_worktree_from_main must surface prune errors rather than
+        // swallowing them. Point repo_root at a real directory that is not a
+        // git repo: worktree remove fails, then prune is attempted and must
+        // propagate the failure (previously the Result was ignored).
+        let bogus = std::env::temp_dir().join(unique_tag("greppy-ws-prune-fail"));
+        fs::create_dir_all(&bogus).unwrap();
+        let missing_wt = bogus.join("no-such-worktree");
+        let err = discard_worktree_from_main(&bogus, &missing_wt)
+            .expect_err("prune against non-repo must fail");
+        match err {
+            WorkspaceError::GitFailed { command, .. } => {
+                assert!(
+                    command.contains("prune") || command.contains("worktree"),
+                    "expected prune/worktree failure, got command={command}"
+                );
+            }
+            other => panic!("expected GitFailed from prune, got {other}"),
+        }
+        let _ = fs::remove_dir_all(&bogus);
     }
 
     #[test]
