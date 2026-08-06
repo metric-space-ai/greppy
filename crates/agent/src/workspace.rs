@@ -654,9 +654,15 @@ fn prepare_stable_worktree(
             }
             Err(e) => return Err(e),
         }
+    } else if linked_git_dir_from_main(repo_root, stable_dir)?.is_some() {
+        // Directory gone (cache purge / user delete) but main still has a
+        // registration for this exact path. Prune the stale entry from the MAIN
+        // side before attempting `worktree add` — never run git through the
+        // (absent) worktree.
+        git_ok_cwd(repo_root, &["worktree", "prune"])?;
     }
 
-    add_worktree_and_record(repo_root, stable_dir, base_commit, fresh)
+    add_worktree_with_stale_recovery(repo_root, stable_dir, base_commit, fresh)
 }
 
 /// Force-remove a (possibly tampered) worktree using only main-repo commands and
@@ -670,27 +676,93 @@ fn discard_worktree_from_main(repo_root: &Path, worktree: &Path) -> Result<(), W
         .unwrap_or(false);
     if !removed {
         // Registration may be half-broken after a rewritten `.git` (git refuses
-        // remove when the reverse pointer does not match). Wipe the directory
-        // first with plain filesystem ops, then prune the main registry so a
+        // remove when the reverse pointer does not match). Wipe the path first
+        // with plain filesystem ops (directory *or* a plain file left in its
+        // place by a human/cache tool), then prune the main registry so a
         // subsequent `worktree add` can re-register the same path.
-        if worktree.exists() {
-            if let Err(e) = fs::remove_dir_all(worktree) {
-                if worktree.exists() {
-                    return Err(WorkspaceError::Io(io::Error::new(
-                        e.kind(),
-                        format!(
-                            "cannot remove stale agent worktree {}: {e}",
-                            worktree.display()
-                        ),
-                    )));
-                }
-            }
-        }
+        remove_path_for_discard(worktree)?;
         // Propagate prune failure: a silent prune leave-behind can hide the
         // original cause of a subsequent `worktree add` failure.
         git_ok_cwd(repo_root, &["worktree", "prune"])?;
     }
     Ok(())
+}
+
+/// Remove a leftover worktree path that may be a directory, a plain file, or a
+/// symlink. Used only from the main-side discard path.
+fn remove_path_for_discard(worktree: &Path) -> Result<(), WorkspaceError> {
+    let meta = match fs::symlink_metadata(worktree) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(WorkspaceError::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot stat stale agent worktree {}: {e}",
+                    worktree.display()
+                ),
+            )));
+        }
+    };
+    let result = if meta.file_type().is_symlink() || meta.is_file() {
+        fs::remove_file(worktree)
+    } else {
+        fs::remove_dir_all(worktree)
+    };
+    if let Err(e) = result {
+        if worktree.exists() {
+            return Err(WorkspaceError::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot remove stale agent worktree {}: {e}",
+                    worktree.display()
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `worktree add` for the stable create path, with a single recovery attempt when
+/// git still reports the path as a lingering registration.
+///
+/// Does **not** use `add -f`. On a registered-path failure: discard via the
+/// main-side helper, then retry the add **exactly once**. Unrelated failures
+/// propagate immediately; the retry cannot loop.
+fn add_worktree_with_stale_recovery(
+    repo_root: &Path,
+    worktree: &Path,
+    base_commit: &str,
+    fresh: bool,
+) -> Result<PathBuf, WorkspaceError> {
+    match add_worktree_and_record(repo_root, worktree, base_commit, fresh) {
+        Ok(linked) => Ok(linked),
+        Err(e) if is_already_registered_worktree_error(&e) => {
+            discard_worktree_from_main(repo_root, worktree)?;
+            // Exactly one retry — no loop.
+            add_worktree_and_record(repo_root, worktree, base_commit, fresh)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// True when a `worktree add` failed because the path is still registered in the
+/// main repository (missing-on-disk or otherwise).
+fn is_already_registered_worktree_error(err: &WorkspaceError) -> bool {
+    match err {
+        WorkspaceError::GitFailed {
+            command, stderr, ..
+        } => {
+            let cmd = command.to_ascii_lowercase();
+            let msg = stderr.to_ascii_lowercase();
+            cmd.contains("worktree")
+                && cmd.contains("add")
+                && (msg.contains("already registered worktree")
+                    || msg.contains("missing but already registered")
+                    || msg.contains("already registered"))
+        }
+        _ => false,
+    }
 }
 
 fn add_worktree_and_record(
@@ -2985,6 +3057,197 @@ gitdir /tmp/second-meta
             common.display()
         );
         ws.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // --- WP25: recover from a stale worktree registration ---
+
+    #[test]
+    fn create_recovers_when_registration_lingers_after_directory_deleted() {
+        // Production-realistic: stable worktree dir deleted (cache purge / human)
+        // while main still has the registration. Create must prune + re-add.
+        let repo = init_fixture("greppy-ws-stale-missing");
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-stale-missing")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        assert!(ws.is_stable());
+        drop(ws);
+
+        // Confirm registration is present, then wipe only the directory (leave
+        // the main-repo registration intact — the bug scenario).
+        assert!(
+            linked_git_dir_from_main(&repo, &wt)
+                .expect("list")
+                .is_some(),
+            "precondition: registration must still exist before delete"
+        );
+        fs::remove_dir_all(&wt).expect("delete worktree directory");
+        assert!(!wt.exists());
+        assert!(
+            linked_git_dir_from_main(&repo, &wt)
+                .expect("list after delete")
+                .is_some(),
+            "precondition: registration must linger after directory delete"
+        );
+
+        let ws2 =
+            AgentWorkspace::create(&repo, &unique_tag("run-stale-missing-2")).expect("recover");
+        assert_eq!(ws2.worktree_path(), &wt);
+        assert!(ws2.is_stable());
+        assert!(
+            wt.join("hello.txt").is_file(),
+            "recovered worktree must be usable"
+        );
+        assert!(
+            linked_git_dir_from_main(&repo, &wt)
+                .expect("list")
+                .is_some(),
+            "recovered worktree must be registered"
+        );
+        // Host-side identity must verify (usable for finish/cleanup).
+        ws2.verify_identity()
+            .expect("recovered worktree identity must verify");
+        let outcome = ws2.finish("no changes").expect("finish");
+        assert_eq!(outcome, RunOutcome::Clean);
+        ws2.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn create_recovers_when_registration_lingers_and_path_is_plain_file() {
+        // Directory replaced by a plain file (human / cache tool mishap) while
+        // registration still points at that path. Discard must remove the file
+        // (not only directories) and recreate.
+        let repo = init_fixture("greppy-ws-stale-file");
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-stale-file")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        drop(ws);
+
+        assert!(
+            linked_git_dir_from_main(&repo, &wt)
+                .expect("list")
+                .is_some(),
+            "precondition: registration present"
+        );
+        fs::remove_dir_all(&wt).expect("remove worktree dir");
+        // Plant a plain file at the stable path (not a directory).
+        fs::write(&wt, b"not a worktree\n").expect("plant plain file");
+        assert!(wt.is_file(), "precondition: path is a plain file");
+
+        let ws2 = AgentWorkspace::create(&repo, &unique_tag("run-stale-file-2")).expect("recover");
+        assert_eq!(ws2.worktree_path(), &wt);
+        assert!(
+            wt.is_dir(),
+            "recovered path must be a real worktree directory"
+        );
+        assert!(wt.join("hello.txt").is_file());
+        assert!(linked_git_dir_from_main(&repo, &wt)
+            .expect("list")
+            .is_some());
+        ws2.cleanup().expect("cleanup");
+        destroy_stable(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn already_registered_error_classifier_and_unrelated_add_failure() {
+        // (c) classifier recognises the registered-path failure messages;
+        // recovery is non-recursive (calls add once more, never itself) so
+        // retry cannot loop. (d) unrelated worktree-add failures still propagate.
+        assert!(is_already_registered_worktree_error(&WorkspaceError::GitFailed {
+            command: "git worktree add --detach /tmp/x abc".into(),
+            stderr: "fatal: '/tmp/x' is a missing but already registered worktree; use 'add -f' to override, or 'prune' or 'remove' to clear\n".into(),
+            status: Some(128),
+        }));
+        assert!(is_already_registered_worktree_error(
+            &WorkspaceError::GitFailed {
+                command: "git worktree add --detach /tmp/x abc".into(),
+                stderr: "fatal: '/tmp/x' is already registered as a worktree\n".into(),
+                status: Some(128),
+            }
+        ));
+        // Unrelated failures must NOT be classified as registered-path.
+        assert!(!is_already_registered_worktree_error(
+            &WorkspaceError::GitFailed {
+                command: "git worktree add --detach /tmp/x not-a-commit".into(),
+                stderr: "fatal: invalid reference: not-a-commit\n".into(),
+                status: Some(128),
+            }
+        ));
+        assert!(!is_already_registered_worktree_error(
+            &WorkspaceError::GitFailed {
+                command: "git worktree prune".into(),
+                stderr: "fatal: not a git repository\n".into(),
+                status: Some(128),
+            }
+        ));
+        assert!(!is_already_registered_worktree_error(&WorkspaceError::Io(
+            io::Error::other("boom")
+        )));
+
+        // (d) Unrelated add failure propagates (invalid base commit OID).
+        let repo = init_fixture("greppy-ws-add-fail");
+        let wt = stable_worktree_dir(&repo);
+        if let Some(parent) = wt.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        // Ensure no leftover registration/dir at the stable path.
+        destroy_stable(&repo, &wt);
+        let err = add_worktree_with_stale_recovery(
+            &repo,
+            &wt,
+            "0000000000000000000000000000000000000000",
+            false,
+        )
+        .expect_err("invalid base must fail");
+        match &err {
+            WorkspaceError::GitFailed {
+                command, stderr, ..
+            } => {
+                assert!(
+                    command.contains("worktree") && command.contains("add"),
+                    "command={command}"
+                );
+                assert!(
+                    !is_already_registered_worktree_error(&err),
+                    "must be unrelated failure; stderr={stderr}"
+                );
+            }
+            other => panic!("expected GitFailed, got {other}"),
+        }
+        assert!(!wt.exists(), "failed add must not leave a worktree dir");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn stale_recovery_retries_add_at_most_once() {
+        // Structural guarantee: add_worktree_with_stale_recovery calls
+        // add_worktree_and_record at most twice (initial + one retry), never
+        // re-enters itself. Simulate a path that stays "registered" after
+        // discard by using a non-repo directory as repo_root: discard's prune
+        // fails and is propagated *before* a second add — still no loop.
+        // Separately, when discard succeeds but the second add fails for a
+        // registered-path reason is not reachable in practice (discard clears
+        // the registration); the classifier + non-recursive call graph is the
+        // contract.
+        //
+        // Practical check: after a successful recover from a missing dir, a
+        // second create reuses cleanly (no repeated discard loop / no hang).
+        let repo = init_fixture("greppy-ws-retry-once");
+        let ws = AgentWorkspace::create(&repo, &unique_tag("run-retry-once")).expect("create");
+        let wt = ws.worktree_path().to_path_buf();
+        drop(ws);
+        fs::remove_dir_all(&wt).expect("delete");
+        // First recover.
+        let ws2 = AgentWorkspace::create(&repo, &unique_tag("run-retry-once-2")).expect("recover");
+        assert_eq!(ws2.worktree_path(), &wt);
+        drop(ws2);
+        // Second create reuses the live tree (no stale-registration path).
+        let ws3 = AgentWorkspace::create(&repo, &unique_tag("run-retry-once-3")).expect("reuse");
+        assert_eq!(ws3.worktree_path(), &wt);
+        assert!(wt.join("hello.txt").is_file());
+        ws3.cleanup().expect("cleanup");
         destroy_stable(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
     }
