@@ -92,3 +92,18 @@ Rust crate licenses are declared by their packages and resolved in
 `Cargo.lock`. The release workflow must generate an SPDX SBOM from the exact
 packaged source and attach it to the release. A tag is not publishable when the
 SBOM, model notices, checksums, signatures, or build provenance are missing.
+
+## Ported third-party code
+
+### pi (agent loop semantics)
+
+- Purpose: multi-turn agent loop semantics (turn sequencing, tool-call
+  dispatch, message threading, error/abort behavior) ported into
+  `crates/agent` (`agent_loop`, `env`, `model`).
+- Upstream: [earendil-works/pi](https://github.com/earendil-works/pi) v0.80.2
+  (`packages/agent`).
+- License: MIT; see `licenses/PI-LICENSE.txt`.
+- Scope: semantics only — the Rust modules are idiomatic rewrites, not a
+  line-for-line TypeScript transcription. Attribution is required by MIT and
+  is also recorded in module-level doc comments
+  (`//! Ported from pi v0.80.2 ...`).

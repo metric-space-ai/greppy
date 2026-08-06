@@ -82,6 +82,7 @@ use passthrough::*;
 mod bash_smart;
 mod context;
 use context::*;
+mod agent;
 
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
@@ -554,6 +555,21 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
+    // Hidden Landlock launcher (Linux only): the agent sandbox rewrites tool
+    // spawns as `<exe> __agent-sandbox-landlock <spec> -- <real argv…>`. Intercept
+    // before every other route — including grep-name argv0 and `-p` — so this
+    // undocumented internal mode never collides with user-facing CLI surface.
+    // The launcher itself refuses to run unless GREPPY_AGENT_RUN is set.
+    #[cfg(target_os = "linux")]
+    {
+        if argv
+            .get(1)
+            .is_some_and(|t| t == greppy_agent::sandbox::LANDLOCK_LAUNCHER_ARG)
+        {
+            return greppy_agent::sandbox::run_landlock_launcher(&argv);
+        }
+    }
+
     // Invoked THROUGH a grep/rg filesystem name (symlink or shim to the
     // greppy binary): the caller wanted that tool, verbatim — argv[1..]
     // must never be parsed as greppy subcommands (`rg index .` is a
@@ -591,6 +607,13 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     }
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
+    // `greppy -p` is a structured agent invocation. Intercept before
+    // unknown-verb / grep-passthrough so `-p` never becomes a real-grep
+    // pattern, and so grep flags like `-p` (Perl regex on GNU grep) still
+    // work for non-leading positions via ordinary passthrough.
+    if agent::is_agent_p_invocation(&argv) {
+        return agent::run_agent_p(&argv);
+    }
     if let Some(message) = unknown_verb_refusal(&argv) {
         println!("{message}");
         return EXIT_USAGE;
@@ -623,7 +646,9 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     // Structured Greppy commands perform throttled cache maintenance. This
     // intentionally runs after passthrough detection so an ordinary grep
     // invocation cannot touch Greppy state.
-    if !is_trial_invocation(&argv) {
+    // Skip under GREPPY_AGENT_RUN: agent tool children only have write access to
+    // their own store + lock namespace, not trash/other workspaces that GC needs.
+    if !is_trial_invocation(&argv) && std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_none() {
         maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
     }
     // Structured subcommand (or help/version): clap can parse it. Any
@@ -819,6 +844,12 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
 /// age-based eviction, not the independent quota) — see
 /// [`greppy_core::workspace::store_ttl_secs`].
 pub fn maybe_run_store_cleanup(root: Option<&str>) {
+    // Agent tool children only have write access to their own store + lock
+    // namespace (WP21). GC touches trash/ and other workspaces — skip entirely
+    // while GREPPY_AGENT_RUN is set (also gated at the run_os call site).
+    if std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() {
+        return;
+    }
     let effective = resolve_root(root).ok();
     if greppy_core::cache::maybe_gc(effective.as_deref()).is_ok_and(|report| !report.throttled) {
         cleanup_verified_legacy_trash();

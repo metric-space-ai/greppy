@@ -107,6 +107,16 @@ RUN:
                              every REGEX match as `LINE  content`; the rest
                              compacted, any part of the original printable.
 
+AGENT:
+  -p "TASK" [--model M]   a built-in coding agent carries out TASK on this
+                          repository and delivers the outcome as one commit on
+                          refs/greppy/agent/<id> — nothing is edited in place.
+                          git show <ref> reviews it, git cherry-pick -n <ref>
+                          applies it. Made for subagent delegation of pure,
+                          self-contained coding tasks. Requires a local model
+                          gateway (127.0.0.1:8317); greppy -p --help has the
+                          setup.
+
 CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
   greppy search-symbol NAME --json | greppy read -
   greppy callees S --json | greppy read -

@@ -52,6 +52,9 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 greppy read parse_config --handle              # exact source + a hash-pinned edit handle
 greppy edit replace-body --symbol parse_config --source-file fix.rs   # all-or-nothing, proves its result
 greppy edit apply --plan refactor.json         # many files, ONE transaction: all publish or none
+
+# And in 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
+greppy -p "add tests for clamp_value"          # works in a disposable worktree, returns a proposal ref
 ```
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>

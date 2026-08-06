@@ -4,6 +4,47 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### `greppy -p` — a built-in coding agent
+
+`greppy -p "TASK" [--model M]` runs a one-shot coding agent over the current
+repository. The harness is greppy itself: a ~60-line static system prompt,
+one tool — `greppy` (search/navigate/read/edit, plus commands via
+`bash-smart -- CMD` so output arrives compacted) — and an agent loop ported
+from pi v0.80.2 (MIT; see THIRD_PARTY.md and licenses/PI-LICENSE.txt).
+
+Every run works in a per-repository agent worktree under the platform cache.
+Tracked content is reset to HEAD before every run; ignored build caches are
+kept deliberately so repeat runs stay fast (`--fresh` drops them too). Nested
+repositories are removed; repositories with submodules are refused (the agent
+worktree cannot reset them safely). The worktree's own greppy index is built on
+first use and kept warm afterwards. The run ends as exactly one commit on
+`refs/greppy/agent/<run_id>`, built from the base tree regardless of what
+happened to HEAD in the worktree — nothing is edited in place. `git show <ref>`
+reviews it, `git cherry-pick -n <ref>` applies it; `--apply` does so directly
+but refuses a checkout with uncommitted changes. Concurrent `-p` runs fall
+back to a disposable temp worktree when the stable tree is locked. Host-side
+git against the worktree pins the linked git directory recorded at creation; a
+rewritten worktree `.git` aborts the run (`Tampered`) rather than redirecting
+into the user checkout.
+
+Inference is localhost-only (plain HTTP, no TLS stack in the client): an
+Anthropic-Messages-compatible gateway (standard: CLIProxyAPI on
+127.0.0.1:8317; `GREPPY_ENDPOINT`, `GREPPY_MODEL`, `GREPPY_API_KEY`) with
+strict SSE validation, transient-failure retry, and stream caps. No provider
+SDKs, no stored credentials. Tool subprocesses are write-confined to the run
+worktree, a per-run scratch dir (`TMPDIR`), an isolated greppy data root for
+that worktree (store + lock namespace; not the operator's global greppy data),
+and `~/.cargo/{registry,git}` only — never the platform cache wholesale, the
+global temp root, or `~/.cargo/bin` / credentials (Seatbelt on macOS, Landlock
+on Linux; `--no-sandbox` / `GREPPY_NO_SANDBOX=1` disables). Store GC is skipped
+under `GREPPY_AGENT_RUN`. Reads and network stay open — network confinement
+remains future work. Credential env vars are stripped from tool children and
+agent runs refuse to nest (`GREPPY_AGENT_RUN`).
+
+`AGENTS.md` gains an `AGENT:` section documenting `-p` as a delegation
+primitive for host agents; the frozen-prompt hash moved with that approved
+change.
+
 ## [0.3.0] — unreleased
 
 A breaking release: greppy stops being a navigator that hands you file paths
