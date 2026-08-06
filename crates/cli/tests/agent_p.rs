@@ -242,6 +242,64 @@ fn greppy_e_dash_p_is_not_intercepted_as_agent() {
 }
 
 #[test]
+fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
+    // --deadline-secs 0 expires at loop start (Instant computed after self-check).
+    // The loop must stop with LoopStop::Deadline, print the stopped: line, and
+    // still produce the normal clean outcome (exit 0) — never discard work.
+    let repo = unique_temp("deadline-repo");
+    init_repo(&repo);
+    let store = unique_temp("deadline-store");
+
+    let (endpoint, stop, handle) = spawn_stub_gateway();
+
+    let output = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .env_remove("GREPPY_DEADLINE_SECS")
+        .args([
+            "-p",
+            "say hi",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "4",
+            "--deadline-secs",
+            "0",
+            "--skip-selfcheck",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn greppy -p");
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("stopped: wall-clock deadline reached (0s) — the result may be incomplete"),
+        "expected deadline stop line; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("no changes proposed."),
+        "deadline stop must still deliver the clean/proposal outcome: stdout={stdout}\nstderr={stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+#[test]
 fn nested_agent_run_is_refused() {
     // GREPPY_AGENT_RUN is set in every tool subprocess of a running agent;
     // a second `greppy -p` must refuse before doing any work. Command-scoped

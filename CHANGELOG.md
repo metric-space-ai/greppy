@@ -4,6 +4,8 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+`--deadline-secs N` / `GREPPY_DEADLINE_SECS` stops the agent loop cleanly between turns at a wall-clock budget and still delivers the proposal (or clean) outcome.
+
 ### `greppy -p` — a built-in coding agent
 
 `greppy -p "TASK" [--model M]` runs a one-shot coding agent over the current

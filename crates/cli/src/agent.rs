@@ -6,7 +6,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use greppy_agent::workspace::CreateOptions;
@@ -58,8 +58,8 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
-                   [--apply] [--diff] [--keep-worktree] [--fresh]
-                   [--no-sandbox] [--skip-selfcheck]
+                   [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
+                   [--fresh] [--no-sandbox] [--skip-selfcheck]
   greppy -p --help
 
 Flags:
@@ -67,6 +67,9 @@ Flags:
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
   --max-turns N       Cap on assistant turns (default 40)
+  --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
+                      the loop stops between turns only — a running command is
+                      never cut in half
   --apply             Cherry-pick the proposal into the current checkout
                       (staged, not committed)
   --diff              Print the full proposal patch after the stat
@@ -106,6 +109,12 @@ pub struct AgentArgs {
     /// Maximum assistant turns.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
     pub max_turns: usize,
+
+    /// Wall-clock budget in seconds (stops the loop between turns only).
+    ///
+    /// Also set by env `GREPPY_DEADLINE_SECS`.
+    #[arg(long, env = "GREPPY_DEADLINE_SECS", value_name = "N")]
+    pub deadline_secs: Option<u64>,
 
     /// Cherry-pick the proposal into the current checkout (staged).
     #[arg(long)]
@@ -374,10 +383,24 @@ fn run_agent(args: AgentArgs) -> u8 {
         }
     }
 
+    // Wall-clock Instant is computed AFTER the self-check (and after
+    // prewarm/index) so setup does not eat the budget — only the model loop
+    // does. `deadline_total` mirrors the original N so the low-time advisory
+    // can fire at 20% remaining.
+    let (deadline, deadline_total) = match args.deadline_secs {
+        Some(secs) => {
+            let total = Duration::from_secs(secs);
+            (Some(Instant::now() + total), Some(total))
+        }
+        None => (None, None),
+    };
+
     let config = AgentConfig {
         max_turns: args.max_turns,
         system: Some(SYSTEM_PROMPT.to_string()),
         model: model.clone(),
+        deadline,
+        deadline_total,
         ..AgentConfig::default()
     };
 
@@ -425,8 +448,9 @@ fn run_agent(args: AgentArgs) -> u8 {
     let _ = stdout.flush();
 
     // Stop reason reaches the user BEFORE the proposal block so it is not lost.
-    // MaxTurns / Stuck still produce the proposal (or clean) outcome; exit 0
-    // when a proposal or clean state exists — exit 3 stays for real errors.
+    // MaxTurns / Stuck / Deadline still produce the proposal (or clean)
+    // outcome; exit 0 when a proposal or clean state exists — exit 3 stays
+    // for real errors.
     match &loop_result.stop {
         LoopStop::MaxTurns => {
             let _ = writeln!(
@@ -440,6 +464,13 @@ fn run_agent(args: AgentArgs) -> u8 {
             let _ = writeln!(
                 stderr,
                 "stopped: {n} consecutive tool failures — the agent could not make progress"
+            );
+        }
+        LoopStop::Deadline => {
+            let secs = args.deadline_secs.unwrap_or(0);
+            let _ = writeln!(
+                stderr,
+                "stopped: wall-clock deadline reached ({secs}s) — the result may be incomplete"
             );
         }
         LoopStop::EndTurn | LoopStop::MaxTokens => {}
@@ -976,6 +1007,8 @@ mod tests {
             "http://127.0.0.1:9999",
             "--max-turns",
             "7",
+            "--deadline-secs",
+            "1800",
             "--apply",
             "--diff",
             "--keep-worktree",
@@ -985,6 +1018,7 @@ mod tests {
         assert_eq!(a.model.as_deref(), Some("claude-test"));
         assert_eq!(a.endpoint, "http://127.0.0.1:9999");
         assert_eq!(a.max_turns, 7);
+        assert_eq!(a.deadline_secs, Some(1800));
         assert!(a.apply);
         assert!(a.diff);
         assert!(a.keep_worktree);
@@ -995,15 +1029,47 @@ mod tests {
     #[test]
     fn parse_defaults() {
         // Clear env influence for this unit test by passing model explicitly.
+        // Also clear GREPPY_DEADLINE_SECS so env cannot inject a default.
+        let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
+        std::env::remove_var("GREPPY_DEADLINE_SECS");
         let a = parse(&["do it", "--model", "m"]).expect("parse");
         assert_eq!(a.task.as_deref(), Some("do it"));
         assert_eq!(a.endpoint, DEFAULT_ENDPOINT);
         assert_eq!(a.max_turns, DEFAULT_MAX_TURNS);
+        assert_eq!(a.deadline_secs, None);
         assert!(!a.apply);
         assert!(!a.diff);
         assert!(!a.keep_worktree);
         assert!(!a.no_sandbox);
         assert!(!a.fresh);
+        match prev {
+            Some(v) => std::env::set_var("GREPPY_DEADLINE_SECS", v),
+            None => std::env::remove_var("GREPPY_DEADLINE_SECS"),
+        }
+    }
+
+    #[test]
+    fn parse_deadline_secs_flag() {
+        let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
+        std::env::remove_var("GREPPY_DEADLINE_SECS");
+        let a = parse(&["do it", "--model", "m", "--deadline-secs", "42"]).expect("parse");
+        assert_eq!(a.deadline_secs, Some(42));
+        match prev {
+            Some(v) => std::env::set_var("GREPPY_DEADLINE_SECS", v),
+            None => std::env::remove_var("GREPPY_DEADLINE_SECS"),
+        }
+    }
+
+    #[test]
+    fn parse_deadline_secs_from_env() {
+        let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
+        std::env::set_var("GREPPY_DEADLINE_SECS", "99");
+        let a = parse(&["do it", "--model", "m"]).expect("parse");
+        assert_eq!(a.deadline_secs, Some(99));
+        match prev {
+            Some(v) => std::env::set_var("GREPPY_DEADLINE_SECS", v),
+            None => std::env::remove_var("GREPPY_DEADLINE_SECS"),
+        }
     }
 
     #[test]
@@ -1041,6 +1107,7 @@ mod tests {
             model: None,
             endpoint: DEFAULT_ENDPOINT.into(),
             max_turns: 40,
+            deadline_secs: None,
             apply: false,
             diff: false,
             keep_worktree: false,
@@ -1058,6 +1125,7 @@ mod tests {
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
             max_turns: 40,
+            deadline_secs: None,
             apply: false,
             diff: false,
             keep_worktree: false,
@@ -1134,6 +1202,26 @@ mod tests {
             help.contains("no TLS") || help.contains("plain-HTTP") || help.contains("plain HTTP"),
             "help must state plain-HTTP/no-TLS: {help}"
         );
+        // Wall-clock deadline: flag + between-turns semantics.
+        assert!(
+            help.contains("--deadline-secs") || help.contains("deadline-secs"),
+            "help must mention --deadline-secs: {help}"
+        );
+        assert!(
+            help.contains("between turns") || help.contains("never cut in half"),
+            "help must state deadline stops between turns: {help}"
+        );
+    }
+
+    #[test]
+    fn deadline_stop_line_shape() {
+        // Mirror the exact stderr shape printed on LoopStop::Deadline.
+        let secs: u64 = 1800;
+        let line = format!(
+            "stopped: wall-clock deadline reached ({secs}s) — the result may be incomplete"
+        );
+        assert!(line.contains("stopped: wall-clock deadline reached (1800s)"));
+        assert!(line.contains("the result may be incomplete"));
     }
 
     #[test]
@@ -1239,6 +1327,7 @@ mod tests {
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
             max_turns: 40,
+            deadline_secs: None,
             apply: false,
             diff: false,
             keep_worktree: false,
@@ -1266,6 +1355,7 @@ mod tests {
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
             max_turns: 40,
+            deadline_secs: None,
             apply: false,
             diff: false,
             keep_worktree: false,

@@ -9,8 +9,9 @@
 //!    - On `stop_reason == ToolUse`, execute every requested tool call **in
 //!      order**, then append **one** user message carrying all
 //!      `tool_result` blocks (matching call ids) and continue.
-//!    - Stop on `EndTurn`, `MaxTokens`, configured `max_turns`, or a
-//!      non-recoverable transport error.
+//!    - Stop on `EndTurn`, `MaxTokens`, configured `max_turns`, a wall-clock
+//!      `deadline` (checked only between turns), or a non-recoverable
+//!      transport error.
 //! 2. Tool execution errors become `is_error: true` tool_results and do
 //!    **not** abort the loop.
 //! 3. Transport/connect errors: **retry once**, then surface a typed
@@ -25,6 +26,7 @@ use crate::model::ModelStream;
 use crate::protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, Usage,
 };
+use std::time::{Duration, Instant};
 
 /// Configuration for [`run_agent_loop`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,14 @@ pub struct AgentConfig {
     /// Consecutive failed tool outcomes before the loop stops as
     /// [`LoopStop::Stuck`]. Default: 8.
     pub consecutive_failure_stop: usize,
+    /// Absolute wall-clock deadline. Checked only at the top of each loop
+    /// iteration (before a new model turn). An `Instant` (not a duration) so
+    /// tests can inject one. Default: `None` (no wall-clock limit).
+    pub deadline: Option<Instant>,
+    /// Original wall-clock budget used only for the low-time advisory
+    /// (when remaining < 20% of this total). When `None`, the advisory is
+    /// skipped even if [`Self::deadline`] is set. Default: `None`.
+    pub deadline_total: Option<Duration>,
 }
 
 impl Default for AgentConfig {
@@ -58,6 +68,8 @@ impl Default for AgentConfig {
             tool_choice: ToolChoice::Auto,
             consecutive_failure_advisory: 4,
             consecutive_failure_stop: 8,
+            deadline: None,
+            deadline_total: None,
         }
     }
 }
@@ -112,6 +124,8 @@ pub enum LoopStop {
     /// Hit [`AgentConfig::consecutive_failure_stop`] failed tool outcomes in a
     /// row — the agent could not make progress.
     Stuck,
+    /// Hit [`AgentConfig::deadline`] between turns (never mid-turn / mid-tool).
+    Deadline,
 }
 
 /// Successful loop outcome.
@@ -217,9 +231,20 @@ pub fn run_agent_loop(
     let mut final_text = String::new();
     let mut consecutive_failures: usize = 0;
     let mut turn_budget_advised = false;
+    let mut deadline_advised = false;
 
     // Cap the number of model turns. Each successful stream_turn counts as one.
     while turns < config.max_turns {
+        // Wall-clock deadline is checked only between turns — never mid-turn
+        // and never while a tool call is running, so a partial edit cannot be
+        // left half-applied.
+        if let Some(deadline) = config.deadline {
+            if Instant::now() >= deadline {
+                last_stop = LoopStop::Deadline;
+                break;
+            }
+        }
+
         let tools = env.tool_definitions();
         let req = ModelRequest {
             model: config.model.clone(),
@@ -298,6 +323,30 @@ the rest.",
                         turn_budget_advised = true;
                     }
 
+                    // Wall-clock budget awareness: once, when remaining time is
+                    // below 20% of deadline_total. Skipped entirely when
+                    // deadline_total is None.
+                    if !deadline_advised {
+                        if let (Some(deadline), Some(total)) =
+                            (config.deadline, config.deadline_total)
+                        {
+                            if !total.is_zero()
+                                && remaining_wall_below_fifth(deadline, total, Instant::now())
+                            {
+                                let remaining_secs =
+                                    deadline.saturating_duration_since(Instant::now()).as_secs();
+                                append_tool_advisory(
+                                    &mut outcome.content,
+                                    &format!(
+                                        "{remaining_secs} seconds of wall clock left — finish what is \
+verifiable and report the rest."
+                                    ),
+                                );
+                                deadline_advised = true;
+                            }
+                        }
+                    }
+
                     on_event(LoopEvent::ToolFinish {
                         call_id: id.clone(),
                         name: name.clone(),
@@ -354,8 +403,8 @@ the rest.",
     // If we never broke on a clean EndTurn/MaxTokens (including max_turns == 0
     // or always-tools exhaustion), the provisional MaxTurns stands. When the
     // final turn *did* end cleanly on the last allowed turn, honor that stop.
-    // Stuck already set last_stop and must not be overwritten.
-    if turns == 0 {
+    // Stuck / Deadline already set last_stop and must not be overwritten.
+    if turns == 0 && !matches!(last_stop, LoopStop::Deadline) {
         last_stop = LoopStop::MaxTurns;
     }
 
@@ -383,6 +432,19 @@ fn remaining_turns_at_or_below_quarter(turns_used: usize, max_turns: usize) -> b
     let remaining = max_turns.saturating_sub(turns_used);
     // remaining / max_turns <= 0.25  ⇔  remaining * 4 <= max_turns
     remaining.saturating_mul(4) <= max_turns
+}
+
+/// True when remaining wall-clock time is strictly below 20% of `total`.
+fn remaining_wall_below_fifth(deadline: Instant, total: Duration, now: Instant) -> bool {
+    if total.is_zero() {
+        return false;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    // remaining < 0.2 * total  ⇔  remaining * 5 < total
+    remaining
+        .checked_mul(5)
+        .map(|five| five < total)
+        .unwrap_or(true)
 }
 
 /// Stream a turn; on a retryable failure, retry exactly once.
@@ -1369,5 +1431,283 @@ mod tests {
         assert!(remaining_turns_at_or_below_quarter(3, 4)); // 1 left = 25%
         assert!(!remaining_turns_at_or_below_quarter(2, 4)); // 2 left = 50%
         assert!(!remaining_turns_at_or_below_quarter(0, 0));
+    }
+
+    #[test]
+    fn remaining_wall_below_fifth_math() {
+        let now = Instant::now();
+        let total = Duration::from_secs(100);
+        // 10s left = 10% < 20%
+        assert!(remaining_wall_below_fifth(
+            now + Duration::from_secs(10),
+            total,
+            now
+        ));
+        // 20s left = 20% is NOT strictly below 20%
+        assert!(!remaining_wall_below_fifth(
+            now + Duration::from_secs(20),
+            total,
+            now
+        ));
+        // 21s left > 20%
+        assert!(!remaining_wall_below_fifth(
+            now + Duration::from_secs(21),
+            total,
+            now
+        ));
+        // zero total → never advise
+        assert!(!remaining_wall_below_fifth(
+            now + Duration::from_secs(1),
+            Duration::ZERO,
+            now
+        ));
+    }
+
+    #[test]
+    fn deadline_already_past_stops_before_first_model_turn() {
+        let mut model = FakeModel::new(vec![text_turn("should not run", usage(1, 1))]);
+        let mut env = FakeEnv::new(vec![]);
+        let config = AgentConfig {
+            model: "mock".into(),
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            deadline_total: Some(Duration::from_secs(60)),
+            ..AgentConfig::default()
+        };
+
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("loop");
+        assert_eq!(result.stop, LoopStop::Deadline);
+        assert_eq!(model.calls, 0, "must not start a model turn");
+        // Empty-but-valid: user prompt only, no assistant turn, zero usage.
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, Role::User);
+        assert!(result.final_text.is_empty());
+        assert_eq!(result.usage, Usage::default());
+    }
+
+    #[test]
+    fn deadline_after_two_tool_turns_stops_without_third() {
+        // Both early turns request tools so the loop continues; sleep after the
+        // second model turn so the next top-of-loop deadline check fires.
+        struct SleepOnCallModel {
+            inner: FakeModel,
+            sleep_on_call: usize,
+            sleep_for: Duration,
+            calls: usize,
+        }
+        impl ModelStream for SleepOnCallModel {
+            fn stream_turn(
+                &mut self,
+                req: &ModelRequest,
+                on_event: &mut dyn FnMut(StreamEvent),
+            ) -> Result<TurnResult, ClientError> {
+                self.calls += 1;
+                let n = self.calls;
+                let result = self.inner.stream_turn(req, on_event);
+                if n == self.sleep_on_call {
+                    std::thread::sleep(self.sleep_for);
+                }
+                result
+            }
+        }
+
+        let mut model = SleepOnCallModel {
+            inner: FakeModel::new(vec![
+                tool_turn(
+                    Some("turn one"),
+                    vec![("c1", "bash", json!({}))],
+                    usage(10, 5),
+                ),
+                tool_turn(
+                    Some("turn two"),
+                    vec![("c2", "bash", json!({}))],
+                    usage(20, 6),
+                ),
+                text_turn("turn three must not run", usage(1, 1)),
+            ]),
+            sleep_on_call: 2,
+            // Load-robust: outlast the deadline by a wide margin so turn 3 is
+            // never requested even under host contention.
+            sleep_for: Duration::from_secs(3),
+            calls: 0,
+        };
+        let mut env = FakeEnv::new(vec![bash_tool()]).with_outcome("bash", ToolOutcome::ok("ok"));
+        let config = AgentConfig {
+            model: "mock".into(),
+            max_turns: 10,
+            // Enough headroom for turns 1–2 under load; the sleep on call 2
+            // pushes past it before turn 3 can start.
+            deadline: Some(Instant::now() + Duration::from_secs(1)),
+            deadline_total: Some(Duration::from_secs(60)),
+            ..AgentConfig::default()
+        };
+
+        let result =
+            run_agent_loop(&mut model, &mut env, &config, "hi", &mut |_| {}).expect("loop");
+        assert_eq!(result.stop, LoopStop::Deadline);
+        assert_eq!(model.calls, 2, "turn 3 must never be requested");
+        // History: user, asst1, tools1, asst2, tools2
+        assert_eq!(result.messages.len(), 5);
+        assert_eq!(result.messages[0].role, Role::User);
+        assert_eq!(result.messages[1].role, Role::Assistant);
+        assert_eq!(result.messages[2].role, Role::User);
+        assert_eq!(result.messages[3].role, Role::Assistant);
+        assert_eq!(result.messages[4].role, Role::User);
+        assert_eq!(extract_text(&result.messages[1]), "turn one");
+        assert_eq!(extract_text(&result.messages[3]), "turn two");
+        assert_eq!(result.usage.input_tokens, 30);
+        assert_eq!(result.usage.output_tokens, 11);
+        assert_eq!(env.calls.len(), 2);
+    }
+
+    #[test]
+    fn running_tool_is_not_interrupted_by_deadline() {
+        // Deadline passes while a tool is running: the env call must complete
+        // and its result must land in history; only the *next* model turn is
+        // skipped.
+        struct SlowEnv {
+            tools: Vec<ToolDefinition>,
+            calls: usize,
+            sleep_for: Duration,
+        }
+        impl ExecutionEnv for SlowEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.tools.clone()
+            }
+            fn call_tool(&mut self, _name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.calls += 1;
+                std::thread::sleep(self.sleep_for);
+                ToolOutcome::ok("tool finished fully")
+            }
+        }
+
+        let mut model = FakeModel::new(vec![
+            tool_turn(
+                Some("calling tool"),
+                vec![("c1", "bash", json!({"command": "slow"}))],
+                usage(1, 1),
+            ),
+            text_turn("must not run", usage(1, 1)),
+        ]);
+        let mut env = SlowEnv {
+            tools: vec![bash_tool()],
+            calls: 0,
+            // Load-robust: tool outlasts the deadline so the next top-of-loop
+            // check fires after the tool fully completes.
+            sleep_for: Duration::from_secs(3),
+        };
+        let config = AgentConfig {
+            model: "mock".into(),
+            max_turns: 10,
+            deadline: Some(Instant::now() + Duration::from_secs(1)),
+            deadline_total: Some(Duration::from_secs(60)),
+            ..AgentConfig::default()
+        };
+
+        let result =
+            run_agent_loop(&mut model, &mut env, &config, "hi", &mut |_| {}).expect("loop");
+        assert_eq!(result.stop, LoopStop::Deadline);
+        assert_eq!(model.calls, 1, "no second model turn");
+        assert_eq!(env.calls, 1, "tool must complete");
+        let contents = tool_result_contents(&result);
+        assert_eq!(contents.len(), 1);
+        assert!(!contents[0].0);
+        // Tool body is present even if the low-time advisory was also appended
+        // (deadline_total is set and remaining may already be <20% after sleep).
+        assert!(
+            contents[0].1.starts_with("tool finished fully"),
+            "tool result must be threaded into history: {}",
+            contents[0].1
+        );
+    }
+
+    #[test]
+    fn wall_clock_advisory_once_only_when_deadline_total_set() {
+        // deadline far enough that the loop finishes; remaining << 20% of total
+        // so the advisory fires on the first tool result, exactly once.
+        let mut model = FakeModel::new(vec![
+            tool_turn(None, vec![("c1", "bash", json!({}))], usage(1, 1)),
+            tool_turn(None, vec![("c2", "bash", json!({}))], usage(1, 1)),
+            text_turn("done", usage(1, 1)),
+        ]);
+        let mut env = FakeEnv::new(vec![bash_tool()]).with_outcome("bash", ToolOutcome::ok("ok"));
+        let now = Instant::now();
+        let config = AgentConfig {
+            model: "mock".into(),
+            max_turns: 10,
+            // Plenty of wall time to finish the fake turns.
+            deadline: Some(now + Duration::from_secs(30)),
+            // Total 200s → 30 left is 15% < 20% → advisory fires.
+            deadline_total: Some(Duration::from_secs(200)),
+            ..AgentConfig::default()
+        };
+
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("loop");
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        let contents = tool_result_contents(&result);
+        assert_eq!(contents.len(), 2);
+        let hits: Vec<_> = contents
+            .iter()
+            .filter(|(_, c)| c.contains("seconds of wall clock left"))
+            .collect();
+        assert_eq!(hits.len(), 1, "advisory exactly once: {contents:?}");
+        assert!(
+            contents[0]
+                .1
+                .contains("seconds of wall clock left — finish what is verifiable"),
+            "first tool result should carry advisory: {}",
+            contents[0].1
+        );
+        assert!(
+            !contents[1].1.contains("wall clock left"),
+            "second must not re-advise: {}",
+            contents[1].1
+        );
+    }
+
+    #[test]
+    fn wall_clock_advisory_skipped_without_deadline_total() {
+        let mut model = FakeModel::new(vec![
+            tool_turn(None, vec![("c1", "bash", json!({}))], usage(1, 1)),
+            text_turn("done", usage(1, 1)),
+        ]);
+        let mut env = FakeEnv::new(vec![bash_tool()]).with_outcome("bash", ToolOutcome::ok("ok"));
+        let config = AgentConfig {
+            model: "mock".into(),
+            // Deadline set (and near) but total absent → no advisory.
+            deadline: Some(Instant::now() + Duration::from_secs(1)),
+            deadline_total: None,
+            ..AgentConfig::default()
+        };
+
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("loop");
+        let contents = tool_result_contents(&result);
+        assert!(
+            contents.iter().all(|(_, c)| !c.contains("wall clock left")),
+            "no advisory without deadline_total: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn no_deadline_matches_default_behaviour() {
+        // Regression: default config (no deadline fields) is unchanged.
+        let mut model = FakeModel::new(vec![
+            tool_turn(
+                Some("working"),
+                vec![("c1", "bash", json!({}))],
+                usage(10, 5),
+            ),
+            text_turn("all done", usage(12, 3)),
+        ]);
+        let mut env = FakeEnv::new(vec![bash_tool()]).with_outcome("bash", ToolOutcome::ok("ok"));
+        let config = AgentConfig::default().with_model("mock");
+        assert!(config.deadline.is_none());
+        assert!(config.deadline_total.is_none());
+
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("loop");
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(result.final_text, "all done");
+        assert_eq!(model.calls, 2);
+        assert_eq!(env.calls.len(), 1);
+        assert_eq!(result.messages.len(), 4);
     }
 }
