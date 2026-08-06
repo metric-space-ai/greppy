@@ -228,13 +228,23 @@
 
   <div class="col work"><h2>Working</h2><div class="cards">
     <div class="card work">
-      <h3>Sol-Schlussprüfung WP21 <span class="k">(claude-sol, läuft)</span></h3>
-      <p>Prüft die drei Blocker aus der Produktionsreife-Review: gepinnte Git-Identität, enge
-      Freigabeliste, ehrliches Reset. <strong>Achtung:</strong> Erstversuch wurde vom Anbieter-Filter
-      als „cybersecurity risk" BLOCKIERT (Wortlaut „reproduce exploit/probe"); defensiv umformuliert neu gestartet.
-      Ein blockiertes Review sieht im Log aus wie ein bestandenes — immer auf VERDICT prüfen.</p>
-      <p class="k">Log: <code>~/greppy-040-logs/review-wp21b-sol.log</code> · Danach: Merge-Freigabe an 0.3.0-Session</p>
+      <h3>Sol-Bestätigung WP26 <span class="k">(claude-sol, läuft)</span> — letzter Schritt</h3>
+      <p>Nach ship-with-fixes: prüft nur noch die zwei umgesetzten Punkte (sprachfeste Git-Aufrufe,
+      Zustands- statt Textprüfung, kein Discovery im Anlege-Pfad). Bei grün → Merge-Freigabe an die
+      0.3.0-Session (Owner-Auftrag).</p>
+      <p class="k">Log: <code>~/greppy-040-logs/confirm-wp26-sol.log</code></p>
     </div>
+    <div class="card done">
+      <h3>WP22–WP26 — Isolationsgrenze geschlossen</h3>
+      <p><code>7df6fd5</code> Identität NUR aus dem Hauptrepo (vergiftete .git hätte Host-git ins echte Repo
+      umgelenkt — von Sol reproduziert) · <code>a230437</code> Submodul-Repos werden ABGELEHNT statt halb
+      unterstützt (die Reparatur hatte eine Löschprimitive mit Pfaden aus .gitmodules eingeschleppt) ·
+      <code>b37b43b</code> Gitlink-basierte Sperre am selben Commit, eindeutige Registrierung, Aufräumfehler
+      erreichen den Exit-Code · <code>8abc4cc</code> Selbstheilung bei verwaister Registrierung (live belegt) ·
+      <code>734646c</code> sprachfeste Git-Aufrufe, Zustandsprüfung, kein Discovery.
+      164/164 Tests, 12 grüne Läufe idle.</p>
+    </div>
+
   </div></div>
 
   <div class="col"><h2>To-Do</h2><div class="cards">
