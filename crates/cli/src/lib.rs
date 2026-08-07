@@ -676,6 +676,16 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
             let msg = e.to_string();
             let first = msg.lines().next().unwrap_or("invalid arguments");
+            // A guessed flag is recoverable: drop it, say so, and answer the
+            // question. Printing clap's `error:` line first would still read
+            // as a failure to the agent, so the recovery happens before any
+            // refusal is written.
+            if let Some(reduced) = argv_without_unknown_flag(&argv, first) {
+                if let Some(unknown) = unknown_flag_name(first) {
+                    println!("note: ignoring unknown option `{unknown}`");
+                }
+                return run_os(reduced);
+            }
             // STDOUT, not stderr: agents habitually append `2>/dev/null`,
             // and a usage lesson they never see teaches nothing (P3).
             println!("{first}");

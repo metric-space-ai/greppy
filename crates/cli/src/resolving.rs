@@ -438,3 +438,57 @@ pub(crate) fn resolve_root(root: Option<&str>) -> Result<std::path::PathBuf> {
         .map_err(|e| Error::io("read current_dir for root resolution", e))?;
     Ok(workspace_locator::resolve_workspace_root(&cwd))
 }
+
+/// The flag clap rejected, e.g. `--regex` from `unexpected argument '--regex' found`.
+pub(crate) fn unknown_flag_name(clap_message: &str) -> Option<String> {
+    let unknown = clap_message
+        .strip_prefix("error: unexpected argument '")?
+        .split('\'')
+        .next()?;
+    unknown.starts_with("--").then(|| unknown.to_string())
+}
+
+/// The same invocation with the rejected flag removed, so the call can proceed.
+///
+/// A flag the agent guessed is not a reason to answer nothing: dropping it
+/// yields the query the caller actually meant. Its value is dropped with it
+/// when it is a separate argument, and `None` means there was nothing to drop
+/// (so the caller keeps its usage error).
+/// Flags that were retired because they RESTRICTED a query.
+///
+/// Dropping a decorative flag costs nothing. Dropping a scope filter answers a
+/// different question than the caller asked -- `--changed` means "only what I
+/// touched", and silently searching the whole repository instead is a wrong
+/// answer wearing the shape of a right one. These stay refusals.
+const RETIRED_SCOPE_FLAGS: &[&str] = &["--changed", "--staged", "--since", "--base"];
+
+pub(crate) fn argv_without_unknown_flag(
+    argv: &[std::ffi::OsString],
+    clap_message: &str,
+) -> Option<Vec<std::ffi::OsString>> {
+    let unknown = unknown_flag_name(clap_message)?;
+    if RETIRED_SCOPE_FLAGS.contains(&unknown.as_str()) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(argv.len());
+    let mut skip_value = false;
+    let mut dropped = false;
+    for argument in argv {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        let text = argument.to_string_lossy();
+        if text == unknown {
+            dropped = true;
+            skip_value = true;
+            continue;
+        }
+        if text.starts_with(&format!("{unknown}=")) {
+            dropped = true;
+            continue;
+        }
+        out.push(argument.clone());
+    }
+    dropped.then_some(out)
+}
