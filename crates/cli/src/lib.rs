@@ -676,6 +676,26 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
             let msg = e.to_string();
             let first = msg.lines().next().unwrap_or("invalid arguments");
+            let sub = grep_passthrough_args(&argv)
+                .first()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if let Some((reduced, stray)) =
+                argv_without_stray_positional(
+                    &argv,
+                    first,
+                    // clap prints the real usage line in its own message, which
+                    // covers every command; the hand-written table does not.
+                    subcommand_usage(sub).or_else(|| {
+                        msg.lines()
+                            .find(|line| line.trim_start().starts_with("Usage:"))
+                            .map(str::trim)
+                    }),
+                )
+            {
+                println!("note: `{sub}` takes no argument; ignoring `{stray}`");
+                return run_os(reduced);
+            }
             // A guessed flag is recoverable: drop it, say so, and answer the
             // question. Printing clap's `error:` line first would still read
             // as a failure to the agent, so the recovery happens before any
@@ -685,6 +705,20 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                     println!("note: ignoring unknown option `{unknown}`");
                 }
                 return run_os(reduced);
+            }
+            if let Some((reduced, stray)) = argv_with_stray_path_as_filter(&argv, first) {
+                println!("note: `{stray}` is a path; using it as `--path {stray}`");
+                return run_os(reduced);
+            }
+            // Refused because it narrows: name the spelling that does the job,
+            // so the refusal still tells the caller exactly what to type.
+            if let Some(unknown) = unknown_flag_name(first) {
+                if let Some((_, spelling)) = NARROWING_GUESSES
+                    .iter()
+                    .find(|(guess, _)| *guess == unknown)
+                {
+                    println!("`{unknown}` narrows the result; this is spelled `{spelling}`");
+                }
             }
             // STDOUT, not stderr: agents habitually append `2>/dev/null`,
             // and a usage lesson they never see teaches nothing (P3).
@@ -704,10 +738,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // command list instead of the read usage (trace forensics
             // 2026-07-17: 13/24 calls in one run were flag guesses that the
             // generic list did nothing to correct).
-            let sub = grep_passthrough_args(&argv)
-                .first()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+
             // `greppy edit text-cas …`: clap can only say the subcommand is
             // unknown. The caller's intent is known exactly, so name the
             // spelling that does the work.

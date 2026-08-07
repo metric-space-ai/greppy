@@ -462,6 +462,14 @@ pub(crate) fn unknown_flag_name(clap_message: &str) -> Option<String> {
 /// answer wearing the shape of a right one. These stay refusals.
 const RETIRED_SCOPE_FLAGS: &[&str] = &["--changed", "--staged", "--since", "--base"];
 
+/// Guessed flags that ask for LESS, paired with the spelling that delivers it.
+pub(crate) const NARROWING_GUESSES: &[(&str, &str)] = &[
+    ("--lines", "--offset N --limit M"),
+    ("--line", "--offset N --limit M"),
+    ("--first", "--head M"),
+    ("--last", "--tail N"),
+];
+
 pub(crate) fn argv_without_unknown_flag(
     argv: &[std::ffi::OsString],
     clap_message: &str,
@@ -470,18 +478,24 @@ pub(crate) fn argv_without_unknown_flag(
     if RETIRED_SCOPE_FLAGS.contains(&unknown.as_str()) {
         return None;
     }
+    // A guessed flag that NARROWS has a real spelling here. Dropping it would
+    // answer a wider question than the caller asked -- `--lines 1:20` becoming
+    // the whole file is the same wrong-answer-shaped-right as a dropped scope
+    // filter. Refusing while naming the spelling is still a way forward.
+    if NARROWING_GUESSES.iter().any(|(guess, _)| *guess == unknown) {
+        return None;
+    }
     let mut out = Vec::with_capacity(argv.len());
-    let mut skip_value = false;
     let mut dropped = false;
     for argument in argv {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
         let text = argument.to_string_lossy();
         if text == unknown {
+            // Drop the flag alone, never the token behind it: in
+            // `brief --lines parse_path` that token is the symbol being asked
+            // about, and eating it turns a recoverable call into "required
+            // arguments were not provided". If it really was the flag's value,
+            // the retry sees it as a stray and this same recovery removes it.
             dropped = true;
-            skip_value = true;
             continue;
         }
         if text.starts_with(&format!("{unknown}=")) {
@@ -491,4 +505,93 @@ pub(crate) fn argv_without_unknown_flag(
         out.push(argument.clone());
     }
     dropped.then_some(out)
+}
+
+/// A stray positional that is plainly a path, rewritten as the path filter.
+///
+/// `grep PATTERN PATH` is muscle memory, and agents write
+/// `greppy search-pattern foo modules/logging/` constantly. greppy spells that
+/// `--path`, and refusing the habit costs a turn and teaches nothing. If the
+/// rejected argument looks like a path, say so and use it as the filter.
+pub(crate) fn argv_with_stray_path_as_filter(
+    argv: &[std::ffi::OsString],
+    clap_message: &str,
+) -> Option<(Vec<std::ffi::OsString>, String)> {
+    let stray = clap_message
+        .strip_prefix("error: unexpected argument '")?
+        .split('\'')
+        .next()?;
+    if stray.starts_with('-') || stray.is_empty() {
+        return None;
+    }
+    let looks_like_path = stray.contains('/') || std::path::Path::new(stray).exists();
+    if !looks_like_path {
+        return None;
+    }
+    let mut out = Vec::with_capacity(argv.len() + 1);
+    let mut replaced = false;
+    for argument in argv {
+        if !replaced && argument.to_string_lossy() == stray {
+            out.push(std::ffi::OsString::from("--path"));
+            out.push(argument.clone());
+            replaced = true;
+            continue;
+        }
+        out.push(argument.clone());
+    }
+    replaced.then(|| (out, stray.to_string()))
+}
+
+/// A stray positional on a command that takes none, dropped so the call runs.
+///
+/// `greppy doctor parse_path` is a natural guess -- every other verb takes a
+/// symbol -- and refusing it teaches nothing that running doctor would not have
+/// shown. Only commands whose usage line carries no placeholder qualify; where
+/// a different SHAPE is required (`path --from A --to B`), the usage line is
+/// the answer and the refusal stands.
+pub(crate) fn argv_without_stray_positional(
+    argv: &[std::ffi::OsString],
+    clap_message: &str,
+    usage: Option<&str>,
+) -> Option<(Vec<std::ffi::OsString>, String)> {
+    let stray = clap_message
+        .strip_prefix("error: unexpected argument '")?
+        .split('\'')
+        .next()?;
+    if stray.starts_with('-') || stray.is_empty() {
+        return None;
+    }
+    // A placeholder OUTSIDE the optional brackets means the command wants an
+    // argument of its own; then the stray is a shape problem, not a surplus.
+    // `[--root DIR]` is uppercase too, so the brackets have to go first.
+    let bare = {
+        let mut kept = String::new();
+        let mut depth = 0usize;
+        for ch in usage?.chars() {
+            match ch {
+                '[' | '<' => depth += 1,
+                ']' | '>' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => kept.push(ch),
+                _ => {}
+            }
+        }
+        kept
+    };
+    if bare
+        .split_whitespace()
+        .skip(2)
+        .any(|word| word.chars().any(|c| c.is_ascii_uppercase()))
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(argv.len());
+    let mut dropped = false;
+    for argument in argv {
+        if !dropped && argument.to_string_lossy() == stray {
+            dropped = true;
+            continue;
+        }
+        out.push(argument.clone());
+    }
+    dropped.then(|| (out, stray.to_string()))
 }
