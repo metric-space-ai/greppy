@@ -177,6 +177,90 @@ fn passthrough_stdin_pipe() {
 }
 
 #[test]
+fn passthrough_delayed_stdin_data_is_still_forwarded_byte_exactly() {
+    let mut ours = greppy_command("delayed-stdin");
+    ours.arg("hallo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ours.spawn().expect("spawn greppy");
+    let mut stdin = child.stdin.take().expect("open child stdin");
+    let writer = std::thread::spawn(move || {
+        // The producer grace exists because pipeline processes are scheduled
+        // independently; data can be genuine even when it is not buffered yet.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stdin.write_all(b"hallo\n").expect("write delayed stdin");
+    });
+    let output = child.wait_with_output().expect("collect greppy output");
+    writer.join().expect("join delayed writer");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"hallo\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn passthrough_idle_stdin_pipe_returns_guidance_instead_of_hanging() {
+    let root = unique_tempdir("idle-stdin");
+    std::fs::create_dir(root.join("edit-src")).unwrap();
+
+    for pattern in [".", "edit-src"] {
+        let mut command = greppy_command(&format!("idle-{pattern}"));
+        command
+            .arg(pattern)
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn greppy");
+        // Keeping the writer open with zero bytes reproduces agent runners:
+        // real grep waits forever because EOF never arrives.
+        let stdin = child.stdin.take().expect("open child stdin");
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(child.wait_with_output()).unwrap());
+        let output = match receive.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(output) => output.expect("collect greppy output"),
+            Err(_) => {
+                drop(stdin);
+                let _ = receive.recv_timeout(std::time::Duration::from_secs(1));
+                panic!("greppy {pattern} waited indefinitely on an idle stdin pipe");
+            }
+        };
+        drop(stdin);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(64), "stdout: {stdout}");
+        assert!(
+            stdout.contains("file/path argument or data on stdin"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("greppy index {pattern}")),
+            "directory guidance missing: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn passthrough_file_operand_does_not_consult_idle_stdin() {
+    let mut command = greppy_command("file-with-idle-stdin");
+    command
+        .args(["alpha", "tests/fixtures/count.txt"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn greppy");
+    let stdin = child.stdin.take().expect("open child stdin");
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(child.wait_with_output()).unwrap());
+    let output = receive
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("a named file must let grep finish while stdin remains open")
+        .expect("collect greppy output");
+    drop(stdin);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"alpha\nalpha\nalpha\n");
+}
+
+#[test]
 fn passthrough_missing_file_returns_grep_style_error() {
     let mut ours = greppy_command("missing_file");
     ours.args(["alpha", "tests/fixtures/does_not_exist.txt"]);

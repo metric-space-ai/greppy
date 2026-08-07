@@ -7227,117 +7227,6 @@ fn greppy_only_flag(args: &[std::ffi::OsString]) -> Option<(&'static str, &'stat
     None
 }
 
-/// The passthrough contract is byte exact only after argv has proved it belongs
-/// to grep. A static grammar gate keeps an unknown Greppy/newer-version flag
-/// from being delegated to another program whose diagnostic would erase the
-/// original intent. `--` remains the explicit escape for hyphen-led patterns.
-fn unknown_grep_option(args: &[std::ffi::OsString]) -> Option<String> {
-    const SHORT_NO_VALUE: &str = "EFGPiwxyzvVclLqsrRHhnboaIZTUN";
-    const SHORT_WITH_VALUE: &str = "efmABCdD";
-    const LONG_NO_VALUE: &[&str] = &[
-        "--basic-regexp",
-        "--extended-regexp",
-        "--fixed-strings",
-        "--perl-regexp",
-        "--ignore-case",
-        "--no-ignore-case",
-        "--word-regexp",
-        "--line-regexp",
-        "--null-data",
-        "--invert-match",
-        "--version",
-        "--help",
-        "--byte-offset",
-        "--line-number",
-        "--line-buffered",
-        "--with-filename",
-        "--no-filename",
-        "--only-matching",
-        "--quiet",
-        "--silent",
-        "--text",
-        "--binary",
-        "--recursive",
-        "--dereference-recursive",
-        "--files-with-matches",
-        "--files-without-match",
-        "--count",
-        "--initial-tab",
-        "--null",
-        "--unix-byte-offsets",
-        "--no-group-separator",
-    ];
-    const LONG_WITH_VALUE: &[&str] = &[
-        "--regexp",
-        "--file",
-        "--max-count",
-        "--after-context",
-        "--before-context",
-        "--context",
-        "--binary-files",
-        "--devices",
-        "--directories",
-        "--include",
-        "--exclude",
-        "--exclude-from",
-        "--exclude-dir",
-        "--label",
-        "--group-separator",
-        "--color",
-        "--colour",
-    ];
-
-    let mut index = 0usize;
-    while index < args.len() {
-        let argument = &args[index];
-        if argument == "--" {
-            return None;
-        }
-        let Some(text) = argument.to_str() else {
-            index += 1;
-            continue;
-        };
-        if !text.starts_with('-') || text == "-" {
-            index += 1;
-            continue;
-        }
-        if text.starts_with("--") {
-            let (name, attached) = text
-                .split_once('=')
-                .map_or((text, false), |(name, _)| (name, true));
-            if LONG_NO_VALUE.contains(&name) {
-                index += 1;
-                continue;
-            }
-            if LONG_WITH_VALUE.contains(&name) {
-                index += if attached { 1 } else { 2 };
-                continue;
-            }
-            return Some(text.to_string());
-        }
-
-        let mut chars = text[1..].char_indices().peekable();
-        let mut valid = true;
-        let mut consumes_next = false;
-        while let Some((_, flag)) = chars.next() {
-            if SHORT_NO_VALUE.contains(flag) {
-                continue;
-            }
-            if SHORT_WITH_VALUE.contains(flag) {
-                consumes_next = chars.peek().is_none();
-                break;
-            }
-            valid = false;
-            break;
-        }
-        if !valid {
-            return Some(text.to_string());
-        }
-        index += if consumes_next { 2 } else { 1 };
-    }
-    None
-}
-
 fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // full[0] is the "greppy" placeholder. Strip a leading
     // grep-family (or rg-family) placeholder in full[1] if present so
@@ -7384,6 +7273,9 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
             "status: invalid_invocation\nargument: `{argument}`\nmessage: this is neither a recognized greppy option nor supported grep syntax; nothing was passed to grep\nnext: run `greppy --help`, or put `--` before a literal pattern that begins with `-`"
         )));
     }
+    if let Some(message) = missing_stdin_message(grep_stdin_demand(grep_args), "grep") {
+        return Err(Error::Invalid(message));
+    }
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend_from_slice(grep_args);
@@ -7398,6 +7290,9 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
 /// alternative. Absence of ripgrep must never silently change search
 /// semantics.
 fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
+    if let Some(message) = missing_stdin_message(rg_stdin_demand(args), "ripgrep") {
+        return Err(Error::Invalid(message));
+    }
     if let Some(real_rg) = greppy_passthrough::discover_ripgrep()? {
         let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 1);
         rebuilt.push(std::ffi::OsString::from("rg"));
