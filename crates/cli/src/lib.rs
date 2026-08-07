@@ -722,7 +722,27 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
             // STDOUT, not stderr: agents habitually append `2>/dev/null`,
             // and a usage lesson they never see teaches nothing (P3).
-            println!("{first}");
+            if first.contains("required arguments were not provided") {
+                let missing: Vec<&str> = msg
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| line.starts_with('<') || line.starts_with("--"))
+                    .collect();
+                if missing.is_empty() {
+                    println!("missing a required argument for `{sub}`");
+                } else {
+                    println!("missing for `{sub}`: {}", missing.join(", "));
+                }
+            } else if let Some(stray) = first
+                .strip_prefix("error: unexpected argument '")
+                .and_then(|rest| rest.split('\'').next())
+            {
+                // The usage line below already shows the shape that works;
+                // leading with `error:` only tells the agent it failed.
+                println!("`{stray}` does not fit `{sub}`");
+            } else {
+                println!("{first}");
+            }
             // clap reports a bundled short-flag mistake by its first letter
             // (`-gamma` becomes `-g`), which does not name what the caller
             // wrote. Print the argument verbatim so the refusal is actionable.
@@ -745,7 +765,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             if let Some(corrected) = closest_valid_invocation(&argv, sub, &msg) {
                 println!("{corrected}");
             }
-            if let Some(usage) = subcommand_usage(sub) {
+            // clap prints the real usage line for every command; the
+            // hand-written table does not know `read-file`, `read-smart` or
+            // `bash-smart` and sent them to a generic list that does not even
+            // mention them -- a dead end where a usage line belonged.
+            let clap_usage = msg
+                .lines()
+                .find(|line| line.trim_start().starts_with("Usage:"))
+                .map(|line| line.trim().trim_start_matches("Usage:").trim());
+            if let Some(usage) = subcommand_usage(sub).or(clap_usage) {
                 println!("usage: {usage}");
             } else {
                 println!(
