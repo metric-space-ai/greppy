@@ -733,6 +733,11 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 } else {
                     println!("missing for `{sub}`: {}", missing.join(", "));
                 }
+            } else if let Some(rest) = first.strip_prefix("error: invalid value ") {
+                // clap already names the value and the slot it does not fit;
+                // only the `error:` opening turns a usable hint into what an
+                // agent reads as a dead end. The usage line follows below.
+                println!("invalid value {rest}");
             } else if let Some(stray) = first
                 .strip_prefix("error: unexpected argument '")
                 .and_then(|rest| rest.split('\'').next())
