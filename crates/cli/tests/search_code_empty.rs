@@ -6,11 +6,9 @@
 //! * `search-code` is dead vocabulary: refused as an unknown subcommand
 //!   (exit 64) before grep passthrough — never grepped, never answered.
 //! * `search-pattern` is regex-native: a pattern with metacharacters is
-//!   simply a pattern. Zero hits print `no matches` (naming the path filter
-//!   when one is given) and exit 1 (grep's convention, deliberately). The
-//!   only added line is a computed fact — `case-insensitive: N matches`
-//!   when the case-insensitive run would hit — never an instruction
-//!   (NAV law 1: no justification, no instruction).
+//!   simply a pattern. Zero hits are a successful bounded status: they name
+//!   the empty scope, distinguish a path-filter miss when possible, and give
+//!   concrete broader-search and refresh actions.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,10 +74,9 @@ fn retired_search_code_is_refused_not_grepped() {
     );
 }
 
-/// Zero hits name the active path filter and nothing else: one line, no
-/// interpretation metadata, no retry teaching (NAV law 1).
+/// Zero hits bind the active path filter to concrete next actions.
 #[test]
-fn empty_search_pattern_names_the_path_filter_without_teaching() {
+fn empty_search_pattern_names_the_path_filter_and_next_actions() {
     let (repo, store) = fresh_workspace("empty-filter");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
@@ -90,12 +87,20 @@ fn empty_search_pattern_names_the_path_filter_without_teaching() {
         &["search-pattern", "absent_value", "--path", "src"],
     );
 
-    assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
     assert_eq!(
-        stdout, "no matches under path filter: src\n",
-        "empty output is exactly one line naming the path filter — no \
-         query_interpreted_as/path_filters metadata, no instruction; got: {stdout:?}"
+        code, 0,
+        "bounded no-match status is successful; stdout={stdout}"
     );
+    assert!(stdout.contains("status: no_matches"), "{stdout}");
+    assert!(
+        stdout.contains("message: no matches under path filter: src"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("next: retry without the path filter"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("greppy index ."), "{stdout}");
 }
 
 /// `search-pattern` is regex-native: `absent.*value` is simply a pattern that
@@ -113,19 +118,22 @@ fn metacharacter_pattern_is_just_a_pattern_without_teaching() {
         &["search-pattern", "absent.*value", "--path", "src"],
     );
 
-    assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
     assert_eq!(
-        stdout, "no matches under path filter: src\n",
-        "a metacharacter pattern gets the plain empty answer; got: {stdout:?}"
+        code, 0,
+        "bounded no-match status is successful; stdout={stdout}"
+    );
+    assert!(stdout.contains("status: no_matches"), "{stdout}");
+    assert!(
+        stdout.contains("message: no matches under path filter: src"),
+        "{stdout}"
     );
     assert!(
-        !stdout.contains("literal") && !stdout.contains("try:"),
-        "no metacharacter teaching and no rg retry line; got: {stdout:?}"
+        stdout.contains("greppy search-pattern 'absent.*value'"),
+        "the retry preserves the regex instead of reinterpreting it; got: {stdout:?}"
     );
 }
 
-/// The one fact an empty answer may add: when the case-insensitive run WOULD
-/// hit, the computed count follows — a number, not an instruction.
+/// A computed case-insensitive count remains attached to the bounded status.
 #[test]
 fn empty_search_pattern_reports_the_case_insensitive_fact() {
     let (repo, store) = fresh_workspace("case-fact");
@@ -138,9 +146,13 @@ fn empty_search_pattern_reports_the_case_insensitive_fact() {
         &["search-pattern", "PRESENT", "--fixed", "--path", "src"],
     );
 
-    assert_eq!(code, 1, "zero hits use grep's exit 1; stdout={stdout}");
     assert_eq!(
-        stdout, "no matches under path filter: src\ncase-insensitive: 1 matches\n",
+        code, 0,
+        "bounded no-match status is successful; stdout={stdout}"
+    );
+    assert!(stdout.contains("status: no_matches"), "{stdout}");
+    assert!(
+        stdout.contains("case-insensitive: 1 matches"),
         "the empty answer carries the computed case-insensitive fact; got: {stdout:?}"
     );
 }

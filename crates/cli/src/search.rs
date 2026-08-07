@@ -219,6 +219,99 @@ fn search_sort_name_rows(query: &str, nodes: &mut [greppy_store::Node]) {
     });
 }
 
+fn search_symbol_no_match_status(
+    query: &str,
+    path_filters: &QueryPathFilters,
+    matches_outside_filter: usize,
+) {
+    println!("status: no_matches");
+    if path_filters.is_empty() {
+        println!("scope: indexed definitions in the repository");
+        println!("message: no definition named `{query}`");
+        println!(
+            "next: search source text: greppy search-pattern {} --fixed",
+            shell_example_arg(query)
+        );
+    } else {
+        println!("scope: path filter {}", path_filters.shown());
+        println!(
+            "message: no definition named `{query}` under path filter: {}",
+            path_filters.shown()
+        );
+        if matches_outside_filter > 0 {
+            println!(
+                "reason: {matches_outside_filter} matching definition(s) exist outside the path filter"
+            );
+        } else {
+            println!("reason: no indexed definition matched inside this scope");
+        }
+        println!(
+            "next: retry without the path filter: greppy search-symbol {}",
+            shell_example_arg(query)
+        );
+    }
+    println!("next: refresh definitions after source changes: greppy index .");
+}
+
+fn search_pattern_no_match_status(
+    query: &str,
+    fixed: bool,
+    path_filters: &QueryPathFilters,
+    matches_outside_filter: usize,
+) {
+    println!("status: no_matches");
+    if path_filters.is_empty() {
+        println!("scope: live source files in the repository");
+        println!("message: no matches");
+    } else {
+        println!("scope: path filter {}", path_filters.shown());
+        println!(
+            "message: no matches under path filter: {}",
+            path_filters.shown()
+        );
+        if matches_outside_filter > 0 {
+            println!(
+                "reason: {matches_outside_filter} source match(es) exist outside the path filter"
+            );
+        } else {
+            println!("reason: no source match exists inside this scope");
+        }
+        let mode = if fixed { " --fixed" } else { "" };
+        println!(
+            "next: retry without the path filter: greppy search-pattern {}{mode}",
+            shell_example_arg(query)
+        );
+    }
+    println!(
+        "next: search definition names: greppy search-symbol {}",
+        shell_example_arg(query)
+    );
+    println!("next: refresh graph-backed definition filters after source changes: greppy index .");
+}
+
+fn semantic_no_match_status(query: &str, path_filters: &QueryPathFilters) {
+    println!("status: no_matches");
+    if path_filters.is_empty() {
+        println!("scope: semantic definitions in the repository");
+        println!("message: no matches");
+    } else {
+        println!("scope: path filter {}", path_filters.shown());
+        println!(
+            "message: no matches under path filter: {}",
+            path_filters.shown()
+        );
+        println!(
+            "next: retry without the path filter: greppy search {}",
+            shell_example_arg(query)
+        );
+    }
+    println!(
+        "next: search source text: greppy search-pattern {} --fixed",
+        shell_example_arg(query)
+    );
+    println!("next: refresh semantic definitions after source changes: greppy index .");
+}
+
 fn search_print_node_source(root_path: &std::path::Path, node: &greppy_store::Node) {
     if let Some(span) = read_span_with_meta(
         root_path,
@@ -395,11 +488,12 @@ pub(crate) fn dispatch_search_symbols(
         });
         let total_filtered = hits.len() as i64;
         hits.truncate(cli_result_limit_unless_all(20, all));
+        let status = if hits.is_empty() { "no_matches" } else { "ok" };
         search_symbols_json(
             &store,
             q,
             &project,
-            "ok",
+            status,
             Some(&freshness),
             &hits,
             &path_filters,
@@ -408,13 +502,19 @@ pub(crate) fn dispatch_search_symbols(
             // filter is a false number (measured: total_exact 2 beside 1 hit).
             Some(total_filtered),
         )?;
-        return Ok(if hits.is_empty() { 1 } else { 0 });
+        return Ok(0);
     }
 
-    let mut nodes = search_all_nodes(&store, &project)?;
-    nodes.retain(|node| {
-        path_filters.matches(&node.file_path) && search_kind_matches(&root_path, node, kind)
-    });
+    let mut all_nodes = search_all_nodes(&store, &project)?;
+    all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
+    let matches_outside_filter = all_nodes
+        .iter()
+        .filter(|node| node.name.contains(q) && !path_filters.matches(&node.file_path))
+        .count();
+    let nodes = all_nodes
+        .into_iter()
+        .filter(|node| path_filters.matches(&node.file_path))
+        .collect::<Vec<_>>();
     let mut contained = nodes
         .iter()
         .filter(|node| node.name.contains(q))
@@ -427,14 +527,7 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(0);
     }
 
-    if path_filters.is_empty() {
-        println!("no definition named `{q}`");
-    } else {
-        println!(
-            "no definition named `{q}` under path filter: {}",
-            path_filters.shown()
-        );
-    }
+    search_symbol_no_match_status(q, &path_filters, matches_outside_filter);
 
     let wanted_normalized = search_name_normalized(q);
     let mut similar = nodes
@@ -481,7 +574,7 @@ pub(crate) fn dispatch_search_symbols(
         println!();
         println!("similar names:");
         search_print_symbol_rows(&root_path, &similar, code);
-        return Ok(1);
+        return Ok(0);
     }
 
     let meaning = search_symbol_meaning_hits(
@@ -500,7 +593,7 @@ pub(crate) fn dispatch_search_symbols(
         let purposes = semantic_vector_purposes(&store, root, &meaning, true)?;
         print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), code)?;
     }
-    Ok(1)
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,6 +661,14 @@ pub(crate) fn search_symbols_json(
             "shown": shown,
             "omitted": omitted,
             "truncated": omitted > 0,
+            "next": if status == "no_matches" {
+                vec![
+                    format!("greppy search-pattern {} --fixed", shell_example_arg(query)),
+                    "greppy index .".to_string(),
+                ]
+            } else {
+                Vec::new()
+            },
             "hits": rows,
         }))
         .map_err(|e| Error::Invalid(format!("serialize search-symbols JSON: {e}")))?
@@ -887,6 +988,14 @@ pub(crate) fn dispatch_search_code(
         "live-fallback"
     };
     let mut all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
+    let matches_outside_filter = all_hits
+        .iter()
+        .filter(|hit| {
+            hit.location
+                .rsplit_once(':')
+                .is_some_and(|(file, _)| !path_filters.matches(file))
+        })
+        .count();
     // The path filter shapes the hit set BEFORE any count is taken — a count
     // from before the filter is a false number (the --kind discipline).
     all_hits.retain(|hit| {
@@ -916,7 +1025,7 @@ pub(crate) fn dispatch_search_code(
             fixed,
             resolve_definitions,
         )?;
-        return Ok(if all_hits.is_empty() { 1 } else { 0 });
+        return Ok(0);
     }
 
     let rows = search_pattern_rows(
@@ -928,11 +1037,7 @@ pub(crate) fn dispatch_search_code(
         kind,
     )?;
     if rows.is_empty() {
-        if path_filters.is_empty() {
-            println!("no matches");
-        } else {
-            println!("no matches under path filter: {}", path_filters.shown());
-        }
+        search_pattern_no_match_status(q, fixed, &path_filters, matches_outside_filter);
         let mut insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
         insensitive.retain(|hit| {
             hit.location
@@ -942,7 +1047,7 @@ pub(crate) fn dispatch_search_code(
         if !insensitive.is_empty() {
             println!("case-insensitive: {} matches", insensitive.len());
         }
-        return Ok(1);
+        return Ok(0);
     }
     print_search_pattern_rows(&rows, code, all);
     Ok(0)
@@ -1249,18 +1354,14 @@ pub(crate) fn dispatch_semantic(
                         hits.len(),
                         candidate_limit,
                         Some(&freshness),
-                        "ok",
+                        if hits.is_empty() { "no_matches" } else { "ok" },
                         &display_hits,
                         purposes.as_deref(),
                         expand.as_ref(),
                     )?;
                 } else if hits.is_empty() {
-                    if path_filters.is_empty() {
-                        println!("no matches");
-                    } else {
-                        println!("no matches under path filter: {}", path_filters.shown());
-                    }
-                    return Ok(1);
+                    semantic_no_match_status(q, &path_filters);
+                    return Ok(0);
                 } else {
                     let purposes = semantic_vector_purposes(&store, root, &hits, true)?;
                     print_search_meaning_rows(
@@ -1271,7 +1372,7 @@ pub(crate) fn dispatch_semantic(
                         code,
                     )?;
                 }
-                Ok(if hits.is_empty() { 1 } else { 0 })
+                Ok(0)
             }
             Err(e) => Err(e),
         }
@@ -1621,6 +1722,11 @@ pub(crate) fn semantic_vector_json_with_expand(
         "omitted": omitted,
         "unranked_candidates": unranked_candidates,
         "truncated": truncated,
+        "next": if status == "no_matches" {
+            vec!["retry without --path/--kind", "greppy index ."]
+        } else {
+            Vec::new()
+        },
         "hits": rows,
     });
     if let Some(expand) = expand {

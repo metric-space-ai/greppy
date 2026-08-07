@@ -235,6 +235,10 @@ pub enum Command {
         /// Also print a compact edit handle for every printed span.
         #[arg(long)]
         handle: bool,
+        /// Accepted for agent ergonomics — read already prints source, so this
+        /// flag is named in a note and otherwise changes nothing.
+        #[arg(long)]
+        code: bool,
         /// Emit the existing machine-readable read shape.
         #[arg(long, hide = true)]
         json: bool,
@@ -566,10 +570,7 @@ pub enum Command {
         #[arg(long)]
         fixed: bool,
         /// Restrict matches by the enclosing definition's kind.
-        #[arg(
-            long,
-            value_parser = ["function", "method", "class", "struct", "enum", "trait"]
-        )]
+        #[arg(long, value_name = "KIND")]
         kind: Option<String>,
         /// Restrict matches to these files or directory subtrees. Repeatable;
         /// this is the only path filter.
@@ -588,10 +589,7 @@ pub enum Command {
         #[arg(value_name = "NAME")]
         query: Option<String>,
         /// Restrict matches to one definition kind.
-        #[arg(
-            long,
-            value_parser = ["function", "method", "class", "struct", "enum", "trait"]
-        )]
+        #[arg(long, value_name = "KIND")]
         kind: Option<String>,
         /// Restrict matches to these files or directory subtrees. Repeatable;
         /// this is the only path filter.
@@ -632,10 +630,7 @@ pub enum Command {
         #[arg(value_name = "WHAT IT DOES")]
         query_parts: Vec<String>,
         /// Restrict matches to one definition kind.
-        #[arg(
-            long,
-            value_parser = ["function", "method", "class", "struct", "enum", "trait"]
-        )]
+        #[arg(long, value_name = "KIND")]
         kind: Option<String>,
         /// Restrict matches to these files or directory subtrees. Repeatable;
         /// this is the only path filter.

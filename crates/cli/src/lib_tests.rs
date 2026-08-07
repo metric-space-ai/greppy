@@ -617,10 +617,10 @@ fn parse_path_disambiguation_and_hyphen_values() {
     // usage error — the legacy `brief A B` bundle is gone.
     assert!(Cli::try_parse_from(["greppy", "brief", "open", "close"]).is_err());
 
-    // read takes symbols only; file paths and the old no-op --code spelling
-    // belong to neither this verb nor its exact source contract.
+    // `read` accepts path-shaped positionals and the commonly carried --code
+    // flag so the dispatcher can return source instead of a parser failure.
     assert!(Cli::try_parse_from(["greppy", "read", "open", "a/mod.py"]).is_ok());
-    assert!(Cli::try_parse_from(["greppy", "read", "open", "--code"]).is_err());
+    assert!(Cli::try_parse_from(["greppy", "read", "open", "--code"]).is_ok());
     assert!(Cli::try_parse_from(["greppy", "read-file", "a/mod.py"]).is_ok());
 
     // Selector and content values may begin with '-' (real diff/RST lines).

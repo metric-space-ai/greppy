@@ -1,6 +1,6 @@
 //! `--path P` on the search family: hits are filtered to files under P
 //! BEFORE any count is taken, an empty filtered set says so the way the nav
-//! commands do, and the grep exit codes hold (1 for no hit).
+//! commands do, and an empty filtered set is a successful bounded status.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,7 +79,7 @@ fn search_symbol_path_keeps_only_hits_under_the_filter() {
 }
 
 #[test]
-fn search_symbol_path_with_no_hit_says_so_and_exits_1() {
+fn search_symbol_path_with_no_hit_returns_bounded_status() {
     let (repo, store) = indexed_two_tree_repo("symbol-empty");
 
     let (code, out, err) = run(
@@ -88,7 +88,7 @@ fn search_symbol_path_with_no_hit_says_so_and_exits_1() {
         &["search-symbol", "parse_widget", "--path", "no-such-dir"],
     );
 
-    assert_eq!(code, 1, "stdout={out}\nstderr={err}");
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
     assert!(
         out.contains("no definition named `parse_widget` under path filter: no-such-dir"),
         "{out}"
@@ -163,7 +163,7 @@ fn search_pattern_path_filters_rows_before_counting() {
 }
 
 #[test]
-fn search_pattern_path_with_no_hit_says_so_and_exits_1() {
+fn search_pattern_path_with_no_hit_returns_bounded_status() {
     let (repo, store) = indexed_two_tree_repo("pattern-empty");
 
     let (code, out, err) = run(
@@ -172,7 +172,7 @@ fn search_pattern_path_with_no_hit_says_so_and_exits_1() {
         &["search-pattern", "fn parse_widget", "--path", "no-such-dir"],
     );
 
-    assert_eq!(code, 1, "stdout={out}\nstderr={err}");
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
     assert!(
         out.contains("no matches under path filter: no-such-dir"),
         "{out}"

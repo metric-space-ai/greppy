@@ -564,6 +564,85 @@ fn read_json_miss(store: &greppy_store::Store, project: &str, query: &str) -> se
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the read compatibility decisions at one dispatch boundary"
+)]
+pub(crate) fn dispatch_read(
+    subjects: &[String],
+    head: Option<usize>,
+    tail: Option<usize>,
+    with_handle: bool,
+    code: bool,
+    json: bool,
+    path_filters: &[String],
+    root: Option<&str>,
+) -> Result<i32> {
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    let file_intents = subjects
+        .iter()
+        .map(|subject| {
+            looks_like_path(subject)
+                || read_open_file(&root_path, &canonical_root, subject).is_some()
+        })
+        .collect::<Vec<_>>();
+
+    if code {
+        let note = "note: `--code` is ignored because `greppy read` already prints source";
+        if json {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
+    }
+
+    if !file_intents.iter().any(|is_file| *is_file) {
+        return dispatch_read_symbols(subjects, head, tail, with_handle, json, path_filters, root);
+    }
+
+    if head.is_some() || tail.is_some() || json {
+        let note = "note: a positional file uses `read-file` paging; --head, --tail, and --json apply only to symbol reads";
+        if json {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
+    }
+
+    let mut failed = false;
+    for (index, (subject, is_file)) in subjects.iter().zip(file_intents).enumerate() {
+        if index > 0 {
+            println!();
+        }
+        let code = if is_file {
+            println!("note: `{subject}` is a path; reading it as a file");
+            dispatch_read_files(
+                std::slice::from_ref(subject),
+                None,
+                false,
+                with_handle,
+                path_filters,
+                root,
+            )?
+        } else {
+            dispatch_read_symbols(
+                std::slice::from_ref(subject),
+                head,
+                tail,
+                with_handle,
+                json,
+                path_filters,
+                root,
+            )?
+        };
+        failed |= code != 0;
+    }
+    Ok(i32::from(failed))
+}
+
 pub(crate) fn dispatch_read_symbols(
     symbols: &[String],
     head: Option<usize>,

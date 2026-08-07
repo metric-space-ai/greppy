@@ -589,6 +589,7 @@ pub(crate) fn emit_search_code_results_with_format(
         serde_json::to_string_pretty(&serde_json::json!({
             "command": "search-pattern",
             "status": status,
+            "result_status": if hits.is_empty() { "no_matches" } else { "ok" },
             "query": query,
             "pattern_mode": if fixed { "fixed" } else { "regex" },
             "project": project,
@@ -612,6 +613,15 @@ pub(crate) fn emit_search_code_results_with_format(
             "shown": shown,
             "omitted": omitted,
             "truncated": omitted > 0,
+            "next": if hits.is_empty() {
+                vec![
+                    format!("greppy search-symbol {}", shell_example_arg(query)),
+                    "retry without --path/--kind".to_string(),
+                    "greppy index .".to_string(),
+                ]
+            } else {
+                Vec::new()
+            },
             "hits": rows,
         }))
         .map_err(|error| Error::Invalid(format!("serialize search-code JSON: {error}")))?

@@ -61,9 +61,13 @@ fn read_is_symbols_only_whole_and_doc_extended() {
         "lib.rs:1-6  target\n/// Authored docs.\n#[inline]\npub fn target() {\n    let x = 1;\n    println!(\"{x}\");\n}\n"
     );
 
-    let (path_code, path_out, _) = run(&repo, &store, &["read", "lib.rs"]);
-    assert_eq!(path_code, 1, "{path_out}");
-    assert!(path_out.starts_with("no symbol `lib.rs`"), "{path_out}");
+    let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
+    assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
+    assert!(
+        path_out.starts_with("note: `lib.rs` is a path; reading it as a file\nlib.rs:1-6\n"),
+        "{path_out}"
+    );
+    assert!(path_out.contains("pub fn target()"), "{path_out}");
 }
 
 #[test]

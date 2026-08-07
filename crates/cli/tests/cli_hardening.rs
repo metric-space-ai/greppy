@@ -420,13 +420,14 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
         &store,
     );
     assert_eq!(
-        code, 1,
-        "healed index: the OLD marker no longer exists anywhere; stderr={err}\nstdout={out}"
+        code, 0,
+        "healed index returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "live-fallback");
+    assert_eq!(v["result_status"], "no_matches");
     assert_eq!(v["fresh"], true, "live fallback itself is current: {v:?}");
     assert_eq!(v["total_exact"], 0);
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
@@ -482,13 +483,14 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 1,
-        "old marker is absent from live fallback; stderr={err}\nstdout={out}"
+        code, 0,
+        "old marker returns a bounded no-match status from live fallback; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
     assert_eq!(v["status"], "live-fallback");
+    assert_eq!(v["result_status"], "no_matches");
     assert_eq!(v["fresh"], true);
     assert_eq!(v["index_freshness"]["state"], "drift");
     assert_eq!(v["index_freshness"]["stale_file_count"], 1);
@@ -1629,7 +1631,10 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
         &repo,
         &store,
     );
-    assert_eq!(code, 1, "retired symbol must miss; stderr={err}");
+    assert_eq!(
+        code, 0,
+        "retired symbol returns a bounded miss; stderr={err}"
+    );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(
@@ -1702,7 +1707,10 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         &repo,
         &store,
     );
-    assert_eq!(code, 1, "replaced symbol must miss; stderr={err}");
+    assert_eq!(
+        code, 0,
+        "replaced symbol returns a bounded miss; stderr={err}"
+    );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(
@@ -1966,7 +1974,10 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         &repo,
         &store,
     );
-    assert_eq!(code, 1, "pre-crash symbol must miss; stderr={err}");
+    assert_eq!(
+        code, 0,
+        "pre-crash symbol returns a bounded miss; stderr={err}"
+    );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert!(

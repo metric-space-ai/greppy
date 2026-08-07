@@ -535,6 +535,16 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
         return None;
     }
+    if let Some(command) = SUBCOMMANDS
+        .iter()
+        .copied()
+        .filter(|command| levenshtein(verb, command) <= 2)
+        .min_by_key(|command| levenshtein(verb, command))
+    {
+        return Some(format!(
+            "status: invalid_invocation\ncommand: `{verb}`\nmessage: unknown greppy command; nothing was passed to grep\nnext: did you mean `greppy {command} ...`?"
+        ));
+    }
     greppy_only_flag(&rest[1..])?;
     Some(format!(
         "unrecognized command `{verb}`\nusage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
@@ -782,6 +792,29 @@ fn shell_quote_cli(value: &str) -> String {
     }
 }
 
+const SEARCH_KINDS: &[&str] = &["function", "method", "class", "struct", "enum", "trait"];
+
+/// A guessed domain kind is still evidence about the query, but not about the
+/// language-neutral index vocabulary. Dropping only the filter preserves the
+/// search while naming exactly what was ignored and how to spell a narrower one.
+fn effective_search_kind(kind: Option<String>, json: bool) -> Option<String> {
+    let requested = kind?;
+    let normalized = requested.to_ascii_lowercase();
+    if SEARCH_KINDS.contains(&normalized.as_str()) {
+        return Some(normalized);
+    }
+    let message = format!(
+        "note: ignored unknown --kind value `{requested}`; searching without a kind filter. valid values: {}",
+        SEARCH_KINDS.join(", ")
+    );
+    if json {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+    None
+}
+
 /// One-line usage per agent-facing subcommand, printed after a short arg
 /// error so the failed call carries the correct retry (P3: every failure
 /// costs the agent a turn of thinking plus a tool call).
@@ -798,8 +831,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "brief" => "greppy brief SYMBOL [--path PATH] [--json] [--root DIR]",
         "read" => {
-            "greppy read SYMBOL [--head M] [--tail N] [--handle] [--root DIR]  \
-             or: greppy read FILE [--line N[:M]] [--handle] [--json] [--root DIR]"
+            "greppy read SYMBOL|FILE [--head M] [--tail N] [--handle] [--code] [--path PATH] [--root DIR]"
         }
         "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
         "replace-text" => "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]",
@@ -1417,12 +1449,13 @@ fn dispatch_subcommand(
             head,
             tail,
             handle,
+            code,
             json,
             path_opts,
         } => {
-            let symbols = nav_targets(&symbols)?;
+            let subjects = read_targets(&symbols)?;
             validate_path_filters(root, &path_opts, "--path")?;
-            dispatch_read_symbols(&symbols, head, tail, handle, json, &path_opts, root)
+            dispatch_read(&subjects, head, tail, handle, code, json, &path_opts, root)
         }
         Command::ReadSmart {
             symbols,
@@ -1702,16 +1735,19 @@ fn dispatch_subcommand(
             code,
             all,
             path_opts,
-        } => dispatch_search_code(
-            query.as_deref(),
-            kind.as_deref(),
-            code,
-            all,
-            json,
-            fixed,
-            &path_opts,
-            root,
-        ),
+        } => {
+            let kind = effective_search_kind(kind, json);
+            dispatch_search_code(
+                query.as_deref(),
+                kind.as_deref(),
+                code,
+                all,
+                json,
+                fixed,
+                &path_opts,
+                root,
+            )
+        }
         Command::SearchSymbol {
             query,
             kind,
@@ -1719,16 +1755,19 @@ fn dispatch_subcommand(
             code,
             all,
             path_opts,
-        } => dispatch_search_symbols(
-            query.as_deref(),
-            kind.as_deref(),
-            code,
-            all,
-            json,
-            &path_opts,
-            EmbeddingCliArgs { device, no_gpu },
-            root,
-        ),
+        } => {
+            let kind = effective_search_kind(kind, json);
+            dispatch_search_symbols(
+                query.as_deref(),
+                kind.as_deref(),
+                code,
+                all,
+                json,
+                &path_opts,
+                EmbeddingCliArgs { device, no_gpu },
+                root,
+            )
+        }
         Command::Plus {
             query,
             k,
@@ -1753,6 +1792,7 @@ fn dispatch_subcommand(
             path_opts,
         } => {
             let query = query_parts.join(" ");
+            let kind = effective_search_kind(kind, json);
             dispatch_semantic(
                 (!query.trim().is_empty()).then_some(query.as_str()),
                 &path_opts,
@@ -4833,6 +4873,27 @@ fn nav_targets(raw: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `read` can distinguish a path from a symbol without guessing about graph
+/// meaning: either the spelling is path-shaped or it resolves to a real file.
+/// Keep every other target validation so empty input, globs, and mistyped flags
+/// still receive their precise usage status.
+fn read_targets(raw: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for value in raw {
+        if value == "-" {
+            out.extend(targets_from_stdin()?);
+        } else {
+            out.push(value.clone());
+        }
+    }
+    for target in &out {
+        if !looks_like_path(target) {
+            validate_nav_target(target)?;
+        }
+    }
+    Ok(out)
+}
+
 /// CHAIN: `greppy who-calls S --json | greppy brief -`. Result rows become the
 /// next command's targets; the previous call's `targets` echo does not — that
 /// is what it was asked, not what it answered.
@@ -7092,6 +7153,117 @@ fn greppy_only_flag(args: &[std::ffi::OsString]) -> Option<(&'static str, &'stat
     None
 }
 
+/// The passthrough contract is byte exact only after argv has proved it belongs
+/// to grep. A static grammar gate keeps an unknown Greppy/newer-version flag
+/// from being delegated to another program whose diagnostic would erase the
+/// original intent. `--` remains the explicit escape for hyphen-led patterns.
+fn unknown_grep_option(args: &[std::ffi::OsString]) -> Option<String> {
+    const SHORT_NO_VALUE: &str = "EFGPiwxyzvVclLqsrRHhnboaIZTUN";
+    const SHORT_WITH_VALUE: &str = "efmABCdD";
+    const LONG_NO_VALUE: &[&str] = &[
+        "--basic-regexp",
+        "--extended-regexp",
+        "--fixed-strings",
+        "--perl-regexp",
+        "--ignore-case",
+        "--no-ignore-case",
+        "--word-regexp",
+        "--line-regexp",
+        "--null-data",
+        "--invert-match",
+        "--version",
+        "--help",
+        "--byte-offset",
+        "--line-number",
+        "--line-buffered",
+        "--with-filename",
+        "--no-filename",
+        "--only-matching",
+        "--quiet",
+        "--silent",
+        "--text",
+        "--binary",
+        "--recursive",
+        "--dereference-recursive",
+        "--files-with-matches",
+        "--files-without-match",
+        "--count",
+        "--initial-tab",
+        "--null",
+        "--unix-byte-offsets",
+        "--no-group-separator",
+    ];
+    const LONG_WITH_VALUE: &[&str] = &[
+        "--regexp",
+        "--file",
+        "--max-count",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--binary-files",
+        "--devices",
+        "--directories",
+        "--include",
+        "--exclude",
+        "--exclude-from",
+        "--exclude-dir",
+        "--label",
+        "--group-separator",
+        "--color",
+        "--colour",
+    ];
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            return None;
+        }
+        let Some(text) = argument.to_str() else {
+            index += 1;
+            continue;
+        };
+        if !text.starts_with('-') || text == "-" {
+            index += 1;
+            continue;
+        }
+        if text.starts_with("--") {
+            let (name, attached) = text
+                .split_once('=')
+                .map_or((text, false), |(name, _)| (name, true));
+            if LONG_NO_VALUE.contains(&name) {
+                index += 1;
+                continue;
+            }
+            if LONG_WITH_VALUE.contains(&name) {
+                index += if attached { 1 } else { 2 };
+                continue;
+            }
+            return Some(text.to_string());
+        }
+
+        let mut chars = text[1..].char_indices().peekable();
+        let mut valid = true;
+        let mut consumes_next = false;
+        while let Some((_, flag)) = chars.next() {
+            if SHORT_NO_VALUE.contains(flag) {
+                continue;
+            }
+            if SHORT_WITH_VALUE.contains(flag) {
+                consumes_next = chars.peek().is_none();
+                break;
+            }
+            valid = false;
+            break;
+        }
+        if !valid {
+            return Some(text.to_string());
+        }
+        index += if consumes_next { 2 } else { 1 };
+    }
+    None
+}
+
 fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // full[0] is the "greppy" placeholder. Strip a leading
     // grep-family (or rg-family) placeholder in full[1] if present so
@@ -7131,6 +7303,11 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
         };
         return Err(Error::Invalid(format!(
             "`{flag}` is a greppy flag, not a grep flag - {guidance}."
+        )));
+    }
+    if let Some(argument) = unknown_grep_option(grep_args) {
+        return Err(Error::Invalid(format!(
+            "status: invalid_invocation\nargument: `{argument}`\nmessage: this is neither a recognized greppy option nor supported grep syntax; nothing was passed to grep\nnext: run `greppy --help`, or put `--` before a literal pattern that begins with `-`"
         )));
     }
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
