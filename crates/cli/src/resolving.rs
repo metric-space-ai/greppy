@@ -5,18 +5,71 @@
 
 use super::*;
 
+/// How an unknown flag relates to the flags the subcommand really has.
+///
+/// The three cases need different answers, and collapsing them is what let a
+/// typo through: dropping `--jsoon` and answering in text serves a caller who
+/// asked for JSON the wrong shape of answer, which is worse than a refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnknownFlagKind {
+    /// The subcommand lists this flag, yet clap rejected it: retired here.
+    RetiredHere,
+    /// Within a typo's distance of a real flag, so the intent is known.
+    TypoOf,
+    /// Nothing close. The caller invented it; dropping it is safe.
+    Invented,
+}
+
+pub(crate) fn classify_unknown_flag(
+    argv: &[std::ffi::OsString],
+    subcommand: &str,
+    clap_message: &str,
+) -> Option<UnknownFlagKind> {
+    let unknown = unknown_flag_name(clap_message)?;
+    let candidates = subcommand_flag_candidates(argv, subcommand);
+    let closest = candidates
+        .into_iter()
+        .min_by_key(|candidate| levenshtein(&unknown, candidate))?;
+    Some(match levenshtein(&unknown, closest) {
+        0 => UnknownFlagKind::RetiredHere,
+        1..=2 => UnknownFlagKind::TypoOf,
+        _ => UnknownFlagKind::Invented,
+    })
+}
+
 pub(crate) fn closest_valid_invocation(
     argv: &[std::ffi::OsString],
     subcommand: &str,
     clap_message: &str,
 ) -> Option<String> {
-    let unknown = clap_message
-        .strip_prefix("error: unexpected argument '")?
-        .split('\'')
-        .next()?;
-    if !unknown.starts_with("--") {
+    let unknown = unknown_flag_name(clap_message)?;
+    let unknown = unknown.as_str();
+    let candidates = subcommand_flag_candidates(argv, subcommand);
+    let replacement = candidates
+        .into_iter()
+        .min_by_key(|candidate| levenshtein(unknown, candidate))?;
+    let distance = levenshtein(unknown, replacement);
+    if distance > 4 || distance == 0 {
         return None;
     }
+    Some(
+        argv.iter()
+            .map(|argument| {
+                let argument = argument.to_string_lossy();
+                let value = if argument == unknown {
+                    replacement
+                } else {
+                    argument.as_ref()
+                };
+                shell_quote_cli(value)
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// The flags `subcommand` actually accepts, for near-miss comparison.
+fn subcommand_flag_candidates(argv: &[std::ffi::OsString], subcommand: &str) -> Vec<&'static str> {
     let mut candidates = vec![
         "--root",
         "--device",
@@ -95,27 +148,7 @@ pub(crate) fn closest_valid_invocation(
         },
         _ => Vec::new(),
     });
-    let replacement = candidates
-        .into_iter()
-        .min_by_key(|candidate| levenshtein(unknown, candidate))?;
-    let distance = levenshtein(unknown, replacement);
-    if distance > 4 {
-        return None;
-    }
-    Some(
-        argv.iter()
-            .map(|argument| {
-                let argument = argument.to_string_lossy();
-                let value = if argument == unknown {
-                    replacement
-                } else {
-                    argument.as_ref()
-                };
-                shell_quote_cli(value)
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    candidates
 }
 
 /// If `symbol` is a qualified `Owner.member` / `Owner::member` query,

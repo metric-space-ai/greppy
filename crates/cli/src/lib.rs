@@ -700,11 +700,24 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // question. Printing clap's `error:` line first would still read
             // as a failure to the agent, so the recovery happens before any
             // refusal is written.
-            if let Some(reduced) = argv_without_unknown_flag(&argv, first) {
-                if let Some(unknown) = unknown_flag_name(first) {
-                    println!("note: ignoring unknown option `{unknown}`");
+            // ...but only when the flag was invented. A near-miss of a real
+            // flag is a typo whose intent is known, and dropping it answers a
+            // different question in silence: `--jsoon` dropped means a caller
+            // who asked for JSON is handed text. A flag the subcommand does
+            // list, yet clap rejects, was retired there -- also a refusal.
+            // Both fall through to the usage path below, which names the
+            // corrected invocation.
+            let flag_kind = classify_unknown_flag(&argv, sub, first);
+            if !matches!(
+                flag_kind,
+                Some(UnknownFlagKind::TypoOf) | Some(UnknownFlagKind::RetiredHere)
+            ) {
+                if let Some(reduced) = argv_without_unknown_flag(&argv, first) {
+                    if let Some(unknown) = unknown_flag_name(first) {
+                        println!("note: ignoring unknown option `{unknown}`");
+                    }
+                    return run_os(reduced);
                 }
-                return run_os(reduced);
             }
             if let Some((reduced, stray)) = argv_with_stray_path_as_filter(&argv, first) {
                 println!("note: `{stray}` is a path; using it as `--path {stray}`");
