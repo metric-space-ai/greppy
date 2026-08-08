@@ -88,8 +88,8 @@ fn empty_search_pattern_names_the_path_filter_and_next_actions() {
     );
 
     assert_eq!(
-        code, 0,
-        "bounded no-match status is successful; stdout={stdout}"
+        code, 1,
+        "a bounded no-match status still uses grep's code: dev/SEARCH-OUTPUT-SPEC.md \"Exit codes: grep's convention, deliberately\" — 0 for a hit, 1 for none. The status block carries the guidance; stdout={stdout}"
     );
     assert!(stdout.contains("status: no_matches"), "{stdout}");
     assert!(
@@ -119,8 +119,8 @@ fn metacharacter_pattern_is_just_a_pattern_without_teaching() {
     );
 
     assert_eq!(
-        code, 0,
-        "bounded no-match status is successful; stdout={stdout}"
+        code, 1,
+        "a bounded no-match status still uses grep's code: dev/SEARCH-OUTPUT-SPEC.md \"Exit codes: grep's convention, deliberately\" — 0 for a hit, 1 for none. The status block carries the guidance; stdout={stdout}"
     );
     assert!(stdout.contains("status: no_matches"), "{stdout}");
     assert!(
@@ -148,7 +148,7 @@ fn empty_search_pattern_reports_the_case_insensitive_fact() {
 
     assert_eq!(
         code, 0,
-        "bounded no-match status is successful; stdout={stdout}"
+        "a case-insensitive hit IS a hit, so this case keeps grep's 0; stdout={stdout}"
     );
     assert!(stdout.contains("status: no_matches"), "{stdout}");
     assert!(
