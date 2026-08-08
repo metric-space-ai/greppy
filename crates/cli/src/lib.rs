@@ -535,9 +535,21 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {
         return None;
     }
+    // A search pattern that happens to sit within two edits of a command name
+    // is still a search pattern, and the prompt promises `greppy PATTERN
+    // [FILE]` stays grep byte for byte -- `greppy greppy FILE` used to be
+    // refused while real grep printed the matching line. A MISTYPED subcommand
+    // does not carry a file operand, so an existing path behind the token is
+    // what tells the two apart: with one, this is grep; without one, the typo
+    // hint is still the useful answer.
+    let has_file_operand = rest
+        .iter()
+        .skip(1)
+        .any(|token| std::path::Path::new(token).exists());
     if let Some(command) = SUBCOMMANDS
         .iter()
         .copied()
+        .filter(|_| !has_file_operand)
         .filter(|command| levenshtein(verb, command) <= 2)
         .min_by_key(|command| levenshtein(verb, command))
     {
