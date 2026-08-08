@@ -194,3 +194,43 @@ fn unknown_option_is_a_greppy_status_and_never_a_grep_error() {
     );
     assert!(!typo_out.contains("Usage: grep"), "{typo_out}");
 }
+
+/// `--fixed` is named when it is what caused the miss.
+///
+/// A pattern written as a regular expression cannot match under `--fixed`, so
+/// the miss comes from the flag, not from the code being searched. The answer
+/// used to say only "no matches" and then suggest looking the expression up as
+/// a definition name and reindexing — both lead away from the cause. In a
+/// measured agent run this shape came back twice and sent the agent guessing.
+#[test]
+fn fixed_search_names_the_flag_when_the_pattern_reads_as_a_regex() {
+    let (repo, store) = indexed_workspace("fixed-hint");
+
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["search-pattern", "plugin.*conftest.*override", "--fixed"],
+    );
+    assert_eq!(code, 1, "a miss keeps grep's code; stdout={out}\nstderr={err}");
+    assert!(
+        out.contains("reason: --fixed took the pattern literally"),
+        "the flag that caused the miss must be named; stdout={out}"
+    );
+    // And the way out has to precede the suggestions that lead elsewhere.
+    let cause = out.find("reason: --fixed").expect("reason present");
+    let elsewhere = out
+        .find("next: search definition names")
+        .expect("generic suggestion present");
+    assert!(
+        cause < elsewhere,
+        "the cause must be read before the generic suggestions; stdout={out}"
+    );
+
+    // A pattern that is genuinely literal must NOT collect the hint: a lone dot
+    // is ordinary in real text, and a false hint teaches the wrong lesson.
+    let (_, literal_out, _) = run(&repo, &store, &["search-pattern", "file.txt", "--fixed"]);
+    assert!(
+        !literal_out.contains("reason: --fixed"),
+        "a literal pattern must not be blamed on --fixed; stdout={literal_out}"
+    );
+}

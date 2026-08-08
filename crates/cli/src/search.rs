@@ -282,11 +282,35 @@ fn search_pattern_no_match_status(
             shell_example_arg(query)
         );
     }
+    // `--fixed` takes the pattern literally, so a pattern written as a regular
+    // expression cannot match whatever the file holds -- the miss is caused by
+    // the flag, not by the code. Nothing here said so, and the two suggestions
+    // below lead away from the cause: looking up a regular expression as a
+    // definition name finds nothing, and reindexing changes nothing. Name the
+    // flag first, while the reader is still at the top of the answer.
+    if fixed && pattern_reads_as_regex(query) {
+        println!("reason: --fixed took the pattern literally, and it reads as a regular expression");
+        println!(
+            "next: search it as a regular expression: greppy search-pattern {}",
+            shell_example_arg(query)
+        );
+    }
     println!(
         "next: search definition names: greppy search-symbol {}",
         shell_example_arg(query)
     );
     println!("next: refresh graph-backed definition filters after source changes: greppy index .");
+}
+
+/// Whether a pattern carries regex syntax that `--fixed` would neutralise.
+///
+/// A lone `.` is ordinary in real text (`file.txt`, an English sentence), so it
+/// is not enough on its own; a quantifier, class, group, alternation or escape
+/// is what makes the literal reading the wrong one.
+fn pattern_reads_as_regex(query: &str) -> bool {
+    query
+        .chars()
+        .any(|c| matches!(c, '*' | '+' | '?' | '[' | '(' | '|' | '\\'))
 }
 
 fn semantic_no_match_status(query: &str, path_filters: &QueryPathFilters) {
