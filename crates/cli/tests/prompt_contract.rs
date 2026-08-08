@@ -337,13 +337,24 @@ fn edit_is_eleven_verbs_with_visible_signatures() {
 fn the_header_leads_with_the_product() {
     let text = prompt();
     let header: String = text.lines().take(4).collect::<Vec<_>>().join(" ");
+    // The directive leads (880f0eb): the first thing read is what to do, not
+    // what the tool is. The identity line and the grep promise still have to be
+    // there -- they are what makes the directive credible -- but they follow it.
     assert!(
-        header.contains("holds this repository as a graph"),
-        "the identity line names the product, not the fallback; header: {header}"
+        header.contains("greppy") && !header.starts_with("grep "),
+        "the header leads with the product, not the fallback; header: {header}"
     );
     assert!(
-        header.contains("byte-identical output") && header.contains("grep's exit codes"),
-        "the grep promise is stated exactly once, in the header: {header}"
+        header.contains("Do NOT run grep/find/read loops"),
+        "the directive is the first thing the reader meets; header: {header}"
+    );
+    assert!(
+        text.contains("holds this repository as a graph"),
+        "the identity line names the product, not the fallback"
+    );
+    assert!(
+        text.contains("byte-identical output") && text.contains("grep's exit codes"),
+        "the grep promise is stated exactly once"
     );
 }
 
@@ -358,8 +369,13 @@ fn the_prompt_is_frozen_byte_for_byte() {
 
     // 05.08.2026: owner approved the AGENT: section (greppy -p delegation
     // block) for 0.3.1 — wording frozen in the same review.
+    // 08.08.2026: owner approved three further changes in one review — the
+    // navigation directive moved ahead of the identity line (880f0eb), the
+    // merge that carried the AGENT block into this line (7cc8bb5), and the
+    // INDEX block, which names the one command an answer can now ask for
+    // ("run `greppy index .` first") and would otherwise be unexplained.
     const APPROVED_SHA256: &str =
-        "0a53dcf9b3584a57017f1994c70e816b092cb43f340ab7de9fe17547ae2ed0ce";
+        "e184b412f549db701f1ab5fa299e88850aae9e7bdb3420ceff033f6b4e6f9a16";
 
     let text = prompt();
     let digest = {

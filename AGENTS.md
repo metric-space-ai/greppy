@@ -107,6 +107,12 @@ RUN:
                              every REGEX match as `LINE  content`; the rest
                              compacted, any part of the original printable.
 
+INDEX:
+  index [PATH]                      rebuilds the graph and meaning index for PATH; run it when
+                                    a command reports the index stale (both are built
+                                    automatically on first use). --agent-worktree indexes the
+                                    agent worktree belonging to PATH instead
+
 AGENT:
   -p "TASK" [--model M]   a built-in coding agent carries out TASK on this
                           repository and delivers the outcome as one commit on
