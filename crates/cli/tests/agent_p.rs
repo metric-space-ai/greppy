@@ -325,3 +325,71 @@ fn nested_agent_run_is_refused() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `index --agent-worktree` warms the tree `-p` will actually use.
+///
+/// Indexing the checkout leaves the agent cold: its worktree is a different
+/// path, so a different workspace identity, and the agent then pays for the
+/// first index -- graph AND embeddings -- inside its own run. The warm-up has
+/// to land on the agent's tree and has to leave it registered, or the agent's
+/// next run discards it and builds again.
+#[test]
+fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
+    let dir = unique_temp("index-agent-worktree");
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    init_repo(&repo);
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn parse_path(p: &str) -> usize { p.len() }\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "src/lib.rs"]);
+    git(&repo, &["commit", "-m", "code"]);
+
+    let store = dir.join("store");
+    let out = std::process::Command::new(binary_path())
+        .args(["index", "--agent-worktree"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .output()
+        .expect("spawn greppy");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "warm-up must succeed; stdout={stdout}\nstderr={stderr}"
+    );
+
+    // It has to SAY which tree it warmed: the caller cannot poll a path it
+    // was never told.
+    let worktree = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("agent worktree: "))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("warm-up must name the worktree; stdout={stdout}"));
+    assert!(
+        worktree.contains("agent-worktrees"),
+        "warmed path must be the agent's tree; got {worktree}"
+    );
+    assert_ne!(
+        std::fs::canonicalize(&worktree).unwrap(),
+        std::fs::canonicalize(&repo).unwrap(),
+        "warming the checkout instead of the agent tree is the whole bug"
+    );
+
+    // Registered in the MAIN repository, so the agent reuses it instead of
+    // discarding and rebuilding.
+    let listed = std::process::Command::new("git")
+        .args(["worktree", "list"])
+        .current_dir(&repo)
+        .output()
+        .expect("git worktree list");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("agent-worktrees"),
+        "agent worktree must be registered in the main repo"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

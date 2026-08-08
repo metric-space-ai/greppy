@@ -353,6 +353,46 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
 }
 
 /// Run the indexer against `path` (default: current directory).
+/// Warm the worktree `greppy -p` will use, instead of this checkout.
+///
+/// The built-in agent works in a per-repository worktree whose workspace
+/// identity is its own path, so indexing the checkout leaves the agent cold and
+/// it pays for the first index -- graph plus embeddings -- inside its own run.
+/// Preparing the tree here is the same operation the agent performs, so the
+/// agent's later run finds it registered and reuses it.
+pub(crate) fn dispatch_index_agent_worktree(
+    path: Option<&str>,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    let repo = resolve_root(root.or(path))?;
+    let workspace = greppy_agent::workspace::AgentWorkspace::create(&repo, "index-warm")
+        .map_err(|error| {
+            Error::Invalid(format!(
+                "no agent worktree for {}: {error}",
+                repo.display()
+            ))
+        })?;
+    // A disposable fallback tree is warmed for nothing: the agent's next run
+    // takes the stable path and finds it cold. Say so instead of reporting a
+    // warm index that the measured run will never see.
+    if !workspace.is_stable() {
+        return Err(Error::Invalid(format!(
+            "another `greppy -p` run holds the agent worktree for {}; \
+             warming the disposable fallback would leave the real one cold — \
+             retry once that run finishes",
+            repo.display()
+        )));
+    }
+    let worktree = workspace.worktree_path().to_string_lossy().into_owned();
+    if !cli_json_output() {
+        println!("agent worktree: {worktree}");
+    }
+    // Walk AND key the store by the worktree, so the identity matches the one
+    // the agent resolves; keying by the checkout would warm a third workspace.
+    dispatch_index(Some(&worktree), Some(&worktree), embedding_args)
+}
+
 pub(crate) fn dispatch_index(
     path: Option<&str>,
     root: Option<&str>,

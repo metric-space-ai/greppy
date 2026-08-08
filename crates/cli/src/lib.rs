@@ -1437,7 +1437,11 @@ fn dispatch_subcommand(
             };
             summarize_daemon::daemon_main(socket, cfg, prewarm)
         }
-        Command::Index { path, json } => {
+        Command::Index {
+            path,
+            json,
+            agent_worktree,
+        } => {
             if path.as_deref() == Some("status") {
                 dispatch_index_status(json, root)
             } else {
@@ -1446,7 +1450,12 @@ fn dispatch_subcommand(
                         "index --json is only supported for `grep index status --json`".into(),
                     ));
                 }
-                dispatch_index(path.as_deref(), root, EmbeddingCliArgs { device, no_gpu })
+                let embedding_args = EmbeddingCliArgs { device, no_gpu };
+                if agent_worktree {
+                    dispatch_index_agent_worktree(path.as_deref(), root, embedding_args)
+                } else {
+                    dispatch_index(path.as_deref(), root, embedding_args)
+                }
             }
         }
         Command::WhereAmI { json } => dispatch_where_am_i(root, json),

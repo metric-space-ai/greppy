@@ -79,6 +79,14 @@ pub enum Command {
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
+        /// Warm the worktree `greppy -p` will use, not this checkout.
+        ///
+        /// The built-in agent works in a per-repository worktree with its own
+        /// workspace identity, so indexing the checkout leaves the agent cold
+        /// and it pays for the first index inside its own run. This prepares
+        /// that worktree exactly as the agent does and indexes it there.
+        #[arg(long)]
+        agent_worktree: bool,
     },
     /// The repository at one glance: layout, languages, entry points, test roots.
     WhereAmI {
