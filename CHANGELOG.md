@@ -2,7 +2,39 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
-## [Unreleased]
+## [0.3.1] — 2026-08-08
+
+### Answers that say what to do next
+
+An answer about a stale index used to open with a freshness digest comparison
+and never say what would fix it. The remediation now leads, phrased the way
+`doctor` phrases it, and the digests follow as evidence. Index contention no
+longer just reports that another indexer is "running" — it names the wait and
+`greppy index status --json`, so the two messages stop forming a loop with no
+exit.
+
+`greppy search-pattern … --fixed` now names the flag when the flag is what
+caused the miss: a pattern written as a regular expression cannot match under
+`--fixed`, and the previous suggestions (look it up as a definition name,
+reindex) led away from the cause.
+
+### `index [PATH] [--agent-worktree]`
+
+`--agent-worktree` prepares and indexes the worktree `greppy -p` runs in.
+That worktree has its own workspace identity, so indexing the checkout left
+the agent cold and it paid for the first index — graph and embeddings — inside
+its own run.
+
+### Corrections to the grep contract
+
+`greppy PATTERN [FILE]` stays grep even when PATTERN happens to sit within two
+edits of a command name: `greppy greppy FILE` was refused where real grep
+printed the matching line. A mistyped subcommand carries no file operand, and
+that is now what tells a typo from a pattern.
+
+A mistyped flag is corrected rather than silently dropped — dropping `--jsoon`
+handed text to a caller who asked for JSON.
+
 
 `--deadline-secs N` / `GREPPY_DEADLINE_SECS` stops the agent loop cleanly between turns at a wall-clock budget and still delivers the proposal (or clean) outcome.
 
@@ -47,7 +79,7 @@ agent runs refuse to nest (`GREPPY_AGENT_RUN`).
 primitive for host agents; the frozen-prompt hash moved with that approved
 change.
 
-## [0.3.0] — unreleased
+## [0.3.0] — never released on its own; its changes ship in 0.3.1
 
 A breaking release: greppy stops being a navigator that hands you file paths
 and becomes the whole loop — find the symbol, read exactly it, change exactly
