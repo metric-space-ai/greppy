@@ -110,8 +110,12 @@ fn unknown_kind_searches_without_the_filter_and_lists_valid_values() {
 fn empty_searches_return_bounded_statuses_and_next_actions() {
     let (repo, store) = indexed_workspace("empty");
 
+    // Exit 1, not 0: AGENTS.md states the contract the agent reads -- "the
+    // search commands use grep's codes, 0 for a hit and 1 for none". This test
+    // asserted 0 and so contradicted the prompt; the guidance a caller needs is
+    // in the status block below, and does not need the exit code to repeat it.
     let (symbol_code, symbol_out, symbol_err) = run(&repo, &store, &["search-symbol", "respond"]);
-    assert_eq!(symbol_code, 0, "stdout={symbol_out}\nstderr={symbol_err}");
+    assert_eq!(symbol_code, 1, "stdout={symbol_out}\nstderr={symbol_err}");
     assert!(symbol_out.contains("status: no_matches"), "{symbol_out}");
     assert!(
         symbol_out.contains("message: no definition named `respond`"),
@@ -136,7 +140,7 @@ fn empty_searches_return_bounded_statuses_and_next_actions() {
             "missing/subtree",
         ],
     );
-    assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
+    assert_eq!(path_code, 1, "stdout={path_out}\nstderr={path_err}");
     assert!(path_out.contains("status: no_matches"), "{path_out}");
     assert!(
         path_out.contains("message: no matches under path filter: missing/subtree"),
