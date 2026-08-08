@@ -973,7 +973,8 @@ pub(crate) fn dispatch_plus(
 
 pub(crate) fn plus_stale_skip_message(freshness: &serde_json::Value) -> String {
     format!(
-        "grep: indexed search skipped because {}; no stale indexed hits emitted",
+        "grep: {} — indexed search skipped, no stale indexed hits emitted ({})",
+        crate::STALE_REMEDIATION,
         stale_freshness_reason(freshness)
     )
 }

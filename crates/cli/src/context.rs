@@ -634,7 +634,8 @@ pub(crate) fn context_json(
 
 pub(crate) fn context_stale_skip_message(freshness: &serde_json::Value) -> String {
     format!(
-        "context: source-span lookup skipped because {}; no stale indexed spans emitted",
+        "context: {} — source-span lookup skipped, no stale indexed spans emitted ({})",
+        crate::STALE_REMEDIATION,
         stale_freshness_reason(freshness)
     )
 }

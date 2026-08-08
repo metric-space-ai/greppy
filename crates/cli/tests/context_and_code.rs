@@ -758,6 +758,19 @@ fn plus_refuses_stale_hits_when_auto_reindex_disabled() {
         err.contains("graph freshness is drift") && err.contains("no stale indexed hits emitted"),
         "stale plus must explain the refusal; stderr={err:?}"
     );
+    // The instruction has to precede the digests. A caller reads the front of
+    // the line, and the reason string is hundreds of characters of hash
+    // comparison -- put it first and the remediation is never reached.
+    let remediation = err.find("run `greppy index").expect(
+        "stale answer must say what to do; stderr={err:?}",
+    );
+    let digests = err
+        .find("graph freshness is drift")
+        .expect("reason must still be present as evidence");
+    assert!(
+        remediation < digests,
+        "remediation must come before the freshness digests; stderr={err:?}"
+    );
     assert!(
         out.contains("no usable index") && !out.contains("src/helper.rs"),
         "stale plus must not serve indexed rows; got: {out:?}"

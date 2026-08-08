@@ -875,9 +875,17 @@ fn removed_verbs_and_scope_flags_are_refused() {
             code, 64,
             "search-pattern must refuse the retired scope flag {flag}"
         );
+        // Name the retired flag and the command it does not fit, then show the
+        // signature that does exist. clap's "unexpected argument" named the
+        // flag alone; the caller still had to go looking for what the command
+        // actually accepts.
         assert!(
-            out.contains(&format!("unexpected argument '{flag}'")),
-            "{flag} refusal must name the dead flag; stdout={out:?}"
+            out.contains(flag) && out.contains("search-pattern"),
+            "{flag} refusal must name the dead flag and the command; stdout={out:?}"
+        );
+        assert!(
+            out.contains("usage: greppy search-pattern REGEX"),
+            "{flag} refusal must show the real signature; stdout={out:?}"
         );
     }
 }
@@ -2178,8 +2186,14 @@ fn held_lock_makes_second_index_exit_75_without_writing() {
         "indexer must NOT run while the lock is held (RV-003); stdout={out}"
     );
     assert!(
-        err.contains("another indexer is running"),
+        err.contains("another indexer is already building the index"),
         "should report the held lock on stderr; stderr={err}"
+    );
+    // Contention must also say what to do next, or the caller is stuck between
+    // a stale-index answer telling them to index and an index refusing to run.
+    assert!(
+        err.contains("retry") && err.contains("greppy index status"),
+        "held-lock report must name the next step; stderr={err}"
     );
 
     // The db must be byte-identical: the indexer did not write.

@@ -1584,9 +1584,20 @@ fn impact_refuses_the_retired_diff_flags() {
             code, 64,
             "retired flag must be a usage error; stdout={out} stderr={err}"
         );
+        // The refusal must name the flag it rejected and the command it does
+        // not fit, and show the signature that does exist. "unexpected
+        // argument" was clap's phrasing; it named the flag but not the command
+        // and offered no signature, so a caller learned less from a longer
+        // message.
+        let refused = flag[1];
+        let shown = format!("{out}{err}");
         assert!(
-            out.contains("unexpected argument") || err.contains("unexpected argument"),
-            "the refusal names the unexpected argument; stdout={out} stderr={err}"
+            shown.contains(refused) && shown.contains("impact"),
+            "the refusal names the rejected flag and the command; stdout={out} stderr={err}"
+        );
+        assert!(
+            shown.contains("usage: greppy impact SYMBOL"),
+            "the refusal shows the signature that does exist; stdout={out} stderr={err}"
         );
     }
 }

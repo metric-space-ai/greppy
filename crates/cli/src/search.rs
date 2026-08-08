@@ -593,8 +593,13 @@ pub(crate) fn dispatch_search_symbols(
         let purposes = semantic_vector_purposes(&store, root, &meaning, true)?;
         print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), code)?;
     }
-    // Nothing at all was produced: keep grep's "no lines selected".
-    Ok(if meaning.is_empty() { 1 } else { 0 })
+    // A bounded no-match status with next actions was printed above, so this
+    // call answered the question -- "there is no such definition, here is how
+    // to look further" -- and exits 0. grep's "no lines selected" code belongs
+    // to the passthrough (`greppy PATTERN`, `greppy rg …`), which is untouched;
+    // spending it here made a delivered answer look like a failed call, and a
+    // caller that reads exit codes then treats good guidance as an error.
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1048,8 +1053,9 @@ pub(crate) fn dispatch_search_code(
         if !insensitive.is_empty() {
             println!("case-insensitive: {} matches", insensitive.len());
         }
-        // The status block above is the guidance; the code stays grep's.
-        return Ok(if insensitive.is_empty() { 1 } else { 0 });
+        // The status block above IS the answer, so the code says so. Only the
+        // passthrough keeps grep's "no lines selected".
+        return Ok(0);
     }
     print_search_pattern_rows(&rows, code, all);
     Ok(0)
@@ -1362,8 +1368,9 @@ pub(crate) fn dispatch_semantic(
                         expand.as_ref(),
                     )?;
                 } else if hits.is_empty() {
+                    // Same rule as the other verbs: the status block answers.
                     semantic_no_match_status(q, &path_filters);
-                    return Ok(1);
+                    return Ok(0);
                 } else {
                     let purposes = semantic_vector_purposes(&store, root, &hits, true)?;
                     print_search_meaning_rows(

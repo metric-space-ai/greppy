@@ -1026,10 +1026,19 @@ mod tests {
         assert!(!a.fresh);
     }
 
+    /// Serializes the tests that mutate `GREPPY_DEADLINE_SECS`.
+    ///
+    /// The variable is process-wide but the test harness runs these three in
+    /// parallel, so the two that clear it raced the one that sets 99 and the
+    /// suite failed at random. Each holds this lock for the whole
+    /// set-parse-restore sequence.
+    static DEADLINE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parse_defaults() {
         // Clear env influence for this unit test by passing model explicitly.
         // Also clear GREPPY_DEADLINE_SECS so env cannot inject a default.
+        let _serialized = DEADLINE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
         std::env::remove_var("GREPPY_DEADLINE_SECS");
         let a = parse(&["do it", "--model", "m"]).expect("parse");
@@ -1050,6 +1059,7 @@ mod tests {
 
     #[test]
     fn parse_deadline_secs_flag() {
+        let _serialized = DEADLINE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
         std::env::remove_var("GREPPY_DEADLINE_SECS");
         let a = parse(&["do it", "--model", "m", "--deadline-secs", "42"]).expect("parse");
@@ -1062,6 +1072,7 @@ mod tests {
 
     #[test]
     fn parse_deadline_secs_from_env() {
+        let _serialized = DEADLINE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
         std::env::set_var("GREPPY_DEADLINE_SECS", "99");
         let a = parse(&["do it", "--model", "m"]).expect("parse");

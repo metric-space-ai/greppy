@@ -7057,17 +7057,26 @@ fn vector_exact_scan_skip_message(command: &str, total: i64, limit: i64) -> Stri
 
 fn vector_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     format!(
-        "{command}: vector search skipped because {}",
+        "{command}: {STALE_REMEDIATION} — vector search skipped ({})",
         stale_freshness_reason(freshness)
     )
 }
 
 fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     format!(
-        "{command}: indexed search skipped because {}; no stale indexed hits emitted",
+        "{command}: {STALE_REMEDIATION} — indexed search skipped, \
+         no stale indexed hits emitted ({})",
         stale_freshness_reason(freshness)
     )
 }
+
+/// What to do about a stale index, stated the way `doctor` states it.
+///
+/// A stale-index answer used to open with a hash comparison and never said what
+/// would fix it, so the caller read a paragraph of digests and still had to
+/// guess. Callers read the front of a line, so the instruction goes first and
+/// the digests move to the end, where they remain available as evidence.
+pub(crate) const STALE_REMEDIATION: &str = "run `greppy index .` first";
 
 fn stale_freshness_reason(freshness: &serde_json::Value) -> String {
     let state = freshness

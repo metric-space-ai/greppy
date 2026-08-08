@@ -422,8 +422,16 @@ pub(crate) fn dispatch_index(
     let _lock = match greppy_freshness::try_acquire(&store_path) {
         Ok(lock) => Some(lock),
         Err(greppy_freshness::LockError::Held { .. }) => {
+            // Contention is a status, not a dead end: another process is
+            // already building the very index this call wanted. Saying only
+            // that it is "running" left the caller with nothing to do next --
+            // and this fires exactly when a stale-index answer has just told
+            // them to run `greppy index`, so the two messages together used to
+            // form a loop with no exit.
             eprintln!(
-                "grep: another indexer is running against {}",
+                "grep: another indexer is already building the index for {} — \
+                 wait for it to finish, then retry; `greppy index status --json` \
+                 reports its progress",
                 store_path.display()
             );
             return Ok(EXIT_TEMPFAIL as i32);
