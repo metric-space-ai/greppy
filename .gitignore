@@ -77,3 +77,13 @@ crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
 crates/cli/assets/embeddinggemma-300m-q4k/*.gguf
 crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
 bench/agent_coding/*.bak*
+
+# Bench corpus data lives in the benchmark repository, not here.
+bench/agent_efficiency/realcorpus/candidates.json
+bench/agent_efficiency/sweqa/sweqa_test.jsonl
+bench/agent_efficiency/tasks_v2.json
+bench/agent_coding/validated_v2.jsonl
+bench/agent_coding/tasks_v2.json
+bench/agent_coding/tasks_hard.json
+bench/agent_coding/harvest_candidates_v2.jsonl
+bench/summary_quality/cases_v1.json

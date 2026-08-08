@@ -3,4 +3,4 @@
 /gson/
 /zod/
 !MANIFEST.json
-!candidates.json
+# The harvested candidate corpus is maintained in the benchmark repository.
