@@ -1139,13 +1139,18 @@ fn adopt_inherited_fds(raws: &[i32]) -> Result<Vec<std::os::fd::OwnedFd>, String
         return Err("fd-spec root_fds is empty".into());
     }
     // Reject duplicates — a confused parent must not hand the same FD twice
-    // (would double-close under OwnedFd Drop).
+    // (would double-close under OwnedFd Drop). Scan the whole spec first: a
+    // duplicate is a duplicate whether or not the first copy happens to be a
+    // live descriptor, and adopting nothing until the spec is known-good means
+    // a rejected spec leaves no half-owned FDs behind.
     let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::with_capacity(raws.len());
     for &n in raws {
         if !seen.insert(n) {
             return Err(format!("fd-spec has duplicate root fd {n}"));
         }
+    }
+    let mut out = Vec::with_capacity(raws.len());
+    for &n in raws {
         out.push(adopt_inherited_fd(n)?);
     }
     Ok(out)
