@@ -5,6 +5,13 @@
 //! macOS-gated: Seatbelt is the platform that reproduced the production
 //! failure. Exercises the real GreppyEnv Enforce path with the real greppy
 //! binary — not a stub.
+//!
+//! The gate is on the whole file, not on the two test functions. With only the
+//! tests gated, every helper below them is dead code on Linux, and `clippy
+//! -D warnings` turns that into ten compile errors — which is how this file
+//! took the ubuntu job red.
+
+#![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
