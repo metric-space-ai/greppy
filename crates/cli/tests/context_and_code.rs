@@ -761,9 +761,9 @@ fn plus_refuses_stale_hits_when_auto_reindex_disabled() {
     // The instruction has to precede the digests. A caller reads the front of
     // the line, and the reason string is hundreds of characters of hash
     // comparison -- put it first and the remediation is never reached.
-    let remediation = err.find("run `greppy index").expect(
-        "stale answer must say what to do; stderr={err:?}",
-    );
+    let remediation = err
+        .find("run `greppy index")
+        .expect("stale answer must say what to do; stderr={err:?}");
     let digests = err
         .find("graph freshness is drift")
         .expect("reason must still be present as evidence");

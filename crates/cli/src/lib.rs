@@ -692,19 +692,17 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            if let Some((reduced, stray)) =
-                argv_without_stray_positional(
-                    &argv,
-                    first,
-                    // clap prints the real usage line in its own message, which
-                    // covers every command; the hand-written table does not.
-                    subcommand_usage(sub).or_else(|| {
-                        msg.lines()
-                            .find(|line| line.trim_start().starts_with("Usage:"))
-                            .map(str::trim)
-                    }),
-                )
-            {
+            if let Some((reduced, stray)) = argv_without_stray_positional(
+                &argv,
+                first,
+                // clap prints the real usage line in its own message, which
+                // covers every command; the hand-written table does not.
+                subcommand_usage(sub).or_else(|| {
+                    msg.lines()
+                        .find(|line| line.trim_start().starts_with("Usage:"))
+                        .map(str::trim)
+                }),
+            ) {
                 println!("note: `{sub}` takes no argument; ignoring `{stray}`");
                 return run_os(reduced);
             }

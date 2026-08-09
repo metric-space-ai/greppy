@@ -289,7 +289,9 @@ fn search_pattern_no_match_status(
     // definition name finds nothing, and reindexing changes nothing. Name the
     // flag first, while the reader is still at the top of the answer.
     if fixed && pattern_reads_as_regex(query) {
-        println!("reason: --fixed took the pattern literally, and it reads as a regular expression");
+        println!(
+            "reason: --fixed took the pattern literally, and it reads as a regular expression"
+        );
         println!(
             "next: search it as a regular expression: greppy search-pattern {}",
             shell_example_arg(query)

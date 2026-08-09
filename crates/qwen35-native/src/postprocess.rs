@@ -478,11 +478,17 @@ mod tests {
         // full block before the answer
         let raw = "<think>\nlet me look at dispatch_brief\n</think>\nDispatches the brief subcommand for dispatch_brief.";
         let out = postprocess_brief_output(raw, &prompt);
-        assert!(!out.is_empty(), "answer after think block must survive: {out:?}");
+        assert!(
+            !out.is_empty(),
+            "answer after think block must survive: {out:?}"
+        );
         // stray closing tag only (resumed mid-stream)
         let raw = "reasoning tail</think>\nDispatches the brief subcommand for dispatch_brief.";
         let out = postprocess_brief_output(raw, &prompt);
-        assert!(!out.is_empty(), "answer after stray closer must survive: {out:?}");
+        assert!(
+            !out.is_empty(),
+            "answer after stray closer must survive: {out:?}"
+        );
     }
 
     #[test]

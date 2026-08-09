@@ -211,7 +211,10 @@ fn fixed_search_names_the_flag_when_the_pattern_reads_as_a_regex() {
         &store,
         &["search-pattern", "plugin.*conftest.*override", "--fixed"],
     );
-    assert_eq!(code, 1, "a miss keeps grep's code; stdout={out}\nstderr={err}");
+    assert_eq!(
+        code, 1,
+        "a miss keeps grep's code; stdout={out}\nstderr={err}"
+    );
     assert!(
         out.contains("reason: --fixed took the pattern literally"),
         "the flag that caused the miss must be named; stdout={out}"

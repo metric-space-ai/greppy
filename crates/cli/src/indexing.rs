@@ -366,12 +366,9 @@ pub(crate) fn dispatch_index_agent_worktree(
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
     let repo = resolve_root(root.or(path))?;
-    let workspace = greppy_agent::workspace::AgentWorkspace::create(&repo, "index-warm")
-        .map_err(|error| {
-            Error::Invalid(format!(
-                "no agent worktree for {}: {error}",
-                repo.display()
-            ))
+    let workspace =
+        greppy_agent::workspace::AgentWorkspace::create(&repo, "index-warm").map_err(|error| {
+            Error::Invalid(format!("no agent worktree for {}: {error}", repo.display()))
         })?;
     // A disposable fallback tree is warmed for nothing: the agent's next run
     // takes the stable path and finds it cold. Say so instead of reporting a
