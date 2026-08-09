@@ -381,13 +381,34 @@ pub(crate) fn dispatch_index_agent_worktree(
             repo.display()
         )));
     }
-    let worktree = workspace.worktree_path().to_string_lossy().into_owned();
+    let worktree_path = workspace.worktree_path().to_path_buf();
+    let worktree = worktree_path.to_string_lossy().into_owned();
     if !cli_json_output() {
         println!("agent worktree: {worktree}");
     }
+    // The agent does not read the operator's data root: `greppy -p` runs with
+    // GREPPY_STORE_DIR pointed at an isolated tree beside the worktree, and the
+    // sandbox grants only that tree. Warming under the operator's root writes a
+    // store the measured run never opens — same workspace key, different data
+    // root, so the index is formally warm and practically cold. Point at the
+    // agent's root here, exactly as agent.rs does before it runs.
+    let agent_data = crate::agent::agent_data_root(&worktree_path);
+    std::fs::create_dir_all(&agent_data).map_err(|error| {
+        Error::Invalid(format!(
+            "no agent data root at {}: {error}",
+            agent_data.display()
+        ))
+    })?;
+    let restore = std::env::var_os("GREPPY_STORE_DIR");
+    std::env::set_var("GREPPY_STORE_DIR", &agent_data);
     // Walk AND key the store by the worktree, so the identity matches the one
     // the agent resolves; keying by the checkout would warm a third workspace.
-    dispatch_index(Some(&worktree), Some(&worktree), embedding_args)
+    let outcome = dispatch_index(Some(&worktree), Some(&worktree), embedding_args);
+    match restore {
+        Some(previous) => std::env::set_var("GREPPY_STORE_DIR", previous),
+        None => std::env::remove_var("GREPPY_STORE_DIR"),
+    }
+    outcome
 }
 
 pub(crate) fn dispatch_index(

@@ -823,7 +823,7 @@ fn writable_roots_for(
 ///
 /// `<worktree>/../greppy-agent-data/<worktree-name>` — sibling of the worktree,
 /// outside the worktree content and outside the stable `.lock` sibling.
-fn agent_data_root(worktree_path: &Path) -> std::path::PathBuf {
+pub(crate) fn agent_data_root(worktree_path: &Path) -> std::path::PathBuf {
     let parent = worktree_path
         .parent()
         .map(Path::to_path_buf)
