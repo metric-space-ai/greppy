@@ -795,18 +795,47 @@ fn extract_one(entry: &InventoryEntry, lang: Language) -> FileOutcome {
     };
     match parser_extract(lang, &bytes, &entry.rel_path) {
         Ok(extraction) => {
-            let provider_output = ProviderOutput::from_extraction(
-                manifest_for_language(lang),
-                lang,
-                &entry.rel_path,
-                extraction.clone(),
-            );
-            if provider_output.validate().is_err() {
+            let (extraction, dropped, contract_error) =
+                validate_or_degrade(lang, &entry.rel_path, extraction);
+            // A C-parsed `.h` whose output needed record drops (or failed
+            // outright) is the signature of C++ syntax in a C header —
+            // ClickHouse and Poco write C++ under `.h` throughout. Re-extract
+            // with the C++ grammar and keep whichever result carries more of
+            // the file.
+            let c_header_needs_cpp = lang == Language::C
+                && entry.rel_path.ends_with(".h")
+                && (dropped > 0 || contract_error.is_some());
+            if c_header_needs_cpp {
+                if let Ok(retry) = parser_extract(Language::Cpp, &bytes, &entry.rel_path) {
+                    let (cpp_extraction, _, cpp_error) =
+                        validate_or_degrade(Language::Cpp, &entry.rel_path, retry);
+                    if cpp_error.is_none() {
+                        let cpp_wins = match &contract_error {
+                            Some(_) => true,
+                            None => cpp_extraction.nodes.len() >= extraction.nodes.len(),
+                        };
+                        if cpp_wins {
+                            return FileOutcome::Extracted {
+                                rel_path: entry.rel_path.clone(),
+                                abs_path: entry.abs_path.clone(),
+                                bytes,
+                                metadata,
+                                nodes: cpp_extraction.nodes,
+                                edges: cpp_extraction.edges,
+                            };
+                        }
+                    }
+                }
+            }
+            if let Some(contract_error) = contract_error {
+                // Name the violated rule: "failed contract validation" alone
+                // sent a whole ClickHouse triage hunting through 47 headers
+                // for a cause the error already knew.
                 return FileOutcome::Unreadable {
                     entry: entry.clone(),
                     language: lang,
                     reason: "provider_invalid",
-                    detail: "provider output failed contract validation".into(),
+                    detail: format!("provider output failed contract validation: {contract_error}"),
                 };
             }
             FileOutcome::Extracted {
@@ -825,6 +854,61 @@ fn extract_one(entry: &InventoryEntry, lang: Language) -> FileOutcome {
             detail: e.to_string(),
         },
     }
+}
+
+/// Validate the extraction under the provider contract; when validation fails,
+/// degrade by dropping the records that violate it instead of refusing the
+/// whole file. One anonymous node produced by grammar error-recovery must not
+/// discard the hundreds of real definitions around it — 47 template-heavy
+/// ClickHouse headers went dark exactly this way. The contract itself is
+/// unchanged: the filtered output must still validate, and a file whose
+/// failure filtering cannot cure is refused as before.
+///
+/// Returns the (possibly filtered) extraction, how many records were dropped,
+/// and the original contract error when even the filtered output is invalid.
+fn validate_or_degrade(
+    lang: Language,
+    rel_path: &str,
+    extraction: greppy_parser::ExtractionResult,
+) -> (
+    greppy_parser::ExtractionResult,
+    usize,
+    Option<greppy_parser::ProviderContractError>,
+) {
+    let provider_output = ProviderOutput::from_extraction(
+        manifest_for_language(lang),
+        lang,
+        rel_path,
+        extraction.clone(),
+    );
+    let Err(contract_error) = provider_output.validate() else {
+        return (extraction, 0, None);
+    };
+    let mut filtered = extraction;
+    let before = filtered.nodes.len() + filtered.edges.len();
+    filtered.nodes.retain(|node| {
+        node.start_line >= 1
+            && node.end_line >= node.start_line
+            && !node.name.trim().is_empty()
+            && !node.qualified_name.trim().is_empty()
+    });
+    filtered.edges.retain(|edge| {
+        edge.line >= 1
+            && !edge.edge_type.trim().is_empty()
+            && !edge.source_qualified_name.trim().is_empty()
+            && !edge.target_qualified_name.trim().is_empty()
+    });
+    let dropped = before - (filtered.nodes.len() + filtered.edges.len());
+    let recheck = ProviderOutput::from_extraction(
+        manifest_for_language(lang),
+        lang,
+        rel_path,
+        filtered.clone(),
+    );
+    if recheck.validate().is_err() {
+        return (filtered, dropped, Some(contract_error));
+    }
+    (filtered, dropped, None)
 }
 
 /// Extract every supported file. Returns the per-file outcomes **in
@@ -5147,5 +5231,51 @@ def Widget():
             "edge resolution must scale ~linearly; 4x input took {ratio:.2}x work \
              (quadratic would be ~16x). w1={w1}, w4={w4}"
         );
+    }
+
+    /// ClickHouse regression: one anonymous node from grammar error-recovery
+    /// must degrade to a dropped record, never to a dark file.
+    #[test]
+    fn invalid_record_is_dropped_not_the_file() {
+        let src = "int real_fn(void) { return 1; }\n";
+        let extraction =
+            greppy_parser::extract(Language::C, src.as_bytes(), "a.c").expect("extract");
+        let mut poisoned = extraction;
+        poisoned.nodes.push(ExtractedNode {
+            label: "Function".into(),
+            name: String::new(),
+            qualified_name: String::new(),
+            file_path: "a.c".into(),
+            start_line: 1,
+            end_line: 1,
+            properties: serde_json::Value::Null,
+        });
+        let (filtered, dropped, error) = validate_or_degrade(Language::C, "a.c", poisoned);
+        assert_eq!(dropped, 1, "exactly the anonymous node goes");
+        assert!(error.is_none(), "the cured file is valid: {error:?}");
+        assert!(
+            filtered.nodes.iter().any(|n| n.name == "real_fn"),
+            "the real definition survives the cure"
+        );
+    }
+
+    /// ClickHouse regression: C++ syntax under a `.h` name is parsed with the
+    /// C grammar; wide_integer_impl.h yielded one anonymous function node and
+    /// the file went dark. The cure must not depend on the C++ retry: even
+    /// under C, the anonymous node is dropped and the file stays indexable.
+    #[test]
+    fn cpp_syntax_in_dot_h_degrades_under_c() {
+        let src =
+            "constexpr const auto & toBitInt256(const wide::integer<Bits, Signed> & n)\n{\n}\n";
+        let extraction =
+            greppy_parser::extract(Language::C, src.as_bytes(), "a.h").expect("extract");
+        assert!(
+            extraction.nodes.iter().any(|n| n.name.trim().is_empty()),
+            "precondition: the C grammar still emits the anonymous node; if this \
+             starts failing the grammar improved and this pin can move to Cpp"
+        );
+        let (_, dropped, error) = validate_or_degrade(Language::C, "a.h", extraction);
+        assert!(dropped >= 1, "the anonymous node is dropped");
+        assert!(error.is_none(), "the file is not refused: {error:?}");
     }
 }
