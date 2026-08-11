@@ -2,7 +2,35 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
-## [0.3.1] — 2026-08-08
+## [0.3.0] — 2026-08-12
+
+The first release of the 0.3 line, and it ships the whole line: everything
+below, developed as 0.3.0 and 0.3.1, lands here together. (An interim
+internal tag named v0.3.1 existed briefly during stabilisation and was
+retired; the next release will be 0.3.1, collecting the fix round currently
+under bench validation.)
+
+### Fixes landed during bench stabilisation (2026-08-08 … 2026-08-12)
+
+`index --agent-worktree` warms the store the agent actually reads: `greppy
+-p` runs against an isolated data root beside the worktree, and the warm-up
+now writes there instead of the operator's root — before this, prewarmed
+agents still paid the full first index inside the measured run (9× slower,
+confirmed end-to-end by the benchmark).
+
+One invalid provider record degrades the record, not the file. Template-heavy
+C++ headers (ClickHouse) lost hundreds of definitions to a single anonymous
+node produced by grammar error-recovery; `.h` files whose C parse shows C++
+syntax are re-extracted with the C++ grammar, and the skip detail now names
+the violated contract rule.
+
+A dead embedding-daemon endpoint degrades to in-process embedding instead of
+failing every semantic query. `Failed` stays reserved for a live daemon that
+actually holds the model; the error texts name a next action.
+
+Edit receipts echo the landed span (±3 context lines, read back from disk,
+changed lines marked). `who-calls` on a module names the module's own
+definitions and the two commands that answer the question as meant.
 
 ### Answers that say what to do next
 
@@ -79,7 +107,7 @@ agent runs refuse to nest (`GREPPY_AGENT_RUN`).
 primitive for host agents; the frozen-prompt hash moved with that approved
 change.
 
-## [0.3.0] — never released on its own; its changes ship in 0.3.1
+### The 0.3.0 development line
 
 A breaking release: greppy stops being a navigator that hands you file paths
 and becomes the whole loop — find the symbol, read exactly it, change exactly
