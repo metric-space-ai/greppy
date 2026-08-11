@@ -372,6 +372,19 @@ pub(crate) fn emit_edit_outcome(
                         }
                     }
                 }
+                // Echo the landed span with context, read back from disk.
+                // The bare receipt is a claim; agents measurably re-read the
+                // whole file to verify it (three full re-reads of one 7.8K
+                // file in a single bench run). ~300 characters of read-back
+                // evidence retire that pattern — the harness Edit tool proved
+                // it. Disk is the source: this shows what IS there now, not
+                // what was sent.
+                // Multi-site receipts (headline set) keep their per-site
+                // address lines: a min-max span would mark untouched lines
+                // between the sites as changed, which is worse than no echo.
+                if record.published && !record.already_as_sent && record.headline.is_none() {
+                    print_landed_span(&record);
+                }
                 for note in &record.notes {
                     println!("{note}");
                 }
@@ -401,6 +414,48 @@ pub(crate) fn emit_edit_outcome(
             }
             Ok(refusal.exit)
         }
+    }
+}
+
+/// Read the edited span back from disk and print it with ±3 lines of context,
+/// numbered read-file style. Only the single-file, known-span case — multi-site
+/// edits keep their per-site address lines. Long spans are elided in the
+/// middle: the evidence a verifier needs is the seams, not the body it wrote.
+fn print_landed_span(record: &super::EditRecord) {
+    const CONTEXT: usize = 3;
+    const HEAD_TAIL: usize = 6;
+    let (Some((first, last)), [file]) = (record.span, record.files.as_slice()) else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(file) else {
+        return;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    if first == 0 || first > last {
+        return;
+    }
+    let start = first.saturating_sub(CONTEXT + 1);
+    let end = (last + CONTEXT).min(lines.len());
+    if start >= end {
+        return;
+    }
+    let span_len = last.saturating_sub(first) + 1;
+    let elide = span_len > 2 * HEAD_TAIL;
+    println!("│");
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let number = start + offset + 1;
+        if elide && number == first + HEAD_TAIL && number <= last.saturating_sub(HEAD_TAIL) {
+            println!("│ …  ({} lines)", span_len - 2 * HEAD_TAIL);
+        }
+        if elide && number >= first + HEAD_TAIL && number <= last.saturating_sub(HEAD_TAIL) {
+            continue;
+        }
+        let marker = if number >= first && number <= last {
+            '>'
+        } else {
+            ' '
+        };
+        println!("│{marker}{number:>5}  {line}");
     }
 }
 

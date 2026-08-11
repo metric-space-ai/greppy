@@ -2937,6 +2937,48 @@ pub(crate) fn nav_refuse_non_callable(
         node.file_path,
         node.start_line.max(1)
     );
+    // The sentence alone reads as a dead end: measured agents fell back to
+    // four lexical-search loops to find the module's callables by hand. The
+    // callables are one store query away — name them, and name the command
+    // that answers for the module as a whole.
+    let mut callables = store
+        .list_nodes(&node.project, "", &node.file_path, 0, 64)?
+        .into_iter()
+        .filter(|candidate| {
+            NavDirection::Incoming.answerable(&candidate.label)
+                && !is_synthetic_file_anchor(
+                    &candidate.label,
+                    &candidate.name,
+                    &candidate.qualified_name,
+                )
+        })
+        .collect::<Vec<_>>();
+    callables.sort_by_key(|candidate| candidate.start_line);
+    if !callables.is_empty() {
+        println!();
+        println!("its definitions:");
+        let shown = callables.len().min(8);
+        for candidate in &callables[..shown] {
+            println!(
+                "{}:{}  {}  {}",
+                candidate.file_path,
+                candidate.start_line.max(1),
+                candidate.name,
+                candidate.label.to_lowercase()
+            );
+        }
+        if callables.len() > shown {
+            println!("… and {} more", callables.len() - shown);
+        }
+        println!();
+        println!("next: callers of one of them: greppy who-calls {}", {
+            &callables[0].name
+        });
+    }
+    println!(
+        "next: every reference to the {}: greppy find-usages {target}",
+        { nav_kind_word(lines.as_ref(), node) }
+    );
     Ok(Some(1))
 }
 
