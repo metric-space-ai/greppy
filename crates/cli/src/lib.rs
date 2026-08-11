@@ -7006,12 +7006,17 @@ fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -
         }
         embed_daemon::EmbedDaemonResult::DaemonBusy => {
             return Err(Error::Store(
-                "EmbeddingGemma daemon remained busy until the request deadline".into(),
+                "EmbeddingGemma daemon remained busy until the request deadline; \
+                 retry, or run with --device cpu to bypass the shared daemon"
+                    .into(),
             ));
         }
         embed_daemon::EmbedDaemonResult::Failed => {
             return Err(Error::Store(
-                "EmbeddingGemma daemon failed while retaining model ownership".into(),
+                "EmbeddingGemma daemon answered faulted while holding the model; \
+                 it recovers on its idle TTL — retry shortly, or run with \
+                 --device cpu to bypass it"
+                    .into(),
             ));
         }
     };
