@@ -84,7 +84,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    for path in (TASKS_V2, CLASSES_V2, gen.CANDIDATES, gen.MANIFEST,
+    # The task bank itself is benchmark corpus, maintained in the benchmark
+    # repository. Without it there is no audit subject — that is not a failure
+    # of this repository. (Ancillary inputs like the realcorpus MANIFEST stay
+    # tracked here; their presence does not make an audit possible.)
+    if not TASKS_V2.exists():
+        print("[verify] task bank not in this checkout: the corpus lives in "
+              "the benchmark repository — nothing to audit")
+        return 0
+    for path in (CLASSES_V2, gen.CANDIDATES, gen.MANIFEST,
                  gen.TASKS_V1, gen.CLASSES_V1):
         if not path.exists():
             print(f"[verify] missing file: {path}")
