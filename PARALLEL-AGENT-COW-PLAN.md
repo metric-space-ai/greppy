@@ -105,6 +105,7 @@ native worktree with a concise diagnostic.
 | Concurrent creation | **10 workspaces gated; 50 stress-tested** |
 | Quota enforcement | **no overshoot beyond one in-flight write buffer** |
 | Crash recovery | **no stale mount used as a valid workspace; private state recoverable or safely reclaimable** |
+| Active graph-refresh wait | **no silent/`ETA unavailable` wait beyond 5 s; report owner/state/progress at least every 10 s and unblock within 2 s after writer failure or exit** |
 | End-to-end agent wall clock | **materially faster than the best of temp worktree, warm worktree pool, and Rift on the registered concurrent workloads** |
 | Custom virtual-FS authorization | **only if it beats or uniquely satisfies a gate that Rift/native CoW cannot** |
 
@@ -333,6 +334,9 @@ are release requirements, not deferred cleanup:
 - concurrent agent fixtures must use production-shaped unique run IDs and
   scratch paths; shared literal fixture paths must never let one test delete
   another test's live sandbox roots;
+- steady-state Overlay queries must open the persisted Delta read-only, just as
+  Single-Store queries do; migrations, WAL setup, and evidence cleanup remain
+  writer-only work rather than recurring query latency;
 - the release performance harness must run explicitly in release mode and emit
   its machine-readable measurements and thresholds; its internal
   `store-cow-release-perf` build disables inference variance without enabling
@@ -341,6 +345,17 @@ are release requirements, not deferred cleanup:
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named
 here so a later refactor cannot remove the protections as “test-only” behavior.
+
+One additional operational defect was recorded while navigating this checkout:
+a graph command can wait behind an active refresh for more than 90 seconds while
+reporting only `ETA unavailable`; a refresh that later fails because the
+workspace kept changing gives the blocked caller no owner, state, or progress.
+This does not change Store-CoW correctness and is not allowed to reopen 0.3.2
+after its exact-commit gates pass. It is a bounded 0.3.3 release requirement:
+surface refresh PID/state/progress on stderr without polluting JSON stdout, wake
+promptly when the writer exits or fails, and cover held-lock, killed-writer, and
+failed-publication cases with deterministic tests. The gate is registered in
+section 3.2 rather than left as open-ended cleanup.
 
 ### 6.4 0.3.2 build order
 
