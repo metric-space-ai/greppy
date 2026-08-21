@@ -440,9 +440,11 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         .ok()
         .flatten();
     let store = match overlay.as_ref() {
-        Some(overlay) => {
-            greppy_store::Store::open_overlay(&overlay.base_path, &store_path, &overlay.visibility)
-        }
+        Some(overlay) => greppy_store::Store::open_overlay_read_only(
+            &overlay.base_path,
+            &store_path,
+            &overlay.visibility,
+        ),
         None => greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only()),
     };
     let Ok(store) = store else {
@@ -536,8 +538,11 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }
-        let store =
-            greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)?;
+        let store = greppy_store::Store::open_overlay_read_only(
+            &overlay.base_path,
+            &path,
+            &overlay.visibility,
+        )?;
         let _ = workspace_locator::ensure_db_mode(&path);
         if let Some(store_dir) = path.parent() {
             workspace_locator::touch_lastused(store_dir);

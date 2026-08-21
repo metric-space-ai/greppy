@@ -242,7 +242,33 @@ impl Store {
         delta_path: &Path,
         visibility: &crate::VisibilityIndex,
     ) -> Result<Self> {
-        let mut store = Self::open_with(delta_path, OpenOptions::query_writer())?;
+        Self::open_overlay_with(
+            base_path,
+            delta_path,
+            visibility,
+            OpenOptions::query_writer(),
+        )
+    }
+
+    /// Open an immutable Base and private Delta for the query hot path.
+    /// TEMP tables and views remain writable even though the persisted Delta
+    /// connection is read-only, avoiding migrations and write-path PRAGMAs on
+    /// every command invocation.
+    pub fn open_overlay_read_only(
+        base_path: &Path,
+        delta_path: &Path,
+        visibility: &crate::VisibilityIndex,
+    ) -> Result<Self> {
+        Self::open_overlay_with(base_path, delta_path, visibility, OpenOptions::read_only())
+    }
+
+    fn open_overlay_with(
+        base_path: &Path,
+        delta_path: &Path,
+        visibility: &crate::VisibilityIndex,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let mut store = Self::open_with(delta_path, options)?;
         let base_uri = sqlite_read_only_uri(base_path)?;
         store
             .conn
@@ -514,6 +540,31 @@ mod tests {
             crate::migrate::CURRENT_VERSION
         );
         s2.integrity_check().unwrap();
+    }
+
+    #[test]
+    fn read_only_overlay_can_build_temp_views_but_not_mutate_delta() {
+        let tmp = tempdir_via_env();
+        let base_path = tmp.join("base.db");
+        let delta_path = tmp.join("delta.db");
+        drop(Store::open(&base_path).unwrap());
+        drop(Store::open(&delta_path).unwrap());
+
+        let store = Store::open_overlay_read_only(
+            &base_path,
+            &delta_path,
+            &crate::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let projects: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(projects, 0);
+        assert!(store
+            .conn()
+            .execute("DELETE FROM main.projects", [])
+            .is_err());
     }
 
     fn tempdir_via_env() -> std::path::PathBuf {

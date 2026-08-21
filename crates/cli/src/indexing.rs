@@ -125,9 +125,11 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     }
 
     let store = match crate::store_cow::overlay_spec(&effective_root)? {
-        Some(overlay) => {
-            greppy_store::Store::open_overlay(&overlay.base_path, &store_path, &overlay.visibility)?
-        }
+        Some(overlay) => greppy_store::Store::open_overlay_read_only(
+            &overlay.base_path,
+            &store_path,
+            &overlay.visibility,
+        )?,
         None => {
             greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())?
         }
