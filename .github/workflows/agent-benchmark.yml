@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/greppy-bench-store-${{ matrix.group }}
-          key: bench-store-v2-${{ matrix.group }}-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+          key: bench-store-v2-${{ matrix.group }}-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.py', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
       - name: Restore model assets
         if: steps.bench-store.outputs.cache-hit != 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -87,6 +87,8 @@ jobs:
         run: cargo build --release --bin greppy --features metal
       - name: Materialize benchmark repositories (group subset)
         if: steps.bench-store.outputs.cache-hit != 'true'
+        env:
+          GREPPY_BENCH_CORPUS_HOME: ${{ runner.temp }}/greppy-bench-corpus-${{ matrix.group }}
         run: |
           bash bench/agent_efficiency/gen_corpus.sh
           python3 bench/agent_efficiency/real_corpus.py setup \
@@ -103,6 +105,7 @@ jobs:
       - name: Build stores for the group repos
         if: steps.bench-store.outputs.cache-hit != 'true'
         env:
+          GREPPY_BENCH_CORPUS_HOME: ${{ runner.temp }}/greppy-bench-corpus-${{ matrix.group }}
           GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
           GREPPY_STORE_DIR: ${{ runner.temp }}/greppy-bench-store-${{ matrix.group }}
           RUN_DIR: ${{ runner.temp }}/greppy-store-prime
@@ -149,17 +152,17 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/greppy-bench-store-g1
-          key: bench-store-v2-g1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+          key: bench-store-v2-g1-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.py', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
       - name: Restore group store cache g2
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/greppy-bench-store-g2
-          key: bench-store-v2-g2-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+          key: bench-store-v2-g2-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.py', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
       - name: Restore group store cache g3
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/greppy-bench-store-g3
-          key: bench-store-v2-g3-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
+          key: bench-store-v2-g3-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json', 'bench/agent_efficiency/tasks_v2.json', 'bench/agent_efficiency/gen_corpus.py', 'bench/agent_efficiency/gen_corpus.sh', 'bench/agent_efficiency/real_corpus.py') }}
       - name: Merge group stores (disjoint workspace hashes)
         shell: bash
         run: |
@@ -207,6 +210,8 @@ jobs:
         run: cargo build --bin greppy --features ci-test-assets
 
       - name: Materialize benchmark repositories
+        env:
+          GREPPY_BENCH_CORPUS_HOME: ${{ runner.temp }}/greppy-bench-corpus
         run: |
           bash bench/agent_efficiency/gen_corpus.sh
           python3 bench/agent_efficiency/real_corpus.py setup \
@@ -214,6 +219,7 @@ jobs:
 
       - name: Verify pinned task and repository contract
         env:
+          GREPPY_BENCH_CORPUS_HOME: ${{ runner.temp }}/greppy-bench-corpus
           REALTASKS_GREPPY_BIN: ${{ runner.temp }}/greppy-task-bank-target/debug/greppy
         run: |
           python3 -m unittest discover -s bench/agent_efficiency -p 'test_*.py' -v
@@ -241,6 +247,7 @@ jobs:
       - name: Run pre-registered acceptance gate
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          GREPPY_BENCH_CORPUS_HOME: ${{ runner.temp }}/greppy-bench-corpus
           GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
           # Warm store from prime-store; the index step degrades to a fast
           # freshness validation instead of a multi-hour embedding build.

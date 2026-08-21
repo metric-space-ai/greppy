@@ -32,7 +32,8 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-CORPUS = HERE / "corpus"
+CORPUS_HOME = pathlib.Path(os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE)
+CORPUS = CORPUS_HOME / "corpus"
 
 
 # --------------------------------------------------------------------------

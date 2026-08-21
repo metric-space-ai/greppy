@@ -63,6 +63,10 @@ baseline while every ordering remains reproducible.
 # Product binary. Both models are embedded and active.
 cargo build --release --bin greppy
 
+# Keep every benchmark workspace outside the product checkout. All corpus
+# producers and consumers use this one root.
+export GREPPY_BENCH_CORPUS_HOME="${TMPDIR:-/tmp}/greppy-agent-efficiency-corpus"
+
 # Synthetic controls.
 bash bench/agent_efficiency/gen_corpus.sh
 python3 bench/agent_efficiency/verify_task_classes.py

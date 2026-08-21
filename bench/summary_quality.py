@@ -21,7 +21,10 @@ from typing import Any
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent
-REALCORPUS = HERE / "agent_efficiency" / "realcorpus"
+CORPUS_HOME = pathlib.Path(
+    os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE / "agent_efficiency"
+)
+REALCORPUS = CORPUS_HOME / "realcorpus"
 MANIFEST = REALCORPUS / "MANIFEST.json"
 CASES_SCHEMA = "greppy.summary-quality-cases.v1"
 RESULTS_SCHEMA = "greppy.summary-quality-results.v1"

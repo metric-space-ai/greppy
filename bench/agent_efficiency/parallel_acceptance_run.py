@@ -634,6 +634,15 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def repository_manifest_record(realcorpus: pathlib.Path) -> dict[str, str]:
+    """Return stable provenance for the manifest beside benchmark repos."""
+    repo_manifest = realcorpus / "MANIFEST.json"
+    return {
+        "path": "realcorpus/MANIFEST.json",
+        "sha256": sha256_file(repo_manifest),
+    }
+
+
 def write_run_manifest(
     run_dir: pathlib.Path,
     tasks_path: pathlib.Path,
@@ -665,7 +674,6 @@ def write_run_manifest(
         text=True,
         check=False,
     ).stdout.strip()
-    repo_manifest = HERE / "realcorpus" / "MANIFEST.json"
     manifest = {
         "schema_version": "greppy.agent-benchmark-run.v1",
         "product_candidate": "greppy",
@@ -689,10 +697,7 @@ def write_run_manifest(
             "path": str(task_classes_path.relative_to(REPO)),
             "sha256": sha256_file(task_classes_path),
         },
-        "repository_manifest": {
-            "path": str(repo_manifest.relative_to(REPO)),
-            "sha256": sha256_file(repo_manifest),
-        },
+        "repository_manifest": repository_manifest_record(run_bench.REALCORPUS),
         "raw_traces_published": False,
         "publishable_artifacts": [
             "RUN_MANIFEST.json",

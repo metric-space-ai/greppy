@@ -349,6 +349,11 @@ are release requirements, not deferred cleanup:
   public, immutable Git commit and verify the tracked SHA-256 lock before use;
   an absent or mismatched navigation, summary, or coding bank fails closed
   before any claimed evidence is published.
+- benchmark repository producers, task mirrors, and consumers must share one
+  explicit corpus root outside the product checkout; CI uses runner scratch
+  space so baseline agents cannot discover the candidate binary, includes the
+  corpus generator in store-cache keys, and fails on a missing repository root
+  before costly indexing or agent execution begins.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

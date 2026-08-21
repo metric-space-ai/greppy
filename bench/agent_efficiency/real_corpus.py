@@ -150,7 +150,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 _SEED_DIR = os.environ.get("GREPPY_BENCH_SEED_DIR")
-ROOT = HERE / "realcorpus"
+CORPUS_HOME = Path(os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE)
+ROOT = CORPUS_HOME / "realcorpus"
 REPO_ROOT = HERE.parents[1]
 CBM = Path(os.environ.get("GREPPY_REFERENCE_ORACLE", "reference-oracle"))
 MANIFEST = ROOT / "MANIFEST.json"

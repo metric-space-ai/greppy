@@ -19,6 +19,7 @@ Usage:
     python3 bench/agent_efficiency/verify_tasks.py --index   # (re)index first
 """
 import json
+import os
 import re
 import pathlib
 import subprocess
@@ -27,7 +28,8 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 BIN = str(REPO / "target" / "release" / "greppy")
-CORPUS = HERE / "corpus"
+CORPUS_HOME = pathlib.Path(os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE)
+CORPUS = CORPUS_HOME / "corpus"
 
 REPOS = ["rust_medium", "python_large", "go_small",
          "java_medium", "js_small", "ts_large"]

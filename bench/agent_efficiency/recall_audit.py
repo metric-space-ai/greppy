@@ -34,6 +34,8 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 BIN = pathlib.Path(os.environ.get("GREPPY_BENCH_BIN")
                    or HERE.parents[1] / "target" / "release" / "greppy")
+CORPUS_HOME = pathlib.Path(os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE)
+REALCORPUS = CORPUS_HOME / "realcorpus"
 REAL = ["serde", "flask", "gson", "zod", "tokio", "django"]
 PRIMARY = {"Function", "Method", "Struct", "Class", "Enum", "Trait", "Interface"}
 
@@ -154,7 +156,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    roots = ([HERE / "realcorpus" / r for r in REAL] if args.all
+    roots = ([REALCORPUS / r for r in REAL] if args.all
              else [args.root] if args.root else None)
     if not roots:
         ap.error("--root or --all required")

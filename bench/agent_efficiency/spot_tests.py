@@ -43,7 +43,7 @@ PROBES = [
 
 results = []
 for name, repo, q in PROBES:
-    root = str(HERE / "realcorpus" / repo)
+    root = str(run_bench.REALCORPUS / repo)
     row = {"name": name, "repo": repo, "q": q}
     for arm, sysprompt in (("grep", run_bench.GREP_SYS),
                            ("greppy", run_bench.gp_sys(root))):

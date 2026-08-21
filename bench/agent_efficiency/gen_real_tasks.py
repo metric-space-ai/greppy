@@ -61,6 +61,8 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = pathlib.Path(__file__).resolve().parent
 CANDIDATES = HERE / "realcorpus" / "candidates.json"
 MANIFEST = HERE / "realcorpus" / "MANIFEST.json"
+BENCH_CORPUS_HOME = pathlib.Path(os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE)
+REAL_REPO_ROOT = BENCH_CORPUS_HOME / "realcorpus"
 TASKS_V1 = HERE / "tasks.json"
 CLASSES_V1 = HERE / "task_classes.json"
 OUT_TASKS = HERE / "tasks_v2.json"
@@ -328,7 +330,7 @@ def ensure_mirrors(manifest: dict) -> dict[str, pathlib.Path]:
     (WORK_DIR / "repos").mkdir(parents=True, exist_ok=True)
     STORE_DIR.mkdir(parents=True, exist_ok=True)
     for name in REPO_ORDER:
-        src = HERE / "realcorpus" / name
+        src = REAL_REPO_ROOT / name
         dst = WORK_DIR / "repos" / name
         commit = manifest["repos"][name]["commit"]
         marker = dst / ".realtasks_commit"
