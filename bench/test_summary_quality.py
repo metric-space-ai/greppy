@@ -190,6 +190,73 @@ class SummaryQualityJudgeTests(unittest.TestCase):
                 response, [{"id": "sq030"}, {"id": "sq031"}]
             )
 
+    def test_read_timeout_is_retried_and_checkpointed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            cases = root / "cases.json"
+            results = root / "results.json"
+            output = root / "judgments.json"
+            cases.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SUMMARY_QUALITY.CASES_SCHEMA,
+                        "cases": [
+                            {
+                                "id": "sq030",
+                                "repo": "fixture",
+                                "file_path": "src/lib.rs",
+                                "signature": "fn fixture()",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            results.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SUMMARY_QUALITY.RESULTS_SCHEMA,
+                        "cases_sha256": sha256(cases),
+                        "records": [{"id": "sq030", "summary": "Does work."}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                cases=cases,
+                results=results,
+                output=output,
+                batch_size=5,
+                timeout=1,
+                delay=0,
+            )
+            response = {
+                "prompt_version": SUMMARY_QUALITY.JUDGE_PROMPT_VERSION,
+                "verdicts": [self.valid_response()["verdicts"][0]],
+            }
+            with (
+                mock.patch.object(
+                    SUMMARY_QUALITY, "load_minimax_key", return_value="key"
+                ),
+                mock.patch.object(
+                    SUMMARY_QUALITY, "source_for", return_value="fn fixture() {}"
+                ),
+                mock.patch.object(
+                    SUMMARY_QUALITY,
+                    "judge_request",
+                    side_effect=[TimeoutError("read timed out"), response],
+                ) as request,
+                mock.patch.object(SUMMARY_QUALITY.time, "sleep") as sleep,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                return_code = SUMMARY_QUALITY.judge(args)
+            checkpoint = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+        self.assertEqual([row["id"] for row in checkpoint["verdicts"]], ["sq030"])
+
 
 if __name__ == "__main__":
     unittest.main()

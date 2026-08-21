@@ -354,6 +354,10 @@ are release requirements, not deferred cleanup:
   space so baseline agents cannot discover the candidate binary, includes the
   corpus generator in store-cache keys, and fails on a missing repository root
   before costly indexing or agent execution begins.
+- summary-quality judging must treat socket/read `TimeoutError` like the other
+  retryable provider failures, preserve each completed batch checkpoint, and
+  resume without discarding already accepted judgments; one transient read
+  timeout must not void an otherwise reproducible 204-case release run.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

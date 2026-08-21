@@ -667,7 +667,12 @@ def judge(args: argparse.Namespace) -> int:
                 except ValueError:
                     delay = 5.0 * (2**attempt)
                 time.sleep(min(120.0, max(5.0, delay)))
-            except (RuntimeError, json.JSONDecodeError, urllib.error.URLError) as exc:
+            except (
+                RuntimeError,
+                TimeoutError,
+                json.JSONDecodeError,
+                urllib.error.URLError,
+            ) as exc:
                 error = exc
                 time.sleep(min(60.0, 2.0**attempt))
         if response is None or rows is None:
