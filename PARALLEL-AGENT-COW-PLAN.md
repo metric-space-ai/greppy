@@ -358,6 +358,10 @@ are release requirements, not deferred cleanup:
   retryable provider failures, preserve each completed batch checkpoint, and
   resume without discarding already accepted judgments; one transient read
   timeout must not void an otherwise reproducible 204-case release run.
+- the Windows release matrix must request Cargo's real `cpu-only` feature, not
+  an inert `cpu` workflow sentinel; Windows CPU is the certified 0.3.2 scope,
+  and the hard no-GPU-backend assertion must remain active for accidental
+  unqualified builds rather than breaking the intended release artifact.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

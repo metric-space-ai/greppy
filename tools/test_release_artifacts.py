@@ -233,6 +233,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
 
         self.assertIn("cargo build --locked --release", workflow)
+        windows_matrix = workflow.split("- name: windows-x86_64", 1)[1].split(
+            "steps:", 1
+        )[0]
+        self.assertIn("features: cpu-only", windows_matrix)
+        self.assertNotIn("features: cpu\n", windows_matrix)
+        self.assertIn("--features ${{ matrix.features }}", workflow)
         self.assertIn("record-build-environment", workflow)
         self.assertIn("create-training-archive", workflow)
         self.assertIn("augment-spdx", workflow)

@@ -221,7 +221,7 @@ jobs:
           - name: windows-x86_64
             os: windows-latest
             asset: greppy-windows-x86_64.zip
-            features: cpu
+            features: cpu-only
             footprint_devices: 'cpu'
             runner_os: Windows
             runner_arch: X64
@@ -286,7 +286,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
       - name: Build release binary
-        run: cargo build --locked --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
+        run: cargo build --locked --release --bin greppy --features ${{ matrix.features }}
 
       - name: Sign macOS binary with Developer ID
         if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
