@@ -510,7 +510,8 @@ fn require_release_profile() {
 fn store_cow_release_performance_gate() {
     const FILES: usize = 1_200;
     const DIRTY_FILES: usize = 6;
-    const QUERY_ROUNDS: usize = 20;
+    const QUERY_WARMUP_ROUNDS: usize = 4;
+    const QUERY_ROUNDS: usize = 40;
 
     require_release_profile();
 
@@ -573,16 +574,20 @@ fn store_cow_release_performance_gate() {
     let overlay = Some((base_graph.as_path(), base_commit.as_str()));
 
     index(&repo, &clean_delta_store, overlay);
+    let query_args = ["search-symbol", "cow_gate_180", "--json"];
+    for _ in 0..QUERY_WARMUP_ROUNDS {
+        timed_query(&repo, &base_store, &query_args, None);
+        timed_query(&repo, &clean_delta_store, &query_args, overlay);
+    }
     let mut clean_single = Vec::new();
     let mut clean_overlay = Vec::new();
     for round in 0..QUERY_ROUNDS {
-        let args = ["search-symbol", "cow_gate_180", "--json"];
         if round % 2 == 0 {
-            clean_single.push(timed_query(&repo, &base_store, &args, None));
-            clean_overlay.push(timed_query(&repo, &clean_delta_store, &args, overlay));
+            clean_single.push(timed_query(&repo, &base_store, &query_args, None));
+            clean_overlay.push(timed_query(&repo, &clean_delta_store, &query_args, overlay));
         } else {
-            clean_overlay.push(timed_query(&repo, &clean_delta_store, &args, overlay));
-            clean_single.push(timed_query(&repo, &base_store, &args, None));
+            clean_overlay.push(timed_query(&repo, &clean_delta_store, &query_args, overlay));
+            clean_single.push(timed_query(&repo, &base_store, &query_args, None));
         }
     }
 
@@ -601,31 +606,31 @@ fn store_cow_release_performance_gate() {
     index(&repo, &full_store, None);
     let full_index = full_index_started.elapsed();
 
+    for _ in 0..QUERY_WARMUP_ROUNDS {
+        timed_query(&repo, &full_store, &query_args, None);
+        timed_query(&repo, &dirty_delta_store, &query_args, overlay);
+    }
     let mut dirty_single = Vec::new();
     let mut dirty_overlay = Vec::new();
     for round in 0..QUERY_ROUNDS {
-        let args = ["search-symbol", "cow_gate_180", "--json"];
         if round % 2 == 0 {
-            dirty_single.push(timed_query(&repo, &full_store, &args, None));
-            dirty_overlay.push(timed_query(&repo, &dirty_delta_store, &args, overlay));
+            dirty_single.push(timed_query(&repo, &full_store, &query_args, None));
+            dirty_overlay.push(timed_query(&repo, &dirty_delta_store, &query_args, overlay));
         } else {
-            dirty_overlay.push(timed_query(&repo, &dirty_delta_store, &args, overlay));
-            dirty_single.push(timed_query(&repo, &full_store, &args, None));
+            dirty_overlay.push(timed_query(&repo, &dirty_delta_store, &query_args, overlay));
+            dirty_single.push(timed_query(&repo, &full_store, &query_args, None));
         }
     }
 
-    let clean_median = regression_percent(
-        percentile_micros(&clean_overlay, 50),
-        percentile_micros(&clean_single, 50),
-    );
-    let dirty_median = regression_percent(
-        percentile_micros(&dirty_overlay, 50),
-        percentile_micros(&dirty_single, 50),
-    );
-    let dirty_p95 = regression_percent(
-        percentile_micros(&dirty_overlay, 95),
-        percentile_micros(&dirty_single, 95),
-    );
+    let clean_baseline_median_us = percentile_micros(&clean_single, 50);
+    let clean_overlay_median_us = percentile_micros(&clean_overlay, 50);
+    let baseline_median_us = percentile_micros(&dirty_single, 50);
+    let overlay_median_us = percentile_micros(&dirty_overlay, 50);
+    let baseline_p95_us = percentile_micros(&dirty_single, 95);
+    let overlay_p95_us = percentile_micros(&dirty_overlay, 95);
+    let clean_median = regression_percent(clean_overlay_median_us, clean_baseline_median_us);
+    let dirty_median = regression_percent(overlay_median_us, baseline_median_us);
+    let dirty_p95 = regression_percent(overlay_p95_us, baseline_p95_us);
     let warm_base_improvement =
         (full_index.as_secs_f64() - overlay_index.as_secs_f64()) * 100.0 / full_index.as_secs_f64();
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -662,6 +667,7 @@ fn store_cow_release_performance_gate() {
         "indexer_version": greppy_core::INDEXER_VERSION_BASE,
         "fixture_files": FILES,
         "dirty_files": DIRTY_FILES,
+        "query_warmup_rounds": QUERY_WARMUP_ROUNDS,
         "query_rounds": QUERY_ROUNDS,
         "baseline": "0.3.1-compatible single Store query/full private graph index",
         "warm_base": {
@@ -671,12 +677,18 @@ fn store_cow_release_performance_gate() {
             "gate_percent": 50.0,
         },
         "query_regression": {
+            "baseline_median_us": baseline_median_us,
+            "overlay_median_us": overlay_median_us,
+            "baseline_p95_us": baseline_p95_us,
+            "overlay_p95_us": overlay_p95_us,
             "median_percent": dirty_median,
             "p95_percent": dirty_p95,
             "median_gate_percent": 10.0,
             "p95_gate_percent": 20.0,
         },
         "warm_serial_clean_regression": {
+            "baseline_median_us": clean_baseline_median_us,
+            "overlay_median_us": clean_overlay_median_us,
             "median_percent": clean_median,
             "gate_percent": 5.0,
         },
