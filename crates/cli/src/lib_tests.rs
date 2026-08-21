@@ -1161,6 +1161,7 @@ fn ten_agents_reuse_published_summary_without_private_duplicates() {
     let base =
         greppy_store::SummaryCache::open_read_only(&base_dir).expect("reopen immutable Base cache");
     assert_eq!(base.count().expect("count Base summaries"), 1);
+    drop(base);
     std::fs::remove_dir_all(root).expect("remove test directory");
 }
 

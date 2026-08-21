@@ -324,7 +324,8 @@ are release requirements, not deferred cleanup:
   while graph-only background work remains functional;
 - every short-lived test fixture must leave no orphan summary/embedding daemon
   and must release its temporary Store, preventing silent fixture recreation and
-  unbounded disk growth;
+  unbounded disk growth; SQLite/cache handles are explicitly closed before
+  directory removal so the same cleanup contract holds on Windows;
 - automatic Delta reindexing must never mix progress text into machine-readable
   JSON output;
 - tests that modify process-global environment variables must serialize those
