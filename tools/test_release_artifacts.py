@@ -251,6 +251,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 1)
         self.assertIn('if [ "$device" = cpu ]', workflow)
 
+        windows_smoke = (
+            REPOSITORY_ROOT / "bench/release_package_smoke.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(' semantic-search \'', windows_smoke)
+        self.assertIn(" search --json ", windows_smoke)
+
 
 if __name__ == "__main__":
     unittest.main()

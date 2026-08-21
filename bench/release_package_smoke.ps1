@@ -47,7 +47,7 @@ if ($LASTEXITCODE -ne 0 -or $briefExpanded.id -ne $brief.expand_id -or
     throw 'brief expand contract failed'
 }
 
-$semantic = (& $Binary --device cpu --root "$Work/repo" semantic-search 'restrict a numeric value to an allowed range' --json) | ConvertFrom-Json
+$semantic = (& $Binary --device cpu --root "$Work/repo" search --json 'restrict a numeric value to an allowed range') | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or $semantic.schema_version -ne 'greppy.semantic-search.v1' -or
     $semantic.status -ne 'ok' -or $semantic.hits.Count -lt 1 -or
     [string]::IsNullOrWhiteSpace($semantic.expand_id)) {

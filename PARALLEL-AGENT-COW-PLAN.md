@@ -362,6 +362,10 @@ are release requirements, not deferred cleanup:
   an inert `cpu` workflow sentinel; Windows CPU is the certified 0.3.2 scope,
   and the hard no-GPU-backend assertion must remain active for accidental
   unqualified builds rather than breaking the intended release artifact.
+- packaged Windows smoke tests must exercise the shipping `search --json`
+  command rather than the retired `semantic-search` spelling; a release probe
+  must fail on invalid product vocabulary before attempting to parse its CLI
+  error text as JSON.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named
