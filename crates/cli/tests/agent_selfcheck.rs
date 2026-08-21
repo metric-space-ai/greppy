@@ -177,6 +177,7 @@ fn selfcheck_passes_on_healthy_fixture() {
         .args(["index"])
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .output()
         .expect("index");
     // Index may warn about embeddings; structural must succeed for where-am-i.
@@ -191,6 +192,7 @@ fn selfcheck_passes_on_healthy_fixture() {
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
         .env_remove("GREPPY_SKIP_SELFCHECK")
@@ -247,6 +249,7 @@ fn skip_selfcheck_bypasses_probes() {
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
         .args([

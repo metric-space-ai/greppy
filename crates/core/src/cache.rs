@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const STORE_FORMAT_VERSION: u32 = 2;
 pub const STORE_MANIFEST_FILE: &str = "store.manifest";
+pub const AGENT_BASE_FORMAT_VERSION: u32 = 1;
+pub const AGENT_BASE_MANIFEST_FILE: &str = "base.cache.manifest";
 pub const LAST_USED_FILE: &str = ".lastused";
 pub const DEFAULT_STORE_TTL_DAYS: u64 = 14;
 pub const DEFAULT_STORE_MAX_GIB: u64 = 10;
@@ -21,6 +23,7 @@ pub const DEFAULT_SUMMARY_CACHE_MAX_MIB: u64 = 32;
 pub const ORPHAN_GRACE_SECS: u64 = 24 * 60 * 60;
 
 const STORE_MANIFEST_MAGIC: &str = "greppy-workspace-store";
+const AGENT_BASE_MANIFEST_MAGIC: &str = "greppy-agent-base-store";
 const LAST_USED_WRITE_GAP: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,14 @@ pub struct StoreManifest {
     pub format_version: u32,
     pub workspace_hash: String,
     pub canonical_root: PathBuf,
+    pub created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBaseManifest {
+    pub format_version: u32,
+    pub identity_hash: String,
+    pub canonical_repository_identity: String,
     pub created_at_unix_secs: u64,
 }
 
@@ -142,6 +153,7 @@ struct ManagedEntry {
 enum ManagedKind {
     Workspace,
     Model,
+    AgentBase,
 }
 
 impl ManagedKind {
@@ -149,6 +161,7 @@ impl ManagedKind {
         match self {
             Self::Workspace => "workspace",
             Self::Model => "model",
+            Self::AgentBase => "agent-base",
         }
     }
 }
@@ -198,6 +211,69 @@ pub fn workspaces_root() -> PathBuf {
 
 pub fn models_root() -> PathBuf {
     data_root().join("models").join("v1")
+}
+
+pub fn agent_base_stores_root() -> PathBuf {
+    data_root()
+        .join("agent-base-stores")
+        .join(format!("v{AGENT_BASE_FORMAT_VERSION}"))
+}
+
+pub fn write_agent_base_manifest(
+    dir: &Path,
+    identity_hash: &str,
+    canonical_repository_identity: &str,
+) -> io::Result<()> {
+    let directory_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !is_hex_id(identity_hash, 64)
+        || canonical_repository_identity.trim().is_empty()
+        || (directory_name != identity_hash
+            && !directory_name.starts_with(&format!(".building-{identity_hash}-")))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid agent Base cache identity",
+        ));
+    }
+    ensure_owned_namespace(dir)?;
+    let manifest = AgentBaseManifest {
+        format_version: AGENT_BASE_FORMAT_VERSION,
+        identity_hash: identity_hash.to_string(),
+        canonical_repository_identity: canonical_repository_identity.to_string(),
+        created_at_unix_secs: unix_now_secs(),
+    };
+    atomic_write(
+        &dir.join(AGENT_BASE_MANIFEST_FILE),
+        &encode_agent_base_manifest(&manifest),
+    )
+}
+
+pub fn read_agent_base_manifest(dir: &Path) -> io::Result<AgentBaseManifest> {
+    let metadata = fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent Base cache entry is not a directory",
+        ));
+    }
+    let manifest = decode_agent_base_manifest(&fs::read(dir.join(AGENT_BASE_MANIFEST_FILE))?)?;
+    let directory_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if manifest.format_version != AGENT_BASE_FORMAT_VERSION
+        || (directory_name != manifest.identity_hash
+            && !directory_name.starts_with(&format!(".building-{}-", manifest.identity_hash)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agent Base cache manifest mismatch",
+        ));
+    }
+    Ok(manifest)
 }
 
 pub fn locks_root() -> PathBuf {
@@ -352,8 +428,22 @@ pub fn acquire_named_lock(
     mode: LockMode,
     nonblocking: bool,
 ) -> io::Result<Option<FileLock>> {
-    ensure_owned_namespace(&locks_root())?;
-    let path = locks_root().join(sanitize_lock_name(name));
+    acquire_named_lock_in(&data_root(), name, mode, nonblocking)
+}
+
+/// Acquire a cache lock inside an explicit managed data root. Components
+/// that construct layouts from an injected root (for example Store-CoW Base
+/// publication) must not silently coordinate through the process-global
+/// `GREPPY_STORE_DIR` instead.
+pub fn acquire_named_lock_in(
+    data_root: &Path,
+    name: &str,
+    mode: LockMode,
+    nonblocking: bool,
+) -> io::Result<Option<FileLock>> {
+    let root = data_root.join("locks");
+    ensure_owned_namespace(&root)?;
+    let path = root.join(sanitize_lock_name(name));
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -454,6 +544,40 @@ pub fn clear_cache(workspace_root: Option<&Path>) -> io::Result<GcReport> {
             if entry.kind != ManagedKind::Workspace || entry.id != hash {
                 continue;
             }
+        }
+        report.scanned_bytes = report.scanned_bytes.saturating_add(entry.bytes);
+        let Some(_lease) = try_entry_lock(&entry)? else {
+            report.locked_bytes = report.locked_bytes.saturating_add(entry.bytes);
+            report.skipped_locked.push(entry.path);
+            continue;
+        };
+        let trashed = move_to_trash(&entry)?;
+        remove_path_no_symlink(&trashed)?;
+        report.removed_bytes = report.removed_bytes.saturating_add(entry.bytes);
+        report.removed.push(entry.path);
+    }
+    Ok(report)
+}
+
+/// Remove every verified shared Base belonging to one canonical repository
+/// identity. This complements workspace-scoped clear: Base stores are shared
+/// across linked worktrees and therefore cannot be keyed by one worktree hash.
+pub fn clear_agent_bases(canonical_repository_identity: &str) -> io::Result<GcReport> {
+    let Some(_gc_lock) = acquire_named_lock("global.gc", LockMode::Exclusive, false)? else {
+        unreachable!("blocking lock acquisition returned no guard")
+    };
+    cleanup_trash()?;
+    let (entries, _, _) = scan_entries(false)?;
+    let mut report = GcReport::default();
+    for entry in entries {
+        if entry.kind != ManagedKind::AgentBase {
+            continue;
+        }
+        let Ok(manifest) = read_agent_base_manifest(&entry.path) else {
+            continue;
+        };
+        if manifest.canonical_repository_identity != canonical_repository_identity {
+            continue;
         }
         report.scanned_bytes = report.scanned_bytes.saturating_add(entry.bytes);
         let Some(_lease) = try_entry_lock(&entry)? else {
@@ -639,6 +763,59 @@ fn scan_entries(mark_new_orphans: bool) -> io::Result<(Vec<ManagedEntry>, Vec<Pa
     } else if models.exists() {
         unmanaged_paths.push(models.clone());
     }
+    let agent_bases = agent_base_stores_root();
+    if namespace_chain_is_safe(&agent_bases) {
+        let repository_dirs = fs::read_dir(&agent_bases)?;
+        for repository_dir in repository_dirs.flatten() {
+            let repository_path = repository_dir.path();
+            let repository_id = repository_dir.file_name().to_string_lossy().into_owned();
+            if !repository_dir
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+                || !is_hex_id(&repository_id, 64)
+            {
+                unmanaged = unmanaged.saturating_add(path_size_no_symlink(&repository_path));
+                unmanaged_paths.push(repository_path);
+                continue;
+            }
+            let Ok(generations) = fs::read_dir(&repository_path) else {
+                unmanaged = unmanaged.saturating_add(path_size_no_symlink(&repository_path));
+                unmanaged_paths.push(repository_path);
+                continue;
+            };
+            for generation in generations.flatten() {
+                let path = generation.path();
+                let Ok(manifest) = read_agent_base_manifest(&path) else {
+                    unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
+                    unmanaged_paths.push(path);
+                    continue;
+                };
+                let complete = fs::read_to_string(path.join("COMPLETE"))
+                    .ok()
+                    .is_some_and(|value| value.trim() == manifest.identity_hash);
+                let published = complete && path.join("graph.db").is_file();
+                let last_used = read_last_used(&path).unwrap_or_else(|| {
+                    fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(UNIX_EPOCH)
+                });
+                let orphaned_since = update_orphan_marker(&path, !published, mark_new_orphans);
+                entries.push(ManagedEntry {
+                    kind: ManagedKind::AgentBase,
+                    id: manifest.identity_hash,
+                    path: path.clone(),
+                    workspace_root: None,
+                    bytes: path_size_no_symlink(&path),
+                    last_used,
+                    orphaned: !published,
+                    orphaned_since,
+                });
+            }
+        }
+    } else if agent_bases.exists() {
+        unmanaged_paths.push(agent_bases.clone());
+    }
     // Legacy model layout was `<data>/models/<model>/<digest>`. It is safe to
     // manage only digest directories carrying Greppy's matching marker; every
     // other legacy child remains unmanaged.
@@ -701,7 +878,9 @@ fn scan_entries(mark_new_orphans: bool) -> io::Result<(Vec<ManagedEntry>, Vec<Pa
             let name = entry.file_name();
             if matches!(
                 name.to_str(),
-                Some("workspaces" | "models" | "locks" | "trash" | "gc.state")
+                Some(
+                    "workspaces" | "models" | "agent-base-stores" | "locks" | "trash" | "gc.state"
+                )
             ) {
                 continue;
             }
@@ -765,6 +944,11 @@ fn try_entry_lock(entry: &ManagedEntry) -> io::Result<Option<FileLock>> {
             true,
         ),
         ManagedKind::Model => acquire_model_lifecycle(&entry.id, LockMode::Exclusive, true),
+        ManagedKind::AgentBase => acquire_named_lock(
+            &format!("agent-base-{}.builder", entry.id),
+            LockMode::Exclusive,
+            true,
+        ),
     }
 }
 
@@ -827,6 +1011,13 @@ fn trash_entry_is_verified(path: &Path) -> bool {
             return false;
         };
         return model_entry_has_marker(path, digest);
+    }
+    if let Some(rest) = name.strip_prefix("agent-base-") {
+        let Some(identity_hash) = rest.get(..64).filter(|value| is_hex_id(value, 64)) else {
+            return false;
+        };
+        return read_agent_base_manifest(path)
+            .is_ok_and(|manifest| manifest.identity_hash == identity_hash);
     }
     false
 }
@@ -978,6 +1169,64 @@ fn decode_manifest(raw: &[u8]) -> io::Result<StoreManifest> {
         format_version,
         workspace_hash,
         canonical_root: PathBuf::from(root),
+        created_at_unix_secs,
+    })
+}
+
+fn encode_agent_base_manifest(manifest: &AgentBaseManifest) -> Vec<u8> {
+    format!(
+        "{AGENT_BASE_MANIFEST_MAGIC}\n{}\n{}\n{}\n{}\n",
+        manifest.format_version,
+        manifest.identity_hash,
+        manifest.created_at_unix_secs,
+        hex_encode(manifest.canonical_repository_identity.as_bytes())
+    )
+    .into_bytes()
+}
+
+fn decode_agent_base_manifest(raw: &[u8]) -> io::Result<AgentBaseManifest> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "manifest is not UTF-8"))?;
+    let mut lines = text.lines();
+    if lines.next() != Some(AGENT_BASE_MANIFEST_MAGIC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agent Base manifest magic mismatch",
+        ));
+    }
+    let format_version = lines
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid manifest version"))?;
+    let identity_hash = lines
+        .next()
+        .filter(|value| is_hex_id(value, 64))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Base identity hash"))?
+        .to_string();
+    let created_at_unix_secs = lines
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid created time"))?;
+    let repository_identity = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing repository identity"))?;
+    let canonical_repository_identity = String::from_utf8(hex_decode(repository_identity)?)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "repository identity is not UTF-8",
+            )
+        })?;
+    if canonical_repository_identity.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "repository identity is empty",
+        ));
+    }
+    Ok(AgentBaseManifest {
+        format_version,
+        identity_hash,
+        canonical_repository_identity,
         created_at_unix_secs,
     })
 }
@@ -1293,11 +1542,11 @@ fn lock_file(_file: &File, _mode: LockMode, _nonblocking: bool) -> io::Result<bo
 fn unlock_file(_file: &File) {}
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV: Mutex<()> = Mutex::new(());
 
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1312,7 +1561,7 @@ mod tests {
 
     #[test]
     fn versioned_store_has_valid_manifest() {
-        let _guard = ENV.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let base = tempdir("manifest");
         let repo = base.join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -1331,7 +1580,7 @@ mod tests {
 
     #[test]
     fn gc_never_deletes_unmanaged_override_children() {
-        let _guard = ENV.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let base = tempdir("unmanaged");
         let data = base.join("shared");
         let unrelated = data.join("do-not-delete");
@@ -1363,7 +1612,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gc_never_follows_symlinked_namespace_components() {
-        let _guard = ENV.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let base = tempdir("namespace-symlink");
         let data = base.join("data");
         let repo = base.join("repo");
@@ -1400,7 +1649,7 @@ mod tests {
 
     #[test]
     fn gc_dry_run_does_not_resume_verified_trash() {
-        let _guard = ENV.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let base = tempdir("dry-run-trash");
         let data = base.join("data");
         let repo = base.join("repo");
@@ -1430,7 +1679,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exclusive_lock_cannot_steal_live_shared_lock_regardless_of_age() {
-        let _guard = ENV.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let base = tempdir("lock");
         std::env::set_var("GREPPY_STORE_DIR", base.join("data"));
         let shared = acquire_named_lock("x", LockMode::Shared, false)
@@ -1450,7 +1699,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn quota_continues_past_locked_lru_entries_to_low_water() {
-        let _guard = ENV.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let base = tempdir("quota-lock");
         let data = base.join("data");
         let repo_a = base.join("repo-a");
@@ -1481,6 +1730,59 @@ mod tests {
         );
         assert!(report.locked_bytes >= 4096);
         assert!(report.removed_bytes >= 4096);
+        std::env::remove_var("GREPPY_STORE_DIR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn agent_base_is_managed_and_live_reader_lease_blocks_gc() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("agent-base-gc");
+        let data = base.join("data");
+        std::env::set_var("GREPPY_STORE_DIR", &data);
+        let identity_hash = "b".repeat(64);
+        let directory = agent_base_stores_root()
+            .join("a".repeat(64))
+            .join(&identity_hash);
+        write_agent_base_manifest(&directory, &identity_hash, "git-common-dir:/repo/.git").unwrap();
+        fs::write(directory.join("graph.db"), vec![0u8; 4096]).unwrap();
+        fs::write(directory.join("COMPLETE"), &identity_hash).unwrap();
+        fs::write(directory.join(LAST_USED_FILE), b"1").unwrap();
+
+        let reader = acquire_named_lock(
+            &format!("agent-base-{identity_hash}.builder"),
+            LockMode::Shared,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let status = cache_status().unwrap();
+        let entry = status
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "agent-base")
+            .expect("agent Base must be managed");
+        assert_eq!(entry.path, directory);
+        assert!(entry.locked);
+        assert!(!status
+            .unmanaged
+            .iter()
+            .any(|path| path.starts_with(data.join("agent-base-stores"))));
+
+        let policy = GcPolicy {
+            ttl: Duration::ZERO,
+            high_water_bytes: 1,
+            low_water_bytes: 0,
+            interval: Duration::ZERO,
+        };
+        let locked = run_gc(&policy, false, None).unwrap();
+        assert!(directory.exists());
+        assert!(locked.skipped_locked.contains(&directory));
+        drop(reader);
+        let removed = run_gc(&policy, false, None).unwrap();
+        assert!(!directory.exists());
+        assert!(removed.removed.contains(&directory));
+
         std::env::remove_var("GREPPY_STORE_DIR");
         let _ = fs::remove_dir_all(base);
     }

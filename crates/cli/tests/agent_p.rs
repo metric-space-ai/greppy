@@ -155,6 +155,7 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         // Avoid pulling a real model path from the parent environment.
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
@@ -167,6 +168,7 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
             &endpoint,
             "--max-turns",
             "2",
+            "--private-store",
             // Self-check is covered by agent_selfcheck.rs; keep this test on the
             // gateway/loop contract without depending on a warm index.
             "--skip-selfcheck",
@@ -194,6 +196,10 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
         stdout.contains("no changes proposed."),
         "expected clean outcome in stdout: {stdout}\nstderr={stderr}"
     );
+    assert!(
+        stderr.contains("store mode: private (--private-store)"),
+        "expected explicit full-private fallback mode: {stdout}\nstderr={stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
@@ -209,6 +215,7 @@ fn greppy_e_dash_p_is_not_intercepted_as_agent() {
     let output = Command::new(binary_path())
         .current_dir(&dir)
         .env("GREPPY_STORE_DIR", unique_temp("e-dash-p-store"))
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
         .args(["-e", "-p", "hay.txt"])
@@ -255,6 +262,7 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
         .env_remove("GREPPY_DEADLINE_SECS")
@@ -308,6 +316,7 @@ fn nested_agent_run_is_refused() {
     let output = Command::new(binary_path())
         .args(["-p", "do something", "--model", "m"])
         .env("GREPPY_AGENT_RUN", "1")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .current_dir(&dir)
         .stdin(Stdio::null())
         .output()
@@ -352,6 +361,7 @@ fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
         .args(["index", "--agent-worktree"])
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .output()
         .expect("spawn greppy");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

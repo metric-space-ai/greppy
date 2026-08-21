@@ -120,6 +120,10 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
     std::fs::create_dir_all(&agent_data).unwrap();
     let scratch = base.join("greppy-agent-scratch").join("run");
     std::fs::create_dir_all(&scratch).unwrap();
+    let shared_base = base.join("shared-base");
+    std::fs::create_dir_all(&shared_base).unwrap();
+    let shared_base_graph = shared_base.join("graph.db");
+    std::fs::write(&shared_base_graph, b"immutable-base").unwrap();
 
     // Capture the process global temp BEFORE overriding TMPDIR for children.
     let global_temp = std::env::temp_dir();
@@ -128,6 +132,7 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
     // binary process so this cannot poison parallel unit-test threads.
     std::env::set_var("GREPPY_STORE_DIR", &agent_data);
     std::env::set_var("TMPDIR", &scratch);
+    std::env::set_var("GREPPY_AGENT_BASE_STORE", &shared_base_graph);
 
     let roots = agent_writable_roots(&worktree, &scratch, &agent_data);
     assert!(
@@ -150,6 +155,10 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
     assert!(
         !roots.iter().any(|r| r.ends_with(".cargo")),
         "whole cargo home must not be a root: {roots:?}"
+    );
+    assert!(
+        !roots.iter().any(|root| shared_base_graph.starts_with(root)),
+        "published Base must stay outside every writable sandbox root: {roots:?}"
     );
 
     let mode = match sandbox::resolve_enforce_spec(&roots) {
@@ -224,6 +233,29 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_file(&cache_probe);
+
+    // Store-CoW invariant: the tool child may read the published Base through
+    // SQLite, but the Base path itself is never writable inside the sandbox.
+    let base_write = env.call_tool(
+        "greppy",
+        &json!({"args": [
+            "bash-smart",
+            "--",
+            "bash",
+            "-lc",
+            format!("printf tamper >> '{}'", shared_base_graph.display())
+        ]}),
+    );
+    assert!(
+        base_write.is_error,
+        "published Base write must be denied; content={}",
+        base_write.content
+    );
+    assert_eq!(
+        std::fs::read(&shared_base_graph).unwrap(),
+        b"immutable-base",
+        "sandboxed agent must not change published Base bytes"
+    );
     let cache_out = env.call_tool(
         "greppy",
         &json!({"args": [
@@ -275,6 +307,7 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
     );
 
     std::env::remove_var("GREPPY_STORE_DIR");
+    std::env::remove_var("GREPPY_AGENT_BASE_STORE");
     let _ = std::fs::remove_dir_all(&base);
 }
 

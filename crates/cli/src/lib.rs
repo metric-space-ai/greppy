@@ -19,6 +19,12 @@
 #[cfg(all(feature = "ci-test-assets", not(debug_assertions)))]
 compile_error!("ci-test-assets is forbidden outside debug/test builds");
 
+/// Process environment is global to the test binary. Every unit test that
+/// mutates it must hold this one crate-wide lock for its full set/use/restore
+/// sequence so tests in different modules cannot race each other.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A binary without a GPU backend is not buildable, the same way a binary
 /// without the embedded models is not buildable. Nothing fails at runtime when
 /// the backend is missing — the work just takes twenty times longer, measured
@@ -83,6 +89,7 @@ mod bash_smart;
 mod context;
 use context::*;
 mod agent;
+mod store_cow;
 
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
@@ -157,7 +164,10 @@ const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
-#[cfg(all(debug_assertions, not(feature = "ci-test-assets")))]
+#[cfg(all(
+    not(feature = "ci-test-assets"),
+    any(debug_assertions, feature = "store-cow-release-perf")
+))]
 const ENV_TEST_SKIP_INFERENCE: &str = "GREPPY_TEST_SKIP_INFERENCE";
 /// Test-only failpoint: simulate an unavailable embedding backend so tests
 /// can pin the degraded-index contract (graph publishes, embeddings retry
@@ -175,12 +185,19 @@ fn test_inference_skipped() -> bool {
     true
 }
 
-#[cfg(all(debug_assertions, not(feature = "ci-test-assets")))]
+#[cfg(all(
+    not(feature = "ci-test-assets"),
+    any(debug_assertions, feature = "store-cow-release-perf")
+))]
 fn test_inference_skipped() -> bool {
     std::env::var_os(ENV_TEST_SKIP_INFERENCE).is_some()
 }
 
-#[cfg(all(not(debug_assertions), not(feature = "ci-test-assets")))]
+#[cfg(all(
+    not(debug_assertions),
+    not(feature = "ci-test-assets"),
+    not(feature = "store-cow-release-perf")
+))]
 fn test_inference_skipped() -> bool {
     false
 }
@@ -1181,6 +1198,20 @@ fn dispatch_cache(command: CacheCommand, root: Option<&str>) -> Result<i32> {
             };
             let mut report = greppy_core::cache::clear_cache(target.as_deref())
                 .map_err(|error| Error::io("clear cache", error))?;
+            if let Some(root) = target.as_deref() {
+                let repository_identity = crate::store_cow::canonical_repository_identity(root)?;
+                let base_report = greppy_core::cache::clear_agent_bases(&repository_identity)
+                    .map_err(|error| Error::io("clear shared agent Base stores", error))?;
+                report.scanned_bytes = report
+                    .scanned_bytes
+                    .saturating_add(base_report.scanned_bytes);
+                report.removed_bytes = report
+                    .removed_bytes
+                    .saturating_add(base_report.removed_bytes);
+                report.locked_bytes = report.locked_bytes.saturating_add(base_report.locked_bytes);
+                report.removed.extend(base_report.removed);
+                report.skipped_locked.extend(base_report.skipped_locked);
+            }
             cleanup_verified_legacy_trash();
             for entry in verified_legacy_cache_entries() {
                 if target.as_deref().is_some_and(|root| root != entry.root) {
@@ -1529,23 +1560,15 @@ fn dispatch_subcommand(
             )
         }
         Command::Brief {
-            symbol,
+            symbols,
             path_opts,
             code: _,
             all: _,
             json,
         } => {
-            let targets = nav_targets(std::slice::from_ref(&symbol))?;
+            let targets = nav_targets(&symbols)?;
             validate_path_filters(root, &path_opts, "--path")?;
-            if targets.len() > 1 {
-                // One SYMBOL is enforced at the clap level; several can only
-                // arrive through the `-` pipe, and brief sketches ONE body.
-                return Err(Error::Invalid(format!(
-                    "brief takes exactly one symbol; the pipe delivered {} — brief them one at a time",
-                    targets.len()
-                )));
-            }
-            dispatch_brief(targets.first().map(String::as_str), &path_opts, json, root)
+            dispatch_briefs(&targets, &path_opts, json, root)
         }
         #[cfg(feature = "bash-smart")]
         Command::BashSmart { regexes, argv } => bash_smart::run(&argv, &regexes, root),
@@ -3802,6 +3825,14 @@ fn spawn_background_job(
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
 ) -> bool {
+    // Integration tests use short-lived stores and explicitly opt out of
+    // inference. A detached child can outlive the fixture guard, recreate the
+    // removed store, and extract hundreds of MiB of embedded model assets per
+    // test process. Honour the test contract for the complete background
+    // lifecycle, not just the foreground inference call.
+    if test_inference_skipped() && kind == "embedding" {
+        return false;
+    }
     let Ok(root) = resolve_root(root) else {
         return false;
     };
@@ -4109,8 +4140,7 @@ const BRIEF_LIMIT: usize = 15;
 /// Folded into the summary-cache key only (not the daemon identity):
 /// bump when generation behavior changes without a prompt-version bump,
 /// so cached summaries cannot outlive the code that produced them.
-#[cfg(any(unix, windows))]
-const SUMMARY_CACHE_GENERATION: &str = "sc1";
+pub(crate) const SUMMARY_CACHE_GENERATION: &str = "sc1";
 
 /// Summary generations are cached by (model identity, path+span content):
 /// a hit skips the daemon entirely, a miss generates and stores best-effort.
@@ -4120,8 +4150,10 @@ fn summarize_source_cached(
     cfg: &QwenSummaryConfig,
     model_key: &str,
     cache: Option<&greppy_store::SummaryCache>,
+    fallback_cache: Option<&greppy_store::SummaryCache>,
     file_path: &str,
     source: &str,
+    unbounded: bool,
 ) -> Option<Vec<String>> {
     let cache_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
     let hash = greppy_store::span_hash(file_path, source);
@@ -4130,10 +4162,19 @@ fn summarize_source_cached(
             return Some(bullets);
         }
     }
+    if let Some(cache) = fallback_cache {
+        if let Ok(Some(bullets)) = cache.get(&cache_key, &hash) {
+            return Some(bullets);
+        }
+    }
     let bullets = summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, source)
         .filter(|bullets| !bullets.is_empty())?;
     if let Some(cache) = cache {
-        let _ = cache.put(&cache_key, &hash, &bullets);
+        let _ = if unbounded {
+            cache.put_unbounded(&cache_key, &hash, &bullets)
+        } else {
+            cache.put(&cache_key, &hash, &bullets)
+        };
     }
     Some(bullets)
 }
@@ -4164,7 +4205,19 @@ fn summarize_definition_span(
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
         let cache = greppy_store::SummaryCache::open(&workspace_locator::store_dir(root_path)).ok();
-        summarize_source_cached(&cfg, &model_key, cache.as_ref(), file_path, source_span)
+        let base_cache = std::env::var_os(crate::store_cow::ENV_BASE_PATH)
+            .map(std::path::PathBuf::from)
+            .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
+            .and_then(|directory| greppy_store::SummaryCache::open_read_only(&directory).ok());
+        summarize_source_cached(
+            &cfg,
+            &model_key,
+            cache.as_ref(),
+            base_cache.as_ref(),
+            file_path,
+            source_span,
+            false,
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -4596,10 +4649,16 @@ fn dispatch_stats(root: Option<&str>) -> Result<i32> {
 fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
     let store = open_default_store(root)?;
     let diag = store.diagnostics()?;
+    let root_path = resolve_root(root)?;
+    let store_path = workspace_locator::store_path(&root_path);
+    let store_cow = crate::store_cow::diagnostics(&root_path, &store, &store_path);
     if json {
+        let mut value = serde_json::to_value(&diag)
+            .map_err(|e| Error::Invalid(format!("serialize diagnostics JSON: {e}")))?;
+        value["store_cow"] = store_cow;
         println!(
             "{}",
-            serde_json::to_string_pretty(&diag)
+            serde_json::to_string_pretty(&value)
                 .map_err(|e| Error::Invalid(format!("serialize diagnostics JSON: {e}")))?
         );
         return Ok(if diag.is_healthy() { 0 } else { EXIT_IO as i32 });
@@ -4613,6 +4672,22 @@ fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
         "integrity: {}",
         if diag.integrity_ok { "ok" } else { "failed" }
     );
+    println!(
+        "store_mode: {}",
+        store_cow["mode"].as_str().unwrap_or("single")
+    );
+    if let Some(identity) = store_cow["base_identity"].as_str() {
+        println!("base_identity: {identity}");
+    }
+    if let (Some(dirty), Some(deleted)) = (
+        store_cow["dirty_file_count"].as_u64(),
+        store_cow["deleted_file_count"].as_u64(),
+    ) {
+        println!("delta_paths: dirty={dirty} deleted={deleted}");
+    }
+    if let Some(reason) = store_cow["fallback_reason"].as_str() {
+        println!("store_fallback: {reason}");
+    }
     for message in &diag.integrity_messages {
         println!("  integrity_message: {message}");
     }

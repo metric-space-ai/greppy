@@ -27,7 +27,7 @@ impl Store {
     pub fn upsert_workspace_state(&mut self, w: &WorkspaceState) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "INSERT INTO workspace_state
+            "INSERT INTO main.workspace_state
                   (root_path, git_dir, git_common_dir, head_oid, index_signature,
                    schema_version, indexer_version, graph_generation, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -88,14 +88,14 @@ impl Store {
     pub fn bump_generation(&mut self, root_path: &str) -> Result<u64> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "UPDATE workspace_state
+            "UPDATE main.workspace_state
                  SET graph_generation = graph_generation + 1,
                      updated_at = ?2
                  WHERE root_path = ?1",
             params![root_path, now_iso8601()],
         )?;
         let gen: i64 = tx.raw().query_row(
-            "SELECT graph_generation FROM workspace_state WHERE root_path = ?1",
+            "SELECT graph_generation FROM main.workspace_state WHERE root_path = ?1",
             params![root_path],
             |row| row.get(0),
         )?;

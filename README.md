@@ -53,8 +53,12 @@ greppy read parse_config --handle              # exact source + a hash-pinned ed
 greppy edit replace-body --symbol parse_config --source-file fix.rs   # all-or-nothing, proves its result
 greppy edit apply --plan refactor.json         # many files, ONE transaction: all publish or none
 
-# And in 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
+# And since 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
 greppy -p "add tests for clamp_value"          # works in a disposable worktree, returns a proposal ref
+
+# In 0.3.2, concurrent agents share an immutable Base index and write private Deltas:
+greppy index --agent-worktree                  # build or validate the shared Base ahead of time
+greppy -p --private-store "diagnose indexing"  # opt out for one run and use a full private Store
 ```
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
@@ -336,6 +340,7 @@ file belong in one `apply --plan` call; each plan operation declares the
 | Command | Does |
 |---|---|
 | `greppy index [PATH]` | build or refresh the index; `greppy index status` reports progress |
+| `greppy index --agent-worktree` | build or validate the immutable Base Store used by integrated agents |
 | `greppy stats` | node and edge counts for the project graph |
 | `greppy diagnostics` | schema health, integrity, workspace state, provider completeness |
 | `greppy doctor` | end-to-end health check of the active index |
@@ -466,6 +471,22 @@ are private to the current user (`0700` on Unix), and cache objects are managed
 only after ownership, type, and path validation. Set `GREPPY_STORE_DIR` to place
 the data on an encrypted or ephemeral volume.
 
+For integrated agents in 0.3.2, unchanged repository data is held once in a
+content-identified, immutable Base Store. Each run gets a writable private Delta
+containing only dirty, deleted, renamed, or newly created paths. The Base identity
+includes the Git tree, schema/indexer versions, and summary/embedding model
+contracts; incompatible identities select a new Base instead of migrating one in
+place. Publication is atomic, readers hold eviction leases, and corrupt or
+incomplete Bases are quarantined before a rebuild. `--private-store` disables
+reuse for one agent run. `doctor`, `diagnostics`, and `index status --json` report
+the selected mode, Base and Delta identities, completeness, cache hit, changed
+path counts, and any fallback reason.
+
+Base Stores and Deltas contain source-derived paths, spans, graph relations,
+summaries, and embeddings. They have the same confidentiality requirements as
+the repository itself. Agent sandboxes can read a published Base but cannot
+write it; writable Delta state remains isolated per run.
+
 Full source bodies are not duplicated into SQLite. Exact code search reads the
 current worktree through real `grep` where available, with an in-binary literal
 fallback on clean Windows hosts. Freshness checks guard indexed graph spans and
@@ -476,7 +497,7 @@ greppy cache status --json       # inspect paths, sizes, locks, TTL and quota
 greppy cache gc --dry-run        # preview TTL/LRU reclamation
 greppy cache gc                  # reclaim eligible entries
 greppy cache clear --root . --yes
-greppy cache clear --all --yes   # explicit destructive operation
+greppy cache clear --all --yes   # also removes managed shared Agent Bases
 ```
 
 The default workspace-cache TTL is 14 days. `GREPPY_STORE_TTL_DAYS=0` disables

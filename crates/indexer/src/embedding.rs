@@ -222,6 +222,9 @@ pub fn count_code_embedding_documents_for_project(
         offset += nodes.len();
 
         for node in nodes {
+            if store.is_overlay() && node.id < 0 {
+                continue;
+            }
             if !is_embedding_candidate_label(&node.label) {
                 continue;
             }
@@ -307,6 +310,9 @@ pub fn index_code_embeddings_for_project_with_progress(
         offset += nodes.len();
 
         for node in nodes {
+            if store.is_overlay() && node.id < 0 {
+                continue;
+            }
             report.nodes_considered += 1;
             if !is_embedding_candidate_label(&node.label) {
                 report.nodes_skipped_non_definition += 1;

@@ -79,12 +79,12 @@ pub enum Command {
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
-        /// Warm the worktree `greppy -p` will use, not this checkout.
+        /// Warm the worktree and shared Base Store `greppy -p` will use.
         ///
         /// The built-in agent works in a per-repository worktree with its own
-        /// workspace identity, so indexing the checkout leaves the agent cold
-        /// and it pays for the first index inside its own run. This prepares
-        /// that worktree exactly as the agent does and indexes it there.
+        /// workspace identity. This prepares that worktree exactly as the
+        /// agent does and builds or validates its immutable shared Base Store;
+        /// persistent failure is reported and uses the private-Store fallback.
         #[arg(long)]
         agent_worktree: bool,
     },
@@ -182,9 +182,9 @@ pub enum Command {
     /// traits have no body to sketch: they print their whole definition.
     /// This is the orientation aid; `who-calls` and `callees` give addresses.
     Brief {
-        /// The symbol to brief — exactly one. `-` reads it from the pipe.
-        #[arg(value_name = "SYMBOL")]
-        symbol: String,
+        /// One or more symbols to brief. `-` reads targets from the pipe.
+        #[arg(value_name = "SYMBOL", num_args = 1..)]
+        symbols: Vec<String>,
         /// Restrict returned definitions/callers/callees to these files or
         /// directory subtrees. Graph resolution itself remains workspace-wide.
         /// Repeatable.

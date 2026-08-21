@@ -1440,6 +1440,13 @@ pub(crate) fn semantic_vector_purposes(
     let summary_cache = summary_runtime.as_ref().and_then(|_| {
         greppy_store::SummaryCache::open(&workspace_locator::store_dir(&root_path)).ok()
     });
+    #[cfg(any(unix, windows))]
+    let base_summary_cache = summary_runtime.as_ref().and_then(|_| {
+        std::env::var_os(crate::store_cow::ENV_BASE_PATH)
+            .map(std::path::PathBuf::from)
+            .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
+            .and_then(|directory| greppy_store::SummaryCache::open_read_only(&directory).ok())
+    });
     let mut purposes = Vec::new();
     for hit in hits {
         let node = hit
@@ -1487,8 +1494,10 @@ pub(crate) fn semantic_vector_purposes(
                     cfg,
                     model_key,
                     summary_cache.as_ref(),
+                    base_summary_cache.as_ref(),
                     file_path,
                     &code,
+                    false,
                 )
                 .unwrap_or_default();
             }

@@ -62,7 +62,7 @@ impl Store {
         {
             let raw = tx.raw();
             let mut stmt = raw.prepare_cached(
-                "INSERT INTO raw_edges
+                "INSERT INTO main.raw_edges
                    (project, file_path, source_qname, target_qname, edge_type, properties)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  RETURNING id",
@@ -104,6 +104,22 @@ impl Store {
         Ok(rows)
     }
 
+    /// List only raw edges physically owned by the private Delta database.
+    /// In a composed Store-CoW view [`Store::list_raw_edges`] includes Base
+    /// rows as well; rebuilding logical Delta edges must stay proportional to
+    /// changed files and therefore consumes this main-schema-only set.
+    pub fn list_delta_raw_edges(&self, project: &str) -> Result<Vec<RawEdge>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, project, file_path, source_qname, target_qname, edge_type, properties
+             FROM main.raw_edges WHERE project = ?1
+             ORDER BY file_path, id",
+        )?;
+        let rows = stmt
+            .query_map(params![project], row_to_raw_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// List the raw edges contributed by a single `(project, file_path)`,
     /// ordered by `id`. Useful for verifying a file's contribution.
     pub fn list_raw_edges_for_file(&self, project: &str, file_path: &str) -> Result<Vec<RawEdge>> {
@@ -125,7 +141,7 @@ impl Store {
         let n = self
             .conn()
             .execute(
-                "DELETE FROM raw_edges WHERE project = ?1 AND file_path = ?2",
+                "DELETE FROM main.raw_edges WHERE project = ?1 AND file_path = ?2",
                 params![project, file_path],
             )
             .map_err(Error::Sqlite)?;

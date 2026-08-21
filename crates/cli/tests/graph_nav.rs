@@ -168,6 +168,38 @@ fn run_with_env(
     )
 }
 
+fn run_with_stdin(
+    args: &[&str],
+    stdin: &str,
+    cwd: &Path,
+    store_dir: &Path,
+) -> (i32, String, String) {
+    use std::io::Write as _;
+
+    let mut child = Command::new(bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("GREPPY_STORE_DIR", store_dir)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn greppy with stdin");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write greppy stdin");
+    let out = child.wait_with_output().expect("wait for greppy");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -1752,19 +1784,47 @@ fn brief_reports_a_missing_symbol() {
 }
 
 #[test]
-fn brief_refuses_a_second_symbol() {
-    // 0.3.0: brief sketches ONE body. The legacy `brief A B` bundle
-    // (`== A ==` + full source) is gone — a second positional is a usage
-    // error, like any malformed invocation.
+fn brief_accepts_multiple_symbols_in_order_for_text_and_json() {
+    // 0.3.2 aligns the binary with the agent contract: related symbols can
+    // be briefed in one high-yield call without losing per-symbol structure.
     let (repo, store) = index_fixture("brief-two-symbols");
     let (code, out, err) = run(&["brief", "caller", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 64,
-        "a second symbol must be a usage error; stderr={err}"
+    assert_eq!(code, 0, "multi brief must succeed; stderr={err}");
+    assert!(
+        out.contains("== caller ==") && out.contains("== do_it =="),
+        "text output must retain ordered per-symbol boundaries; got: {out}"
     );
     assert!(
-        !out.contains("== caller ==") && !out.contains("== do_it =="),
-        "the multi-symbol bundle must never print; got: {out}"
+        out.find("== caller ==") < out.find("== do_it =="),
+        "request order must be stable; got: {out}"
+    );
+
+    let (code, out, err) = run(&["brief", "caller", "do_it", "--json"], &repo, &store);
+    assert_eq!(code, 0, "JSON multi brief must succeed; stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["schema_version"], "greppy.brief.batch.v1");
+    assert_eq!(value["total_exact"], 2);
+    assert_eq!(value["results"][0]["query"], "caller");
+    assert_eq!(value["results"][1]["query"], "do_it");
+    assert!(value["results"][0]["definitions"].is_array());
+
+    let (code, piped, err) =
+        run_with_stdin(&["brief", "-", "--json"], "caller\ndo_it\n", &repo, &store);
+    assert_eq!(code, 0, "piped multi brief must succeed; stderr={err}");
+    let piped: serde_json::Value = serde_json::from_str(&piped).unwrap();
+    assert_eq!(piped["symbols"], serde_json::json!(["caller", "do_it"]));
+    assert_eq!(piped["results"][0]["query"], "caller");
+    assert_eq!(piped["results"][1]["query"], "do_it");
+
+    let (code, out, err) = run(&["brief", "caller", "definitely_missing"], &repo, &store);
+    assert_eq!(code, 64, "mixed hit/miss must refuse the whole batch");
+    assert!(
+        out.is_empty(),
+        "a refused batch must print no partial answer"
+    );
+    assert!(
+        err.contains("definitely_missing"),
+        "the refusal must name the missing target; stderr={err}"
     );
 }
 

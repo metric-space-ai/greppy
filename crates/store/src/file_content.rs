@@ -22,21 +22,21 @@ use crate::store::Store;
 use crate::store_error::{Error, Result};
 
 const DROP_FILE_CONTENT_FTS_TRIGGERS: &str = r#"
-DROP TRIGGER IF EXISTS file_content_fts_ai;
-DROP TRIGGER IF EXISTS file_content_fts_ad;
-DROP TRIGGER IF EXISTS file_content_fts_au;
+DROP TRIGGER IF EXISTS main.file_content_fts_ai;
+DROP TRIGGER IF EXISTS main.file_content_fts_ad;
+DROP TRIGGER IF EXISTS main.file_content_fts_au;
 "#;
 
 const CREATE_FILE_CONTENT_FTS_TRIGGERS: &str = r#"
-CREATE TRIGGER file_content_fts_ai AFTER INSERT ON file_content BEGIN
+CREATE TRIGGER main.file_content_fts_ai AFTER INSERT ON file_content BEGIN
     INSERT INTO file_content_fts(rowid, snippet, file_path)
     VALUES (new.id, new.snippet, new.file_path);
 END;
-CREATE TRIGGER file_content_fts_ad AFTER DELETE ON file_content BEGIN
+CREATE TRIGGER main.file_content_fts_ad AFTER DELETE ON file_content BEGIN
     INSERT INTO file_content_fts(file_content_fts, rowid, snippet, file_path)
     VALUES ('delete', old.id, old.snippet, old.file_path);
 END;
-CREATE TRIGGER file_content_fts_au AFTER UPDATE ON file_content BEGIN
+CREATE TRIGGER main.file_content_fts_au AFTER UPDATE ON file_content BEGIN
     INSERT INTO file_content_fts(file_content_fts, rowid, snippet, file_path)
     VALUES ('delete', old.id, old.snippet, old.file_path);
     INSERT INTO file_content_fts(rowid, snippet, file_path)
@@ -59,7 +59,7 @@ impl Store {
         let count: i64 = self
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM file_content WHERE project = ?1",
+                "SELECT COUNT(*) FROM main.file_content WHERE project = ?1",
                 params![project],
                 |row| row.get(0),
             )
@@ -74,13 +74,13 @@ impl Store {
             .map_err(Error::Sqlite)?;
         tx.raw()
             .execute(
-                "DELETE FROM file_content WHERE project = ?1",
+                "DELETE FROM main.file_content WHERE project = ?1",
                 params![project],
             )
             .map_err(Error::Sqlite)?;
         tx.raw()
             .execute(
-                "INSERT INTO file_content_fts(file_content_fts) VALUES ('rebuild')",
+                "INSERT INTO main.file_content_fts(file_content_fts) VALUES ('rebuild')",
                 [],
             )
             .map_err(Error::Sqlite)?;
@@ -99,7 +99,7 @@ impl Store {
     pub fn delete_file_content(&mut self, project: &str, rel_path: &str) -> Result<usize> {
         let tx = self.transaction()?;
         let n = tx.raw().execute(
-            "DELETE FROM file_content WHERE project = ?1 AND rel_path = ?2",
+            "DELETE FROM main.file_content WHERE project = ?1 AND rel_path = ?2",
             params![project, rel_path],
         )?;
         tx.commit()?;
@@ -134,7 +134,7 @@ impl Store {
             let mut stmt = tx
                 .raw()
                 .prepare_cached(
-                    "INSERT INTO file_content
+                    "INSERT INTO main.file_content
                        (project, rel_path, file_path, line, snippet)
                      VALUES (?1, ?2, ?2, ?3, ?4)
                      ON CONFLICT(project, rel_path, line) DO UPDATE SET
@@ -185,7 +185,7 @@ impl Store {
             let mut stmt = tx
                 .raw()
                 .prepare_cached(
-                    "INSERT INTO file_content
+                    "INSERT INTO main.file_content
                        (project, rel_path, file_path, line, snippet)
                      VALUES (?1, ?2, ?2, ?3, ?4)
                      ON CONFLICT(project, rel_path, line) DO UPDATE SET
@@ -203,7 +203,7 @@ impl Store {
         }
         tx.raw()
             .execute(
-                "INSERT INTO file_content_fts(file_content_fts) VALUES ('rebuild')",
+                "INSERT INTO main.file_content_fts(file_content_fts) VALUES ('rebuild')",
                 [],
             )
             .map_err(Error::Sqlite)?;
@@ -249,6 +249,35 @@ impl Store {
         // them. A normal grep pattern like "processOrder" becomes
         // `"processOrder"`.
         let fts_query = build_fts_query(query);
+        if self.is_overlay() {
+            let overfetch = limit.saturating_mul(4).max(limit);
+            let mut hits =
+                search_file_content_layer(self, "main", false, project, &fts_query, overfetch)?;
+            hits.extend(search_file_content_layer(
+                self,
+                "greppy_base",
+                true,
+                project,
+                &fts_query,
+                overfetch,
+            )?);
+            // BM25 magnitudes from independently-sized corpora are not
+            // comparable. Re-score the overfetched candidates using one
+            // corpus-independent lexical function, then total-order ties.
+            for hit in &mut hits {
+                hit.rank = -overlay_lexical_score(query, &hit.snippet, &hit.rel_path);
+            }
+            hits.sort_by(|left, right| {
+                left.rank
+                    .total_cmp(&right.rank)
+                    .then_with(|| left.rel_path.cmp(&right.rel_path))
+                    .then_with(|| left.line.cmp(&right.line))
+                    .then_with(|| left.snippet.cmp(&right.snippet))
+            });
+            hits.dedup_by(|left, right| left.rel_path == right.rel_path && left.line == right.line);
+            hits.truncate(limit);
+            return Ok(hits);
+        }
         let mut stmt = self.conn().prepare(
             "SELECT c.rel_path, c.line, c.snippet, bm25(file_content_fts) AS rank
              FROM file_content_fts
@@ -281,6 +310,11 @@ impl Store {
             return Ok(0);
         }
         let fts_query = build_fts_query(query);
+        if self.is_overlay() {
+            let delta = count_file_content_layer(self, "main", false, project, &fts_query)?;
+            let base = count_file_content_layer(self, "greppy_base", true, project, &fts_query)?;
+            return Ok(delta.saturating_add(base));
+        }
         let total: i64 = self.conn().query_row(
             "SELECT COUNT(*)
              FROM file_content_fts
@@ -292,6 +326,84 @@ impl Store {
         )?;
         Ok(total as usize)
     }
+}
+
+fn search_file_content_layer(
+    store: &Store,
+    schema: &str,
+    filter_hidden: bool,
+    project: &str,
+    fts_query: &str,
+    limit: usize,
+) -> Result<Vec<FileContentHit>> {
+    debug_assert!(matches!(schema, "main" | "greppy_base"));
+    let hidden = if filter_hidden {
+        "AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = c.file_path)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT c.rel_path, c.line, c.snippet, bm25(file_content_fts) AS rank
+         FROM {schema}.file_content_fts
+         JOIN {schema}.file_content c ON c.id = file_content_fts.rowid
+         WHERE file_content_fts MATCH ?1
+           AND c.project = ?2
+           {hidden}
+         ORDER BY rank
+         LIMIT ?3"
+    );
+    let mut stmt = store.conn().prepare(&sql)?;
+    let hits = stmt
+        .query_map(params![fts_query, project, limit as i64], |row| {
+            let line: i64 = row.get(1)?;
+            Ok(FileContentHit {
+                rel_path: row.get(0)?,
+                line: line as u32,
+                snippet: row.get(2)?,
+                rank: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(hits)
+}
+
+fn count_file_content_layer(
+    store: &Store,
+    schema: &str,
+    filter_hidden: bool,
+    project: &str,
+    fts_query: &str,
+) -> Result<usize> {
+    debug_assert!(matches!(schema, "main" | "greppy_base"));
+    let hidden = if filter_hidden {
+        "AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = c.file_path)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT COUNT(*)
+         FROM {schema}.file_content_fts
+         JOIN {schema}.file_content c ON c.id = file_content_fts.rowid
+         WHERE file_content_fts MATCH ?1
+           AND c.project = ?2
+           {hidden}"
+    );
+    let count: i64 = store
+        .conn()
+        .query_row(&sql, params![fts_query, project], |row| row.get(0))?;
+    Ok(count.max(0) as usize)
+}
+
+fn overlay_lexical_score(query: &str, snippet: &str, path: &str) -> f64 {
+    let query = query.to_lowercase();
+    let snippet = snippet.to_lowercase();
+    let path = path.to_lowercase();
+    let mut score = if snippet.contains(&query) { 100.0 } else { 0.0 };
+    for token in query.split_whitespace().filter(|token| !token.is_empty()) {
+        score += snippet.matches(token).count() as f64 * 10.0;
+        score += path.matches(token).count() as f64 * 2.0;
+    }
+    score
 }
 
 /// One row returned from `search_file_content`.

@@ -70,7 +70,7 @@ fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64>
     let prior: Option<(i64, String, String, String, String)> = tx
         .prepare_cached(
             "SELECT id, name, qualified_name, label, file_path
-             FROM nodes WHERE project = ?1 AND qualified_name = ?2",
+             FROM main.nodes WHERE project = ?1 AND qualified_name = ?2",
         )?
         .query_row(params![n.project, n.qualified_name], |row| {
             Ok((
@@ -85,7 +85,7 @@ fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64>
     if let Some((old_id, old_name, old_qname, old_label, old_file)) = &prior {
         let (old_name_col, old_qname_col) = fts_tokens(old_name, old_qname);
         tx.execute(
-            "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)
+            "INSERT INTO main.nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)
              VALUES('delete', ?1, ?2, ?3, ?4, ?5)",
             params![old_id, old_name_col, old_qname_col, old_label, old_file],
         )
@@ -95,7 +95,7 @@ fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64>
     let props_str = serde_json::to_string(&n.properties)?;
     let id: i64 = tx
         .prepare_cached(
-            "INSERT INTO nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties)
+            "INSERT INTO main.nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(project, qualified_name) DO UPDATE SET
                label = excluded.label,
@@ -126,7 +126,7 @@ fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64>
     // `delete_nodes_for_file` can reproduce them exactly.
     let (name_col, qname_col) = fts_tokens(&n.name, &n.qualified_name);
     tx.execute(
-        "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO main.nodes_fts(rowid, name, qualified_name, label, file_path) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![id, name_col, qname_col, n.label, n.file_path],
     )
     .map_err(Error::Sqlite)?;
@@ -134,8 +134,48 @@ fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64>
 }
 
 impl Store {
+    fn equivalent_visible_overlay_node(&self, node: &NewNode) -> Result<Option<i64>> {
+        if !self.is_overlay() {
+            return Ok(None);
+        }
+        let visible = self
+            .conn()
+            .query_row(
+                "SELECT id, label, name, file_path, start_line, end_line, properties
+                 FROM nodes WHERE project = ?1 AND qualified_name = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![node.project, node.qualified_name],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, label, name, file_path, start_line, end_line, properties)) = visible else {
+            return Ok(None);
+        };
+        let properties: serde_json::Value = serde_json::from_str(&properties)?;
+        Ok((label == node.label
+            && name == node.name
+            && file_path == node.file_path
+            && start_line == node.start_line
+            && end_line == node.end_line
+            && properties == node.properties)
+            .then_some(id))
+    }
+
     /// Insert a new node. Returns the assigned id.
     pub fn insert_node(&mut self, n: &NewNode) -> Result<i64> {
+        if let Some(id) = self.equivalent_visible_overlay_node(n)? {
+            return Ok(id);
+        }
         let tx = self.transaction()?;
         let id = insert_node_in_tx(tx.raw(), n)?;
         tx.commit()?;
@@ -162,10 +202,17 @@ impl Store {
         if nodes.is_empty() {
             return Ok(Vec::new());
         }
+        let reused = nodes
+            .iter()
+            .map(|node| self.equivalent_visible_overlay_node(node))
+            .collect::<Result<Vec<_>>>()?;
         let tx = self.transaction()?;
         let mut ids = Vec::with_capacity(nodes.len());
-        for n in nodes {
-            ids.push(insert_node_in_tx(tx.raw(), n)?);
+        for (node, reused_id) in nodes.iter().zip(reused) {
+            ids.push(match reused_id {
+                Some(id) => id,
+                None => insert_node_in_tx(tx.raw(), node)?,
+            });
         }
         tx.commit()?;
         Ok(ids)
@@ -377,7 +424,7 @@ impl Store {
         let row: Option<(String, String, String, String)> = tx
             .raw()
             .prepare_cached(
-                "SELECT name, qualified_name, label, file_path FROM nodes WHERE id = ?1",
+                "SELECT name, qualified_name, label, file_path FROM main.nodes WHERE id = ?1",
             )?
             .query_row(params![id], |r| {
                 Ok((
@@ -392,7 +439,7 @@ impl Store {
             let (name_col, qname_col) = fts_tokens(&name, &qname);
             tx.raw()
                 .execute(
-                    "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)
+                    "INSERT INTO main.nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)
                      VALUES('delete', ?1, ?2, ?3, ?4, ?5)",
                     params![id, name_col, qname_col, label, file_path],
                 )
@@ -400,12 +447,12 @@ impl Store {
         }
         tx.raw()
             .execute(
-                "DELETE FROM vector_embeddings WHERE node_id = ?1",
+                "DELETE FROM main.vector_embeddings WHERE node_id = ?1",
                 params![id],
             )
             .map_err(Error::Sqlite)?;
         tx.raw()
-            .execute("DELETE FROM nodes WHERE id = ?1", params![id])
+            .execute("DELETE FROM main.nodes WHERE id = ?1", params![id])
             .map_err(Error::Sqlite)?;
         tx.commit()?;
         Ok(())
@@ -429,7 +476,7 @@ impl Store {
         let rows: Vec<(i64, String, String, String, String)> = {
             let mut stmt = self.conn().prepare_cached(
                 "SELECT id, name, qualified_name, label, file_path
-                 FROM nodes WHERE project = ?1 AND file_path = ?2",
+                 FROM main.nodes WHERE project = ?1 AND file_path = ?2",
             )?;
             let collected = stmt
                 .query_map(params![project, file_path], |row| {
@@ -448,12 +495,13 @@ impl Store {
             let _ = self.delete_vector_embeddings_for_file(project, file_path)?;
             return Ok(0);
         }
+        let overlay = self.is_overlay();
         let tx = self.transaction()?;
         for (id, name, qname, label, fpath) in &rows {
             let (name_col, qname_col) = fts_tokens(name, qname);
             tx.raw()
                 .execute(
-                    "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)
+                    "INSERT INTO main.nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)
                      VALUES('delete', ?1, ?2, ?3, ?4, ?5)",
                     params![id, name_col, qname_col, label, fpath],
                 )
@@ -461,14 +509,33 @@ impl Store {
         }
         tx.raw()
             .execute(
-                "DELETE FROM vector_embeddings WHERE project = ?1 AND file_path = ?2",
+                "DELETE FROM main.vector_embeddings WHERE project = ?1 AND file_path = ?2",
                 params![project, file_path],
             )
             .map_err(Error::Sqlite)?;
+        if overlay {
+            tx.raw()
+                .execute(
+                    "DELETE FROM main.overlay_edges
+                     WHERE project = ?1
+                       AND (
+                         source_qualified_name IN (
+                           SELECT qualified_name FROM main.nodes
+                           WHERE project = ?1 AND file_path = ?2
+                         )
+                         OR target_qualified_name IN (
+                           SELECT qualified_name FROM main.nodes
+                           WHERE project = ?1 AND file_path = ?2
+                         )
+                       )",
+                    params![project, file_path],
+                )
+                .map_err(Error::Sqlite)?;
+        }
         let n = tx
             .raw()
             .execute(
-                "DELETE FROM nodes WHERE project = ?1 AND file_path = ?2",
+                "DELETE FROM main.nodes WHERE project = ?1 AND file_path = ?2",
                 params![project, file_path],
             )
             .map_err(Error::Sqlite)?;

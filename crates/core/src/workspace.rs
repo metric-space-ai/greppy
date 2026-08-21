@@ -35,6 +35,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Trusted agent-parent override for the logical project column. Linked and
+/// temporary worktrees have unrelated directory basenames; Store-CoW needs
+/// all of them to address the same Base rows.
+pub const PROJECT_IDENTITY_ENV: &str = "GREPPY_PROJECT_IDENTITY";
+
 use sha2::{Digest, Sha256};
 
 /// Canonicalise `path` lexically for the hash (resolve symlinks if
@@ -170,6 +175,12 @@ pub fn resolve_workspace_root(start: &Path) -> PathBuf {
 /// from any cwd, then `greppy search-code Q` from a subdir, and the
 /// project identity matches.
 pub fn project_identity(start: &Path) -> String {
+    if let Ok(identity) = std::env::var(PROJECT_IDENTITY_ENV) {
+        let identity = identity.trim();
+        if crate::validate::is_valid_project_name(identity) {
+            return identity.to_string();
+        }
+    }
     resolve_workspace_root(start)
         .file_name()
         .and_then(|s| s.to_str())
@@ -271,6 +282,7 @@ mod tests {
 
     #[test]
     fn store_dir_never_returns_path_inside_workspace_root() {
+        let _guard = crate::cache::TEST_ENV_LOCK.lock().unwrap();
         // The store directory must NOT be `<root>/.greppy/graph.db`.
         // We assert it is not under the workspace root.
         let tmp = tempdir_root("greppy-locator-test");
@@ -287,6 +299,7 @@ mod tests {
 
     #[test]
     fn store_path_is_store_dir_plus_graph_db() {
+        let _guard = crate::cache::TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempdir_root("greppy-store-path");
         let sp = store_path(&tmp);
         assert!(sp.ends_with("graph.db"));
@@ -483,6 +496,7 @@ mod tests {
 
     #[test]
     fn legacy_cleanup_api_never_removes_unverified_directories() {
+        let _guard = crate::cache::TEST_ENV_LOCK.lock().unwrap();
         let cache = tempdir_root("greppy-cleanup-stores");
         let previous_store_dir = std::env::var_os("GREPPY_STORE_DIR");
         std::env::set_var("GREPPY_STORE_DIR", cache.join("managed-data"));
@@ -531,6 +545,7 @@ mod tests {
 
     #[test]
     fn store_ttl_secs_defaults_to_14_days() {
+        let _guard = crate::cache::TEST_ENV_LOCK.lock().unwrap();
         // Guard against another test's env mutation leaking in.
         std::env::remove_var(ENV_STORE_TTL_DAYS);
         assert_eq!(store_ttl_secs(), STORE_TTL_DAYS_DEFAULT * 24 * 60 * 60);

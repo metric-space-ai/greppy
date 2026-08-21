@@ -17,7 +17,7 @@ impl Store {
     /// maintenance, not the hot path. Returns once the rebuild completes.
     pub fn vacuum(&self) -> Result<()> {
         self.conn()
-            .execute_batch("VACUUM")
+            .execute_batch("VACUUM main")
             .map_err(|e| Error::Store(format!("vacuum: {e}")))
     }
 
@@ -28,7 +28,7 @@ impl Store {
     /// lookups. Cheap relative to VACUUM; safe to run after a bulk insert.
     pub fn analyze(&self) -> Result<()> {
         self.conn()
-            .execute_batch("ANALYZE")
+            .execute_batch("ANALYZE main")
             .map_err(|e| Error::Store(format!("analyze: {e}")))
     }
 
@@ -49,7 +49,10 @@ impl Store {
     /// contentless index. No-op-safe to call repeatedly.
     pub fn optimize_fts(&self) -> Result<()> {
         self.conn()
-            .execute("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')", [])
+            .execute(
+                "INSERT INTO main.nodes_fts(nodes_fts) VALUES('optimize')",
+                [],
+            )
             .map(|_| ())
             .map_err(|e| Error::Store(format!("optimize nodes_fts: {e}")))
     }

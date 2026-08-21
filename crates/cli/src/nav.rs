@@ -1490,6 +1490,132 @@ pub(crate) fn impact_node_sentence(
     Some(format!("{first}{}", chars.as_str()))
 }
 
+pub(crate) fn dispatch_briefs(
+    symbols: &[String],
+    paths: &[String],
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    if symbols.len() <= 1 {
+        return dispatch_brief(symbols.first().map(String::as_str), paths, json, root);
+    }
+
+    if !json {
+        let mut store = open_default_store_query_writer(root)?;
+        maybe_reindex_stale(&mut store, root)?;
+        let project = project_for(root)?;
+        let mut missing = Vec::new();
+        for symbol in symbols {
+            let ids = resolve_symbol_nodes(&store, Some(symbol))?;
+            if ids.is_empty() {
+                missing.push(symbol.clone());
+            } else {
+                ensure_unambiguous_target(&store, symbol, &ids)?;
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::Invalid(unknown_targets_message(
+                &store, &project, &missing,
+            )));
+        }
+        drop(store);
+        let mut exit = 0;
+        for (index, symbol) in symbols.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            println!("== {symbol} ==");
+            exit = exit.max(dispatch_brief(Some(symbol), paths, false, root)?);
+        }
+        return Ok(exit);
+    }
+
+    prewarm_summary_daemon();
+    let path_filters = prepare_query_path_filters(root, "brief", "", paths)?;
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    let project = project_for(root)?;
+    let gate_extra = serde_json::json!({
+        "schema_version": BRIEF_JSON_SCHEMA_VERSION,
+        "symbols": symbols,
+    });
+    if let Some(code) = graph_stale_gate(
+        &store,
+        root,
+        &project,
+        "brief",
+        true,
+        gate_extra.clone(),
+        "results",
+    )? {
+        return Ok(code);
+    }
+    if let Some(code) =
+        provider_policy_graph_gate(&store, root, &project, "brief", true, gate_extra, "results")?
+    {
+        return Ok(code);
+    }
+
+    // Match batched who-calls/callees: resolve the complete request before
+    // printing, so a typo cannot hide inside an apparently complete batch.
+    let mut resolved = Vec::with_capacity(symbols.len());
+    let mut missing = Vec::new();
+    for symbol in symbols {
+        let ids = resolve_symbol_nodes(&store, Some(symbol))?;
+        if ids.is_empty() {
+            missing.push(symbol.clone());
+        }
+        resolved.push(ids);
+    }
+    if !missing.is_empty() {
+        return Err(Error::Invalid(unknown_targets_message(
+            &store, &project, &missing,
+        )));
+    }
+    for (symbol, ids) in symbols.iter().zip(&resolved) {
+        ensure_unambiguous_target(&store, symbol, ids)?;
+    }
+
+    let semantic_backend_unavailable = embedding_config_for_required_use(EmbeddingCliArgs {
+        device: None,
+        no_gpu: false,
+    })
+    .err()
+    .filter(embedding_asset_missing_error)
+    .map(|error| error.to_string());
+    let root_path = resolve_root(root)?;
+    let mut results = Vec::with_capacity(symbols.len());
+    for (symbol, targets) in symbols.iter().zip(&resolved) {
+        results.push(brief_json_value(
+            &store,
+            &project,
+            symbol,
+            targets,
+            &root_path,
+            BriefJsonContext {
+                root,
+                path_filters: &path_filters,
+                semantic_backend_unavailable: semantic_backend_unavailable.as_deref(),
+            },
+        )?);
+    }
+    let output = serde_json::json!({
+        "schema_version": "greppy.brief.batch.v1",
+        "command": "brief",
+        "status": "ok",
+        "project": project,
+        "symbols": symbols,
+        "total_exact": results.len(),
+        "results": results,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|error| Error::Invalid(format!("serialize brief batch JSON: {error}")))?
+    );
+    Ok(0)
+}
+
 pub(crate) fn dispatch_brief(
     symbol: Option<&str>,
     paths: &[String],
@@ -2525,6 +2651,23 @@ pub(crate) fn dispatch_brief_json(
     root_path: &std::path::Path,
     context: BriefJsonContext<'_>,
 ) -> Result<i32> {
+    let output = brief_json_value(store, project, query_symbol, targets, root_path, context)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|error| Error::Invalid(format!("serialize brief JSON: {error}")))?
+    );
+    Ok(0)
+}
+
+fn brief_json_value(
+    store: &greppy_store::Store,
+    project: &str,
+    query_symbol: &str,
+    targets: &[i64],
+    root_path: &std::path::Path,
+    context: BriefJsonContext<'_>,
+) -> Result<serde_json::Value> {
     let root = context.root;
     let path_filters = context.path_filters;
     let semantic_backend_unavailable = context.semantic_backend_unavailable;
@@ -2685,12 +2828,7 @@ pub(crate) fn dispatch_brief_json(
         output["expand_id"] = serde_json::json!(&expand.id);
         output["expand"] = expand.json_value();
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output)
-            .map_err(|e| Error::Invalid(format!("serialize brief JSON: {e}")))?
-    );
-    Ok(0)
+    Ok(output)
 }
 
 /// One answer line of `who-calls` / `callees`: an address, the symbol, and

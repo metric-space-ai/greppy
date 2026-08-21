@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::store_error::{Error, Result};
@@ -64,6 +64,26 @@ impl SummaryCache {
         Ok(Self { conn })
     }
 
+    /// Open a published immutable Base cache without creating, migrating, or
+    /// updating it. [`Self::get`] already treats the LRU touch as best-effort,
+    /// so lookups remain valid on this read-only connection.
+    pub fn open_read_only(store_dir: &Path) -> Result<Self> {
+        let path = store_dir.join(SUMMARY_CACHE_DB_FILE);
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| {
+            Error::Store(format!(
+                "open read-only summary cache {}: {e}",
+                path.display()
+            ))
+        })?;
+        conn.busy_timeout(std::time::Duration::from_millis(200))
+            .map_err(|e| Error::Store(format!("summary cache busy_timeout: {e}")))?;
+        Ok(Self { conn })
+    }
+
     /// Look up a cached purpose summary.
     pub fn get(&self, model_key: &str, span_hash: &str) -> Result<Option<Vec<String>>> {
         let row: Option<String> = self
@@ -89,9 +109,38 @@ impl SummaryCache {
             .map_err(|e| Error::Store(format!("summary cache decode: {e}")))
     }
 
+    pub fn count(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))
+            .map_err(|e| Error::Store(format!("summary cache count: {e}")))
+    }
+
     /// Insert or replace a cached purpose summary. Empty summaries are not
     /// useful cache entries and are deliberately ignored.
     pub fn put(&self, model_key: &str, span_hash: &str, bullets: &[String]) -> Result<()> {
+        self.put_inner(model_key, span_hash, bullets, true)
+    }
+
+    /// Populate a publication-time immutable cache without applying the
+    /// interactive LRU cap. A Base must contain every generated unchanged
+    /// summary; pruning it while it is being built would reintroduce duplicate
+    /// inference across agents on repositories with many definitions.
+    pub fn put_unbounded(
+        &self,
+        model_key: &str,
+        span_hash: &str,
+        bullets: &[String],
+    ) -> Result<()> {
+        self.put_inner(model_key, span_hash, bullets, false)
+    }
+
+    fn put_inner(
+        &self,
+        model_key: &str,
+        span_hash: &str,
+        bullets: &[String],
+        prune: bool,
+    ) -> Result<()> {
         if bullets.is_empty() {
             return Ok(());
         }
@@ -111,7 +160,11 @@ impl SummaryCache {
                 ],
             )
             .map_err(|e| Error::Store(format!("summary cache put: {e}")))?;
-        self.prune_to_budget()
+        if prune {
+            self.prune_to_budget()
+        } else {
+            Ok(())
+        }
     }
 
     /// Bound an actively-used workspace's summary cache independently of whole-
@@ -233,6 +286,37 @@ mod tests {
             cache.get("m", "s").unwrap(),
             Some(vec!["new one".into(), "new two".into()])
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn published_cache_can_be_read_without_write_permission() {
+        let dir = tmp_dir();
+        let cache = SummaryCache::open(&dir).unwrap();
+        cache.put_unbounded("m", "s", &["shared".into()]).unwrap();
+        drop(cache);
+        let path = dir.join(SUMMARY_CACHE_DB_FILE);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let cache = SummaryCache::open_read_only(&dir).unwrap();
+        assert_eq!(cache.get("m", "s").unwrap(), Some(vec!["shared".into()]));
+        assert!(cache.put("m", "new", &["private".into()]).is_err());
+        drop(cache);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

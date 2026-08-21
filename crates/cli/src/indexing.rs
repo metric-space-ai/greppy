@@ -55,6 +55,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     });
 
     if !store_path.exists() {
+        let store_cow = crate::store_cow::diagnostics_without_store(&effective_root, &store_path);
         let status = serde_json::json!({
             "command": command,
             "status": "no_index",
@@ -77,6 +78,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "skip_counts_by_reason": [],
             "dirty_overlay": dirty_overlay.to_json(),
             "inference": inference_diagnostics,
+            "store_cow": store_cow,
             "message": "no active index; run greppy index first",
         });
         if json {
@@ -89,6 +91,16 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             println!("status: no_index");
             println!("root: {}", effective_root.display());
             println!("store: {}", store_path.display());
+            println!(
+                "store_mode: {}",
+                store_cow["mode"].as_str().unwrap_or("single")
+            );
+            if let Some(identity) = store_cow["base_identity"].as_str() {
+                println!("base_identity: {identity}");
+            }
+            if let Some(reason) = store_cow["fallback_reason"].as_str() {
+                println!("store_fallback: {reason}");
+            }
             println!("message: run `greppy index {}` first", root.unwrap_or("."));
             if let Some(inference) = &inference {
                 print_inference_registry(inference);
@@ -112,8 +124,15 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         return Ok(1);
     }
 
-    let store =
-        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())?;
+    let store = match crate::store_cow::overlay_spec(&effective_root)? {
+        Some(overlay) => {
+            greppy_store::Store::open_overlay(&overlay.base_path, &store_path, &overlay.visibility)?
+        }
+        None => {
+            greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())?
+        }
+    };
+    let store_cow = crate::store_cow::diagnostics(&effective_root, &store, &store_path);
     let diag = store.diagnostics()?;
     let freshness = nav_freshness_json(&store, root, &project);
     let fresh = freshness
@@ -261,6 +280,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "coverage_warning": coverage_warning,
             "vectors_missing_with_model": vectors_missing_with_model,
             "dirty_overlay": dirty_overlay.to_json(),
+            "store_cow": store_cow,
             "inference": inference_diagnostics,
         });
         println!(
@@ -284,6 +304,16 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         println!("store: {}", store_path.display());
         println!("store_format: {}", store_format.unwrap_or(0));
         println!("store_bytes: {store_bytes}");
+        println!(
+            "store_mode: {}",
+            store_cow["mode"].as_str().unwrap_or("single")
+        );
+        if let Some(identity) = store_cow["base_identity"].as_str() {
+            println!("base_identity: {identity}");
+        }
+        if let Some(reason) = store_cow["fallback_reason"].as_str() {
+            println!("store_fallback: {reason}");
+        }
         println!("embedding_complete: {embedding_complete}");
         if let Some(inference) = &inference {
             print_inference_registry(inference);
@@ -386,12 +416,6 @@ pub(crate) fn dispatch_index_agent_worktree(
     if !cli_json_output() {
         println!("agent worktree: {worktree}");
     }
-    // The agent does not read the operator's data root: `greppy -p` runs with
-    // GREPPY_STORE_DIR pointed at an isolated tree beside the worktree, and the
-    // sandbox grants only that tree. Warming under the operator's root writes a
-    // store the measured run never opens — same workspace key, different data
-    // root, so the index is formally warm and practically cold. Point at the
-    // agent's root here, exactly as agent.rs does before it runs.
     let agent_data = crate::agent::agent_data_root(&worktree_path);
     std::fs::create_dir_all(&agent_data).map_err(|error| {
         Error::Invalid(format!(
@@ -399,14 +423,70 @@ pub(crate) fn dispatch_index_agent_worktree(
             agent_data.display()
         ))
     })?;
+    let restore_project = std::env::var_os(greppy_core::PROJECT_IDENTITY_ENV);
+    std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV);
+    let logical_project = greppy_core::project_identity(&repo);
+    std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, logical_project);
+    let shared_data_root = greppy_core::cache::data_root();
+    let cow_env = [
+        crate::store_cow::ENV_MODE,
+        crate::store_cow::ENV_BASE_PATH,
+        crate::store_cow::ENV_BASE_COMMIT,
+        crate::store_cow::ENV_BASE_REUSED,
+        crate::store_cow::ENV_FALLBACK_REASON,
+    ]
+    .map(|name| (name, std::env::var_os(name)));
+    let prepared_base = match crate::store_cow::prepare_base_store(&workspace, &shared_data_root) {
+        Ok(prepared) => {
+            if !cli_json_output() {
+                println!(
+                    "store mode: overlay (Base {}, {})",
+                    &prepared.identity_hash[..12],
+                    if prepared.reused {
+                        "reused"
+                    } else {
+                        "published"
+                    }
+                );
+            }
+            Some(prepared)
+        }
+        Err(error) => {
+            crate::store_cow::configure_private_environment(&error.to_string());
+            eprintln!(
+                "greppy index --agent-worktree: shared Base unavailable ({error}) — \
+                 warming a full private Store"
+            );
+            None
+        }
+    };
+    // The agent does not read the operator's data root: `greppy -p` runs with
+    // GREPPY_STORE_DIR pointed at an isolated tree beside the worktree, and the
+    // sandbox grants only that tree. Warming under the operator's root writes a
+    // store the measured run never opens — same workspace key, different data
+    // root, so the index is formally warm and practically cold. Point at the
+    // agent's root here, exactly as agent.rs does before it runs.
     let restore = std::env::var_os("GREPPY_STORE_DIR");
     std::env::set_var("GREPPY_STORE_DIR", &agent_data);
+    if let Some(prepared) = &prepared_base {
+        crate::store_cow::configure_overlay_environment(prepared, workspace.base_commit());
+    }
     // Walk AND key the store by the worktree, so the identity matches the one
     // the agent resolves; keying by the checkout would warm a third workspace.
     let outcome = dispatch_index(Some(&worktree), Some(&worktree), embedding_args);
     match restore {
         Some(previous) => std::env::set_var("GREPPY_STORE_DIR", previous),
         None => std::env::remove_var("GREPPY_STORE_DIR"),
+    }
+    match restore_project {
+        Some(previous) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, previous),
+        None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
+    }
+    for (name, value) in cow_env {
+        match value {
+            Some(previous) => std::env::set_var(name, previous),
+            None => std::env::remove_var(name),
+        }
     }
     outcome
 }
@@ -449,6 +529,7 @@ pub(crate) fn dispatch_index(
     let project = workspace_locator::project_identity(&effective_root);
     let index_options = greppy_indexer::IndexOptions {
         discover_overrides: discover_overrides_from_env()?,
+        only_paths: None,
     };
     let embedding_config = embedding_config_for_index(embedding_args)?;
 
@@ -498,6 +579,17 @@ pub(crate) fn dispatch_index(
             return Err(Error::io(context, source));
         }
     };
+    if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {
+        return index_overlay_snapshot(
+            &store_path,
+            &target,
+            &project,
+            &overlay,
+            embedding_config.as_ref(),
+            &index_options,
+            true,
+        );
+    }
     // Holding the writer lock, build a fresh snapshot in a temp DB, validate
     // it, then publish it with one filesystem rename. The indexer crate still
     // supports in-place incremental updates for library tests; the CLI path is
@@ -595,6 +687,95 @@ pub(crate) fn dispatch_index(
                 );
             }
         }
+    }
+    Ok(0)
+}
+
+pub(crate) fn index_overlay_snapshot(
+    active_path: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    overlay: &crate::store_cow::OverlaySpec,
+    embedding_config: Option<&EmbeddingModelConfig>,
+    index_options: &greppy_indexer::IndexOptions,
+    announce: bool,
+) -> Result<i32> {
+    cleanup_stale_snapshot_artifacts(active_path, false)?;
+    let temp_path = unique_store_sibling(active_path, "delta-building");
+    cleanup_sqlite_family(&temp_path)?;
+    if overlay.visibility.changed_count() > 0 {
+        seed_temp_store_from_active_if_usable(active_path, &temp_path)?;
+    }
+    {
+        let mut delta = greppy_store::Store::open(&temp_path)?;
+        // A Delta generation contains only paths that still differ from the
+        // pinned Base. Exact reverts and removed untracked files therefore
+        // discard their former private contributions before the next overlay
+        // is constructed.
+        for state in delta.list_file_states(project)? {
+            if overlay.visibility.is_dirty_path(&state.rel_path) {
+                continue;
+            }
+            delta.delete_nodes_for_file(project, &state.rel_path)?;
+            delta.delete_raw_edges_for_file(project, &state.rel_path)?;
+            delta.delete_file_content(project, &state.rel_path)?;
+            delta.delete_vector_embeddings_for_file(project, &state.rel_path)?;
+            delta.delete_index_skip(project, &state.rel_path)?;
+            delta.delete_file_state(project, &state.rel_path)?;
+        }
+        // Resolved edge ids are layer-local and cheap to regenerate from the
+        // source-owned raw edge union. Never carry a prior generation's
+        // resolution across a changed logical namespace.
+        delta
+            .conn()
+            .execute("DELETE FROM main.edges WHERE project = ?1", [project])
+            .map_err(|error| Error::Store(format!("clear prior Delta edges: {error}")))?;
+    }
+
+    let mut store =
+        greppy_store::Store::open_overlay(&overlay.base_path, &temp_path, &overlay.visibility)?;
+    let mut overlay_options = index_options.clone();
+    overlay_options.only_paths = Some(
+        overlay
+            .visibility
+            .dirty_paths()
+            .map(ToOwned::to_owned)
+            .collect(),
+    );
+    let report = greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)?;
+    greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
+    let base_commit = std::env::var(crate::store_cow::ENV_BASE_COMMIT)
+        .map_err(|_| Error::Invalid("overlay index missing pinned Base commit".into()))?;
+    crate::store_cow::persist_visibility(&store, &overlay.visibility, &base_commit)?;
+    let embedding = if let Some(config) = embedding_config {
+        Some(index_embeddings_into_temp_store(
+            &mut store,
+            target,
+            project,
+            config,
+            &report,
+            active_path.parent().map(std::path::Path::to_path_buf),
+            None,
+        )?)
+    } else {
+        None
+    };
+    checkpoint_store(&store, &temp_path)?;
+    drop(store);
+    maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
+    publish_store_snapshot(&temp_path, active_path)?;
+    cleanup_stale_snapshot_artifacts(active_path, false)?;
+
+    if announce {
+        println!(
+            "indexed Delta generation {}: {} changed/deleted paths, {} private nodes (project: {project})",
+            report.graph_generation,
+            overlay.visibility.changed_count(),
+            report.nodes_extracted,
+        );
+    }
+    if let Some(EmbeddingBuildOutcome::Degraded { reason, .. }) = embedding {
+        eprintln!("greppy: Delta embeddings degraded: {reason}");
     }
     Ok(0)
 }

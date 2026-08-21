@@ -65,4 +65,5 @@ pub use crate::validate::{
 };
 pub use crate::workspace::{
     project_identity, resolve_workspace_root, store_dir, store_path, workspace_hash,
+    PROJECT_IDENTITY_ENV,
 };

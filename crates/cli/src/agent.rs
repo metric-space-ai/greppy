@@ -133,6 +133,11 @@ pub struct AgentArgs {
     #[arg(long)]
     pub fresh: bool,
 
+    /// Disable shared immutable Base Store reuse for this run and build a
+    /// complete private index. Intended for diagnostics and safe fallback.
+    #[arg(long)]
+    pub private_store: bool,
+
     /// Disable the write-confinement sandbox for tool subprocesses.
     ///
     /// Also set by env `GREPPY_NO_SANDBOX=1` (Boolish: 1/true/yes/y/on).
@@ -242,6 +247,14 @@ fn run_agent(args: AgentArgs) -> u8 {
             return EXIT_AGENT;
         }
     };
+    let shared_data_root = greppy_core::cache::data_root();
+
+    // Stable and disposable agent worktrees have cache/run-id basenames that
+    // are unrelated to the source repository. Pin one logical project name so
+    // Base and Delta rows resolve identically in every worktree.
+    std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV);
+    let logical_project = greppy_core::project_identity(&cwd);
+    std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, logical_project);
 
     // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
     // worktree is created and BEFORE contacting the gateway.
@@ -315,7 +328,38 @@ fn run_agent(args: AgentArgs) -> u8 {
         keep_worktree_on_error(&workspace);
         return EXIT_AGENT;
     }
+
+    let prepared_base = if args.private_store {
+        crate::store_cow::configure_private_environment("explicit --private-store");
+        eprintln!("store mode: private (--private-store)");
+        None
+    } else {
+        match crate::store_cow::prepare_base_store(&workspace, &shared_data_root) {
+            Ok(prepared) => {
+                eprintln!(
+                    "store mode: overlay (Base {}, {})",
+                    &prepared.identity_hash[..12],
+                    if prepared.reused {
+                        "reused"
+                    } else {
+                        "published"
+                    }
+                );
+                Some(prepared)
+            }
+            Err(error) => {
+                crate::store_cow::configure_private_environment(&error.to_string());
+                eprintln!(
+                    "greppy -p: shared Base unavailable ({error}) — falling back to a full private Store"
+                );
+                None
+            }
+        }
+    };
     std::env::set_var("GREPPY_STORE_DIR", &agent_data);
+    if let Some(prepared) = &prepared_base {
+        crate::store_cow::configure_overlay_environment(prepared, workspace.base_commit());
+    }
 
     // Prewarm: build/refresh the worktree's own greppy index before the first
     // model turn so search/where-am-i do not open empty. Runs unsandboxed in the
@@ -1028,17 +1072,13 @@ mod tests {
 
     /// Serializes the tests that mutate `GREPPY_DEADLINE_SECS`.
     ///
-    /// The variable is process-wide but the test harness runs these three in
-    /// parallel, so the two that clear it raced the one that sets 99 and the
-    /// suite failed at random. Each holds this lock for the whole
-    /// set-parse-restore sequence.
-    static DEADLINE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn parse_defaults() {
         // Clear env influence for this unit test by passing model explicitly.
         // Also clear GREPPY_DEADLINE_SECS so env cannot inject a default.
-        let _serialized = DEADLINE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
         std::env::remove_var("GREPPY_DEADLINE_SECS");
         let a = parse(&["do it", "--model", "m"]).expect("parse");
@@ -1059,7 +1099,9 @@ mod tests {
 
     #[test]
     fn parse_deadline_secs_flag() {
-        let _serialized = DEADLINE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
         std::env::remove_var("GREPPY_DEADLINE_SECS");
         let a = parse(&["do it", "--model", "m", "--deadline-secs", "42"]).expect("parse");
@@ -1072,7 +1114,9 @@ mod tests {
 
     #[test]
     fn parse_deadline_secs_from_env() {
-        let _serialized = DEADLINE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("GREPPY_DEADLINE_SECS");
         std::env::set_var("GREPPY_DEADLINE_SECS", "99");
         let a = parse(&["do it", "--model", "m"]).expect("parse");
@@ -1123,6 +1167,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
         };
@@ -1141,6 +1186,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
         };
@@ -1237,6 +1283,9 @@ mod tests {
 
     #[test]
     fn writable_roots_are_narrow_no_global_shared_state() {
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let wt = unique("roots-wt");
         fs::create_dir_all(&wt).unwrap();
         let run_id = "run-roots-test";
@@ -1343,16 +1392,18 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            private_store: false,
             no_sandbox: true,
             skip_selfcheck: false,
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
-        let scratch = agent_scratch_dir(&wt, "run");
+        let run_id = wt.file_name().unwrap().to_string_lossy().into_owned();
+        let scratch = agent_scratch_dir(&wt, &run_id);
         fs::create_dir_all(&scratch).unwrap();
         let agent_data = agent_data_root(&wt);
         fs::create_dir_all(&agent_data).unwrap();
-        let mode = resolve_sandbox_mode(&a, &wt, "run", &scratch, &agent_data).expect("ok");
+        let mode = resolve_sandbox_mode(&a, &wt, &run_id, &scratch, &agent_data).expect("ok");
         assert!(matches!(mode, SandboxMode::Off));
         let _ = fs::remove_dir_all(&wt);
         let _ = fs::remove_dir_all(&scratch);
@@ -1371,16 +1422,18 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();
-        let scratch = agent_scratch_dir(&wt, "run");
+        let run_id = wt.file_name().unwrap().to_string_lossy().into_owned();
+        let scratch = agent_scratch_dir(&wt, &run_id);
         fs::create_dir_all(&scratch).unwrap();
         let agent_data = agent_data_root(&wt);
         fs::create_dir_all(&agent_data).unwrap();
-        let mode = resolve_sandbox_mode(&a, &wt, "run", &scratch, &agent_data).expect("ok");
+        let mode = resolve_sandbox_mode(&a, &wt, &run_id, &scratch, &agent_data).expect("ok");
         match mode {
             SandboxMode::Enforce(spec) => {
                 assert!(!spec.writable_roots.is_empty());
@@ -1451,6 +1504,9 @@ mod tests {
 
     #[test]
     fn store_cleanup_skipped_under_agent_run_env() {
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os(greppy_agent::AGENT_RUN_ENV);
         std::env::set_var(greppy_agent::AGENT_RUN_ENV, "1");
         // Must return immediately — no GC under GREPPY_AGENT_RUN (WP21).

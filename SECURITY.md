@@ -154,3 +154,20 @@ Set `GREPPY_STORE_DIR` to an encrypted or ephemeral user-private location when
 repository contents require additional at-rest protection. Use `greppy cache
 status --json` to audit stored paths and `greppy cache clear --root DIR --yes`
 or `greppy cache clear --all --yes` to remove managed data.
+
+Integrated agents in 0.3.2 reuse a content-identified Base Store containing
+source-derived graph rows, indexed spans, summaries, and embeddings. The Base is
+published atomically, verified against a complete identity manifest, opened
+read-only, and excluded from the agent's writable sandbox roots. Every run writes
+only to its private Delta Store. A shared Base is therefore a local
+confidentiality boundary, not a sanitised artifact: place `GREPPY_STORE_DIR` on
+storage with protection equivalent to the repository. On ephemeral or encrypted
+workstations, keep the Base cache on the same class of volume and clear it with
+the cache commands above before decommissioning the environment.
+
+Base corruption or incompatibility is fail-closed: Greppy quarantines an invalid
+generation and rebuilds it under an exclusive lease; if a complete Base cannot be
+prepared, that agent run falls back to a full private Store and reports the
+reason. Cache reclamation validates Greppy ownership markers and holds the same
+lifecycle lock used by live readers, so it cannot evict a Base in use or traverse
+unmanaged directories.

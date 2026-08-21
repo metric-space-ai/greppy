@@ -1,8 +1,5 @@
 use super::*;
 use clap::Parser;
-use std::sync::Mutex;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn drift_json(reason: &str) -> serde_json::Value {
     serde_json::json!({ "reasons": [reason] })
@@ -61,7 +58,7 @@ impl EnvRestore {
 impl Drop for EnvRestore {
     fn drop(&mut self) {
         for (name, value) in &self.vars {
-            // SAFETY: env-mutating tests hold ENV_LOCK while this guard is alive.
+            // SAFETY: env-mutating tests hold TEST_ENV_LOCK while this guard is alive.
             unsafe {
                 match value {
                     Some(v) => std::env::set_var(name, v),
@@ -192,9 +189,9 @@ fn semantic_fallback_commands_use_query_tokens() {
 
 #[test]
 fn lazy_embedding_threshold_is_inclusive_and_testable() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&[ENV_LAZY_EMBED_MIN_SPANS]);
-    // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_LAZY_EMBED_MIN_SPANS, "3");
     }
@@ -606,16 +603,23 @@ fn parse_path_disambiguation_and_hyphen_values() {
         .command
     {
         Some(Command::Brief {
-            symbol, path_opts, ..
+            symbols, path_opts, ..
         }) => {
-            assert_eq!(symbol, "open");
+            assert_eq!(symbols, vec!["open".to_string()]);
             assert_eq!(path_opts, vec!["src/flask/testing.py".to_string()]);
         }
         other => panic!("unexpected: {other:?}"),
     }
-    // 0.3.0: brief takes exactly ONE symbol. A second positional is a
-    // usage error — the legacy `brief A B` bundle is gone.
-    assert!(Cli::try_parse_from(["greppy", "brief", "open", "close"]).is_err());
+    // 0.3.2: the documented high-yield multi-symbol brief is accepted.
+    match Cli::try_parse_from(["greppy", "brief", "open", "close"])
+        .unwrap()
+        .command
+    {
+        Some(Command::Brief { symbols, .. }) => {
+            assert_eq!(symbols, vec!["open".to_string(), "close".to_string()]);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 
     // `read` accepts path-shaped positionals and the commonly carried --code
     // flag so the dispatcher can return source instead of a parser failure.
@@ -717,14 +721,14 @@ fn cli_device_flags_parse_on_embedding_commands() {
 
 #[test]
 fn embedding_device_preference_obeys_cli_and_env() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&[
         ENV_DEVICE,
         ENV_NO_GPU,
         ENV_EMBED_CUDA_DEVICE,
         ENV_QWEN_CUDA_DEVICE,
     ]);
-    // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::remove_var(ENV_DEVICE);
         std::env::remove_var(ENV_NO_GPU);
@@ -735,7 +739,7 @@ fn embedding_device_preference_obeys_cli_and_env() {
         greppy_embed_native::DevicePreference::Auto
     );
 
-    // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_DEVICE, "metal");
     }
@@ -763,7 +767,7 @@ fn embedding_device_preference_obeys_cli_and_env() {
         greppy_embed_native::DevicePreference::Cpu
     );
 
-    // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_NO_GPU, "1");
     }
@@ -772,7 +776,7 @@ fn embedding_device_preference_obeys_cli_and_env() {
         greppy_embed_native::DevicePreference::Cpu
     );
 
-    // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::remove_var(ENV_NO_GPU);
     }
@@ -1103,11 +1107,68 @@ fn semantic_purpose_span_cap_limits_lines_and_bytes() {
     assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn ten_agents_reuse_published_summary_without_private_duplicates() {
+    let root = test_tempdir("shared-base-summary-ten-agents");
+    let base_dir = root.join("base");
+    let file_path = "src/lib.rs";
+    let source = "fn shared() -> usize { 42 }";
+    let model_key = "shared-summary-model";
+    let complete_model_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
+    let span_hash = greppy_store::span_hash(file_path, source);
+    let expected = vec!["Returns the shared value.".to_string()];
+
+    let base = greppy_store::SummaryCache::open(&base_dir).expect("create Base summary cache");
+    base.put_unbounded(&complete_model_key, &span_hash, &expected)
+        .expect("publish Base summary");
+    assert_eq!(base.count().expect("count Base summaries"), 1);
+    drop(base);
+
+    let mut agents = Vec::new();
+    for index in 0..10 {
+        let base_dir = base_dir.clone();
+        let delta_dir = root.join(format!("delta-{index}"));
+        let expected = expected.clone();
+        agents.push(std::thread::spawn(move || {
+            let base = greppy_store::SummaryCache::open_read_only(&base_dir)
+                .expect("open immutable Base cache");
+            let delta =
+                greppy_store::SummaryCache::open(&delta_dir).expect("open private Delta cache");
+            let config = QwenSummaryConfig {
+                model_id: "unused-on-cache-hit".into(),
+                gguf: delta_dir.join("missing.gguf"),
+                tokenizer: delta_dir.join("missing-tokenizer.json"),
+                device: greppy_qwen35_native::DevicePreference::Cpu,
+            };
+            let actual = summarize_source_cached(
+                &config,
+                model_key,
+                Some(&delta),
+                Some(&base),
+                file_path,
+                source,
+                false,
+            )
+            .expect("published Base entry must avoid model invocation");
+            assert_eq!(actual, expected);
+            delta.count().expect("count private summaries")
+        }));
+    }
+    for agent in agents {
+        assert_eq!(agent.join().expect("agent thread"), 0);
+    }
+    let base =
+        greppy_store::SummaryCache::open_read_only(&base_dir).expect("reopen immutable Base cache");
+    assert_eq!(base.count().expect("count Base summaries"), 1);
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
 #[test]
 fn discover_scope_env_parses_include_and_exclude_lists() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&[ENV_DISCOVER_INCLUDE, ENV_DISCOVER_EXCLUDE]);
-    // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_DISCOVER_INCLUDE, "src/*.rs; tests/*.rs\nbenches/*.rs");
         std::env::set_var(ENV_DISCOVER_EXCLUDE, "src/generated.rs;\n target/**");

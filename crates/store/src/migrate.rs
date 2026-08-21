@@ -98,10 +98,15 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "index_skip_identity",
         sql: include_str!("migrations/0015_index_skip_identity.sql"),
     },
+    Migration {
+        version: 16,
+        name: "overlay_edges",
+        sql: include_str!("migrations/0016_overlay_edges.sql"),
+    },
 ];
 
 /// Current schema version this crate knows about.
-pub const CURRENT_VERSION: u32 = 15;
+pub const CURRENT_VERSION: u32 = 16;
 
 /// Apply pending migrations. Returns the number of migrations applied.
 pub fn migrate(conn: &Connection) -> Result<usize, Error> {
@@ -511,7 +516,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(migrate(&conn).unwrap(), 1);
+        let expected_pending = super::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 14)
+            .count();
+        assert_eq!(migrate(&conn).unwrap(), expected_pending);
         let identity: (Option<i64>, Option<i64>) = conn
             .query_row(
                 "SELECT ctime_ns, file_id FROM index_skips
@@ -528,7 +537,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "15");
+        assert_eq!(version, CURRENT_VERSION.to_string());
+        let overlay_edges_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'overlay_edges'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(overlay_edges_present, 1);
     }
 
     /// a migration that fails part-way must not advance

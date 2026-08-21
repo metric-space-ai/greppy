@@ -38,11 +38,11 @@ impl Store {
     pub fn bump_file_and_skip_generations(&mut self, project: &str, generation: u64) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "UPDATE file_state SET last_indexed_generation = ?2 WHERE project = ?1",
+            "UPDATE main.file_state SET last_indexed_generation = ?2 WHERE project = ?1",
             params![project, generation as i64],
         )?;
         tx.raw().execute(
-            "UPDATE index_skips SET last_indexed_generation = ?2 WHERE project = ?1",
+            "UPDATE main.index_skips SET last_indexed_generation = ?2 WHERE project = ?1",
             params![project, generation as i64],
         )?;
         tx.commit()?;
@@ -52,7 +52,7 @@ impl Store {
     pub fn upsert_index_skip(&mut self, skip: &IndexSkip) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "INSERT INTO index_skips
+            "INSERT INTO main.index_skips
                   (project, rel_path, language, reason, detail, size, mtime_ns,
                    ctime_ns, file_id, last_indexed_generation, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -107,7 +107,7 @@ impl Store {
         }
         let tx = self.transaction()?;
         tx.raw().execute(
-            "DELETE FROM index_skips WHERE project = ?1 AND rel_path = ?2",
+            "DELETE FROM main.index_skips WHERE project = ?1 AND rel_path = ?2",
             params![project, rel_path],
         )?;
         tx.commit()?;

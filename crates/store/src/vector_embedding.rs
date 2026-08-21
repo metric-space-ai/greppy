@@ -108,7 +108,7 @@ impl Store {
         let id = tx
             .raw()
             .prepare_cached(
-                "INSERT INTO vector_embeddings
+                "INSERT INTO main.vector_embeddings
                    (project, model_id, prompt_version, task, node_id, chunk_idx,
                     qualified_name, file_path, start_line, end_line,
                     content_sha256, graph_generation, dim, vector_norm,
@@ -215,7 +215,11 @@ impl Store {
         task: &str,
         graph_generation: Option<u64>,
     ) -> Result<i64> {
-        let generation = graph_generation.map(|g| g as i64);
+        let generation = if self.is_overlay() {
+            None
+        } else {
+            graph_generation.map(|g| g as i64)
+        };
         let n = self.conn().query_row(
             "SELECT COUNT(*)
              FROM vector_embeddings
@@ -256,7 +260,7 @@ impl Store {
     ) -> Result<usize> {
         let tx = self.transaction()?;
         let n = tx.raw().execute(
-            "DELETE FROM vector_embeddings WHERE project = ?1 AND file_path = ?2",
+            "DELETE FROM main.vector_embeddings WHERE project = ?1 AND file_path = ?2",
             params![project, file_path],
         )?;
         tx.commit()?;
@@ -271,7 +275,7 @@ impl Store {
     ) -> Result<usize> {
         let tx = self.transaction()?;
         let n = tx.raw().execute(
-            "DELETE FROM vector_embeddings
+            "DELETE FROM main.vector_embeddings
              WHERE project = ?1 AND graph_generation < ?2",
             params![project, graph_generation as i64],
         )?;
@@ -294,7 +298,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let query_norm = vector_norm(query_vector);
-        let generation = q.graph_generation.map(|g| g as i64);
+        // Base and Delta generations are layer-local. Visibility already
+        // selects the current rows, so applying either layer's generation to
+        // the union would incorrectly discard the other layer.
+        let generation = if self.is_overlay() {
+            None
+        } else {
+            q.graph_generation.map(|g| g as i64)
+        };
         let file = q.file_path.unwrap_or("");
 
         // ---------------------------------------------------- pass 1: score
@@ -1203,5 +1214,154 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn overlay_vector_search_merges_layers_and_suppresses_dirty_base_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("base.db");
+        let delta_path = tmp.path().join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/base".into(),
+            })
+            .unwrap();
+            let clean = base
+                .insert_node(&node("p", "p.clean", "src/clean.rs"))
+                .unwrap();
+            let dirty = base
+                .insert_node(&node("p", "p.old_dirty", "src/dirty.rs"))
+                .unwrap();
+            base.upsert_vector_embedding(&embedding(
+                "p",
+                Some(clean),
+                "p.clean",
+                "src/clean.rs",
+                1,
+                &"a".repeat(64),
+                vec![1.0, 0.0],
+            ))
+            .unwrap();
+            base.upsert_vector_embedding(&embedding(
+                "p",
+                Some(dirty),
+                "p.old_dirty",
+                "src/dirty.rs",
+                1,
+                &"b".repeat(64),
+                vec![0.99, 0.01],
+            ))
+            .unwrap();
+        }
+        {
+            let mut delta = Store::open(&delta_path).unwrap();
+            delta
+                .upsert_project(&Project {
+                    name: "p".into(),
+                    indexed_at: "x".into(),
+                    root_path: "/delta".into(),
+                })
+                .unwrap();
+            let node_id = delta
+                .insert_node(&node("p", "p.new_dirty", "src/dirty.rs"))
+                .unwrap();
+            delta
+                .upsert_vector_embedding(&embedding(
+                    "p",
+                    Some(node_id),
+                    "p.new_dirty",
+                    "src/dirty.rs",
+                    2,
+                    &"c".repeat(64),
+                    vec![0.8, 0.2],
+                ))
+                .unwrap();
+        }
+
+        let visibility = crate::VisibilityIndex::new(["src/dirty.rs".into()], []).unwrap();
+        let overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let hits = overlay
+            .vector_search_exact(&[1.0, 0.0], &query("p", Some(2), 10))
+            .unwrap();
+        let qnames = hits
+            .iter()
+            .map(|hit| hit.embedding.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(qnames, vec!["p.clean", "p.new_dirty"]);
+        assert!(hits[0].embedding.node_id.is_some_and(|id| id < 0));
+        assert!(hits[1].embedding.node_id.is_some_and(|id| id > 0));
+        assert_eq!(
+            overlay
+                .count_vector_embeddings(
+                    "p",
+                    "google/embeddinggemma-300m-q4",
+                    "embeddinggemma-code-retrieval-st-v2",
+                    "retrieval_document",
+                    Some(2),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn ten_agents_reuse_base_embedding_without_private_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/base".into(),
+            })
+            .unwrap();
+            let node_id = base
+                .insert_node(&node("p", "p.shared", "src/shared.rs"))
+                .unwrap();
+            base.upsert_vector_embedding(&embedding(
+                "p",
+                Some(node_id),
+                "p.shared",
+                "src/shared.rs",
+                1,
+                &"d".repeat(64),
+                vec![1.0, 0.0],
+            ))
+            .unwrap();
+        }
+        let before = std::fs::read(&base_path).unwrap();
+        let mut permissions = std::fs::metadata(&base_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&base_path, permissions).unwrap();
+
+        let mut agents = Vec::new();
+        for index in 0..10 {
+            let base_path = base_path.clone();
+            let delta_path = tmp.path().join(format!("delta-{index}.db"));
+            agents.push(std::thread::spawn(move || {
+                let visibility = crate::VisibilityIndex::default();
+                let overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+                let hits = overlay
+                    .vector_search_exact(&[1.0, 0.0], &query("p", Some(1), 10))
+                    .unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].embedding.qualified_name, "p.shared");
+                assert!(hits[0].embedding.node_id.is_some_and(|id| id < 0));
+                overlay
+                    .conn()
+                    .query_row("SELECT COUNT(*) FROM main.vector_embeddings", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            }));
+        }
+        for agent in agents {
+            assert_eq!(agent.join().unwrap(), 0);
+        }
+        assert_eq!(std::fs::read(&base_path).unwrap(), before);
     }
 }

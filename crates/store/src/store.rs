@@ -1,6 +1,6 @@
 //! Connection wrapper, open modes, and the high-level entry point.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -56,6 +56,12 @@ pub struct Store {
     // directory for as long as this SQLite handle is alive. In-memory and
     // non-workspace test databases legitimately have no lease.
     _lifecycle: Option<greppy_core::cache::FileLock>,
+    overlay: Option<OverlayInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct OverlayInfo {
+    base_path: PathBuf,
 }
 
 impl std::fmt::Debug for Store {
@@ -150,6 +156,7 @@ impl Store {
         let s = Self {
             conn,
             _lifecycle: lifecycle,
+            overlay: None,
         };
         // Verify integrity on WRITE opens (i.e. `greppy index`) only.
         // `PRAGMA integrity_check` is O(db-size) — hundreds of ms on a large
@@ -227,6 +234,49 @@ impl Store {
         &self.conn
     }
 
+    /// Open a writable private Delta with an immutable Base attached behind
+    /// one set of TEMP views. Existing read queries continue to address the
+    /// ordinary table names; writes must explicitly target `main.<table>`.
+    pub fn open_overlay(
+        base_path: &Path,
+        delta_path: &Path,
+        visibility: &crate::VisibilityIndex,
+    ) -> Result<Self> {
+        let mut store = Self::open_with(delta_path, OpenOptions::query_writer())?;
+        let base_uri = sqlite_read_only_uri(base_path)?;
+        store
+            .conn
+            .execute("ATTACH DATABASE ?1 AS greppy_base", [base_uri])?;
+        store.conn.execute_batch(
+            "CREATE TEMP TABLE greppy_hidden_paths (
+                 path TEXT PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )?;
+        {
+            let tx = store.conn.transaction()?;
+            {
+                let mut insert = tx.prepare("INSERT INTO greppy_hidden_paths(path) VALUES (?1)")?;
+                for path in visibility.dirty_paths().chain(visibility.deleted_paths()) {
+                    insert.execute([path])?;
+                }
+            }
+            tx.commit()?;
+        }
+        store.conn.execute_batch(OVERLAY_VIEWS_SQL)?;
+        store.overlay = Some(OverlayInfo {
+            base_path: base_path.to_path_buf(),
+        });
+        Ok(store)
+    }
+
+    pub fn is_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    pub fn overlay_base_path(&self) -> Option<&Path> {
+        self.overlay.as_ref().map(|info| info.base_path.as_path())
+    }
+
     /// Begin a write transaction. Rolls back on drop if neither
     /// `commit()` nor `rollback()` is called explicitly.
     pub fn transaction(&mut self) -> Result<Transaction<'_>> {
@@ -234,6 +284,162 @@ impl Store {
         Ok(Transaction { tx })
     }
 }
+
+fn sqlite_read_only_uri(path: &Path) -> Result<String> {
+    let absolute = std::path::absolute(path).map_err(|error| Error::Io {
+        context: format!("resolve immutable Base path {}", path.display()),
+        source: error,
+    })?;
+    let raw = absolute.to_str().ok_or_else(|| {
+        Error::Store(format!(
+            "immutable Base path is not valid UTF-8: {}",
+            absolute.display()
+        ))
+    })?;
+    let mut encoded = String::with_capacity(raw.len() + 32);
+    for byte in raw.bytes() {
+        match byte {
+            b'%' => encoded.push_str("%25"),
+            b'?' => encoded.push_str("%3F"),
+            b'#' => encoded.push_str("%23"),
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push(byte as char),
+        }
+    }
+    Ok(format!("file:{encoded}?mode=ro&immutable=1"))
+}
+
+/// Base ids are negated while Delta ids remain positive. SQLite AUTOINCREMENT
+/// starts at one, so the two namespaces cannot collide.
+const OVERLAY_VIEWS_SQL: &str = r#"
+CREATE TEMP VIEW projects AS
+SELECT * FROM main.projects
+UNION ALL
+SELECT b.* FROM greppy_base.projects b
+WHERE NOT EXISTS (SELECT 1 FROM main.projects d WHERE d.name = b.name);
+
+CREATE TEMP VIEW nodes AS
+SELECT * FROM main.nodes
+UNION ALL
+SELECT -b.id AS id, b.project, b.label, b.name, b.qualified_name,
+       b.file_path, b.start_line, b.end_line, b.properties
+FROM greppy_base.nodes b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
+)
+AND NOT EXISTS (
+    SELECT 1 FROM main.nodes d
+    WHERE d.project = b.project AND d.qualified_name = b.qualified_name
+);
+
+CREATE TEMP VIEW raw_edges AS
+SELECT * FROM main.raw_edges
+UNION ALL
+SELECT -b.id AS id, b.project, b.file_path, b.source_qname,
+       b.target_qname, b.edge_type, b.properties
+FROM greppy_base.raw_edges b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
+);
+
+CREATE TEMP VIEW edges AS
+SELECT d.id, d.project, visible_source.id AS source_id,
+       visible_target.id AS target_id, d.edge_type, d.properties,
+       json_extract(d.properties, '$.url_path') AS url_path_gen
+FROM main.overlay_edges d
+JOIN nodes visible_source
+  ON visible_source.project = d.project
+ AND visible_source.qualified_name = d.source_qualified_name
+JOIN nodes visible_target
+  ON visible_target.project = d.project
+ AND visible_target.qualified_name = d.target_qualified_name
+UNION ALL
+SELECT -e.id AS id, e.project, visible_source.id AS source_id,
+       visible_target.id AS target_id, e.edge_type, e.properties,
+       e.url_path_gen
+FROM greppy_base.edges e
+JOIN greppy_base.nodes base_source ON base_source.id = e.source_id
+JOIN greppy_base.nodes base_target ON base_target.id = e.target_id
+JOIN nodes visible_source
+  ON visible_source.project = base_source.project
+ AND visible_source.qualified_name = base_source.qualified_name
+JOIN nodes visible_target
+  ON visible_target.project = base_target.project
+ AND visible_target.qualified_name = base_target.qualified_name
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
+)
+AND NOT EXISTS (
+    SELECT 1 FROM main.overlay_edges d
+    WHERE d.project = e.project
+      AND d.source_qualified_name = base_source.qualified_name
+      AND d.target_qualified_name = base_target.qualified_name
+      AND d.edge_type = e.edge_type
+);
+
+CREATE TEMP VIEW file_state AS
+SELECT * FROM main.file_state
+UNION ALL
+SELECT b.* FROM greppy_base.file_state b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.rel_path
+);
+
+CREATE TEMP VIEW file_content AS
+SELECT * FROM main.file_content
+UNION ALL
+SELECT -b.id AS id, b.project, b.rel_path, b.line, b.snippet, b.file_path
+FROM greppy_base.file_content b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
+);
+
+CREATE TEMP VIEW vector_embeddings AS
+SELECT * FROM main.vector_embeddings
+UNION ALL
+SELECT -b.id AS id, b.project, b.model_id, b.prompt_version, b.task,
+       CASE WHEN b.node_id IS NULL THEN NULL ELSE -b.node_id END AS node_id,
+       b.chunk_idx, b.qualified_name, b.file_path, b.start_line, b.end_line,
+       b.content_sha256, b.graph_generation, b.dim, b.vector_norm,
+       b.vector, b.created_at, b.vector_i8, b.i8_scale
+FROM greppy_base.vector_embeddings b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
+);
+
+CREATE TEMP VIEW provider_state AS
+SELECT * FROM main.provider_state
+UNION ALL
+SELECT b.* FROM greppy_base.provider_state b
+WHERE NOT EXISTS (
+    SELECT 1 FROM main.provider_state d
+    WHERE d.project = b.project AND d.language = b.language
+);
+
+CREATE TEMP VIEW index_skips AS
+SELECT * FROM main.index_skips
+UNION ALL
+SELECT b.* FROM greppy_base.index_skips b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.rel_path
+);
+
+CREATE TEMP VIEW file_identity AS
+SELECT * FROM main.file_identity
+UNION ALL
+SELECT b.* FROM greppy_base.file_identity b
+WHERE NOT EXISTS (
+    SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.rel_path
+);
+
+CREATE TEMP VIEW workspace_state AS
+SELECT * FROM main.workspace_state
+UNION ALL
+SELECT b.* FROM greppy_base.workspace_state b
+WHERE NOT EXISTS (
+    SELECT 1 FROM main.workspace_state d WHERE d.root_path = b.root_path
+);
+"#;
 
 fn workspace_lifecycle_for_path(
     path: &Path,

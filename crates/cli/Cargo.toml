@@ -27,6 +27,7 @@ greppy-search = { path = "../search" }
 greppy-store = { path = "../store" }
 clap = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
@@ -62,6 +63,10 @@ bash-smart = []
 # Release builds reject this feature at compile time; product builds always use
 # both real embedded models.
 ci-test-assets = []
+# Internal release-benchmark build. This keeps Store-CoW timing independent of
+# model inference while preserving the production rule that release binaries
+# ignore GREPPY_TEST_SKIP_INFERENCE. It is never enabled for shipped artifacts.
+store-cow-release-perf = []
 # GPU inference for both embedded models. It is NOT opt-in: the target sections
 # below enable the platform backend on every build, because a CPU-only binary is
 # not a slower greppy, it is a different product -- measured on this repo, one

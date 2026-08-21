@@ -27,7 +27,7 @@ impl Store {
     pub fn upsert_file_state(&mut self, f: &FileState) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "INSERT INTO file_state
+            "INSERT INTO main.file_state
                   (project, rel_path, language, sha256, mtime_ns, size,
                    parser_version, extractor_version, last_indexed_generation)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -79,11 +79,11 @@ impl Store {
         // the additive identity row explicitly so deleted paths cannot leave
         // stale stat metadata behind.
         tx.raw().execute(
-            "DELETE FROM file_identity WHERE project = ?1 AND rel_path = ?2",
+            "DELETE FROM main.file_identity WHERE project = ?1 AND rel_path = ?2",
             params![project, rel_path],
         )?;
         tx.raw().execute(
-            "DELETE FROM file_state WHERE project = ?1 AND rel_path = ?2",
+            "DELETE FROM main.file_state WHERE project = ?1 AND rel_path = ?2",
             params![project, rel_path],
         )?;
         tx.commit()?;

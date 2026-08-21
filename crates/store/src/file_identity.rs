@@ -21,7 +21,7 @@ impl Store {
         identity: FileIdentity,
     ) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO file_identity(project, rel_path, ctime_ns, file_id)
+            "INSERT INTO main.file_identity(project, rel_path, ctime_ns, file_id)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(project, rel_path) DO UPDATE SET
                ctime_ns = excluded.ctime_ns,

@@ -130,6 +130,31 @@ fn search_fts_scoped(
     let Some(fts_query) = fts_prefix_query(query) else {
         return Ok(Vec::new());
     };
+    if store.is_overlay() {
+        let overfetch = limit.saturating_mul(4).max(limit);
+        let mut hits = search_fts_layer(store, "main", false, project, &fts_query, overfetch)?;
+        hits.extend(search_fts_layer(
+            store,
+            "greppy_base",
+            true,
+            project,
+            &fts_query,
+            overfetch,
+        )?);
+        for hit in &mut hits {
+            if let Some(node) = store.get_node(hit.node_id)? {
+                hit.rank = -overlay_symbol_score(query, &node);
+            }
+        }
+        hits.sort_by(|left, right| {
+            left.rank
+                .total_cmp(&right.rank)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        hits.dedup_by_key(|hit| hit.node_id);
+        hits.truncate(limit);
+        return Ok(hits);
+    }
 
     // Forensics F2: pseudo/structural nodes carry no navigational value as
     // user-facing symbols. Their information already lives in edges or the
@@ -193,6 +218,11 @@ pub fn count_fts_in_project(
     let Some(fts_query) = fts_prefix_query(query) else {
         return Ok(0);
     };
+    if store.is_overlay() {
+        let delta = count_fts_layer(store, "main", false, project, &fts_query)?;
+        let base = count_fts_layer(store, "greppy_base", true, project, &fts_query)?;
+        return Ok(delta.saturating_add(base));
+    }
     store
         .conn()
         .query_row(
@@ -208,6 +238,126 @@ pub fn count_fts_in_project(
             |row| row.get(0),
         )
         .map_err(Error::Sqlite)
+}
+
+fn search_fts_layer(
+    store: &crate::store::Store,
+    schema: &str,
+    base_layer: bool,
+    project: Option<&str>,
+    fts_query: &str,
+    limit: usize,
+) -> Result<Vec<FtsHit>, crate::store_error::Error> {
+    use crate::store_error::Error;
+    debug_assert!(matches!(schema, "main" | "greppy_base"));
+    let id = if base_layer {
+        "-nodes_fts.rowid"
+    } else {
+        "nodes_fts.rowid"
+    };
+    let hidden = if base_layer {
+        "AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = nodes.file_path)"
+    } else {
+        ""
+    };
+    let project_filter = if project.is_some() {
+        "AND nodes.project = ?2"
+    } else {
+        ""
+    };
+    let limit_parameter = if project.is_some() { "?3" } else { "?2" };
+    let sql = format!(
+        "SELECT {id}, bm25(nodes_fts)
+         FROM {schema}.nodes_fts
+         JOIN {schema}.nodes ON nodes.id = nodes_fts.rowid
+         WHERE nodes_fts MATCH ?1
+           {project_filter}
+           AND nodes.label NOT IN ('Call','Import','File','Folder','Project')
+           AND nodes.name != '__file__'
+           AND nodes.qualified_name NOT LIKE '%::__file__'
+           AND nodes.qualified_name NOT LIKE '%.__file__'
+           {hidden}
+         ORDER BY rank LIMIT {limit_parameter}"
+    );
+    let mut stmt = store.conn().prepare(&sql).map_err(Error::Sqlite)?;
+    let rows = if let Some(project) = project {
+        stmt.query_map(rusqlite::params![fts_query, project, limit as i64], |row| {
+            Ok(FtsHit {
+                node_id: row.get(0)?,
+                rank: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+            Ok(FtsHit {
+                node_id: row.get(0)?,
+                rank: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
+}
+
+fn count_fts_layer(
+    store: &crate::store::Store,
+    schema: &str,
+    base_layer: bool,
+    project: &str,
+    fts_query: &str,
+) -> Result<i64, crate::store_error::Error> {
+    use crate::store_error::Error;
+    debug_assert!(matches!(schema, "main" | "greppy_base"));
+    let hidden = if base_layer {
+        "AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = nodes.file_path)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT COUNT(*)
+         FROM {schema}.nodes_fts
+         JOIN {schema}.nodes ON nodes.id = nodes_fts.rowid
+         WHERE nodes_fts MATCH ?1
+           AND nodes.project = ?2
+           AND nodes.label NOT IN ('Call','Import','File','Folder','Project')
+           AND nodes.name != '__file__'
+           AND nodes.qualified_name NOT LIKE '%::__file__'
+           AND nodes.qualified_name NOT LIKE '%.__file__'
+           {hidden}"
+    );
+    store
+        .conn()
+        .query_row(&sql, rusqlite::params![fts_query, project], |row| {
+            row.get(0)
+        })
+        .map_err(Error::Sqlite)
+}
+
+fn overlay_symbol_score(query: &str, node: &crate::Node) -> f64 {
+    let query_tokens = camel_split(query);
+    let name = camel_split(&node.name);
+    let qualified = camel_split(&node.qualified_name);
+    let mut score = if name == query_tokens { 100.0 } else { 0.0 };
+    if name.starts_with(&query_tokens) {
+        score += 25.0;
+    }
+    for token in query_tokens
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+    {
+        score += name
+            .split_whitespace()
+            .filter(|value| *value == token)
+            .count() as f64
+            * 10.0;
+        score += qualified
+            .split_whitespace()
+            .filter(|value| *value == token)
+            .count() as f64
+            * 2.0;
+    }
+    score
 }
 
 #[cfg(test)]

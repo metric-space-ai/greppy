@@ -122,8 +122,8 @@ use greppy_parser::{
 use greppy_store::{
     self,
     file_state::{self, FileState},
-    workspace_state as ws, ContentRow, FileIdentity, IndexSkip, NewEdge, NewNode, NewRawEdge,
-    Project, ProviderState, RawEdge, Store, WorkspaceState,
+    workspace_state as ws, ContentRow, FileIdentity, IndexSkip, NewEdge, NewNode, NewOverlayEdge,
+    NewRawEdge, Project, ProviderState, RawEdge, Store, WorkspaceState,
 };
 use rayon::prelude::*;
 
@@ -199,6 +199,11 @@ impl IndexReport {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexOptions {
     pub discover_overrides: greppy_discover::WalkOverrides,
+    /// Internal Store-CoW extraction boundary. Discovery still walks the
+    /// complete repository so policy and freshness stay authoritative, while
+    /// extraction and structural contributions are restricted to paths owned
+    /// by the private Delta.
+    pub only_paths: Option<std::collections::BTreeSet<String>>,
 }
 
 /// Run the indexer against `root`. The store is mutated in-place; nodes
@@ -223,11 +228,19 @@ pub fn index_with_options(
     options: &IndexOptions,
 ) -> Result<IndexReport> {
     let abs_root = greppy_discover::detect_repo_root(root)?;
-    let all_entries = greppy_discover::walk_with_policy_and_overrides(
+    let discovered_entries = greppy_discover::walk_with_policy_and_overrides(
         &abs_root,
         &greppy_discover::SkipPolicy::walk_default(),
         &options.discover_overrides,
     )?;
+    let all_entries = if let Some(only_paths) = options.only_paths.as_ref() {
+        discovered_entries
+            .into_iter()
+            .filter(|entry| only_paths.contains(&entry.rel_path))
+            .collect::<Vec<_>>()
+    } else {
+        discovered_entries
+    };
 
     let mut report = IndexReport {
         project: project_name.to_string(),
@@ -1363,7 +1376,37 @@ fn resolve_and_persist_edges(
     // Persist every resolved edge in a SINGLE transaction (was: one
     // transaction per edge). Determinism is unchanged — the edge order is
     // the same IMPORTS-then-references order resolved above.
-    insert_edges_batched(store, &resolved)?;
+    if store.is_overlay() {
+        let logical = resolved
+            .iter()
+            .map(|edge| {
+                let source_qualified_name =
+                    index.qname_for_id(edge.source_id).ok_or_else(|| {
+                        greppy_core::Error::Store(format!(
+                            "overlay edge source id {} has no logical identity",
+                            edge.source_id
+                        ))
+                    })?;
+                let target_qualified_name =
+                    index.qname_for_id(edge.target_id).ok_or_else(|| {
+                        greppy_core::Error::Store(format!(
+                            "overlay edge target id {} has no logical identity",
+                            edge.target_id
+                        ))
+                    })?;
+                Ok(NewOverlayEdge {
+                    project: edge.project.clone(),
+                    source_qualified_name: source_qualified_name.to_owned(),
+                    target_qualified_name: target_qualified_name.to_owned(),
+                    edge_type: edge.edge_type.clone(),
+                    properties: edge.properties.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        store.replace_overlay_edges(project, &logical)?;
+    } else {
+        insert_edges_batched(store, &resolved)?;
+    }
     Ok(resolved.len())
 }
 
@@ -1505,8 +1548,27 @@ fn persist_raw_edges_for_file(
 /// on a full run we resolve the freshly-extracted edges directly and only use
 /// this table for the *next* incremental run.
 fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>> {
-    let rows = store.list_raw_edges(project)?;
+    let rows = if store.is_overlay() {
+        store.list_delta_raw_edges(project)?
+    } else {
+        store.list_raw_edges(project)?
+    };
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
+}
+
+/// Rebuild the complete bounded logical edge contribution of a private
+/// Store-CoW Delta. This is intentionally O(Delta raw edges), never O(Base):
+/// it closes no-op/prune generations where the incremental parser correctly
+/// skips unchanged dirty files but publication still needs a self-contained
+/// next Delta snapshot.
+pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> {
+    if !store.is_overlay() {
+        return Err(greppy_core::Error::Invalid(
+            "rebuild_overlay_edges requires an overlay Store".into(),
+        ));
+    }
+    let raw_edges = load_all_raw_edges(store, project)?;
+    resolve_and_persist_edges(store, project, &raw_edges)
 }
 
 // Test-only instrumentation: the number of raw edges PHASE B actually fed
@@ -1671,6 +1733,16 @@ fn resolve_edges_incremental(
         return count_edges(store, project);
     }
 
+    // A private Delta owns only edges extracted from dirty files. Rebuild
+    // that bounded logical edge set from its own raw rows: unchanged Base
+    // edges are already supplied by the composed view and must never be
+    // copied into the Delta merely because a definition changed.
+    if store.is_overlay() {
+        let raw_edges = load_all_raw_edges(store, project)?;
+        note_reresolved(raw_edges.len());
+        return resolve_and_persist_edges(store, project, &raw_edges);
+    }
+
     // Did a changed file alter the resolvable definition set? If so, an
     // UNCHANGED file's edge could now resolve differently — fall back to the
     // full, insert-only re-resolution (identical to a first run).
@@ -1686,7 +1758,7 @@ fn resolve_edges_incremental(
         store
             .conn()
             .execute(
-                "DELETE FROM edges WHERE project = ?1",
+                "DELETE FROM main.edges WHERE project = ?1",
                 rusqlite::params![project],
             )
             .map_err(sqlite_err)?;
@@ -2010,6 +2082,12 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     if edges.is_empty() {
         return Ok(());
     }
+    if store.is_overlay() {
+        for edge in edges {
+            store.insert_edge(edge)?;
+        }
+        return Ok(());
+    }
     // The store's `Transaction` does not expose its raw connection to other
     // crates, so we drive one explicit transaction on the public
     // `conn()` borrow instead: BEGIN, reuse a single cached prepared
@@ -2022,7 +2100,7 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut stmt = conn
             .prepare_cached(
-                "INSERT INTO edges (project, source_id, target_id, edge_type, properties)
+                "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
                    properties = excluded.properties",
@@ -2106,6 +2184,9 @@ struct GraphIndex {
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
     id_to_file: std::collections::HashMap<i64, String>,
+    /// `node id → qualified_name`, used to persist cross-database Delta
+    /// edges by logical identity rather than connection-local ids.
+    id_to_qname: std::collections::HashMap<i64, String>,
     /// `file basename stem → File node ids`. Backs the `require`/`import`→File
     /// IMPORTS pass (Ruby `require 'record'`, Clojure `(:require ..)`, Elm/
     /// Erlang/Zig/Dart module imports). Populated at load; only usable AFTER
@@ -2139,6 +2220,8 @@ impl GraphIndex {
         let mut by_name: std::collections::HashMap<String, Vec<NodeLite>> =
             std::collections::HashMap::new();
         let mut id_to_file: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        let mut id_to_qname: std::collections::HashMap<i64, String> =
             std::collections::HashMap::new();
         let mut files_by_stem: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
@@ -2175,6 +2258,7 @@ impl GraphIndex {
                     file_path: file_path.clone(),
                 };
                 id_to_file.insert(id, file_path);
+                id_to_qname.insert(id, qname.clone());
                 by_name.entry(name).or_default().push(node.clone());
                 by_qname.insert(qname, node);
             }
@@ -2184,6 +2268,7 @@ impl GraphIndex {
             by_name,
             imports_by_file: std::collections::HashMap::new(),
             id_to_file,
+            id_to_qname,
             files_by_stem,
         })
     }
@@ -2192,6 +2277,10 @@ impl GraphIndex {
     fn by_qname(&self, qname: &str) -> Option<&NodeLite> {
         note_edge_resolution_work(1);
         self.by_qname.get(qname)
+    }
+
+    fn qname_for_id(&self, id: i64) -> Option<&str> {
+        self.id_to_qname.get(&id).map(String::as_str)
     }
 
     /// Record a resolved IMPORTS target for `file` so the reference
@@ -3291,6 +3380,7 @@ mod tests {
             discover_overrides: greppy_discover::WalkOverrides::empty()
                 .include("src/*.rs")
                 .exclude("src/generated.rs"),
+            only_paths: None,
         };
         let report = index_with_options(&mut store, &repo, "test", &options).unwrap();
 

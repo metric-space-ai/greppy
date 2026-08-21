@@ -21,3 +21,4 @@ sha2 = { workspace = true }
 # regression test to count committed write transactions precisely.
 # Additive feature on the same rusqlite version — no behavioural change.
 rusqlite = { workspace = true, features = ["hooks"] }
+tempfile = { workspace = true }

@@ -258,6 +258,9 @@ pub(crate) fn embedding_config_for_required_use(
 pub(crate) fn embedding_config_optional(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<Option<EmbeddingModelConfig>> {
+    if test_inference_skipped() {
+        return Ok(None);
+    }
     embedding_config_required(args).map(Some)
 }
 
@@ -311,6 +314,17 @@ pub(crate) fn embedding_config_required(
         ));
     }
     let device = embedding_device_preference(args.device, args.no_gpu)?;
+    if test_inference_skipped() {
+        return Ok(EmbeddingModelConfig {
+            model_id: embedded_embedding_model_id(),
+            source: EmbeddingModelSource::Gguf {
+                gguf: "__greppy_test_skip_inference__.gguf".into(),
+                tokenizer: "__greppy_test_skip_inference__.tokenizer.json".into(),
+            },
+            max_length: None,
+            device,
+        });
+    }
     let source = match embeddinggemma_assets::paths() {
         Some((gguf, tokenizer)) => EmbeddingModelSource::Gguf {
             gguf: gguf.into(),
@@ -329,6 +343,26 @@ pub(crate) fn embedding_config_required(
         max_length: None,
         device,
     })
+}
+
+fn embedded_embedding_model_id() -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut combined = Sha256::new();
+    for (name, digest) in [
+        (
+            "embeddinggemma-300M-Q4_K.gguf",
+            env!("GREPPY_EMBEDDED_GGUF_SHA"),
+        ),
+        ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+    ] {
+        combined.update(name.as_bytes());
+        combined.update([0]);
+        combined.update(digest.as_bytes());
+        combined.update([0]);
+    }
+    let digest = combined.finalize();
+    format!("{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{digest:x}")
 }
 
 pub(crate) fn embedding_source_content_digest(source: &EmbeddingModelSource) -> Result<String> {

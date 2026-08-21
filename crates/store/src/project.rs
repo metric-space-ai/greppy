@@ -17,7 +17,7 @@ impl Store {
     pub fn upsert_project(&mut self, p: &Project) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "INSERT INTO projects (name, indexed_at, root_path)
+            "INSERT INTO main.projects (name, indexed_at, root_path)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(name) DO UPDATE SET
                    indexed_at = excluded.indexed_at,
@@ -68,7 +68,7 @@ impl Store {
     pub fn delete_project(&mut self, name: &str) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw()
-            .execute("DELETE FROM projects WHERE name = ?1", params![name])?;
+            .execute("DELETE FROM main.projects WHERE name = ?1", params![name])?;
         tx.commit()?;
         Ok(())
     }

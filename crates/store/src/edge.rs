@@ -24,18 +24,99 @@ pub struct NewEdge {
     pub properties: serde_json::Value,
 }
 
+/// An edge owned by a private Store-CoW Delta. Endpoints are logical graph
+/// identities because either endpoint may live in the immutable Base DB.
+#[derive(Debug, Clone)]
+pub struct NewOverlayEdge {
+    pub project: String,
+    pub source_qualified_name: String,
+    pub target_qualified_name: String,
+    pub edge_type: String,
+    pub properties: serde_json::Value,
+}
+
 impl Store {
+    /// Replace all logical Delta edges for one project atomically.
+    ///
+    /// The composed overlay view resolves qnames to the currently visible
+    /// Base-or-Delta nodes. Thus a dirty-file edge can target an unchanged
+    /// Base node without leaking a database-local Base id into the Delta.
+    pub fn replace_overlay_edges(&mut self, project: &str, edges: &[NewOverlayEdge]) -> Result<()> {
+        let tx = self.transaction()?;
+        tx.raw().execute(
+            "DELETE FROM main.overlay_edges
+             WHERE project = ?1
+               AND edge_type NOT IN ('CONTAINS_FOLDER', 'CONTAINS_FILE', 'DEFINES')",
+            params![project],
+        )?;
+        {
+            let mut stmt = tx.raw().prepare_cached(
+                "INSERT INTO main.overlay_edges
+                   (project, source_qualified_name, target_qualified_name, edge_type, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(project, source_qualified_name, target_qualified_name, edge_type)
+                 DO UPDATE SET properties = excluded.properties",
+            )?;
+            for edge in edges {
+                let properties = serde_json::to_string(&edge.properties)?;
+                stmt.execute(params![
+                    edge.project,
+                    edge.source_qualified_name,
+                    edge.target_qualified_name,
+                    edge.edge_type,
+                    properties,
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Insert an edge. Returns the assigned id. The `(source_id,
     /// target_id, edge_type)` triple is unique; a duplicate insert is
     /// upserted (enforced by the `UNIQUE(source_id, target_id, type)`
     /// schema constraint).
     pub fn insert_edge(&mut self, e: &NewEdge) -> Result<i64> {
+        if self.is_overlay() {
+            let visible: Option<(i64, String)> = self
+                .conn()
+                .query_row(
+                    "SELECT id, properties FROM edges
+                     WHERE project = ?1 AND source_id = ?2 AND target_id = ?3 AND edge_type = ?4
+                     ORDER BY id DESC LIMIT 1",
+                    params![e.project, e.source_id, e.target_id, e.edge_type],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, properties)) = visible {
+                let properties: serde_json::Value = serde_json::from_str(&properties)?;
+                if properties == e.properties {
+                    return Ok(id);
+                }
+            }
+            let source_qualified_name: String = self.conn().query_row(
+                "SELECT qualified_name FROM nodes WHERE id = ?1 AND project = ?2",
+                params![e.source_id, e.project],
+                |row| row.get(0),
+            )?;
+            let target_qualified_name: String = self.conn().query_row(
+                "SELECT qualified_name FROM nodes WHERE id = ?1 AND project = ?2",
+                params![e.target_id, e.project],
+                |row| row.get(0),
+            )?;
+            return self.insert_overlay_edge(&NewOverlayEdge {
+                project: e.project.clone(),
+                source_qualified_name,
+                target_qualified_name,
+                edge_type: e.edge_type.clone(),
+                properties: e.properties.clone(),
+            });
+        }
         let props_str = serde_json::to_string(&e.properties)?;
         let tx = self.transaction()?;
         let id: i64 = tx
             .raw()
             .prepare_cached(
-                "INSERT INTO edges (project, source_id, target_id, edge_type, properties)
+                "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
                    properties = excluded.properties
@@ -46,6 +127,29 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(Error::Sqlite)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn insert_overlay_edge(&mut self, edge: &NewOverlayEdge) -> Result<i64> {
+        let properties = serde_json::to_string(&edge.properties)?;
+        let tx = self.transaction()?;
+        let id = tx.raw().query_row(
+            "INSERT INTO main.overlay_edges
+               (project, source_qualified_name, target_qualified_name, edge_type, properties)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project, source_qualified_name, target_qualified_name, edge_type)
+             DO UPDATE SET properties = excluded.properties
+             RETURNING id",
+            params![
+                edge.project,
+                edge.source_qualified_name,
+                edge.target_qualified_name,
+                edge.edge_type,
+                properties,
+            ],
+            |row| row.get(0),
+        )?;
         tx.commit()?;
         Ok(id)
     }

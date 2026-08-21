@@ -95,6 +95,11 @@ fn index_graph(repo: &Path, store: &Path) {
         code, 0,
         "graph index failed; stdout={stdout}\nstderr={stderr}"
     );
+    let job = graph_db(store).parent().unwrap().join("index.job");
+    assert!(
+        !job.exists(),
+        "GREPPY_TEST_SKIP_INFERENCE must suppress detached background jobs for short-lived fixtures"
+    );
 }
 
 #[test]

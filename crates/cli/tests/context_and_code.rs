@@ -19,6 +19,30 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+struct FixtureCleanup {
+    root: PathBuf,
+}
+
+impl FixtureCleanup {
+    fn for_repo(repo: &Path) -> Self {
+        Self {
+            root: repo.parent().expect("fixture repo parent").to_path_buf(),
+        }
+    }
+
+    fn for_root(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for FixtureCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
 }
@@ -139,25 +163,27 @@ fn run_command(
     )
 }
 
-fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
+fn index_fixture(tag: &str) -> (PathBuf, PathBuf, FixtureCleanup) {
     let (repo, store) = make_repo(tag);
+    let cleanup = FixtureCleanup::for_repo(&repo);
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
         "index . should succeed; stderr={err}\nstdout={out}"
     );
-    (repo, store)
+    (repo, store, cleanup)
 }
 
 #[cfg(not(feature = "ci-test-assets"))]
-fn index_fixture_with_inference(tag: &str) -> (PathBuf, PathBuf) {
+fn index_fixture_with_inference(tag: &str) -> (PathBuf, PathBuf, FixtureCleanup) {
     let (repo, store) = make_repo(tag);
+    let cleanup = FixtureCleanup::for_repo(&repo);
     let (code, out, err) = run_with_inference(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
         "inference index should succeed; stderr={err}\nstdout={out}"
     );
-    (repo, store)
+    (repo, store, cleanup)
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +192,7 @@ fn index_fixture_with_inference(tag: &str) -> (PathBuf, PathBuf) {
 
 #[test]
 fn context_returns_locator_for_a_known_symbol() {
-    let (repo, store) = index_fixture("ctx-known");
+    let (repo, store, _cleanup) = index_fixture("ctx-known");
 
     // An exact-name lookup ("find the definition site of do_it") returns a
     // lean, grep-shaped locator: the qualified-name + file:line header and
@@ -207,7 +233,7 @@ fn context_returns_locator_for_a_known_symbol() {
 // literal-lookup token factor collapses (was 0.43x, i.e. ~2x worse).
 #[test]
 fn context_exact_name_returns_lean_locator_only() {
-    let (repo, store) = index_fixture("ctx-exact-lean");
+    let (repo, store, _cleanup) = index_fixture("ctx-exact-lean");
 
     // `do_it` is defined in helper.rs and CALLED from `caller` in lib.rs.
     // The pre-fix union path resolved the caller's body too (it mentions
@@ -241,7 +267,7 @@ fn context_exact_name_returns_lean_locator_only() {
 
 #[test]
 fn context_exact_module_header_uses_display_name() {
-    let (repo, store) = index_fixture("ctx-module-display");
+    let (repo, store, _cleanup) = index_fixture("ctx-module-display");
 
     let (code, out, err) = run(&["context", "lib"], &repo, &store);
     assert_eq!(code, 0, "context lib should exit 0; stderr={err}");
@@ -263,7 +289,7 @@ fn context_exact_module_header_uses_display_name() {
 #[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn context_multiword_query_returns_semantic_locators() {
-    let (repo, store) = index_fixture_with_inference("ctx-rich-research");
+    let (repo, store, _cleanup) = index_fixture_with_inference("ctx-rich-research");
 
     // "do_it helper" is two tokens -> never a bare identifier. It should not
     // take the exact-name locator fast path; with the embedded model default it
@@ -285,7 +311,7 @@ fn context_multiword_query_returns_semantic_locators() {
 
 #[test]
 fn context_emits_locator_for_type_query() {
-    let (repo, store) = index_fixture("ctx-struct");
+    let (repo, store, _cleanup) = index_fixture("ctx-struct");
 
     // Exact type-name lookup → lean locator (header + declaration line),
     // matching the Z3 find-definition contract. The struct's field body is
@@ -308,7 +334,7 @@ fn context_emits_locator_for_type_query() {
 
 #[test]
 fn context_k_limits_number_of_spans() {
-    let (repo, store) = index_fixture("ctx-k");
+    let (repo, store, _cleanup) = index_fixture("ctx-k");
 
     // --k 1 must emit exactly one `== ` header.
     let (code, out, err) = run(&["context", "make", "--k", "1"], &repo, &store);
@@ -322,7 +348,7 @@ fn context_k_limits_number_of_spans() {
 
 #[test]
 fn context_lines_flag_prefixes_line_numbers() {
-    let (repo, store) = index_fixture("ctx-lines");
+    let (repo, store, _cleanup) = index_fixture("ctx-lines");
 
     let (code, out, err) = run(&["context", "do_it", "--lines"], &repo, &store);
     assert_eq!(code, 0, "context --lines should exit 0; stderr={err}");
@@ -341,7 +367,7 @@ fn context_lines_flag_prefixes_line_numbers() {
 
 #[test]
 fn context_json_reports_source_and_budget_metadata() {
-    let (repo, store) = index_fixture("ctx-json");
+    let (repo, store, _cleanup) = index_fixture("ctx-json");
 
     let (code, out, err) = run(
         &["context", "do_it", "--json", "--diagnostics", "--k", "1"],
@@ -390,6 +416,7 @@ fn context_json_reports_source_and_budget_metadata() {
 #[test]
 fn context_json_reports_span_truncation_metadata() {
     let root = fresh_dir("ctx-json-trunc");
+    let _cleanup = FixtureCleanup::for_root(&root);
     let repo = root.join("repo");
     let src = repo.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -443,7 +470,7 @@ fn context_json_reports_span_truncation_metadata() {
 
 #[test]
 fn context_unknown_query_reports_no_matches() {
-    let (repo, store) = index_fixture("ctx-none");
+    let (repo, store, _cleanup) = index_fixture("ctx-none");
 
     let (code, out, _err) = run(&["context", "no_such_symbol_zzz_qq"], &repo, &store);
     assert_eq!(code, 1, "unknown context query must exit 1; got: {out:?}");
@@ -455,7 +482,7 @@ fn context_unknown_query_reports_no_matches() {
 
 #[test]
 fn context_requires_a_query() {
-    let (repo, store) = index_fixture("ctx-empty");
+    let (repo, store, _cleanup) = index_fixture("ctx-empty");
 
     let (code, _out, err) = run(&["context", ""], &repo, &store);
     assert_eq!(
@@ -469,7 +496,7 @@ fn context_requires_a_query() {
 /// indexed span.
 #[test]
 fn context_refuses_stale_spans_when_auto_reindex_disabled() {
-    let (repo, store) = index_fixture("ctx-stale");
+    let (repo, store, _cleanup) = index_fixture("ctx-stale");
     std::fs::write(
         repo.join("src/helper.rs"),
         "pub fn do_it_changed() -> u32 {\n    45\n}\n",
@@ -501,7 +528,7 @@ fn context_refuses_stale_spans_when_auto_reindex_disabled() {
 /// published generation.
 #[test]
 fn context_refuses_current_request_while_small_drift_refreshes() {
-    let (repo, store) = index_fixture("ctx-heal");
+    let (repo, store, _cleanup) = index_fixture("ctx-heal");
     std::fs::write(
         repo.join("src/helper.rs"),
         "pub fn do_it_changed() -> u32 {\n    45\n}\n",
@@ -526,7 +553,7 @@ fn context_refuses_current_request_while_small_drift_refreshes() {
 
 #[test]
 fn plus_outputs_grep_like_signal_rows() {
-    let (repo, store) = index_fixture("plus-format");
+    let (repo, store, _cleanup) = index_fixture("plus-format");
 
     let (code, out, err) = run(&["plus", "do_it", "--k", "3"], &repo, &store);
     assert_eq!(code, 0, "plus should exit 0; stderr={err}\nstdout={out}");
@@ -556,7 +583,7 @@ fn plus_outputs_grep_like_signal_rows() {
 
 #[test]
 fn plus_json_reports_budget_and_ranked_hits_without_changing_text_default() {
-    let (repo, store) = index_fixture("plus-json");
+    let (repo, store, _cleanup) = index_fixture("plus-json");
 
     let (code, out, err) = run(
         &["plus", "do_it", "--json", "--diagnostics", "--k", "1"],
@@ -612,7 +639,7 @@ fn plus_json_reports_budget_and_ranked_hits_without_changing_text_default() {
 
 #[test]
 fn plus_vectors_json_skips_embedding_on_literal_control_before_model_load() {
-    let (repo, store) = index_fixture("plus-vector-literal-control");
+    let (repo, store, _cleanup) = index_fixture("plus-vector-literal-control");
 
     let (code, out, err) = run(
         &["plus", "do_it", "--json", "--diagnostics", "--k", "1"],
@@ -647,7 +674,7 @@ fn plus_vectors_json_skips_embedding_on_literal_control_before_model_load() {
 
 #[test]
 fn plus_vectors_json_skips_embedding_on_graph_control_before_model_load() {
-    let (repo, store) = index_fixture("plus-vector-graph-control");
+    let (repo, store, _cleanup) = index_fixture("plus-vector-graph-control");
 
     let (code, out, err) = run(
         &[
@@ -688,7 +715,7 @@ fn plus_vectors_json_skips_embedding_on_graph_control_before_model_load() {
 
 #[test]
 fn plus_code_flag_prints_source_span_under_hit() {
-    let (repo, store) = index_fixture("plus-code");
+    let (repo, store, _cleanup) = index_fixture("plus-code");
 
     let (code, out, err) = run(&["plus", "do_it", "--code", "--k", "1"], &repo, &store);
     assert_eq!(
@@ -709,7 +736,7 @@ fn plus_code_flag_prints_source_span_under_hit() {
 /// from the old generation in the triggering request.
 #[test]
 fn plus_json_refuses_current_request_while_small_drift_refreshes() {
-    let (repo, store) = index_fixture("plus-json-stale");
+    let (repo, store, _cleanup) = index_fixture("plus-json-stale");
     std::fs::write(
         repo.join("src/helper.rs"),
         "pub fn do_it_changed() -> u32 {\n    44\n}\n",
@@ -737,7 +764,7 @@ fn plus_json_refuses_current_request_while_small_drift_refreshes() {
 /// With automatic refresh disabled, stale plus refuses all indexed signals.
 #[test]
 fn plus_refuses_stale_hits_when_auto_reindex_disabled() {
-    let (repo, store) = index_fixture("plus-stale");
+    let (repo, store, _cleanup) = index_fixture("plus-stale");
     std::fs::write(
         repo.join("src/helper.rs"),
         "pub fn do_it_changed() -> u32 {\n    44\n}\n",
@@ -780,6 +807,7 @@ fn plus_refuses_stale_hits_when_auto_reindex_disabled() {
 #[test]
 fn plus_explain_line_one_module_hit_uses_display_name() {
     let root = fresh_dir("plus-module-explain");
+    let _cleanup = FixtureCleanup::for_root(&root);
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -817,7 +845,7 @@ fn plus_explain_line_one_module_hit_uses_display_name() {
 // byte-exact verbatim file lines (their own indentation kept, no dedent).
 #[test]
 fn who_calls_code_prints_the_byte_exact_call_site_statement() {
-    let (repo, store) = index_fixture("whocalls-code");
+    let (repo, store, _cleanup) = index_fixture("whocalls-code");
 
     // `do_it` is called by `caller` in lib.rs from one statement on line 7.
     // who-calls --code must print the call-site address and exactly that
@@ -837,7 +865,7 @@ fn who_calls_code_prints_the_byte_exact_call_site_statement() {
 
 #[test]
 fn who_calls_without_code_omits_body() {
-    let (repo, store) = index_fixture("whocalls-nocode");
+    let (repo, store, _cleanup) = index_fixture("whocalls-nocode");
 
     // Without --code, the body marker must NOT appear (pointer-only).
     let (code, out, _err) = run(&["who-calls", "do_it"], &repo, &store);
@@ -850,7 +878,7 @@ fn who_calls_without_code_omits_body() {
 
 #[test]
 fn brief_json_preserves_definition_and_expand_contract() {
-    let (repo, store) = index_fixture("brief-json-contract");
+    let (repo, store, _cleanup) = index_fixture("brief-json-contract");
 
     let (code, out, err) = run(
         &["brief", "caller", "--json", "--diagnostics"],
@@ -897,7 +925,7 @@ fn brief_json_preserves_definition_and_expand_contract() {
 
 #[test]
 fn callees_code_includes_callee_body() {
-    let (repo, store) = index_fixture("callees-code");
+    let (repo, store, _cleanup) = index_fixture("callees-code");
 
     // `caller` calls `do_it`; callees --code must include do_it's body.
     let (code, out, err) = run(&["callees", "caller", "--code"], &repo, &store);
@@ -914,7 +942,7 @@ fn callees_code_includes_callee_body() {
 
 #[test]
 fn trace_code_includes_node_body() {
-    let (repo, store) = index_fixture("trace-code");
+    let (repo, store, _cleanup) = index_fixture("trace-code");
 
     // Outgoing trace from `caller` reaches `do_it`; --code must include
     // do_it's body.

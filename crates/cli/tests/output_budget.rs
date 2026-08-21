@@ -164,6 +164,39 @@ fn who_calls_json_budget_keeps_structure_total_and_executable_retry() {
 }
 
 #[test]
+fn multi_brief_json_budget_keeps_whole_ordered_results_and_retry() {
+    let (repo, store) = fixture();
+    let budget = 3_000usize;
+    let (code, stdout, stderr) = run(
+        repo,
+        store,
+        &[
+            "brief",
+            "caller_0",
+            "caller_1",
+            "--json",
+            "--max-bytes",
+            "3000",
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.len() <= budget, "{} bytes\n{stdout}", stdout.len());
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["schema_version"], "greppy.brief.batch.v1");
+    assert_eq!(value["total"], 2);
+    let results = value["results"].as_array().expect("batch results");
+    assert!(!results.is_empty(), "{stdout}");
+    assert_eq!(results[0]["query"], "caller_0");
+    if results.len() == 2 {
+        assert_eq!(results[1]["query"], "caller_1");
+    } else {
+        assert_eq!(value["truncated"], true);
+        assert!(value["try"].as_str().unwrap().contains("--offset 1"));
+    }
+}
+
+#[test]
 fn mini_budget_never_cuts_a_json_diagnostic() {
     let (repo, store) = fixture();
     let (code, stdout, stderr) = run(

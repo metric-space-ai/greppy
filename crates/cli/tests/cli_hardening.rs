@@ -1153,6 +1153,11 @@ fn doctor_json_reports_missing_index_as_structured_status() {
     assert_eq!(v["project"], "repo");
     assert_eq!(v["project_present"], false);
     assert_eq!(v["fresh"], false);
+    assert_eq!(v["store_cow"]["mode"], "single");
+    assert_eq!(v["store_cow"]["base_path"], serde_json::Value::Null);
+    assert_eq!(v["store_cow"]["base_complete"], serde_json::Value::Null);
+    assert_eq!(v["store_cow"]["fallback_reason"], serde_json::Value::Null);
+    assert_eq!(v["store_cow"]["delta_path"], v["store_path"]);
     for model in ["embedding", "summary"] {
         assert_eq!(v["inference"]["models"][model]["embedded"], true);
         assert_eq!(

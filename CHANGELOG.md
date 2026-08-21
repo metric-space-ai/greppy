@@ -2,13 +2,53 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
+## [0.3.2] — 2026-08-21
+
+### Parallel Agent Store CoW
+
+Concurrent `greppy -p` runs now share one content-identified, immutable Base
+Store for unchanged code while keeping a writable Delta Store private to each
+agent. The Base identity covers the Git tree, store schema, indexer/extractor
+contract, and summary and embedding contracts. One leased builder publishes a
+complete graph, text index, summaries, and embeddings atomically; followers
+reuse it read-only. Corrupt or incompatible generations are quarantined and
+rebuilt, with an explicit full-private fallback if preparation cannot complete.
+
+Overlay queries cover graph navigation, callers/callees, traversals, path and
+impact, symbol and content search, FTS and vector search, `brief`, `read`,
+`expand`, stats, freshness, and diagnostics. Dirty and deleted Base paths are
+suppressed against the pinned Base commit, cross-layer edges resolve through
+logical symbol identity, rankings merge deterministically, and an exact revert
+removes the Delta contribution. Atomic Delta snapshots preserve the previous
+generation across a failed publication.
+
+`greppy index --agent-worktree` now builds or validates the same shared Base
+the integrated agent will consume. `greppy -p --private-store` opts one run out
+of Base reuse for diagnosis. `doctor`, `diagnostics`, and index-health output
+report Store mode, identities, completeness, changed paths, cache hits, and
+fallback reason. Shared Agent Bases participate in ownership-checked TTL/LRU
+cache management and are protected from eviction by live reader leases.
+
+The sandbox exposes the Base only as readable data and gives each agent an
+isolated writable Delta. Differential full-reindex tests cover edits, deletes,
+renames, untracked files, exact revert, graph and text query families, and
+pre-publication crashes; concurrency tests gate ten agents and stress fifty
+isolated Deltas. Base summaries and embeddings are reused across ten agents
+without duplicate private rows.
+
+### Batched brief
+
+`brief` now accepts multiple symbols, including newline-delimited selectors on
+stdin. Human and JSON output preserve requested order, apply the global output
+budget only at whole-result boundaries, and return a usable retry when the next
+complete result does not fit.
+
 ## [0.3.0] — 2026-08-12
 
 The first release of the 0.3 line, and it ships the whole line: everything
 below, developed as 0.3.0 and 0.3.1, lands here together. (An interim
 internal tag named v0.3.1 existed briefly during stabilisation and was
-retired; the next release will be 0.3.1, collecting the fix round currently
-under bench validation.)
+retired.)
 
 ### Fixes landed during bench stabilisation (2026-08-08 … 2026-08-12)
 

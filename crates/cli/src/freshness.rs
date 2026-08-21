@@ -436,9 +436,16 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         Ok(lock) => lock,
         _ => return false, // another writer is active: refuse this snapshot
     };
-    let Ok(store) =
-        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())
-    else {
+    let overlay = crate::store_cow::overlay_spec_live(&effective_root)
+        .ok()
+        .flatten();
+    let store = match overlay.as_ref() {
+        Some(overlay) => {
+            greppy_store::Store::open_overlay(&overlay.base_path, &store_path, &overlay.visibility)
+        }
+        None => greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only()),
+    };
+    let Ok(store) = store else {
         return false;
     };
     // Remember whether this store served code-span vectors BEFORE the
@@ -465,18 +472,33 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     };
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
+        only_paths: None,
     };
-    index_atomic_snapshot(
-        &store_path,
-        &effective_root,
-        &project,
-        embedding_cfg.as_ref(),
-        &options,
-        false,
-        None,
-    )
-    .map(|snapshot| snapshot.index.is_clean())
-    .unwrap_or(false)
+    if let Some(overlay) = overlay.as_ref() {
+        crate::indexing::index_overlay_snapshot(
+            &store_path,
+            &effective_root,
+            &project,
+            overlay,
+            embedding_cfg.as_ref(),
+            &options,
+            false,
+        )
+        .map(|code| code == 0)
+        .unwrap_or(false)
+    } else {
+        index_atomic_snapshot(
+            &store_path,
+            &effective_root,
+            &project,
+            embedding_cfg.as_ref(),
+            &options,
+            false,
+            None,
+        )
+        .map(|snapshot| snapshot.index.is_clean())
+        .unwrap_or(false)
+    }
 }
 
 pub(crate) fn freshness_json_is_fresh(freshness: &serde_json::Value) -> bool {
@@ -500,6 +522,27 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // any `greppy index` would have failed to open the store anyway).
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
+    }
+    if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
+        greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
+            Error::io(
+                format!(
+                    "create private Delta Store for {}",
+                    effective_root.display()
+                ),
+                error,
+            )
+        })?;
+        if !path.exists() {
+            drop(greppy_store::Store::open(&path)?);
+        }
+        let store =
+            greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)?;
+        let _ = workspace_locator::ensure_db_mode(&path);
+        if let Some(store_dir) = path.parent() {
+            workspace_locator::touch_lastused(store_dir);
+        }
+        return Ok(store);
     }
     // Forensics F4: a query against a repo that was never indexed used to
     // open a non-existent DB, fail deep in SQLite, and exit 73 (EXIT_IO)
@@ -596,6 +639,22 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
 pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
     let path = workspace_locator::store_path(&effective_root);
+    if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
+        greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
+            Error::io(
+                format!(
+                    "create private Delta Store for {}",
+                    effective_root.display()
+                ),
+                error,
+            )
+        })?;
+        if !path.exists() {
+            drop(greppy_store::Store::open(&path)?);
+        }
+        return greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)
+            .map_err(Into::into);
+    }
     if !path.exists() {
         // Reuse the normal query open to trigger the existing first-use
         // auto-index/error path, then reopen writable for the evidence write.
@@ -647,6 +706,7 @@ pub(crate) fn try_auto_index_inline(root: Option<&str>) -> bool {
     }
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
+        only_paths: None,
     };
     index_atomic_snapshot(
         &store_path,

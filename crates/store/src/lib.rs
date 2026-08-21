@@ -31,6 +31,7 @@
 
 #![deny(rust_2018_idioms)]
 
+pub mod base_store;
 pub mod diagnostics;
 pub mod edge;
 pub mod expand_pack;
@@ -54,8 +55,13 @@ pub mod summary_cache;
 pub mod vector_embedding;
 pub mod workspace_state;
 
+pub use base_store::{
+    BaseBuilderLease, BaseReaderLease, BaseStoreIdentity, BaseStoreLayout, BaseStoreManifest,
+    StoreView, VisibilityIndex, BASE_STORE_FORMAT_VERSION, BASE_STORE_MANIFEST_FILE,
+    BASE_SUMMARY_CACHE_FILE, COMPLETE_FILE,
+};
 pub use diagnostics::{ProjectDiagnostics, StoreDiagnostics};
-pub use edge::{Edge, NewEdge};
+pub use edge::{Edge, NewEdge, NewOverlayEdge};
 pub use expand_pack::{ExpandPack, NewExpandPack, DEFAULT_EXPAND_TTL_SECS};
 pub use file_content::{ContentRow, FileContentHit};
 pub use file_identity::FileIdentity;

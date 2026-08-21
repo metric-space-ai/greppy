@@ -61,7 +61,7 @@ impl Store {
             .map_err(|e| crate::Error::Store(format!("serialize provider diagnostics: {e}")))?;
         let tx = self.transaction()?;
         tx.raw().execute(
-            "INSERT INTO provider_state
+            "INSERT INTO main.provider_state
                   (project, language, provider_version, status,
                    supported_edge_classes, unsupported_edge_classes,
                    files_seen, files_indexed, files_failed, diagnostics,
@@ -104,7 +104,7 @@ impl Store {
     ) -> Result<()> {
         let tx = self.transaction()?;
         tx.raw().execute(
-            "DELETE FROM provider_state WHERE project = ?1",
+            "DELETE FROM main.provider_state WHERE project = ?1",
             params![project],
         )?;
         tx.commit()?;
