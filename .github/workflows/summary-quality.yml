@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - crates/cli/assets/MODEL_ASSETS.json
+      - bench/BENCHMARK_CORPUS.lock.json
+      - tools/materialize_benchmark_corpus.py
   workflow_dispatch:
 
 permissions:
@@ -20,6 +22,10 @@ jobs:
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Materialize digest-locked summary cases
+        run: |
+          python3 tools/materialize_benchmark_corpus.py \
+            --target bench/summary_quality/cases_v1.json
       - name: Restore model assets
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:

@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - crates/cli/assets/MODEL_ASSETS.json
+      - bench/BENCHMARK_CORPUS.lock.json
+      - tools/materialize_benchmark_corpus.py
   workflow_dispatch:
 
 permissions:
@@ -20,16 +22,13 @@ jobs:
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: Locate external coding task bank
+      - name: Materialize digest-locked coding task bank
         id: coding_task_bank
         shell: bash
         run: |
-          if test -s bench/agent_coding/tasks_v2.json; then
-            echo 'available=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'available=false' >> "$GITHUB_OUTPUT"
-            echo '::notice::coding task bank is maintained outside this checkout; benchmark skipped without publishing evidence'
-          fi
+          python3 tools/materialize_benchmark_corpus.py \
+            --target bench/agent_coding/tasks_v2.json
+          echo 'available=true' >> "$GITHUB_OUTPUT"
       - name: Restore model assets
         if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830

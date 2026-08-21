@@ -1,0 +1,27 @@
+{
+  "schema_version": "greppy.benchmark-corpus-lock.v1",
+  "repository": "metric-space-ai/greppy",
+  "commit": "95d359e2ff32f8a988f39b099aaf4a239814d7c4",
+  "files": [
+    {
+      "source": "bench/agent_efficiency/tasks_v2.json",
+      "target": "bench/agent_efficiency/tasks_v2.json",
+      "sha256": "111c28361710fb0b607bb83fe4cef0c13afe93d6abd22bac948522e2c8fa17a0"
+    },
+    {
+      "source": "bench/agent_efficiency/realcorpus/candidates.json",
+      "target": "bench/agent_efficiency/realcorpus/candidates.json",
+      "sha256": "1ca14f6883b6d1e0fa2a00a5468a55d7ad6151ca9a58333ccf2501eb74e3dd92"
+    },
+    {
+      "source": "bench/summary_quality/cases_v1.json",
+      "target": "bench/summary_quality/cases_v1.json",
+      "sha256": "9efcc533dfed8add87a47debb31ce5511a4950b946aebd75a92d573b01da6b68"
+    },
+    {
+      "source": "bench/agent_coding/tasks_v2.json",
+      "target": "bench/agent_coding/tasks_v2.json",
+      "sha256": "8dd46a943f94fb0fcc8d446ec2809e487b68dfb44f7bcd1dcdfb3f6dfb4e1360"
+    }
+  ]
+}

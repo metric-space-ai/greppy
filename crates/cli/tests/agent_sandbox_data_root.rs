@@ -23,8 +23,37 @@ use greppy_agent::{sandbox, ExecutionEnv, GreppyEnv, SandboxMode};
 use serde_json::json;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
-/// Both tests mutate process-global `GREPPY_STORE_DIR` / `TMPDIR`; serialize.
+/// Both tests mutate process-global sandbox/build environment; serialize.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct ScopedEnv {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnv {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
@@ -130,9 +159,9 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
 
     // Safety: set only for this process; integration tests run in their own
     // binary process so this cannot poison parallel unit-test threads.
-    std::env::set_var("GREPPY_STORE_DIR", &agent_data);
-    std::env::set_var("TMPDIR", &scratch);
-    std::env::set_var("GREPPY_AGENT_BASE_STORE", &shared_base_graph);
+    let store_env = ScopedEnv::set("GREPPY_STORE_DIR", &agent_data);
+    let tmp_env = ScopedEnv::set("TMPDIR", &scratch);
+    let base_store_env = ScopedEnv::set("GREPPY_AGENT_BASE_STORE", &shared_base_graph);
 
     let roots = agent_writable_roots(&worktree, &scratch, &agent_data);
     assert!(
@@ -306,8 +335,7 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
         "TMPDIR must be inside scratch; reported={reported:?} scratch={scratch_s}"
     );
 
-    std::env::remove_var("GREPPY_STORE_DIR");
-    std::env::remove_var("GREPPY_AGENT_BASE_STORE");
+    drop((base_store_env, tmp_env, store_env));
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -328,8 +356,13 @@ fn enforce_cargo_test_in_scratch_crate_still_works() {
     std::fs::create_dir_all(&agent_data).unwrap();
     let scratch = base.join("greppy-agent-scratch").join("run");
     std::fs::create_dir_all(&scratch).unwrap();
-    std::env::set_var("GREPPY_STORE_DIR", &agent_data);
-    std::env::set_var("TMPDIR", &scratch);
+    let store_env = ScopedEnv::set("GREPPY_STORE_DIR", &agent_data);
+    let tmp_env = ScopedEnv::set("TMPDIR", &scratch);
+    // A host/CI target directory may sit outside the deliberately narrow
+    // sandbox roots. This fixture verifies worktree-local builds, so force
+    // Cargo back to its ordinary `tiny/target` rather than granting a shared
+    // writable build cache to the agent.
+    let cargo_target_env = ScopedEnv::remove("CARGO_TARGET_DIR");
 
     let roots = agent_writable_roots(&worktree, &scratch, &agent_data);
     let mode = match sandbox::resolve_enforce_spec(&roots) {
@@ -371,6 +404,6 @@ fn enforce_cargo_test_in_scratch_crate_still_works() {
         out.content
     );
 
-    std::env::remove_var("GREPPY_STORE_DIR");
+    drop((cargo_target_env, tmp_env, store_env));
     let _ = std::fs::remove_dir_all(&base);
 }

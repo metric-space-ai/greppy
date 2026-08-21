@@ -14,6 +14,8 @@ on:
       - 'bench/agent_efficiency/task_classes.json'
       - 'bench/agent_efficiency/real_corpus.py'
       - 'bench/agent_efficiency/realcorpus/candidates.json'
+      - 'bench/BENCHMARK_CORPUS.lock.json'
+      - 'tools/materialize_benchmark_corpus.py'
   pull_request:
     paths:
       - '.github/workflows/task-bank-audit.yml'
@@ -25,6 +27,8 @@ on:
       - 'bench/agent_efficiency/task_classes.json'
       - 'bench/agent_efficiency/real_corpus.py'
       - 'bench/agent_efficiency/realcorpus/candidates.json'
+      - 'bench/BENCHMARK_CORPUS.lock.json'
+      - 'tools/materialize_benchmark_corpus.py'
 
 permissions:
   contents: read
@@ -37,6 +41,11 @@ jobs:
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Materialize digest-locked navigation task bank
+        run: |
+          python3 tools/materialize_benchmark_corpus.py \
+            --target bench/agent_efficiency/tasks_v2.json \
+            --target bench/agent_efficiency/realcorpus/candidates.json
       - name: Restore model assets
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:

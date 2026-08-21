@@ -540,13 +540,18 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
     }
-    if let Some(flag) = rest.iter().skip(1).find_map(|token| {
-        let token = token.to_str()?;
-        DEAD_EDIT_FLAGS
-            .iter()
-            .find(|flag| token == **flag || token.starts_with(&format!("{flag}=")))
-            .copied()
-    }) {
+    if let Some(flag) = rest
+        .iter()
+        .skip(1)
+        .take_while(|token| *token != "--")
+        .find_map(|token| {
+            let token = token.to_str()?;
+            DEAD_EDIT_FLAGS
+                .iter()
+                .find(|flag| token == **flag || token.starts_with(&format!("{flag}=")))
+                .copied()
+        })
+    {
         return Some(format!("error: unrecognized argument '{flag}'"));
     }
     if verb.starts_with('-') || SUBCOMMANDS.contains(&verb) {

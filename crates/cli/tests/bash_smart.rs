@@ -93,6 +93,27 @@ fn short_output_follows_verdict_and_exit_code_passes_through() {
 }
 
 #[test]
+fn child_flags_after_delimiter_pass_through_unchanged() {
+    let workspace = fresh_workspace("child-flag");
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"$1\"",
+            "child",
+            "--target",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"ok \xe2\x80\x94 exit 0\n--target\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
     let workspace = fresh_workspace("long");
     let output = run(

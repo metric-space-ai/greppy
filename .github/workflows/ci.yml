@@ -148,6 +148,7 @@ jobs:
 
       - name: paired coding benchmark harness
         run: |
+          python3 -m unittest tools.test_materialize_benchmark_corpus -v
           python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
           # v1 micro-revert bank retired (owner decision 2026-07-21); full
           # validate-only returns once the v2 runner integration lands.
