@@ -331,7 +331,7 @@ echo "embedding endpoint: $EMBED_SOCK"
 echo "summary endpoint:   $SUMMARY_SOCK"
 
 run_semantic() { # run_semantic <label> <query>
-  "$BIN" --root "$REPO_EMBED" semantic-search "$2" --json >"$WORK/out/$1.json" \
+  "$BIN" --root "$REPO_EMBED" search --json "$2" >"$WORK/out/$1.json" \
     || fail "semantic-search '$2' exited $?"
   jq -e '.status == "ok" and (.hits | length) >= 1' "$WORK/out/$1.json" >/dev/null \
     || fail "semantic-search '$2' returned no ok hits"
@@ -411,7 +411,7 @@ section "concurrency: 32+ connections, single owner, classified queue-limit reje
 BEFORE_COMPLETED="$(python3 "$CLIENT" status "$EMBED_SOCK" | jq -r '.completed_requests')"
 CLI_PIDS=""
 for i in 1 2 3 4 5; do
-  "$BIN" --root "$REPO_EMBED" semantic-search "$(unique_query "burst-$i")" --json \
+  "$BIN" --root "$REPO_EMBED" search --json "$(unique_query "burst-$i")" \
     >"$WORK/out/burst-$i.json" 2>"$WORK/out/burst-$i.err" &
   CLI_PIDS="$CLI_PIDS $!"
 done
@@ -458,7 +458,7 @@ REJECTED="$(python3 "$CLIENT" status "$EMBED_SOCK" | jq -r '.rejected_requests')
 section "kill -9 mid-load: stale socket repaired, fresh owner, correct answers"
 
 for i in 1 2 3; do
-  "$BIN" --root "$REPO_EMBED" semantic-search "$(unique_query "kill-$i")" --json \
+  "$BIN" --root "$REPO_EMBED" search --json "$(unique_query "kill-$i")" \
     >"$WORK/out/kill-$i.json" 2>&1 &
 done
 python3 "$CLIENT" wait-active "$EMBED_SOCK" 60 >/dev/null \

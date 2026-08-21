@@ -265,6 +265,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("pgrep -f", unix_smoke)
         self.assertIn('find "$RUNTIME_BASE"', unix_smoke)
 
+        for probe_path in (
+            "bench/release_daemon_stress.sh",
+            "bench/hardware_evidence.sh",
+        ):
+            probe = (REPOSITORY_ROOT / probe_path).read_text(encoding="utf-8")
+            self.assertNotRegex(probe, r'\$BIN[^\n]*\bsemantic-search\b')
+            self.assertIn(" search --json ", probe)
+
 
 if __name__ == "__main__":
     unittest.main()

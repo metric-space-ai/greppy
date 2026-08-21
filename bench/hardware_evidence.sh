@@ -357,7 +357,7 @@ series_json() {
 
 section "measure: semantic-search latency ($CALLS calls)"
 measure_series semantic-search "$WORK/search.samples" -- \
-  "$BIN" --device "$DEVICE_FLAG" --root "$WORK/repo" semantic-search "$QUERY" --json
+  "$BIN" --device "$DEVICE_FLAG" --root "$WORK/repo" search --json "$QUERY"
 SEARCH_JSON="$(series_json "$WORK/search.samples")"
 echo "semantic-search: $SEARCH_JSON"
 
@@ -381,7 +381,7 @@ jq -e '
 ' "$WORK/brief.json" >/dev/null || ok=1
 check "brief returns definition with summary" $ok
 
-"$BIN" --device "$DEVICE_FLAG" --root "$WORK/repo" semantic-search "$QUERY" --json >"$WORK/semantic.json"
+"$BIN" --device "$DEVICE_FLAG" --root "$WORK/repo" search --json "$QUERY" >"$WORK/semantic.json"
 ok=0
 jq -e '
   .schema_version == "greppy.semantic-search.v1" and
@@ -397,7 +397,7 @@ ok=0
     && jq -e --arg id "$EXPAND_ID" '.id == $id and (.payload_text | length > 0)' "$WORK/expand.json" >/dev/null; } || ok=1
 check "expand resolves search evidence" $ok
 
-"$BIN" --device "$DEVICE_FLAG" --root "$WORK/repo" semantic-search "$QUERY" --json >"$WORK/semantic2.json"
+"$BIN" --device "$DEVICE_FLAG" --root "$WORK/repo" search --json "$QUERY" >"$WORK/semantic2.json"
 ok=0
 [ "$(jq -c '[.hits[].qualified_name]' "$WORK/semantic.json")" = "$(jq -c '[.hits[].qualified_name]' "$WORK/semantic2.json")" ] || ok=1
 check "semantic-search ordering is deterministic across reruns" $ok
