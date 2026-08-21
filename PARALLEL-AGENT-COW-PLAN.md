@@ -340,7 +340,11 @@ are release requirements, not deferred cleanup:
 - the release performance harness must run explicitly in release mode and emit
   its machine-readable measurements and thresholds; its internal
   `store-cow-release-perf` build disables inference variance without enabling
-  the test bypass in shipped release binaries.
+  the test bypass in shipped release binaries;
+- the non-blocking coding-outcome workflow must not fail because its externally
+  maintained task corpus is absent from the product checkout: absence is an
+  explicit no-evidence skip, while a present corpus still runs and publishes
+  the complete preregistered gate.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

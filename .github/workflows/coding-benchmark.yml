@@ -20,7 +20,18 @@ jobs:
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Locate external coding task bank
+        id: coding_task_bank
+        shell: bash
+        run: |
+          if test -s bench/agent_coding/tasks_v2.json; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::coding task bank is maintained outside this checkout; benchmark skipped without publishing evidence'
+          fi
       - name: Restore model assets
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
@@ -31,21 +42,25 @@ jobs:
           key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
 
       - name: Fetch model assets (release-hosted, sha-pinned)
+        if: steps.coding_task_bank.outputs.available == 'true'
         shell: bash
         run: ./tools/fetch_model_assets.sh
 
       - name: Install pinned Rust toolchain
+        if: steps.coding_task_bank.outputs.available == 'true'
         # dtolnay/rust-toolchain v1, pinned to an immutable source revision.
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: '1.95.0'
 
       - name: Install pinned benchmark runtimes
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '25.9.0'
 
       - name: Install pinned Pi Code and pnpm
+        if: steps.coding_task_bank.outputs.available == 'true'
         run: |
           npm install --global \
             @earendil-works/pi-coding-agent@0.80.2 \
@@ -54,22 +69,26 @@ jobs:
           test "$(pnpm --version)" = "10.12.1"
 
       - name: Install pinned Python
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.13.13'
 
       - name: Install pinned Java
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
           distribution: temurin
           java-version: '21.0.11'
 
       - name: Install pinned Go
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: '1.26.2'
 
       - name: Verify public task and harness contract
+        if: steps.coding_task_bank.outputs.available == 'true'
         run: |
           python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
           python3 bench/agent_coding/run_benchmark.py \
@@ -77,13 +96,16 @@ jobs:
             --validate-only
 
       - name: Verify bundled inference assets
+        if: steps.coding_task_bank.outputs.available == 'true'
         run: |
           python3 tools/verify_model_redistribution.py
 
       - name: Build candidate binary with Metal
+        if: steps.coding_task_bank.outputs.available == 'true'
         run: cargo build --release --bin greppy --features metal
 
       - name: Run pre-registered coding outcome gate
+        if: steps.coding_task_bank.outputs.available == 'true'
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
@@ -98,7 +120,7 @@ jobs:
             --run-id "github-$GITHUB_SHA"
 
       - name: Show gate verdict and failure kinds (also on failure)
-        if: always()
+        if: ${{ always() && steps.coding_task_bank.outputs.available == 'true' }}
         env:
           RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
         run: |
@@ -122,7 +144,7 @@ jobs:
           fi
 
       - name: Upload gate diagnostics (also on failure, no raw traces)
-        if: always()
+        if: ${{ always() && steps.coding_task_bank.outputs.available == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: greppy-coding-benchmark-diagnostics-${{ github.sha }}
@@ -134,6 +156,7 @@ jobs:
             ${{ runner.temp }}/greppy-coding-benchmark/MANIFEST.json
 
       - name: Package publishable evidence without raw traces
+        if: steps.coding_task_bank.outputs.available == 'true'
         env:
           RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
         run: |
@@ -148,11 +171,13 @@ jobs:
           shasum -a 256 greppy-coding-benchmark.tar.gz > greppy-coding-benchmark.tar.gz.sha256
 
       - name: Attest coding benchmark evidence
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: greppy-coding-benchmark.tar.gz
 
       - name: Upload coding benchmark evidence
+        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: greppy-coding-benchmark-${{ github.sha }}
