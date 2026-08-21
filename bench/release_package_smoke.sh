@@ -4,7 +4,7 @@
 # The script is copied verbatim into the release tarball (see
 # .github/workflows/release.yml) and must stay self-contained: every fixture
 # is generated inline, and only POSIX-ish tooling that exists on the ubuntu
-# and macos runners is used (bash 3.2+, jq, cmp, find, pgrep, shasum or
+# and macos runners is used (bash 3.2+, jq, cmp, find, shasum or
 # sha256sum).
 
 set -euo pipefail
@@ -40,10 +40,11 @@ dir_digest() {
 # Inference daemons (crates/cli/src/embed_daemon.rs / summarize_daemon.rs)
 # outlive the CLI call that spawned them (GREPPY_*_DAEMON_EXIT_TTL_S). Cache
 # purity and cache-clear assertions must not race their lock files / socket
-# teardown, so wait for every daemon process to drain first.
+# teardown. Wait only for sockets and lock files in this smoke's owned runtime
+# directory: a global pgrep would couple the release to unrelated agents.
 drain_daemons() {
   local deadline=$(( $(date +%s) + 180 ))
-  while pgrep -f '(embed|summarize)-daemon --socket' >/dev/null 2>&1; do
+  while find "$RUNTIME_BASE" \( -type f -o -type s \) -print -quit 2>/dev/null | grep -q .; do
     [ "$(date +%s)" -lt "$deadline" ] || fail "inference daemons did not exit within 180s"
     sleep 1
   done
@@ -140,8 +141,8 @@ brief_expand="$(jq -r '.expand_id' "$WORK/brief.json")"
 "$BIN" --root "$WORK/repo" expand "$brief_expand" --json >"$WORK/brief-expand.json"
 jq -e --arg id "$brief_expand" '.id == $id and (.payload_text | contains("apply_limit"))' "$WORK/brief-expand.json" >/dev/null
 
-"$BIN" --device cpu --root "$WORK/repo" semantic-search \
-  "restrict a numeric value to an allowed range" --json >"$WORK/semantic.json"
+"$BIN" --device cpu --root "$WORK/repo" search --json \
+  "restrict a numeric value to an allowed range" >"$WORK/semantic.json"
 jq -e '
   .schema_version == "greppy.semantic-search.v1" and
   .status == "ok" and
@@ -162,68 +163,57 @@ jq -e --arg id "$semantic_expand" --argjson omitted "$semantic_omitted" '
 
 # --- text output mode: prescribed shape and deterministic ordering ----------
 # Contracts under test:
-# * brief (text): dispatch_brief in crates/cli/src/lib.rs prints, in this
-#   fixed order: the definition header `== NAME (file:start-end) ==`, then
-#   `-- CALLERS (n) --`, then (non-callable targets only) `-- REFERENCES
-#   (n) --`, then `-- CALLS (n) --`, then the trailing
-#   `Expand: greppy expand <id>` line (ExpandHandle::text_line).
-# * semantic-search (text): print_semantic_vector_hit in crates/cli/src/lib.rs
-#   prints one block per hit — a bare `file:start-end` locator line, an
-#   indented signature, indented purpose bullets — followed by the trailing
-#   `greppy expand <id>  → source evidence …` line
-#   (ExpandHandle::semantic_text_line).
+# * brief (text): BriefRender prints the generated purpose, compact locator,
+#   source span, and an aggregated `called by ...` tail in that order.
+# * search (text): print_search_meaning_rows prints one compact
+#   `file:start  symbol — purpose` row per hit. Text mode intentionally shows
+#   up to eight hits while JSON exposes a smaller display window plus expand.
 # * Hit ordering: crates/store/src/vector_embedding.rs vector_search_exact:
 #   "Ranking is total and deterministic: score descending, then
-#   `qualified_name`, then row id." The JSON hits array is rendered from the
-#   same ranked slice, so text order must equal JSON order, and JSON scores
-#   must be non-increasing.
+#   `qualified_name`, then row id." JSON's displayed rows must therefore be a
+#   prefix of text mode, and JSON scores must be non-increasing.
 section "text output mode: prescribed shape and deterministic ordering"
 
 "$BIN" --device cpu --root "$WORK/repo" brief apply_limit >"$WORK/brief.txt"
 first_match_line() { grep -n "$1" "$2" | head -1 | cut -d: -f1 || true; }
-def_line="$(first_match_line '^== .*apply_limit (src/lib.rs:1-1) ==$' "$WORK/brief.txt")"
-callers_line="$(first_match_line '^-- CALLERS ([0-9]*) --$' "$WORK/brief.txt")"
-calls_line="$(first_match_line '^-- CALLS ([0-9]*) --$' "$WORK/brief.txt")"
-expand_line="$(first_match_line '^Expand: greppy expand ' "$WORK/brief.txt")"
-[ -n "$def_line" ] || fail "brief text: missing '== …apply_limit (src/lib.rs:1-1) ==' definition header"
-[ -n "$callers_line" ] || fail "brief text: missing '-- CALLERS (n) --' section"
-[ -n "$calls_line" ] || fail "brief text: missing '-- CALLS (n) --' section"
-[ -n "$expand_line" ] || fail "brief text: missing trailing 'Expand: greppy expand' line"
-[ "$def_line" -lt "$callers_line" ] || fail "brief text: definition must precede CALLERS"
-[ "$callers_line" -lt "$calls_line" ] || fail "brief text: CALLERS must precede CALLS"
-[ "$calls_line" -lt "$expand_line" ] || fail "brief text: CALLS must precede the Expand line"
-[ "$expand_line" -eq "$(grep -c '' "$WORK/brief.txt")" ] || fail "brief text: Expand line must be the last line"
-grep -q 'process_value src/lib.rs:2-2$' "$WORK/brief.txt" \
-  || fail "brief text: expected caller row for process_value at src/lib.rs:2-2"
+purpose_line="$(first_match_line '^.*range 0 to 100\.$' "$WORK/brief.txt")"
+locator_line="$(first_match_line '^src/lib.rs:1$' "$WORK/brief.txt")"
+source_line="$(first_match_line '^pub fn apply_limit(value: i32) -> i32 { value.clamp(0, 100) }$' "$WORK/brief.txt")"
+caller_line="$(first_match_line '^called by process_value$' "$WORK/brief.txt")"
+[ -n "$purpose_line" ] || fail "brief text: missing generated apply_limit purpose"
+[ -n "$locator_line" ] || fail "brief text: missing compact src/lib.rs:1 locator"
+[ -n "$source_line" ] || fail "brief text: missing apply_limit source span"
+[ -n "$caller_line" ] || fail "brief text: missing aggregated caller tail"
+[ "$purpose_line" -lt "$locator_line" ] || fail "brief text: purpose must precede locator"
+[ "$locator_line" -lt "$source_line" ] || fail "brief text: locator must precede source"
+[ "$source_line" -lt "$caller_line" ] || fail "brief text: source must precede caller tail"
 
 # JSON scores must be non-increasing (the ranked half of the contract).
 jq -e '[.hits[].score] | . == (sort | reverse)' "$WORK/semantic.json" >/dev/null \
   || fail "semantic-search JSON: hit scores are not in descending order"
 
 semantic_locs_from_text() {
-  # Locator lines are the only non-indented lines apart from the trailing
-  # expand handle; blocks are blank-line separated.
-  awk '/^[^ ]/ && $0 !~ /^greppy expand / && NF > 0' "$1"
+  awk -F '  ' '$1 ~ /^[^ ]+:[0-9]+$/ && NF >= 2 { print $1 }' "$1"
 }
 
-"$BIN" --device cpu --root "$WORK/repo" semantic-search \
+"$BIN" --device cpu --root "$WORK/repo" search \
   "restrict a numeric value to an allowed range" >"$WORK/semantic.txt"
-grep -Eq '^greppy expand [^ ]+  → source evidence for ' "$WORK/semantic.txt" \
-  || fail "semantic-search text: missing trailing 'greppy expand <id>' evidence line"
 semantic_locs_from_text "$WORK/semantic.txt" >"$WORK/semantic-locs-text.txt"
 [ -s "$WORK/semantic-locs-text.txt" ] || fail "semantic-search text: no hit locator lines found"
-grep -Eq '^src/[a-z_]+\.rs:[0-9]+(-[0-9]+)?$' "$WORK/semantic-locs-text.txt" \
-  || fail "semantic-search text: locator lines do not look like file:start-end"
+grep -Eq '^src/[a-z_]+\.rs:[0-9]+$' "$WORK/semantic-locs-text.txt" \
+  || fail "semantic-search text: locator lines do not look like file:start"
 
-# Text order must equal the ranked JSON order for the same query.
-jq -r '.hits[] | .summary_loc // "\(.file_path):\(.start_line)-\(.end_line)"' \
+# JSON's shorter display window must be the prefix of text's ranked rows.
+jq -r '.hits[] | "\(.file):\(.start_line)"' \
   "$WORK/semantic.json" >"$WORK/semantic-locs-json.txt"
-cmp -s "$WORK/semantic-locs-text.txt" "$WORK/semantic-locs-json.txt" \
-  || { diff -u "$WORK/semantic-locs-json.txt" "$WORK/semantic-locs-text.txt" >&2 || true; \
-       fail "semantic-search: text hit order diverges from ranked JSON order"; }
+head -n "$(wc -l <"$WORK/semantic-locs-json.txt" | tr -d ' ')" \
+  "$WORK/semantic-locs-text.txt" >"$WORK/semantic-locs-text-prefix.txt"
+cmp -s "$WORK/semantic-locs-text-prefix.txt" "$WORK/semantic-locs-json.txt" \
+  || { diff -u "$WORK/semantic-locs-json.txt" "$WORK/semantic-locs-text-prefix.txt" >&2 || true; \
+       fail "semantic-search: JSON rows are not a prefix of ranked text rows"; }
 
 # Repeating the query must reproduce the same ordering (determinism).
-"$BIN" --device cpu --root "$WORK/repo" semantic-search \
+"$BIN" --device cpu --root "$WORK/repo" search \
   "restrict a numeric value to an allowed range" >"$WORK/semantic-rerun.txt"
 semantic_locs_from_text "$WORK/semantic-rerun.txt" >"$WORK/semantic-locs-rerun.txt"
 cmp -s "$WORK/semantic-locs-text.txt" "$WORK/semantic-locs-rerun.txt" \
@@ -243,7 +233,7 @@ assert_brief_exact() {
   jq -e --arg sym "$symbol" '
     .status == "ok" and
     ([.definitions[].qualified_name] | any(contains($sym))) and
-    ([.definitions[].file_path] | any(. == "src/case.rs"))
+    ([.definitions[].file] | any(. == "src/case.rs"))
   ' "$WORK/brief-$symbol.json" >/dev/null \
     || fail "brief $symbol: expected an exact definition hit in src/case.rs"
 }
@@ -255,7 +245,7 @@ assert_semantic_retrieves() {
   local symbol="$1"
   local query="$2"
   local out="$WORK/semantic-$symbol.json"
-  "$BIN" --device cpu --root "$WORK/repo" semantic-search "$query" --json >"$out"
+  "$BIN" --device cpu --root "$WORK/repo" search --json "$query" >"$out"
   jq -e '.status == "ok" and (.hits | length) >= 1' "$out" >/dev/null \
     || fail "semantic-search '$query': expected status ok with hits"
   jq -r '.hits[].qualified_name' "$out" >"$WORK/semantic-$symbol-names.txt"
@@ -272,23 +262,26 @@ assert_semantic_retrieves apply_to_field "apply a rename case rule to a struct f
 assert_semantic_retrieves rename_by_rules "rename the serialize and deserialize names using the container rules"
 assert_semantic_retrieves serialize_name "return the field name used when serializing"
 
-# --- text/JSON parity --------------------------------------------------------
-# The same query in text and JSON mode must surface the same hit set: both
-# renderers consume the identical ranked slice (dispatch_semantic in
-# crates/cli/src/lib.rs), so the normalized `file:start-end` sets must match.
-section "text/JSON parity: identical hit set in both modes"
+# --- text/JSON ranked-prefix parity -----------------------------------------
+# Text shows up to eight compact rows; JSON shows a smaller display window and
+# puts the remaining retrieved hits behind expand. The displayed JSON rows
+# must be the prefix of the text ranking for the same query.
+section "text/JSON parity: JSON display is a prefix of text ranking"
 
 parity_query="apply a rename case rule to a struct field"
-"$BIN" --device cpu --root "$WORK/repo" semantic-search "$parity_query" >"$WORK/parity.txt"
-"$BIN" --device cpu --root "$WORK/repo" semantic-search "$parity_query" --json >"$WORK/parity.json"
+"$BIN" --device cpu --root "$WORK/repo" search "$parity_query" >"$WORK/parity.txt"
+"$BIN" --device cpu --root "$WORK/repo" search --json "$parity_query" >"$WORK/parity.json"
 jq -e '.status == "ok"' "$WORK/parity.json" >/dev/null
 semantic_locs_from_text "$WORK/parity.txt" | LC_ALL=C sort >"$WORK/parity-locs-text.txt"
-jq -r '.hits[] | .summary_loc // "\(.file_path):\(.start_line)-\(.end_line)"' \
-  "$WORK/parity.json" | LC_ALL=C sort >"$WORK/parity-locs-json.txt"
+jq -r '.hits[] | "\(.file):\(.start_line)"' \
+  "$WORK/parity.json" >"$WORK/parity-locs-json.txt"
 [ -s "$WORK/parity-locs-text.txt" ] || fail "parity: text mode returned no hits"
-cmp -s "$WORK/parity-locs-text.txt" "$WORK/parity-locs-json.txt" \
-  || { diff -u "$WORK/parity-locs-json.txt" "$WORK/parity-locs-text.txt" >&2 || true; \
-       fail "parity: text and JSON modes returned different hit sets"; }
+semantic_locs_from_text "$WORK/parity.txt" \
+  | head -n "$(wc -l <"$WORK/parity-locs-json.txt" | tr -d ' ')" \
+  >"$WORK/parity-locs-text-prefix.txt"
+cmp -s "$WORK/parity-locs-text-prefix.txt" "$WORK/parity-locs-json.txt" \
+  || { diff -u "$WORK/parity-locs-json.txt" "$WORK/parity-locs-text-prefix.txt" >&2 || true; \
+       fail "parity: JSON rows are not a prefix of text rows"; }
 
 # --- byte-exact grep passthrough without cache side effects ------------------
 # Contract (crates/cli/src/lib.rs run_os): passthrough detection runs BEFORE
@@ -491,8 +484,8 @@ run_installed() {
     "$PREFIX/bin/greppy" "$@"
 }
 run_installed --device cpu --root "$PREFIX/smoke-repo" index "$PREFIX/smoke-repo" >"$WORK/install-index.txt"
-run_installed --device cpu --root "$PREFIX/smoke-repo" semantic-search \
-  "restrict a numeric value to an allowed range" --json >"$WORK/install-semantic.json"
+run_installed --device cpu --root "$PREFIX/smoke-repo" search --json \
+  "restrict a numeric value to an allowed range" >"$WORK/install-semantic.json"
 jq -e '.status == "ok" and (.hits | length) >= 1' "$WORK/install-semantic.json" >/dev/null \
   || fail "installed binary: semantic-search returned no hits"
 

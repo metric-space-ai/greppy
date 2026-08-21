@@ -257,6 +257,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn(' semantic-search \'', windows_smoke)
         self.assertIn(" search --json ", windows_smoke)
 
+        unix_smoke = (
+            REPOSITORY_ROOT / "bench/release_package_smoke.sh"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('" semantic-search', unix_smoke)
+        self.assertGreaterEqual(unix_smoke.count(" search --json"), 4)
+        self.assertNotIn("pgrep -f", unix_smoke)
+        self.assertIn('find "$RUNTIME_BASE"', unix_smoke)
+
 
 if __name__ == "__main__":
     unittest.main()
