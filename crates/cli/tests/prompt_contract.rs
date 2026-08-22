@@ -337,16 +337,19 @@ fn edit_is_eleven_verbs_with_visible_signatures() {
 fn the_header_leads_with_the_product() {
     let text = prompt();
     let header: String = text.lines().take(4).collect::<Vec<_>>().join(" ");
-    // The directive leads (880f0eb): the first thing read is what to do, not
-    // what the tool is. The identity line and the grep promise still have to be
-    // there -- they are what makes the directive credible -- but they follow it.
+    // The product and one-shot routing lead: the first thing read is which
+    // greppy command answers the question, not how to fall back to grep.
     assert!(
         header.contains("greppy") && !header.starts_with("grep "),
         "the header leads with the product, not the fallback; header: {header}"
     );
     assert!(
-        header.contains("Do NOT run grep/find/read loops"),
-        "the directive is the first thing the reader meets; header: {header}"
+        header.contains("Default to ONE high-yield"),
+        "one-shot routing is the first thing the reader meets; header: {header}"
+    );
+    assert!(
+        text.contains("Do NOT run grep/find/read loops"),
+        "the fallback prohibition remains part of the prompt contract"
     );
     assert!(
         text.contains("holds this repository as a graph"),
@@ -374,8 +377,11 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // merge that carried the AGENT block into this line (7cc8bb5), and the
     // INDEX block, which names the one command an answer can now ask for
     // ("run `greppy index .` first") and would otherwise be unexplained.
+    // 22.08.2026: the owner approved the 0.3.2 one-shot routing contract:
+    // named definition/caller/impact/path questions go directly to one
+    // high-yield command and stop when its answer is sufficient.
     const APPROVED_SHA256: &str =
-        "e184b412f549db701f1ab5fa299e88850aae9e7bdb3420ceff033f6b4e6f9a16";
+        "d5824f0162cf8201b30880445e581cdc92ce47d0a9142963e13cbe340ae9188f";
 
     let text = prompt();
     let digest = {
