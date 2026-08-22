@@ -382,6 +382,9 @@ are release requirements, not deferred cleanup:
   verification must use the registered `GREPPY_BENCH_BIN`, and every verifier
   failure must propagate as a non-zero orchestrator exit rather than producing
   a false-green index-only run.
+- release-gate unit tests must construct their minimal synthetic task input
+  locally and remain runnable when the externally maintained `tasks_v2.json`
+  bank is intentionally absent from the product checkout.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

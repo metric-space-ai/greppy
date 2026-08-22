@@ -122,13 +122,20 @@ print(json.dumps({
     def test_synthetic_verifier_failure_is_the_orchestrator_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "run"
+            tasks = pathlib.Path(directory) / "synthetic_tasks.json"
+            tasks.write_text(
+                json.dumps([{"id": "synthetic-1", "repo": "python_large"}]),
+                encoding="utf-8",
+            )
             argv = [
                 "parallel_acceptance_run.py",
+                "--tasks",
+                str(tasks),
                 "--skip-build",
                 "--index-only",
                 "--output-dir",
                 str(output),
-                "r113",
+                "synthetic-1",
             ]
             with (
                 mock.patch.object(sys, "argv", argv),
