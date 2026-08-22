@@ -525,7 +525,7 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
     }
-    if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
+    if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment()? {
         greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
             Error::io(
                 format!(
@@ -538,11 +538,13 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }
-        let store = greppy_store::Store::open_overlay_read_only(
-            &overlay.base_path,
-            &path,
-            &overlay.visibility,
+        let delta = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?;
+        let visibility = crate::store_cow::visibility_for_open_connection(
+            &effective_root,
+            &base_commit,
+            delta.conn(),
         )?;
+        let store = delta.attach_overlay(&base_path, &visibility)?;
         let _ = workspace_locator::ensure_db_mode(&path);
         if let Some(store_dir) = path.parent() {
             workspace_locator::touch_lastused(store_dir);

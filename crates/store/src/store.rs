@@ -268,18 +268,27 @@ impl Store {
         visibility: &crate::VisibilityIndex,
         options: OpenOptions,
     ) -> Result<Self> {
-        let mut store = Self::open_with(delta_path, options)?;
+        Self::open_with(delta_path, options)?.attach_overlay(base_path, visibility)
+    }
+
+    /// Attach an immutable Base to an already-open Delta. Query callers use
+    /// this after reading the persisted visibility from the same read-only
+    /// connection, avoiding a second SQLite open on every overlay command.
+    pub fn attach_overlay(
+        mut self,
+        base_path: &Path,
+        visibility: &crate::VisibilityIndex,
+    ) -> Result<Self> {
         let base_uri = sqlite_read_only_uri(base_path)?;
-        store
-            .conn
+        self.conn
             .execute("ATTACH DATABASE ?1 AS greppy_base", [base_uri])?;
-        store.conn.execute_batch(
+        self.conn.execute_batch(
             "CREATE TEMP TABLE greppy_hidden_paths (
                  path TEXT PRIMARY KEY
              ) WITHOUT ROWID;",
         )?;
         {
-            let tx = store.conn.transaction()?;
+            let tx = self.conn.transaction()?;
             {
                 let mut insert = tx.prepare("INSERT INTO greppy_hidden_paths(path) VALUES (?1)")?;
                 for path in visibility.dirty_paths().chain(visibility.deleted_paths()) {
@@ -288,11 +297,11 @@ impl Store {
             }
             tx.commit()?;
         }
-        store.conn.execute_batch(OVERLAY_VIEWS_SQL)?;
-        store.overlay = Some(OverlayInfo {
+        self.conn.execute_batch(OVERLAY_VIEWS_SQL)?;
+        self.overlay = Some(OverlayInfo {
             base_path: base_path.to_path_buf(),
         });
-        Ok(store)
+        Ok(self)
     }
 
     pub fn is_overlay(&self) -> bool {
@@ -550,12 +559,10 @@ mod tests {
         drop(Store::open(&base_path).unwrap());
         drop(Store::open(&delta_path).unwrap());
 
-        let store = Store::open_overlay_read_only(
-            &base_path,
-            &delta_path,
-            &crate::VisibilityIndex::default(),
-        )
-        .unwrap();
+        let delta = Store::open_with(&delta_path, OpenOptions::read_only()).unwrap();
+        let store = delta
+            .attach_overlay(&base_path, &crate::VisibilityIndex::default())
+            .unwrap();
         let projects: i64 = store
             .conn()
             .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))

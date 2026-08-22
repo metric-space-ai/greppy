@@ -339,8 +339,9 @@ are release requirements, not deferred cleanup:
   scratch paths; shared literal fixture paths must never let one test delete
   another test's live sandbox roots;
 - steady-state Overlay queries must open the persisted Delta read-only, just as
-  Single-Store queries do; migrations, WAL setup, and evidence cleanup remain
-  writer-only work rather than recurring query latency;
+  Single-Store queries do, and must load cached visibility from that same
+  connection rather than opening the Delta twice; migrations, WAL setup, and
+  evidence cleanup remain writer-only work rather than recurring query latency;
 - the release performance harness must run explicitly in release mode and emit
   its machine-readable measurements and thresholds; its internal
   `store-cow-release-perf` build disables inference variance without enabling

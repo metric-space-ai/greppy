@@ -42,6 +42,22 @@ pub(crate) fn overlay_spec_live(root: &Path) -> Result<Option<OverlaySpec>> {
 }
 
 fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Option<OverlaySpec>> {
+    let Some((base_path, base_commit)) = overlay_environment()? else {
+        return Ok(None);
+    };
+    let visibility = if allow_cached_visibility {
+        cached_visibility(root, &base_commit)
+            .unwrap_or_else(|| visibility_against(root, &base_commit))?
+    } else {
+        visibility_against(root, &base_commit)?
+    };
+    Ok(Some(OverlaySpec {
+        base_path,
+        visibility,
+    }))
+}
+
+pub(crate) fn overlay_environment() -> Result<Option<(PathBuf, String)>> {
     if std::env::var(ENV_MODE).ok().as_deref() != Some(MODE_OVERLAY) {
         return Ok(None);
     }
@@ -56,16 +72,7 @@ fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Opti
     }
     let base_commit = std::env::var(ENV_BASE_COMMIT)
         .map_err(|_| Error::Invalid(format!("{ENV_MODE}=overlay without {ENV_BASE_COMMIT}")))?;
-    let visibility = if allow_cached_visibility {
-        cached_visibility(root, &base_commit)
-            .unwrap_or_else(|| visibility_against(root, &base_commit))?
-    } else {
-        visibility_against(root, &base_commit)?
-    };
-    Ok(Some(OverlaySpec {
-        base_path,
-        visibility,
-    }))
+    Ok(Some((base_path, base_commit)))
 }
 
 fn cached_visibility(root: &Path, base_commit: &str) -> Option<Result<VisibilityIndex>> {
@@ -78,6 +85,13 @@ fn cached_visibility(root: &Path, base_commit: &str) -> Option<Result<Visibility
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
+    cached_visibility_from_connection(&connection, base_commit)
+}
+
+pub(crate) fn cached_visibility_from_connection(
+    connection: &rusqlite::Connection,
+    base_commit: &str,
+) -> Option<Result<VisibilityIndex>> {
     let raw = connection
         .query_row(
             "SELECT value FROM schema_meta WHERE key = ?1",
@@ -103,6 +117,15 @@ fn cached_visibility(root: &Path, base_commit: &str) -> Option<Result<Visibility
         VisibilityIndex::new(dirty, deleted)
             .map_err(|error| Error::io("validate cached Store Delta visibility", error)),
     )
+}
+
+pub(crate) fn visibility_for_open_connection(
+    root: &Path,
+    base_commit: &str,
+    connection: &rusqlite::Connection,
+) -> Result<VisibilityIndex> {
+    cached_visibility_from_connection(connection, base_commit)
+        .unwrap_or_else(|| visibility_against(root, base_commit))
 }
 
 pub(crate) fn persist_visibility(
