@@ -287,7 +287,7 @@ impl Store {
                  path TEXT PRIMARY KEY
              ) WITHOUT ROWID;",
         )?;
-        {
+        if visibility.changed_count() != 0 {
             let tx = self.conn.transaction()?;
             {
                 let mut insert = tx.prepare("INSERT INTO greppy_hidden_paths(path) VALUES (?1)")?;
