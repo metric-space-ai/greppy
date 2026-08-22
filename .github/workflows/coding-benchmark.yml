@@ -16,9 +16,14 @@ permissions:
 
 jobs:
   benchmark:
-    name: paired edit and test outcomes
+    name: paired outcomes shard ${{ matrix.shard }}
     runs-on: macos-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -115,9 +120,10 @@ jobs:
             --tasks bench/agent_coding/tasks_v2.json \
             --greppy-bin "$GREPPY_BENCH_BIN" \
             --warm-greppy \
-            --workers 3 \
+            --shard-count 6 \
+            --shard-index "${{ matrix.shard }}" \
             --output-dir "$RUN_DIR" \
-            --run-id "github-$GITHUB_SHA"
+            --run-id "github-$GITHUB_SHA-shard-${{ matrix.shard }}"
 
       - name: Show gate verdict and failure kinds (also on failure)
         if: ${{ always() && steps.coding_task_bank.outputs.available == 'true' }}
@@ -133,7 +139,7 @@ jobs:
             python3 - "$RUN_DIR/results.json" << 'PYEOF'
           import collections, json, sys
           rows = json.load(open(sys.argv[1]))
-          rows = rows if isinstance(rows, list) else rows.get("rows", [])
+          rows = rows if isinstance(rows, list) else rows.get("results", [])
           kinds = collections.Counter(
               (row.get("arm"), row.get("failure_kind") or ("ok" if row.get("valid") else "invalid-unknown"))
               for row in rows
@@ -147,7 +153,7 @@ jobs:
         if: ${{ always() && steps.coding_task_bank.outputs.available == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: greppy-coding-benchmark-diagnostics-${{ github.sha }}
+          name: greppy-coding-benchmark-shard-${{ matrix.shard }}-${{ github.sha }}
           retention-days: 30
           if-no-files-found: ignore
           path: |
@@ -155,8 +161,59 @@ jobs:
             ${{ runner.temp }}/greppy-coding-benchmark/results.json
             ${{ runner.temp }}/greppy-coding-benchmark/MANIFEST.json
 
+  aggregate:
+    name: merge and grade all paired outcomes
+    needs: benchmark
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Materialize digest-locked coding task bank
+        run: |
+          python3 tools/materialize_benchmark_corpus.py \
+            --target bench/agent_coding/tasks_v2.json
+      - name: Install pinned Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13.13'
+      - name: Download all completed shard evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: greppy-coding-benchmark-shard-*-${{ github.sha }}
+          path: ${{ runner.temp }}/greppy-coding-shards
+      - name: Require six disjoint shards and grade the registered full corpus
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
+          SHARD_DIR: ${{ runner.temp }}/greppy-coding-shards
+        run: |
+          test "$(find "$SHARD_DIR" -name MANIFEST.json | wc -l | tr -d ' ')" = 6
+          python3 bench/agent_coding/run_benchmark.py \
+            --tasks bench/agent_coding/tasks_v2.json \
+            --merge-shards "$SHARD_DIR" \
+            --output-dir "$RUN_DIR" \
+            --run-id "github-$GITHUB_SHA"
+      - name: Show merged gate verdict and failure kinds
+        if: always()
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
+        run: |
+          test -s "$RUN_DIR/gate.json" && cat "$RUN_DIR/gate.json" || true
+          if [ -s "$RUN_DIR/results.json" ]; then
+            jq -r '.results | group_by([.arm, (.failure_kind // (if .valid then "ok" else "invalid-unknown" end))])[] | "\(length) \(.[0].arm) \(.[0].failure_kind // (if .[0].valid then "ok" else "invalid-unknown" end))"' "$RUN_DIR/results.json"
+          fi
+      - name: Upload merged gate diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-coding-benchmark-diagnostics-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/greppy-coding-benchmark/gate.json
+            ${{ runner.temp }}/greppy-coding-benchmark/results.json
+            ${{ runner.temp }}/greppy-coding-benchmark/MANIFEST.json
       - name: Package publishable evidence without raw traces
-        if: steps.coding_task_bank.outputs.available == 'true'
         env:
           RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
         run: |
@@ -166,18 +223,15 @@ jobs:
           test "$(jq -r .gate.passed "$RUN_DIR/MANIFEST.json")" = true
           test "$(jq -r .greppy_source.git_commit "$RUN_DIR/MANIFEST.json")" = "$GITHUB_SHA"
           test "$(jq -r .greppy_source.tracked_worktree_dirty "$RUN_DIR/MANIFEST.json")" = false
+          test "$(jq -r '.shards | length' "$RUN_DIR/MANIFEST.json")" = 6
           cp "$RUN_DIR/MANIFEST.json" "$RUN_DIR/results.json" publish/
           tar -C publish -czf greppy-coding-benchmark.tar.gz .
-          shasum -a 256 greppy-coding-benchmark.tar.gz > greppy-coding-benchmark.tar.gz.sha256
-
+          sha256sum greppy-coding-benchmark.tar.gz > greppy-coding-benchmark.tar.gz.sha256
       - name: Attest coding benchmark evidence
-        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: greppy-coding-benchmark.tar.gz
-
       - name: Upload coding benchmark evidence
-        if: steps.coding_task_bank.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: greppy-coding-benchmark-${{ github.sha }}

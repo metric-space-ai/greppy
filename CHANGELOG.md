@@ -51,11 +51,15 @@ measurements. Isolated invalid arms receive bounded serial recovery after the
 parallel run; remaining invalid sessions fail closed without weakening any
 efficiency or quality threshold.
 
-The coding-outcome release gate now runs independent paired tasks with bounded
-three-worker concurrency. Its first full 0.3.2 candidate completed only 47 of
-82 arms before the workflow's six-hour timeout; atomic, lock-serialized
-checkpoints and resume identity remain intact, while tasks, arm order within a
-pair, models, prompts, grading, and release thresholds are unchanged.
+The coding-outcome release gate now partitions its registered 41 tasks and
+three arms into six deterministic runner shards, with at most three shards
+active concurrently. A serial candidate completed 47 of 123 arms before the
+six-hour timeout; three threads on one runner reached only 75 because local
+build and toolchain contention erased much of the gain. Shards retain atomic
+checkpoints and deterministic within-task arm order, and a separate fail-closed
+merge requires six disjoint, complete task partitions before grading all 123
+results once. Tasks, models, prompts, grading, and release thresholds are
+unchanged.
 
 `read-file` accepts explicitly absolute diagnostic and artifact paths outside
 the repository, while relative `../` traversal remains confined to the repo.

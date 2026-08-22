@@ -1,7 +1,8 @@
 # greppy 0.3.2–0.3.3 — Parallel Agent CoW Release Plan
 
-Status: 0.3.2 implemented and locally gate-qualified; the first exact-commit
-coding gate exposed and now fixes a six-hour serial-harness timeout. Fresh
+Status: 0.3.2 implemented and locally gate-qualified; two exact-commit coding
+gates exposed single-runner runtime contention and now route the registered
+corpus through deterministic runner shards plus a fail-closed merge. Fresh
 exact-commit CI, artifact signing, and publication remain pending · 2026-08-22.
 0.3.3 remains planned.
 
@@ -410,13 +411,16 @@ are release requirements, not deferred cleanup:
   outside the repository, while relative `../` traversal remains confined.
   This is required for agents to inspect downloaded release-gate artifacts
   through Greppy itself and is covered by CLI integration tests.
-- the coding-outcome release gate must finish its registered 41-task, two-arm
-  corpus inside its own six-hour workflow budget. The first complete 0.3.2
-  candidate reached only 47 of 82 arms before GitHub cancelled it at 360
-  minutes. Independent tasks therefore run with bounded three-worker
-  concurrency; both arms within each task retain deterministic order, and
-  lock-serialized atomic checkpoints, resume identity, task content, grading,
-  models, prompts, and thresholds remain unchanged.
+- the coding-outcome release gate must finish its registered 41-task,
+  three-arm corpus without any job exceeding six hours. A serial candidate
+  reached 47 of 123 arms before GitHub cancelled it at 360 minutes; three
+  threads on one runner reached only 75 because local build/toolchain
+  contention erased much of the expected gain. The corpus therefore uses six
+  deterministic task shards with at most three independent runners active at
+  once. A separate fail-closed merge requires six disjoint, complete
+  partitions and then grades all 123 results exactly once. Within-task arm
+  order, atomic checkpoints, task content, models, prompts, grading, and
+  thresholds remain unchanged.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

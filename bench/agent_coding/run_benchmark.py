@@ -1628,6 +1628,7 @@ def save_checkpoint(
     manifest.update({"updated_at": result_document["updated_at"], "results": [public_result(row) for row in ordered], "gate": gate})
     atomic_write_json(run_dir / "results.json", result_document)
     atomic_write_json(run_dir / "MANIFEST.json", manifest)
+    atomic_write_json(run_dir / "gate.json", gate)
 
 
 def sanitized_failure_row(task_id: str, arm: str, error: Exception) -> dict[str, Any]:
@@ -1808,8 +1809,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=1,
         help="run this many independent tasks concurrently (default: 1)",
     )
+    parser.add_argument("--shard-count", type=positive_int, help="partition tasks into this many stable shards")
+    parser.add_argument("--shard-index", type=int, help="zero-based stable shard to execute")
+    parser.add_argument("--merge-shards", type=pathlib.Path, help="merge completed shard artifacts and grade once")
     parser.add_argument("--validate-only", action="store_true", help="validate tasks without cloning or invoking Pi")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if (args.shard_count is None) != (args.shard_index is None):
+        parser.error("--shard-count and --shard-index must be provided together")
+    if args.shard_count is not None and not 0 <= args.shard_index < args.shard_count:
+        parser.error("--shard-index must be between zero and shard-count minus one")
+    if args.merge_shards is not None and (args.shard_count is not None or args.resume):
+        parser.error("--merge-shards cannot be combined with shard execution or --resume")
+    return args
 
 
 def positive_int(value: str) -> int:
@@ -1835,6 +1846,114 @@ def execute_tasks(
             future.result()
 
 
+def merge_shard_outputs(
+    *,
+    shard_root: pathlib.Path,
+    run_dir: pathlib.Path,
+    run_id: str,
+    tasks: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    manifest_paths = sorted(shard_root.rglob("MANIFEST.json"))
+    if not manifest_paths:
+        raise HarnessError("no shard manifests found")
+    expected_ids = [task["id"] for task in tasks]
+    expected_keys = {(task_id, arm) for task_id in expected_ids for arm in ARMS}
+    expected_tasks = [task_manifest_entry(task) for task in tasks]
+    critical_fields = (
+        "schema_version",
+        "harness_version",
+        "greppy_source",
+        "gate_preregistration",
+        "model",
+        "prompt_contract",
+        "provider_extension",
+        "setup_contract",
+        "task_file",
+        "tools_per_arm",
+        "warm_greppy_outside_measurement",
+        "isolation",
+    )
+    manifests: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    task_entries: list[dict[str, Any]] = []
+    mutation_preflight: dict[str, Any] = {}
+    shard_evidence: list[dict[str, Any]] = []
+    reference: dict[str, Any] | None = None
+    for manifest_path in manifest_paths:
+        result_path = manifest_path.with_name("results.json")
+        if not result_path.is_file():
+            raise HarnessError(f"shard results missing beside {manifest_path}")
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        result_document = json.loads(result_path.read_text(encoding="utf-8"))
+        if reference is None:
+            reference = manifest
+        else:
+            mismatches = [field for field in critical_fields if manifest.get(field) != reference.get(field)]
+            if mismatches:
+                raise HarnessError(f"shard manifest identity mismatch: {', '.join(mismatches)}")
+        shard_rows = result_document.get("results")
+        if not isinstance(shard_rows, list):
+            raise HarnessError(f"shard results are invalid: {result_path}")
+        rows.extend(shard_rows)
+        task_entries.extend(manifest.get("tasks") or [])
+        for task_id, preflight in (manifest.get("mutation_preflight") or {}).items():
+            if task_id in mutation_preflight:
+                raise HarnessError(f"duplicate shard mutation preflight: {task_id}")
+            mutation_preflight[task_id] = preflight
+        shard_evidence.append(
+            {
+                "manifest_sha256": sha256_bytes(manifest_bytes),
+                "platform": manifest.get("platform"),
+                "executables": manifest.get("executables"),
+                "run_id": manifest.get("run_id"),
+            }
+        )
+        manifests.append(manifest)
+
+    validated_rows = validate_resume_rows(rows, expected_ids)
+    actual_keys = {(row["task_id"], row["arm"]) for row in validated_rows}
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        raise HarnessError(f"shard coverage mismatch: missing={missing[:5]} extra={extra[:5]}")
+    task_entry_ids = [entry.get("id") for entry in task_entries if isinstance(entry, dict)]
+    if (
+        len(task_entry_ids) != len(task_entries)
+        or len(task_entry_ids) != len(set(task_entry_ids))
+        or set(task_entry_ids) != set(expected_ids)
+    ):
+        raise HarnessError("shard task manifests do not form the registered task set")
+    task_entries_by_id = {entry["id"]: entry for entry in task_entries}
+    if [task_entries_by_id[task_id] for task_id in expected_ids] != expected_tasks:
+        raise HarnessError("shard task manifests do not form the registered task set")
+    if set(mutation_preflight) != set(expected_ids):
+        raise HarnessError("shard mutation preflights do not cover the registered task set")
+
+    assert reference is not None
+    base_manifest = dict(reference)
+    for field in ("gate", "results", "updated_at"):
+        base_manifest.pop(field, None)
+    base_manifest.update(
+        {
+            "created_at": min(manifest["created_at"] for manifest in manifests),
+            "run_id": run_id,
+            "tasks": expected_tasks,
+            "mutation_preflight": mutation_preflight,
+            "shards": shard_evidence,
+        }
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    save_checkpoint(
+        run_dir=run_dir,
+        run_id=run_id,
+        rows=validated_rows,
+        base_manifest=base_manifest,
+        expected_task_ids=expected_ids,
+    )
+    return grade_results(validated_rows, expected_ids)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     install_cleanup_signal_handlers()
     args = parse_args(argv)
@@ -1843,6 +1962,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.validate_only:
         print(f"validated {len(tasks)} task(s)")
         return 0
+
+    if args.merge_shards is not None:
+        if args.output_dir is None or args.run_id is None:
+            raise HarnessError("--merge-shards requires --output-dir and --run-id")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", args.run_id):
+            raise HarnessError("run-id is invalid")
+        gate = merge_shard_outputs(
+            shard_root=args.merge_shards.resolve(),
+            run_dir=args.output_dir.resolve(),
+            run_id=args.run_id,
+            tasks=tasks,
+        )
+        print(json.dumps(gate, indent=2, sort_keys=True))
+        return 0 if gate["passed"] else 2
+
+    if args.shard_count is not None:
+        tasks = [task for index, task in enumerate(tasks) if index % args.shard_count == args.shard_index]
+        if not tasks:
+            raise HarnessError("selected shard contains no tasks")
 
     api_key = os.environ.get("MINIMAX_API_KEY", "")
     if not api_key:
@@ -2025,6 +2163,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     gate = grade_results(rows, expected_ids)
     print(json.dumps(gate, indent=2, sort_keys=True))
+    if args.shard_count is not None:
+        expected_keys = {(task_id, arm) for task_id in expected_ids for arm in selected_arms}
+        completed_keys = {(row["task_id"], row["arm"]) for row in rows}
+        if completed_keys != expected_keys:
+            raise HarnessError("shard execution ended without complete arm coverage")
+        return 0
     return 0 if gate["passed"] else 2
 
 

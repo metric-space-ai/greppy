@@ -878,6 +878,84 @@ class ParallelExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(bench.HarnessError, "worker failed"):
             bench.execute_tasks([{"id": "a"}], 2, fail)
 
+    def test_merge_requires_disjoint_complete_shards(self):
+        tasks = []
+        for task_id in ("a", "b"):
+            tasks.append(
+                {
+                    "id": task_id,
+                    "repository": {"url": "https://example.invalid/repo", "commit": "a" * 40},
+                    "setup_commands": [],
+                    "mutation_patch": "diff --git a/a b/a\n",
+                    "user_task": "Fix it.",
+                    "test_command": ["true"],
+                    "timeout_seconds": 60,
+                    "task_bank": "v1",
+                }
+            )
+        critical = {
+            field: {"field": field}
+            for field in (
+                "schema_version",
+                "harness_version",
+                "greppy_source",
+                "gate_preregistration",
+                "model",
+                "prompt_contract",
+                "provider_extension",
+                "setup_contract",
+                "task_file",
+                "tools_per_arm",
+                "warm_greppy_outside_measurement",
+                "isolation",
+            )
+        }
+        with tempfile.TemporaryDirectory() as tmp_name:
+            root = pathlib.Path(tmp_name)
+            shard_root = root / "shards"
+            for index, task in enumerate(tasks):
+                shard = shard_root / str(index)
+                shard.mkdir(parents=True)
+                rows = []
+                for arm in bench.ARMS:
+                    row = result_row(task["id"], arm, passed=True, tools=1, inputs=1, wall=1)
+                    row["schema_version"] = bench.RESULT_SCHEMA_VERSION
+                    rows.append(row)
+                (shard / "results.json").write_text(
+                    json.dumps({"results": rows}), encoding="utf-8"
+                )
+                manifest = {
+                    **critical,
+                    "created_at": f"2026-08-22T00:00:0{index}Z",
+                    "run_id": f"shard-{index}",
+                    "tasks": [bench.task_manifest_entry(task)],
+                    "mutation_preflight": {task["id"]: {"valid": True}},
+                    "platform": {"shard": index},
+                    "executables": {"shard": index},
+                }
+                (shard / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+            gate = bench.merge_shard_outputs(
+                shard_root=shard_root,
+                run_dir=root / "merged",
+                run_id="merged",
+                tasks=tasks,
+            )
+            self.assertTrue(gate["complete"])
+            merged = json.loads((root / "merged" / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(merged["results"]), len(tasks) * len(bench.ARMS))
+            self.assertTrue((root / "merged" / "gate.json").is_file())
+
+            duplicate = json.loads((shard_root / "1" / "results.json").read_text(encoding="utf-8"))
+            duplicate["results"].append(duplicate["results"][0])
+            (shard_root / "1" / "results.json").write_text(json.dumps(duplicate), encoding="utf-8")
+            with self.assertRaisesRegex(bench.HarnessError, "duplicate"):
+                bench.merge_shard_outputs(
+                    shard_root=shard_root,
+                    run_dir=root / "duplicate",
+                    run_id="duplicate",
+                    tasks=tasks,
+                )
+
 
 class AuditV2RunTests(unittest.TestCase):
     TEST_PATCH = (
