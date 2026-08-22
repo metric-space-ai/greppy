@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -848,6 +849,35 @@ class TaskBankV2Tests(unittest.TestCase):
         t["mutation_patch"] = t.pop("test_patch")
         tasks = bench.validate_task_document(doc)
         self.assertEqual(tasks[0]["task_bank"], "v1")
+
+class ParallelExecutionTests(unittest.TestCase):
+    def test_worker_count_must_be_positive(self):
+        self.assertEqual(bench.positive_int("3"), 3)
+        with self.assertRaises(bench.argparse.ArgumentTypeError):
+            bench.positive_int("0")
+
+    def test_tasks_run_once_with_bounded_parallelism(self):
+        barrier = threading.Barrier(2)
+        seen = []
+        lock = threading.Lock()
+
+        def run_task(task):
+            if task["id"] in {"a", "b"}:
+                barrier.wait(timeout=2)
+            with lock:
+                seen.append(task["id"])
+
+        tasks = [{"id": task_id} for task_id in ("a", "b", "c")]
+        bench.execute_tasks(tasks, 2, run_task)
+        self.assertEqual(sorted(seen), ["a", "b", "c"])
+
+    def test_worker_failure_propagates(self):
+        def fail(_task):
+            raise bench.HarnessError("worker failed")
+
+        with self.assertRaisesRegex(bench.HarnessError, "worker failed"):
+            bench.execute_tasks([{"id": "a"}], 2, fail)
+
 
 class AuditV2RunTests(unittest.TestCase):
     TEST_PATCH = (

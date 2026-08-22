@@ -51,6 +51,12 @@ measurements. Isolated invalid arms receive bounded serial recovery after the
 parallel run; remaining invalid sessions fail closed without weakening any
 efficiency or quality threshold.
 
+The coding-outcome release gate now runs independent paired tasks with bounded
+three-worker concurrency. Its first full 0.3.2 candidate completed only 47 of
+82 arms before the workflow's six-hour timeout; atomic, lock-serialized
+checkpoints and resume identity remain intact, while tasks, arm order within a
+pair, models, prompts, grading, and release thresholds are unchanged.
+
 `read-file` accepts explicitly absolute diagnostic and artifact paths outside
 the repository, while relative `../` traversal remains confined to the repo.
 This lets integrated agents inspect downloaded gate artifacts without leaving

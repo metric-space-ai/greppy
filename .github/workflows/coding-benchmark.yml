@@ -115,6 +115,7 @@ jobs:
             --tasks bench/agent_coding/tasks_v2.json \
             --greppy-bin "$GREPPY_BENCH_BIN" \
             --warm-greppy \
+            --workers 3 \
             --output-dir "$RUN_DIR" \
             --run-id "github-$GITHUB_SHA"
 

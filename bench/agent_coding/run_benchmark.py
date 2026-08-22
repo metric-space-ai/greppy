@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import datetime as dt
 import hashlib
@@ -19,8 +20,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -1800,8 +1802,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pi-bin", default=os.environ.get("PI_BIN", "pi"))
     parser.add_argument("--greppy-bin", default=os.environ.get("GREPPY_BENCH_BIN", str(REPO_ROOT / "target" / "release" / "greppy")))
     parser.add_argument("--warm-greppy", action="store_true", help="index the Greppy arm before measured agent time")
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=1,
+        help="run this many independent tasks concurrently (default: 1)",
+    )
     parser.add_argument("--validate-only", action="store_true", help="validate tasks without cloning or invoking Pi")
     return parser.parse_args(argv)
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def execute_tasks(
+    tasks: Sequence[dict[str, Any]],
+    workers: int,
+    run_task: Callable[[dict[str, Any]], None],
+) -> None:
+    """Run independent tasks with bounded concurrency and propagate failures."""
+    if workers == 1:
+        for task in tasks:
+            run_task(task)
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(run_task, task) for task in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1875,9 +1906,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         selected_arms = ARMS
 
-    for task in tasks:
-        if all((task["id"], arm) in completed for arm in selected_arms):
-            continue
+    checkpoint_lock = threading.Lock()
+
+    def checkpoint_rows(new_rows: Sequence[dict[str, Any]]) -> None:
+        with checkpoint_lock:
+            for row in new_rows:
+                key = (row["task_id"], row["arm"])
+                if key in completed:
+                    continue
+                rows.append(row)
+                completed.add(key)
+            save_checkpoint(
+                run_dir=run_dir,
+                run_id=run_id,
+                rows=rows,
+                base_manifest=base_manifest,
+                expected_task_ids=expected_ids,
+            )
+
+    pending_tasks = [
+        task
+        for task in tasks
+        if not all((task["id"], arm) in completed for arm in selected_arms)
+    ]
+
+    def run_task(task: dict[str, Any]) -> None:
         print(f"[{task['id']}] preparing pinned repository", flush=True)
         # Keep the full upstream mirror in a separately randomized harness
         # directory. Agent-visible paths are task-id-free and contain only the
@@ -1893,7 +1946,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 backing = clone_pinned_repository(task, pathlib.Path(backing_tmp_name))
                 preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task["id"], secrets)
-                base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
+                with checkpoint_lock:
+                    base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
                 if not preflight["valid"]:
                     if task.get("task_bank") == "v2":
                         detail = preflight.get("patched_failure_classification") or {}
@@ -1958,15 +2012,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                             time.sleep(30 * attempt)
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source
                         row = sanitized_failure_row(task["id"], arm, error)
-                    rows.append(row)
-                    completed.add((task["id"], arm))
-                    save_checkpoint(run_dir=run_dir, run_id=run_id, rows=rows, base_manifest=base_manifest, expected_task_ids=expected_ids)
+                    checkpoint_rows([row])
             except Exception as error:
-                for arm in selected_arms:
-                    if (task["id"], arm) not in completed:
-                        rows.append(sanitized_failure_row(task["id"], arm, error))
-                        completed.add((task["id"], arm))
-                save_checkpoint(run_dir=run_dir, run_id=run_id, rows=rows, base_manifest=base_manifest, expected_task_ids=expected_ids)
+                failures = [
+                    sanitized_failure_row(task["id"], arm, error)
+                    for arm in selected_arms
+                    if (task["id"], arm) not in completed
+                ]
+                checkpoint_rows(failures)
+
+    execute_tasks(pending_tasks, args.workers, run_task)
 
     gate = grade_results(rows, expected_ids)
     print(json.dumps(gate, indent=2, sort_keys=True))

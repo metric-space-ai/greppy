@@ -1,7 +1,9 @@
 # greppy 0.3.2–0.3.3 — Parallel Agent CoW Release Plan
 
-Status: 0.3.2 implemented and locally gate-qualified; exact-commit CI, signing
-and publication pending · 2026-08-21. 0.3.3 remains planned.
+Status: 0.3.2 implemented and locally gate-qualified; the first exact-commit
+coding gate exposed and now fixes a six-hour serial-harness timeout. Fresh
+exact-commit CI, artifact signing, and publication remain pending · 2026-08-22.
+0.3.3 remains planned.
 
 Scope decision: **two releases, two complete features.** The milestones below
 are implementation order, not open research branches.
@@ -408,6 +410,13 @@ are release requirements, not deferred cleanup:
   outside the repository, while relative `../` traversal remains confined.
   This is required for agents to inspect downloaded release-gate artifacts
   through Greppy itself and is covered by CLI integration tests.
+- the coding-outcome release gate must finish its registered 41-task, two-arm
+  corpus inside its own six-hour workflow budget. The first complete 0.3.2
+  candidate reached only 47 of 82 arms before GitHub cancelled it at 360
+  minutes. Independent tasks therefore run with bounded three-worker
+  concurrency; both arms within each task retain deterministic order, and
+  lock-serialized atomic checkpoints, resume identity, task content, grading,
+  models, prompts, and thresholds remain unchanged.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named
