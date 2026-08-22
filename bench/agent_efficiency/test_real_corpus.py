@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from bench.agent_efficiency import parallel_acceptance_run, real_corpus
 
@@ -38,6 +39,7 @@ print(json.dumps({
     "task_mirror_source": str(gen_real_tasks.REAL_REPO_ROOT),
     "context_cost": str(context_cost.CORPUS),
     "task_verifier": str(verify_tasks.CORPUS),
+    "task_verifier_bin": str(verify_tasks.BIN),
     "recall_audit": str(recall_audit.REALCORPUS),
     "summary_quality": str(summary_quality.REALCORPUS),
     "tracked_candidates": str(gen_real_tasks.CANDIDATES),
@@ -45,7 +47,12 @@ print(json.dumps({
 """
         with tempfile.TemporaryDirectory() as directory:
             external = pathlib.Path(directory).resolve()
-            env = dict(os.environ, GREPPY_BENCH_CORPUS_HOME=str(external))
+            candidate = external / "candidate-greppy"
+            env = dict(
+                os.environ,
+                GREPPY_BENCH_CORPUS_HOME=str(external),
+                GREPPY_BENCH_BIN=str(candidate),
+            )
             completed = subprocess.run(
                 [sys.executable, "-c", probe],
                 cwd=repository,
@@ -63,6 +70,7 @@ print(json.dumps({
         self.assertEqual(paths["task_mirror_source"], str(external / "realcorpus"))
         self.assertEqual(paths["context_cost"], str(external / "corpus"))
         self.assertEqual(paths["task_verifier"], str(external / "corpus"))
+        self.assertEqual(paths["task_verifier_bin"], str(candidate))
         self.assertEqual(paths["recall_audit"], str(external / "realcorpus"))
         self.assertEqual(paths["summary_quality"], str(external / "realcorpus"))
         self.assertEqual(
@@ -82,6 +90,66 @@ print(json.dumps({
             record["sha256"],
             "8702eb2099943bddf524714216050145eea44bca178d8db2772601bcdd8518c0",
         )
+
+    def test_synthetic_selection_does_not_require_real_corpus_manifest(self) -> None:
+        class CorpusLayout:
+            REAL_REPOS = {"serde"}
+            REALCORPUS = pathlib.Path("/missing-real-corpus")
+
+        record = parallel_acceptance_run.selected_repository_manifest(
+            [{"id": "r113", "repo": "python_large"}], CorpusLayout
+        )
+
+        self.assertIsNone(record)
+
+    def test_real_selection_still_requires_real_corpus_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            realcorpus = pathlib.Path(directory)
+            (realcorpus / "MANIFEST.json").write_text(
+                '{"repos": {}}\n', encoding="utf-8"
+            )
+
+            class CorpusLayout:
+                REAL_REPOS = {"serde"}
+                REALCORPUS = realcorpus
+
+            record = parallel_acceptance_run.selected_repository_manifest(
+                [{"id": "r001", "repo": "serde"}], CorpusLayout
+            )
+
+        self.assertEqual(record["path"], "realcorpus/MANIFEST.json")
+
+    def test_synthetic_verifier_failure_is_the_orchestrator_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "run"
+            argv = [
+                "parallel_acceptance_run.py",
+                "--skip-build",
+                "--index-only",
+                "--output-dir",
+                str(output),
+                "r113",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.dict(
+                    os.environ,
+                    {"GREPPY_STORE_DIR": str(pathlib.Path(directory) / "store")},
+                ),
+                mock.patch.object(parallel_acceptance_run, "ensure_api_key"),
+                mock.patch.object(parallel_acceptance_run, "write_run_manifest"),
+                mock.patch.object(
+                    parallel_acceptance_run, "run_logged", return_value=7
+                ),
+                mock.patch.object(parallel_acceptance_run, "write_summary"),
+                mock.patch.object(
+                    parallel_acceptance_run, "index_task_repos"
+                ) as index_repos,
+            ):
+                status = parallel_acceptance_run.main()
+
+        self.assertEqual(status, 7)
+        index_repos.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,14 +1,30 @@
 Use greppy for every code-navigation step in this repository — finding a
-definition, a caller, a usage, an implementation, a test. Do NOT run
-grep/find/read loops for these: start with `greppy search` (meaning),
-`greppy search-symbol` (name) or `greppy search-pattern` (text), then follow
-the graph with `greppy who-calls` / `callees` / `brief`, and read code with
-`greppy read`. When you would reach for grep, ripgrep or a file read, invoke
-them THROUGH greppy — `greppy PATTERN [FILE]` is byte-identical grep,
-`greppy rg …` is ripgrep, `greppy read-file PATH` reads files — so every
-search stays in one tool. Every tool result stays in your context: prefer
-one high-yield call (`greppy brief --code`, `greppy expand`) over a chain
-of narrow searches, and stop searching as soon as the evidence suffices.
+definition, caller, usage, implementation or test. Default to ONE high-yield
+command chosen by the question:
+
+- exact definition or source: `greppy search-symbol NAME --code`;
+- direct callers, "who calls", deprecation or dead-code question: `greppy who-calls NAME --code`;
+- "what depends on", blast-radius or transitive change-risk question: `greppy impact NAME --code`;
+- relationship between two named symbols: `greppy path --from A --to B`;
+- concept-to-code discovery: `greppy search "WHAT IT DOES" --code`;
+- literal text/config: `greppy search-pattern PATTERN --code`.
+
+Stop after a successful command contains the requested definition, code,
+caller or path. Do not run a second command merely to confirm it. Follow up
+only when the result explicitly says it is ambiguous, incomplete/truncated or
+has no match. Navigation commands accept the named symbol directly: never run
+`search-symbol` first just to locate a symbol before `who-calls`, `impact`,
+`callees`, `brief` or `path`, and never recurse through callers manually when
+`impact` answers the requested dependency tree. `greppy read` accepts symbols
+only — never a file path or line
+range; use `greppy read-file PATH --lines A:B` for files. Do not begin with
+`where-am-i` or `--help` when the question already names its target, and do not
+add `--all` unless the default result says relevant evidence was omitted.
+
+Do NOT run grep/find/read loops. When you would reach for grep, ripgrep or a
+file read, invoke them THROUGH greppy — `greppy PATTERN [FILE]` is byte-identical
+grep, `greppy rg …` is ripgrep, and `greppy read-file PATH` reads files — so
+every search stays in one tool. Every tool result stays in your context.
 
 Run every build, test or lint command through `greppy bash-smart -- CMD`:
 it executes CMD unchanged (same exit code) and returns a verdict line plus

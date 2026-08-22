@@ -370,6 +370,18 @@ are release requirements, not deferred cleanup:
 - release-smoke daemon draining must observe only the probe's owned runtime
   directory; a global process-name scan must never couple one validation run
   to unrelated greppy agents or daemons on the same machine.
+- the integrated-agent manual must route exact definition, caller, impact,
+  path, and semantic questions directly to one high-yield command, distinguish
+  symbol reads from file/range reads, and require stopping when that result is
+  sufficient; the registered agent-efficiency gate must be met by better agent
+  behavior rather than weakened thresholds.
+- synthetic-only diagnostic or `--index-only` acceptance runs must not require
+  the external real-corpus `MANIFEST.json`; the run manifest records real-corpus
+  provenance only when a selected task uses it, while a selected real-corpus
+  run continues to fail closed on a missing or mismatched manifest. Synthetic
+  verification must use the registered `GREPPY_BENCH_BIN`, and every verifier
+  failure must propagate as a non-zero orchestrator exit rather than producing
+  a false-green index-only run.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

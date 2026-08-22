@@ -83,6 +83,20 @@ class ReleaseGateTests(unittest.TestCase):
         )
         self.assertEqual(run_bench.prompt_contract()["arm_order"], run_bench.ARM_ORDER_VERSION)
 
+    def test_greppy_prompt_routes_direct_questions_to_one_shot_commands(self) -> None:
+        prompt = run_bench.gp_sys("/ignored")
+        self.assertEqual(
+            run_bench.BENCHMARK_PROMPT_VERSION,
+            "greppy-agents-md-0.3.2-one-shot",
+        )
+        self.assertIn("greppy who-calls NAME --code", prompt)
+        self.assertIn("greppy impact NAME --code", prompt)
+        self.assertIn('"what depends on"', prompt)
+        self.assertIn("never run\n`search-symbol` first", prompt)
+        self.assertIn("greppy search-symbol NAME --code", prompt)
+        self.assertIn("Stop after a successful command", prompt)
+        self.assertIn("`greppy read` accepts symbols", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

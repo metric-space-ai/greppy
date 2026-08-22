@@ -74,7 +74,7 @@ TASKS = HERE / "tasks_v2.json"
 RESULTS = HERE / "results.json"
 RAW_ROOT = HERE / "raw_runs"
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
-BENCHMARK_PROMPT_VERSION = "greppy-agents-md-0.3.0"
+BENCHMARK_PROMPT_VERSION = "greppy-agents-md-0.3.2-one-shot"
 ARM_ORDER_VERSION = "sha256-task-agent-v1"
 
 

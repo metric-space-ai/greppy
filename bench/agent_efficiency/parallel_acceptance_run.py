@@ -155,6 +155,18 @@ def main() -> int:
 
     steps: list[tuple[str, int]] = []
 
+    selected_tasks = select_tasks(
+        tasks_path, args.repo, set(args.task_ids) if args.task_ids else None
+    )
+    if not selected_tasks:
+        raise SystemExit("no tasks selected")
+    sys.path.insert(0, str(HERE))
+    import run_bench as run_bench_module  # noqa: PLC0415
+    selected_tasks_use_real_corpus = any(
+        task.get("repo") in run_bench_module.REAL_REPOS
+        for task in selected_tasks
+    )
+
     if not args.skip_build:
         steps.append((
             "build-greppy",
@@ -169,9 +181,10 @@ def main() -> int:
         task_classes_path=task_classes_path,
         llm_provider=args.llm_provider,
         agents=agents,
+        selected_tasks=selected_tasks,
     )
     if not args.skip_verify:
-        if is_v2:
+        if is_v2 and selected_tasks_use_real_corpus:
             # Corpus-v2 contract verifier: validates tasks_v2.json +
             # task_classes_v2.json against candidates.json/MANIFEST and
             # re-runs the mechanical gates (firewall, multi-hop, byte
@@ -187,26 +200,28 @@ def main() -> int:
                               aggregate, forensics, tasks_path)
                 return verify_rc
         else:
-            steps.append((
-                "verify-task-classes",
-                run_logged(
+            # A selected tasks_v2 control is backed only by the synthetic v1
+            # corpus. Validate that corpus without requiring unrelated real
+            # mirrors or their external MANIFEST.json.
+            synthetic_verify_steps = (
+                (
+                    "verify-task-classes",
                     [sys.executable, str(HERE / "verify_task_classes.py")],
-                    logs_dir / "verify-task-classes.log",
                 ),
-            ))
-            steps.append((
-                "verify-tasks-index",
-                run_logged(
+                (
+                    "verify-tasks-index",
                     [sys.executable, str(HERE / "verify_tasks.py"), "--index"],
-                    logs_dir / "verify-tasks-index.log",
                 ),
-            ))
-
-    selected_tasks = select_tasks(
-        tasks_path, args.repo, set(args.task_ids) if args.task_ids else None
-    )
-    if not selected_tasks:
-        raise SystemExit("no tasks selected")
+            )
+            for step_name, command in synthetic_verify_steps:
+                verify_rc = run_logged(command, logs_dir / f"{step_name}.log")
+                steps.append((step_name, verify_rc))
+                if verify_rc != 0:
+                    write_summary(
+                        summary, run_dir, steps, results, graded_results,
+                        aggregate, forensics, tasks_path
+                    )
+                    return verify_rc
 
     if is_v2:
         # Index every repo the selected tasks touch (4 real repos under
@@ -643,12 +658,25 @@ def repository_manifest_record(realcorpus: pathlib.Path) -> dict[str, str]:
     }
 
 
+def selected_repository_manifest(
+    selected_tasks: list[dict[str, Any]], run_bench_module: Any
+) -> dict[str, str] | None:
+    """Record real-corpus provenance only when the selection consumes it."""
+    if not any(
+        task.get("repo") in run_bench_module.REAL_REPOS
+        for task in selected_tasks
+    ):
+        return None
+    return repository_manifest_record(run_bench_module.REALCORPUS)
+
+
 def write_run_manifest(
     run_dir: pathlib.Path,
     tasks_path: pathlib.Path,
     task_classes_path: pathlib.Path,
     llm_provider: str,
     agents: list[str],
+    selected_tasks: list[dict[str, Any]],
 ) -> None:
     """Pin every input needed to audit or reproduce one acceptance run."""
     if not BIN.is_file():
@@ -674,6 +702,8 @@ def write_run_manifest(
         text=True,
         check=False,
     ).stdout.strip()
+    repository_manifest = selected_repository_manifest(selected_tasks, run_bench)
+
     manifest = {
         "schema_version": "greppy.agent-benchmark-run.v1",
         "product_candidate": "greppy",
@@ -697,7 +727,7 @@ def write_run_manifest(
             "path": str(task_classes_path.relative_to(REPO)),
             "sha256": sha256_file(task_classes_path),
         },
-        "repository_manifest": repository_manifest_record(run_bench.REALCORPUS),
+        "repository_manifest": repository_manifest,
         "raw_traces_published": False,
         "publishable_artifacts": [
             "RUN_MANIFEST.json",

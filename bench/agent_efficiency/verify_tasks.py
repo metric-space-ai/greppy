@@ -27,7 +27,9 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-BIN = str(REPO / "target" / "release" / "greppy")
+BIN = os.environ.get("GREPPY_BENCH_BIN") or str(
+    REPO / "target" / "release" / "greppy"
+)
 CORPUS_HOME = pathlib.Path(os.environ.get("GREPPY_BENCH_CORPUS_HOME") or HERE)
 CORPUS = CORPUS_HOME / "corpus"
 
