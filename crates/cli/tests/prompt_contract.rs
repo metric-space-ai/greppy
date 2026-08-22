@@ -344,7 +344,7 @@ fn the_header_leads_with_the_product() {
         "the header leads with the product, not the fallback; header: {header}"
     );
     assert!(
-        header.contains("Default to ONE high-yield"),
+        header.contains("Default to ONE compact"),
         "one-shot routing is the first thing the reader meets; header: {header}"
     );
     assert!(
@@ -379,9 +379,11 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // ("run `greppy index .` first") and would otherwise be unexplained.
     // 22.08.2026: the owner approved the 0.3.2 one-shot routing contract:
     // named definition/caller/impact/path questions go directly to one
-    // high-yield command and stop when its answer is sufficient.
+    // command and stop when its answer is sufficient.
+    // 22.08.2026: release-gate forensics approved compact graph-first routes;
+    // source text is requested only when the question needs body evidence.
     const APPROVED_SHA256: &str =
-        "d5824f0162cf8201b30880445e581cdc92ce47d0a9142963e13cbe340ae9188f";
+        "572062d98bfd04568d6346ab8095a88ed11c6c3097aa40f945c40be26b41f2d7";
 
     let text = prompt();
     let digest = {

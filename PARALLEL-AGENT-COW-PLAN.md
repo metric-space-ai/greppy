@@ -372,10 +372,18 @@ are release requirements, not deferred cleanup:
   directory; a global process-name scan must never couple one validation run
   to unrelated greppy agents or daemons on the same machine.
 - the integrated-agent manual must route exact definition, caller, impact,
-  path, and semantic questions directly to one high-yield command, distinguish
-  symbol reads from file/range reads, and require stopping when that result is
-  sufficient; the registered agent-efficiency gate must be met by better agent
-  behavior rather than weakened thresholds.
+  path, and semantic questions directly to one compact graph command,
+  distinguish symbol reads from file/range reads, request `--code` only when
+  body evidence is actually required, and stop when that result is sufficient;
+  the registered agent-efficiency gate must be met by better agent behavior
+  rather than weakened thresholds.
+- agent-efficiency `variable_input` must remove each arm's own fixed first-turn
+  prompt and user-query baseline from every later turn. Explorer is deliberately
+  uncoached while Greppy ships this manual; charging that static manual once per
+  tool round is a treatment-confounded metric, not variable search context. The
+  release-gate schema is versioned when this definition changes, an invariant
+  test covers unequal fixed prompt lengths with identical tool histories, and
+  the 20-percent acceptance threshold remains unchanged.
 - synthetic-only diagnostic or `--index-only` acceptance runs must not require
   the external real-corpus `MANIFEST.json`; the run manifest records real-corpus
   provenance only when a selected task uses it, while a selected real-corpus
@@ -386,6 +394,11 @@ are release requirements, not deferred cleanup:
 - release-gate unit tests must construct their minimal synthetic task input
   locally and remain runnable when the externally maintained `tasks_v2.json`
   bank is intentionally absent from the product checkout.
+- local release validation must use a run-owned Cargo target or an immutable
+  downloaded artifact and verify the binary still exists before each evidence
+  command. Shared `/Volumes/tmp` targets can be removed by unrelated cleanup;
+  that invalidates the local run but must never be mistaken for a product or
+  source failure, and remote exact-SHA evidence remains authoritative.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

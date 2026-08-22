@@ -67,7 +67,9 @@ def recompute(jsonl_text: str) -> dict:
         "output": sum(outputs),
         "tool_calls": tool_calls,
         "turns": len(inputs),
-        "variable_input": sum(prompt_inputs[1:]),  # base turn removed
+        "variable_input": sum(
+            max(0, value - prompt_inputs[0]) for value in prompt_inputs[1:]
+        ) if prompt_inputs else 0,
     }
 
 
@@ -199,7 +201,8 @@ def main() -> None:
             "",
             "Leg 1: independent re-implementation (recompute(), written without "
             "run_bench import) of ctx_chars/ctx_tok, input/output, "
-            "variable_input (base turn removed), tool_calls, turns. "
+            "variable_input (each arm's fixed first-turn prompt removed), "
+            "tool_calls, turns. "
             "Leg 2: parser-vs-parser — deliberately imports run_bench.py to "
             "compare both implementations on identical raw input. "
             "wall_s cross-checked against .meta.json. "

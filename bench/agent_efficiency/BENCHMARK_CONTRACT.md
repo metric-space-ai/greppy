@@ -39,7 +39,8 @@ reproducible from the manifest.
 - explicit hard-negative graph terms are hard failures, so an answer cannot
   pass by naming the expected symbols alongside a known false edge;
 - input and output tokens separately;
-- variable input tokens after the common first-turn prompt;
+- variable input tokens added after each arm's own fixed first-turn prompt and
+  user-query baseline (the fixed prompt is subtracted from every later turn);
 - tool calls and source-open calls;
 - returned search-context volume;
 - wall-clock time and provider errors.

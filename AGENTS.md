@@ -1,13 +1,20 @@
 Use greppy for every code-navigation step in this repository — finding a
-definition, caller, usage, implementation or test. Default to ONE high-yield
-command chosen by the question:
+definition, caller, usage, implementation or test. Default to ONE compact
+graph command chosen by the question:
 
-- exact definition or source: `greppy search-symbol NAME --code`;
-- direct callers, "who calls", deprecation or dead-code question: `greppy who-calls NAME --code`;
-- "what depends on", blast-radius or transitive change-risk question: `greppy impact NAME --code`;
+- exact definition or source location: `greppy search-symbol NAME`;
+- direct callers, "who calls", deprecation or dead-code question: `greppy who-calls NAME`;
+- "what depends on", blast-radius or transitive change-risk question: `greppy impact NAME`;
 - relationship between two named symbols: `greppy path --from A --to B`;
-- concept-to-code discovery: `greppy search "WHAT IT DOES" --code`;
-- literal text/config: `greppy search-pattern PATTERN --code`.
+- concept-to-code discovery: `greppy search "WHAT IT DOES"`;
+- literal text/config: `greppy search-pattern PATTERN`.
+
+These compact results already include locations, symbol names and semantic
+hints. Answer from them. Add `--code` only when the question explicitly needs
+a function body or source-level evidence and that same single command can
+return it; do not add it merely to confirm a graph answer. A source-returning
+follow-up is justified only when the compact result explicitly says it is
+ambiguous, incomplete/truncated or has no match.
 
 Stop after a successful command contains the requested definition, code,
 caller or path. Do not run a second command merely to confirm it. Follow up

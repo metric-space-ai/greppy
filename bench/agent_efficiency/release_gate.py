@@ -117,7 +117,7 @@ def main() -> int:
         and input_ratio <= 0.80,
     }
     report = {
-        "schema_version": "greppy.agent-release-gate.v2",
+        "schema_version": "greppy.agent-release-gate.v3",
         "baseline": args.baseline,
         "candidate": args.candidate,
         "comparable_rows": len(comparable),

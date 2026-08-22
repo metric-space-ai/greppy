@@ -7,6 +7,7 @@ from unittest import mock
 
 import release_gate
 import run_bench
+import verify_metrics
 
 
 def result(correct: bool, *, tools: int, opens: int, variable_input: int) -> dict:
@@ -87,15 +88,41 @@ class ReleaseGateTests(unittest.TestCase):
         prompt = run_bench.gp_sys("/ignored")
         self.assertEqual(
             run_bench.BENCHMARK_PROMPT_VERSION,
-            "greppy-agents-md-0.3.2-one-shot",
+            "greppy-agents-md-0.3.2-compact-one-shot",
         )
-        self.assertIn("greppy who-calls NAME --code", prompt)
-        self.assertIn("greppy impact NAME --code", prompt)
+        self.assertIn("greppy who-calls NAME`", prompt)
+        self.assertIn("greppy impact NAME`", prompt)
         self.assertIn('"what depends on"', prompt)
         self.assertIn("never run\n`search-symbol` first", prompt)
-        self.assertIn("greppy search-symbol NAME --code", prompt)
+        self.assertIn("greppy search-symbol NAME`", prompt)
+        self.assertIn("Add `--code` only when", prompt)
+        self.assertIn("do not add it merely to confirm", prompt)
         self.assertIn("Stop after a successful command", prompt)
         self.assertIn("`greppy read` accepts symbols", prompt)
+
+    def test_variable_input_excludes_each_arms_fixed_prompt_on_every_turn(self) -> None:
+        def transcript(prompt_inputs: list[int]) -> str:
+            rows = []
+            for prompt_input in prompt_inputs:
+                rows.append(
+                    json.dumps(
+                        {
+                            "type": "turn_end",
+                            "toolResults": [],
+                            "message": {
+                                "content": [],
+                                "usage": {"input": prompt_input},
+                            },
+                        }
+                    )
+                )
+            return "\n".join(rows)
+
+        compact = transcript([1000, 1100, 1250])
+        long_fixed_prompt = transcript([3000, 3100, 3250])
+        for parser in (run_bench.parse_pi_jsonl, verify_metrics.recompute):
+            self.assertEqual(parser(compact)["variable_input"], 350)
+            self.assertEqual(parser(long_fixed_prompt)["variable_input"], 350)
 
 
 if __name__ == "__main__":

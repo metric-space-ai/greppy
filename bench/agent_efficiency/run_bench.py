@@ -74,7 +74,7 @@ TASKS = HERE / "tasks_v2.json"
 RESULTS = HERE / "results.json"
 RAW_ROOT = HERE / "raw_runs"
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
-BENCHMARK_PROMPT_VERSION = "greppy-agents-md-0.3.2-one-shot"
+BENCHMARK_PROMPT_VERSION = "greppy-agents-md-0.3.2-compact-one-shot"
 ARM_ORDER_VERSION = "sha256-task-agent-v1"
 
 
@@ -491,6 +491,17 @@ def parse_pi_jsonl(out: str) -> dict:
     prompt_input = sum(turn_prompt_inputs)
     first_prompt_input = turn_prompt_inputs[0] if turn_prompt_inputs else 0
     loop_prompt_input = sum(turn_prompt_inputs[1:])
+    # Each later Pi turn reports the complete prompt again, including the
+    # arm's fixed system prompt and original user question. The explorer arm
+    # is intentionally uncoached while Greppy ships AGENTS.md, so summing
+    # those complete prompts would charge Greppy's static manual once per
+    # tool round and call it "variable" input. Subtract each arm's own first
+    # turn baseline from every later turn; what remains is the context added
+    # by tool results and intermediate model output.
+    variable_input = sum(
+        max(0, prompt_input - first_prompt_input)
+        for prompt_input in turn_prompt_inputs[1:]
+    )
     first_reported_input = turn_reported_inputs[0] if turn_reported_inputs else 0
     loop_reported_input = sum(turn_reported_inputs[1:])
     return {
@@ -500,7 +511,7 @@ def parse_pi_jsonl(out: str) -> dict:
         "prompt_input": prompt_input,
         "first_turn_prompt_input": first_prompt_input,
         "loop_prompt_input": loop_prompt_input,
-        "variable_input": loop_prompt_input,
+        "variable_input": variable_input,
         "first_turn_input": first_reported_input,
         "loop_input": loop_reported_input,
         "turns": len(turn_prompt_inputs),
@@ -751,7 +762,7 @@ def report(results_path: pathlib.Path,
                 print(f"    {bang}")
             print(f"    SEARCH-CONTEXT tokens (gated metric)    : "
                   f"{_gate_h(_factors(subset, 'ctx_tok', base))}")
-            print(f"    LOOP PROMPT tokens (base turn removed)  : "
+            print(f"    VARIABLE PROMPT tokens (fixed prompt removed): "
                   f"{_gate_h(_factors(subset, 'variable_input', base))}")
             print(f"    OUTPUT tokens                           : "
                   f"{_gate_h(_factors(subset, 'output', base))}")
