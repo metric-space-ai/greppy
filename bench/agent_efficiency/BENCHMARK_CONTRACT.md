@@ -62,6 +62,9 @@ mismatches, or incomplete pairs make a run non-decision-capable.
 5. Candidate variable input tokens on structural tasks are at most 80% of
    baseline.
 6. Every comparable row has accepted machine-readable quality evidence.
+7. Every baseline and candidate row is a completed, error-free provider
+   session. Invalid sessions fail coverage and never enter paired quality or
+   cost ratios.
 
 `release_gate.py` implements these thresholds. They are fixed before the run
 and may not be relaxed after observing results.

@@ -384,6 +384,11 @@ are release requirements, not deferred cleanup:
   release-gate schema is versioned when this definition changes, an invariant
   test covers unequal fixed prompt lengths with identical tool histories, and
   the 20-percent acceptance threshold remains unchanged.
+- isolated provider failures must never become product-efficiency datapoints.
+  The parallel runner resumes only invalid arms in bounded serial recovery
+  rounds; any remaining invalid arm fails coverage, while all cost ratios use
+  completed error-free pairs only. The release-gate schema is versioned for
+  this fail-closed contract and the 20-percent thresholds remain unchanged.
 - synthetic-only diagnostic or `--index-only` acceptance runs must not require
   the external real-corpus `MANIFEST.json`; the run manifest records real-corpus
   provenance only when a selected task uses it, while a selected real-corpus
@@ -399,6 +404,10 @@ are release requirements, not deferred cleanup:
   command. Shared `/Volumes/tmp` targets can be removed by unrelated cleanup;
   that invalidates the local run but must never be mistaken for a product or
   source failure, and remote exact-SHA evidence remains authoritative.
+- `read-file` must accept an explicitly absolute diagnostic or artifact path
+  outside the repository, while relative `../` traversal remains confined.
+  This is required for agents to inspect downloaded release-gate artifacts
+  through Greppy itself and is covered by CLI integration tests.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

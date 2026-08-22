@@ -69,6 +69,35 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertTrue(report["passed"])
 
+    def test_provider_error_voids_coverage_without_contaminating_ratios(self) -> None:
+        rows = [
+            {
+                "id": "healthy",
+                "type": "locate",
+                "explorer": result(True, tools=10, opens=5, variable_input=1000),
+                "greppy": result(True, tools=7, opens=3, variable_input=700),
+            },
+            {
+                "id": "rate-limited",
+                "type": "locate",
+                "explorer": result(True, tools=10, opens=5, variable_input=1000),
+                "greppy": {
+                    **result(False, tools=41, opens=16, variable_input=184883),
+                    "error": "429 rate limit",
+                },
+            },
+        ]
+        status, report = self.evaluate(rows)
+        self.assertEqual(status, 2)
+        self.assertEqual(report["schema_version"], "greppy.agent-release-gate.v4")
+        self.assertEqual(report["invalid_agent_rows"], ["rate-limited"])
+        self.assertEqual(report["valid_agent_rows"], 1)
+        self.assertFalse(report["checks"]["all_rows_have_valid_agent_results"])
+        self.assertEqual(report["ratios_candidate_over_baseline"]["variable_input"], {
+            "ratio": 0.7,
+            "rows": 1,
+        })
+
     def test_arm_order_is_reproducible_and_not_fixed(self) -> None:
         agents = ["grep", "greppy", "explorer"]
         orders = {

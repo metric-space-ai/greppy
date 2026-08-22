@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
-## [0.3.2] — 2026-08-21
+## [0.3.2] — 2026-08-22
 
 ### Parallel Agent Store CoW
 
@@ -42,6 +42,19 @@ without duplicate private rows.
 stdin. Human and JSON output preserve requested order, apply the global output
 budget only at whole-result boundaries, and return a usable retry when the next
 complete result does not fit.
+
+### Release hardening
+
+The agent-efficiency gate now removes each arm's fixed prompt from later-turn
+input and treats provider errors as invalid coverage rather than product-cost
+measurements. Isolated invalid arms receive bounded serial recovery after the
+parallel run; remaining invalid sessions fail closed without weakening any
+efficiency or quality threshold.
+
+`read-file` accepts explicitly absolute diagnostic and artifact paths outside
+the repository, while relative `../` traversal remains confined to the repo.
+This lets integrated agents inspect downloaded gate artifacts without leaving
+Greppy's read/navigation workflow.
 
 ## [0.3.0] — 2026-08-12
 

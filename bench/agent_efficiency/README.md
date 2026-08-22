@@ -88,7 +88,10 @@ python3 bench/agent_efficiency/parallel_acceptance_run.py \
 Five workers is the default production setting. Higher concurrency can trigger
 provider rate limits and does not make a partial run decision-capable. The
 runner has bounded retry/backoff and a circuit breaker for sustained provider
-failure.
+failure. After the parallel phase it also performs at most two serial recovery
+rounds for isolated invalid provider sessions, resuming valid task arms instead
+of charging a 429/dead session to either product. A session that remains invalid
+after bounded recovery fails the run.
 
 ## Artifacts
 

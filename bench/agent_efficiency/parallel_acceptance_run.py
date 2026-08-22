@@ -42,6 +42,7 @@ BIN = pathlib.Path(os.environ["GREPPY_BENCH_BIN"]) if os.environ.get("GREPPY_BEN
 # tasks, and marks the run FAILED in SUMMARY.md.
 QUOTA_BREAKER_LIMIT = 8
 QUOTA_BREAKER_EXIT = 3
+INVALID_RECOVERY_ROUNDS = 2
 QUOTA_ERROR_RE = re.compile(r"rate[ _-]?limit|\b429\b|quota", re.IGNORECASE)
 # run_bench.py per-task agent execution order; used to count consecutive
 # quota-errored sessions inside each finished worker's one-task results file.
@@ -487,6 +488,51 @@ def run_parallel_bench(
             file=sys.stderr,
         )
         return 1
+    requested_agents = tuple(agent.strip() for agent in agents.split(",") if agent.strip())
+    invalid = invalid_worker_results(selected_tasks, worker_dir, requested_agents)
+    for recovery_round in range(1, INVALID_RECOVERY_ROUNDS + 1):
+        if not invalid:
+            break
+        print(
+            "RECOVERY: re-running only invalid provider sessions after the "
+            f"parallel phase (round {recovery_round}/{INVALID_RECOVERY_ROUNDS}): "
+            + ", ".join(
+                f"{task_id}[{','.join(agent_names)}]"
+                for task_id, agent_names in invalid.items()
+            ),
+            file=sys.stderr,
+        )
+        for task in selected_tasks:
+            if task["id"] not in invalid:
+                continue
+            rc = run_one_task(
+                task,
+                worker_dir,
+                raw_dir,
+                logs_dir,
+                False,
+                agents,
+                llm_provider,
+                tasks_path,
+                log_suffix=f".recovery-{recovery_round}",
+            )
+            if rc != 0:
+                print(
+                    f"recovery task {task['id']} failed with exit {rc}",
+                    file=sys.stderr,
+                )
+                return rc
+        invalid = invalid_worker_results(selected_tasks, worker_dir, requested_agents)
+    if invalid:
+        print(
+            "FAILED — invalid provider sessions remain after bounded recovery: "
+            + ", ".join(
+                f"{task_id}[{','.join(agent_names)}]"
+                for task_id, agent_names in invalid.items()
+            ),
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -515,6 +561,42 @@ def count_consecutive_quota_errors(
     return consecutive
 
 
+def agent_result_valid(result: Any) -> bool:
+    """Mirror run_bench.agent_valid without importing the CLI module."""
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    return bool(str(result.get("answer") or "").strip() or result.get("tool_calls"))
+
+
+def invalid_agents_in_worker_result(
+    worker_result: pathlib.Path, agents: tuple[str, ...]
+) -> tuple[str, ...]:
+    try:
+        rows = json.loads(worker_result.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return agents
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return agents
+    row = rows[0]
+    return tuple(agent for agent in agents if not agent_result_valid(row.get(agent)))
+
+
+def invalid_worker_results(
+    selected_tasks: list[dict[str, Any]],
+    worker_dir: pathlib.Path,
+    agents: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    invalid: dict[str, tuple[str, ...]] = {}
+    for task in selected_tasks:
+        task_id = task["id"]
+        agent_names = invalid_agents_in_worker_result(
+            worker_dir / f"{task_id}.json", agents
+        )
+        if agent_names:
+            invalid[task_id] = agent_names
+    return invalid
+
+
 def run_one_task(
     task: dict[str, Any],
     worker_dir: pathlib.Path,
@@ -524,6 +606,7 @@ def run_one_task(
     agents: str = DEFAULT_AGENTS,
     llm_provider: str = "minimax",
     tasks_path: pathlib.Path = TASKS,
+    log_suffix: str = "",
 ) -> int:
     tid = task["id"]
     cmd = [
@@ -544,7 +627,7 @@ def run_one_task(
     if rerun:
         cmd.append("--rerun")
     cmd.append(tid)
-    return run_logged(cmd, logs_dir / f"{tid}.log")
+    return run_logged(cmd, logs_dir / f"{tid}{log_suffix}.log")
 
 
 def select_tasks(

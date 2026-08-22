@@ -66,6 +66,17 @@ def metric_ratio(
     return candidate_total / base_total, count
 
 
+def valid_agent_result(result: Any) -> bool:
+    """Return whether a row measures a completed agent session.
+
+    Provider errors and dead sessions are harness failures, not product-cost
+    observations. They must fail coverage without contaminating ratios.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    return bool(str(result.get("answer") or "").strip() or result.get("tool_calls"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=pathlib.Path, required=True)
@@ -81,9 +92,21 @@ def main() -> int:
         if isinstance(row.get(args.baseline), dict)
         and isinstance(row.get(args.candidate), dict)
     ]
+    invalid_agent_rows = [
+        row
+        for row in comparable
+        if not valid_agent_result(row.get(args.baseline))
+        or not valid_agent_result(row.get(args.candidate))
+    ]
+    valid_pairs = [
+        row
+        for row in comparable
+        if valid_agent_result(row.get(args.baseline))
+        and valid_agent_result(row.get(args.candidate))
+    ]
     missing_quality = 0
     losses = wins = ties = 0
-    for row in comparable:
+    for row in valid_pairs:
         base = quality(row, args.baseline)
         cand = quality(row, args.candidate)
         if base is None or cand is None:
@@ -95,7 +118,7 @@ def main() -> int:
         else:
             ties += 1
 
-    structural = [row for row in comparable if row.get("type") == "locate"]
+    structural = [row for row in valid_pairs if row.get("type") == "locate"]
     tool_ratio, tool_n = metric_ratio(
         structural, args.baseline, args.candidate, "tool_calls"
     )
@@ -108,7 +131,8 @@ def main() -> int:
     loss_p = one_sided_loss_probability(losses, wins)
     observed_not_lower = wins >= losses
     checks = {
-        "all_rows_have_accepted_quality": missing_quality == 0 and bool(comparable),
+        "all_rows_have_accepted_quality": missing_quality == 0 and bool(valid_pairs),
+        "all_rows_have_valid_agent_results": not invalid_agent_rows and bool(comparable),
         "candidate_observed_correctness_not_lower": observed_not_lower,
         "no_significant_correctness_regression": loss_p >= 0.05,
         "tool_calls_at_least_20_percent_lower": tool_ratio is not None and tool_ratio <= 0.80,
@@ -117,10 +141,11 @@ def main() -> int:
         and input_ratio <= 0.80,
     }
     report = {
-        "schema_version": "greppy.agent-release-gate.v3",
+        "schema_version": "greppy.agent-release-gate.v4",
         "baseline": args.baseline,
         "candidate": args.candidate,
         "comparable_rows": len(comparable),
+        "valid_agent_rows": len(valid_pairs),
         "structural_rows": len(structural),
         "quality": {
             "missing": missing_quality,
@@ -130,6 +155,7 @@ def main() -> int:
             "candidate_observed_correctness_not_lower": observed_not_lower,
             "one_sided_regression_p": loss_p,
         },
+        "invalid_agent_rows": [row.get("id") for row in invalid_agent_rows],
         "ratios_candidate_over_baseline": {
             "tool_calls": {"ratio": tool_ratio, "rows": tool_n},
             "source_open_calls": {"ratio": open_ratio, "rows": open_n},

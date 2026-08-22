@@ -215,6 +215,30 @@ fn read_file_range_and_all_bypass_pagination() {
 }
 
 #[test]
+fn read_file_accepts_explicit_absolute_path_outside_repo_only() {
+    let (repo, store) = fresh_workspace("absolute-external");
+    let external = repo.parent().unwrap().join("diagnostic.json");
+    std::fs::write(&external, "{\n  \"passed\": false\n}\n").unwrap();
+
+    let external_arg = external.to_str().unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", external_arg, "--all"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let canonical_external = external.canonicalize().unwrap();
+    assert_eq!(
+        stdout,
+        format!(
+            "{}:1-3\n{{\n  \"passed\": false\n}}\n",
+            canonical_external.display()
+        )
+    );
+
+    let (escape_code, escape_out, escape_err) =
+        run(&repo, &store, &["read-file", "../diagnostic.json", "--all"]);
+    assert_eq!(escape_code, 1, "stdout={escape_out}\nstderr={escape_err}");
+    assert_eq!(escape_out, "no such file: ../diagnostic.json\n");
+}
+
+#[test]
 fn read_handle_is_compact_and_existing_json_shape_survives() {
     let (repo, store) = fresh_workspace("handle");
     std::fs::write(repo.join("lib.rs"), "pub fn target() {}\n").unwrap();

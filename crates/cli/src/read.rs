@@ -1190,11 +1190,19 @@ fn read_open_file(
 ) -> Option<(String, std::path::PathBuf, String)> {
     let candidate = read_file_candidate(root_path, subject);
     let canonical = candidate.canonicalize().ok()?;
-    if !canonical.starts_with(canonical_root) || !canonical.is_file() {
+    if !canonical.is_file() {
         return None;
     }
-    let relative = canonical.strip_prefix(canonical_root).ok()?;
-    let shown = relative.to_string_lossy().replace('\\', "/");
+    let shown = if let Ok(relative) = canonical.strip_prefix(canonical_root) {
+        relative.to_string_lossy().replace('\\', "/")
+    } else {
+        // Reading is allowed for an explicitly absolute diagnostic/artifact
+        // path. Keep relative `../` traversal confined to the repository.
+        if !std::path::Path::new(subject).is_absolute() {
+            return None;
+        }
+        canonical.to_string_lossy().replace('\\', "/")
+    };
     let content = std::fs::read_to_string(&canonical).ok()?;
     Some((shown, canonical, content))
 }
