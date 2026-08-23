@@ -385,6 +385,12 @@ are release requirements, not deferred cleanup:
   body evidence is actually required, and stop when that result is sufficient;
   the registered agent-efficiency gate must be met by better agent behavior
   rather than weakened thresholds.
+- concept-to-code discovery must consume one ranked semantic candidate set,
+  select the best matching returned definition, and never paraphrase the same
+  question into an unbounded search loop. A repeated exact-commit release run
+  found the registered target at rank two on the first call but still issued
+  50-plus equivalent searches; the fix is the shipped agent contract, while
+  the registered task bank and 20-percent thresholds remain unchanged.
 - agent-efficiency `variable_input` must remove each arm's own fixed first-turn
   prompt and user-query baseline from every later turn. Explorer is deliberately
   uncoached while Greppy ships this manual; charging that static manual once per

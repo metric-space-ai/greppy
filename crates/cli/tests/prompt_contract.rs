@@ -382,8 +382,10 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // command and stop when its answer is sufficient.
     // 22.08.2026: release-gate forensics approved compact graph-first routes;
     // source text is requested only when the question needs body evidence.
+    // 23.08.2026: repeated exact-commit release evidence approved one ranked
+    // semantic candidate set and forbids paraphrased semantic retry loops.
     const APPROVED_SHA256: &str =
-        "572062d98bfd04568d6346ab8095a88ed11c6c3097aa40f945c40be26b41f2d7";
+        "2be5ffdbc265fb39ecbd477f31d28d1ebceccd49e836a7d3c29003b5a13715e4";
 
     let text = prompt();
     let digest = {

@@ -117,7 +117,7 @@ class ReleaseGateTests(unittest.TestCase):
         prompt = run_bench.gp_sys("/ignored")
         self.assertEqual(
             run_bench.BENCHMARK_PROMPT_VERSION,
-            "greppy-agents-md-0.3.2-compact-one-shot",
+            "greppy-agents-md-0.3.2-single-semantic-query",
         )
         self.assertIn("greppy who-calls NAME`", prompt)
         self.assertIn("greppy impact NAME`", prompt)
@@ -127,6 +127,8 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertIn("Add `--code` only when", prompt)
         self.assertIn("do not add it merely to confirm", prompt)
         self.assertIn("Stop after a successful command", prompt)
+        self.assertIn("run exactly one `greppy search`", prompt)
+        self.assertIn("Do not paraphrase the question", prompt)
         self.assertIn("`greppy read` accepts symbols", prompt)
 
     def test_variable_input_excludes_each_arms_fixed_prompt_on_every_turn(self) -> None:

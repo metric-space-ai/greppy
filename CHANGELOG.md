@@ -51,6 +51,13 @@ measurements. Isolated invalid arms receive bounded serial recovery after the
 parallel run; remaining invalid sessions fail closed without weakening any
 efficiency or quality threshold.
 
+The integrated-agent navigation contract now treats one semantic `search`
+result as a ranked answer-candidate set and forbids paraphrased semantic retry
+loops. Exact-candidate evidence showed the requested definition at rank two on
+the first call while an unconstrained agent repeated 50-plus equivalent
+queries. The release corpus and its 20-percent efficiency thresholds remain
+unchanged.
+
 The coding-outcome release gate now partitions its registered 41 tasks and
 three arms into six deterministic runner shards, with at most three shards
 active concurrently. A serial candidate completed 47 of 123 arms before the

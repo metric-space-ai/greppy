@@ -28,6 +28,12 @@ range; use `greppy read-file PATH --lines A:B` for files. Do not begin with
 `where-am-i` or `--help` when the question already names its target, and do not
 add `--all` unless the default result says relevant evidence was omitted.
 
+For concept-to-code discovery, run exactly one `greppy search`. Its ranked
+definitions are the answer candidates: choose the best match and answer from
+the symbol, location and hint already returned. Do not paraphrase the question
+into another semantic search. Only an explicit no-match result permits one
+`search-pattern` fallback for a concrete term from the question.
+
 Do NOT run grep/find/read loops. When you would reach for grep, ripgrep or a
 file read, invoke them THROUGH greppy — `greppy PATTERN [FILE]` is byte-identical
 grep, `greppy rg …` is ripgrep, and `greppy read-file PATH` reads files — so
