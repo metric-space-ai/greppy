@@ -771,6 +771,14 @@ def classify_v2_patched_failure(
             proof_line = failed_line
             supporting_line = collected_line
             signature = "pytest_failed_with_collected_tests"
+        else:
+            progress_failure = _first_matching_line(
+                lines,
+                r"^(?=[.sSxXFE]*[FE])[.sSxXFE]+\s+\[\s*100%\]$",
+            )
+            if progress_failure:
+                proof_line = progress_failure
+                signature = "pytest_quiet_progress_failure"
     elif re.search(r"(?:^|\s)go\s+test(?:\s|$)", command):
         framework = "go-test"
         proof_line = _first_matching_line(lines, r"^(?:--- FAIL:|FAIL\t)")

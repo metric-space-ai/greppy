@@ -61,6 +61,12 @@ merge requires six disjoint, complete task partitions before grading all 123
 results once. Tasks, models, prompts, grading, and release thresholds are
 unchanged.
 
+Coding mutation preflight now accepts Pytest's completed quiet-mode progress
+line as framework-proven failure evidence when it contains an `F` or `E` marker.
+Pytest `-q` can omit the collection banner even though tests executed; this
+previously invalidated a real two-test failure as infrastructure. Bare failure
+text and all-passing progress remain fail-closed.
+
 The packaged-daemon SIGKILL recovery smoke now creates a cold replacement
 owner and proves an active model load before killing it. Polling for the
 microsecond-scale active window of three warm embeddings produced a false

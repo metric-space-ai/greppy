@@ -426,6 +426,12 @@ are release requirements, not deferred cleanup:
   partitions and then grades all 123 results exactly once. Within-task arm
   order, atomic checkpoints, task content, models, prompts, grading, and
   thresholds remain unchanged.
+- coding mutation preflight must recognize Pytest's quiet progress failure
+  line (for example, `.......FF [100%]`) as positive framework evidence even
+  when `-q` omits the `collected N items` banner. A `FAILED ...` string without
+  either a positive collection banner or an unambiguous completed progress
+  line remains infrastructure failure, and an all-passing quiet progress line
+  must not be accepted as mutation evidence.
 
 These defects are fixed in the 0.3.2 implementation and covered by the workspace,
 differential Store-CoW, and release-performance test gates. They remain named

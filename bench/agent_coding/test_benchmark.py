@@ -370,6 +370,7 @@ class V2PreflightClassificationTests(unittest.TestCase):
     def test_accepts_each_supported_framework_failure_signature(self) -> None:
         cases = [
             (["python3", "-m", "pytest", "-q"], "collected 2 items\ntest_case FAILED\n1 failed\n", "pytest_failed_with_collected_tests"),
+            (["python3", "-m", "pytest", "-q"], ".......FF [100%]\n", "pytest_quiet_progress_failure"),
             (["go", "test", "./..."], "--- FAIL: TestFeature (0.00s)\n", "go_test_fail_marker"),
             (["go", "test", "./..."], "FAIL\texample.test/pkg\t0.01s\n", "go_test_fail_marker"),
             (["cargo", "test"], "test result: FAILED. 0 passed; 1 failed\n", "cargo_test_failed_result"),
@@ -388,6 +389,14 @@ class V2PreflightClassificationTests(unittest.TestCase):
         classification = self.classify(
             ["python3", "-m", "pytest", "-q"],
             "FAILED tests/test_feature.py::test_case - assertion failed\n",
+        )
+        self.assertEqual(classification["verdict"], "preflight_infra_failure")
+        self.assertEqual(classification["signature"], "no_framework_failure_evidence")
+
+    def test_pytest_quiet_progress_requires_a_failure_marker(self) -> None:
+        classification = self.classify(
+            ["python3", "-m", "pytest", "-q"],
+            "......... [100%]\n",
         )
         self.assertEqual(classification["verdict"], "preflight_infra_failure")
         self.assertEqual(classification["signature"], "no_framework_failure_evidence")
