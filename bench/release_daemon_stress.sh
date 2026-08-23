@@ -452,15 +452,26 @@ REJECTED="$(python3 "$CLIENT" status "$EMBED_SOCK" | jq -r '.rejected_requests')
 [ "$REJECTED" -ge 1 ] || fail "daemon status shows no rejected requests after the flood"
 
 # --- kill -9 mid-load: clean respawn, correct answers -------------------------
-# SIGKILL the owner while requests are in flight. The endpoint file survives
-# the kill (no Drop runs), so the next client must classify the dead endpoint,
-# spawn a fresh owner, repair the socket, and serve correct answers.
+# First SIGKILL the warm owner and let real clients repair its stale endpoint.
+# Their replacement owner must cold-load the model, giving the test a
+# deterministic observable in-flight window. SIGKILL that cold-loading owner;
+# the final client must again classify the dead endpoint, spawn a fresh owner,
+# repair the socket, and serve correct answers. Waiting for a warm single-query
+# micro-window was racy on fast macOS runners.
 section "kill -9 mid-load: stale socket repaired, fresh owner, correct answers"
+
+WARM_EMBED_PID="$EMBED_PID"
+kill -9 "$WARM_EMBED_PID"
+poll 15 "warm SIGKILLed daemon to disappear" bash -c "! kill -0 $WARM_EMBED_PID 2>/dev/null"
+[ -S "$EMBED_SOCK" ] || fail "SIGKILL should leave the warm daemon socket behind"
 
 for i in 1 2 3; do
   "$BIN" --root "$REPO_EMBED" search --json "$(unique_query "kill-$i")" \
     >"$WORK/out/kill-$i.json" 2>&1 &
 done
+poll 15 "one cold replacement embedding daemon owner" daemon_count_is "$EMBED_SOCK" 1
+EMBED_PID="$(daemon_pid "$EMBED_SOCK")"
+[ "$EMBED_PID" != "$WARM_EMBED_PID" ] || fail "cold replacement reused the killed daemon pid"
 python3 "$CLIENT" wait-active "$EMBED_SOCK" 60 >/dev/null \
   || fail "no in-flight inference observed before the kill"
 kill -9 "$EMBED_PID"

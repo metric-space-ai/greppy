@@ -61,6 +61,12 @@ merge requires six disjoint, complete task partitions before grading all 123
 results once. Tasks, models, prompts, grading, and release thresholds are
 unchanged.
 
+The packaged-daemon SIGKILL recovery smoke now creates a cold replacement
+owner and proves an active model load before killing it. Polling for the
+microsecond-scale active window of three warm embeddings produced a false
+failure on fast macOS runners even though stale-socket recovery, concurrency,
+and inference had already passed.
+
 `read-file` accepts explicitly absolute diagnostic and artifact paths outside
 the repository, while relative `../` traversal remains confined to the repo.
 This lets integrated agents inspect downloaded gate artifacts without leaving

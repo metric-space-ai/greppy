@@ -374,6 +374,11 @@ are release requirements, not deferred cleanup:
 - release-smoke daemon draining must observe only the probe's owned runtime
   directory; a global process-name scan must never couple one validation run
   to unrelated greppy agents or daemons on the same machine.
+- packaged-daemon SIGKILL recovery must establish a cold replacement owner and
+  observe its active model load before killing it. A warm three-query active
+  window can be shorter than status polling on fast macOS runners and must not
+  create a false release failure after inference and stale-socket behavior have
+  otherwise passed.
 - the integrated-agent manual must route exact definition, caller, impact,
   path, and semantic questions directly to one compact graph command,
   distinguish symbol reads from file/range reads, request `--code` only when
