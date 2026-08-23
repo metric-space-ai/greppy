@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
-## [0.3.2] — 2026-08-22
+## [0.3.2] — 2026-08-23
 
 ### Parallel Agent Store CoW
 

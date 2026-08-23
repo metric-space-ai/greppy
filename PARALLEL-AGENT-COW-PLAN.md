@@ -3,7 +3,7 @@
 Status: 0.3.2 implemented and locally gate-qualified; two exact-commit coding
 gates exposed single-runner runtime contention and now route the registered
 corpus through deterministic runner shards plus a fail-closed merge. Fresh
-exact-commit CI, artifact signing, and publication remain pending · 2026-08-22.
+exact-commit CI, artifact signing, and publication remain pending · 2026-08-23.
 0.3.3 remains planned.
 
 Scope decision: **two releases, two complete features.** The milestones below
