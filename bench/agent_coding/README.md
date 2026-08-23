@@ -151,13 +151,15 @@ timeouts, Ctrl-C, SIGTERM, and SIGHUP. As with any process, SIGKILL or machine
 power loss cannot execute cleanup handlers; stale operating-system temporary
 directories can then be removed normally.
 
-Every task/arm may receive at most one fresh isolated replay when Pi reaches
-the registered agent timeout. This policy is identical for explorer, Greppy,
-and Greppy-edit. The timed-out attempt remains publication-safe evidence in the
-final row, and its tokens, tool calls, source opens, edits, turns, and wall time
-are added to the recovered result. A second timeout remains invalid and fails
-the gate. Provider-reported upstream errors and harness setup failures keep
-their separate bounded infrastructure retries; they are not measurements.
+The registered Pi timeout is a symmetric compute cutoff, not an infrastructure
+retry trigger. When the cutoff is reached after at least one completed turn and
+without a provider-reported error, the harness kills the complete process group
+and independently tests the worktree snapshot left at that instant. A passing
+snapshot is correct; a failing snapshot is an ordinary measured failure. The
+full cutoff wall time and all parsed costs remain in that arm's single result,
+and no timeout replay is allowed. A zero-turn timeout or provider-reported error
+remains invalid. Provider-reported upstream errors and harness setup failures
+keep their separate bounded infrastructure retries; they are not measurements.
 
 ## Preregistered gate
 
@@ -176,11 +178,11 @@ The gate is fixed in code and copied into every manifest:
 7. Tool-call, source-open, input-token, navigation-arm, and wall-time ratios are
    descriptive only. Wall time is computed only for solved pairs. A
    failed test can never receive or contribute a speed win.
-8. Missing or invalid arms after bounded recovery fail the gate. Each task/arm
-   gets at most one fresh-session replay after a Pi timeout, with the discarded
-   attempt recorded and all of its measured cost charged to the final result.
-   A second timeout, nonzero exit, reported model error after infrastructure
-   retries, or zero-turn session remains invalid even if a partial edit passes.
+8. Missing or invalid arms after bounded infrastructure retries fail the gate.
+   An agent timeout after at least one completed turn is a valid measured cutoff:
+   the independent test grades the resulting snapshot and there is no replay.
+   A non-timeout nonzero exit, reported model error after infrastructure retries,
+   or zero-turn timeout remains invalid even if a partial edit passes.
 
 ## Unit tests
 
@@ -197,7 +199,6 @@ validation, setup failure and secret handling, clean-pass/mutated-fail preflight
 behavior, setup exclusion
 from measured agent wall time, metric parsing and secret redaction, exact paired
 correctness grading, the 20% provider-cost threshold, post-edit re-read gate,
-30/20 minimum sample sizes, strict agent success validity, manifest
+30/20 minimum sample sizes, cutoff-snapshot validity, manifest
 platform/version provenance, resume identity, and exclusion of failed tests
-from speed credit. They also cover symmetric one-time timeout recovery,
-publication-safe attempt evidence, and conservative recovery-cost accounting.
+from speed credit. They also cover symmetric no-replay timeout accounting.

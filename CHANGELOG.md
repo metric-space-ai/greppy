@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
-## [0.3.2] — 2026-08-23
+## [0.3.2] — 2026-08-24
 
 ### Parallel Agent Store CoW
 
@@ -73,13 +73,15 @@ merge requires six disjoint, complete task partitions before grading all 123
 results once. Tasks, models, prompts, grading, and release thresholds are
 unchanged.
 
-Coding shards now recover at most one invalid Pi timeout per task/arm in a
-fresh isolated session, identically for explorer, Greppy, and Greppy-edit. The
-timed-out attempt remains in publication-safe evidence and all of its measured
-tokens, tool calls, source opens, edits, turns, and wall time are charged to the
-recovered row; a second timeout remains invalid. This prevents one stochastic
-runaway from voiding an otherwise complete multi-hour shard without making a
-timeout free or weakening the fail-closed gate. The manifest now also freezes
+Coding shards now treat each registered Pi timeout as a symmetric compute
+cutoff rather than an infrastructure failure. After at least one completed turn,
+the exact worktree snapshot at the cutoff is independently tested: a passing
+snapshot is correct, a failing snapshot is an ordinary measured loss, all cost
+remains charged, and no timeout replay occurs. Zero-turn cutoffs and
+provider-reported errors remain invalid. This replaces the harness-v3
+fresh-session recovery after exact-candidate evidence showed that complete
+replays can hit the same task budget and merely double cost without resolving
+the measurement. The manifest now also freezes
 the Greppy-edit prompt hashes and describes the actual provider-dollar and
 post-edit re-read thresholds instead of stale token-ratio wording. The binding
 edit contract now matches the tested harness: all three arms receive the same

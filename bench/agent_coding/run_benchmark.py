@@ -71,7 +71,7 @@ def provider_cost_usd(agent: dict) -> float:
         float(agent.get(field, 0) or 0) * rate / 1_000_000
         for field, rate in PROVIDER_PRICE_USD_PER_MILLION.items()
     )
-HARNESS_VERSION = "3"
+HARNESS_VERSION = "4"
 DEFAULT_MODEL = os.environ.get("GREPPY_BENCH_MODEL", "MiniMax-M3")
 DEFAULT_PROVIDER = os.environ.get("GREPPY_BENCH_PROVIDER", "minimax")
 # "off" for the registered MiniMax gate; forensics runs set e.g. "medium" so
@@ -84,25 +84,10 @@ MIN_SOLVED_PAIRS = 20
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
 PROVIDER_ERROR_RETRIES_PER_ARM = 4
 HARNESS_ERROR_RETRIES_PER_ARM = 4
-AGENT_TIMEOUT_RECOVERIES_PER_ARM = 1
 MAX_ARM_ATTEMPTS = (
     1
     + PROVIDER_ERROR_RETRIES_PER_ARM
     + HARNESS_ERROR_RETRIES_PER_ARM
-    + AGENT_TIMEOUT_RECOVERIES_PER_ARM
-)
-RECOVERY_COST_FIELDS = (
-    "input_tokens",
-    "uncached_input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "tool_calls",
-    "source_opens",
-    "wall_seconds",
-    "edit_calls",
-    "post_edit_source_opens",
-    "turns",
 )
 
 SHARED_SYSTEM_PROMPT = (
@@ -1469,70 +1454,27 @@ def run_arm(
 
 
 def agent_result_is_valid(agent: dict[str, Any]) -> bool:
-    return agent.get("success") is True
-
-
-def timeout_recovery_is_allowed(row: dict[str, Any], recoveries_used: int) -> bool:
-    """Allow one symmetric fresh-session replay for an invalid agent timeout."""
-    agent = row.get("agent")
+    if agent.get("success") is True:
+        return True
+    # The task timeout is the preregistered compute cutoff, not an
+    # infrastructure failure. A process that reached the cutoff after at least
+    # one completed turn leaves a measurable worktree snapshot; run_arm grades
+    # that snapshot with the independent test exactly like any other attempt.
     return (
-        recoveries_used < AGENT_TIMEOUT_RECOVERIES_PER_ARM
-        and row.get("valid") is False
-        and isinstance(agent, dict)
-        and agent.get("timed_out") is True
+        agent.get("timed_out") is True
+        and int(agent.get("turns", 0) or 0) > 0
+        and not agent.get("reported_error")
     )
 
 
-def timeout_recovery_summary(row: dict[str, Any]) -> dict[str, Any]:
-    """Return publication-safe evidence for a superseded timeout attempt."""
-    agent = row.get("agent") if isinstance(row.get("agent"), dict) else {}
-    return {
-        "reason": "agent_timeout",
-        "valid": row.get("valid"),
-        "correctness": row.get("correctness"),
-        "agent": {field: agent.get(field, 0) for field in RECOVERY_COST_FIELDS},
-        "test": row.get("test"),
-        "pretest_diff_sha256": row.get("pretest_diff_sha256"),
-        "pretest_diff_bytes": row.get("pretest_diff_bytes"),
-        "final_diff_sha256": row.get("final_diff_sha256"),
-        "final_diff_bytes": row.get("final_diff_bytes"),
-        "test_files_modified_by_agent": row.get("test_files_modified_by_agent"),
-        "worktree_cleaned": row.get("worktree_cleaned"),
-        "completed_at": row.get("completed_at"),
-    }
-
-
-def include_timeout_recovery_costs(
-    row: dict[str, Any], timeout_attempts: Sequence[dict[str, Any]], session_attempts: int
-) -> None:
-    """Charge every recovered timeout to the final measured arm result."""
-    agent = row.get("agent")
-    if not isinstance(agent, dict):
-        return
-    for attempt in timeout_attempts:
-        previous_agent = attempt["agent"]
-        for field in RECOVERY_COST_FIELDS:
-            agent[field] = (agent.get(field, 0) or 0) + (previous_agent.get(field, 0) or 0)
-    agent["session_attempts"] = session_attempts
-    agent["timeout_recovery_attempts"] = len(timeout_attempts)
-    if timeout_attempts:
-        row["timeout_recovery"] = {
-            "policy_version": "1",
-            "fresh_isolated_session_per_attempt": True,
-            "overhead_included_in_final_agent_metrics": True,
-            "attempts": list(timeout_attempts),
-        }
-
-
-def run_arm_with_recovery(
+def run_arm_with_retries(
     *,
     task_id: str,
     arm: str,
     run_attempt: Callable[[int], dict[str, Any]],
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    """Run one arm with preregistered infrastructure and timeout recovery."""
-    timeout_attempts: list[dict[str, Any]] = []
+    """Run one arm with bounded provider and harness-infrastructure retries."""
     provider_retries = 0
     harness_retries = 0
     for attempt in range(1, MAX_ARM_ATTEMPTS + 1):
@@ -1567,18 +1509,8 @@ def run_arm_with_recovery(
             )
             sleep(30 * provider_retries)
             continue
-        if timeout_recovery_is_allowed(row, len(timeout_attempts)):
-            timeout_attempts.append(timeout_recovery_summary(row))
-            print(
-                f"[{task_id}] {arm}: agent timeout, fresh-session "
-                f"recovery {len(timeout_attempts)}/{AGENT_TIMEOUT_RECOVERIES_PER_ARM}; "
-                "timeout cost remains charged",
-                flush=True,
-            )
-            continue
-        include_timeout_recovery_costs(row, timeout_attempts, attempt)
         return row
-    raise HarnessError("arm recovery exhausted the total attempt bound")
+    raise HarnessError("arm retries exhausted the total attempt bound")
 
 
 def exact_regression_p_value(baseline_only: int, candidate_only: int) -> float:
@@ -1877,13 +1809,13 @@ def build_base_manifest(
             "minimum_sample": "at least 30 complete pairs and at least 20 both-solved pairs",
             "efficiency": "Greppy-edit billed provider dollars <= 0.80x explorer",
             "edit_loop": "Greppy-edit post-edit source opens <= 0.1 per observed Greppy edit",
-            "invalid_session_recovery": {
-                "agent_timeout_retries_per_task_arm": AGENT_TIMEOUT_RECOVERIES_PER_ARM,
+            "agent_cutoff": {
+                "timeout_source": "each task's preregistered timeout_seconds",
                 "applies_symmetrically_to_all_arms": True,
-                "fresh_isolated_session_per_attempt": True,
-                "timeout_attempt_metrics_are_recorded": True,
-                "timeout_attempt_costs_are_included_in_final_metrics": True,
-                "second_timeout_remains_invalid": True,
+                "evaluate_worktree_snapshot_after_timeout": True,
+                "valid_after_completed_turn_without_provider_error": True,
+                "agent_timeout_retries_per_task_arm": 0,
+                "full_cutoff_attempt_metrics_are_recorded": True,
             },
             "wall_time": "reported only for solved pairs; never a gate metric",
             "failed_test_speed_credit": False,
@@ -2261,9 +2193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # 5xx) invalidate an attempt without measuring anything;
                         # retry those up to four times so infrastructure noise
                         # does not consume task validity. Harness failures receive
-                        # the existing bounded recovery. One invalid agent timeout
-                        # also receives a fresh-session replay for every arm; its
-                        # full measured cost is charged to the final row.
+                        # the existing bounded recovery. Agent timeouts are measured
+                        # cutoffs and therefore never replayed.
                         def run_attempt(attempt: int) -> dict[str, Any]:
                             # each attempt needs untouched worktree/store dirs;
                             # reusing the previous attempt's task_tmp fails on
@@ -2282,7 +2213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 secrets=secrets,
                             )
 
-                        row = run_arm_with_recovery(
+                        row = run_arm_with_retries(
                             task_id=task["id"], arm=arm, run_attempt=run_attempt
                         )
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source

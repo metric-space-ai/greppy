@@ -1,12 +1,13 @@
 # greppy 0.3.2–0.3.3 — Parallel Agent CoW Release Plan
 
 Status: 0.3.2 implemented and locally gate-qualified. Deterministic coding
-shards fixed single-runner contention, but two full exact-commit runs then each
-produced one different stochastic agent-timeout arm. The harness now permits
-one symmetric fresh-session timeout recovery per task/arm, records the discarded
-attempt, charges all of its measured cost, and fails closed on a second timeout.
-Fresh exact-commit gates, artifact signing, and publication remain pending ·
-2026-08-23. 0.3.3 remains planned.
+shards fixed single-runner contention, but exact-commit evidence showed that
+fresh-session timeout replays can reach the same task budget and merely double
+cost. Harness v4 therefore treats the preregistered timeout as a symmetric
+compute cutoff: it independently tests the exact worktree snapshot, records one
+measured outcome, and never grants a timeout replay. Fresh exact-commit gates,
+artifact signing, and publication remain pending · 2026-08-24. 0.3.3 remains
+planned.
 
 Scope decision: **two releases, two complete features.** The milestones below
 are implementation order, not open research branches.
@@ -364,12 +365,13 @@ are release requirements, not deferred cleanup:
   retryable provider failures, preserve each completed batch checkpoint, and
   resume without discarding already accepted judgments; one transient read
   timeout must not void an otherwise reproducible 204-case release run.
-- the coding-outcome gate must tolerate one isolated stochastic agent timeout
-  per task/arm without hiding its cost: explorer, Greppy, and Greppy-edit each
-  receive at most one fresh isolated replay; the superseded timeout remains in
-  publication-safe evidence and its tokens, tool calls, source opens, edits,
-  turns, and wall time are charged to the final result; a second timeout stays
-  invalid and fails closed. The manifest records all three arm prompt hashes
+- the coding-outcome gate must treat each task's fixed timeout as a symmetric
+  compute cutoff: after at least one completed turn, explorer, Greppy, and
+  Greppy-edit each have their exact cutoff worktree snapshot independently
+  tested as the single measured outcome; there is no timeout replay and all
+  tokens, tool calls, source opens, edits, turns, and wall time stay charged.
+  A zero-turn cutoff or provider-reported error stays invalid and fails closed.
+  The manifest records all three arm prompt hashes
   plus the actual provider-dollar and edit-loop gate contract, not the retired
   token-ratio wording.
 - the Windows release matrix must request Cargo's real `cpu-only` feature, not

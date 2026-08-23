@@ -128,7 +128,7 @@ correctness parity (30/30/30) and the post-edit re-read rate (0.088), not of
 cost. Thresholds below are UNCHANGED from the original registration.
 
 Measured by `bench/agent_coding` on the paired task set, third arm
-`greppy-edit` (harness-v3 registered treatment):
+`greppy-edit` (harness-v4 registered treatment):
 
 - `provider_cost_ratio` (greppy-edit / explorer, solved pairs): **≤ 0.80**
 - `post_edit_source_opens_per_edit` (source opens of a file the same agent
@@ -139,7 +139,7 @@ Measured by `bench/agent_coding` on the paired task set, third arm
   navigation-arm provider-cost, and solved-pair wall-time ratios
 
 The shipped `AGENTS.md` manual and each arm's treatment/full-system prompt are
-pinned separately by hash in every run manifest. Harness v3 records explorer,
+pinned separately by hash in every run manifest. Harness v4 records explorer,
 Greppy navigation, and Greppy-edit prompt identities; a resume refuses any
 prompt, binary, model, task-bank, platform, or gate-contract mismatch.
 
@@ -148,18 +148,22 @@ run): all three arms receive the identical explicit Pi palette
 `bash,read,edit,write`. Greppy-edit's requirement to edit through Greppy is a
 preregistered treatment, not a hidden capability restriction. The older
 2026-07-17 bash-only arm definition is retired and its evidence is not combined
-with harness-v3 evidence. `tools_per_arm` and every full prompt hash are part of
+with harness-v4 evidence. `tools_per_arm` and every full prompt hash are part of
 the manifest identity. Thresholds are unchanged.
 
-Invalid-session recovery (registered 2026-08-23 after two otherwise complete
-exact-commit runs each exposed one different stochastic arm timeout, and before
-any harness-v3 measurement): every task/arm receives at most one fresh isolated
-replay after an agent timeout. The policy applies identically to explorer,
-Greppy, and Greppy-edit. The superseded timeout remains in publication-safe
-evidence and its tokens, tool calls, source opens, edits, turns, and wall time
-are added to the final arm metrics. A second timeout remains invalid and fails
-closed. Provider/harness infrastructure retries remain separately bounded and
-are not measurements. Harness-v2 results cannot resume under this contract.
+Agent cutoff semantics (re-registered 2026-08-24 after harness-v3 demonstrated
+that full fresh-session timeout replays could themselves reach the same task
+budget): each task's fixed timeout is a compute cutoff, not an infrastructure
+failure. The rule applies identically to explorer, Greppy, and Greppy-edit. If
+Pi reaches the cutoff after at least one completed turn and without a
+provider-reported error, the harness kills the process group and independently
+tests the exact worktree snapshot left at the cutoff. That single attempt is a
+valid measurement: a passing snapshot is correct and a failing snapshot is an
+ordinary correctness loss. Its full tokens, tool calls, source opens, edits,
+turns, and wall time remain charged; there is no timeout replay. A zero-turn
+cutoff or provider-reported error remains invalid and fails closed.
+Provider/harness infrastructure retries remain separately bounded and are not
+measurements. Harness-v2/v3 results cannot resume under this contract.
 
 ## Verify (binding, v0.3.0)
 
