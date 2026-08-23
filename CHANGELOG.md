@@ -73,6 +73,19 @@ merge requires six disjoint, complete task partitions before grading all 123
 results once. Tasks, models, prompts, grading, and release thresholds are
 unchanged.
 
+Coding shards now recover at most one invalid Pi timeout per task/arm in a
+fresh isolated session, identically for explorer, Greppy, and Greppy-edit. The
+timed-out attempt remains in publication-safe evidence and all of its measured
+tokens, tool calls, source opens, edits, turns, and wall time are charged to the
+recovered row; a second timeout remains invalid. This prevents one stochastic
+runaway from voiding an otherwise complete multi-hour shard without making a
+timeout free or weakening the fail-closed gate. The manifest now also freezes
+the Greppy-edit prompt hashes and describes the actual provider-dollar and
+post-edit re-read thresholds instead of stale token-ratio wording. The binding
+edit contract now matches the tested harness: all three arms receive the same
+explicit `bash,read,edit,write` palette, and treatment rather than a hidden tool
+restriction defines the Greppy-edit contrast.
+
 Coding mutation preflight now accepts Pytest's completed quiet-mode progress
 line as framework-proven failure evidence when it contains an `F` or `E` marker.
 Pytest `-q` can omit the collection banner even though tests executed; this

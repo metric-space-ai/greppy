@@ -128,32 +128,38 @@ correctness parity (30/30/30) and the post-edit re-read rate (0.088), not of
 cost. Thresholds below are UNCHANGED from the original registration.
 
 Measured by `bench/agent_coding` on the paired task set, third arm
-`greppy-edit` (v3 prompt set):
+`greppy-edit` (harness-v3 registered treatment):
 
 - `provider_cost_ratio` (greppy-edit / explorer, solved pairs): **≤ 0.80**
 - `post_edit_source_opens_per_edit` (source opens of a file the same agent
   already edited in the same task): **≤ 0.1**
-- `partial_apply_incidents`: **0** (by construction; measured anyway)
 - exact-McNemar correctness parity vs explorer: hard gate, unchanged
-- diagnostics (not gate metrics): edit-verb usage share, failures by exit
-  code, ambiguity rate, certificate count
+- minimum sample: **30** complete pairs and **20** both-solved pairs
+- diagnostics (not gate metrics): tool-call, source-open, input-token,
+  navigation-arm provider-cost, and solved-pair wall-time ratios
 
-Prompt set v3 (`bench/agent_coding/prompts/greppy_system_v3.md`,
-`mscc_skill_v3.md`) is pinned by hash in every run manifest; v2 remains
-pinned for all v0.2.x evidence.
+The shipped `AGENTS.md` manual and each arm's treatment/full-system prompt are
+pinned separately by hash in every run manifest. Harness v3 records explorer,
+Greppy navigation, and Greppy-edit prompt identities; a resume refuses any
+prompt, binary, model, task-bank, platform, or gate-contract mismatch.
 
-Arm tool surface (revision 2026-07-17, before any measured gate-v4 run):
-the `greppy-edit` arm runs pi with `--tools bash` — no builtin
-read/edit/write. Rationale from trace forensics: the displacement prompt
-("there is no apply_patch") is visibly false while a builtin `edit` tool
-sits in the palette, and the agent then ignores greppy entirely (0 greppy
-calls in the greppy-arm serde trace); the MSCC panel shows 78-87% greppy
-adoption exactly where the displacement claim is true. Tool surfaces are
-part of the arm definition, recorded per arm in the manifest
-(`tools_per_arm`), and identical across both arms' *capabilities*: bash
-can still read and write files, so the arm loses no ability, only the
-contradiction. Explorer and greppy arms keep `bash,read,edit,write`.
-Thresholds are unchanged.
+Arm tool surface (re-registered 2026-08-23 before the next measured release
+run): all three arms receive the identical explicit Pi palette
+`bash,read,edit,write`. Greppy-edit's requirement to edit through Greppy is a
+preregistered treatment, not a hidden capability restriction. The older
+2026-07-17 bash-only arm definition is retired and its evidence is not combined
+with harness-v3 evidence. `tools_per_arm` and every full prompt hash are part of
+the manifest identity. Thresholds are unchanged.
+
+Invalid-session recovery (registered 2026-08-23 after two otherwise complete
+exact-commit runs each exposed one different stochastic arm timeout, and before
+any harness-v3 measurement): every task/arm receives at most one fresh isolated
+replay after an agent timeout. The policy applies identically to explorer,
+Greppy, and Greppy-edit. The superseded timeout remains in publication-safe
+evidence and its tokens, tool calls, source opens, edits, turns, and wall time
+are added to the final arm metrics. A second timeout remains invalid and fails
+closed. Provider/harness infrastructure retries remain separately bounded and
+are not measurements. Harness-v2 results cannot resume under this contract.
 
 ## Verify (binding, v0.3.0)
 

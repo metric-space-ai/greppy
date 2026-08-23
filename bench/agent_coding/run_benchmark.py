@@ -71,7 +71,7 @@ def provider_cost_usd(agent: dict) -> float:
         float(agent.get(field, 0) or 0) * rate / 1_000_000
         for field, rate in PROVIDER_PRICE_USD_PER_MILLION.items()
     )
-HARNESS_VERSION = "2"
+HARNESS_VERSION = "3"
 DEFAULT_MODEL = os.environ.get("GREPPY_BENCH_MODEL", "MiniMax-M3")
 DEFAULT_PROVIDER = os.environ.get("GREPPY_BENCH_PROVIDER", "minimax")
 # "off" for the registered MiniMax gate; forensics runs set e.g. "medium" so
@@ -82,6 +82,28 @@ ARMS = ("explorer", "greppy", "greppy-edit")
 MIN_COMPLETE_PAIRS = 30
 MIN_SOLVED_PAIRS = 20
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
+PROVIDER_ERROR_RETRIES_PER_ARM = 4
+HARNESS_ERROR_RETRIES_PER_ARM = 4
+AGENT_TIMEOUT_RECOVERIES_PER_ARM = 1
+MAX_ARM_ATTEMPTS = (
+    1
+    + PROVIDER_ERROR_RETRIES_PER_ARM
+    + HARNESS_ERROR_RETRIES_PER_ARM
+    + AGENT_TIMEOUT_RECOVERIES_PER_ARM
+)
+RECOVERY_COST_FIELDS = (
+    "input_tokens",
+    "uncached_input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "tool_calls",
+    "source_opens",
+    "wall_seconds",
+    "edit_calls",
+    "post_edit_source_opens",
+    "turns",
+)
 
 SHARED_SYSTEM_PROMPT = (
     "You are a coding agent working in the current Git worktree. Implement the "
@@ -1450,6 +1472,115 @@ def agent_result_is_valid(agent: dict[str, Any]) -> bool:
     return agent.get("success") is True
 
 
+def timeout_recovery_is_allowed(row: dict[str, Any], recoveries_used: int) -> bool:
+    """Allow one symmetric fresh-session replay for an invalid agent timeout."""
+    agent = row.get("agent")
+    return (
+        recoveries_used < AGENT_TIMEOUT_RECOVERIES_PER_ARM
+        and row.get("valid") is False
+        and isinstance(agent, dict)
+        and agent.get("timed_out") is True
+    )
+
+
+def timeout_recovery_summary(row: dict[str, Any]) -> dict[str, Any]:
+    """Return publication-safe evidence for a superseded timeout attempt."""
+    agent = row.get("agent") if isinstance(row.get("agent"), dict) else {}
+    return {
+        "reason": "agent_timeout",
+        "valid": row.get("valid"),
+        "correctness": row.get("correctness"),
+        "agent": {field: agent.get(field, 0) for field in RECOVERY_COST_FIELDS},
+        "test": row.get("test"),
+        "pretest_diff_sha256": row.get("pretest_diff_sha256"),
+        "pretest_diff_bytes": row.get("pretest_diff_bytes"),
+        "final_diff_sha256": row.get("final_diff_sha256"),
+        "final_diff_bytes": row.get("final_diff_bytes"),
+        "test_files_modified_by_agent": row.get("test_files_modified_by_agent"),
+        "worktree_cleaned": row.get("worktree_cleaned"),
+        "completed_at": row.get("completed_at"),
+    }
+
+
+def include_timeout_recovery_costs(
+    row: dict[str, Any], timeout_attempts: Sequence[dict[str, Any]], session_attempts: int
+) -> None:
+    """Charge every recovered timeout to the final measured arm result."""
+    agent = row.get("agent")
+    if not isinstance(agent, dict):
+        return
+    for attempt in timeout_attempts:
+        previous_agent = attempt["agent"]
+        for field in RECOVERY_COST_FIELDS:
+            agent[field] = (agent.get(field, 0) or 0) + (previous_agent.get(field, 0) or 0)
+    agent["session_attempts"] = session_attempts
+    agent["timeout_recovery_attempts"] = len(timeout_attempts)
+    if timeout_attempts:
+        row["timeout_recovery"] = {
+            "policy_version": "1",
+            "fresh_isolated_session_per_attempt": True,
+            "overhead_included_in_final_agent_metrics": True,
+            "attempts": list(timeout_attempts),
+        }
+
+
+def run_arm_with_recovery(
+    *,
+    task_id: str,
+    arm: str,
+    run_attempt: Callable[[int], dict[str, Any]],
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Run one arm with preregistered infrastructure and timeout recovery."""
+    timeout_attempts: list[dict[str, Any]] = []
+    provider_retries = 0
+    harness_retries = 0
+    for attempt in range(1, MAX_ARM_ATTEMPTS + 1):
+        try:
+            row = run_attempt(attempt)
+        except HarnessError as harness_error:
+            harness_retries += 1
+            if (
+                harness_retries > HARNESS_ERROR_RETRIES_PER_ARM
+                or attempt >= MAX_ARM_ATTEMPTS
+            ):
+                raise
+            print(
+                f"[{task_id}] {arm}: {harness_error}, "
+                f"harness retry {harness_retries}/{HARNESS_ERROR_RETRIES_PER_ARM}",
+                flush=True,
+            )
+            sleep(30 * harness_retries)
+            continue
+        row["agent"]["provider_attempts"] = attempt
+        provider_flake = (
+            not row["valid"]
+            and row["agent"].get("reported_error")
+            and not row["agent"].get("timed_out")
+        )
+        if provider_flake and provider_retries < PROVIDER_ERROR_RETRIES_PER_ARM:
+            provider_retries += 1
+            print(
+                f"[{task_id}] {arm}: provider error, "
+                f"retry {provider_retries}/{PROVIDER_ERROR_RETRIES_PER_ARM}",
+                flush=True,
+            )
+            sleep(30 * provider_retries)
+            continue
+        if timeout_recovery_is_allowed(row, len(timeout_attempts)):
+            timeout_attempts.append(timeout_recovery_summary(row))
+            print(
+                f"[{task_id}] {arm}: agent timeout, fresh-session "
+                f"recovery {len(timeout_attempts)}/{AGENT_TIMEOUT_RECOVERIES_PER_ARM}; "
+                "timeout cost remains charged",
+                flush=True,
+            )
+            continue
+        include_timeout_recovery_costs(row, timeout_attempts, attempt)
+        return row
+    raise HarnessError("arm recovery exhausted the total attempt bound")
+
+
 def exact_regression_p_value(baseline_only: int, candidate_only: int) -> float:
     discordant = baseline_only + candidate_only
     if discordant == 0:
@@ -1670,6 +1801,7 @@ def build_base_manifest(
 ) -> dict[str, Any]:
     explorer_system = system_prompt("explorer", greppy_bin)
     greppy_system = system_prompt("greppy", greppy_bin)
+    greppy_edit_system = system_prompt("greppy-edit", greppy_bin)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "harness_version": HARNESS_VERSION,
@@ -1711,10 +1843,12 @@ def build_base_manifest(
             "shared_system_sha256": sha256_text(SHARED_SYSTEM_PROMPT),
             "explorer_treatment_sha256": sha256_text(EXPLORER_POLICY),
             "greppy_treatment_sha256": sha256_text(GREPPY_POLICY_TEMPLATE),
+            "greppy_edit_treatment_sha256": sha256_text(GREPPY_EDIT_POLICY_TEMPLATE),
             "explorer_full_system_sha256": sha256_text(explorer_system),
             "greppy_full_system_sha256": sha256_text(greppy_system),
+            "greppy_edit_full_system_sha256": sha256_text(greppy_edit_system),
             "same_user_prompt_per_pair": True,
-            "only_intended_prompt_delta": "navigation treatment",
+            "only_intended_prompt_delta": "preregistered navigation/edit treatment",
         },
         "isolation": {
             "single_commit_repository_per_preflight_and_arm": True,
@@ -1736,12 +1870,21 @@ def build_base_manifest(
         "warm_greppy_outside_measurement": warm_greppy,
         "gate_preregistration": {
             "correctness": (
-                "Greppy paired correctness wins >= losses, plus one-sided exact "
+                "Greppy-edit paired correctness wins >= losses, plus one-sided exact "
                 "McNemar regression alarm at p < 0.05"
             ),
             "efficiency_population": "pairs where both arms pass the independent test",
             "minimum_sample": "at least 30 complete pairs and at least 20 both-solved pairs",
-            "efficiency": "sum ratio <= 0.80 for tool calls AND source opens AND input tokens",
+            "efficiency": "Greppy-edit billed provider dollars <= 0.80x explorer",
+            "edit_loop": "Greppy-edit post-edit source opens <= 0.1 per observed Greppy edit",
+            "invalid_session_recovery": {
+                "agent_timeout_retries_per_task_arm": AGENT_TIMEOUT_RECOVERIES_PER_ARM,
+                "applies_symmetrically_to_all_arms": True,
+                "fresh_isolated_session_per_attempt": True,
+                "timeout_attempt_metrics_are_recorded": True,
+                "timeout_attempt_costs_are_included_in_final_metrics": True,
+                "second_timeout_remains_invalid": True,
+            },
             "wall_time": "reported only for solved pairs; never a gate metric",
             "failed_test_speed_credit": False,
         },
@@ -2116,46 +2259,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                     try:
                         # Provider-reported stream errors (rate limits, upstream
                         # 5xx) invalidate an attempt without measuring anything;
-                        # retry those up to two times so infrastructure noise
-                        # does not consume task validity. Timeouts and harness
-                        # failures are not retried.
-                        for attempt in range(1, 6):
+                        # retry those up to four times so infrastructure noise
+                        # does not consume task validity. Harness failures receive
+                        # the existing bounded recovery. One invalid agent timeout
+                        # also receives a fresh-session replay for every arm; its
+                        # full measured cost is charged to the final row.
+                        def run_attempt(attempt: int) -> dict[str, Any]:
                             # each attempt needs untouched worktree/store dirs;
                             # reusing the previous attempt's task_tmp fails on
                             # the existing worktree path
                             attempt_tmp = task_tmp if attempt == 1 else task_tmp / f"retry{attempt}"
-                            try:
-                                row = run_arm(
-                                    arm=arm,
-                                    task=task,
-                                    backing=backing,
-                                    task_tmp=attempt_tmp,
-                                    raw_dir=raw_run_dir / task["id"] / arm,
-                                    pi_bin=pi_bin,
-                                    greppy_bin=greppy_bin,
-                                    warm_greppy=args.warm_greppy,
-                                    expected_mutation_hash=preflight["mutation_diff_sha256"],
-                                    secrets=secrets,
-                                )
-                            except HarnessError as harness_error:
-                                # warmup/worktree failures are runner-environment
-                                # noise, not measurements - retry them like
-                                # provider errors instead of consuming the task
-                                if attempt >= 5:
-                                    raise
-                                print(f"[{task['id']}] {arm}: {harness_error}, retry {attempt}/4", flush=True)
-                                time.sleep(30 * attempt)
-                                continue
-                            row["agent"]["provider_attempts"] = attempt
-                            provider_flake = (
-                                not row["valid"]
-                                and row["agent"].get("reported_error")
-                                and not row["agent"].get("timed_out")
+                            return run_arm(
+                                arm=arm,
+                                task=task,
+                                backing=backing,
+                                task_tmp=attempt_tmp,
+                                raw_dir=raw_run_dir / task["id"] / arm / f"attempt-{attempt}",
+                                pi_bin=pi_bin,
+                                greppy_bin=greppy_bin,
+                                warm_greppy=args.warm_greppy,
+                                expected_mutation_hash=preflight["mutation_diff_sha256"],
+                                secrets=secrets,
                             )
-                            if not provider_flake:
-                                break
-                            print(f"[{task['id']}] {arm}: provider error, retry {attempt}/4", flush=True)
-                            time.sleep(30 * attempt)
+
+                        row = run_arm_with_recovery(
+                            task_id=task["id"], arm=arm, run_attempt=run_attempt
+                        )
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source
                         row = sanitized_failure_row(task["id"], arm, error)
                     checkpoint_rows([row])

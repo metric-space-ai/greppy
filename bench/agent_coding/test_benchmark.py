@@ -655,6 +655,138 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(bench.agent_result_is_valid({"success": False, "turns": 3, "return_code": 1}))
         self.assertTrue(bench.agent_result_is_valid({"success": True, "turns": 1, "return_code": 0}))
 
+    def test_timeout_recovery_is_one_time_and_charges_previous_cost(self) -> None:
+        timed_out = result_row(
+            "sample", "explorer", passed=False, tools=7, inputs=100, wall=60, source_opens=3, valid=False
+        )
+        timed_out["agent"].update(
+            {
+                "success": False,
+                "timed_out": True,
+                "turns": 4,
+                "uncached_input_tokens": 80,
+                "output_tokens": 20,
+                "cache_read_tokens": 20,
+                "cache_write_tokens": 0,
+            }
+        )
+        timed_out.update(
+            {
+                "pretest_diff_sha256": "a" * 64,
+                "pretest_diff_bytes": 12,
+                "final_diff_sha256": "b" * 64,
+                "final_diff_bytes": 12,
+                "test": {"return_code": 1, "timed_out": False},
+                "worktree_cleaned": True,
+            }
+        )
+        self.assertTrue(bench.timeout_recovery_is_allowed(timed_out, 0))
+        self.assertFalse(bench.timeout_recovery_is_allowed(timed_out, 1))
+
+        recovered = result_row(
+            "sample", "explorer", passed=True, tools=5, inputs=50, wall=10, source_opens=2
+        )
+        recovered["agent"].update(
+            {
+                "success": True,
+                "timed_out": False,
+                "turns": 2,
+                "uncached_input_tokens": 40,
+                "output_tokens": 10,
+                "cache_read_tokens": 10,
+                "cache_write_tokens": 0,
+            }
+        )
+        summary = bench.timeout_recovery_summary(timed_out)
+        bench.include_timeout_recovery_costs(recovered, [summary], 2)
+
+        self.assertTrue(bench.agent_result_is_valid(recovered["agent"]))
+        self.assertEqual(recovered["agent"]["tool_calls"], 12)
+        self.assertEqual(recovered["agent"]["source_opens"], 5)
+        self.assertEqual(recovered["agent"]["input_tokens"], 150)
+        self.assertEqual(recovered["agent"]["wall_seconds"], 70)
+        self.assertEqual(recovered["agent"]["timeout_recovery_attempts"], 1)
+        self.assertEqual(recovered["agent"]["session_attempts"], 2)
+        self.assertTrue(recovered["timeout_recovery"]["overhead_included_in_final_agent_metrics"])
+        self.assertNotIn("stdout", recovered["timeout_recovery"]["attempts"][0])
+
+    def test_arm_recovery_replays_timeout_once_from_a_new_attempt(self) -> None:
+        timed_out = result_row(
+            "sample", "greppy-edit", passed=False, tools=9, inputs=90, wall=60, valid=False
+        )
+        timed_out["agent"].update(
+            {
+                "success": False,
+                "timed_out": True,
+                "turns": 3,
+                "uncached_input_tokens": 70,
+                "output_tokens": 20,
+                "cache_read_tokens": 20,
+                "cache_write_tokens": 0,
+            }
+        )
+        recovered = result_row(
+            "sample", "greppy-edit", passed=True, tools=3, inputs=30, wall=5
+        )
+        recovered["agent"].update(
+            {
+                "success": True,
+                "timed_out": False,
+                "turns": 2,
+                "uncached_input_tokens": 25,
+                "output_tokens": 5,
+                "cache_read_tokens": 5,
+                "cache_write_tokens": 0,
+            }
+        )
+        attempts: list[int] = []
+
+        def run_attempt(attempt: int) -> dict[str, object]:
+            attempts.append(attempt)
+            return timed_out if attempt == 1 else recovered
+
+        row = bench.run_arm_with_recovery(
+            task_id="sample", arm="greppy-edit", run_attempt=run_attempt, sleep=lambda _: None
+        )
+
+        self.assertEqual(attempts, [1, 2])
+        self.assertTrue(row["valid"])
+        self.assertEqual(row["agent"]["session_attempts"], 2)
+        self.assertEqual(row["agent"]["timeout_recovery_attempts"], 1)
+        self.assertEqual(row["agent"]["tool_calls"], 12)
+        self.assertEqual(len(row["timeout_recovery"]["attempts"]), 1)
+
+    def test_arm_recovery_second_timeout_remains_invalid(self) -> None:
+        timed_out = result_row(
+            "sample", "explorer", passed=False, tools=4, inputs=40, wall=60, valid=False
+        )
+        timed_out["agent"].update(
+            {
+                "success": False,
+                "timed_out": True,
+                "turns": 2,
+                "uncached_input_tokens": 30,
+                "output_tokens": 10,
+                "cache_read_tokens": 10,
+                "cache_write_tokens": 0,
+            }
+        )
+        attempts: list[int] = []
+
+        def run_attempt(attempt: int) -> dict[str, object]:
+            attempts.append(attempt)
+            return json.loads(json.dumps(timed_out))
+
+        row = bench.run_arm_with_recovery(
+            task_id="sample", arm="explorer", run_attempt=run_attempt, sleep=lambda _: None
+        )
+
+        self.assertEqual(attempts, [1, 2])
+        self.assertFalse(row["valid"])
+        self.assertTrue(row["agent"]["timed_out"])
+        self.assertEqual(row["agent"]["tool_calls"], 8)
+        self.assertEqual(row["agent"]["timeout_recovery_attempts"], 1)
+
     def test_publishable_manifest_includes_platform_and_versions(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-coding-manifest-") as tmp_name:
             root = pathlib.Path(tmp_name)
@@ -691,6 +823,12 @@ class ContractTests(unittest.TestCase):
             self.assertTrue(manifest["platform"]["architecture"])
             self.assertRegex(manifest["tasks"][0]["setup_commands_sha256"], r"^[0-9a-f]{64}$")
             self.assertIn("setup_contract", bench.RESUME_IDENTITY_FIELDS)
+            self.assertIn("greppy_edit_treatment_sha256", manifest["prompt_contract"])
+            self.assertIn("greppy_edit_full_system_sha256", manifest["prompt_contract"])
+            recovery = manifest["gate_preregistration"]["invalid_session_recovery"]
+            self.assertEqual(recovery["agent_timeout_retries_per_task_arm"], 1)
+            self.assertTrue(recovery["timeout_attempt_costs_are_included_in_final_metrics"])
+            self.assertTrue(recovery["second_timeout_remains_invalid"])
             changed_setup = json.loads(json.dumps(manifest))
             changed_setup["tasks"][0]["setup_commands_sha256"] = "0" * 64
             with self.assertRaisesRegex(bench.HarnessError, "tasks"):

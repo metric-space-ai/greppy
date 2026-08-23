@@ -151,6 +151,14 @@ timeouts, Ctrl-C, SIGTERM, and SIGHUP. As with any process, SIGKILL or machine
 power loss cannot execute cleanup handlers; stale operating-system temporary
 directories can then be removed normally.
 
+Every task/arm may receive at most one fresh isolated replay when Pi reaches
+the registered agent timeout. This policy is identical for explorer, Greppy,
+and Greppy-edit. The timed-out attempt remains publication-safe evidence in the
+final row, and its tokens, tool calls, source opens, edits, turns, and wall time
+are added to the recovered result. A second timeout remains invalid and fails
+the gate. Provider-reported upstream errors and harness setup failures keep
+their separate bounded infrastructure retries; they are not measurements.
+
 ## Preregistered gate
 
 The gate is fixed in code and copied into every manifest:
@@ -161,14 +169,18 @@ The gate is fixed in code and copied into every manifest:
 3. A decision requires at least 30 complete pairs and at least 20 pairs where
    both independent tests pass; smaller runs cannot pass.
 4. Only pairs where **both** independent tests pass enter efficiency grading.
-5. Across those solved pairs, Greppy must use at most `0.80x` the explorer's
-   summed tool calls, at most `0.80x` its summed source opens, **and** at most
-   `0.80x` its summed input tokens. All three conditions are required.
-6. Wall time is descriptive only and is computed only for solved pairs. A
+5. Across those solved pairs, Greppy-edit's billed provider cost must be at
+   most `0.80x` explorer's under the frozen price table in the manifest.
+6. Greppy-edit must keep post-edit source opens at or below `0.1` per observed
+   Greppy edit; a run with no observed Greppy edits cannot pass this gate.
+7. Tool-call, source-open, input-token, navigation-arm, and wall-time ratios are
+   descriptive only. Wall time is computed only for solved pairs. A
    failed test can never receive or contribute a speed win.
-7. Missing or invalid arms fail the gate. Pi timeouts, nonzero exits, reported
-   model errors, and zero-turn sessions make an arm invalid even if a partial
-   edit happens to pass the test.
+8. Missing or invalid arms after bounded recovery fail the gate. Each task/arm
+   gets at most one fresh-session replay after a Pi timeout, with the discarded
+   attempt recorded and all of its measured cost charged to the final result.
+   A second timeout, nonzero exit, reported model error after infrastructure
+   retries, or zero-turn session remains invalid even if a partial edit passes.
 
 ## Unit tests
 
@@ -184,7 +196,8 @@ one-commit workspace isolation and cleanup on exceptions, strict argv-only setup
 validation, setup failure and secret handling, clean-pass/mutated-fail preflight
 behavior, setup exclusion
 from measured agent wall time, metric parsing and secret redaction, exact paired
-correctness grading, the 20% efficiency threshold across all three metrics,
+correctness grading, the 20% provider-cost threshold, post-edit re-read gate,
 30/20 minimum sample sizes, strict agent success validity, manifest
 platform/version provenance, resume identity, and exclusion of failed tests
-from speed credit.
+from speed credit. They also cover symmetric one-time timeout recovery,
+publication-safe attempt evidence, and conservative recovery-cost accounting.
