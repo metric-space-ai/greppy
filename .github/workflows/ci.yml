@@ -374,7 +374,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y sqlite3
 
-      - name: Build debug binaries
+      - name: Build debug binaries (Linux CPU)
+        if: runner.os == 'Linux'
+        run: cargo build --bins --features cpu-only
+
+      - name: Build debug binaries (macOS Metal)
+        if: runner.os == 'macOS'
         run: cargo build --bins
 
       - name: battle suite + soak

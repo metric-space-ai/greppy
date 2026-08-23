@@ -58,6 +58,11 @@ the first call while an unconstrained agent repeated 50-plus equivalent
 queries. The release corpus and its 20-percent efficiency thresholds remain
 unchanged.
 
+Explicit and scheduled CI soaks now build Linux debug binaries with the real
+`cpu-only` feature, while macOS keeps its default Metal build. The previous
+unqualified Linux soak correctly tripped Greppy's hard no-GPU-backend guard
+before the battle suite could start.
+
 The coding-outcome release gate now partitions its registered 41 tasks and
 three arms into six deterministic runner shards, with at most three shards
 active concurrently. A serial candidate completed 47 of 123 arms before the

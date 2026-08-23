@@ -366,6 +366,10 @@ are release requirements, not deferred cleanup:
   an inert `cpu` workflow sentinel; Windows CPU is the certified 0.3.2 scope,
   and the hard no-GPU-backend assertion must remain active for accidental
   unqualified builds rather than breaking the intended release artifact.
+- explicit and scheduled Linux CI soaks must likewise request `cpu-only` when
+  building their debug binaries. An unqualified Ubuntu soak correctly trips
+  the hard no-GPU-backend assertion before the battle suite starts; macOS
+  retains its default Metal build.
 - every executable release, daemon-stress, and hardware-evidence probe on
   Windows and Unix must exercise the shipping `search` command (with `--json`
   for machine-readable probes) rather than the retired `semantic-search`
