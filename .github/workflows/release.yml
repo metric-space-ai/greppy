@@ -524,7 +524,16 @@ jobs:
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}").Hash.ToLowerInvariant()
-          "$hash  ${{ matrix.asset }}" | Set-Content -Encoding ascii "${{ matrix.asset }}.sha256"
+          $checksumPath = Join-Path (Get-Location) "${{ matrix.asset }}.sha256"
+          [IO.File]::WriteAllText(
+            $checksumPath,
+            "$hash  ${{ matrix.asset }}`n",
+            [Text.Encoding]::ASCII
+          )
+          $bytes = [IO.File]::ReadAllBytes($checksumPath)
+          if (($bytes -contains [byte]13) -or ($bytes[-1] -ne [byte]10)) {
+            throw 'checksum sidecar must use a single LF-terminated portable line'
+          }
 
       - name: Attest release package provenance
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
