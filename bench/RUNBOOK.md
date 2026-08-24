@@ -46,11 +46,23 @@ export PATH=$HOME/.nvm/versions/node/v22.23.1/bin:$HOME/opt/go/bin:$HOME/.cargo/
 ### Store and embedding policy
 ```bash
 export GREPPY_STORE_DIR=$HOME/greppy-bench-store   # never the shared user cache
-export GREPPY_LAZY_EMBED_MIN_SPANS=999999999       # embed at index time, not mid-task
 ```
-Indexing prints `embedded N code spans` per repo — that IS the prewarm. A
-`brief` right after indexing measured 1.3 s, so there is no 126 s daemon cold
-start to work around; do not add prewarm ceremony that pretends otherwise.
+`greppy index` exiting 0 proves that the graph generation was published; it does
+not prove that semantic embeddings are ready. Keep the same sandbox, Store
+namespace, device visibility, and daemon lifecycle alive while polling:
+
+```bash
+greppy index
+greppy index status --json
+```
+
+Start an agent arm only after `index status --json` itself exits 0 and reports
+both `healthy: true` and `embedding_complete: true`. Poll with a bounded
+deadline and fail the arm as a harness-readiness error on timeout. Do not infer
+readiness from elapsed time, `current_embedding_rows`, or the exit status of
+`index` alone. A Linux GPU prewarm must expose only the selected NVIDIA device
+and required driver nodes, but it must not hide `/dev/nvidia*` entirely or end a
+`--die-with-parent` namespace while embedding is still active.
 
 ## Navigation bench
 ```bash
@@ -94,7 +106,7 @@ pair, not the run failing. Raw Pi traces are NOT kept in `--output-dir`.
 - **A source open is a source open, whoever returns it.** `source_open_calls`
   once counted `cat/head/tail/sed` and the pi read tool but not greppy's own
   `read`/`read-smart`/`read-file`/`--code` — a bias in the candidate's favour
-  in the metric the release gate rests on.
+  in the diagnostic metric being compared.
 - **The ground-truth verifier speaks the shipped vocabulary too.** It once
   failed 17/100 tasks purely because it invoked retired verbs. `find_usages`
   maps to `who-calls` (0.3.0 walks CALLS+USAGE); multi-term literal checks

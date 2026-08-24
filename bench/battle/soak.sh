@@ -162,7 +162,7 @@ while [[ "$i" -lt "$ITERS" ]]; do
     fi
 
     # Structured search must not crash (exercises the read path).
-    ( cd "$CORPUS" && "$GREPPY_BIN" search-code "soak_touch_$i" ) >>"$LOG" 2>&1 || true
+    ( cd "$CORPUS" && "$GREPPY_BIN" search-pattern "soak_touch_$i" --fixed ) >>"$LOG" 2>&1 || true
 
     # Byte-exact grep passthrough on the moving needle's current home file.
     needle_rel="src/$(printf 'mod%04d' "$(( i % N_FILES ))").rs"

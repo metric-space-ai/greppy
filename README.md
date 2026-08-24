@@ -45,13 +45,13 @@ greppy -i "connection refused" server.log
 # A few extra commands, on the same binary:
 greppy who-calls parse_config                  # who calls this function
 greppy impact User --direction incoming        # what breaks if I change User
-greppy semantic-search "restrict a value to a range"   # find code by meaning
+greppy search "restrict a value to a range"       # find definitions by meaning
 greppy brief _split_blueprint_path             # definition + callers + callees
 
 # And since 0.3.0, editing on the same evidence — transactional, certificate-backed:
 greppy read parse_config --handle              # exact source + a hash-pinned edit handle
-greppy edit replace-body --symbol parse_config --source-file fix.rs   # all-or-nothing, proves its result
-greppy edit apply --plan refactor.json         # many files, ONE transaction: all publish or none
+greppy replace parse_config --verify < fix.rs  # one verified symbol replacement
+greppy patch --verify < refactor.diff          # coordinated all-or-nothing patch
 
 # And since 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
 greppy -p "add tests for clamp_value"          # works in a disposable worktree, returns a proposal ref
@@ -90,7 +90,7 @@ embedded.
 [SUPPORT.md](SUPPORT.md) for the exact target list):
 
 ```bash
-version=v0.2.1
+version=v0.3.2
 asset=greppy-macos-arm64.tar.gz        # or greppy-linux-x86_64.tar.gz
 gh release download "$version" --repo metric-space-ai/greppy \
   --pattern "$asset" --pattern SHA256SUMS
@@ -111,9 +111,9 @@ only the two "Source code" links. The API and the bundled inventory are the
 source of truth:
 
 ```bash
-gh release view v0.2.1 --repo metric-space-ai/greppy \
-  --json assets -q '.assets | length'          # → 24
-gh release download v0.2.1 --repo metric-space-ai/greppy \
+gh release view v0.3.2 --repo metric-space-ai/greppy \
+  --json assets -q '.assets | length'          # → 22
+gh release download v0.3.2 --repo metric-space-ai/greppy \
   --pattern RELEASE-ASSETS.json                # machine-readable asset inventory
 gh attestation verify "$asset" --repo metric-space-ai/greppy   # build provenance
 ```
@@ -123,7 +123,7 @@ downloads ~780 MB of model files):
 
 ```bash
 git clone https://github.com/metric-space-ai/greppy && cd greppy
-git checkout v0.2.1
+git checkout v0.3.2
 ./tools/fetch_model_assets.sh
 cargo build --locked --release --bin greppy
 install -m 0755 target/release/greppy "$HOME/.local/bin/greppy"
@@ -150,14 +150,17 @@ First run:
 
 ```bash
 greppy --version
-greppy doctor --root . --json     # index + backend health
+greppy doctor --root . --json     # end-to-end index + backend health
 greppy who-calls SOME_SYMBOL --root . --json   # first query builds the index
 ```
 
 The index is built once per repository and reused across sessions. While
-embeddings are still building, `semantic-search --json` returns
-`status: "indexing"` with progress and an ETA (exit 75) — retry it later or
-poll `greppy index status`; graph commands work immediately.
+embeddings are still building, `search` prints one stable progress line such as
+`semantic index building — 3/12 spans, ETA ~9s (backend cuda)` and exits 1:
+a building semantic index is not yet a search answer, and Greppy never returns
+partial semantic hits. Graph and symbol commands work immediately. Automation
+must poll `greppy index status --json` and start semantic work only after the
+command exits 0 with both `healthy: true` and `embedding_complete: true`.
 
 Measured footprint (serde, 339 files / 4,573 symbols; CPU and Metal numbers
 from the `runtime-footprint-*.json` assets on the release, measured on hosted
@@ -171,9 +174,9 @@ serde commit — evidence in
 | Installed binary | ~1 GB |
 | Graph index build | ~2 s (Apple Silicon), ~4 s (4-core Linux) — queries work immediately |
 | Semantic embeddings | background, one-time per repo: **~15 s with CUDA** (RTX A4500), **~1 min with Metal on an Apple M5**, ~1.5 min on the 3-core virtual M1 CI runner, ~24 min (M-series CPU), ~63 min (4-core Linux CPU) |
-| Warm query, CUDA | `brief` 0.1 s · `semantic-search` 0.2 s |
-| Warm query, Metal | `brief` 0.6–0.7 s · `semantic-search` 1.0–1.5 s (M5 / CI runner) |
-| Warm query, CPU only | `brief` 3.6–7 s · `semantic-search` 6–16 s |
+| Warm query, CUDA | `brief` 0.1 s · `search` 0.2 s |
+| Warm query, Metal | `brief` 0.6–0.7 s · `search` 1.0–1.5 s (M5 / CI runner) |
+| Warm query, CPU only | `brief` 3.6–7 s · `search` 6–16 s |
 | Per-repo store | ~32 MB; extracted model cache 814 MB, 10 GiB quota with GC |
 
 **2. Add the prompt to your agent.** That's the whole integration — no MCP
@@ -183,87 +186,18 @@ shell commands (Claude Code, Cursor, Codex CLI, Gemini CLI, your own).
 The prompt ships as [`AGENTS.md`](AGENTS.md) in this repo. Copy it into your
 repo root — agents that read `AGENTS.md` pick it up automatically; for Claude
 Code, add the line `@AGENTS.md` to your `CLAUDE.md` (that's all this repo's
-[`CLAUDE.md`](CLAUDE.md) contains). Or paste the block below into your
-project-instructions file, or tell your agent:
+[`CLAUDE.md`](CLAUDE.md) contains). Or tell your agent:
 `install https://github.com/metric-space-ai/greppy/`. The index builds itself
 on the first query.
 
 ### The agent prompt (use as-is)
 
-This is the exact prompt from the published benchmarks. Custom routing or
-method instructions on top measurably change nothing except prompt cost
-(paper, 2×2 ablation).
-
-```text
-This project has `greppy`, a local code-navigation tool over a symbol graph and
-an on-device semantic index. Ordinary grep invocations are delegated byte-for-
-byte to the real system grep, but Greppy must not be installed or invoked as a
-global grep alias.
-
-CODE-NAVIGATION COMMANDS. SYMBOL is a function / method / class / type name.
-They return resolved results as `qualified_name file:line`, not text matches:
-  greppy who-calls SYMBOL        the callers of SYMBOL (incoming calls)
-  greppy callees SYMBOL          the functions SYMBOL calls (outgoing calls)
-  greppy find-usages SYMBOL      every reference to SYMBOL (calls, uses, imports)
-  greppy brief SYMBOL            SYMBOL's definition plus its callers and callees, in one call
-  greppy impact SYMBOL           the transitive set of code a change to SYMBOL reaches
-  greppy search-symbols NAME     definitions whose name matches NAME (a name or fragment)
-  greppy path --from A --to B    a call chain from symbol A to symbol B, if one exists
-
-SEMANTIC SEARCH — use when you do NOT know the symbol's name:
-  greppy semantic-search "PLAIN-ENGLISH DESCRIPTION"
-      Describe the behaviour or code you are looking for in plain English
-      (e.g. "restrict a value to a range", "retry a failed HTTP request").
-      Returns the closest-matching definitions by meaning (signature + file:line).
-      While first-use embeddings are still building, returns a retryable status
-      with the active backend, progress, and ETA instead of partial/empty hits.
-
-EXPAND — get the full source in one call instead of opening files by hand:
-  greppy expand ID
-      who-calls / callees / impact / semantic-search may end their output with a
-      line `Expand: greppy expand <id>`. Run it to print the prepared evidence
-      pack — the full source of the top matches, bundled — in a single call,
-      instead of reading each file:line yourself.
-
-READ — the definition's exact source span plus an edit handle:
-  greppy read SYMBOL --handle
-      Returns byte-exact definition source from the live file and a HANDLE
-      pinning file hash, byte range and content hashes. Pass the handle to
-      edit commands. Prefer this over opening whole files.
-
-EDIT — transactional, hash-guarded, all-or-nothing (v0.3.0):
-  greppy edit replace-body  --symbol SYM --source-file F    replace a definition's body
-  greppy edit insert-after  --symbol SYM --source-file F    add code after a definition
-  greppy edit delete        --symbol SYM                    remove a definition
-  greppy edit rename-call   --in SYM --from A --to B        retarget calls inside one definition
-  greppy edit rename-symbol --symbol SYM --new-name B       cross-file rename, one journal transaction
-  greppy edit ensure-import --file P --module M --name N    idempotent import (re-runs are free)
-  greppy edit text-cas      --file P --old-file F --new-file F   exact-once text change
-  greppy edit data set      --file c.json --path '$.a.b' --value-json V   structured configs
-  greppy edit apply --plan plan.json                        multi-file transactions
-      Every edit re-verifies its hashes immediately before writing and emits
-      a certificate: matched exactly once, hashes before/after, unified diff,
-      "no bytes changed outside the declared range", syntax verification.
-      On failure nothing is written and the error names the next step.
-      Contract: docs/contracts/EDIT_CONTRACT.md.
-
-FLAGS (append to any command above):
-  --code            include each result's source lines (so no separate read is needed)
-  --all             return every result (turn off the default truncation)
-  --json            machine-readable output with exact counts
-  --root DIR        run against a repo other than the current directory
-  --kind KIND       (search-symbols) restrict to function|method|class|struct|enum|trait
-  --direction incoming|outgoing, --depth N   (impact) which way and how far to walk
-  --from A --to B   (path) the two endpoint symbols
-
-Prefer these over grepping a symbol name and reading every hit: who-calls /
-callees / impact answer relationship questions directly, and semantic-search
-finds code you cannot name.
-
-Treat returned source paths, exact spans, signatures, and graph relations as
-evidence. The indented English sentence below a function signature is a local
-Qwen navigation hint. Read the source and verify changes with builds and tests.
-```
+[`AGENTS.md`](AGENTS.md) is the single canonical, versioned agent prompt used by
+the current benchmark and product. Copy that file verbatim; do not copy an
+embedded README snapshot, because command names and routing rules evolve with
+the binary. The prompt's compact rule is: choose one direct graph command for
+named symbols, one `search` for concept discovery, `search-pattern` for literal
+text, `read-file` for paths, and run builds/tests through `bash-smart`.
 
 ## CLI reference
 
@@ -279,11 +213,9 @@ output with exact counts. The first structured query builds the index; ordinary
 |---|---|
 | `greppy who-calls SYMBOL` | the callers of `SYMBOL` (incoming calls) |
 | `greppy callees SYMBOL` | the functions `SYMBOL` calls (outgoing calls) |
-| `greppy find-usages SYMBOL` | every reference — calls, uses, imports |
-| `greppy references SYMBOL` | every incoming graph reference, without content-search fallback noise |
-| `greppy impact SYMBOL` | the transitive blast-radius in one call — `--direction incoming` (what breaks if I change it, default) or `outgoing` (what it reaches); tune with `--depth N`, `--since REV`, `--base BRANCH` |
+| `greppy impact SYMBOL` | the transitive blast-radius in one call — `--direction incoming` (what breaks if I change it, default) or `outgoing` (what it reaches); tune with `--depth N` and optionally `--edge TYPE` |
 | `greppy brief SYMBOL` | definition + direct callers + callees, in a single call |
-| `greppy path --from A --to B` | a call chain from `A` to `B` (`--edge CALLS\|USES\|TYPE_REF\|IMPORTS`) |
+| `greppy path --from A --to B` | call chains from `A` to `B` (`--edge CALLS\|USAGE\|TYPE_ASSIGN\|IMPORTS`) |
 | `greppy graph-locate FILE:LINE` | the innermost symbol enclosing a `file:line` location |
 | `greppy fan-in` / `greppy fan-out` | the most-called / most-calling symbols in the project |
 | `greppy trace SYMBOL` | a call-graph trace |
@@ -293,53 +225,45 @@ output with exact counts. The first structured query builds the index; ordinary
 
 | Command | Finds |
 |---|---|
-| `greppy semantic-search "PLAIN ENGLISH"` | code by meaning (EmbeddingGemma + Qwen hints) — use when you don't know the symbol name |
-| `greppy search-symbols NAME` | definitions by name or fragment (`--kind function\|struct\|trait\|…`) |
-| `greppy search-code QUERY` | full-text code search |
+| `greppy search "PLAIN ENGLISH"` | ranked definitions by meaning — use when you do not know the symbol name |
+| `greppy search-symbol NAME` | definitions by name or fragment (`--kind function\|struct\|trait\|…`) |
+| `greppy search-pattern REGEX [--fixed]` | literal/config/source-text matches with enclosing-symbol context |
 | `greppy plus QUERY` | fused ranking: literal + symbol + semantic + graph-neighbour signals |
 | `greppy expand ID` | the full source of results from a previous query (`Expand: greppy expand <id>`) |
 
-**Read by span** *(new in 0.3.0)*
+**Read source**
 
 | Command | Returns |
 |---|---|
 | `greppy read SYMBOL --handle` | the definition's exact source span plus a **HANDLE** that pins file, byte range, and content hashes — pass it to edit commands instead of re-locating the code |
-| `greppy expand ID --handle` | the same, for a hit from a previous search |
+| `greppy read-smart SYMBOL [--depth N]` | source with nested blocks folded into semantic one-line descriptions |
+| `greppy read-file PATH [--lines A:B\|--all]` | file content; use this for paths because `read` accepts symbols only |
+| `greppy expand ID` | a prepared continuation/evidence pack from a prior compact result |
 
-**Edit transactionally** *(new in 0.3.0)* — hash-guarded, all-or-nothing; never
-patch source files by hand when a verb fits:
+**Edit transactionally** — selectors are exact and edits fail without writing
+when their preconditions do not hold:
 
 | Command | Does |
 |---|---|
-| `greppy edit replace-span --target HANDLE --source-file F` | replace exactly the span a `read --handle` returned |
-| `greppy edit replace-body --symbol SYM --source-file F` | replace a definition's body |
-| `greppy edit insert-after` / `insert-before --symbol SYM --source-file F` | add code next to a definition |
-| `greppy edit delete --symbol SYM` | remove a definition |
-| `greppy edit rename-call --in SYM --from A --to B` | retarget calls inside one definition |
-| `greppy edit rename-symbol --symbol SYM --new-name B` | rename with all references and imports, residual-checked |
-| `greppy edit change-signature --symbol SYM --spec F` | change a signature plus every call site, as one transaction |
-| `greppy edit ensure-import` / `ensure-method` / `ensure-argument` / `ensure-annotation` | idempotent structural edits — re-runs are safe |
-| `greppy edit text-cas --file P --old 'OLD' --new 'NEW'` | exact-once text change (configs, docs); `regex-cas` with declared match count |
-| `greppy edit data set --file c.json --path '$.a.b' --value-json V` | structured JSON/TOML/YAML values, format- and comment-preserving |
-| `greppy edit apply --plan PLAN.json` | several edits — same or multiple files — as **one** journal transaction with overlap rejection; one failure means no file changes |
-| `greppy edit recover [--report FILE]` | restore a crashed journal transaction explicitly |
+| `greppy replace SYMBOL [NEW]` | replace a definition; `--body` limits the replacement to its body |
+| `greppy replace-span HANDLE [NEW]` | replace exactly the hash-pinned span returned by a read command |
+| `greppy replace-text FILE OLD [NEW]` | replace exact text, requiring one occurrence unless `--expect N` is set |
+| `greppy replace-lines FILE A:B [NEW]` | replace an inclusive 1-based line range |
+| `greppy insert-lines FILE N [NEW]` | insert after line N; line 0 inserts at the top |
+| `greppy delete SYMBOL` / `delete-lines FILE A:B` | remove a definition or explicit line range |
+| `greppy rename SYMBOL NEW_NAME` | rename a definition and graph-resolved references |
+| `greppy patch [DIFF]` | apply a unified multi-file diff atomically |
+| `greppy undo [EDIT_ID]` | reverse the latest edit, or one named edit, when no later overlap prevents it |
 
-Every edit prints a **certificate**: matched exactly once, hashes before/after,
-changed byte ranges, syntax verification, and the resulting span
-(`result_span`) — the agent has already seen the outcome and never needs to
-re-read the file. Full evidence (complete diff, AST nodes) goes to `--report
-FILE`. Exit codes: `0` ok/already-satisfied · `10` not found · `11` ambiguous
-(candidates listed) · `12` stale — re-read the span, retry · `13` result
-rejected, nothing written · `14` validator failed · `16` publish blocked
-(workspace lock), nothing written. Batching rule: several edits to the same
-file belong in one `apply --plan` call; each plan operation declares the
-`file_sha256` from its handle.
+Add `--dry-run` to preview and `--verify` to run the configured build/linter and
+map diagnostics back to symbols. Coordinated edits belong in one `patch`; use
+`undo` to reverse a published edit rather than manually reconstructing it.
 
 **Workspace & health**
 
 | Command | Does |
 |---|---|
-| `greppy index [PATH]` | build or refresh the index; `greppy index status` reports progress |
+| `greppy index [PATH]` | build or refresh the graph; `greppy index status --json` is the semantic-readiness gate (`healthy` + `embedding_complete`) |
 | `greppy index --agent-worktree` | build or validate the immutable Base Store used by integrated agents |
 | `greppy stats` | node and edge counts for the project graph |
 | `greppy diagnostics` | schema health, integrity, workspace state, provider completeness |
@@ -348,9 +272,11 @@ file belong in one `apply --plan` call; each plan operation declares the
 | `greppy trial …` | run a local baseline-vs-greppy comparison on your own repository and print a `greppy.project-trial.v1` JSON record |
 
 **Global flags** — accepted before or after the subcommand: `--root DIR`,
-`--device auto\|cpu\|metal\|cuda[:INDEX]` (or `GREPPY_DEVICE`), `--json`,
-`--code`, `--all`. `greppy --version`, `greppy --help`, and
-`greppy <command> --help` print the full detail for any command.
+`--device auto\|cpu\|metal\|cuda[:INDEX]` (or `GREPPY_DEVICE`), `--limit N`,
+`--offset N`, and `--max-bytes N`. Output flags such as `--json`, `--code`, and
+`--all` are available on the commands whose output supports them. `greppy
+--version`, `greppy --help`, and `greppy <command> --help` print the exact
+surface for the installed binary.
 
 ---
 
@@ -447,8 +373,8 @@ repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 ## How it works
 
 - **Standard grep.** Any invocation that isn't one of the extra commands runs real `grep` and returns its output and exit code unchanged.
-- **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USES`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`find-usages`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches.
-- **Native semantic navigation.** `semantic-search` uses Google's embedded **EmbeddingGemma** to find code by meaning. A **Qwen3.5-0.8B (Q4_K_M, MTP) that greppy fine-tuned in-house** — trained by distillation specifically to write code-navigation hints — adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
+- **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USAGE`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches.
+- **Native semantic navigation.** `search` uses Google's embedded **EmbeddingGemma** to find code by meaning. A **Qwen3.5-0.8B (Q4_K_M, MTP) that greppy fine-tuned in-house** — trained by distillation specifically to write code-navigation hints — adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
 - **Bounded warm daemons.** The embedding and summary engines use separate local daemons. A used model remains resident for five idle minutes; the process exits after 30 idle minutes. Failed inference never removes deterministic source or graph output.
 - **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
 
@@ -456,8 +382,8 @@ repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 
 A symbol graph is built from source text. Edges a program wires up at runtime — reflection, dependency injection, monkeypatching, dynamically dispatched calls, code generated during the build — are invisible to every static tool, greppy included. Greppy is built so these blind spots do not turn into wrong answers:
 
-- `semantic-search` finds code by meaning, not by graph edges. A reflection target or a generated handler is still findable by describing what it does.
-- `find-usages` reports references and imports, not only resolved calls — dynamic call sites almost always still name the symbol somewhere in the text.
+- `search` finds code by meaning, not by graph edges. A reflection target or a generated handler is still findable by describing what it does.
+- `who-calls` includes incoming CALLS and USAGE edges; `search-pattern` remains available for source-level name certainty.
 - The grep passthrough stays available for string-level certainty.
 - The shipped agent prompt states the rule outright: an empty result does not prove that no relation exists — switch navigation methods instead of concluding.
 
@@ -525,13 +451,13 @@ diagnostics for subsequent releases. Pin the tag for production.
 
 - **Language parsers — 60+ bundled:** every language indexes symbols and answers
   definition and text search; most (every procedural language — Ruby, C++, C#,
-  Kotlin, Swift, Elixir, and dozens more, not only the six below) also extract
+  Kotlin, Swift, Elixir, and dozens more, not only the certified set below) also extract
   call, usage, and import relations, so `who-calls` / `callees` / `impact` work
   out of the box.
 - **Graph-completeness certified:** Rust, Python, Java, JavaScript, TypeScript,
-  and Go — fixtures and real-repository tests guarantee complete caller/callee/
-  usage/impact; other languages extract the same relations without that formal
-  guarantee.
+  Go, C++, C#, Kotlin, Swift, and Ruby — fixture grids and real-repository tests
+  guarantee complete caller/callee/usage/impact relations; other languages
+  extract the same relations without that formal guarantee.
 - **Supported release targets:** macOS Apple Silicon with Metal, Linux x86_64
   with CPU and NVIDIA CUDA, and Windows x86_64 CPU with named-pipe daemons.
 - **Known boundaries:** reflection, runtime dependency injection, generated

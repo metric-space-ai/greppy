@@ -43,7 +43,7 @@ python3 bench/runtime_footprint.py \
 ```
 
 The harness uses and removes a private `GREPPY_STORE_DIR` outside the target
-repository. It stops resident daemons between index, semantic-search, and brief
+repository. It stops resident daemons between index, semantic `search`, and `brief`
 so each first measurement includes a real cold model load; subsequent samples
 measure the warm path. Its atomic JSON artifact contains binary and redacted
 command-template hashes, platform facts, timings, cache byte counts, sanitized
@@ -82,7 +82,7 @@ fail: 0
 
 A `pass` preserves stdout, stderr, and exit code byte-for-byte against real
 grep. Semantic code navigation is exercised separately through explicit
-commands such as `semantic-search` and `brief`.
+commands such as `search` and `brief`.
 
 A `fail` is an invocation that violated the contract. The script
 prints the expected vs. actual output so a regression can be

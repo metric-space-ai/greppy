@@ -23,7 +23,7 @@ required.
 
 Every run records SHA256 for the task bank, class document, repository
 manifest, prompt texts, and Greppy binary plus the Greppy Git commit and model
-ID. A result without that `RUN_MANIFEST.json` is not release evidence.
+ID. A result without that `RUN_MANIFEST.json` is not valid diagnostic evidence.
 
 ## Measurement
 
@@ -48,9 +48,10 @@ reproducible from the manifest.
 Provider failures, timeouts, missing grades, stale repositories, prompt/hash
 mismatches, or incomplete pairs make a run non-decision-capable.
 
-## Release gates
+## Diagnostic acceptance thresholds
 
-`v0.2.0` requires all gates against `explorer`:
+Complete diagnostic runs are evaluated against `explorer` using these fixed
+thresholds:
 
 1. Greppy must have at least as many observed paired correctness wins as losses.
 2. A one-sided exact discordant-pair test must not detect a correctness
@@ -66,12 +67,15 @@ mismatches, or incomplete pairs make a run non-decision-capable.
    session. Invalid sessions fail coverage and never enter paired quality or
    cost ratios.
 
-`release_gate.py` implements these thresholds. They are fixed before the run
-and may not be relaxed after observing results.
+`release_gate.py` is the legacy filename of the evaluator that implements these
+thresholds. Its result is diagnostic: agent benchmarks find candidates for a
+subsequent release and never block publication of the release under test. The
+thresholds are fixed before a run and may not be relaxed after observing its
+results.
 
 ## Publication
 
 Publish `RUN_MANIFEST.json`, per-task results, mechanically graded results,
-aggregate report, forensics report, release-gate report, and summary with the
-release. Raw Pi JSONL traces may contain source snippets and are retained only
-for local audit; they are never release artifacts.
+aggregate report, forensics report, diagnostic-threshold report, and summary as
+diagnostic evidence. Raw Pi JSONL traces may contain source snippets and are
+retained only for local audit; they are never release artifacts.

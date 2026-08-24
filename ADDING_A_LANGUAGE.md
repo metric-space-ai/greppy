@@ -216,20 +216,21 @@ cd /tmp/fix-<lang> && "$BIN" index . >/dev/null && "$BIN" stats
 `stats` prints node counts by label and edge counts by type (plain text — there is
 no `--json` on `stats`). Compare **every line** to your `EXPECTED.md`. For endpoints,
 spot-check specific symbols. These are the exact working invocations — pass a
-**qualified name** (`<relpath>::<Label>::<name>`, as printed by `callees`/`references`
+**qualified name** (`<relpath>::<Label>::<name>`, as printed by `callees`/`who-calls`
 themselves):
 
 ```bash
 "$BIN" callees   "src/a.ext::Function::main"     # outgoing CALLS of main
-"$BIN" references "src/a.ext::Function::helper"  # every incoming CALLS/USAGE/IMPORTS
-"$BIN" find-usages "src/a.ext::Class::MyType"    # incoming USAGE / type refs
+"$BIN" who-calls "src/a.ext::Function::helper"   # incoming CALLS and USAGE edges
+"$BIN" who-calls "src/a.ext::Class::MyType"      # incoming usage/type evidence
 "$BIN" search-graph --name "pkg::MyClass::method" --json   # look up ONE known qname
 ```
 
 Notes learned the hard way:
-- `callees`/`references` for a symbol with **zero** matching edges print "— 0 …"
-  and may **exit non-zero** — that is "no edges", not "symbol missing". Confirm the
-  node exists via `stats` counts, don't treat the exit code as an error.
+- `callees`/`who-calls` for an existing symbol with **zero** matching edges say
+  so and exit 0. A missing or ambiguous symbol exits non-zero and names the
+  resolution problem. Confirm the node exists via `stats` when diagnosing the
+  distinction.
 - `search-graph --name ""` / label-listing flags do **not** enumerate all nodes;
   `stats` is your enumeration tool. Use `search-graph --name` only to fetch one
   qname you already expect.
@@ -377,7 +378,7 @@ partial is welcome; a false "supported" is not.
 
 ```
 write fixture + EXPECTED.md  ->  wire detection  ->  register lang (spec + queries)
-  ->  cargo build  ->  index fixture + `stats`/`callees`/`references` vs golden
+  ->  cargo build  ->  index fixture + `stats`/`callees`/`who-calls` vs golden
   ->  ripgrep completeness reconcile  ->  (bespoke extractor / indexer pass if needed)
   ->  cargo test + clippy + fmt + neighbor non-regression  ->  flip LANGUAGE_SUPPORT.md
   ->  commit crates/ only  ->  open PR with the evidence

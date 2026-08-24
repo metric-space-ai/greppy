@@ -15,7 +15,7 @@ the harness has a scrub gate that refuses to emit otherwise).
 
 | Artifact | Backend | Proves |
 | --- | --- | --- |
-| `*-macos-aarch64-metal.json` | metal | The shipped Metal backend selects and runs end to end (index → semantic-search → brief → expand) on Apple Silicon. `platform.apple_silicon_generation` + the note in `measurements.notes` say whether the Metal 4 **tensor-ops** matmul path (M5-class GPU) or the simdgroup fallback was exercised. |
+| `*-macos-aarch64-metal.json` | metal | The shipped Metal backend selects and runs end to end (index → semantic `search` → `brief` → `expand`) on Apple Silicon. `platform.apple_silicon_generation` + the note in `measurements.notes` say whether the Metal 4 **tensor-ops** matmul path (M5-class GPU) or the simdgroup fallback was exercised. |
 | `*-linux-x86_64-cpu.json` | cpu | The Linux binary's CPU backend runs end to end; `backend.cpu_capabilities` records which SIMD tiers the product's own probe engaged (avx2 / avx-vnni / avx512f). |
 | `*-linux-x86_64-cuda.json` | cuda | The CUDA backend runs end to end on a real NVIDIA GPU (RTX A4500) *without any CUDA toolkit installed*: the harness strips `nvcc` from `PATH`, unsets `LD_LIBRARY_PATH`, and asserts the backend library the binary materializes needs no `cudart`/`cublas`/`nvrtc` — only the driver's `libcuda.so.1`. It also records the VRAM peak (nvidia-smi polling). |
 | any artifact with `backend.baseline_x86_required: true` | cpu | **Pending hardware — see below.** The binary runs correctly on an x86-64 CPU that *lacks* AVX-VNNI/AVX-512, i.e. the SIMD fallback paths carry the full contract-check suite. |
@@ -24,11 +24,11 @@ Every artifact additionally locks in, on that hardware:
 
 - backend selection: `greppy doctor --json` picked exactly the requested
   backend, and that backend is compiled into the binary;
-- functional contracts: brief/semantic-search/expand JSON contracts,
+- functional contracts: `brief`/`search`/`expand` JSON contracts,
   deterministic hit ordering across reruns, byte-exact grep passthrough;
 - timings on the fixed 2-file fixture (`measurements.fixture.tree_sha256`
   pins the workload, identical across platforms): cold `index` wall time
-  and warm p50/p95 over 20 sequential `semantic-search` and `brief` calls.
+  and warm p50/p95 over 20 sequential `search` and `brief` calls.
   Per-call latency includes full CLI process startup + daemon round trip —
   it is the latency an agent actually experiences, not bare model forward
   time (`bench/inference_performance/` measures that).

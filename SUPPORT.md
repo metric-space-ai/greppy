@@ -2,7 +2,7 @@
 
 ## Release targets
 
-The `v0.2.x` release gate covers:
+The `v0.3.x` release gate covers:
 
 | Platform | Inference backend | Daemon transport |
 |---|---|---|
@@ -10,7 +10,7 @@ The `v0.2.x` release gate covers:
 | Linux x86_64 | CPU and NVIDIA CUDA | Unix-domain socket |
 | Windows x86_64 | CPU | named pipe with user ACL |
 
-Windows CUDA, macOS Intel, and Linux ARM64 are not release-gated for `v0.2.x`.
+Windows CUDA, macOS Intel, and Linux ARM64 are not release-gated for `v0.3.x`.
 An unsupported accelerator must not prevent CPU operation in automatic mode.
 An explicitly selected unavailable backend fails with a diagnostic instead of
 silently switching devices.
@@ -21,14 +21,14 @@ Greppy bundles tree-sitter parsers for **more than 60 languages**. Every one of
 them indexes symbols and answers definition and text search, and most of them —
 every procedural language, from the mainstream set through Ruby, C++, C#,
 Kotlin, Swift, Elixir, Scala, and dozens more — also extract call, usage, and
-import graph relations, so `who-calls`, `callees`, `find-usages`, and `impact`
+import graph relations, so `who-calls`, `callees`, `path`, and `impact`
 work out of the box (e.g. `greppy who-calls` resolves callers in an Elixir file
 with no extra setup).
 
 Eleven languages — **Rust, Python, Java, JavaScript, TypeScript, Go, C++,
 C#, Kotlin, Swift, and Ruby** — are additionally **acceptance-certified for
 graph completeness**: per-language certification grids (12 cells over
-cross-file CALLS/USES/TYPE_REF/IMPORTS plus reindex stability and freshness
+cross-file CALLS/USAGE/TYPE_REF/IMPORTS plus reindex stability and freshness
 behavior, `crates/cli/tests/graph_grid_*.rs`), language fixtures, and
 real-repository tests guarantee their caller/callee/usage/impact relations
 are correct and complete. Every other language extracts the same relations

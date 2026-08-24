@@ -1,6 +1,6 @@
 # Battle-proof validation harness (Track C)
 
-A **black-box** production-invariant suite. It drives the already-built
+A **black-box** production-invariant suite. It drives an already-built copy of
 the shipped `greppy` binary and asserts the contracts that
 matter in production. It does **not** touch any crate source or Cargo
 files — it lives entirely under `bench/battle/`.
@@ -70,7 +70,7 @@ BATTLE_SCALE_FILES=2000 BATTLE_SCALE_BUDGET_S=1800 bash bench/battle/scale.sh
    well-formed sibling still indexes.
 6. **navigation.sh** — build a tiny Rust fixture with a known
    caller/callee and a struct+impl that **share a name**; drive
-   `who-calls` / `find-usages` / `trace` and assert the printed symbols
+   `who-calls` / `callees` / `trace` and assert the printed symbols
    are the right ones (guards the name→node resolution layer that a
    DB-only check cannot see).
 7. **multilang.sh** — generate ONE git repo mixing **Rust, Python,
@@ -81,8 +81,8 @@ BATTLE_SCALE_FILES=2000 BATTLE_SCALE_BUDGET_S=1800 bash bench/battle/scale.sh
    package/relative target does not resolve to a node, asserted as a
    known characteristic); `stats` per-label/per-type counts match
    graph.db exactly; `who-calls`/`callees`/`path` resolve the right
-   symbol in every language; `find-usages` lands on a `TYPE_REF`-d Rust
-   struct; `search-symbols`/`search-code` find known symbols/content
+   symbol in every language; `who-calls` lands on a `TYPE_REF`-d Rust
+   struct; `search-symbol`/`search-pattern` find known symbols/content
    across all six languages; the grep passthrough contract (`greppy -R` and
    `greppy` vs `/usr/bin/grep`) holds byte-exact in its STRICT
    regime while the recursive **semantic augmentation** is asserted
@@ -90,7 +90,7 @@ BATTLE_SCALE_FILES=2000 BATTLE_SCALE_BUDGET_S=1800 bash bench/battle/scale.sh
    identical node/edge counts and sets); and an unsupported `.txt` file is
    classified gracefully with zero graph nodes.
 8. **soak.sh** *(opt-in, slow)* — drive `BATTLE_SOAK_ITERS` rounds of an
-   `index → edit → reindex → search-code → grep` loop against a mutating
+   `index → edit → reindex → search-pattern → grep` loop against a mutating
    corpus. Asserts, **across all iterations**: no panic / signal crash,
    `integrity_check` stays `ok`, the grep passthrough stays **byte-exact** vs
    `/usr/bin/grep`, sidecar temp files stay bounded under a short TTL and
@@ -195,14 +195,14 @@ the underlying behaviour is fixed.
 - **Soak** (8/8 at 100 iters, opt-in): no panic, integrity stays ok,
   grep passthrough stays byte-exact, sidecars bounded (peak <= 4) and TTL
   cleanup reclaims expired files, RSS flat (early 1504 KB / late 1536 KB).
-- **Navigation** (14/14): `who-calls` / `find-usages` / `trace` resolve a
+- **Navigation** (14/14): `who-calls` / `callees` / `trace` resolve a
   known caller/callee and land on the struct (not the same-named impl).
 - **Multilang** (74/74): one mixed Rust/Python/JS/TS/Go/Ruby repo indexes
   with no panic and `integrity_check=ok`; every supported language yields
   a cross-file `CALLS` edge and the four resolving languages a cross-file
   `IMPORTS` edge; `stats` per-label/per-type counts match graph.db
-  exactly; `who-calls`/`callees`/`path`/`find-usages` return the right
-  symbol per language; `search-symbols`/`search-code` find known
+  exactly; `who-calls`/`callees`/`path` return the right
+  symbol per language; `search-symbol`/`search-pattern` find known
   symbols/content in all six; grep-compatible passthrough remains byte-exact
   even with a fresh graph in scope; index-twice is byte-identical; the unsupported `.txt` produces
   zero nodes.
