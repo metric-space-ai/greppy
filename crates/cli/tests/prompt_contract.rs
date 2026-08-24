@@ -384,8 +384,10 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // source text is requested only when the question needs body evidence.
     // 23.08.2026: repeated exact-commit release evidence approved one ranked
     // semantic candidate set and forbids paraphrased semantic retry loops.
+    // 24.08.2026: the 0.3.2 coding gate approved one precise Greppy edit with
+    // verification and no redundant reread after a successful edit.
     const APPROVED_SHA256: &str =
-        "2be5ffdbc265fb39ecbd477f31d28d1ebceccd49e836a7d3c29003b5a13715e4";
+        "752cecd93ba0ba54785f8ee4281ae1cd253b9e8cbb5b1040e18670e2bfcf909b";
 
     let text = prompt();
     let digest = {
