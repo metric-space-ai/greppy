@@ -11,11 +11,11 @@ published checksum and build provenance.
 
 A release is cut only when, on the exact release commit, all of the following
 pass: CI, CodeQL, the Rust dependency security audit, the task-bank
-reproducibility audit, the navigation-regime agent benchmark, and the
-summary-quality gate — plus code signing and notarization. Greppy's claim is
-structural code navigation, and the navigation benchmark is a hard, per-commit
-release gate that must be green on the released binary. The remaining
-benchmarks run continuously and their verdicts are published with each commit.
+reproducibility audit, and the summary-quality gate — plus code signing and
+notarization. Agent benchmarks run continuously as diagnostic inputs for a
+subsequent release; they never gate publication of the release under test.
+Their findings require reproduction and product/harness/prompt/usage triage
+before any product change.
 
 ## Verifying a release
 

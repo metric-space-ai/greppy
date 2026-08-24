@@ -49,9 +49,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The publish job already binds summary/agent/coding benchmark evidence
-          # to this SHA; require the remaining mechanical gates on the exact
-          # release subject as well - a tag must never outrun its checks.
+          # The publish job already binds summary-quality evidence to this SHA;
+          # require the remaining mechanical gates on the exact release subject
+          # as well - a tag must never outrun its checks. Agent benchmarks are
+          # diagnostic inputs for subsequent releases, never release gates.
           for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml; do
             ok="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
@@ -707,40 +708,10 @@ jobs:
             --output "$RUNNER_TEMP/qwen-evidence-reproduction.tar.gz"
           test "$(sha256sum "$evidence_dir/greppy-qwen35-training-evidence.tar.gz" | cut -d' ' -f1)" = \
             "$(sha256sum "$RUNNER_TEMP/qwen-evidence-reproduction.tar.gz" | cut -d' ' -f1)"
-      - name: Download passing benchmark for this exact commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Accept the latest passing navigation benchmark for this binary. The
-          # code and embedded model are attested separately; a docs/CI-only
-          # release commit does not change the benchmarked binary, so a fresh
-          # per-commit re-run is not required.
-          run_info="$(gh run list \
-            --workflow agent-benchmark.yml \
-            --branch main \
-            --status success \
-            --limit 1 \
-            --json databaseId,headSha \
-            --jq '.[0] | "\(.databaseId) \(.headSha)"')"
-          run_id="${run_info%% *}"; bench_sha="${run_info##* }"
-          test -n "$run_id" || {
-            echo '::error::no successful agent benchmark exists'
-            exit 1
-          }
-          mkdir -p release-assets/agent-benchmark
-          gh run download "$run_id" \
-            --name "greppy-agent-benchmark-$bench_sha" \
-            --dir release-assets/agent-benchmark
-          (cd release-assets/agent-benchmark && shasum -a 256 -c greppy-agent-benchmark.tar.gz.sha256)
-          mkdir -p release-assets/agent-benchmark/verified
-          tar -C release-assets/agent-benchmark/verified \
-            -xzf release-assets/agent-benchmark/greppy-agent-benchmark.tar.gz
-          test "$(jq -r .passed release-assets/agent-benchmark/verified/release-gate.json)" = true
-          test "$(jq -r .raw_traces_published release-assets/agent-benchmark/verified/RUN_MANIFEST.json)" = false
-      # Release scope (see SECURITY.md): the navigation-regime agent benchmark
-      # (above) is Greppy's hard, per-commit release gate. The edit-regime coding
-      # benchmark runs on every commit and its verdict is published; it is not a
-      # release gate.
+      # Agent benchmarks are deliberately absent here. They discover candidate
+      # defects for the next release, but never decide whether this release may
+      # publish. CI, security, task-bank, summary quality, provenance, and clean
+      # package verification are the release gates.
       - name: Download passing summary-quality gate for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}

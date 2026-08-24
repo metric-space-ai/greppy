@@ -18,8 +18,6 @@
     {"name": "greppy-windows-x86_64.zip.spdx.json", "role": "sbom"},
     {"name": "build-environment-windows-x86_64.json", "role": "build-environment"},
     {"name": "model-redistribution-report.json", "role": "model-provenance"},
-    {"name": "greppy-agent-benchmark.tar.gz", "role": "benchmark-evidence"},
-    {"name": "greppy-agent-benchmark.tar.gz.sha256", "role": "checksum-sidecar"},
     {"name": "greppy-summary-quality.tar.gz", "role": "summary-quality-evidence"},
     {"name": "greppy-summary-quality.tar.gz.sha256", "role": "checksum-sidecar"},
     {"name": "greppy-qwen35-training-evidence.tar.gz", "role": "training-evidence"},

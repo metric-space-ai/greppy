@@ -415,8 +415,8 @@ are release requirements, not deferred cleanup:
   path, and semantic questions directly to one compact graph command,
   distinguish symbol reads from file/range reads, request `--code` only when
   body evidence is actually required, and stop when that result is sufficient;
-  the registered agent-efficiency gate must be met by better agent behavior
-  rather than weakened thresholds.
+  the registered agent-efficiency diagnostic keeps its thresholds and any
+  reproduced findings feed a subsequent release rather than gating this one.
 - concept-to-code discovery must consume one ranked semantic candidate set,
   select the best matching returned definition, and never paraphrase the same
   question into an unbounded search loop. A repeated exact-commit release run
@@ -427,13 +427,13 @@ are release requirements, not deferred cleanup:
   prompt and user-query baseline from every later turn. Explorer is deliberately
   uncoached while Greppy ships this manual; charging that static manual once per
   tool round is a treatment-confounded metric, not variable search context. The
-  release-gate schema is versioned when this definition changes, an invariant
+  benchmark schema is versioned when this definition changes, an invariant
   test covers unequal fixed prompt lengths with identical tool histories, and
   the 20-percent acceptance threshold remains unchanged.
 - isolated provider failures must never become product-efficiency datapoints.
   The parallel runner resumes only invalid arms in bounded serial recovery
   rounds; any remaining invalid arm fails coverage, while all cost ratios use
-  completed error-free pairs only. The release-gate schema is versioned for
+  completed error-free pairs only. The benchmark schema is versioned for
   this fail-closed contract and the 20-percent thresholds remain unchanged.
 - synthetic-only diagnostic or `--index-only` acceptance runs must not require
   the external real-corpus `MANIFEST.json`; the run manifest records real-corpus
@@ -442,7 +442,7 @@ are release requirements, not deferred cleanup:
   verification must use the registered `GREPPY_BENCH_BIN`, and every verifier
   failure must propagate as a non-zero orchestrator exit rather than producing
   a false-green index-only run.
-- release-gate unit tests must construct their minimal synthetic task input
+- benchmark-verifier unit tests must construct their minimal synthetic task input
   locally and remain runnable when the externally maintained `tasks_v2.json`
   bank is intentionally absent from the product checkout.
 - local release validation must use a run-owned Cargo target or an immutable
@@ -452,9 +452,9 @@ are release requirements, not deferred cleanup:
   source failure, and remote exact-SHA evidence remains authoritative.
 - `read-file` must accept an explicitly absolute diagnostic or artifact path
   outside the repository, while relative `../` traversal remains confined.
-  This is required for agents to inspect downloaded release-gate artifacts
+  This is required for agents to inspect downloaded benchmark artifacts
   through Greppy itself and is covered by CLI integration tests.
-- the coding-outcome release gate must finish its registered 41-task,
+- the coding-outcome diagnostic must finish its registered 41-task,
   three-arm corpus without any job exceeding six hours. A serial candidate
   reached 47 of 123 arms before GitHub cancelled it at 360 minutes; three
   threads on one runner reached only 75 because local build/toolchain

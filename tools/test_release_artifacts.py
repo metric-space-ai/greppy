@@ -217,7 +217,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 24)
+        self.assertEqual(len(names), 22)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
@@ -225,6 +225,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         # out of band (hours-long CPU index on the hosted runner), and the
         # edit-regime coding benchmark publishes per commit but does not gate.
         self.assertNotIn("runtime-footprint-windows-x86_64-cpu.json", names)
+        self.assertNotIn("greppy-agent-benchmark.tar.gz", names)
+        self.assertNotIn("greppy-agent-benchmark.tar.gz.sha256", names)
         self.assertNotIn("greppy-coding-benchmark.tar.gz", names)
 
     def test_release_workflow_keeps_hardening_gates(self) -> None:
@@ -240,6 +242,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("features: cpu\n", windows_matrix)
         self.assertIn("--features ${{ matrix.features }}", workflow)
         self.assertIn("record-build-environment", workflow)
+        self.assertEqual(
+            release.BUILD_ENVIRONMENTS[
+                "build-environment-windows-x86_64.json"
+            ]["build_features"],
+            "cpu-only",
+        )
         self.assertIn("create-training-archive", workflow)
         self.assertIn("augment-spdx", workflow)
         self.assertIn("stage-release", workflow)
@@ -249,6 +257,13 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('gh release create "$GITHUB_REF_NAME"', workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
+        self.assertNotIn("--workflow agent-benchmark.yml", workflow)
+        self.assertNotIn("greppy-agent-benchmark", workflow)
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertNotIn("agent benchmark, and the summary-quality gate", readme)
+        self.assertNotIn("navigation benchmark is a hard", security)
+        self.assertIn("never gate publication", security)
         # One Unix footprint invocation remains; the Windows measurement is out
         # of band (see the release-scope comment in release.yml).
         self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 1)

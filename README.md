@@ -380,7 +380,8 @@ Task banks, prompts, binaries, runtime versions, setup commands, and repository
 commits are hashed into their manifests. Arm order is deterministically
 balanced per task and its ordering scheme is versioned in the manifest.
 
-Release gates, run on the exact release commit:
+Agent diagnostics, run continuously on candidate commits but never used as
+release gates:
 
 - at least as many paired correctness wins as losses, with no paired
   regression alarm at `p < 0.05`;
@@ -390,9 +391,10 @@ Release gates, run on the exact release commit:
   binary hash, per-task rows, grading, aggregate, and forensics are published;
 - raw agent traces remain private and are not release artifacts.
 
-v0.2.1 shipped with these gates green; the run evidence is attached to the
-release. Index construction is a one-time cost per repository, reported
-separately with its break-even.
+Findings are triaged as product, harness, prompt, usage, or expected-test
+behavior and feed fixes into a subsequent release. Published evidence never
+blocks the release under test. Index construction is a one-time cost per
+repository, reported separately with its break-even.
 
 ---
 
@@ -435,8 +437,8 @@ task, proves that constructing it exactly is NP-complete, lower-bounds what
 purely lexical navigation must pay for entry ambiguity and unresolved
 relations, and states the measurable conditions under which the combined
 policy greppy implements is strictly cheaper without losing correctness.
-The pre-registered factorial study in the paper is the same evidence design
-this repository enforces as release gates; the paper ships the frozen protocol
+The pre-registered factorial study in the paper is the same diagnostic design
+this repository runs continuously; the paper ships the frozen protocol
 and the four-model panels (115 tasks × 4 conditions × 5 budgets × 3
 repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 
@@ -515,11 +517,11 @@ rm "$HOME/.local/bin/greppy"     # or wherever you installed it
 
 ## Status
 
-**Current release: [v0.2.1](https://github.com/metric-space-ai/greppy/releases/tag/v0.2.1)**.
-Releases ship after CI, CodeQL, the security audit, the task-bank audit, the
-agent benchmark, and the summary-quality gate pass on the release commit, then
-get signed, notarized, and attested (SBOM + provenance). Pin the tag for
-production.
+**Current release: [v0.3.2](https://github.com/metric-space-ai/greppy/releases/tag/v0.3.2)**.
+Releases ship after CI, CodeQL, the security audit, the task-bank audit, and the
+summary-quality gate pass on the release commit, then get signed, notarized,
+and attested (SBOM + provenance). Agent benchmarks remain non-blocking
+diagnostics for subsequent releases. Pin the tag for production.
 
 - **Language parsers — 60+ bundled:** every language indexes symbols and answers
   definition and text search; most (every procedural language — Ruby, C++, C#,

@@ -103,7 +103,7 @@ Each acceptance run is isolated under
 - `results.mechanical.json`: accepted machine-readable quality grades;
 - `aggregate.txt`: aggregate factors by class, size, type, and language;
 - `FORENSICS_explorer_VS_greppy.md`: product-baseline analysis;
-- `release-gate.json`: fixed release thresholds and pass/fail status;
+- `release-gate.json`: legacy-named fixed diagnostic thresholds and status;
 - `SUMMARY.md`: executed steps and exit codes.
 
 Raw Pi JSONL is retained locally for debugging and forensics. It may contain
@@ -111,7 +111,7 @@ source snippets and full trajectories and is excluded from Git and release
 artifacts. The publishable files above contain per-task metrics and grading but
 no raw traces.
 
-## Release gates
+## Diagnostic acceptance thresholds
 
 The result is accepted only when every comparable row has quality evidence,
 Greppy has at least as many observed paired correctness wins as losses, the
@@ -120,6 +120,8 @@ uses at most 80% of the baseline's tool calls, source-open calls, and variable
 input tokens. The exact test is not presented as proof of population
 equivalence. `release_gate.py` enforces those thresholds; `forensics.py
 --enforce` additionally rejects missing evidence and router violations.
+These thresholds fail the diagnostic closed; they do not gate publication of
+the release under test. Reproduced findings are inputs to a subsequent release.
 
 ## Large-repository stress
 

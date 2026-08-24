@@ -45,7 +45,7 @@ complete result does not fit.
 
 ### Release hardening
 
-The agent-efficiency gate now removes each arm's fixed prompt from later-turn
+The agent-efficiency diagnostic now removes each arm's fixed prompt from later-turn
 input and treats provider errors as invalid coverage rather than product-cost
 measurements. Isolated invalid arms receive bounded serial recovery after the
 parallel run; remaining invalid sessions fail closed without weakening any
@@ -55,7 +55,7 @@ The integrated-agent navigation contract now treats one semantic `search`
 result as a ranked answer-candidate set and forbids paraphrased semantic retry
 loops. Exact-candidate evidence showed the requested definition at rank two on
 the first call while an unconstrained agent repeated 50-plus equivalent
-queries. The release corpus and its 20-percent efficiency thresholds remain
+queries. The diagnostic corpus and its 20-percent efficiency thresholds remain
 unchanged.
 
 Explicit and scheduled CI soaks now build Linux debug binaries with the real
@@ -63,7 +63,7 @@ Explicit and scheduled CI soaks now build Linux debug binaries with the real
 unqualified Linux soak correctly tripped Greppy's hard no-GPU-backend guard
 before the battle suite could start.
 
-The coding-outcome release gate now partitions its registered 41 tasks and
+The coding-outcome diagnostic now partitions its registered 41 tasks and
 three arms into six deterministic runner shards, with at most three shards
 active concurrently. A serial candidate completed 47 of 123 arms before the
 six-hour timeout; three threads on one runner reached only 75 because local
