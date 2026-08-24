@@ -4,7 +4,9 @@ This harness measures coding outcomes for the same pinned mutation with
 MiniMax-M3 through Pi Code:
 
 - `explorer`: an uncoached coding agent using normal repository exploration;
-- `greppy`: the same coding agent with a concise Greppy navigation treatment.
+- `greppy`: the same coding agent with a concise Greppy navigation treatment;
+- `greppy-edit`: the same coding agent with the shipped Greppy manual and an
+  explicit edit-through-Greppy treatment.
 
 This is **coding-outcome evidence that complements, and does not replace, the
 navigation benchmark** in `bench/agent_efficiency/`. The navigation benchmark
@@ -17,11 +19,13 @@ Every pair uses the same pinned repository commit, ordered setup argv arrays,
 mutation patch, user task, test argv, timeout, Pi version, MiniMax-M3 model,
 built-in tools, shared system prompt, and user prompt. Every arm receives the
 same explicit Pi tool palette: `bash,read,edit,write`; no arm is advantaged or
-constrained by a palette cut. The only intended prompt delta is the
-preregistered navigation treatment: the Greppy arms receive their Greppy
-command guides, while the explorer arm receives no code-intelligence workflow.
-Full prompt hashes, the shared user-prompt hash, the per-arm palette, and the
-setup-command hash are recorded in `MANIFEST.json`.
+constrained by a palette cut. The intended prompt deltas are the preregistered
+navigation and edit treatments: both Greppy arms receive their command guides,
+and `greppy-edit` must make source changes through Greppy. Its row fails closed
+if it changes the worktree without an observed Greppy edit or calls Pi's
+built-in edit/write controls. Full prompt hashes, the shared user-prompt hash,
+the per-arm palette, and setup-command hash are recorded in `MANIFEST.json`;
+the per-row treatment verdict is recorded in `results.json`.
 
 The order of the arms is deterministically counterbalanced from the task ID.
 Each arm gets a separate temporary Git repository, `GREPPY_STORE_DIR`, and
@@ -127,6 +131,8 @@ For each arm the harness records:
 - total tool calls and source opens, where a source open is a Pi `read` call or
   a shell call beginning a command segment with `cat`, `head`, `tail`, or
   `sed -n` (the same definition used by `run_bench.py`);
+- observed Greppy edit calls, files touched by file-addressed edits or unified
+  diffs on stdin, post-edit source opens, and built-in edit/write calls;
 - measured agent wall time, excluding setup, Greppy warmup, and the independent
   test;
 - test exit status and duration;

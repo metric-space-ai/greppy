@@ -520,9 +520,15 @@ pub(crate) fn argv_without_unknown_flag(
     }
     let mut out = Vec::with_capacity(argv.len());
     let mut dropped = false;
+    let mut options_ended = false;
     for argument in argv {
         let text = argument.to_string_lossy();
-        if text == unknown {
+        if text == "--" {
+            options_ended = true;
+            out.push(argument.clone());
+            continue;
+        }
+        if !options_ended && text == unknown {
             // Drop the flag alone, never the token behind it: in
             // `brief --lines parse_path` that token is the symbol being asked
             // about, and eating it turns a recoverable call into "required
@@ -531,7 +537,7 @@ pub(crate) fn argv_without_unknown_flag(
             dropped = true;
             continue;
         }
-        if text.starts_with(&format!("{unknown}=")) {
+        if !options_ended && text.starts_with(&format!("{unknown}=")) {
             dropped = true;
             continue;
         }
@@ -563,8 +569,14 @@ pub(crate) fn argv_with_stray_path_as_filter(
     }
     let mut out = Vec::with_capacity(argv.len() + 1);
     let mut replaced = false;
+    let mut options_ended = false;
     for argument in argv {
-        if !replaced && argument.to_string_lossy() == stray {
+        if argument == "--" {
+            options_ended = true;
+            out.push(argument.clone());
+            continue;
+        }
+        if !options_ended && !replaced && argument.to_string_lossy() == stray {
             out.push(std::ffi::OsString::from("--path"));
             out.push(argument.clone());
             replaced = true;
@@ -619,8 +631,14 @@ pub(crate) fn argv_without_stray_positional(
     }
     let mut out = Vec::with_capacity(argv.len());
     let mut dropped = false;
+    let mut options_ended = false;
     for argument in argv {
-        if !dropped && argument.to_string_lossy() == stray {
+        if argument == "--" {
+            options_ended = true;
+            out.push(argument.clone());
+            continue;
+        }
+        if !options_ended && !dropped && argument.to_string_lossy() == stray {
             dropped = true;
             continue;
         }

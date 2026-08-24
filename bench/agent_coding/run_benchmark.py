@@ -116,16 +116,24 @@ AGENTS_MD = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 # TREATMENT (navigate-only vs edit-through-greppy); only the vocabulary now
 # comes from one source of truth.
 GREPPY_EDIT_POLICY_TEMPLATE = (
-    "This system does not ship grep, ripgrep, or a patch utility for source "
-    "files. Greppy replaces all of them; the executable is {greppy}, always "
-    "with `--root .`. If you need original grep behavior, call greppy exactly "
-    "like grep (byte-exact passthrough).\n"
-    "Navigate and READ with greppy instead of opening whole files, and make "
-    "every source change THROUGH greppy's EDIT verbs — no manual patching, no "
-    "apply_patch. A refused edit is information: it tells you the file or the "
-    "target moved; re-read and retry deliberately.\n"
-    "Verify the final result with the supplied verification command.\n\n"
-    "Greppy's manual:\n\n" + AGENTS_MD
+    "Use Greppy as the primary code-navigation surface before opening source "
+    "files. The executable is {greppy}; always pass `--root .`. Inspect one "
+    "compact result, then implement the fix. Do not begin with `where-am-i`, "
+    "directory listings, filesystem-wide searches, or grep/read loops when the "
+    "task already names its target.\n"
+    "Make every source change with a Greppy edit verb. Prefer one `{greppy} "
+    "patch --verify --root .` containing the complete coordinated change as a "
+    "standard unified diff on stdin (`--- a/file`, `+++ b/file`, `@@ ...`); "
+    "never use `*** Begin Patch` markers. Built-in edit/write is present only "
+    "as an equal-palette control: calling it, or changing the worktree with no "
+    "observed Greppy edit, invalidates the attempt. If Greppy refuses the edit, "
+    "use its diagnostic for at most one deliberate reread and retry. After a "
+    "verified edit succeeds, do not reopen the touched source. Run the supplied "
+    "verification command once.\n\n"
+    "Greppy's manual:\n\n" + AGENTS_MD +
+    "\n\nFINAL ARM CHECK: source inspection and source changes must go through "
+    "Greppy. Built-in edit/write, direct cat/grep/find/ls/sed source loops, and "
+    "a changed worktree with zero observed Greppy edits invalidate the attempt."
 )
 
 GREPPY_POLICY_TEMPLATE = (
@@ -964,6 +972,7 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
     edit_calls = 0
+    builtin_edit_calls = 0
     post_edit_source_opens = 0
     edited_files: set[str] = set()
     error: str | None = None
@@ -990,6 +999,8 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
                 continue
             name = item.get("name")
             opened_file = None
+            if name in {"edit", "write"}:
+                builtin_edit_calls += 1
             if name == "read":
                 source_opens += 1
                 opened_file = str((item.get("arguments") or {}).get("path", ""))
@@ -1012,6 +1023,12 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
                         diff = _first_positional(arguments)
                         if diff:
                             edited_files.update(_patch_paths(diff))
+                        # The documented form streams a unified diff through a
+                        # heredoc/stdin, so no positional argument names the
+                        # touched files. The full shell command still contains
+                        # the `---`/`+++` headers and is already redacted before
+                        # this parser sees it.
+                        edited_files.update(_patch_paths(command))
                     # Symbol, span, rename, and undo commands do not carry a
                     # file positional in the shipped 0.3.0 grammar.
             if opened_file and _normalized_source_path(opened_file) in edited_files:
@@ -1038,6 +1055,7 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         "turns": turns,
         "reported_error": bool(error),
         "edit_calls": edit_calls,
+        "builtin_edit_calls": builtin_edit_calls,
         "edited_files": sorted(edited_files),
         "post_edit_source_opens": post_edit_source_opens,
         # provider error text, redacted upstream with the rest of stdout;
@@ -1428,13 +1446,19 @@ def run_arm(
             operation="final HEAD capture",
         ).stdout.decode("ascii", "replace").strip()
 
+        treatment = edit_treatment_validation(
+            arm=arm,
+            agent=agent,
+            changed_worktree=pretest_diff != mutation_diff,
+        )
         row = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task["id"],
             "arm": arm,
-            "valid": agent_result_is_valid(agent),
+            "valid": agent_result_is_valid(agent) and treatment["valid"],
             "correctness": not test_result.timed_out and test_result.returncode == 0,
             "agent": agent,
+            "treatment": treatment,
             "setup": setup,
             "test": process_summary(test_result, test_output),
             "warmup": warmup,
@@ -1465,6 +1489,30 @@ def agent_result_is_valid(agent: dict[str, Any]) -> bool:
         and int(agent.get("turns", 0) or 0) > 0
         and not agent.get("reported_error")
     )
+
+
+def edit_treatment_validation(
+    *, arm: str, agent: dict[str, Any], changed_worktree: bool
+) -> dict[str, Any]:
+    """Fail closed when the edit arm's measured change bypasses Greppy."""
+    if arm != "greppy-edit":
+        return {"applies": False, "valid": True, "failure_reasons": []}
+
+    reasons: list[str] = []
+    builtin_edit_calls = int(agent.get("builtin_edit_calls", 0) or 0)
+    greppy_edit_calls = int(agent.get("edit_calls", 0) or 0)
+    if builtin_edit_calls:
+        reasons.append("builtin_edit_or_write_used")
+    if changed_worktree and greppy_edit_calls == 0:
+        reasons.append("changed_worktree_without_greppy_edit")
+    return {
+        "applies": True,
+        "valid": not reasons,
+        "failure_reasons": reasons,
+        "changed_worktree": changed_worktree,
+        "greppy_edit_calls": greppy_edit_calls,
+        "builtin_edit_calls": builtin_edit_calls,
+    }
 
 
 def run_arm_with_retries(

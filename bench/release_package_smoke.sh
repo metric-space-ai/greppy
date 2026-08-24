@@ -15,6 +15,16 @@ case "$BIN" in /*) ;; *) BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN"
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 64; }
 WORK="${2:-$(mktemp -d "${TMPDIR:-/tmp}/greppy-release-smoke-XXXXXX")}"
 mkdir -p "$WORK/repo/src" "$WORK/repo/.git" "$WORK/store"
+# A 0.3.1 data root may contain these now-unmanaged namespaces. They must not
+# shadow the packaged model assets or prevent the managed v2 workspace from
+# being created beside them.
+mkdir -p \
+  "$WORK/store/embedded-model" \
+  "$WORK/store/models/v1/unmanaged-old" \
+  "$WORK/store/workspaces/v2/unmanaged-old"
+printf '%s\n' 'legacy-0.3.1-cache' >"$WORK/store/embedded-model/legacy.marker"
+printf '%s\n' 'stale-model-placeholder' >"$WORK/store/models/v1/unmanaged-old/model.gguf"
+printf '%s\n' 'stale-workspace-placeholder' >"$WORK/store/workspaces/v2/unmanaged-old/graph.db"
 
 section() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -127,6 +137,8 @@ section "baseline: doctor, index, JSON brief + semantic-search + expand"
 jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' "$WORK/doctor.json" >/dev/null
 
 "$BIN" --device cpu --root "$WORK/repo" index "$WORK/repo" >"$WORK/index.txt"
+"$BIN" --device cpu --root "$WORK/repo" where-am-i >"$WORK/where-am-i.txt"
+test -s "$WORK/where-am-i.txt" || fail "packaged legacy-cache index: where-am-i returned no repository overview"
 "$BIN" --device cpu --root "$WORK/repo" brief apply_limit --json >"$WORK/brief.json"
 jq -e '
   .schema_version == "greppy.brief.v1" and
@@ -414,14 +426,20 @@ done
 "$BIN" cache status --json >"$WORK/cache-status-cleared.json"
 jq -e '.managed_bytes == 0 and (.entries | length) == 0' "$WORK/cache-status-cleared.json" >/dev/null \
   || fail "cache status after clear --all: expected zero managed bytes and no entries"
-[ -z "$(find "$GREPPY_STORE_DIR" -name 'graph.db' 2>/dev/null)" ] \
-  || fail "cache clear --all left workspace databases behind"
+
+# Clear removes managed data only. The seeded 0.3.1-shaped namespaces are
+# deliberately unmanaged and must survive byte-for-byte; no other workspace
+# database or model blob may remain.
+remaining_graphs="$(find "$GREPPY_STORE_DIR" -name 'graph.db' -print 2>/dev/null)"
+[ "$remaining_graphs" = "$WORK/store/workspaces/v2/unmanaged-old/graph.db" ] \
+  || fail "cache clear --all removed unmanaged legacy data or left a managed workspace database"
 
 # Extracted embedded models are managed entries (model_entry_has_marker
 # accepts the CLI's JSON extraction marker since the 2026-07-13 fix) and must
 # be reclaimed by `cache clear --all --yes` like any other model entry.
-[ -z "$(find "$GREPPY_STORE_DIR" -name '*.gguf' 2>/dev/null)" ] \
-  || fail "cache clear --all left extracted model blobs behind"
+remaining_models="$(find "$GREPPY_STORE_DIR" -name '*.gguf' -print 2>/dev/null)"
+[ "$remaining_models" = "$WORK/store/models/v1/unmanaged-old/model.gguf" ] \
+  || fail "cache clear --all removed unmanaged legacy data or left a managed model blob"
 
 # --- simulated install + residue-free removal --------------------------------
 # Install the packaged binary into a temp prefix (exactly what the tarball

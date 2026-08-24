@@ -46,6 +46,10 @@ tokens per run. For symbol-scoped changes prefer greppy's edit commands —
 `greppy replace S`, `greppy replace-text F OLD NEW`, `greppy patch`,
 `greppy rename S NAME` — with `--verify` to get build diagnostics mapped
 back to symbols, and `greppy undo` to revert a bad edit.
+Prefer one precise edit, or one `greppy patch --verify` for coordinated changes.
+After a verified edit succeeds, do not reopen touched source merely to confirm
+it; follow up only when the edit result explicitly reports ambiguity,
+incomplete evidence, or a verification failure.
 
 `greppy` holds this repository as a graph: every definition, what it calls, what uses it,
 and a meaning index over its source. Invoked like grep (`greppy PATTERN [FILE]`,

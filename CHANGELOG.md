@@ -88,6 +88,12 @@ edit contract now matches the tested harness: all three arms receive the same
 explicit `bash,read,edit,write` palette, and treatment rather than a hidden tool
 restriction defines the Greppy-edit contrast.
 
+That edit treatment now fails closed when a changed worktree has no observed
+Greppy edit or Pi's built-in edit/write controls were used. Unified diffs
+streamed to `greppy patch` on stdin contribute their touched files to the
+post-edit re-read metric, and the prompt names the accepted unified-diff form
+instead of leaving agents to retry incompatible patch marker formats.
+
 Coding mutation preflight now accepts Pytest's completed quiet-mode progress
 line as framework-proven failure evidence when it contains an `F` or `E` marker.
 Pytest `-q` can omit the collection banner even though tests executed; this
@@ -104,6 +110,17 @@ and inference had already passed.
 the repository, while relative `../` traversal remains confined to the repo.
 This lets integrated agents inspect downloaded gate artifacts without leaving
 Greppy's read/navigation workflow.
+
+Automatic CLI option recovery now treats POSIX `--` as a hard boundary. A
+malformed invocation with option-looking positional arguments after the
+terminator is refused once with bounded usage output instead of recursively
+rewriting the same arguments until stack overflow.
+
+Release-package acceptance now seeds unmanaged 0.3.1-shaped model and workspace
+cache namespaces before indexing, proves `index` followed by `where-am-i`, and
+then verifies that cache clearing removes managed data while preserving those
+unmanaged legacy files. This covers upgrades from an existing cache as well as
+the already-gated fresh-store package path.
 
 ## [0.3.0] — 2026-08-12
 

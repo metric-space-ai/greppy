@@ -105,6 +105,46 @@ fn run_with_env_and_inference(
     )
 }
 
+#[test]
+fn option_recovery_never_rewrites_arguments_after_double_dash() {
+    let (repo, store, _scratch) = make_repo("double-dash-recovery", "marker");
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "--fixed",
+            "--",
+            "--tools",
+            "--path",
+            "nested/path",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+
+    assert_eq!(
+        code, 64,
+        "invalid post-terminator arguments must be refused"
+    );
+    assert!(
+        err.is_empty(),
+        "usage guidance is emitted on stdout: {err:?}"
+    );
+    assert!(
+        out.contains("usage:"),
+        "bounded refusal must include usage: {out}"
+    );
+    assert!(
+        !out.contains("ignoring unknown option") && !out.contains("using it as"),
+        "arguments after `--` must never enter automatic option recovery: {out}"
+    );
+    assert!(
+        out.len() < 4096,
+        "a malformed invocation must remain bounded, got {} bytes",
+        out.len()
+    );
+}
+
 struct HeldIndex {
     child: std::process::Child,
 }

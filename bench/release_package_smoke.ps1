@@ -5,6 +5,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force "$Work/repo/src", "$Work/repo/.git", "$Work/store" | Out-Null
+New-Item -ItemType Directory -Force `
+    "$Work/store/embedded-model", `
+    "$Work/store/models/v1/unmanaged-old", `
+    "$Work/store/workspaces/v2/unmanaged-old" | Out-Null
+'legacy-0.3.1-cache' | Set-Content -Encoding utf8NoBOM "$Work/store/embedded-model/legacy.marker"
+'stale-model-placeholder' | Set-Content -Encoding utf8NoBOM "$Work/store/models/v1/unmanaged-old/model.gguf"
+'stale-workspace-placeholder' | Set-Content -Encoding utf8NoBOM "$Work/store/workspaces/v2/unmanaged-old/graph.db"
 @'
 pub fn apply_limit(value: i32) -> i32 { value.clamp(0, 100) }
 pub fn process_value(value: i32) -> i32 { apply_limit(value) }
@@ -32,6 +39,10 @@ if ($doctor.command -ne 'doctor' -or $doctor.inference.registry.selected_backend
 
 & $Binary --device cpu --root "$Work/repo" index "$Work/repo" | Out-File "$Work/index.txt"
 if ($LASTEXITCODE -ne 0) { throw "index failed: $LASTEXITCODE" }
+$whereAmI = & $Binary --device cpu --root "$Work/repo" where-am-i
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($whereAmI -join "`n"))) {
+    throw 'packaged legacy-cache index: where-am-i failed'
+}
 $brief = (& $Binary --device cpu --root "$Work/repo" brief apply_limit --json) | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or $brief.schema_version -ne 'greppy.brief.v1' -or
     $brief.status -ne 'ok' -or $brief.definitions.Count -lt 1 -or

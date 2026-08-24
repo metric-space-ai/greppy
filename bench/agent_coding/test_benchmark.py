@@ -821,6 +821,46 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(metrics["edit_calls"], 1)
         self.assertEqual(metrics["edited_files"], ["src/a.rs"])
 
+    def test_greppy_patch_stdin_tracks_touched_files_and_rereads(self) -> None:
+        patch_event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}],
+            "message": {
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {
+                            "command": (
+                                "greppy patch --verify --root . <<'PATCH'\n"
+                                "--- a/src/a.rs\n"
+                                "+++ b/src/a.rs\n"
+                                "@@ -1 +1 @@\n-old\n+new\nPATCH"
+                            )
+                        },
+                    }
+                ]
+            },
+        }
+        read_event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}],
+            "message": {
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {"command": "greppy read-file src/a.rs --root ."},
+                    }
+                ]
+            },
+        }
+        raw = "\n".join(json.dumps(event) for event in (patch_event, read_event)) + "\n"
+        metrics = bench.parse_pi_jsonl(raw.encode())
+        self.assertEqual(metrics["edit_calls"], 1)
+        self.assertEqual(metrics["edited_files"], ["src/a.rs"])
+        self.assertEqual(metrics["post_edit_source_opens"], 1)
+
     def test_greppy_read_is_not_mistaken_for_an_edit(self) -> None:
         event = {
             "type": "turn_end",
@@ -838,6 +878,48 @@ class ContractTests(unittest.TestCase):
         metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
         self.assertEqual(metrics["edit_calls"], 0)
         self.assertEqual(metrics["edited_files"], [])
+
+    def test_builtin_edit_and_write_calls_are_observed(self) -> None:
+        event = {
+            "type": "turn_end",
+            "toolResults": [{"content": []}, {"content": []}],
+            "message": {
+                "content": [
+                    {"type": "toolCall", "name": "edit", "arguments": {}},
+                    {"type": "toolCall", "name": "write", "arguments": {}},
+                ]
+            },
+        }
+        metrics = bench.parse_pi_jsonl((json.dumps(event) + "\n").encode())
+        self.assertEqual(metrics["builtin_edit_calls"], 2)
+
+    def test_changed_edit_arm_requires_greppy_and_rejects_builtin_edits(self) -> None:
+        valid = bench.edit_treatment_validation(
+            arm="greppy-edit",
+            agent={"edit_calls": 1, "builtin_edit_calls": 0},
+            changed_worktree=True,
+        )
+        self.assertTrue(valid["valid"])
+
+        bypassed = bench.edit_treatment_validation(
+            arm="greppy-edit",
+            agent={"edit_calls": 0, "builtin_edit_calls": 1},
+            changed_worktree=True,
+        )
+        self.assertFalse(bypassed["valid"])
+        self.assertEqual(
+            bypassed["failure_reasons"],
+            ["builtin_edit_or_write_used", "changed_worktree_without_greppy_edit"],
+        )
+
+    def test_edit_arm_prompt_names_fail_closed_treatment_contract(self) -> None:
+        prompt = bench.GREPPY_EDIT_POLICY_TEMPLATE.format(greppy="/greppy")
+        self.assertIn("invalidates the attempt", prompt)
+        self.assertIn("/greppy patch --verify --root .", prompt)
+        self.assertIn("standard unified diff", prompt)
+        self.assertIn("never use `*** Begin Patch` markers", prompt)
+        self.assertIn("Greppy's manual", prompt)
+        self.assertIn("zero observed Greppy edits invalidate", prompt)
 
     def test_secret_redaction_and_metric_parsing(self) -> None:
         secret = "sk-never-log-this"

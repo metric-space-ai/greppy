@@ -374,6 +374,16 @@ are release requirements, not deferred cleanup:
   The manifest records all three arm prompt hashes
   plus the actual provider-dollar and edit-loop gate contract, not the retired
   token-ratio wording.
+- the Greppy-edit treatment must fail closed when a changed worktree contains
+  no observed Greppy edit or the agent used built-in edit/write tools. The
+  normal tool palette remains identical across arms, but the prompt states the
+  measured treatment as an explicit validity contract, favors one verified
+  Greppy patch for coordinated changes, and forbids post-success source
+  reopening unless diagnostics require recovery.
+- automatic CLI recovery must never rewrite or delete arguments after the
+  POSIX `--` end-of-options marker. Malformed post-terminator arguments receive
+  one bounded usage refusal; they must not cycle between unknown-option and
+  stray-path recovery until stack overflow.
 - the Windows release matrix must request Cargo's real `cpu-only` feature, not
   an inert `cpu` workflow sentinel; Windows CPU is the certified 0.3.2 scope,
   and the hard no-GPU-backend assertion must remain active for accidental
@@ -395,6 +405,12 @@ are release requirements, not deferred cleanup:
   window can be shorter than status polling on fast macOS runners and must not
   create a false release failure after inference and stale-socket behavior have
   otherwise passed.
+- every packaged platform artifact must prove the complete fresh-workspace
+  chain `index` then `where-am-i` before graph and semantic probes continue.
+  The package smoke seeds unmanaged 0.3.1-shaped model and workspace cache
+  namespaces first: the reported gpu3 failure was isolated to that old default
+  store, while the exact 0.3.2 candidate must pass both a fresh store and this
+  legacy-namespace coexistence case.
 - the integrated-agent manual must route exact definition, caller, impact,
   path, and semantic questions directly to one compact graph command,
   distinguish symbol reads from file/range reads, request `--code` only when
