@@ -4543,8 +4543,8 @@ const MINIMAL_CHANGE_SIGNATURE_EXAMPLE: &str =
 // `--file F --old-file F2`, `--file F --pattern REGEX`, `--file F --lines A:B`,
 // `--file F`, `--symbol S`, `--symbol S --body`, or `--target H`. Every
 // combination that the grammar does not provide is a refusal with a stable
-// `error.code`, never a guess: `dev/CLI-SPEC.md` rule 1 forbids reinterpreting
-// an argument into a different question.
+// `error.code`, never a guess: the CLI grammar never reinterprets an argument
+// into a different question.
 // ---------------------------------------------------------------------------
 
 /// A refused edit. The code is what a caller branches on; the message says
@@ -5702,7 +5702,7 @@ fn content_fallback(
 }
 
 // ---------------------------------------------------------------------------
-// Several targets per call — `dev/CLI-SPEC.md` rules 1-3, 5.
+// Several targets per call — stable CLI grammar contract.
 //
 // A positional argument is a TARGET, never a path filter: the only path filter
 // is `--path`, and it narrows every target in the batch. An argument the
