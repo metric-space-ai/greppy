@@ -1,7 +1,7 @@
 use crate::{BaselineSnapshot, ChunkId, ChunkStore, EntryKind, Error, Result, CHUNK_SIZE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
@@ -412,7 +412,13 @@ impl WorkspaceCore {
         for (index, id) in replacement {
             inode.chunks[index] = id;
         }
+        let journal_id = self.begin_namespace_journal(
+            &workspace.id,
+            "write",
+            &serde_json::to_vec(&(inode.id, new_size, &inode.chunks))?,
+        )?;
         self.update_inode(&workspace.id, inode.id, new_size, &inode.chunks)?;
+        self.complete_namespace_journal(journal_id)?;
         for id in old {
             self.chunks.unpin(id)?;
         }
@@ -889,22 +895,71 @@ impl WorkspaceCore {
 
     pub fn recover(&self) -> Result<()> {
         self.chunks.verify()?;
+        let mut expected = HashMap::<ChunkId, u64>::new();
         let connection = self.lock_metadata()?;
-        let active: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM cow_journal WHERE state != 'complete'",
-            [],
-            |row| row.get(0),
+        {
+            let mut statement = connection.prepare("SELECT chunks_json FROM cow_inodes")?;
+            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                for id in serde_json::from_slice::<Vec<ChunkId>>(&row?)? {
+                    *expected.entry(id).or_default() += 1;
+                }
+            }
+        }
+        {
+            let mut statement = connection.prepare("SELECT baseline_json FROM cow_workspaces")?;
+            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                let snapshot: BaselineSnapshot = serde_json::from_slice(&row?)?;
+                for id in snapshot_chunks(&snapshot) {
+                    *expected.entry(id).or_default() += 1;
+                }
+            }
+        }
+        {
+            let mut statement = connection.prepare("SELECT baseline_json FROM cow_proposals")?;
+            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                let snapshot: BaselineSnapshot = serde_json::from_slice(&row?)?;
+                for id in snapshot_chunks(&snapshot) {
+                    *expected.entry(id).or_default() += 1;
+                }
+            }
+        }
+        drop(connection);
+        self.chunks.reconcile_references(&expected)?;
+        let connection = self.lock_metadata()?;
+        connection.execute("DELETE FROM cow_journal", [])?;
+        Ok(())
+    }
+
+    fn begin_namespace_journal(
+        &self,
+        workspace_id: &str,
+        operation: &str,
+        payload: &[u8],
+    ) -> Result<i64> {
+        let connection = self.lock_metadata()?;
+        connection.execute(
+            "INSERT INTO cow_journal(workspace_id, operation, state, payload)
+             VALUES(?1, ?2, 'prepared', ?3)",
+            params![workspace_id, operation, payload],
         )?;
-        if active != 0 {
-            connection.execute(
-                "UPDATE cow_workspaces SET state = 'broken'
-                 WHERE id IN (SELECT workspace_id FROM cow_journal WHERE state != 'complete')",
-                [],
-            )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    fn complete_namespace_journal(&self, journal_id: i64) -> Result<()> {
+        let connection = self.lock_metadata()?;
+        let changed = connection.execute(
+            "UPDATE cow_journal SET state = 'complete' WHERE id = ?1",
+            params![journal_id],
+        )?;
+        if changed != 1 {
             return Err(Error::Corrupt(format!(
-                "{active} incomplete namespace journal entries require recovery"
+                "namespace journal {journal_id} disappeared"
             )));
         }
+        connection.execute("DELETE FROM cow_journal WHERE id = ?1", params![journal_id])?;
         Ok(())
     }
 
@@ -1586,6 +1641,36 @@ mod tests {
                 .unwrap(),
             [vec![3_u8; 7], b"x".to_vec(), vec![3_u8; 2]].concat()
         );
+    }
+
+    #[test]
+    fn reopening_recovers_an_incomplete_journal_and_reconciles_cas_refs() {
+        let (_repo, storage, core, workspace) = fixture();
+        core.create_file(&workspace, "interrupted.bin", 0o100644)
+            .unwrap();
+        core.write(&workspace, "interrupted.bin", 0, b"committed")
+            .unwrap();
+        let inode = core.materialize(&workspace, "interrupted.bin").unwrap();
+        core.chunks.pin(inode.chunks[0]).unwrap();
+        {
+            let connection = core.lock_metadata().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cow_journal(workspace_id, operation, state, payload)
+                     VALUES(?1, 'write', 'prepared', X'00')",
+                    params![workspace.id],
+                )
+                .unwrap();
+        }
+        drop(core);
+
+        let reopened = WorkspaceCore::open(storage.path()).unwrap();
+        assert_eq!(
+            reopened.read(&workspace, "interrupted.bin", 0, 32).unwrap(),
+            b"committed"
+        );
+        reopened.remove_workspace(workspace).unwrap();
+        assert_eq!(reopened.chunks().stats().unwrap().referenced_chunks, 0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -289,6 +290,33 @@ impl ChunkStore {
                 "cannot unpin unknown or unreferenced chunk {id}"
             )));
         }
+        Ok(())
+    }
+
+    /// Replace the cached reference counters with the authoritative counts
+    /// derived from namespace and proposal manifests. This closes the only
+    /// cross-database crash window: namespace metadata and the append-only CAS
+    /// deliberately use separate WAL databases, so a process can die after
+    /// either side commits. Bytes are never guessed or discarded here.
+    pub(crate) fn reconcile_references(&self, expected: &HashMap<ChunkId, u64>) -> Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE cow_chunks SET refs = 0", [])?;
+        for (id, refs) in expected {
+            let changed = transaction.execute(
+                "UPDATE cow_chunks SET refs = ?2 WHERE hash = ?1",
+                params![&id.0[..], *refs as i64],
+            )?;
+            if changed != 1 {
+                return Err(Error::Corrupt(format!(
+                    "manifest references unknown chunk {id}"
+                )));
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 
