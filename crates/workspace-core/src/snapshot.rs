@@ -156,6 +156,7 @@ fn capture_entry(repository: &Path, relative: &str, store: &ChunkStore) -> Resul
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(&path)?;
         let bytes = path_bytes(target.as_os_str());
+        crate::path_policy::validate_symlink_target(relative, &bytes)?;
         let (chunks, size) = store.put_stream(bytes.as_slice())?;
         return Ok(BaselineEntry {
             path: relative.to_string(),

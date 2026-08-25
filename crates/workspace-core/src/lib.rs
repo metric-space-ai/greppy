@@ -8,6 +8,7 @@
 mod chunk_store;
 mod error;
 mod namespace;
+mod path_policy;
 mod provider;
 mod snapshot;
 

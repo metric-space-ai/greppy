@@ -316,7 +316,7 @@ impl Filesystem for PortableFuse {
     fn readlink(&self, _req: &Request, inode: INodeNo, reply: ReplyData) {
         match self.workspace_parts(inode).and_then(|(workspace, path)| {
             self.core
-                .read(&workspace, path, 0, usize::MAX)
+                .read_symlink(&workspace, path)
                 .map_err(|_| Errno::EIO)
         }) {
             Ok(bytes) => reply.data(&bytes),
@@ -569,9 +569,10 @@ impl Filesystem for PortableFuse {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if !flags.is_empty() {
+        if flags.intersects(RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT) {
             return reply.error(Errno::EINVAL);
         }
+        let no_replace = flags.contains(RenameFlags::RENAME_NOREPLACE);
         let result = self
             .node(parent)
             .zip(self.node(new_parent))
@@ -583,6 +584,9 @@ impl Filesystem for PortableFuse {
                     let source = self.doctor_path(&doctor_destination(&source_parent, name)?)?;
                     let destination =
                         self.doctor_path(&doctor_destination(&destination_parent, new_name)?)?;
+                    if no_replace && destination.exists() {
+                        return Err(Errno::EEXIST);
+                    }
                     return fs::rename(source, destination).map_err(io_errno);
                 }
                 let (workspace, source) = workspace_destination(&source_parent, name)?;
@@ -595,6 +599,15 @@ impl Filesystem for PortableFuse {
                     .core
                     .open_workspace(&workspace)
                     .map_err(|_| Errno::ENOENT)?;
+                if no_replace
+                    && self
+                        .core
+                        .metadata(&handle, &destination)
+                        .map_err(|_| Errno::EIO)?
+                        .is_some()
+                {
+                    return Err(Errno::EEXIST);
+                }
                 self.core
                     .rename(&handle, source, destination)
                     .map_err(|_| Errno::EIO)

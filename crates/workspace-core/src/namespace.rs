@@ -529,13 +529,32 @@ impl WorkspaceCore {
         path: impl AsRef<Path>,
         target: &[u8],
     ) -> Result<()> {
+        let path = normalize_path(path.as_ref(), false)?;
+        crate::path_policy::validate_symlink_target(&path, target)?;
         self.create_node(
             workspace,
-            path.as_ref(),
+            Path::new(&path),
             NodeKind::Symlink,
             0o120000,
             target,
         )
+    }
+
+    pub fn read_symlink(
+        &self,
+        workspace: &WorkspaceHandle,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<u8>> {
+        let path = normalize_path(path.as_ref(), false)?;
+        let metadata = self
+            .metadata(workspace, &path)?
+            .ok_or_else(|| Error::InvalidPath(format!("path does not exist: {path}")))?;
+        if metadata.kind != NodeKind::Symlink {
+            return Err(Error::InvalidPath(format!("path is not a symlink: {path}")));
+        }
+        let target = self.read(workspace, &path, 0, usize::MAX)?;
+        crate::path_policy::validate_symlink_target(&path, &target)?;
+        Ok(target)
     }
 
     pub fn hard_link(
@@ -576,13 +595,28 @@ impl WorkspaceCore {
                 "directory is not empty: {path}"
             )));
         }
-        let connection = self.lock_metadata()?;
-        connection.execute(
-            "INSERT INTO cow_entries(workspace_id, path, inode_id, tombstone)
-             VALUES(?1, ?2, NULL, 1)
-             ON CONFLICT(workspace_id, path) DO UPDATE SET inode_id = NULL, tombstone = 1",
-            params![workspace.id, path],
+        let inode = self.materialize(workspace, &path)?;
+        let mut connection = self.lock_metadata()?;
+        let transaction = connection.transaction()?;
+        insert_tombstone(&transaction, &workspace.id, &path)?;
+        let remaining: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM cow_entries
+             WHERE workspace_id = ?1 AND inode_id = ?2 AND tombstone = 0",
+            params![workspace.id, inode.id],
+            |row| row.get(0),
         )?;
+        if remaining == 0 {
+            transaction.execute(
+                "DELETE FROM cow_inodes WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace.id, inode.id],
+            )?;
+        }
+        transaction.commit()?;
+        if remaining == 0 {
+            for id in inode.chunks {
+                self.chunks.unpin(id)?;
+            }
+        }
         Ok(())
     }
 
@@ -602,19 +636,70 @@ impl WorkspaceCore {
         let metadata = self
             .metadata(workspace, &source)?
             .ok_or_else(|| Error::InvalidPath(format!("source does not exist: {source}")))?;
-        if self.metadata(workspace, &destination)?.is_some() {
-            return Err(Error::InvalidPath(format!(
-                "destination already exists: {destination}"
-            )));
-        }
+        let destination_metadata = self.metadata(workspace, &destination)?;
         if metadata.kind != NodeKind::Directory {
+            if destination_metadata
+                .as_ref()
+                .is_some_and(|destination| destination.kind == NodeKind::Directory)
+            {
+                return Err(Error::InvalidPath(format!(
+                    "cannot replace directory with non-directory: {destination}"
+                )));
+            }
             let inode = self.materialize(workspace, &source)?;
             let mut connection = self.lock_metadata()?;
             let transaction = connection.transaction()?;
+            let replaced: Option<(i64, Vec<ChunkId>)> = transaction
+                .query_row(
+                    "SELECT i.id, i.chunks_json
+                     FROM cow_entries e JOIN cow_inodes i ON i.id = e.inode_id
+                     WHERE e.workspace_id = ?1 AND e.path = ?2 AND e.tombstone = 0",
+                    params![workspace.id, destination],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            serde_json::from_slice(&row.get::<_, Vec<u8>>(1)?).map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        1,
+                                        rusqlite::types::Type::Blob,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
+                        ))
+                    },
+                )
+                .optional()?;
             insert_entry(&transaction, &workspace.id, &destination, inode.id)?;
             insert_tombstone(&transaction, &workspace.id, &source)?;
+            let mut released = Vec::new();
+            if let Some((replaced_inode, chunks)) = replaced {
+                let remaining: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM cow_entries
+                     WHERE workspace_id = ?1 AND inode_id = ?2 AND tombstone = 0",
+                    params![workspace.id, replaced_inode],
+                    |row| row.get(0),
+                )?;
+                if remaining == 0 {
+                    transaction.execute(
+                        "DELETE FROM cow_inodes WHERE workspace_id = ?1 AND id = ?2",
+                        params![workspace.id, replaced_inode],
+                    )?;
+                    released = chunks;
+                }
+            }
             transaction.commit()?;
+            for id in released {
+                self.chunks.unpin(id)?;
+            }
             return Ok(());
+        }
+
+        if destination_metadata.is_some() {
+            return Err(Error::InvalidPath(format!(
+                "destination directory already exists: {destination}"
+            )));
         }
 
         let mut connection = self.lock_metadata()?;
@@ -1736,6 +1821,46 @@ mod tests {
     }
 
     #[test]
+    fn file_rename_atomically_replaces_an_existing_destination() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.create_file(&workspace, "destination", 0o100600)
+            .unwrap();
+        core.write(&workspace, "destination", 0, b"old unique bytes")
+            .unwrap();
+        core.create_file(&workspace, "temporary", 0o100600).unwrap();
+        core.write(&workspace, "temporary", 0, b"replacement")
+            .unwrap();
+        let before = core.chunks().stats().unwrap().referenced_chunks;
+        core.rename(&workspace, "temporary", "destination").unwrap();
+        assert!(core.metadata(&workspace, "temporary").unwrap().is_none());
+        assert_eq!(
+            core.read(&workspace, "destination", 0, 32).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before - 1);
+    }
+
+    #[test]
+    fn unlink_releases_private_chunks_only_after_the_last_hard_link() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.create_file(&workspace, "private.bin", 0o100600)
+            .unwrap();
+        core.write(&workspace, "private.bin", 0, b"private unique bytes")
+            .unwrap();
+        core.hard_link(&workspace, "private.bin", "private.link")
+            .unwrap();
+        let before = core.chunks().stats().unwrap().referenced_chunks;
+        core.unlink(&workspace, "private.bin").unwrap();
+        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before);
+        assert_eq!(
+            core.read(&workspace, "private.link", 0, 64).unwrap(),
+            b"private unique bytes"
+        );
+        core.unlink(&workspace, "private.link").unwrap();
+        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before - 1);
+    }
+
+    #[test]
     fn metadata_updates_are_inode_scoped_and_persisted() {
         let (_repo, _storage, core, workspace) = fixture();
         core.hard_link(&workspace, "README.md", "README.link")
@@ -1768,6 +1893,26 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.name == ".git"));
+    }
+
+    #[test]
+    fn symlinks_are_confined_to_the_workspace_on_every_platform() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.mkdir(&workspace, "nested", 0o755).unwrap();
+        core.mkdir(&workspace, "nested/deeper", 0o755).unwrap();
+        core.symlink(&workspace, "nested/deeper/internal", b"../target")
+            .unwrap();
+        assert_eq!(
+            core.read_symlink(&workspace, "nested/deeper/internal")
+                .unwrap(),
+            b"../target"
+        );
+        assert!(core
+            .symlink(&workspace, "nested/escape", b"../../host")
+            .is_err());
+        assert!(core
+            .symlink(&workspace, "nested/windows-escape", b"C:\\Windows")
+            .is_err());
     }
 
     #[test]

@@ -90,6 +90,14 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
     fs::write(root.join("unicode-ä.txt"), b"unicode").unwrap();
     fs::rename(root.join("unicode-ä.txt"), root.join("renamed.txt")).unwrap();
     fs::remove_file(root.join("renamed.txt")).unwrap();
+    fs::write(root.join("atomic-target.txt"), b"old").unwrap();
+    fs::write(root.join("atomic-temporary.txt"), b"new").unwrap();
+    fs::rename(
+        root.join("atomic-temporary.txt"),
+        root.join("atomic-target.txt"),
+    )
+    .unwrap();
+    assert_eq!(fs::read(root.join("atomic-target.txt")).unwrap(), b"new");
     symlink("tracked.txt", root.join("tracked.link")).unwrap();
     assert_eq!(
         fs::read_link(root.join("tracked.link")).unwrap(),
