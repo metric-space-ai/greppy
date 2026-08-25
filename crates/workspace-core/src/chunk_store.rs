@@ -442,7 +442,7 @@ impl ChunkStore {
         }
         current.sync_data()?;
         segments.last_mut().unwrap().1 = segment_len;
-        File::open(self.root.join("segments"))?.sync_all()?;
+        sync_directory(&self.root.join("segments"))?;
 
         let transaction = connection.transaction()?;
         for (id, len) in &segments {
@@ -474,7 +474,7 @@ impl ChunkStore {
                 Err(error) => return Err(error.into()),
             }
         }
-        File::open(self.root.join("segments"))?.sync_all()?;
+        sync_directory(&self.root.join("segments"))?;
         let after_bytes = segments.iter().map(|(_, len)| *len).sum();
         let retained_logical: i64 = rows.iter().map(|(_, _, _, len, _)| *len as i64).sum();
         Ok(ChunkGcReport {
@@ -550,6 +550,14 @@ impl ChunkStore {
             .join("segments")
             .join(format!("{segment_id:016x}.gcws"))
     }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn new_segment_file(path: &Path) -> Result<File> {

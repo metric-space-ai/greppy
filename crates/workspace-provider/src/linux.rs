@@ -316,7 +316,7 @@ impl Filesystem for PortableFuse {
     fn readlink(&self, _req: &Request, inode: INodeNo, reply: ReplyData) {
         match self.workspace_parts(inode).and_then(|(workspace, path)| {
             self.core
-                .read(&workspace, path, 0, u32::MAX)
+                .read(&workspace, path, 0, usize::MAX)
                 .map_err(|_| Errno::EIO)
         }) {
             Ok(bytes) => reply.data(&bytes),
@@ -354,7 +354,7 @@ impl Filesystem for PortableFuse {
                 .map_err(|_| Errno::ENOENT)
                 .and_then(|handle| {
                     self.core
-                        .read(&handle, path, offset, size)
+                        .read(&handle, path, offset, size as usize)
                         .map_err(|_| Errno::EIO)
                 }),
             _ => Err(Errno::EINVAL),
@@ -521,7 +521,7 @@ impl Filesystem for PortableFuse {
         reply: ReplyCreate,
     ) {
         match self.create_node(parent, name, mode, false) {
-            Ok((inode, attr)) => reply.created(
+            Ok((_inode, attr)) => reply.created(
                 &TTL,
                 &attr,
                 Generation(0),
@@ -812,21 +812,20 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
             break;
         }
     });
-    let config = Config {
-        mount_options: vec![
-            MountOption::FSName("greppy-workspace".into()),
-            MountOption::Subtype("greppy-cow".into()),
-            MountOption::RW,
-            MountOption::DefaultPermissions,
-            MountOption::NoDev,
-            MountOption::NoSuid,
-            MountOption::Exec,
-            MountOption::NoAtime,
-        ],
-        acl: SessionACL::Owner,
-        n_threads: Some(8),
-        clone_fd: true,
-    };
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("greppy-workspace".into()),
+        MountOption::Subtype("greppy-cow".into()),
+        MountOption::RW,
+        MountOption::DefaultPermissions,
+        MountOption::NoDev,
+        MountOption::NoSuid,
+        MountOption::Exec,
+        MountOption::NoAtime,
+    ];
+    config.acl = SessionACL::Owner;
+    config.n_threads = Some(8);
+    config.clone_fd = true;
     let result = fuser::mount(filesystem, mount_root, &config);
     let mut state = manifest.write().unwrap();
     state.state = ProviderState::Broken;

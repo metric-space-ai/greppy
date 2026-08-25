@@ -45,6 +45,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite"] }
 sha2 = "0.10"
 blake3 = "1"
+filetime = "0.2"
 tempfile = "3"
 regex = "1"
 toml_edit = "0.22"

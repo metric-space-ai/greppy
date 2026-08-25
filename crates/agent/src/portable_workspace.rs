@@ -7,6 +7,7 @@
 use greppy_workspace_core::{
     capture_repository, BaselineSnapshot, ProviderInstallation, WorkspaceCore, WorkspaceHandle,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
@@ -168,6 +169,7 @@ impl AgentWorkspace {
         provider.doctor_io(&format!("startup-{run_id}"))?;
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
+        recover_apply_journals(&core)?;
         let baseline = capture_repository(repo_root, core.chunks())?;
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
@@ -350,7 +352,19 @@ impl AgentWorkspace {
 pub fn apply_proposal(target_checkout: &Path, ref_name: &str) -> Result<(), WorkspaceError> {
     let data_root = workspace_data_root()?;
     let core = WorkspaceCore::open(data_root.join("core"))?;
+    recover_apply_journals(&core)?;
     apply_from_core(&core, target_checkout, ref_name, None)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApplyJournal {
+    schema: u32,
+    ref_name: String,
+    repository: PathBuf,
+    baseline_hash: String,
+    baseline_tree: String,
+    affected_paths: Vec<String>,
+    modified_times: Vec<(String, i64)>,
 }
 
 fn apply_from_core(
@@ -397,6 +411,27 @@ fn apply_from_core(
             &proposal.final_tree,
         ],
     )?;
+    let affected_paths = changed_paths(
+        &canonical_target,
+        &proposal.baseline_tree,
+        &proposal.final_tree,
+    )?;
+    let journal = ApplyJournal {
+        schema: 1,
+        ref_name: ref_name.into(),
+        repository: canonical_target.clone(),
+        baseline_hash: proposal.baseline_hash.clone(),
+        baseline_tree: proposal.baseline_tree.clone(),
+        affected_paths,
+        modified_times: proposal
+            .baseline
+            .entries
+            .iter()
+            .filter(|entry| entry.kind != greppy_workspace_core::EntryKind::Tombstone)
+            .map(|entry| (entry.path.clone(), entry.modified_unix_ns))
+            .collect(),
+    };
+    let journal_path = publish_apply_journal(core, &journal)?;
     let mut child = Command::new("git")
         .args([
             "-C",
@@ -416,6 +451,7 @@ fn apply_from_core(
         .write_all(&patch)?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
+        restore_apply_journal(core, &journal_path, &journal)?;
         return Err(WorkspaceError::Conflict {
             ref_name: ref_name.into(),
             detail: String::from_utf8_lossy(&output.stderr).trim().into(),
@@ -423,11 +459,298 @@ fn apply_from_core(
     }
     let index_after = hash_optional_file(&index_path)?;
     if index_before != index_after {
+        restore_apply_journal(core, &journal_path, &journal)?;
         return Err(WorkspaceError::Tampered {
             path: index_path,
             detail: "Git index changed during a worktree-only apply".into(),
         });
     }
+    let final_index = journal_path.with_extension("final-index");
+    let read_final = Command::new("git")
+        .args([
+            "-C",
+            path_text(&canonical_target)?,
+            "read-tree",
+            &proposal.final_tree,
+        ])
+        .env("GIT_INDEX_FILE", &final_index)
+        .output()?;
+    if !read_final.status.success() {
+        restore_apply_journal(core, &journal_path, &journal)?;
+        return Err(git_failed(
+            "git read-tree for final apply check",
+            &read_final,
+        ));
+    }
+    let _ = Command::new("git")
+        .args([
+            "-C",
+            path_text(&canonical_target)?,
+            "update-index",
+            "--refresh",
+        ])
+        .env("GIT_INDEX_FILE", &final_index)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    let final_check = Command::new("git")
+        .args([
+            "-C",
+            path_text(&canonical_target)?,
+            "diff-files",
+            "--name-status",
+            "--",
+        ])
+        .env("GIT_INDEX_FILE", &final_index)
+        .output()?;
+    let _ = fs::remove_file(final_index);
+    if !final_check.status.success() || !final_check.stdout.is_empty() {
+        restore_apply_journal(core, &journal_path, &journal)?;
+        return Err(WorkspaceError::Tampered {
+            path: canonical_target,
+            detail: format!(
+                "working tree does not exactly match the proposal final tree after apply: {}",
+                String::from_utf8_lossy(&final_check.stdout).trim()
+            ),
+        });
+    }
+    remove_apply_journal(&journal_path)?;
+    Ok(())
+}
+
+fn changed_paths(
+    repository: &Path,
+    baseline: &str,
+    final_tree: &str,
+) -> Result<Vec<String>, WorkspaceError> {
+    let bytes = git_bytes(
+        repository,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            baseline,
+            final_tree,
+        ],
+    )?;
+    let mut paths = Vec::new();
+    for value in bytes
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+    {
+        let path = String::from_utf8(value.to_vec()).map_err(|_| {
+            WorkspaceError::Unsupported("proposal contains a non-UTF-8 path".into())
+        })?;
+        validate_apply_path(&path)?;
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn validate_apply_path(path: &str) -> Result<(), WorkspaceError> {
+    let value = Path::new(path);
+    if path.is_empty()
+        || value.is_absolute()
+        || value.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        })
+    {
+        return Err(WorkspaceError::Tampered {
+            path: value.into(),
+            detail: "proposal contains an unsafe apply path".into(),
+        });
+    }
+    Ok(())
+}
+
+fn apply_journal_root(core: &WorkspaceCore) -> PathBuf {
+    core.root().join("apply-journals")
+}
+
+fn publish_apply_journal(
+    core: &WorkspaceCore,
+    journal: &ApplyJournal,
+) -> Result<PathBuf, WorkspaceError> {
+    let root = apply_journal_root(core);
+    fs::create_dir_all(&root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(journal.repository.as_os_str().to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(journal.ref_name.as_bytes());
+    let id = format!("{:x}", hasher.finalize());
+    let path = root.join(format!("{id}.json"));
+    let temporary = root.join(format!(".{id}.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(journal)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, &path)?;
+    sync_directory(&root)?;
+    Ok(path)
+}
+
+fn recover_apply_journals(core: &WorkspaceCore) -> Result<(), WorkspaceError> {
+    let root = apply_journal_root(core);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = entries
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let bytes = fs::read(&path)?;
+        let journal: ApplyJournal =
+            serde_json::from_slice(&bytes).map_err(|error| WorkspaceError::Tampered {
+                path: path.clone(),
+                detail: format!("apply recovery journal is invalid: {error}"),
+            })?;
+        if journal.schema != 1 {
+            return Err(WorkspaceError::Tampered {
+                path,
+                detail: format!("unsupported apply recovery schema {}", journal.schema),
+            });
+        }
+        restore_apply_journal(core, &path, &journal)?;
+    }
+    Ok(())
+}
+
+fn restore_apply_journal(
+    core: &WorkspaceCore,
+    journal_path: &Path,
+    journal: &ApplyJournal,
+) -> Result<(), WorkspaceError> {
+    let repository = journal.repository.canonicalize()?;
+    for path in &journal.affected_paths {
+        validate_apply_path(path)?;
+    }
+    let index = journal_path.with_extension("index");
+    let index_text = path_text(&index)?.to_string();
+    let read_tree = Command::new("git")
+        .args([
+            "-C",
+            path_text(&repository)?,
+            "read-tree",
+            &journal.baseline_tree,
+        ])
+        .env("GIT_INDEX_FILE", &index)
+        .output()?;
+    if !read_tree.status.success() {
+        return Err(git_failed("git read-tree for apply recovery", &read_tree));
+    }
+    let mut removal = journal.affected_paths.clone();
+    removal.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    for path in &removal {
+        remove_visible_path(&repository.join(path))?;
+    }
+    for path in &journal.affected_paths {
+        let present = Command::new("git")
+            .args([
+                "-C",
+                path_text(&repository)?,
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                path,
+            ])
+            .env("GIT_INDEX_FILE", &index)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !present.success() {
+            continue;
+        }
+        if let Some(parent) = repository.join(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let output = Command::new("git")
+            .args([
+                "-C",
+                path_text(&repository)?,
+                "checkout-index",
+                "--force",
+                "--",
+                path,
+            ])
+            .env("GIT_INDEX_FILE", &index_text)
+            .output()?;
+        if !output.status.success() {
+            return Err(git_failed("git checkout-index for apply recovery", &output));
+        }
+    }
+    for (path, modified_unix_ns) in &journal.modified_times {
+        validate_apply_path(path)?;
+        let target = repository.join(path);
+        if fs::symlink_metadata(&target).is_err() {
+            continue;
+        }
+        let seconds = modified_unix_ns.div_euclid(1_000_000_000);
+        let nanos = modified_unix_ns.rem_euclid(1_000_000_000) as u32;
+        let time = filetime::FileTime::from_unix_time(seconds, nanos);
+        if fs::symlink_metadata(&target)?.file_type().is_symlink() {
+            filetime::set_symlink_file_times(&target, time, time)?;
+        } else {
+            filetime::set_file_times(&target, time, time)?;
+        }
+    }
+    let _ = fs::remove_file(&index);
+    let observed = capture_repository(&repository, core.chunks())?;
+    let observed_hash = observed.baseline_hash.clone();
+    release_snapshot(core.chunks(), observed);
+    if observed_hash != journal.baseline_hash {
+        return Err(WorkspaceError::Tampered {
+            path: repository,
+            detail: format!(
+                "apply rollback could not restore baseline {}; observed {observed_hash}",
+                journal.baseline_hash
+            ),
+        });
+    }
+    remove_apply_journal(journal_path)
+}
+
+fn remove_visible_path(path: &Path) -> Result<(), WorkspaceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)?
+        }
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn remove_apply_journal(path: &Path) -> Result<(), WorkspaceError> {
+    fs::remove_file(path)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), WorkspaceError> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -747,7 +1070,33 @@ mod tests {
 
         let index = git_path(&repo, "index").unwrap();
         let index_before = fs::read(&index).unwrap();
+        let recovery_core = WorkspaceCore::open(data.join("core")).unwrap();
         workspace.cleanup().unwrap();
+
+        let proposal = recovery_core.proposal(&ref_name).unwrap();
+        let journal = ApplyJournal {
+            schema: 1,
+            ref_name: ref_name.clone(),
+            repository: repo.canonicalize().unwrap(),
+            baseline_hash: proposal.baseline_hash.clone(),
+            baseline_tree: proposal.baseline_tree.clone(),
+            affected_paths: changed_paths(&repo, &proposal.baseline_tree, &proposal.final_tree)
+                .unwrap(),
+            modified_times: proposal
+                .baseline
+                .entries
+                .iter()
+                .filter(|entry| entry.kind != greppy_workspace_core::EntryKind::Tombstone)
+                .map(|entry| (entry.path.clone(), entry.modified_unix_ns))
+                .collect(),
+        };
+        let journal_path = publish_apply_journal(&recovery_core, &journal).unwrap();
+        fs::write(repo.join("tracked.txt"), "partially applied\n").unwrap();
+        recover_apply_journals(&recovery_core).unwrap();
+        assert!(!journal_path.exists());
+        assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+
         apply_proposal(&repo, &ref_name).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
         assert_eq!(fs::read(&index).unwrap(), index_before);
