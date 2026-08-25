@@ -1,0 +1,18 @@
+[package]
+name = "greppy-workspace-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Stable C ABI used by Greppy's minimal FSKit adapter"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+greppy-workspace-core = { path = "../workspace-core" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

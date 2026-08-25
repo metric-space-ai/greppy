@@ -17,6 +17,7 @@ members = [
     "crates/agent",
     "crates/workspace-core",
     "crates/workspace-provider",
+    "crates/workspace-ffi",
 ]
 
 [workspace.package]

@@ -1060,6 +1060,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "greppy-workspace-ffi"
+version = "0.3.3"
+dependencies = [
+ "greppy-workspace-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "greppy-workspace-provider"
 version = "0.3.3"
 dependencies = [
