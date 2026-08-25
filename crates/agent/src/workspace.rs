@@ -1774,13 +1774,55 @@ extern "C" {
     fn libc_flock(fd: i32, operation: i32) -> i32;
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle stays valid for the call, OVERLAPPED is initialized,
+    // and the one-byte range remains locked by this handle until Drop.
+    let rc = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if rc != 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    // SAFETY: best-effort unlock of the same one-byte range held by this handle.
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped) };
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
-    // Non-unix: no flock; allow the stable path (single-user assumption).
     Ok(true)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn unlock_file(_file: &File) {}
 
 fn path_str(p: &Path) -> Result<&str, WorkspaceError> {
@@ -3402,11 +3444,8 @@ gitdir /tmp/second-meta
         let common = main_common_dir(&repo).expect("common");
         let spoof = common.join("worktrees").join(unique_tag("spoof"));
         fs::create_dir_all(&spoof).unwrap();
-        fs::write(
-            spoof.join("gitdir"),
-            format!("{}/.git\n", wt_canon.display()),
-        )
-        .unwrap();
+        let real_reverse_pointer = fs::read_to_string(linked.join("gitdir")).unwrap();
+        fs::write(spoof.join("gitdir"), real_reverse_pointer).unwrap();
 
         let after = linked_git_dir_via_common_scan(&repo, &wt_canon).expect("scan");
         assert!(
