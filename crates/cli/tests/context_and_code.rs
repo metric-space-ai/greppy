@@ -6,7 +6,7 @@
 //! * The `--code` flag on `who-calls` / `callees` /
 //!   `trace` appends verbatim source to the usual `file:line` line: the
 //!   call-site statement for `who-calls`, the definition span for
-//!   `callees` / `trace` (dev/NAV-OUTPUT-SPEC.md).
+//!   `callees` / `trace`.
 //!
 //! These spawn the real `greppy` binary against a multi-file fixture
 //! indexed end-to-end, so the spans are read from the same files the
@@ -839,7 +839,7 @@ fn plus_explain_line_one_module_hit_uses_display_name() {
 // --code flag on the navigation commands.
 // ---------------------------------------------------------------------------
 
-// 0.3.0 contract (dev/NAV-OUTPUT-SPEC.md, `--code`): for who-calls the span
+// 0.3.0 `--code` contract: for who-calls the span
 // is the STATEMENT ENCLOSING THE CALL SITE inside the caller — NOT the
 // caller's body — printed as `<file>:<line>  <name>` followed by the
 // byte-exact verbatim file lines (their own indentation kept, no dedent).
