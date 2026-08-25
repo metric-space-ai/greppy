@@ -71,6 +71,11 @@ jobs:
       - name: Compile Linux adapter without host-filesystem CoW dependencies
         run: cargo build -p greppy-workspace-provider --release --locked
 
+      - name: Mount and exercise Chunk-CoW plus private Git namespace
+        env:
+          GREPPY_RUN_FUSE_TEST: "1"
+        run: cargo test -p greppy-workspace-provider --test linux_mount --locked -- --nocapture
+
       - name: Reject legacy native backend source and dependencies
         shell: bash
         run: |

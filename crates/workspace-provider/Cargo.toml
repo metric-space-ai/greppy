@@ -19,3 +19,6 @@ serde_json = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18", default-features = false }
 libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

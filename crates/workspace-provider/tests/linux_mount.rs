@@ -1,0 +1,129 @@
+#![cfg(target_os = "linux")]
+
+use greppy_workspace_core::{capture_repository, ProviderInstallation, WorkspaceCore, CHUNK_SIZE};
+use std::fs;
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+struct MountGuard {
+    mount: std::path::PathBuf,
+    child: Child,
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("fusermount3")
+            .args(["-u", self.mount.to_str().unwrap()])
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().into()
+}
+
+#[test]
+fn mounted_provider_satisfies_workspace_and_private_git_contract() {
+    if std::env::var_os("GREPPY_RUN_FUSE_TEST").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let data = temp.path().join("data");
+    let mount = temp.path().join("mount");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&mount).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.test"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+    git(&repo, &["add", "tracked.txt"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    fs::write(repo.join("tracked.txt"), b"dirty\n").unwrap();
+    fs::write(repo.join("untracked.txt"), b"user\n").unwrap();
+
+    let core = WorkspaceCore::open(data.join("core")).unwrap();
+    let baseline = capture_repository(&repo, core.chunks()).unwrap();
+    let workspace = core.create_workspace("mount-test", baseline).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_greppy-workspace-provider"))
+        .args(["--data-root", data.to_str().unwrap()])
+        .args(["--mount-root", mount.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let _guard = MountGuard {
+        mount: mount.clone(),
+        child,
+    };
+    let started = Instant::now();
+    let provider = loop {
+        if let Ok(provider) = ProviderInstallation::require_healthy(&data) {
+            break provider;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        thread::sleep(Duration::from_millis(50));
+    };
+    provider.doctor_io("linux-mount").unwrap();
+
+    let root = provider.workspace_path(workspace.id()).unwrap();
+    assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"dirty\n");
+    assert_eq!(fs::read(root.join("untracked.txt")).unwrap(), b"user\n");
+    fs::write(root.join("unicode-ä.txt"), b"unicode").unwrap();
+    fs::rename(root.join("unicode-ä.txt"), root.join("renamed.txt")).unwrap();
+    fs::remove_file(root.join("renamed.txt")).unwrap();
+    symlink("tracked.txt", root.join("tracked.link")).unwrap();
+    assert_eq!(
+        fs::read_link(root.join("tracked.link")).unwrap(),
+        Path::new("tracked.txt")
+    );
+    fs::hard_link(root.join("tracked.txt"), root.join("tracked.hard")).unwrap();
+    assert_eq!(fs::metadata(root.join("tracked.hard")).unwrap().nlink(), 2);
+    fs::set_permissions(root.join("tracked.txt"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        fs::metadata(root.join("tracked.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    fs::write(root.join("large.bin"), vec![7_u8; CHUNK_SIZE * 2]).unwrap();
+    let before = core.chunks().stats().unwrap();
+    let mut large = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("large.bin"))
+        .unwrap();
+    large.seek(SeekFrom::Start(CHUNK_SIZE as u64 + 3)).unwrap();
+    large.write_all(b"X").unwrap();
+    large.sync_all().unwrap();
+    let after = core.chunks().stats().unwrap();
+    assert_eq!(after.chunk_count, before.chunk_count + 1);
+
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.email", "test@example.test"]);
+    git(&root, &["config", "user.name", "Test"]);
+    git(&root, &["add", "-A"]);
+    assert_eq!(git(&root, &["status", "--porcelain"]).is_empty(), false);
+    assert!(!git(&root, &["write-tree"]).is_empty());
+}

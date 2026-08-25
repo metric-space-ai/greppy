@@ -1433,11 +1433,6 @@ fn normalize_path(path: &Path, allow_root: bool) -> Result<String> {
     if normalized.is_empty() && !allow_root {
         return Err(Error::InvalidPath("empty workspace path".into()));
     }
-    if parts.first().map(String::as_str) == Some(".git") {
-        return Err(Error::InvalidPath(
-            ".git is reserved for private Git state".into(),
-        ));
-    }
     Ok(normalized)
 }
 
@@ -1629,6 +1624,24 @@ mod tests {
             assert!(metadata.changed_unix_ns >= 456);
             assert_eq!(metadata.nlink, 2);
         }
+    }
+
+    #[test]
+    fn private_git_directory_is_a_normal_isolated_namespace() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.mkdir(&workspace, ".git", 0o700).unwrap();
+        core.create_file(&workspace, ".git/config", 0o600).unwrap();
+        core.write(&workspace, ".git/config", 0, b"[core]\n\tbare = false\n")
+            .unwrap();
+        assert_eq!(
+            core.read(&workspace, ".git/config", 0, 128).unwrap(),
+            b"[core]\n\tbare = false\n"
+        );
+        assert!(core
+            .read_dir(&workspace, "")
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == ".git"));
     }
 
     #[test]
