@@ -162,6 +162,22 @@ impl WorkspaceCore {
         &self.chunks
     }
 
+    pub fn open_workspace(&self, id: &str) -> Result<WorkspaceHandle> {
+        validate_workspace_id(id)?;
+        let connection = self.lock_metadata()?;
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE id = ?1 AND state != 'broken')",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(Error::InvalidPath(format!(
+                "unknown or broken workspace {id}"
+            )));
+        }
+        Ok(WorkspaceHandle { id: id.into() })
+    }
+
     pub fn create_workspace(
         &self,
         id: &str,

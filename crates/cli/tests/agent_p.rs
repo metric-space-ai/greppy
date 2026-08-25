@@ -56,6 +56,121 @@ fn init_repo(root: &std::path::Path) {
     git(root, &["commit", "-m", "initial"]);
 }
 
+struct FakeProvider {
+    data: PathBuf,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for FakeProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Integration-test adapter for the CLI process. It deliberately has no
+/// product fallback path: tests publish the same provider identity contract
+/// as a real adapter, while this helper mirrors the fixture repository only
+/// after WorkspaceCore has created a namespace.
+fn spawn_fake_provider(root: &std::path::Path, repo: &std::path::Path) -> FakeProvider {
+    use greppy_workspace_core::{
+        AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState, WorkspaceCore,
+        PROVIDER_PROTOCOL_VERSION,
+    };
+
+    let data = root.join("provider-data");
+    let mount = root.join("provider-mount");
+    std::fs::create_dir_all(mount.join("doctor")).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let manifest = ProviderManifest {
+        protocol_version: PROVIDER_PROTOCOL_VERSION,
+        adapter_version: "0.3.4-cli-test".into(),
+        adapter_kind: AdapterKind::FsKit,
+        state: ProviderState::Ready,
+        instance_id: "cli-test-provider".into(),
+        data_root: data.clone(),
+        mount_root: mount.clone(),
+        heartbeat_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        capabilities: ProviderCapabilities {
+            hard_links: true,
+            symbolic_links: true,
+            byte_range_locks: true,
+            memory_maps: true,
+            atomic_rename: true,
+            case_preserving: true,
+        },
+    };
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    std::fs::write(data.join("provider.json"), &bytes).unwrap();
+    std::fs::write(mount.join(".greppy-provider.json"), bytes).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let data_thread = data.clone();
+    let mount_thread = mount.clone();
+    let repo_thread = repo.to_path_buf();
+    let handle = thread::spawn(move || {
+        let mut core = None;
+        let mut mirrored = std::collections::HashSet::new();
+        while !stop_thread.load(Ordering::SeqCst) {
+            if core.is_none() {
+                core = WorkspaceCore::open(data_thread.join("core")).ok();
+            }
+            if let Some(core) = &core {
+                if let Ok(workspaces) = core.list_workspaces() {
+                    let active = workspaces
+                        .iter()
+                        .map(|workspace| workspace.id.clone())
+                        .collect::<std::collections::HashSet<_>>();
+                    for workspace in &workspaces {
+                        let destination = mount_thread.join("workspaces").join(&workspace.id);
+                        if !destination.exists() {
+                            std::fs::create_dir_all(&destination).unwrap();
+                            copy_fixture_tree(&repo_thread, &destination);
+                            mirrored.insert(workspace.id.clone());
+                        }
+                    }
+                    let removed = mirrored.difference(&active).cloned().collect::<Vec<_>>();
+                    for workspace in removed {
+                        let _ = std::fs::remove_dir_all(
+                            mount_thread.join("workspaces").join(&workspace),
+                        );
+                        mirrored.remove(&workspace);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    FakeProvider {
+        data,
+        stop,
+        handle: Some(handle),
+    }
+}
+
+fn copy_fixture_tree(source: &std::path::Path, destination: &std::path::Path) {
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_fixture_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 /// Minimal Anthropic Messages gateway: GET /v1/models → 200; POST /v1/messages
 /// → canned SSE text-only end_turn stream.
 fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
@@ -149,12 +264,15 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
     let repo = unique_temp("repo");
     init_repo(&repo);
     let store = unique_temp("store");
+    let provider_root = unique_temp("provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
 
     let (endpoint, stop, handle) = spawn_stub_gateway();
 
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         // Avoid pulling a real model path from the parent environment.
         .env_remove("GREPPY_MODEL")
@@ -203,6 +321,8 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&provider_root);
 }
 
 /// F9: leading `-p` is reserved for the agent, but `greppy -e -p X` must reach
@@ -256,12 +376,15 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
     let repo = unique_temp("deadline-repo");
     init_repo(&repo);
     let store = unique_temp("deadline-store");
+    let provider_root = unique_temp("deadline-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
 
     let (endpoint, stop, handle) = spawn_stub_gateway();
 
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
@@ -305,6 +428,8 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&provider_root);
 }
 
 #[test]
@@ -335,13 +460,11 @@ fn nested_agent_run_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `index --agent-worktree` warms the tree `-p` will actually use.
+/// `index --agent-worktree` warms the portable namespace `-p` will use.
 ///
-/// Indexing the checkout leaves the agent cold: its worktree is a different
-/// path, so a different workspace identity, and the agent then pays for the
-/// first index -- graph AND embeddings -- inside its own run. The warm-up has
-/// to land on the agent's tree and has to leave it registered, or the agent's
-/// next run discards it and builds again.
+/// The warm-up must exercise a provider namespace while publishing a reusable
+/// immutable index Base. The temporary namespace is removed afterwards and is
+/// never registered as a native Git worktree.
 #[test]
 fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
     let dir = unique_temp("index-agent-worktree");
@@ -357,10 +480,12 @@ fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
     git(&repo, &["commit", "-m", "code"]);
 
     let store = dir.join("store");
+    let provider = spawn_fake_provider(&dir, &repo);
     let out = std::process::Command::new(binary_path())
         .args(["index", "--agent-worktree"])
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .output()
         .expect("spawn greppy");
@@ -380,26 +505,31 @@ fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
         .map(str::to_string)
         .unwrap_or_else(|| panic!("warm-up must name the worktree; stdout={stdout}"));
     assert!(
-        worktree.contains("agent-worktrees"),
-        "warmed path must be the agent's tree; got {worktree}"
+        worktree.contains("workspaces"),
+        "warmed path must be in the provider namespace; got {worktree}"
     );
-    assert_ne!(
-        std::fs::canonicalize(&worktree).unwrap(),
-        std::fs::canonicalize(&repo).unwrap(),
-        "warming the checkout instead of the agent tree is the whole bug"
+    for _ in 0..50 {
+        if !std::path::Path::new(&worktree).exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !std::path::Path::new(&worktree).exists(),
+        "temporary provider namespace must be cleaned after warm-up"
     );
 
-    // Registered in the MAIN repository, so the agent reuses it instead of
-    // discarding and rebuilding.
+    // Portable workspaces are private namespaces, never native Git worktrees.
     let listed = std::process::Command::new("git")
         .args(["worktree", "list"])
         .current_dir(&repo)
         .output()
         .expect("git worktree list");
     assert!(
-        String::from_utf8_lossy(&listed.stdout).contains("agent-worktrees"),
-        "agent worktree must be registered in the main repo"
+        !String::from_utf8_lossy(&listed.stdout).contains(&worktree),
+        "portable namespace must not be registered as a native Git worktree"
     );
 
+    drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
 }

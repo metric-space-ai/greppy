@@ -1,0 +1,21 @@
+[package]
+name = "greppy-workspace-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Thin native filesystem adapters for Greppy's portable Chunk-CoW workspaces"
+
+[[bin]]
+name = "greppy-workspace-provider"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+greppy-workspace-core = { path = "../workspace-core" }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = { workspace = true }

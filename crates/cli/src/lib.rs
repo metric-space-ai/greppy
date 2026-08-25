@@ -87,6 +87,7 @@ use passthrough::*;
 #[cfg(feature = "bash-smart")]
 mod bash_smart;
 mod context;
+mod workspace_setup;
 use context::*;
 mod agent;
 mod store_cow;
@@ -1496,9 +1497,15 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
     let data_root = greppy_agent::workspace::workspace_data_root()
         .map_err(|error| Error::Invalid(error.to_string()))?;
     match command {
-        WorkspaceCommand::Setup => Err(Error::Invalid(
-            "the bundled platform adapter is not present in this development artifact".into(),
-        )),
+        WorkspaceCommand::Setup => {
+            let provider = workspace_setup::setup(&data_root).map_err(Error::Invalid)?;
+            println!(
+                "portable workspace provider installed and healthy — {:?} at {}",
+                provider.manifest().adapter_kind,
+                provider.mount_root().display()
+            );
+            Ok(0)
+        }
         WorkspaceCommand::Doctor { json } => {
             let provider = greppy_workspace_core::ProviderInstallation::require_healthy(&data_root)
                 .map_err(|error| Error::Invalid(error.to_string()))?;
