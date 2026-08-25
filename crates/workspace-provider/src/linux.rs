@@ -440,7 +440,11 @@ impl Filesystem for PortableFuse {
         };
         let mut children: Vec<(u64, FileType, Vec<u8>)> = vec![
             (inode.0, FileType::Directory, b".".to_vec()),
-            (ROOT, FileType::Directory, b"..".to_vec()),
+            (
+                self.parent_inode(&node),
+                FileType::Directory,
+                b"..".to_vec(),
+            ),
         ];
         let result: Result<(), Errno> = (|| {
             match &node {
@@ -573,6 +577,14 @@ impl Filesystem for PortableFuse {
             .zip(self.node(new_parent))
             .ok_or(Errno::ENOENT)
             .and_then(|(source_parent, destination_parent)| {
+                if matches!(&source_parent, Node::DoctorRoot | Node::Doctor(_))
+                    && matches!(&destination_parent, Node::DoctorRoot | Node::Doctor(_))
+                {
+                    let source = self.doctor_path(&doctor_destination(&source_parent, name)?)?;
+                    let destination =
+                        self.doctor_path(&doctor_destination(&destination_parent, new_name)?)?;
+                    return fs::rename(source, destination).map_err(io_errno);
+                }
                 let (workspace, source) = workspace_destination(&source_parent, name)?;
                 let (destination_workspace, destination) =
                     workspace_destination(&destination_parent, new_name)?;
@@ -654,6 +666,28 @@ impl Filesystem for PortableFuse {
 }
 
 impl PortableFuse {
+    fn parent_inode(&self, node: &Node) -> u64 {
+        match node {
+            Node::Root => ROOT,
+            Node::Workspaces | Node::DoctorRoot | Node::Marker => ROOT,
+            Node::WorkspaceRoot(_) => WORKSPACES,
+            Node::WorkspacePath { workspace, path } => match path.rsplit_once('/') {
+                Some((parent, _)) => self.inode(Node::WorkspacePath {
+                    workspace: workspace.clone(),
+                    path: parent.into(),
+                }),
+                None => self.inode(Node::WorkspaceRoot(workspace.clone())),
+            },
+            Node::Doctor(path) => match path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                Some(parent) => self.inode(Node::Doctor(parent.into())),
+                None => DOCTOR,
+            },
+        }
+    }
+
     fn append_workspace_dir(
         &self,
         workspace: &str,
@@ -851,6 +885,14 @@ fn workspace_destination(parent: &Node, name: &OsStr) -> Result<(String, String)
             Ok((workspace.clone(), join_virtual(path, name)))
         }
         _ => Err(Errno::EROFS),
+    }
+}
+
+fn doctor_destination(parent: &Node, name: &OsStr) -> Result<PathBuf, Errno> {
+    match parent {
+        Node::DoctorRoot => Ok(PathBuf::from(name)),
+        Node::Doctor(path) => Ok(path.join(name)),
+        _ => Err(Errno::EXDEV),
     }
 }
 

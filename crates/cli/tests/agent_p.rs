@@ -460,6 +460,21 @@ fn nested_agent_run_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn workspace_doctor_json_is_machine_readable_when_provider_is_missing() {
+    let dir = unique_temp("doctor-missing");
+    let output = Command::new(binary_path())
+        .args(["workspace", "doctor", "--json"])
+        .env("GREPPY_WORKSPACE_DIR", &dir)
+        .output()
+        .expect("spawn workspace doctor");
+    assert_eq!(output.status.code(), Some(73));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["healthy"], false);
+    assert!(value["error"].as_str().unwrap().contains("provider.json"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `index --agent-worktree` warms the portable namespace `-p` will use.
 ///
 /// The warm-up must exercise a provider namespace while publishing a reusable

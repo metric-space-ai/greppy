@@ -1507,11 +1507,38 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             Ok(0)
         }
         WorkspaceCommand::Doctor { json } => {
-            let provider = greppy_workspace_core::ProviderInstallation::require_healthy(&data_root)
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            provider
-                .doctor_io(&format!("doctor-{}", std::process::id()))
-                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let provider =
+                match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
+                    Ok(provider) => provider,
+                    Err(error) if json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "healthy": false,
+                                "error": error.to_string(),
+                                "data_root": data_root
+                            }))
+                            .map_err(|error| Error::Invalid(error.to_string()))?
+                        );
+                        return Ok(EXIT_IO as i32);
+                    }
+                    Err(error) => return Err(Error::Invalid(error.to_string())),
+                };
+            if let Err(error) = provider.doctor_io(&format!("doctor-{}", std::process::id())) {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "healthy": false,
+                            "provider": provider.manifest(),
+                            "error": error.to_string()
+                        }))
+                        .map_err(|error| Error::Invalid(error.to_string()))?
+                    );
+                    return Ok(EXIT_IO as i32);
+                }
+                return Err(Error::Invalid(error.to_string()));
+            }
             let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             let workspaces = core
@@ -1549,8 +1576,23 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             Ok(0)
         }
         WorkspaceCommand::Status { json } => {
-            let provider = greppy_workspace_core::ProviderInstallation::require_healthy(&data_root)
-                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let provider =
+                match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
+                    Ok(provider) => provider,
+                    Err(error) if json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ready": false,
+                                "error": error.to_string(),
+                                "data_root": data_root
+                            }))
+                            .map_err(|error| Error::Invalid(error.to_string()))?
+                        );
+                        return Ok(EXIT_IO as i32);
+                    }
+                    Err(error) => return Err(Error::Invalid(error.to_string())),
+                };
             let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             let workspaces = core
