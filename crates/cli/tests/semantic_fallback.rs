@@ -2,8 +2,8 @@
 //! command `search` (the replacement for the retired `semantic-search`)
 //! and for `brief`, plus the retirement pin for the dead verb.
 //!
-//! 0.3.0 contract (dev/SEARCH-OUTPUT-SPEC.md + dev/NAV-OUTPUT-SPEC-BRIEF.md,
-//! normative; NAV law 1: no justification, no instruction):
+//! 0.3.0 CLI contract (normative; navigation law 1: no justification, no
+//! instruction):
 //! * While the embedding index is still building, `search` prints ONE status
 //!   line with progress and ETA and exits 1 (grep's convention). Never
 //!   partial hits, never `try:` fallback instructions.
@@ -203,7 +203,7 @@ pub fn caller() -> i32 {
         "graph-only brief remains successful; stdout={stdout}\nstderr={stderr}"
     );
     assert!(stderr.is_empty(), "brief prints no degradation notice");
-    // The 0.3.0 brief shape (dev/NAV-OUTPUT-SPEC-BRIEF.md): address, the
+    // The 0.3.0 brief shape: address, the
     // verbatim definition head, the one-line-per-step sketch naming the
     // callee, the closing brace, and the aggregated caller line. No
     // "semantic backend unavailable" notice (NAV law 1), no 0.2.x
@@ -219,9 +219,9 @@ pub fn caller() -> i32 {
     );
 }
 
-/// The pre-0.3.0 `semantic-search` subcommand is dead-listed vocabulary
-/// (dev/SEARCH-OUTPUT-SPEC.md: "`greppy semantic-search X` must be an unknown
-/// subcommand, not a grep for 'semantic-search' in a file called X").
+/// The pre-0.3.0 `semantic-search` subcommand is dead-listed vocabulary: it
+/// must be an unknown subcommand, not a grep for "semantic-search" in a file
+/// called X.
 #[test]
 fn retired_semantic_search_is_refused_not_grepped() {
     let (repo, store, _scratch) = fixture(
