@@ -1,42 +1,48 @@
-//! Per-run isolation: git worktrees and review-patch proposals.
+//! Per-run isolation: native worktrees or private CoW snapshots and proposals.
 //!
-//! Every agent run works in a detached worktree of the target repo. The agent
-//! never writes to the user's checkout. The run's outcome is a **proposal**: a
-//! commit preserved on `refs/greppy/agent/<run_id>` plus a printable patch.
-//! Applying it to a real checkout is a separate, explicit host-side step.
+//! Every agent run works in a private tree pinned to the target repository's
+//! current commit. The agent never writes to the user's checkout. The run's
+//! outcome is a **proposal**: a commit preserved on
+//! `refs/greppy/agent/<run_id>` plus a printable patch. Applying it to a real
+//! checkout is a separate, explicit host-side step.
 //!
 //! # Worktree placement
 //!
-//! By default the worktree is **stable per repository**:
+//! The 0.3.3 CLI defaults to Filesystem-CoW with fail-closed native fallback.
+//! A short-lived stable Git worktree is the pristine snapshot template:
 //!
 //! ```text
 //! <platform-cache>/greppy/agent-worktrees/<16-hex sha256 of canonical repo root>
 //! ```
 //!
 //! (`~/Library/Caches` on macOS; `$XDG_CACHE_HOME` or `~/.cache` elsewhere.)
-//! Reusing that path keeps the greppy store (and thus the semantic index) warm
-//! across runs: each run resets tracked content to `HEAD` without deleting the
-//! directory. Ignored build caches are kept by default (so repeat runs stay
-//! fast); pass `--fresh` to drop them too. Concurrent `-p` runs never share a
-//! stable tree — an exclusive lock on a sibling `.lock` file is required; if
-//! the lock is held the run falls back to a disposable
-//! `$TMPDIR/greppy-agent/<run_id>` worktree (and says so on stderr).
+//! The template is reset to the pinned commit under an exclusive lock. A CoW
+//! run snapshots it into a private sibling and immediately releases that lock,
+//! allowing concurrent agents to share physical extents without sharing
+//! writable files. The snapshot receives a private Git directory whose object
+//! database uses the main repository only as a read-only alternate. New model
+//! objects and refs remain private until `finish` transfers the proposal.
+//!
+//! `--workspace-backend native` retains the 0.3.2 stable/temp implementation.
+//! `auto` falls back there before model startup when CoW is unavailable;
+//! `cow` fails explicitly instead. Ignored build caches are retained in the
+//! template by default; `--fresh` drops them before snapshotting.
 //!
 //! Host-side git against the worktree always pins `--git-dir` + `--work-tree`
 //! recorded at creation time. If the worktree's `.git` control file is later
 //! rewritten, `finish` / reset refuse with [`WorkspaceError::Tampered`] rather
 //! than rediscovering a poisoned pointer into the user checkout.
 //!
-//! [`AgentWorkspace::cleanup`] **does not** delete a stable worktree (that would
-//! destroy the warm store); it only resets it. Fallback temp worktrees are
-//! force-removed as before. `--keep-worktree` leaves a temp tree on disk; for a
-//! stable tree the directory already survives cleanup.
+//! [`AgentWorkspace::cleanup`] removes CoW and temporary workspaces but keeps
+//! and resets the stable native/template worktree. `--keep-worktree` preserves
+//! a CoW or temporary tree for inspection.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -45,12 +51,9 @@ use sha2::{Digest, Sha256};
 pub struct AgentWorkspace {
     repo_root: PathBuf,
     worktree: PathBuf,
-    /// Absolute linked-worktree git directory recorded at creation from the
-    /// **main repository's** worktree registration (`<common>/worktrees/<id>`),
-    /// never rediscovered through the worktree's own `.git` file. Every
-    /// host-side git call against the worktree pins this path via `--git-dir`
-    /// so a poisoned `.git` file cannot redirect operations into the user
-    /// checkout.
+    /// Absolute Git directory pinned at creation. Native worktrees use the
+    /// main repository's linked-worktree registration; CoW workspaces use a
+    /// private real Git directory inside the snapshot.
     linked_git_dir: PathBuf,
     run_id: String,
     base_commit: String,
@@ -67,6 +70,8 @@ enum WorktreeKind {
     Stable,
     /// Per-run temp tree under `$TMPDIR/greppy-agent/<run_id>`; removed on cleanup.
     Temp,
+    /// Per-run native CoW snapshot with private Git state; removed on cleanup.
+    Cow,
 }
 
 /// Outcome of [`AgentWorkspace::finish`].
@@ -121,6 +126,9 @@ pub enum WorkspaceError {
     /// The repository uses a feature the agent worktree cannot handle safely
     /// (currently: tracked submodules). Create refuses without writing anything.
     Unsupported(String),
+    /// A caller explicitly required CoW but the native backend could not be
+    /// created safely. Auto mode consumes this error and falls back natively.
+    CowUnavailable(String),
     /// Local filesystem error (mkdir, etc.).
     Io(io::Error),
 }
@@ -175,6 +183,9 @@ impl fmt::Display for WorkspaceError {
             Self::Unsupported(reason) => {
                 write!(f, "repository is not supported by greppy -p: {reason}")
             }
+            Self::CowUnavailable(reason) => {
+                write!(f, "Filesystem-CoW is unavailable: {reason}")
+            }
             Self::Io(e) => write!(f, "workspace I/O error: {e}"),
         }
     }
@@ -216,7 +227,8 @@ impl Drop for FileLock {
 }
 
 impl AgentWorkspace {
-    /// Create a detached worktree for `run_id` from `repo_root`'s `HEAD`.
+    /// Create a native detached worktree for `run_id` from `repo_root`'s
+    /// `HEAD`, preserving the pre-0.3.3 library default.
     ///
     /// Prefers a **stable** path under the platform user cache (one tree per
     /// repository). If that tree is already locked by another `-p` run, falls
@@ -229,8 +241,7 @@ impl AgentWorkspace {
         Self::create_with_options(repo_root, run_id, CreateOptions::default())
     }
 
-    /// Like [`Self::create`], with explicit reset options (`fresh` drops ignored
-    /// files too via `git clean -ffdx`).
+    /// Like [`Self::create`], with explicit reset and backend selection.
     pub fn create_with_options(
         repo_root: &Path,
         run_id: &str,
@@ -256,6 +267,11 @@ impl AgentWorkspace {
         // HEAD lookup — detection and recorded base must be the same object.
         let main_git_dir =
             PathBuf::from(git_ok_cwd(&toplevel, &["rev-parse", "--absolute-git-dir"])?);
+        let main_common_git_dir = PathBuf::from(git_ok_wt(
+            &main_git_dir,
+            &toplevel,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?);
         let base_commit = git_ok_wt(&main_git_dir, &toplevel, &["rev-parse", "HEAD"])?;
         if main_commit_has_gitlinks(&main_git_dir, &toplevel, &base_commit)? {
             return Err(WorkspaceError::Unsupported(
@@ -267,10 +283,43 @@ impl AgentWorkspace {
         let stable_dir = stable_worktree_dir(&toplevel);
         let lock_path = stable_lock_path(&stable_dir);
 
-        match try_acquire_lock(&lock_path)? {
+        let template_lock = match options.backend {
+            WorkspaceBackend::Native => try_acquire_lock(&lock_path)?,
+            WorkspaceBackend::Auto | WorkspaceBackend::Cow => {
+                acquire_template_lock(&lock_path, Duration::from_secs(5))?
+            }
+        };
+        match template_lock {
             Some(lock) => {
                 let linked_git_dir =
                     prepare_stable_worktree(&toplevel, &stable_dir, &base_commit, options.fresh)?;
+                if options.backend != WorkspaceBackend::Native {
+                    match create_cow_workspace(
+                        &stable_dir,
+                        &main_common_git_dir,
+                        run_id,
+                        &base_commit,
+                        options.backend == WorkspaceBackend::Auto,
+                    ) {
+                        Ok((worktree, private_git_dir)) => {
+                            return Ok(Self {
+                                repo_root: toplevel,
+                                worktree,
+                                linked_git_dir: private_git_dir,
+                                run_id: run_id.to_string(),
+                                base_commit,
+                                kind: WorktreeKind::Cow,
+                                _lock: None,
+                            });
+                        }
+                        Err(error) if options.backend == WorkspaceBackend::Auto => {
+                            eprintln!(
+                                "greppy -p: Filesystem-CoW unavailable ({error}) — using the native stable worktree"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 Ok(Self {
                     repo_root: toplevel,
                     worktree: stable_dir,
@@ -282,6 +331,11 @@ impl AgentWorkspace {
                 })
             }
             None => {
+                if options.backend == WorkspaceBackend::Cow {
+                    return Err(WorkspaceError::CowUnavailable(
+                        "Filesystem-CoW template is currently locked by another creator".into(),
+                    ));
+                }
                 // Concurrent holder — disposable temp so two runs never share a tree.
                 eprintln!(
                     "greppy -p: agent worktree in use for this repository — using a temporary worktree"
@@ -306,7 +360,7 @@ impl AgentWorkspace {
         &self.worktree
     }
 
-    /// Absolute linked-worktree git directory pinned at creation.
+    /// Absolute pinned Git directory: linked for native, private for CoW.
     pub fn linked_git_dir(&self) -> &Path {
         &self.linked_git_dir
     }
@@ -326,7 +380,7 @@ impl AgentWorkspace {
         &self.base_commit
     }
 
-    /// True when this run uses the stable per-repository worktree.
+    /// True when this run uses the stable native per-repository worktree.
     pub fn is_stable(&self) -> bool {
         self.kind == WorktreeKind::Stable
     }
@@ -399,6 +453,29 @@ impl AgentWorkspace {
         }
 
         let ref_name = self.ref_name();
+
+        if self.kind == WorktreeKind::Cow {
+            let export_ref = "refs/greppy/export/proposal";
+            git_ok_wt(
+                &self.linked_git_dir,
+                &self.worktree,
+                &["update-ref", export_ref, &commit],
+            )?;
+            git_ok_cwd(
+                &self.repo_root,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    path_str(&self.linked_git_dir)?,
+                    export_ref,
+                ],
+            )?;
+            git_ok_cwd(
+                &self.repo_root,
+                &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+            )?;
+        }
 
         // Pin the proposal in the *shared* repo so it survives worktree removal.
         // These run against the main checkout identity (not the worktree).
@@ -530,24 +607,62 @@ impl AgentWorkspace {
                 git_ok_cwd(&self.repo_root, &["worktree", "remove", "--force", &wt])?;
                 Ok(())
             }
+            WorktreeKind::Cow => {
+                self.verify_identity()?;
+                greppy_rift_core::remove_snapshot(&self.worktree).map_err(|error| {
+                    WorkspaceError::Io(io::Error::other(format!(
+                        "failed to remove CoW workspace {}: {error}",
+                        self.worktree.display()
+                    )))
+                })?;
+                Ok(())
+            }
         }
     }
 
     /// Verify the pinned identity still matches the on-disk worktree.
     ///
-    /// Authoritative source is the **main repository's** registration for this
-    /// path; the worktree's `.git` file and a pinned rev-parse are cross-checks
-    /// only. See [`verify_worktree_identity`].
+    /// Native identity is anchored in the main repository registration. CoW
+    /// identity requires a real private `.git` directory contained by the
+    /// pinned snapshot path.
     fn verify_identity(&self) -> Result<(), WorkspaceError> {
-        verify_worktree_identity(&self.repo_root, &self.worktree, &self.linked_git_dir)
+        match self.kind {
+            WorktreeKind::Cow => verify_private_git_identity(&self.worktree, &self.linked_git_dir),
+            WorktreeKind::Stable | WorktreeKind::Temp => {
+                verify_worktree_identity(&self.repo_root, &self.worktree, &self.linked_git_dir)
+            }
+        }
     }
 }
 
 /// Options for [`AgentWorkspace::create_with_options`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct CreateOptions {
     /// When true, reset also drops ignored files (`git clean -ffdx`).
     pub fresh: bool,
+    /// Workspace allocation backend. Direct library callers default to native
+    /// for API compatibility; the 0.3.3 CLI passes [`WorkspaceBackend::Auto`].
+    pub backend: WorkspaceBackend,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        Self {
+            fresh: false,
+            backend: WorkspaceBackend::Native,
+        }
+    }
+}
+
+/// Requested workspace allocation backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceBackend {
+    /// Use CoW when available and fall back before model startup.
+    Auto,
+    /// Always use the existing Git-worktree implementation.
+    Native,
+    /// Require CoW and return an explicit error when unavailable.
+    Cow,
 }
 
 // Drop intentionally does NOT auto-remove: an unapplied proposal's worktree may
@@ -582,6 +697,167 @@ fn stable_lock_path(stable_dir: &Path) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("worktree");
     parent.join(format!("{name}.lock"))
+}
+
+fn cow_worktree_dir(stable_dir: &Path, run_id: &str) -> PathBuf {
+    let parent = stable_dir.parent().unwrap_or_else(|| Path::new("."));
+    let template = stable_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("worktree");
+    let mut hash = Sha256::new();
+    hash.update(run_id.as_bytes());
+    let run_hash: String = format!("{:x}", hash.finalize()).chars().take(16).collect();
+    parent.join(format!("{template}.cow.{run_hash}"))
+}
+
+fn create_cow_workspace(
+    template: &Path,
+    main_common_git_dir: &Path,
+    run_id: &str,
+    base_commit: &str,
+    require_constant_time_metadata: bool,
+) -> Result<(PathBuf, PathBuf), WorkspaceError> {
+    let destination = cow_worktree_dir(template, run_id);
+    if destination.exists() {
+        return Err(WorkspaceError::CowUnavailable(format!(
+            "CoW workspace path already exists and was preserved for recovery: {}",
+            destination.display()
+        )));
+    }
+    let destination_root = destination.parent().ok_or_else(|| {
+        WorkspaceError::CowUnavailable(format!(
+            "CoW workspace has no destination root: {}",
+            destination.display()
+        ))
+    })?;
+    let capability = greppy_rift_core::probe(template, destination_root).map_err(|error| {
+        WorkspaceError::CowUnavailable(format!("native CoW capability probe failed: {error}"))
+    })?;
+    if require_constant_time_metadata && !capability.constant_time_metadata {
+        return Err(WorkspaceError::CowUnavailable(format!(
+            "{} is exact CoW but traverses the full tree; auto requires constant-time metadata",
+            match capability.backend {
+                greppy_rift_core::Backend::ApfsClonefile => "APFS clonefile",
+                greppy_rift_core::Backend::BtrfsSnapshot => "Btrfs snapshot",
+                greppy_rift_core::Backend::LinuxReflinkTree => "Linux reflink tree",
+            }
+        )));
+    }
+    greppy_rift_core::snapshot_exact(template, &destination).map_err(|error| {
+        WorkspaceError::CowUnavailable(format!("native CoW snapshot failed: {error}"))
+    })?;
+
+    match setup_private_git(&destination, main_common_git_dir, base_commit) {
+        Ok(private_git_dir) => Ok((destination, private_git_dir)),
+        Err(setup_error) => match greppy_rift_core::remove_snapshot(&destination) {
+            Ok(_) => Err(setup_error),
+            Err(cleanup_error) => Err(WorkspaceError::Io(io::Error::other(format!(
+                "{setup_error}; cleanup of partial CoW workspace {} also failed: {cleanup_error}",
+                destination.display()
+            )))),
+        },
+    }
+}
+
+fn setup_private_git(
+    worktree: &Path,
+    main_common_git_dir: &Path,
+    base_commit: &str,
+) -> Result<PathBuf, WorkspaceError> {
+    let control = worktree.join(".git");
+    let metadata = fs::symlink_metadata(&control).map_err(WorkspaceError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(WorkspaceError::Tampered {
+            path: control,
+            detail: "CoW template did not contain a regular linked-worktree .git control file"
+                .into(),
+        });
+    }
+    fs::remove_file(&control)?;
+
+    // Refuse user/global init templates: repository-provided hooks must never
+    // be copied into the agent's private Git directory.
+    let empty_template = worktree.with_extension("empty-git-template");
+    fs::create_dir(&empty_template)?;
+    let template_arg = format!("--template={}", path_str(&empty_template)?);
+    let init = git_run_cwd(worktree, &["init", "--quiet", &template_arg]);
+    let template_cleanup = fs::remove_dir(&empty_template);
+    let init = init?;
+    template_cleanup?;
+    if !init.status.success() {
+        return Err(git_failed("git init --quiet --template=<empty>", &init));
+    }
+
+    let private_git_dir = fs::canonicalize(worktree.join(".git"))?;
+    let shared_objects = fs::canonicalize(main_common_git_dir.join("objects"))?;
+    let shared_objects = path_str(&shared_objects)?;
+    if shared_objects.contains(['\n', '\r']) {
+        return Err(WorkspaceError::CowUnavailable(
+            "Git object path contains a line break and cannot be represented safely as an alternate"
+                .into(),
+        ));
+    }
+    let alternates = private_git_dir.join("objects/info/alternates");
+    fs::write(&alternates, format!("{shared_objects}\n"))?;
+    fs::write(private_git_dir.join("HEAD"), format!("{base_commit}\n"))?;
+    git_ok_wt(&private_git_dir, worktree, &["read-tree", base_commit])?;
+
+    let status = git_run_wt(
+        &private_git_dir,
+        worktree,
+        &["status", "--porcelain=v1", "-z"],
+    )?;
+    if !status.status.success() {
+        return Err(git_failed("git status --porcelain=v1 -z", &status));
+    }
+    if !status.stdout.is_empty() {
+        return Err(WorkspaceError::CowUnavailable(
+            "CoW snapshot and pinned base tree differ before agent startup".into(),
+        ));
+    }
+    Ok(private_git_dir)
+}
+
+fn verify_private_git_identity(
+    worktree: &Path,
+    expected_git_dir: &Path,
+) -> Result<(), WorkspaceError> {
+    let control = worktree.join(".git");
+    let metadata = fs::symlink_metadata(&control).map_err(|error| WorkspaceError::Tampered {
+        path: control.clone(),
+        detail: format!("private Git directory is missing or unreadable: {error}"),
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(WorkspaceError::Tampered {
+            path: control,
+            detail: "private .git is not a real directory".into(),
+        });
+    }
+    let actual = fs::canonicalize(&control).map_err(|error| WorkspaceError::Tampered {
+        path: control.clone(),
+        detail: format!("private Git directory cannot be canonicalized: {error}"),
+    })?;
+    let expected =
+        fs::canonicalize(expected_git_dir).map_err(|error| WorkspaceError::Tampered {
+            path: expected_git_dir.to_path_buf(),
+            detail: format!("pinned private Git directory cannot be canonicalized: {error}"),
+        })?;
+    let root = fs::canonicalize(worktree).map_err(|error| WorkspaceError::Tampered {
+        path: worktree.to_path_buf(),
+        detail: format!("CoW workspace cannot be canonicalized: {error}"),
+    })?;
+    if actual != expected || !actual.starts_with(&root) {
+        return Err(WorkspaceError::Tampered {
+            path: control,
+            detail: format!(
+                "private Git identity mismatch: expected {}, found {}",
+                expected.display(),
+                actual.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn repo_root_hash(canonical_root: &Path) -> String {
@@ -1327,6 +1603,22 @@ fn try_acquire_lock(lock_path: &Path) -> Result<Option<FileLock>, WorkspaceError
     }
 }
 
+fn acquire_template_lock(
+    lock_path: &Path,
+    timeout: Duration,
+) -> Result<Option<FileLock>, WorkspaceError> {
+    let started = Instant::now();
+    loop {
+        if let Some(lock) = try_acquire_lock(lock_path)? {
+            return Ok(Some(lock));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn open_lock_file(lock_path: &Path) -> Result<File, WorkspaceError> {
     let mut opts = OpenOptions::new();
     opts.create(true).read(true).write(true);
@@ -1670,6 +1962,201 @@ mod tests {
         let head_sym = git_c(repo, &["symbolic-ref", "-q", "HEAD"]);
         let index = git_c(repo, &["ls-files", "-s"]);
         (head, head_sym, index)
+    }
+
+    #[test]
+    fn cow_workspace_has_private_git_proposal_and_cleanup() {
+        let repo = init_fixture("greppy-ws-cow");
+        let main_before = main_checkout_fingerprint(&repo);
+        let run_id = unique_tag("run-cow");
+        let ws = AgentWorkspace::create_with_options(
+            &repo,
+            &run_id,
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        )
+        .expect("create CoW workspace");
+        let worktree = ws.worktree_path().to_path_buf();
+        let stable = stable_worktree_dir(&repo);
+
+        assert_eq!(ws.kind, WorktreeKind::Cow);
+        assert_ne!(worktree, stable);
+        assert!(worktree.join(".git").is_dir());
+        assert!(git_c(&worktree, &["status", "--porcelain"]).is_empty());
+        assert_eq!(main_checkout_fingerprint(&repo), main_before);
+
+        std::fs::write(worktree.join("hello.txt"), b"changed in CoW\n").unwrap();
+        std::fs::write(worktree.join("cow-only.txt"), b"private\n").unwrap();
+        git_c(&worktree, &["config", "user.name", "model"]);
+        git_c(&worktree, &["config", "user.email", "model@test.local"]);
+        git_c(&worktree, &["add", "-A"]);
+        git_c(&worktree, &["commit", "-m", "model commit"]);
+        let model_commit = git_c(&worktree, &["rev-parse", "HEAD"]);
+        assert!(
+            !git_run_cwd(&repo, &["cat-file", "-e", &model_commit])
+                .unwrap()
+                .status
+                .success(),
+            "model-created objects must remain private before finish"
+        );
+
+        let proposal = ws.finish("CoW proposal").expect("finish");
+        let (commit, ref_name) = match proposal {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("expected proposal"),
+        };
+        assert_eq!(git_c(&repo, &["rev-parse", &ref_name]), commit);
+        assert_eq!(
+            git_c(&repo, &["rev-parse", &format!("{commit}^")]),
+            ws.base_commit
+        );
+        assert_eq!(main_checkout_fingerprint(&repo), main_before);
+
+        ws.cleanup().expect("cleanup CoW workspace");
+        assert!(!worktree.exists());
+        destroy_stable(&repo, &stable);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cow_private_git_rewrite_is_rejected_and_tree_is_preserved() {
+        let repo = init_fixture("greppy-ws-cow-tamper");
+        let main_before = main_checkout_fingerprint(&repo);
+        let ws = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-tamper"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        )
+        .expect("create CoW workspace");
+        let worktree = ws.worktree_path().to_path_buf();
+        let private_backup = worktree.join(".git-private-backup");
+        std::fs::rename(worktree.join(".git"), &private_backup).unwrap();
+        std::os::unix::fs::symlink(repo.join(".git"), worktree.join(".git")).unwrap();
+
+        let error = ws.finish("must reject").expect_err("tamper rejection");
+        assert!(matches!(error, WorkspaceError::Tampered { .. }));
+        assert!(
+            worktree.exists(),
+            "tampered CoW workspace must be preserved"
+        );
+        assert_eq!(main_checkout_fingerprint(&repo), main_before);
+
+        std::fs::remove_file(worktree.join(".git")).unwrap();
+        std::fs::rename(private_backup, worktree.join(".git")).unwrap();
+        let stable = stable_worktree_dir(&repo);
+        ws.cleanup().expect("cleanup after restoring private Git");
+        destroy_stable(&repo, &stable);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn native_and_cow_proposals_have_identical_trees() {
+        let repo = init_fixture("greppy-ws-cow-parity");
+        let native = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-native-parity"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Native,
+            },
+        )
+        .expect("native workspace");
+        std::fs::write(native.worktree_path().join("hello.txt"), b"same edit\n").unwrap();
+        std::fs::write(native.worktree_path().join("new.txt"), b"same new file\n").unwrap();
+        let native_commit = match native.finish("native parity").unwrap() {
+            RunOutcome::Proposal { commit, .. } => commit,
+            RunOutcome::Clean => panic!("expected native proposal"),
+        };
+        let native_tree = git_c(&repo, &["rev-parse", &format!("{native_commit}^{{tree}}")]);
+        native.cleanup().unwrap();
+
+        let cow = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-parity"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        )
+        .expect("CoW workspace");
+        std::fs::write(cow.worktree_path().join("hello.txt"), b"same edit\n").unwrap();
+        std::fs::write(cow.worktree_path().join("new.txt"), b"same new file\n").unwrap();
+        let cow_commit = match cow.finish("CoW parity").unwrap() {
+            RunOutcome::Proposal { commit, .. } => commit,
+            RunOutcome::Clean => panic!("expected CoW proposal"),
+        };
+        let cow_tree = git_c(&repo, &["rev-parse", &format!("{cow_commit}^{{tree}}")]);
+        assert_eq!(cow_tree, native_tree);
+        let stable = stable_worktree_dir(&repo);
+        cow.cleanup().unwrap();
+        destroy_stable(&repo, &stable);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs() {
+        use std::sync::{Arc, Barrier};
+
+        let repo = Arc::new(init_fixture("greppy-ws-cow-concurrent"));
+        let main_before = main_checkout_fingerprint(&repo);
+        let barrier = Arc::new(Barrier::new(10));
+        let mut handles = Vec::new();
+        for worker in 0..10 {
+            let repo = Arc::clone(&repo);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let run_id = unique_tag(&format!("run-cow-{worker}"));
+                barrier.wait();
+                let ws = AgentWorkspace::create_with_options(
+                    &repo,
+                    &run_id,
+                    CreateOptions {
+                        fresh: true,
+                        backend: WorkspaceBackend::Cow,
+                    },
+                )
+                .expect("concurrent CoW create");
+                assert_eq!(ws.kind, WorktreeKind::Cow);
+                std::fs::write(
+                    ws.worktree_path().join(format!("worker-{worker}.txt")),
+                    format!("worker {worker}\n"),
+                )
+                .unwrap();
+                let (commit, ref_name) = match ws.finish("concurrent CoW").unwrap() {
+                    RunOutcome::Proposal {
+                        commit, ref_name, ..
+                    } => (commit, ref_name),
+                    RunOutcome::Clean => panic!("expected proposal"),
+                };
+                let path = ws.worktree_path().to_path_buf();
+                ws.cleanup().unwrap();
+                assert!(!path.exists());
+                (commit, ref_name)
+            }));
+        }
+
+        let mut refs = Vec::new();
+        for handle in handles {
+            let (commit, ref_name) = handle.join().expect("worker thread");
+            assert_eq!(git_c(&repo, &["rev-parse", &ref_name]), commit);
+            refs.push(ref_name);
+        }
+        refs.sort();
+        refs.dedup();
+        assert_eq!(refs.len(), 10);
+        assert_eq!(main_checkout_fingerprint(&repo), main_before);
+
+        let stable = stable_worktree_dir(&repo);
+        destroy_stable(&repo, &stable);
+        let _ = std::fs::remove_dir_all(repo.as_path());
     }
 
     #[test]
@@ -2480,7 +2967,10 @@ mod tests {
         let ws3 = AgentWorkspace::create_with_options(
             &repo,
             &unique_tag("run-ignored-3"),
-            CreateOptions { fresh: true },
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Native,
+            },
         )
         .expect("fresh");
         assert!(

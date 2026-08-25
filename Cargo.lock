@@ -727,6 +727,7 @@ dependencies = [
 name = "greppy-agent"
 version = "0.3.2"
 dependencies = [
+ "greppy-rift-core",
  "landlock",
  "serde",
  "serde_json",
@@ -942,6 +943,17 @@ dependencies = [
  "greppy-store",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "greppy-rift-core"
+version = "0.1.0"
+source = "git+https://github.com/mkh-welsch/rift?rev=1e93e3cd1b06fde5ea73671d5febd496473fa549#1e93e3cd1b06fde5ea73671d5febd496473fa549"
+dependencies = [
+ "libc",
+ "serde",
+ "thiserror 2.0.18",
+ "walkdir",
 ]
 
 [[package]]

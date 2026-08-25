@@ -2,6 +2,31 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
+## [Unreleased]
+
+### Filesystem-CoW agent workspaces
+
+`greppy -p` can create exact private Filesystem-CoW workspaces through the
+purpose-specific `greppy-rift-core` hard fork. `--workspace-backend auto` is
+the default: it attempts only O(1)-metadata CoW before model startup and falls
+back to the unchanged 0.3.2 native Git-worktree path when the platform,
+filesystem, or snapshot setup is unavailable. `native` forces the 0.3.2 path;
+`cow` requires exact CoW, including per-file reflink trees, and fails explicitly
+instead of silently copying.
+
+Every CoW run replaces the linked-worktree control file with a real private Git
+directory. Existing repository objects are exposed read-only through Git
+alternates; new objects, indexes, refs, and model-created commits stay private
+until `finish` exports one verified proposal commit. Main-checkout HEAD and
+index remain unchanged. Identity and containment checks preserve a workspace
+on suspected tampering instead of deleting or publishing it.
+
+The retained snapshot core is a hard, purpose-specific MIT-licensed fork of
+`anomalyco/rift`, pinned to an immutable revision. It contains only APFS,
+Btrfs, and Linux reflink mechanics plus capability probing and cleanup. The
+former Rift CLI, registry, hooks, FFI, workspace policy, and compatibility
+surface are not part of Greppy.
+
 ## [0.3.2] — 2026-08-24
 
 ### Parallel Agent Store CoW

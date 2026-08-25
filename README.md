@@ -199,6 +199,25 @@ the binary. The prompt's compact rule is: choose one direct graph command for
 named symbols, one `search` for concept discovery, `search-pattern` for literal
 text, `read-file` for paths, and run builds/tests through `bash-smart`.
 
+The integrated agent allocates its workspace before the first model request.
+The 0.3.3 candidate defaults to `--workspace-backend auto`: use an exact native
+Filesystem-CoW snapshot only when capability probing guarantees no full-tree
+metadata traversal, otherwise retain the 0.3.2 Git-worktree behavior. Use
+`native` to force the 0.3.2 backend or `cow` to require exact CoW, including a
+per-file reflink tree, and receive an explicit error when it is unavailable:
+
+```bash
+greppy -p "TASK" --model MODEL --workspace-backend auto
+greppy -p "TASK" --model MODEL --workspace-backend native
+greppy -p "TASK" --model MODEL --workspace-backend cow
+```
+
+Each CoW workspace has a real private `.git` directory. It reads the pinned
+base commit's objects through Git alternates, but its index, refs, new objects,
+and agent-created commits are private. Only the final verified proposal commit
+is imported into `refs/greppy/agent/<run-id>`; the current checkout's HEAD and
+index are not changed. CoW does not relax sandboxing or Store isolation.
+
 ## CLI reference
 
 Every command runs on the current repository, or pass `--root DIR`. Structured
@@ -414,6 +433,15 @@ Base Stores and Deltas contain source-derived paths, spans, graph relations,
 summaries, and embeddings. They have the same confidentiality requirements as
 the repository itself. Agent sandboxes can read a published Base but cannot
 write it; writable Delta state remains isolated per run.
+
+Filesystem-CoW in the 0.3.3 candidate is a separate layer from the 0.3.2
+Base/Delta Store. A snapshot contains the working tree, retained ignored build
+caches unless `--fresh` is used, and private Git control state. APFS directory
+clones, Btrfs subvolume snapshots, and Linux file reflinks are provided by the
+pinned, purpose-specific `greppy-rift-core` fork. Unsupported or failed
+preflights fall back only in `auto`; forced `cow` fails visibly. Suspected Git
+identity or containment tampering prevents publication and cleanup so the
+workspace remains available for diagnosis.
 
 Full source bodies are not duplicated into SQLite. Exact code search reads the
 current worktree through real `grep` where available, with an in-binary literal

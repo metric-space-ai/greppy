@@ -1,13 +1,10 @@
 # greppy 0.3.2–0.3.3 — Parallel Agent CoW Release Plan
 
-Status: 0.3.2 implemented and locally gate-qualified. Deterministic coding
-shards fixed single-runner contention, but exact-commit evidence showed that
-fresh-session timeout replays can reach the same task budget and merely double
-cost. Harness v4 therefore treats the preregistered timeout as a symmetric
-compute cutoff: it independently tests the exact worktree snapshot, records one
-measured outcome, and never grants a timeout replay. Fresh exact-commit gates,
-artifact signing, and publication remain pending · 2026-08-24. 0.3.3 remains
-planned.
+Status: 0.3.2 is published. The 0.3.3 Filesystem-CoW candidate is implemented
+through the first local correctness gates and remains unreleased while platform,
+fault-recovery, packaging, stress, and performance gates are completed ·
+2026-08-25. The binding architecture decision and rollback rule are in
+`FILESYSTEM-COW-ADR.md`.
 
 Scope decision: **two releases, two complete features.** The milestones below
 are implementation order, not open research branches.
@@ -136,9 +133,9 @@ dirty/deleted file count, completeness, cache hits, and fallback reason.
 ### 4.2 Workspace selection in 0.3.3
 
 ```text
-greppy -p --workspace auto "TASK"       # default
-greppy -p --workspace worktree "TASK"   # force current backend
-greppy -p --workspace cow "TASK"        # force the selected CoW backend
+greppy -p --workspace-backend auto "TASK"    # default
+greppy -p --workspace-backend native "TASK"  # force 0.3.2 backend
+greppy -p --workspace-backend cow "TASK"     # require CoW
 ```
 
 `auto` policy is frozen for 0.3.3:
@@ -505,13 +502,14 @@ section 3.2 rather than left as open-ended cleanup.
 
 ## 7. 0.3.3 architecture — Filesystem-CoW
 
-### 7.1 Rift make-or-buy gate
+### 7.1 Rift make-or-buy decision — complete
 
-[Rift](https://github.com/anomalyco/rift) is a mandatory reference implementation
-and benchmark competitor, not an assumed dependency. It is MIT-licensed and
-already creates private CoW workspaces using writable Btrfs snapshots, Linux
-per-file reflinks, and APFS `clonefile`. It also supplies lifecycle/registry,
-hooks, Git working-state preservation, garbage collection, and a Rust core.
+[Rift](https://github.com/anomalyco/rift) was evaluated as the mandatory
+reference implementation. The binding decision is a hard, purpose-specific
+fork: `greppy-rift-core` retains only writable Btrfs snapshots, Linux per-file
+reflinks, APFS `clonefile`, probing, receipts, and removal. The dependency is
+pinned at `1e93e3cd1b06fde5ea73671d5febd496473fa549`; provenance and rationale are
+recorded in `FILESYSTEM-COW-ADR.md` and `THIRD_PARTY.md`.
 
 Rift does not replace Store-CoW in 0.3.2: it clones filesystem workspaces, not
 greppy's immutable graph/summary/embedding Base with private logical Deltas.
@@ -519,7 +517,8 @@ greppy's immutable graph/summary/embedding Base with private logical Deltas.
 Rift benchmark claim. Its Store-CoW results are baseline input; F0 in 0.3.3 owns
 the Rift comparison harness and the backend-neutral phase instrumentation.
 
-F0 performs one bounded decision spike using a pinned Rift revision:
+F0 completed one bounded decision spike using pinned Rift revision
+`757a22cb247f9b24a849c9d6bd56f49c0ec494f8`:
 
 1. benchmark `rift create --copy-all` and default filtered creation against the
    temp-worktree fallback and warm native worktree pools of size 2, 5, and 10;
@@ -532,8 +531,7 @@ F0 performs one bounded decision spike using a pinned Rift revision:
    proposal publication; explicitly test `rift init`, because on Linux/Btrfs it
    may convert and swap an ordinary source directory into a subvolume, which is
    not acceptable as an implicit `greppy -p` side effect;
-5. publish an ADR selecting one path: integrate/pin Rift, implement the narrow
-   native snapshot subset in greppy, or proceed with the custom virtual backend.
+5. published an ADR selecting the narrow native snapshot subset as a hard fork.
 
 The current Rift repository is explicitly experimental, its interfaces may
 change without notice, and workspace creation is not implemented on Windows.
@@ -544,11 +542,9 @@ version pinning, fallbacks, and lifecycle tests. Conversely, equivalent native
 CoW performance and correctness block construction of a custom mount stack:
 engineering novelty is not a release gate.
 
-The ADR is binding for the rest of 0.3.3. If Rift wins, greppy builds the Rift
-adapter and does **not** also build WorkspaceCore/FUSE/FSKit/WinFsp. If a narrow
-native backend wins, only that subset is built. The custom virtual stack is
-authorized only by a measured unmet requirement, and the unselected branches
-leave the release scope.
+The ADR is binding for the rest of 0.3.3. WorkspaceCore, FUSE, FSKit, WinFsp,
+Rift's manager/CLI/registry/FFI, and hidden recursive-copy emulation are not
+release scope and must not be implemented as compatibility layers.
 
 ### 7.2 Backend boundary
 
@@ -564,21 +560,20 @@ trait AgentWorkspaceBackend {
 }
 
 NativeWorktreeBackend   # existing stable/temp behavior and warm pool baseline
-NativeCowBackend        # Rift integration or greppy-owned snapshot/reflink path
-VirtualCowBackend       # custom mount path, only when authorized by F0
+NativeCowBackend        # pinned greppy-rift-core snapshot/reflink path
 ```
 
 `run_agent` depends only on this interface. Proposal outcome, sandbox setup,
 Store selection, keep-worktree, error reporting, and cleanup are backend-neutral.
 
-### 7.3 Conditional WorkspaceCore — virtual-backend path only
+### 7.3 Rejected virtual-backend design record — not implementation scope
 
-Only when F0 authorizes the custom virtual backend, add `crates/workspace-cow`
-with no platform mount code:
+F0 did not authorize this design. Sections 7.4–7.8 preserve the evaluated
+alternative only as decision evidence; they are not milestones, deferred work,
+or permitted 0.3.3 compatibility layers. The binding implementation is the
+narrow native core in section 7.1.
 
-Sections 7.4–7.8 describe only this conditionally authorized virtual path; a
-Rift or narrow-native ADR implements equivalent public contracts through its
-selected backend without inheriting this internal design.
+The following model is therefore non-normative:
 
 ```text
 WorkspaceCore
@@ -724,57 +719,53 @@ reported explicitly and never emulated by a hidden full copy.
 
 ### Linux — supported
 
-- Rift, a greppy-owned snapshot/reflink backend, or FUSE3 according to the ADR;
+- pinned `greppy-rift-core`: Btrfs writable subvolume snapshots or per-file
+  `FICLONE` on a reflink-capable filesystem;
 - used by `auto` only when filesystem capabilities and preflight pass;
-- packaged with all selected runtime requirements declared;
-- CI on current Ubuntu x86_64 and ARM64, including cleanup/crash tests.
+- no mount helper or runtime service;
+- CI covers Btrfs, XFS reflink, ext4 unsupported, cleanup, and crash tests.
 
-### macOS — preview
+### macOS — supported candidate
 
-- Rift/APFS `clonefile`, a greppy-owned clone backend, or an FSKit app-extension
-  according to the ADR; an FSKit choice includes a small signed helper;
-- notarized packaging and install/uninstall path documented when required;
+- pinned `greppy-rift-core` APFS directory `clonefile` backend;
+- no helper, mount, extension, or install-time component;
 - `auto` selects it only after backend health/preflight succeeds and the
   performance gates pass; otherwise native worktree fallback;
-- CI on current supported macOS ARM64 plus Intel where the release supports it.
+- CI on the release-supported macOS ARM64 target.
 
-### Windows — preview
+### Windows — native fallback
 
-- native-worktree fallback is supported and explicit because Rift workspace
-  creation is currently not implemented on Windows;
-- CoW is preview only if F0 selects or authorizes a Windows-capable backend;
-- a virtual-backend choice uses native WinFsp, not its POSIX FUSE layer, with
-  prerequisite detection and case/rename/lock/mmap/ACL/unmount coverage.
+- `auto` selects the unchanged native Git-worktree backend;
+- forced `cow` returns an explicit unsupported error before model startup;
+- WinFsp and a Windows virtual backend are not 0.3.3 scope.
 
-Preview means shipped, documented, correctness-gated, and force-selectable; it
-does not promise a CoW adapter on a platform where the selected backend cannot
-meet the gates. The native worktree backend remains fully supported everywhere.
+The native worktree backend remains fully supported everywhere. A platform is
+never reported as CoW-capable when the selected native backend is unavailable.
 
 ## 9. 0.3.3 repository preflight and fallback
 
-Before allocating or mounting state, reject CoW and fall back to native when:
+Before allocating state, reject CoW and fall back to native when:
 
 - tracked submodules/gitlinks are present;
 - Git LFS or required checkout/smudge filters would change visible blob content;
 - case collisions cannot be represented by the host;
-- the adapter/helper/runtime is absent or unhealthy;
-- the Delta/state root lacks required capacity or permissions;
+- the native filesystem capability probe rejects the source/destination pair;
+- the snapshot root lacks required capacity or permissions;
 - the pinned object database is incomplete and cannot provide Base blobs;
 - a repository feature used by the current Git version is unsupported.
 
 Preflight is cached only against an identity that includes relevant Git config,
 attributes, platform, adapter, and repository tree. Fallback never leaves a
-half-mounted path registered as a worktree.
+partial snapshot registered as a valid workspace.
 
 ## 10. 0.3.3 correctness suites
 
 ### 10.1 Filesystem model tests
 
-Run randomized state-machine sequences against both WorkspaceCore and a native
-reference directory, comparing visible trees, bytes, modes, links, errors, and
-directory listings after every operation. Include create, overwrite, append,
-truncate, delete, recreate, file/directory rename, nested redirects, hard links,
-symlinks, concurrent handles, fsync, and quota boundaries.
+Run exact-tree and mutation sequences against each native backend and a native
+Git-worktree reference, comparing visible trees, bytes, modes, links, errors,
+and directory listings. Include create, overwrite, append, truncate, delete,
+recreate, file/directory rename, hard links, symlinks, and concurrent handles.
 
 ### 10.2 Git compatibility tests
 
@@ -803,35 +794,30 @@ Compare outputs and test results with native worktrees; benchmark separately.
 
 ### 10.4 Lifecycle and fault injection
 
-Kill the agent/helper/core during mount, copy-up, rename, metadata transaction,
-Git commit, proposal publication, unmount, and cleanup. Recovery either restores
+Kill the agent during snapshot setup, private-Git initialization, Git commit,
+proposal publication, and cleanup. Recovery either restores
 a consistent kept workspace or safely reclaims private state. It never reuses an
-identity with an incomplete lifecycle journal.
+incomplete or identity-mismatched snapshot as a valid workspace.
 
 ## 11. 0.3.3 build order
 
-- **F0 — Backend contract/make-or-buy:** `AgentWorkspaceBackend`, frozen CLI,
-  native backend migration without behavior change, repository compatibility
-  checks, Rift plus warm-pool E2E baselines, bounded integration spike, and the
-  backend ADR required by section 7.1.
-- **F1 — Selected backend:** implement exactly the ADR winner: pinned Rift
-  integration, the narrow greppy-owned native snapshot/reflink subset, or (only
-  when authorized) WorkspaceCore plus its platform adapters.
+- **F0 — Decision — complete:** bounded Rift spike, hard-fork reduction, exact
+  dependency pin, provenance, core platform CI, and binding ADR.
+- **F1 — Integration — in progress:** frozen CLI, unchanged native fallback,
+  narrow snapshot core, private Git state, and typed fail-closed errors.
 - **F2 — Git/proposal parity:** preserve normal Git behavior and produce the
   same atomic proposal ref and tree as the native-worktree backend; use private
   Git state/object transfer only where the selected backend requires it.
 - **F3 — Lifecycle and platform hardening:** packaging, capability detection,
-  quotas, cleanup, crash recovery, and the common filesystem/Git/toolchain
+  cleanup, crash recovery, and the common filesystem/Git/toolchain
   conformance suite on every selected platform.
 - **F4 — Agent integration:** frozen `auto` policy, Store-CoW composition,
   diagnostics, keep-worktree, cleanup, concurrency and 50-agent stress tests.
 - **F5 — Release:** meet section 3.2, optimize caches without weakening
   semantics, README/SECURITY/CHANGELOG/install docs, publish 0.3.3.
 
-All F0–F5 milestones are in 0.3.3 scope. The ADR closes the two unselected
-implementation branches; it does not turn them into deferred work. Platform
-support is declared as in section 8 and a native fallback is never mislabeled
-as CoW.
+F1–F5 are bounded 0.3.3 work. The rejected virtual-filesystem and full-Rift
+branches are neither deferred milestones nor compatibility obligations.
 
 ## 12. Measurement plan across both releases
 
@@ -918,13 +904,13 @@ workspace backends.
    overfetch, deterministic rerank, and enforce the latency gates.
 3. **Base identity omits a semantic input.** Manifest every input and fail
    closed to a new identity.
-4. **Userspace filesystem metadata latency is high.** Stable stat identities,
-   shared immutable caches, native Delta handles, batch/prefetch where adapters
-   permit, and binding performance gates.
+4. **Native snapshot metadata latency is high.** Measure full agent startup and
+   representative tools against native worktrees; disable `auto` selection on
+   a platform that misses its binding gate.
 5. **Build output dwarfs source edits.** Disk-backed upper, realistic quota
    defaults, separate build benchmarks, no RAM-first promise.
-6. **Directory rename materializes a subtree.** Prefix redirects are mandatory
-   before adapter integration.
+6. **A reflink backend still traverses directory metadata.** Gate it on measured
+   end-to-end value; never describe reflink creation as O(1).
 7. **Private Git is not actually private.** New objects/refs/index live in the
    private Git dir; shared objects are alternates opened read-only; publication
    is an explicit trusted transfer.
@@ -934,13 +920,12 @@ workspace backends.
    custom-adapter expansion.
 9. **First-run Base construction serializes agents.** One builder publishes;
    followers wait boundedly or use safe private fallback.
-10. **CoW adapter crashes strand mounts.** Lifecycle journal, backend health,
-    startup scavenger, explicit recovery, and adapter-specific forced-unmount
-    tests ship before release.
-11. **A custom filesystem duplicates a simpler native-CoW solution.** Rift and
-    warm worktree pools are compulsory E2E baselines; F0 blocks custom adapter
-    work until the ADR identifies a concrete correctness, portability, or
-    performance gap worth its lifetime maintenance cost.
+10. **CoW setup crashes leave partial snapshots.** Ownership/identity checks,
+    startup scavenging, explicit recovery, and backend cleanup tests ship before
+    release.
+11. **The hard fork regrows unused Rift behavior.** Dependency review rejects
+    manager, CLI, registry, FFI, hooks, filtering, source conversion, or hidden
+    copy fallback unless a new ADR explicitly changes the product contract.
 
 ## 16. Documentation deliverables
 
@@ -954,7 +939,7 @@ workspace backends.
 
 ### 0.3.3
 
-- `--workspace auto|worktree|cow` and exact auto policy;
+- `--workspace-backend auto|native|cow` and exact auto policy;
 - platform support/prerequisites and install/uninstall;
 - unsupported-repository fallback conditions;
 - quotas, build-output behavior, kept workspace recovery;
@@ -974,9 +959,9 @@ workspace backends.
 
 ### greppy 0.3.3 is done when
 
-- F0–F5 are merged;
-- Linux FUSE3 is supported and macOS FSKit/Windows WinFsp ship with the declared
-  preview contracts;
+- F0–F5 are complete on one exact candidate commit;
+- macOS APFS, Linux Btrfs/reflink, and Windows native fallback behave exactly as
+  declared; no FUSE, FSKit, or WinFsp component ships;
 - model, Git, toolchain, lifecycle, and fault suites pass per platform status;
 - section 3.2 targets hold or `auto` remains disabled on the failing preview
   platform as specified;
@@ -984,3 +969,8 @@ workspace backends.
 - docs, help, SECURITY, install packaging, and CHANGELOG are complete;
 - ten concurrent agents demonstrate no full temporary checkout materialization;
 - release artifacts are published as 0.3.3.
+
+If any mandatory correctness, security, packaging, or registered performance
+gate cannot be met, this definition is not weakened: the CoW candidate is
+abandoned, released 0.3.2 behavior remains the baseline, and a different
+feature is selected for a new 0.3.3 candidate.

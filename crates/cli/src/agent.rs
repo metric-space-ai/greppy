@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
-use greppy_agent::workspace::CreateOptions;
+use clap::{Parser, ValueEnum};
+use greppy_agent::workspace::{CreateOptions, WorkspaceBackend};
 use greppy_agent::{
     run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
     LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
@@ -30,10 +30,10 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-One-shot coding agent. Works in a per-repository agent worktree (tracked
-content is reset to HEAD before every run; ignored build caches are kept
-deliberately for speed, pass --fresh to drop them; greppy index built on first
-use and kept warm afterwards) and delivers a proposal ref
+One-shot coding agent. Uses an exact Filesystem-CoW workspace when available
+and falls back before model startup to the native 0.3.2 Git-worktree path.
+Tracked content is pinned to HEAD; ignored build caches are kept deliberately
+for speed unless --fresh is passed. It delivers a proposal ref
 (refs/greppy/agent/<run_id>); inspect with `git show` or apply with
 `git cherry-pick -n`. The agent has exactly one tool — `greppy` — covering
 search/navigate/read/edit; commands run through that tool as
@@ -59,7 +59,8 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
-                   [--fresh] [--no-sandbox] [--skip-selfcheck]
+                   [--fresh] [--workspace-backend auto|native|cow]
+                   [--no-sandbox] [--skip-selfcheck]
   greppy -p --help
 
 Flags:
@@ -73,9 +74,12 @@ Flags:
   --apply             Cherry-pick the proposal into the current checkout
                       (staged, not committed)
   --diff              Print the full proposal patch after the stat
-  --keep-worktree     Leave a temporary fallback worktree on disk after success
+  --keep-worktree     Leave a CoW or temporary workspace on disk after success
   --fresh             Drop ignored files too (truly pristine tree; default keeps
                       ignored build caches)
+  --workspace-backend Select auto (O(1)-metadata CoW with native fallback),
+                      native, or cow (require exact CoW, including reflink-tree
+                      backends); env GREPPY_WORKSPACE_BACKEND
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
 
@@ -133,6 +137,15 @@ pub struct AgentArgs {
     #[arg(long)]
     pub fresh: bool,
 
+    /// Workspace allocator: CoW with native fallback, native only, or required CoW.
+    #[arg(
+        long,
+        env = "GREPPY_WORKSPACE_BACKEND",
+        value_enum,
+        default_value_t = WorkspaceBackendArg::Auto
+    )]
+    pub workspace_backend: WorkspaceBackendArg,
+
     /// Disable shared immutable Base Store reuse for this run and build a
     /// complete private index. Intended for diagnostics and safe fallback.
     #[arg(long)]
@@ -167,6 +180,23 @@ pub struct AgentArgs {
         require_equals = false,
     )]
     pub skip_selfcheck: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WorkspaceBackendArg {
+    Auto,
+    Native,
+    Cow,
+}
+
+impl From<WorkspaceBackendArg> for WorkspaceBackend {
+    fn from(value: WorkspaceBackendArg) -> Self {
+        match value {
+            WorkspaceBackendArg::Auto => Self::Auto,
+            WorkspaceBackendArg::Native => Self::Native,
+            WorkspaceBackendArg::Cow => Self::Cow,
+        }
+    }
 }
 
 /// True when argv (after greppy-owned globals) starts with `-p`.
@@ -262,7 +292,10 @@ fn run_agent(args: AgentArgs) -> u8 {
     let workspace = match AgentWorkspace::create_with_options(
         &cwd,
         &run_id,
-        CreateOptions { fresh: args.fresh },
+        CreateOptions {
+            fresh: args.fresh,
+            backend: args.workspace_backend.into(),
+        },
     ) {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {
@@ -277,6 +310,12 @@ fn run_agent(args: AgentArgs) -> u8 {
             } else {
                 eprintln!("greppy -p: unsupported repository: {reason}");
             }
+            return EXIT_USAGE;
+        }
+        Err(WorkspaceError::CowUnavailable(reason)) => {
+            eprintln!(
+                "greppy -p: --workspace-backend cow was requested, but Filesystem-CoW is unavailable: {reason}"
+            );
             return EXIT_USAGE;
         }
         Err(e @ WorkspaceError::Tampered { .. }) => {
@@ -1056,6 +1095,8 @@ mod tests {
             "--apply",
             "--diff",
             "--keep-worktree",
+            "--workspace-backend",
+            "cow",
         ])
         .expect("parse");
         assert_eq!(a.task.as_deref(), Some("fix the bug"));
@@ -1066,6 +1107,7 @@ mod tests {
         assert!(a.apply);
         assert!(a.diff);
         assert!(a.keep_worktree);
+        assert_eq!(a.workspace_backend, WorkspaceBackendArg::Cow);
         assert!(!a.no_sandbox);
         assert!(!a.fresh);
     }
@@ -1167,6 +1209,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
@@ -1186,6 +1229,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
@@ -1392,6 +1436,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: true,
             skip_selfcheck: false,
@@ -1422,6 +1467,7 @@ mod tests {
             diff: false,
             keep_worktree: false,
             fresh: false,
+            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,

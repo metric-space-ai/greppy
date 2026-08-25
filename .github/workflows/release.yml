@@ -472,6 +472,7 @@ jobs:
           test -s "$clean/bin/licenses/QWEN3.5-PROVENANCE.json"
           test -s "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json"
           test -s "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json"
+          test -s "$clean/bin/licenses/RIFT-MIT.txt"
           bash "$clean/bin/release_package_smoke.sh" "$clean/bin/greppy" "$clean/work"
 
       - name: Smoke-test packaged artifact (Windows)
@@ -491,6 +492,7 @@ jobs:
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-PROVENANCE.json")) { throw 'missing Qwen provenance' }
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json")) { throw 'missing Qwen training-data manifest' }
           if (-not (Test-Path "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json")) { throw 'missing model redistribution lock' }
+          if (-not (Test-Path "$clean/bin/licenses/RIFT-MIT.txt")) { throw 'missing Rift MIT license' }
           & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
 
       - name: Generate SPDX SBOM

@@ -147,6 +147,11 @@ is available.
   backend-library overrides are not supported by release builds.
 - Greppy does not install drivers, toolkits, updates, or other software. Release
   upgrades are explicit and use signed/checksummed artifacts.
+- Filesystem-CoW snapshots are local private workspaces, not a security boundary
+  between the agent and repository contents. Their Git directory, index, refs,
+  and newly written objects are private to the run; base objects are exposed
+  read-only through a Git alternate. Only a verified final proposal is imported
+  into the main repository.
 
 ## Sensitive repositories
 
@@ -171,3 +176,14 @@ prepared, that agent run falls back to a full private Store and reports the
 reason. Cache reclamation validates Greppy ownership markers and holds the same
 lifecycle lock used by live readers, so it cannot evict a Base in use or traverse
 unmanaged directories.
+
+The 0.3.3 Filesystem-CoW candidate additionally snapshots the working tree and,
+unless `--fresh` is selected, retained ignored build caches. Protect snapshot
+storage at the same level as the repository. Snapshot creation is serialized
+only while preparing the stable template; each run then replaces the linked
+Git control file with a private Git directory and verifies a clean pinned base.
+Identity, containment, and type checks run again before proposal publication
+and cleanup. A suspected rewrite or symlink attack fails closed and preserves
+the workspace for diagnosis. `--workspace-backend auto` may fall back before
+model startup to the unchanged native Git-worktree backend; forced `cow` never
+silently falls back.

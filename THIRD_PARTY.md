@@ -95,6 +95,23 @@ SBOM, model notices, checksums, signatures, or build provenance are missing.
 
 ## Ported third-party code
 
+### greppy-rift-core (filesystem snapshot mechanics)
+
+- Purpose: exact Filesystem-CoW workspaces for the integrated agent.
+- Upstream: [`anomalyco/rift`](https://github.com/anomalyco/rift), pinned at
+  `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`.
+- Greppy hard fork: [`mkh-welsch/rift`](https://github.com/mkh-welsch/rift),
+  package `greppy-rift-core`, pinned by `Cargo.lock` and `Cargo.toml` at
+  `1e93e3cd1b06fde5ea73671d5febd496473fa549`.
+- License: MIT; see `licenses/RIFT-MIT.txt`.
+- Retained scope: APFS `clonefile`, Btrfs subvolume snapshot/removal, Linux
+  `FICLONE`, capability probing, and exact snapshot receipts.
+
+The fork deliberately removed Rift's CLI, JavaScript/Bun/Node FFI, workspace
+manager, SQLite registry, hooks, markers, Git policy, filtered-copy behavior,
+and source-conversion logic. Greppy owns Git isolation, lifecycle, fallback,
+and proposal publication; no compatibility with Rift's public API is claimed.
+
 ### pi (agent loop semantics)
 
 - Purpose: multi-turn agent loop semantics (turn sequencing, tool-call
