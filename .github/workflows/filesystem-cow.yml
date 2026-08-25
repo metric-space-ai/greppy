@@ -116,6 +116,17 @@ jobs:
           cargo test -p greppy-agent ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs --locked
           cargo test -p greppy-agent fifty_concurrent_cow_workspaces_stress --locked
 
+      - name: Gate warm 300k-file workspace creation
+        env:
+          TMPDIR: /mnt/greppy-cow-btrfs
+          XDG_CACHE_HOME: /mnt/greppy-cow-btrfs/cache
+          GREPPY_REQUIRE_COW_TESTS: "1"
+          GREPPY_COW_PERF_FILES: "300000"
+        run: >-
+          cargo test -p greppy-agent
+          cow_large_fixture_warm_creation_meets_registered_gate
+          --release --locked -- --ignored --nocapture
+
       - name: Unmount Btrfs fixture
         if: always()
         run: sudo umount /mnt/greppy-cow-btrfs || true

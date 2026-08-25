@@ -2546,6 +2546,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "registered 300k-file Btrfs release performance gate"]
+    fn cow_large_fixture_warm_creation_meets_registered_gate() {
+        let Some(file_count) = std::env::var("GREPPY_COW_PERF_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return;
+        };
+        assert!(file_count > 0, "GREPPY_COW_PERF_FILES must be positive");
+
+        let repo = init_fixture("greppy-ws-cow-perf");
+        let fixture = repo.join("large-fixture");
+        let files_per_directory = 1_000usize;
+        for directory in 0..file_count.div_ceil(files_per_directory) {
+            let shard = fixture.join(format!("shard-{directory:04}"));
+            fs::create_dir_all(&shard).expect("create performance fixture shard");
+            let start = directory * files_per_directory;
+            let end = (start + files_per_directory).min(file_count);
+            for file in start..end {
+                fs::write(shard.join(format!("file-{file:06}.txt")), b"x\n")
+                    .expect("write performance fixture file");
+            }
+        }
+        git_c(&repo, &["add", "--all"]);
+        git_c(&repo, &["commit", "-m", "large fixture"]);
+
+        let warmup = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-perf-warmup"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        )
+        .expect("warm CoW template");
+        assert_eq!(warmup.kind, WorktreeKind::Cow);
+        warmup.cleanup().expect("cleanup warmup workspace");
+
+        let template = cow_template_dir(&repo);
+        let capability = greppy_rift_core::probe(
+            &template,
+            template.parent().expect("template destination root"),
+        )
+        .expect("probe warmed template");
+        assert_eq!(capability.backend, greppy_rift_core::Backend::BtrfsSnapshot);
+        assert!(capability.constant_time_metadata);
+
+        let sample_count = 10usize;
+        let mut samples_ms = Vec::with_capacity(sample_count);
+        for sample in 0..sample_count {
+            let started = std::time::Instant::now();
+            let workspace = AgentWorkspace::create_with_options(
+                &repo,
+                &unique_tag(&format!("run-cow-perf-{sample}")),
+                CreateOptions {
+                    fresh: true,
+                    backend: WorkspaceBackend::Cow,
+                },
+            )
+            .expect("create warm performance workspace");
+            let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(workspace.kind, WorktreeKind::Cow);
+            workspace.cleanup().expect("cleanup performance workspace");
+            samples_ms.push(elapsed);
+        }
+        samples_ms.sort_by(f64::total_cmp);
+        let median_ms = (samples_ms[4] + samples_ms[5]) / 2.0;
+        let p95_ms = samples_ms[9];
+        eprintln!(
+            "COW_PERF_JSON {{\"backend\":\"btrfs_snapshot\",\"files\":{file_count},\"samples\":{sample_count},\"median_ms\":{median_ms:.3},\"p95_ms\":{p95_ms:.3}}}"
+        );
+        assert!(
+            median_ms <= 500.0,
+            "warm CoW median {median_ms:.3} ms exceeds 500 ms"
+        );
+        assert!(
+            p95_ms <= 1_000.0,
+            "warm CoW P95 {p95_ms:.3} ms exceeds 1000 ms"
+        );
+
+        destroy_stable(&repo, &template);
+        let _ = fs::remove_file(cow_template_ready_path(&template));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn create_makes_detached_worktree_at_base_leaving_checkout_untouched() {
         let repo = init_fixture("greppy-ws-create");
         let head_before = git_c(&repo, &["rev-parse", "HEAD"]);
