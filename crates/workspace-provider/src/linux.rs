@@ -91,6 +91,31 @@ impl PortableFuse {
         value
     }
 
+    fn remap_after_rename(&self, source: &Node, destination: &Node) {
+        let updates: Vec<(u64, Node, Node)> = self
+            .nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(inode, node)| {
+                relocated_node(node, source, destination)
+                    .map(|relocated| (*inode, node.clone(), relocated))
+            })
+            .collect();
+        let mut reverse = self.reverse.lock().unwrap();
+        let mut nodes = self.nodes.lock().unwrap();
+        for (inode, old, new) in updates {
+            if let Some(replaced_inode) = reverse.get(&new).copied() {
+                if replaced_inode != inode {
+                    nodes.remove(&replaced_inode);
+                }
+            }
+            reverse.remove(&old);
+            reverse.insert(new.clone(), inode);
+            nodes.insert(inode, new);
+        }
+    }
+
     fn child(&self, parent: &Node, name: &OsStr) -> Result<Node, Errno> {
         match parent {
             Node::Root if name == OsStr::new("workspaces") => Ok(Node::Workspaces),
@@ -581,13 +606,23 @@ impl Filesystem for PortableFuse {
                 if matches!(&source_parent, Node::DoctorRoot | Node::Doctor(_))
                     && matches!(&destination_parent, Node::DoctorRoot | Node::Doctor(_))
                 {
-                    let source = self.doctor_path(&doctor_destination(&source_parent, name)?)?;
-                    let destination =
-                        self.doctor_path(&doctor_destination(&destination_parent, new_name)?)?;
+                    let source_node = Node::Doctor(doctor_destination(&source_parent, name)?);
+                    let destination_node =
+                        Node::Doctor(doctor_destination(&destination_parent, new_name)?);
+                    let Node::Doctor(source_relative) = &source_node else {
+                        unreachable!()
+                    };
+                    let Node::Doctor(destination_relative) = &destination_node else {
+                        unreachable!()
+                    };
+                    let source = self.doctor_path(source_relative)?;
+                    let destination = self.doctor_path(destination_relative)?;
                     if no_replace && destination.exists() {
                         return Err(Errno::EEXIST);
                     }
-                    return fs::rename(source, destination).map_err(io_errno);
+                    fs::rename(source, destination).map_err(io_errno)?;
+                    self.remap_after_rename(&source_node, &destination_node);
+                    return Ok(());
                 }
                 let (workspace, source) = workspace_destination(&source_parent, name)?;
                 let (destination_workspace, destination) =
@@ -609,8 +644,19 @@ impl Filesystem for PortableFuse {
                     return Err(Errno::EEXIST);
                 }
                 self.core
-                    .rename(&handle, source, destination)
-                    .map_err(|_| Errno::EIO)
+                    .rename(&handle, &source, &destination)
+                    .map_err(|_| Errno::EIO)?;
+                self.remap_after_rename(
+                    &Node::WorkspacePath {
+                        workspace: workspace.clone(),
+                        path: source,
+                    },
+                    &Node::WorkspacePath {
+                        workspace,
+                        path: destination,
+                    },
+                );
+                Ok(())
             });
         match result {
             Ok(()) => reply.ok(),
@@ -675,6 +721,33 @@ impl Filesystem for PortableFuse {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(error) => reply.error(error),
         }
+    }
+}
+
+fn relocated_node(node: &Node, source: &Node, destination: &Node) -> Option<Node> {
+    match (node, source, destination) {
+        (Node::Doctor(path), Node::Doctor(from), Node::Doctor(to)) => path
+            .strip_prefix(from)
+            .ok()
+            .map(|suffix| Node::Doctor(to.join(suffix))),
+        (
+            Node::WorkspacePath { workspace, path },
+            Node::WorkspacePath {
+                workspace: source_workspace,
+                path: from,
+            },
+            Node::WorkspacePath {
+                workspace: destination_workspace,
+                path: to,
+            },
+        ) if workspace == source_workspace && workspace == destination_workspace => Path::new(path)
+            .strip_prefix(from)
+            .ok()
+            .map(|suffix| Node::WorkspacePath {
+                workspace: workspace.clone(),
+                path: Path::new(to).join(suffix).to_string_lossy().into_owned(),
+            }),
+        _ => None,
     }
 }
 
