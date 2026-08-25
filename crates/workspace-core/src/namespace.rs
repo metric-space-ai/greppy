@@ -37,6 +37,18 @@ pub struct WorkspaceStatus {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalRecord {
+    pub ref_name: String,
+    pub repository: PathBuf,
+    pub base_commit: String,
+    pub baseline_hash: String,
+    pub baseline_tree: String,
+    pub final_tree: String,
+    pub proposal_commit: String,
+    pub baseline: BaselineSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceHandle {
     id: String,
@@ -121,6 +133,16 @@ impl WorkspaceCore {
                  operation TEXT NOT NULL,
                  state TEXT NOT NULL,
                  payload BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cow_proposals (
+                 ref_name TEXT PRIMARY KEY,
+                 repository TEXT NOT NULL,
+                 base_commit TEXT NOT NULL,
+                 baseline_hash TEXT NOT NULL,
+                 baseline_tree TEXT NOT NULL,
+                 final_tree TEXT NOT NULL,
+                 proposal_commit TEXT NOT NULL,
+                 baseline_json BLOB NOT NULL
              );",
         )?;
         let core = Self {
@@ -622,6 +644,142 @@ impl WorkspaceCore {
                 "workspace {} is not ready",
                 workspace.id
             )));
+        }
+        Ok(())
+    }
+
+    pub fn preserve_proposal(
+        &self,
+        workspace: &WorkspaceHandle,
+        ref_name: &str,
+        baseline_tree: &str,
+        final_tree: &str,
+        proposal_commit: &str,
+    ) -> Result<ProposalRecord> {
+        validate_proposal_ref(ref_name)?;
+        validate_oid(baseline_tree)?;
+        validate_oid(final_tree)?;
+        validate_oid(proposal_commit)?;
+        let baseline: BaselineSnapshot = {
+            let connection = self.lock_metadata()?;
+            connection
+                .query_row(
+                    "SELECT baseline_json FROM cow_workspaces WHERE id = ?1",
+                    params![workspace.id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::InvalidPath(format!("unknown workspace {}", workspace.id)))
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?
+        };
+        let pinned = snapshot_chunks(&baseline);
+        for id in &pinned {
+            self.chunks.pin(*id)?;
+        }
+        let repository = baseline.repository.clone();
+        let baseline_json = serde_json::to_vec(&baseline)?;
+        let insert = (|| -> Result<()> {
+            let connection = self.lock_metadata()?;
+            connection.execute(
+                "INSERT INTO cow_proposals(
+                     ref_name, repository, base_commit, baseline_hash,
+                     baseline_tree, final_tree, proposal_commit, baseline_json
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    ref_name,
+                    repository
+                        .to_str()
+                        .ok_or_else(|| Error::UnsupportedRepository(
+                            "repository path is not UTF-8".into()
+                        ))?,
+                    baseline.base_commit,
+                    baseline.baseline_hash,
+                    baseline_tree,
+                    final_tree,
+                    proposal_commit,
+                    baseline_json
+                ],
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = insert {
+            for id in pinned {
+                let _ = self.chunks.unpin(id);
+            }
+            return Err(error);
+        }
+        Ok(ProposalRecord {
+            ref_name: ref_name.into(),
+            repository,
+            base_commit: baseline.base_commit.clone(),
+            baseline_hash: baseline.baseline_hash.clone(),
+            baseline_tree: baseline_tree.into(),
+            final_tree: final_tree.into(),
+            proposal_commit: proposal_commit.into(),
+            baseline,
+        })
+    }
+
+    pub fn proposal(&self, ref_name: &str) -> Result<ProposalRecord> {
+        validate_proposal_ref(ref_name)?;
+        let connection = self.lock_metadata()?;
+        connection
+            .query_row(
+                "SELECT repository, base_commit, baseline_hash, baseline_tree,
+                        final_tree, proposal_commit, baseline_json
+                 FROM cow_proposals WHERE ref_name = ?1",
+                params![ref_name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::InvalidPath(format!("unknown proposal {ref_name}")))
+            .and_then(
+                |(
+                    repository,
+                    base_commit,
+                    baseline_hash,
+                    baseline_tree,
+                    final_tree,
+                    proposal_commit,
+                    bytes,
+                )| {
+                    Ok(ProposalRecord {
+                        ref_name: ref_name.into(),
+                        repository: PathBuf::from(repository),
+                        base_commit,
+                        baseline_hash,
+                        baseline_tree,
+                        final_tree,
+                        proposal_commit,
+                        baseline: serde_json::from_slice(&bytes)?,
+                    })
+                },
+            )
+    }
+
+    pub fn remove_proposal(&self, ref_name: &str) -> Result<()> {
+        let proposal = self.proposal(ref_name)?;
+        let connection = self.lock_metadata()?;
+        let changed = connection.execute(
+            "DELETE FROM cow_proposals WHERE ref_name = ?1",
+            params![ref_name],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidPath(format!("unknown proposal {ref_name}")));
+        }
+        drop(connection);
+        for id in snapshot_chunks(&proposal.baseline) {
+            self.chunks.unpin(id)?;
         }
         Ok(())
     }
@@ -1232,6 +1390,33 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn snapshot_chunks(snapshot: &BaselineSnapshot) -> Vec<ChunkId> {
+    snapshot
+        .entries
+        .iter()
+        .flat_map(|entry| entry.chunks.iter().copied())
+        .chain(snapshot.index_chunks.iter().copied())
+        .collect()
+}
+
+fn validate_proposal_ref(value: &str) -> Result<()> {
+    let suffix = value.strip_prefix("refs/greppy/agent/").ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "proposal ref is outside refs/greppy/agent: {value}"
+        ))
+    })?;
+    validate_workspace_id(suffix)
+}
+
+fn validate_oid(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidPath(format!(
+            "invalid Git object id: {value}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,6 +1522,28 @@ mod tests {
         assert!(core.chunks().stats().unwrap().referenced_chunks > 0);
         core.remove_workspace(workspace).unwrap();
         assert_eq!(core.list_workspaces().unwrap(), []);
+        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
+    }
+
+    #[test]
+    fn proposal_pins_baseline_after_workspace_cleanup() {
+        let (_repo, _storage, core, workspace) = fixture();
+        let record = core
+            .preserve_proposal(
+                &workspace,
+                "refs/greppy/agent/test-workspace",
+                &"1".repeat(40),
+                &"2".repeat(40),
+                &"3".repeat(40),
+            )
+            .unwrap();
+        assert_eq!(
+            record.baseline_hash,
+            core.proposal(&record.ref_name).unwrap().baseline_hash
+        );
+        core.remove_workspace(workspace).unwrap();
+        assert!(core.chunks().stats().unwrap().referenced_chunks > 0);
+        core.remove_proposal(&record.ref_name).unwrap();
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
     }
 }

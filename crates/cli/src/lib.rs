@@ -338,6 +338,33 @@ pub enum CacheCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Apply a persisted proposal to its exact captured dirty baseline.
+    Apply {
+        /// Proposal ref under refs/greppy/agent/.
+        ref_name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    /// Install and activate the bundled platform adapter.
+    Setup,
+    /// Verify provider identity, recovery and mounted filesystem semantics.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show active workspaces, storage and provider state.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove only unreferenced chunks and fully recovered orphan workspaces.
+    Gc,
+}
+
 /// The trained edit operations. Clap exposes each variant as a top-level verb;
 /// this enum is only the small internal dispatch envelope shared by them.
 #[derive(Debug)]
@@ -429,6 +456,8 @@ const SUBCOMMANDS: &[&str] = &[
     "index",
     "where-am-i",
     "cache",
+    "agent",
+    "workspace",
     "trial",
     "stats",
     "diagnostics",
@@ -1439,6 +1468,131 @@ fn configure_explicit_cuda_device(device: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
+    match command {
+        AgentCommand::Apply { ref_name } => {
+            let target = match root {
+                Some(path) => std::path::PathBuf::from(path),
+                None => std::env::current_dir()
+                    .map_err(|error| Error::Invalid(format!("cannot resolve cwd: {error}")))?,
+            };
+            match greppy_agent::apply_proposal(&target, &ref_name) {
+                Ok(()) => {
+                    println!("applied {ref_name}; existing Git index preserved");
+                    Ok(0)
+                }
+                Err(greppy_agent::WorkspaceError::DirtyTarget { detail, .. })
+                | Err(greppy_agent::WorkspaceError::Conflict { detail, .. }) => {
+                    println!("{detail}");
+                    Ok(agent::EXIT_CONFLICT as i32)
+                }
+                Err(error) => Err(Error::Invalid(error.to_string())),
+            }
+        }
+    }
+}
+
+fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
+    let data_root = greppy_agent::workspace::workspace_data_root()
+        .map_err(|error| Error::Invalid(error.to_string()))?;
+    match command {
+        WorkspaceCommand::Setup => Err(Error::Invalid(
+            "the bundled platform adapter is not present in this development artifact".into(),
+        )),
+        WorkspaceCommand::Doctor { json } => {
+            let provider = greppy_workspace_core::ProviderInstallation::require_healthy(&data_root)
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            provider
+                .doctor_io(&format!("doctor-{}", std::process::id()))
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let workspaces = core
+                .list_workspaces()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let stats = core
+                .chunks()
+                .stats()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "healthy": true,
+                        "provider": provider.manifest(),
+                        "active_workspaces": workspaces.len(),
+                        "chunks": stats,
+                        "smoke": {
+                            "read": true,
+                            "write": true,
+                            "partial_write": true,
+                            "rename": true,
+                            "delete": true
+                        }
+                    }))
+                    .map_err(|error| Error::Invalid(error.to_string()))?
+                );
+            } else {
+                println!(
+                    "portable workspace provider healthy — {:?}, {} active workspace(s)",
+                    provider.manifest().adapter_kind,
+                    workspaces.len()
+                );
+            }
+            Ok(0)
+        }
+        WorkspaceCommand::Status { json } => {
+            let provider = greppy_workspace_core::ProviderInstallation::require_healthy(&data_root)
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let workspaces = core
+                .list_workspaces()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let stats = core
+                .chunks()
+                .stats()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "provider": provider.manifest(),
+                        "workspaces": workspaces,
+                        "chunks": stats
+                    }))
+                    .map_err(|error| Error::Invalid(error.to_string()))?
+                );
+            } else {
+                println!(
+                    "provider {:?} ready; {} workspace(s), {} chunks, {} physical bytes",
+                    provider.manifest().adapter_kind,
+                    workspaces.len(),
+                    stats.chunk_count,
+                    stats.segment_bytes
+                );
+            }
+            Ok(0)
+        }
+        WorkspaceCommand::Gc => {
+            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let report = core
+                .chunks()
+                .gc()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            println!(
+                "workspace GC removed {} unreferenced chunk(s) / {} logical bytes; segments {} → {} bytes",
+                report.removed_chunks,
+                report.removed_logical_bytes,
+                report.segment_bytes_before,
+                report.segment_bytes_after
+            );
+            Ok(0)
+        }
+    }
+}
+
 fn dispatch_subcommand(
     cmd: Command,
     root: Option<&str>,
@@ -1506,6 +1660,8 @@ fn dispatch_subcommand(
         }
         Command::WhereAmI { json } => dispatch_where_am_i(root, json),
         Command::Cache { command } => dispatch_cache(command, root),
+        Command::Agent { command } => dispatch_agent_admin(command, root),
+        Command::Workspace { command } => dispatch_workspace_admin(command),
         Command::Trial { args } => trial::run(args, root),
         Command::SearchGraph { name, json } => {
             let mut q = greppy_search::GraphQuery::any().with_limit(cli_result_limit(50));

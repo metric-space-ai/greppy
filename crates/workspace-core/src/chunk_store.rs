@@ -66,6 +66,15 @@ pub struct ChunkStoreStats {
     pub segment_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ChunkGcReport {
+    pub removed_chunks: u64,
+    pub removed_logical_bytes: u64,
+    pub retained_chunks: u64,
+    pub segment_bytes_before: u64,
+    pub segment_bytes_after: u64,
+}
+
 /// Append-only, content-addressed storage. The SQLite committed length is the
 /// authority for every segment, making a crash between `fsync` and the
 /// metadata commit recoverable by truncating the uncommitted tail.
@@ -105,6 +114,7 @@ impl ChunkStore {
             connection: Mutex::new(connection),
         };
         store.recover_uncommitted_tails()?;
+        store.remove_orphan_segment_files()?;
         Ok(store)
     }
 
@@ -356,6 +366,126 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Compact referenced chunks into fresh append-only segments. Fresh files
+    /// are durable before the SQLite transaction switches every row to them;
+    /// old files are deleted only after that commit. Either side of a crash is
+    /// therefore recoverable without guessing which bytes are authoritative.
+    pub fn gc(&self) -> Result<ChunkGcReport> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        let (before_chunks, before_bytes, before_segments): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(len), 0),
+                        COALESCE((SELECT SUM(committed_len) FROM cow_segments), 0)
+                 FROM cow_chunks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let rows: Vec<(ChunkId, i64, u64, usize, i64)> = {
+            let mut statement = connection.prepare(
+                "SELECT hash, segment_id, payload_offset, len, refs
+                 FROM cow_chunks WHERE refs > 0 ORDER BY hash",
+            )?;
+            let mapped = statement.query_map([], |row| {
+                let hash: Vec<u8> = row.get(0)?;
+                let mut bytes = [0_u8; 32];
+                bytes.copy_from_slice(&hash);
+                Ok((
+                    ChunkId(bytes),
+                    row.get(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as usize,
+                    row.get(4)?,
+                ))
+            })?;
+            mapped.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let old_segments: Vec<i64> = {
+            let mut statement = connection.prepare("SELECT id FROM cow_segments ORDER BY id")?;
+            let values = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            values
+        };
+        let mut segment_id = old_segments.last().copied().unwrap_or(0) + 1;
+        let mut segment_len = 0_u64;
+        let mut segments = vec![(segment_id, 0_u64)];
+        let mut updates = Vec::with_capacity(rows.len());
+        let mut current = new_segment_file(&self.segment_path(segment_id))?;
+        for (id, old_segment, old_offset, len, refs) in &rows {
+            let mut source = File::open(self.segment_path(*old_segment))?;
+            source.seek(SeekFrom::Start(*old_offset))?;
+            let mut bytes = vec![0_u8; *len];
+            source.read_exact(&mut bytes)?;
+            if blake3::hash(&bytes).as_bytes() != &id.0 {
+                return Err(Error::Corrupt(format!(
+                    "chunk {id} failed verification during GC"
+                )));
+            }
+            let record_len = RECORD_HEADER_LEN + *len as u64;
+            if segment_len > 0 && segment_len + record_len > SEGMENT_TARGET_SIZE {
+                current.sync_data()?;
+                segments.last_mut().unwrap().1 = segment_len;
+                segment_id += 1;
+                segment_len = 0;
+                segments.push((segment_id, 0));
+                current = new_segment_file(&self.segment_path(segment_id))?;
+            }
+            current.write_all(RECORD_MAGIC)?;
+            current.write_all(&(*len as u32).to_le_bytes())?;
+            current.write_all(&id.0)?;
+            current.write_all(&bytes)?;
+            updates.push((*id, segment_id, segment_len + RECORD_HEADER_LEN, *refs));
+            segment_len += record_len;
+        }
+        current.sync_data()?;
+        segments.last_mut().unwrap().1 = segment_len;
+        File::open(self.root.join("segments"))?.sync_all()?;
+
+        let transaction = connection.transaction()?;
+        for (id, len) in &segments {
+            transaction.execute(
+                "INSERT INTO cow_segments(id, committed_len) VALUES(?1, ?2)",
+                params![id, *len as i64],
+            )?;
+        }
+        transaction.execute("DELETE FROM cow_chunks WHERE refs = 0", [])?;
+        for (id, new_segment, offset, refs) in &updates {
+            let changed = transaction.execute(
+                "UPDATE cow_chunks
+                 SET segment_id = ?2, payload_offset = ?3, refs = ?4
+                 WHERE hash = ?1",
+                params![&id.0[..], new_segment, *offset as i64, refs],
+            )?;
+            if changed != 1 {
+                return Err(Error::Corrupt(format!("chunk {id} disappeared during GC")));
+            }
+        }
+        for id in &old_segments {
+            transaction.execute("DELETE FROM cow_segments WHERE id = ?1", params![id])?;
+        }
+        transaction.commit()?;
+        for id in old_segments {
+            match fs::remove_file(self.segment_path(id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(self.root.join("segments"))?.sync_all()?;
+        let after_bytes = segments.iter().map(|(_, len)| *len).sum();
+        let retained_logical: i64 = rows.iter().map(|(_, _, _, len, _)| *len as i64).sum();
+        Ok(ChunkGcReport {
+            removed_chunks: (before_chunks - rows.len() as i64) as u64,
+            removed_logical_bytes: (before_bytes - retained_logical) as u64,
+            retained_chunks: rows.len() as u64,
+            segment_bytes_before: before_segments as u64,
+            segment_bytes_after: after_bytes,
+        })
+    }
+
     fn recover_uncommitted_tails(&self) -> Result<()> {
         let segments: Vec<(i64, u64)> = {
             let connection = self
@@ -389,11 +519,45 @@ impl ChunkStore {
         Ok(())
     }
 
+    fn remove_orphan_segment_files(&self) -> Result<()> {
+        let known: std::collections::HashSet<PathBuf> = {
+            let connection = self
+                .connection
+                .lock()
+                .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+            let mut statement = connection.prepare("SELECT id FROM cow_segments")?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .map(|id| id.map(|id| self.segment_path(id)))
+                .collect::<std::result::Result<_, _>>()?;
+            paths
+        };
+        for entry in fs::read_dir(self.root.join("segments"))? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "gcws")
+                && !known.contains(&path)
+            {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn segment_path(&self, segment_id: i64) -> PathBuf {
         self.root
             .join("segments")
             .join(format!("{segment_id:016x}.gcws"))
     }
+}
+
+fn new_segment_file(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)?)
 }
 
 #[cfg(test)]
@@ -445,5 +609,22 @@ mod tests {
         let recovered = ChunkStore::open(temp.path()).unwrap();
         assert_eq!(fs::metadata(&segment).unwrap().len(), committed);
         assert_eq!(recovered.read(id).unwrap(), b"committed");
+    }
+
+    #[test]
+    fn gc_rewrites_only_referenced_chunks_and_keeps_them_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(temp.path()).unwrap();
+        let kept = store.put(b"kept").unwrap();
+        store.pin(kept).unwrap();
+        let removed = store.put(b"remove-me").unwrap();
+        let before = store.stats().unwrap();
+        let report = store.gc().unwrap();
+        assert_eq!(report.removed_chunks, 1);
+        assert_eq!(report.retained_chunks, 1);
+        assert!(report.segment_bytes_after < before.segment_bytes);
+        assert_eq!(store.read(kept).unwrap(), b"kept");
+        assert!(store.read(removed).is_err());
+        store.verify().unwrap();
     }
 }

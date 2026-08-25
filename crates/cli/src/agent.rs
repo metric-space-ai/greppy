@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, ValueEnum};
-use greppy_agent::workspace::{CreateOptions, WorkspaceBackend};
+use clap::Parser;
 use greppy_agent::{
     run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
     LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
@@ -30,12 +29,12 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-One-shot coding agent. Uses an exact Filesystem-CoW workspace when available
-and falls back before model startup to the native 0.3.2 Git-worktree path.
-Tracked content is pinned to HEAD; ignored build caches are kept deliberately
-for speed unless --fresh is passed. It delivers a proposal ref
-(refs/greppy/agent/<run_id>); inspect with `git show` or apply with
-`git cherry-pick -n`. The agent has exactly one tool — `greppy` — covering
+One-shot coding agent. Uses the installed portable Chunk-CoW provider and
+fails before the first model request when its adapter or persistent mount is
+not healthy. The immutable baseline includes the pinned commit plus visible
+staged, unstaged and untracked state; ignored files are excluded. It delivers
+a baseline-bound proposal ref (refs/greppy/agent/<run_id>); inspect it with
+`git show` or apply it with `greppy agent apply REF`. The agent has exactly one tool — `greppy` — covering
 search/navigate/read/edit; commands run through that tool as
 `bash-smart -- CMD`. The tool is write-confined to the worktree, a per-run
 scratch dir (TMPDIR), the worktree's greppy store + lock namespace, and
@@ -59,7 +58,6 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
-                   [--fresh] [--workspace-backend auto|native|cow]
                    [--no-sandbox] [--skip-selfcheck]
   greppy -p --help
 
@@ -71,15 +69,10 @@ Flags:
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
                       the loop stops between turns only — a running command is
                       never cut in half
-  --apply             Cherry-pick the proposal into the current checkout
-                      (staged, not committed)
+  --apply             Apply only the Agent delta to the exact captured baseline;
+                      the existing Git index remains byte-identical
   --diff              Print the full proposal patch after the stat
-  --keep-worktree     Leave a CoW or temporary workspace on disk after success
-  --fresh             Drop ignored files too (truly pristine tree; default keeps
-                      ignored build caches)
-  --workspace-backend Select auto (O(1)-metadata CoW with native fallback),
-                      native, or cow (require exact CoW, including reflink-tree
-                      backends); env GREPPY_WORKSPACE_BACKEND
+  --keep-worktree     Preserve the portable namespace and private delta
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
 
@@ -128,23 +121,9 @@ pub struct AgentArgs {
     #[arg(long)]
     pub diff: bool,
 
-    /// Keep a temporary fallback worktree after a successful run.
+    /// Preserve the portable namespace and private delta after a successful run.
     #[arg(long)]
     pub keep_worktree: bool,
-
-    /// Drop ignored files on worktree reset (truly pristine; default keeps
-    /// ignored build caches so repeat runs stay fast).
-    #[arg(long)]
-    pub fresh: bool,
-
-    /// Workspace allocator: CoW with native fallback, native only, or required CoW.
-    #[arg(
-        long,
-        env = "GREPPY_WORKSPACE_BACKEND",
-        value_enum,
-        default_value_t = WorkspaceBackendArg::Auto
-    )]
-    pub workspace_backend: WorkspaceBackendArg,
 
     /// Disable shared immutable Base Store reuse for this run and build a
     /// complete private index. Intended for diagnostics and safe fallback.
@@ -180,23 +159,6 @@ pub struct AgentArgs {
         require_equals = false,
     )]
     pub skip_selfcheck: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum WorkspaceBackendArg {
-    Auto,
-    Native,
-    Cow,
-}
-
-impl From<WorkspaceBackendArg> for WorkspaceBackend {
-    fn from(value: WorkspaceBackendArg) -> Self {
-        match value {
-            WorkspaceBackendArg::Auto => Self::Auto,
-            WorkspaceBackendArg::Native => Self::Native,
-            WorkspaceBackendArg::Cow => Self::Cow,
-        }
-    }
 }
 
 /// True when argv (after greppy-owned globals) starts with `-p`.
@@ -289,14 +251,7 @@ fn run_agent(args: AgentArgs) -> u8 {
     // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
     // worktree is created and BEFORE contacting the gateway.
     let run_id = make_run_id();
-    let workspace = match AgentWorkspace::create_with_options(
-        &cwd,
-        &run_id,
-        CreateOptions {
-            fresh: args.fresh,
-            backend: args.workspace_backend.into(),
-        },
-    ) {
+    let workspace = match AgentWorkspace::create(&cwd, &run_id) {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {
             // Stable user-facing message for the submodule case; fall back to
@@ -312,10 +267,9 @@ fn run_agent(args: AgentArgs) -> u8 {
             }
             return EXIT_USAGE;
         }
-        Err(WorkspaceError::CowUnavailable(reason)) => {
-            eprintln!(
-                "greppy -p: --workspace-backend cow was requested, but Filesystem-CoW is unavailable: {reason}"
-            );
+        Err(WorkspaceError::AdapterUnavailable(reason)) => {
+            eprintln!("greppy -p: portable CoW adapter is unavailable: {reason}");
+            eprintln!("run `greppy workspace setup`, then `greppy workspace doctor --json`");
             return EXIT_USAGE;
         }
         Err(e @ WorkspaceError::Tampered { .. }) => {
@@ -656,8 +610,11 @@ fn run_agent(args: AgentArgs) -> u8 {
         // Conflict is exit 4 (error-ish): keep worktree.
         keep_worktree_on_error(&workspace);
     } else {
-        // keep_worktree: drop without cleanup.
         let path = workspace.worktree_path().display().to_string();
+        if let Err(error) = workspace.keep() {
+            let _ = writeln!(stderr, "greppy -p: cannot preserve workspace: {error}");
+            return EXIT_AGENT;
+        }
         let _ = writeln!(stderr, "worktree kept: {path}");
         drop(workspace);
     }
@@ -729,6 +686,9 @@ fn format_tool_start(name: &str, arguments: &serde_json::Value) -> String {
 }
 
 fn keep_worktree_on_error(workspace: &AgentWorkspace) {
+    if let Err(error) = workspace.keep() {
+        eprintln!("greppy -p: could not mark failed workspace as kept: {error}");
+    }
     eprintln!(
         "worktree kept for debugging: {}",
         workspace.worktree_path().display()
@@ -1098,8 +1058,6 @@ mod tests {
             "--apply",
             "--diff",
             "--keep-worktree",
-            "--workspace-backend",
-            "cow",
         ])
         .expect("parse");
         assert_eq!(a.task.as_deref(), Some("fix the bug"));
@@ -1110,9 +1068,7 @@ mod tests {
         assert!(a.apply);
         assert!(a.diff);
         assert!(a.keep_worktree);
-        assert_eq!(a.workspace_backend, WorkspaceBackendArg::Cow);
         assert!(!a.no_sandbox);
-        assert!(!a.fresh);
     }
 
     /// Serializes the tests that mutate `GREPPY_DEADLINE_SECS`.
@@ -1135,7 +1091,6 @@ mod tests {
         assert!(!a.diff);
         assert!(!a.keep_worktree);
         assert!(!a.no_sandbox);
-        assert!(!a.fresh);
         match prev {
             Some(v) => std::env::set_var("GREPPY_DEADLINE_SECS", v),
             None => std::env::remove_var("GREPPY_DEADLINE_SECS"),
@@ -1173,9 +1128,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_fresh_flag() {
-        let a = parse(&["do it", "--model", "m", "--fresh"]).expect("parse");
-        assert!(a.fresh);
+    fn removed_workspace_backend_and_fresh_flags_are_rejected() {
+        assert!(parse(&["do it", "--model", "m", "--fresh"]).is_err());
+        assert!(parse(&["do it", "--model", "m", "--workspace-backend", "native",]).is_err());
     }
 
     #[test]
@@ -1211,8 +1166,6 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
-            fresh: false,
-            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
@@ -1231,8 +1184,6 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
-            fresh: false,
-            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
@@ -1281,13 +1232,11 @@ mod tests {
             "help must mention --skip-selfcheck: {help}"
         );
         assert!(
-            help.contains("--fresh") || help.contains("fresh"),
-            "help must mention --fresh: {help}"
+            help.contains("ignored files are excluded"),
+            "help must document ignored-file exclusion: {help}"
         );
-        assert!(
-            help.contains("ignored build caches") || help.contains("ignored files"),
-            "help must document ignored-cache default: {help}"
-        );
+        assert!(!help.contains("--workspace-backend"), "help={help}");
+        assert!(!help.contains("--fresh"), "help={help}");
         assert!(
             help.contains("network") || help.contains("reads and network"),
             "help must note network stays open: {help}"
@@ -1402,21 +1351,6 @@ mod tests {
             "locks {locks:?} must live under agent data {agent_data:?}"
         );
 
-        // Stable-worktree lock path must lie outside every granted root.
-        let fake_repo = unique("fake-repo");
-        fs::create_dir_all(&fake_repo).unwrap();
-        let lock = greppy_agent::workspace::stable_lock_path_for(&fake_repo);
-        for r in &roots {
-            // Only treat as contained when lock is strictly under a granted root.
-            if lock.starts_with(r) && lock != *r {
-                panic!(
-                    "lock {} must not live under granted root {}",
-                    lock.display(),
-                    r.display()
-                );
-            }
-        }
-
         match prev_store {
             Some(v) => std::env::set_var("GREPPY_STORE_DIR", v),
             None => std::env::remove_var("GREPPY_STORE_DIR"),
@@ -1424,7 +1358,6 @@ mod tests {
         let _ = fs::remove_dir_all(&wt);
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&agent_data);
-        let _ = fs::remove_dir_all(&fake_repo);
     }
 
     #[test]
@@ -1438,8 +1371,6 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
-            fresh: false,
-            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: true,
             skip_selfcheck: false,
@@ -1469,8 +1400,6 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
-            fresh: false,
-            workspace_backend: WorkspaceBackendArg::Auto,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,

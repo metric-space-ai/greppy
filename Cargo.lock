@@ -746,6 +746,7 @@ dependencies = [
  "greppy-qwen35-native",
  "greppy-search",
  "greppy-store",
+ "greppy-workspace-core",
  "libc",
  "regex",
  "rusqlite",
@@ -761,11 +762,12 @@ dependencies = [
 name = "greppy-agent"
 version = "0.3.3"
 dependencies = [
- "greppy-rift-core",
+ "greppy-workspace-core",
  "landlock",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "ureq",
  "windows-sys 0.61.2",
 ]
@@ -978,17 +980,6 @@ dependencies = [
  "greppy-store",
  "thiserror 1.0.69",
  "tracing",
-]
-
-[[package]]
-name = "greppy-rift-core"
-version = "0.1.0"
-source = "git+https://github.com/mkh-welsch/rift?rev=151100550fca311563ee8323d045a12182dead7c#151100550fca311563ee8323d045a12182dead7c"
-dependencies = [
- "libc",
- "serde",
- "thiserror 2.0.18",
- "walkdir",
 ]
 
 [[package]]

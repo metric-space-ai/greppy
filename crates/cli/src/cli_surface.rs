@@ -99,6 +99,16 @@ pub enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// Manage persisted agent proposals.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Install, inspect and maintain the portable CoW provider.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// Run one isolated own-project baseline/Greppy observation with Pi.
     Trial {
         #[command(flatten)]

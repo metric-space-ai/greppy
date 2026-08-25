@@ -33,6 +33,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod sandbox;
 pub mod wire;
+#[path = "portable_workspace.rs"]
 pub mod workspace;
 
 pub use agent_loop::{run_agent_loop, AgentConfig, LoopError, LoopEvent, LoopResult, LoopStop};
@@ -49,4 +50,4 @@ pub use protocol::{
 };
 pub use sandbox::{SandboxError, SandboxMode, SandboxSpec};
 pub use wire::{to_messages_request_body, SseItem, SseParser};
-pub use workspace::{AgentWorkspace, RunOutcome, WorkspaceError};
+pub use workspace::{apply_proposal, AgentWorkspace, RunOutcome, WorkspaceError};
