@@ -27,6 +27,11 @@ Btrfs, and Linux reflink mechanics plus capability probing and cleanup. The
 former Rift CLI, registry, hooks, FFI, workspace policy, and compatibility
 surface are not part of Greppy.
 
+Windows agent workspaces and sandbox Cargo paths now resolve from native
+`LOCALAPPDATA`/`USERPROFILE` roots instead of falling through a Unix-only
+`HOME` assumption to a mixed `/.cache\\...` path. The Windows CI executes the
+agent workspace suite so this native-fallback contract cannot regress silently.
+
 ## [0.3.2] — 2026-08-24
 
 ### Parallel Agent Store CoW

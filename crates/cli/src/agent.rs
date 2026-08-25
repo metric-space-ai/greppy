@@ -940,11 +940,14 @@ fn cargo_home_dir() -> std::path::PathBuf {
 }
 
 fn home_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return std::path::PathBuf::from(profile);
+    }
     if let Some(h) = std::env::var_os("HOME") {
         return std::path::PathBuf::from(h);
     }
-    // Last-resort fallback; should not matter on real agent hosts.
-    std::path::PathBuf::from("/")
+    std::env::temp_dir()
 }
 
 /// Ensure the worktree's greppy index is usable before the first agent turn.

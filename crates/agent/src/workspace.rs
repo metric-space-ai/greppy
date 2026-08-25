@@ -872,7 +872,17 @@ fn platform_user_cache_dir() -> PathBuf {
     {
         home_dir().join("Library").join("Caches")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data);
+        }
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(user_profile).join("AppData").join("Local");
+        }
+        std::env::temp_dir()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
             return PathBuf::from(xdg);
@@ -882,10 +892,14 @@ fn platform_user_cache_dir() -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile);
+    }
     if let Some(h) = std::env::var_os("HOME") {
         return PathBuf::from(h);
     }
-    PathBuf::from("/")
+    std::env::temp_dir()
 }
 
 /// Create or reuse `stable_dir` as a detached worktree at `base_commit`.
