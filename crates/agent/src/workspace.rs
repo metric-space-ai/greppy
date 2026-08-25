@@ -291,6 +291,7 @@ impl AgentWorkspace {
                         &stable_dir,
                         &base_commit,
                         options.fresh,
+                        false,
                     )?;
                     Ok(Self {
                         repo_root: toplevel,
@@ -328,6 +329,7 @@ impl AgentWorkspace {
                         &stable_dir,
                         &base_commit,
                         options.fresh,
+                        false,
                     )?;
                     Ok(Self {
                         repo_root: toplevel,
@@ -847,7 +849,7 @@ fn create_cow_from_template(
         // Publish readiness last. A killed or failed preparation leaves no
         // trusted marker, so the next creator rebuilds under the same lock.
         let _ = fs::remove_file(&ready_path);
-        prepare_stable_worktree(repo_root, &template, base_commit, true)?;
+        prepare_stable_worktree(repo_root, &template, base_commit, true, true)?;
         fs::write(&ready_path, format!("{base_commit}\n"))?;
     }
     let worktree = snapshot_cow_workspace(&template, run_id, require_constant_time_metadata)?;
@@ -1012,6 +1014,7 @@ fn prepare_stable_worktree(
     stable_dir: &Path,
     base_commit: &str,
     fresh: bool,
+    prepare_snapshot_source: bool,
 ) -> Result<PathBuf, WorkspaceError> {
     if let Some(parent) = stable_dir.parent() {
         fs::create_dir_all(parent)?;
@@ -1053,7 +1056,26 @@ fn prepare_stable_worktree(
         git_ok_cwd(repo_root, &["worktree", "prune"])?;
     }
 
-    add_worktree_with_stale_recovery(repo_root, stable_dir, base_commit, fresh)
+    prepare_snapshot_source_if_needed(stable_dir, prepare_snapshot_source)?;
+    add_worktree_with_stale_recovery(
+        repo_root,
+        stable_dir,
+        base_commit,
+        fresh,
+        prepare_snapshot_source,
+    )
+}
+
+fn prepare_snapshot_source_if_needed(path: &Path, enabled: bool) -> Result<(), WorkspaceError> {
+    if enabled && !path.exists() {
+        greppy_rift_core::prepare_snapshot_source(path).map_err(|error| {
+            WorkspaceError::CowUnavailable(format!(
+                "failed to prepare native CoW template source {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Force-remove a (possibly tampered) worktree using only main-repo commands and
@@ -1125,12 +1147,14 @@ fn add_worktree_with_stale_recovery(
     worktree: &Path,
     base_commit: &str,
     fresh: bool,
+    prepare_snapshot_source: bool,
 ) -> Result<PathBuf, WorkspaceError> {
     match add_worktree_and_record(repo_root, worktree, base_commit, fresh) {
         Ok(linked) => Ok(linked),
         Err(e) if should_recover_stale_worktree_add(repo_root, worktree, &e) => {
             discard_worktree_from_main(repo_root, worktree)?;
             // Exactly one retry — no loop.
+            prepare_snapshot_source_if_needed(worktree, prepare_snapshot_source)?;
             add_worktree_and_record(repo_root, worktree, base_commit, fresh)
         }
         Err(e) => Err(e),
@@ -4094,6 +4118,7 @@ gitdir /tmp/second-meta
             &repo,
             &wt,
             "0000000000000000000000000000000000000000",
+            false,
             false,
         )
         .expect_err("invalid base must fail");

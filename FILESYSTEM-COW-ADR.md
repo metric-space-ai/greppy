@@ -12,11 +12,12 @@ shipping Rift as a workspace manager or building a custom virtual filesystem.
 
 The dependency is `greppy-rift-core` from
 <https://github.com/mkh-welsch/rift>, pinned at
-`319bbd1b5a31a88d3cf1cb929e50139178d12a30`. Its audited upstream base is
+`2a6a47c1e2d5b188a1883c461d25eeb4c4cf383b`. Its audited upstream base is
 `anomalyco/rift` commit
 `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`. The retained API is limited to
-capability probing, exact snapshot creation, and snapshot removal. Greppy owns
-template preparation, private Git state, locking, fallback, sandbox roots,
+creating an empty snapshot-source container, capability probing, exact snapshot
+creation, and snapshot removal. Greppy owns template population, private Git
+state, locking, fallback, sandbox roots,
 proposal publication, diagnostics, and lifecycle policy.
 
 ## Why a hard fork
@@ -88,7 +89,9 @@ blast-radius analysis, and a regression test.
 ## Evidence and remaining gates
 
 The pinned fork commit passed its macOS, Linux, Btrfs, XFS-reflink, and
-ext4-unsupported CI matrix in GitHub Actions run `32814344750`. A controlled
+ext4-unsupported CI matrix in GitHub Actions run `32815769162`, including
+creation of the empty Btrfs source subvolume through the retained Rust API
+rather than an external helper. A controlled
 300,000-file macOS release-gate run on the preceding revision showed APFS
 directory `clonefile` still inside the recursive clone after six minutes. The
 current dependency therefore reports APFS metadata traversal truthfully and
