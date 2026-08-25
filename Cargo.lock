@@ -949,7 +949,7 @@ dependencies = [
 [[package]]
 name = "greppy-rift-core"
 version = "0.1.0"
-source = "git+https://github.com/mkh-welsch/rift?rev=2a6a47c1e2d5b188a1883c461d25eeb4c4cf383b#2a6a47c1e2d5b188a1883c461d25eeb4c4cf383b"
+source = "git+https://github.com/mkh-welsch/rift?rev=151100550fca311563ee8323d045a12182dead7c#151100550fca311563ee8323d045a12182dead7c"
 dependencies = [
  "libc",
  "serde",

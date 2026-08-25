@@ -33,6 +33,11 @@ remain exact explicit-preview backends, but `auto` does not select them because
 both traverse repository metadata; Windows continues to use the native
 fallback.
 
+Btrfs templates are created and sealed read-only through the retained native
+API. A warm snapshot may bypass the repeated full-tree cleanliness traversal
+only when capability probing confirms both constant-time metadata and the
+filesystem-enforced immutable source; other backends retain validation.
+
 Windows agent workspaces and sandbox Cargo paths now resolve from native
 `LOCALAPPDATA`/`USERPROFILE` roots instead of falling through a Unix-only
 `HOME` assumption to a mixed `/.cache\\...` path. The Windows CI executes the

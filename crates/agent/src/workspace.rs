@@ -775,7 +775,7 @@ fn snapshot_cow_workspace(
     template: &Path,
     run_id: &str,
     require_constant_time_metadata: bool,
-) -> Result<PathBuf, WorkspaceError> {
+) -> Result<(PathBuf, bool), WorkspaceError> {
     let destination = cow_worktree_dir(template, run_id);
     if destination.exists() {
         return Err(WorkspaceError::CowUnavailable(format!(
@@ -805,15 +805,24 @@ fn snapshot_cow_workspace(
     greppy_rift_core::snapshot_exact(template, &destination).map_err(|error| {
         WorkspaceError::CowUnavailable(format!("native CoW snapshot failed: {error}"))
     })?;
-    Ok(destination)
+    Ok((
+        destination,
+        capability.constant_time_metadata && capability.source_immutable,
+    ))
 }
 
 fn finish_cow_workspace(
     destination: PathBuf,
     main_common_git_dir: &Path,
     base_commit: &str,
+    source_was_immutable: bool,
 ) -> Result<(PathBuf, PathBuf), WorkspaceError> {
-    match setup_private_git(&destination, main_common_git_dir, base_commit) {
+    match setup_private_git(
+        &destination,
+        main_common_git_dir,
+        base_commit,
+        !source_was_immutable,
+    ) {
         Ok(private_git_dir) => Ok((destination, private_git_dir)),
         Err(setup_error) => match greppy_rift_core::remove_snapshot(&destination) {
             Ok(_) => Err(setup_error),
@@ -849,14 +858,35 @@ fn create_cow_from_template(
         // Publish readiness last. A killed or failed preparation leaves no
         // trusted marker, so the next creator rebuilds under the same lock.
         let _ = fs::remove_file(&ready_path);
+        if template.exists() {
+            greppy_rift_core::set_snapshot_source_immutable(&template, false).map_err(|error| {
+                WorkspaceError::CowUnavailable(format!(
+                    "failed to unseal stale CoW template {}: {error}",
+                    template.display()
+                ))
+            })?;
+            discard_worktree_from_main(repo_root, &template)?;
+        }
         prepare_stable_worktree(repo_root, &template, base_commit, true, true)?;
+        greppy_rift_core::set_snapshot_source_immutable(&template, true).map_err(|error| {
+            WorkspaceError::CowUnavailable(format!(
+                "failed to seal CoW template {}: {error}",
+                template.display()
+            ))
+        })?;
         fs::write(&ready_path, format!("{base_commit}\n"))?;
     }
-    let worktree = snapshot_cow_workspace(&template, run_id, require_constant_time_metadata)?;
+    let (worktree, source_was_immutable) =
+        snapshot_cow_workspace(&template, run_id, require_constant_time_metadata)?;
     // The template stays immutable while the native snapshot is taken. Private
     // Git setup mutates only the destination and can proceed concurrently.
     drop(lock);
-    let result = finish_cow_workspace(worktree, main_common_git_dir, base_commit);
+    let result = finish_cow_workspace(
+        worktree,
+        main_common_git_dir,
+        base_commit,
+        source_was_immutable,
+    );
     if result.is_err() {
         // A template that cloned but failed the private-Git cleanliness check
         // is no longer trusted. The next creator rebuilds it under the lock.
@@ -869,6 +899,7 @@ fn setup_private_git(
     worktree: &Path,
     main_common_git_dir: &Path,
     base_commit: &str,
+    verify_snapshot_clean: bool,
 ) -> Result<PathBuf, WorkspaceError> {
     let control = worktree.join(".git");
     let metadata = fs::symlink_metadata(&control).map_err(WorkspaceError::Io)?;
@@ -908,18 +939,20 @@ fn setup_private_git(
     fs::write(private_git_dir.join("HEAD"), format!("{base_commit}\n"))?;
     git_ok_wt(&private_git_dir, worktree, &["read-tree", base_commit])?;
 
-    let status = git_run_wt(
-        &private_git_dir,
-        worktree,
-        &["status", "--porcelain=v1", "-z"],
-    )?;
-    if !status.status.success() {
-        return Err(git_failed("git status --porcelain=v1 -z", &status));
-    }
-    if !status.stdout.is_empty() {
-        return Err(WorkspaceError::CowUnavailable(
-            "CoW snapshot and pinned base tree differ before agent startup".into(),
-        ));
+    if verify_snapshot_clean {
+        let status = git_run_wt(
+            &private_git_dir,
+            worktree,
+            &["status", "--porcelain=v1", "-z"],
+        )?;
+        if !status.status.success() {
+            return Err(git_failed("git status --porcelain=v1 -z", &status));
+        }
+        if !status.stdout.is_empty() {
+            return Err(WorkspaceError::CowUnavailable(
+                "CoW snapshot and pinned base tree differ before agent startup".into(),
+            ));
+        }
     }
     Ok(private_git_dir)
 }
@@ -2232,6 +2265,7 @@ mod tests {
     fn destroy_stable(repo: &Path, ws_path: &Path) {
         let _ = git_run_cwd(repo, &["worktree", "prune"]);
         if ws_path.exists() {
+            let _ = greppy_rift_core::set_snapshot_source_immutable(ws_path, false);
             let _ = Command::new("git")
                 .args([
                     "worktree",
@@ -2327,30 +2361,50 @@ mod tests {
         let template = cow_template_dir(&repo);
         let ready = cow_template_ready_path(&template);
         assert!(ready.is_file());
-        std::fs::write(template.join("hello.txt"), b"tampered template\n").unwrap();
-
-        let failed = AgentWorkspace::create_with_options(
-            &repo,
-            &unique_tag("run-cow-template-tampered"),
-            CreateOptions {
-                fresh: true,
-                backend: WorkspaceBackend::Cow,
-            },
-        );
-        assert!(matches!(failed, Err(WorkspaceError::CowUnavailable(_))));
-        assert!(!ready.exists(), "failed validation must revoke readiness");
-
-        let recovered = AgentWorkspace::create_with_options(
-            &repo,
-            &unique_tag("run-cow-template-recovered"),
-            CreateOptions {
-                fresh: true,
-                backend: WorkspaceBackend::Cow,
-            },
+        let capability = greppy_rift_core::probe(
+            &template,
+            template.parent().expect("template destination root"),
         )
-        .expect("next CoW creation rebuilds the template");
-        assert!(git_c(recovered.worktree_path(), &["status", "--porcelain"]).is_empty());
-        recovered.cleanup().expect("cleanup recovered workspace");
+        .expect("probe prepared template");
+        let tamper = std::fs::write(template.join("hello.txt"), b"tampered template\n");
+        if capability.source_immutable {
+            assert!(tamper.is_err(), "sealed template accepted a source write");
+            let protected = AgentWorkspace::create_with_options(
+                &repo,
+                &unique_tag("run-cow-template-protected"),
+                CreateOptions {
+                    fresh: true,
+                    backend: WorkspaceBackend::Cow,
+                },
+            )
+            .expect("sealed template remains usable");
+            protected.cleanup().expect("cleanup protected workspace");
+            assert!(ready.exists(), "rejected tamper must retain readiness");
+        } else {
+            tamper.expect("tamper unsealed template");
+            let failed = AgentWorkspace::create_with_options(
+                &repo,
+                &unique_tag("run-cow-template-tampered"),
+                CreateOptions {
+                    fresh: true,
+                    backend: WorkspaceBackend::Cow,
+                },
+            );
+            assert!(matches!(failed, Err(WorkspaceError::CowUnavailable(_))));
+            assert!(!ready.exists(), "failed validation must revoke readiness");
+
+            let recovered = AgentWorkspace::create_with_options(
+                &repo,
+                &unique_tag("run-cow-template-recovered"),
+                CreateOptions {
+                    fresh: true,
+                    backend: WorkspaceBackend::Cow,
+                },
+            )
+            .expect("next CoW creation rebuilds the template");
+            assert!(git_c(recovered.worktree_path(), &["status", "--porcelain"]).is_empty());
+            recovered.cleanup().expect("cleanup recovered workspace");
+        }
 
         destroy_stable(&repo, &template);
         let _ = fs::remove_file(ready);

@@ -449,6 +449,10 @@ directory `clonefile` and Linux per-file `FICLONE` preserve file data with CoW
 but traverse the directory namespace, so they are available only through the
 explicit `cow` preview path; `auto` keeps the native 0.3.2 workspace on those
 filesystems. Windows also keeps the native backend and rejects forced `cow`.
+On Btrfs, the reusable template is sealed with the kernel read-only subvolume
+flag before its readiness marker is published. Greppy skips the repeated
+full-tree startup validation only when probing verifies both that seal and the
+constant-metadata snapshot capability.
 
 Full source bodies are not duplicated into SQLite. Exact code search reads the
 current worktree through real `grep` where available, with an in-binary literal

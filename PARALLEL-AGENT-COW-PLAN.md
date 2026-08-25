@@ -506,10 +506,10 @@ section 3.2 rather than left as open-ended cleanup.
 
 [Rift](https://github.com/anomalyco/rift) was evaluated as the mandatory
 reference implementation. The binding decision is a hard, purpose-specific
-fork: `greppy-rift-core` retains only empty snapshot-source preparation,
-writable Btrfs snapshots, Linux per-file reflinks, APFS `clonefile`, probing,
-receipts, and removal. The dependency is
-pinned at `2a6a47c1e2d5b188a1883c461d25eeb4c4cf383b`; provenance and rationale are
+fork: `greppy-rift-core` retains only empty snapshot-source preparation, Btrfs
+read-only source sealing and writable snapshots, Linux per-file reflinks, APFS
+`clonefile`, probing, receipts, and removal. The dependency is
+pinned at `151100550fca311563ee8323d045a12182dead7c`; provenance and rationale are
 recorded in `FILESYSTEM-COW-ADR.md` and `THIRD_PARTY.md`.
 
 Rift does not replace Store-CoW in 0.3.2: it clones filesystem workspaces, not

@@ -102,11 +102,11 @@ SBOM, model notices, checksums, signatures, or build provenance are missing.
   `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`.
 - Greppy hard fork: [`mkh-welsch/rift`](https://github.com/mkh-welsch/rift),
   package `greppy-rift-core`, pinned by `Cargo.lock` and `Cargo.toml` at
-  `2a6a47c1e2d5b188a1883c461d25eeb4c4cf383b`.
+  `151100550fca311563ee8323d045a12182dead7c`.
 - License: MIT; see `licenses/RIFT-MIT.txt`.
-- Retained scope: empty snapshot-source preparation, APFS `clonefile`, Btrfs
-  subvolume snapshot/removal, Linux `FICLONE`, capability probing, and exact
-  snapshot receipts.
+- Retained scope: empty snapshot-source preparation, Btrfs read-only source
+  sealing, APFS `clonefile`, Btrfs subvolume snapshot/removal, Linux `FICLONE`,
+  capability probing, and exact snapshot receipts.
 
 The fork deliberately removed Rift's CLI, JavaScript/Bun/Node FFI, workspace
 manager, SQLite registry, hooks, markers, Git policy, filtered-copy behavior,

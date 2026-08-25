@@ -12,12 +12,13 @@ shipping Rift as a workspace manager or building a custom virtual filesystem.
 
 The dependency is `greppy-rift-core` from
 <https://github.com/mkh-welsch/rift>, pinned at
-`2a6a47c1e2d5b188a1883c461d25eeb4c4cf383b`. Its audited upstream base is
+`151100550fca311563ee8323d045a12182dead7c`. Its audited upstream base is
 `anomalyco/rift` commit
 `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`. The retained API is limited to
-creating an empty snapshot-source container, capability probing, exact snapshot
-creation, and snapshot removal. Greppy owns template population, private Git
-state, locking, fallback, sandbox roots,
+creating an empty snapshot-source container, setting and verifying native
+source immutability, capability probing, exact snapshot creation, and snapshot
+removal. Greppy owns template population, private Git state, locking, fallback,
+sandbox roots,
 proposal publication, diagnostics, and lifecycle policy.
 
 ## Why a hard fork
@@ -58,6 +59,12 @@ constant-metadata contract. APFS directory `clonefile` and Linux per-file
 `FICLONE` are exact CoW implementations but walk the namespace; they are
 explicit `cow` previews and are not selected by `auto`.
 
+Before publishing a Btrfs template ready marker, Greppy sets and verifies the
+kernel read-only subvolume flag. Only a constant-metadata snapshot from that
+filesystem-enforced immutable source may skip the otherwise mandatory
+post-snapshot full-tree `git status` validation. APFS and per-file reflink
+previews keep that validation.
+
 A CoW workspace receives a real private `.git` directory. The pinned base
 repository's objects are readable through `.git/objects/info/alternates`; the
 workspace's index, refs, new objects, and commits remain private. `finish`
@@ -89,9 +96,9 @@ blast-radius analysis, and a regression test.
 ## Evidence and remaining gates
 
 The pinned fork commit passed its macOS, Linux, Btrfs, XFS-reflink, and
-ext4-unsupported CI matrix in GitHub Actions run `32815769162`, including
-creation of the empty Btrfs source subvolume through the retained Rust API
-rather than an external helper. A controlled
+ext4-unsupported CI matrix in GitHub Actions run `32818350976`, including
+creation of the empty Btrfs source subvolume and enforcement of its read-only
+seal through the retained Rust API rather than an external helper. A controlled
 300,000-file macOS release-gate run on the preceding revision showed APFS
 directory `clonefile` still inside the recursive clone after six minutes. The
 current dependency therefore reports APFS metadata traversal truthfully and
