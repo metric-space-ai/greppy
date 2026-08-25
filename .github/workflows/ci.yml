@@ -49,6 +49,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
+      - name: Reject tracked files covered by .gitignore
+        shell: bash
+        run: |
+          tracked_ignored="$(git ls-files -ci --exclude-standard)"
+          if [[ -n "$tracked_ignored" ]]; then
+            echo "Tracked files must not also be ignored:" >&2
+            echo "$tracked_ignored" >&2
+            exit 1
+          fi
+
       # This job intentionally does not fetch Git LFS. Its debug-only,
       # compile-guarded sentinel assets keep black-box CLI process startup
       # small; `real-assets-link` verifies the actual product payloads.

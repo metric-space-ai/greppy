@@ -2,7 +2,7 @@
 //! retirement pin for the pre-0.3.0 name `search-code` whose literal-search
 //! contract this file used to pin.
 //!
-//! 0.3.0 contract (dev/SEARCH-OUTPUT-SPEC.md, normative):
+//! 0.3.0 CLI contract (normative):
 //! * `search-code` is dead vocabulary: refused as an unknown subcommand
 //!   (exit 64) before grep passthrough — never grepped, never answered.
 //! * `search-pattern` is regex-native: a pattern with metacharacters is
