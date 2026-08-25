@@ -54,7 +54,11 @@ jobs:
 
       - name: Build FSKit Rust static library
         if: runner.os == 'macOS'
-        run: cargo build -p greppy-workspace-ffi --release --locked
+        run: |
+          cargo build -p greppy-workspace-ffi --release --locked
+          swiftc -typecheck \
+            -I crates/workspace-ffi/include \
+            platform/macos/GreppyWorkspaceFS/RustWorkspaceCore.swift
 
   linux-fuse3:
     name: Linux FUSE3 provider

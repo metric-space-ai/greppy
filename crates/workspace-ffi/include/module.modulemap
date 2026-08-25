@@ -1,0 +1,4 @@
+module GreppyWorkspaceCore {
+    header "greppy_workspace.h"
+    export *
+}
