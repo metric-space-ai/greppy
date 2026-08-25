@@ -1910,6 +1910,26 @@ mod tests {
         root
     }
 
+    fn create_cow_fixture(repo: &Path, run_id: &str) -> Option<AgentWorkspace> {
+        match AgentWorkspace::create_with_options(
+            repo,
+            run_id,
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        ) {
+            Ok(workspace) => Some(workspace),
+            Err(WorkspaceError::CowUnavailable(detail))
+                if std::env::var_os("GREPPY_REQUIRE_COW_TESTS").is_none() =>
+            {
+                eprintln!("skipping native CoW integration test: {detail}");
+                None
+            }
+            Err(error) => panic!("create CoW workspace: {error}"),
+        }
+    }
+
     fn clone_fixture(src: &Path) -> PathBuf {
         let dst = std::env::temp_dir().join(unique_tag("greppy-ws-clone"));
         let out = Command::new("git")
@@ -1969,15 +1989,12 @@ mod tests {
         let repo = init_fixture("greppy-ws-cow");
         let main_before = main_checkout_fingerprint(&repo);
         let run_id = unique_tag("run-cow");
-        let ws = AgentWorkspace::create_with_options(
-            &repo,
-            &run_id,
-            CreateOptions {
-                fresh: true,
-                backend: WorkspaceBackend::Cow,
-            },
-        )
-        .expect("create CoW workspace");
+        let Some(ws) = create_cow_fixture(&repo, &run_id) else {
+            let stable = stable_worktree_dir(&repo);
+            destroy_stable(&repo, &stable);
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        };
         let worktree = ws.worktree_path().to_path_buf();
         let stable = stable_worktree_dir(&repo);
 
@@ -2027,15 +2044,12 @@ mod tests {
     fn cow_private_git_rewrite_is_rejected_and_tree_is_preserved() {
         let repo = init_fixture("greppy-ws-cow-tamper");
         let main_before = main_checkout_fingerprint(&repo);
-        let ws = AgentWorkspace::create_with_options(
-            &repo,
-            &unique_tag("run-cow-tamper"),
-            CreateOptions {
-                fresh: true,
-                backend: WorkspaceBackend::Cow,
-            },
-        )
-        .expect("create CoW workspace");
+        let Some(ws) = create_cow_fixture(&repo, &unique_tag("run-cow-tamper")) else {
+            let stable = stable_worktree_dir(&repo);
+            destroy_stable(&repo, &stable);
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        };
         let worktree = ws.worktree_path().to_path_buf();
         let private_backup = worktree.join(".git-private-backup");
         std::fs::rename(worktree.join(".git"), &private_backup).unwrap();
@@ -2078,15 +2092,12 @@ mod tests {
         let native_tree = git_c(&repo, &["rev-parse", &format!("{native_commit}^{{tree}}")]);
         native.cleanup().unwrap();
 
-        let cow = AgentWorkspace::create_with_options(
-            &repo,
-            &unique_tag("run-cow-parity"),
-            CreateOptions {
-                fresh: true,
-                backend: WorkspaceBackend::Cow,
-            },
-        )
-        .expect("CoW workspace");
+        let Some(cow) = create_cow_fixture(&repo, &unique_tag("run-cow-parity")) else {
+            let stable = stable_worktree_dir(&repo);
+            destroy_stable(&repo, &stable);
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        };
         std::fs::write(cow.worktree_path().join("hello.txt"), b"same edit\n").unwrap();
         std::fs::write(cow.worktree_path().join("new.txt"), b"same new file\n").unwrap();
         let cow_commit = match cow.finish("CoW parity").unwrap() {
@@ -2106,6 +2117,15 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let repo = Arc::new(init_fixture("greppy-ws-cow-concurrent"));
+        let Some(probe_workspace) =
+            create_cow_fixture(&repo, &unique_tag("run-cow-capability-probe"))
+        else {
+            let stable = stable_worktree_dir(&repo);
+            destroy_stable(&repo, &stable);
+            let _ = std::fs::remove_dir_all(repo.as_path());
+            return;
+        };
+        probe_workspace.cleanup().expect("cleanup capability probe");
         let main_before = main_checkout_fingerprint(&repo);
         let barrier = Arc::new(Barrier::new(10));
         let mut handles = Vec::new();

@@ -297,8 +297,8 @@ jobs:
       - name: Build Windows CPU test binary
         run: cargo build --workspace --features greppy/ci-test-assets,greppy/cpu-only
 
-      - name: Test Windows locks and daemon transport
-        run: cargo test -p greppy-core -p greppy-embed-native -p greppy --lib --features greppy/ci-test-assets,greppy/cpu-only -- --test-threads=1
+      - name: Test Windows locks, native agent fallback, and daemon transport
+        run: cargo test -p greppy-core -p greppy-embed-native -p greppy-agent -p greppy --lib --features greppy/ci-test-assets,greppy/cpu-only -- --test-threads=1
 
       - name: Verify doctor registry
         shell: pwsh
