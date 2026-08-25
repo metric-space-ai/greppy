@@ -87,14 +87,14 @@ blast-radius analysis, and a regression test.
 
 ## Evidence and remaining gates
 
-The fork's earlier pinned commit passed its macOS, Linux, Btrfs, XFS-reflink,
-and ext4-unsupported CI matrix in GitHub Actions run `32791595854`. A controlled
-300,000-file macOS release-gate run then showed APFS directory `clonefile`
-still inside the recursive clone after six minutes. The exact dependency was
-therefore advanced to a revision that reports APFS metadata traversal
-truthfully and locks that classification in its macOS native test. Greppy unit
-coverage currently proves private Git isolation, tamper preservation, exact
-native/CoW proposal-tree parity, cleanup, and ten concurrent CoW workspaces.
+The pinned fork commit passed its macOS, Linux, Btrfs, XFS-reflink, and
+ext4-unsupported CI matrix in GitHub Actions run `32814344750`. A controlled
+300,000-file macOS release-gate run on the preceding revision showed APFS
+directory `clonefile` still inside the recursive clone after six minutes. The
+current dependency therefore reports APFS metadata traversal truthfully and
+locks that classification in its macOS native test. Greppy unit coverage
+currently proves private Git isolation, tamper preservation, exact native/CoW
+proposal-tree parity, cleanup, and ten concurrent CoW workspaces.
 
 Before release, the exact Greppy candidate must still pass the complete
 workspace test matrix, packaged-artifact/license/SBOM checks, Windows native
