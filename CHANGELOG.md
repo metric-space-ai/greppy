@@ -4,6 +4,8 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-08-25
+
 ### Filesystem-CoW agent workspaces
 
 `greppy -p` can create exact private Filesystem-CoW workspaces through the
