@@ -1674,6 +1674,47 @@ mod tests {
     }
 
     #[test]
+    fn fifty_parallel_workspaces_do_not_leak_namespace_or_chunk_state() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "test@example.test"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        fs::write(repo.path().join("shared.txt"), "immutable baseline\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "base"]);
+
+        let storage = tempfile::tempdir().unwrap();
+        let core = std::sync::Arc::new(WorkspaceCore::open(storage.path()).unwrap());
+        let mut workers = Vec::new();
+        for number in 0..50 {
+            let core = core.clone();
+            let repository = repo.path().to_path_buf();
+            workers.push(std::thread::spawn(move || {
+                let id = format!("parallel-{number:02}");
+                let baseline = crate::capture_repository(&repository, core.chunks()).unwrap();
+                let workspace = core.create_workspace(&id, baseline).unwrap();
+                let private = format!("private-{number:02}.txt");
+                core.create_file(&workspace, &private, 0o100600).unwrap();
+                core.write(&workspace, &private, 0, id.as_bytes()).unwrap();
+                assert_eq!(
+                    core.read(&workspace, &private, 0, 64).unwrap(),
+                    id.as_bytes()
+                );
+                assert_eq!(
+                    core.read(&workspace, "shared.txt", 0, 64).unwrap(),
+                    b"immutable baseline\n"
+                );
+                core.remove_workspace(workspace).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(core.list_workspaces().unwrap().is_empty());
+        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
+    }
+
+    #[test]
     fn hard_links_share_an_inode_and_directory_rename_is_logical() {
         let (_repo, _storage, core, workspace) = fixture();
         core.hard_link(&workspace, "README.md", "README.link")
