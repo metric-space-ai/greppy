@@ -45,10 +45,16 @@ jobs:
           key: portable-cow-core-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Test filesystem-independent namespace and Chunk-CAS
-        run: cargo test -p greppy-workspace-core --locked
+        run: |
+          cargo test -p greppy-workspace-core --locked
+          cargo test -p greppy-workspace-ffi --locked
 
-      - name: Compile platform provider surface
+      - name: Compile shared provider binary surface
         run: cargo check -p greppy-workspace-provider --locked
+
+      - name: Build FSKit Rust static library
+        if: runner.os == 'macOS'
+        run: cargo build -p greppy-workspace-ffi --release --locked
 
   linux-fuse3:
     name: Linux FUSE3 provider
