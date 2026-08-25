@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -21,6 +22,10 @@ pub struct NodeMetadata {
     pub mode: u32,
     pub size: u64,
     pub inode: u64,
+    pub nlink: u32,
+    pub accessed_unix_ns: i64,
+    pub modified_unix_ns: i64,
+    pub changed_unix_ns: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +113,9 @@ impl WorkspaceCore {
                  kind TEXT NOT NULL CHECK(kind IN ('file', 'directory', 'symlink')),
                  mode INTEGER NOT NULL,
                  size INTEGER NOT NULL CHECK(size >= 0),
+                 accessed_unix_ns INTEGER NOT NULL,
+                 modified_unix_ns INTEGER NOT NULL,
+                 changed_unix_ns INTEGER NOT NULL,
                  chunks_json BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS cow_entries (
@@ -221,6 +229,7 @@ impl WorkspaceCore {
                         kind,
                         entry.mode,
                         entry.size,
+                        entry.modified_unix_ns,
                         &entry.chunks,
                     )?;
                     insert_entry(&transaction, id, &entry.path, inode)?;
@@ -279,6 +288,10 @@ impl WorkspaceCore {
                 mode: 0o040755,
                 size: 0,
                 inode: stable_inode(&workspace.id, ""),
+                nlink: 2,
+                accessed_unix_ns: 0,
+                modified_unix_ns: 0,
+                changed_unix_ns: 0,
             }));
         }
         let connection = self.lock_metadata()?;
@@ -294,6 +307,10 @@ impl WorkspaceCore {
                 mode: 0o040755,
                 size: 0,
                 inode: stable_inode(&workspace.id, &path),
+                nlink: 2,
+                accessed_unix_ns: 0,
+                modified_unix_ns: 0,
+                changed_unix_ns: 0,
             }));
         }
         let (repository, base_commit) = workspace_origin(&connection, &workspace.id)?;
@@ -306,6 +323,10 @@ impl WorkspaceCore {
                     mode: entry.mode,
                     size: entry.size,
                     inode: stable_inode(&workspace.id, &path),
+                    nlink: 1,
+                    accessed_unix_ns: 0,
+                    modified_unix_ns: 0,
+                    changed_unix_ns: 0,
                 }
             }),
         )
@@ -451,6 +472,40 @@ impl WorkspaceCore {
         mode: u32,
     ) -> Result<()> {
         self.create_node(workspace, path.as_ref(), NodeKind::File, mode, &[])
+    }
+
+    pub fn set_metadata(
+        &self,
+        workspace: &WorkspaceHandle,
+        path: impl AsRef<Path>,
+        mode: Option<u32>,
+        accessed_unix_ns: Option<i64>,
+        modified_unix_ns: Option<i64>,
+    ) -> Result<()> {
+        let path = normalize_path(path.as_ref(), false)?;
+        let inode = self.materialize(workspace, &path)?;
+        let changed_unix_ns = now_unix_ns();
+        let connection = self.lock_metadata()?;
+        let changed = connection.execute(
+            "UPDATE cow_inodes
+             SET mode = COALESCE(?3, mode),
+                 accessed_unix_ns = COALESCE(?4, accessed_unix_ns),
+                 modified_unix_ns = COALESCE(?5, modified_unix_ns),
+                 changed_unix_ns = ?6
+             WHERE workspace_id = ?1 AND id = ?2",
+            params![
+                workspace.id,
+                inode.id,
+                mode.map(i64::from),
+                accessed_unix_ns,
+                modified_unix_ns,
+                changed_unix_ns
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Corrupt(format!("missing inode {}", inode.id)));
+        }
+        Ok(())
     }
 
     pub fn mkdir(
@@ -883,6 +938,7 @@ impl WorkspaceCore {
             kind,
             mode,
             content.len() as u64,
+            now_unix_ns(),
             &chunks,
         )?;
         insert_entry(&transaction, &workspace.id, &path, inode)?;
@@ -927,6 +983,7 @@ impl WorkspaceCore {
             git.kind,
             git.mode,
             git.size,
+            0,
             &chunks,
         )?;
         insert_entry(&transaction, &workspace.id, path, inode)?;
@@ -948,13 +1005,16 @@ impl WorkspaceCore {
     ) -> Result<()> {
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
-            "UPDATE cow_inodes SET size = ?3, chunks_json = ?4
+            "UPDATE cow_inodes
+             SET size = ?3, chunks_json = ?4,
+                 modified_unix_ns = ?5, changed_unix_ns = ?5
              WHERE workspace_id = ?1 AND id = ?2",
             params![
                 workspace_id,
                 inode_id,
                 size as i64,
-                serde_json::to_vec(chunks)?
+                serde_json::to_vec(chunks)?,
+                now_unix_ns()
             ],
         )?;
         if changed != 1 {
@@ -976,16 +1036,20 @@ fn insert_inode(
     kind: NodeKind,
     mode: u32,
     size: u64,
+    modified_unix_ns: i64,
     chunks: &[ChunkId],
 ) -> Result<i64> {
     transaction.execute(
-        "INSERT INTO cow_inodes(workspace_id, kind, mode, size, chunks_json)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO cow_inodes(
+             workspace_id, kind, mode, size,
+             accessed_unix_ns, modified_unix_ns, changed_unix_ns, chunks_json
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6)",
         params![
             workspace_id,
             kind_name(kind),
             mode as i64,
             size as i64,
+            modified_unix_ns,
             serde_json::to_vec(chunks)?
         ],
     )?;
@@ -1024,7 +1088,11 @@ fn overlay_entry(
 ) -> Result<Option<NodeMetadata>> {
     connection
         .query_row(
-            "SELECT e.tombstone, i.id, i.kind, i.mode, i.size
+            "SELECT e.tombstone, i.id, i.kind, i.mode, i.size,
+                    (SELECT COUNT(*) FROM cow_entries links
+                     WHERE links.workspace_id = e.workspace_id
+                       AND links.inode_id = i.id AND links.tombstone = 0),
+                    i.accessed_unix_ns, i.modified_unix_ns, i.changed_unix_ns
              FROM cow_entries e
              LEFT JOIN cow_inodes i ON i.id = e.inode_id
              WHERE e.workspace_id = ?1 AND e.path = ?2",
@@ -1039,12 +1107,24 @@ fn overlay_entry(
                     kind: parse_kind(row.get::<_, String>(2)?.as_str())?,
                     mode: row.get::<_, i64>(3)? as u32,
                     size: row.get::<_, i64>(4)? as u64,
+                    nlink: row.get::<_, i64>(5)? as u32,
+                    accessed_unix_ns: row.get(6)?,
+                    modified_unix_ns: row.get(7)?,
+                    changed_unix_ns: row.get(8)?,
                 }))
             },
         )
         .optional()
         .map(|row| row.flatten())
         .map_err(Into::into)
+}
+
+fn now_unix_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
 }
 
 fn load_inode_for_path(
@@ -1521,6 +1601,8 @@ mod tests {
         let first = core.metadata(&workspace, "README.md").unwrap().unwrap();
         let second = core.metadata(&workspace, "README.link").unwrap().unwrap();
         assert_eq!(first.inode, second.inode);
+        assert_eq!(first.nlink, 2);
+        assert_eq!(second.nlink, 2);
         core.write(&workspace, "README.link", 0, b"X").unwrap();
         assert_eq!(core.read(&workspace, "README.md", 0, 1).unwrap(), b"X");
 
@@ -1530,6 +1612,23 @@ mod tests {
             core.read(&workspace, "moved/lib.rs", 0, 100).unwrap(),
             b"pub fn base() {}\n"
         );
+    }
+
+    #[test]
+    fn metadata_updates_are_inode_scoped_and_persisted() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.hard_link(&workspace, "README.md", "README.link")
+            .unwrap();
+        core.set_metadata(&workspace, "README.link", Some(0o600), Some(123), Some(456))
+            .unwrap();
+        for path in ["README.md", "README.link"] {
+            let metadata = core.metadata(&workspace, path).unwrap().unwrap();
+            assert_eq!(metadata.mode & 0o7777, 0o600);
+            assert_eq!(metadata.accessed_unix_ns, 123);
+            assert_eq!(metadata.modified_unix_ns, 456);
+            assert!(metadata.changed_unix_ns >= 456);
+            assert_eq!(metadata.nlink, 2);
+        }
     }
 
     #[test]

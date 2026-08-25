@@ -130,13 +130,31 @@ impl PortableFuse {
 
     fn attr(&self, inode: u64, node: &Node) -> Result<FileAttr, Errno> {
         let now = SystemTime::now();
-        let (kind, mode, size, nlink, uid, gid) = match node {
-            Node::Root | Node::Workspaces | Node::DoctorRoot | Node::WorkspaceRoot(_) => {
-                (FileType::Directory, 0o700, 0, 2, self.uid, self.gid)
-            }
+        let (kind, mode, size, nlink, uid, gid, atime, mtime, ctime) = match node {
+            Node::Root | Node::Workspaces | Node::DoctorRoot | Node::WorkspaceRoot(_) => (
+                FileType::Directory,
+                0o700,
+                0,
+                2,
+                self.uid,
+                self.gid,
+                now,
+                now,
+                now,
+            ),
             Node::Marker => {
                 let size = self.marker_bytes().map_err(|_| Errno::EIO)?.len() as u64;
-                (FileType::RegularFile, 0o400, size, 1, self.uid, self.gid)
+                (
+                    FileType::RegularFile,
+                    0o400,
+                    size,
+                    1,
+                    self.uid,
+                    self.gid,
+                    now,
+                    now,
+                    now,
+                )
             }
             Node::Doctor(relative) => {
                 let metadata =
@@ -155,6 +173,9 @@ impl PortableFuse {
                     metadata.nlink() as u32,
                     metadata.uid(),
                     metadata.gid(),
+                    metadata.accessed().unwrap_or(now),
+                    metadata.modified().unwrap_or(now),
+                    metadata.created().unwrap_or(now),
                 )
             }
             Node::WorkspacePath { workspace, path } => {
@@ -174,9 +195,9 @@ impl PortableFuse {
             ino: INodeNo(inode),
             size,
             blocks: size.div_ceil(512),
-            atime: now,
-            mtime: now,
-            ctime: now,
+            atime,
+            mtime,
+            ctime,
             crtime: UNIX_EPOCH,
             kind,
             perm: mode,
@@ -249,12 +270,12 @@ impl Filesystem for PortableFuse {
         &self,
         _req: &Request,
         inode: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -264,11 +285,25 @@ impl Filesystem for PortableFuse {
         reply: ReplyAttr,
     ) {
         let result = self.workspace_parts(inode).and_then(|(workspace, path)| {
+            if uid.is_some_and(|value| value != self.uid)
+                || gid.is_some_and(|value| value != self.gid)
+            {
+                return Err(Errno::EPERM);
+            }
             if let Some(size) = size {
                 self.core
-                    .truncate(&workspace, path, size)
+                    .truncate(&workspace, &path, size)
                     .map_err(|_| Errno::EIO)?;
             }
+            self.core
+                .set_metadata(
+                    &workspace,
+                    &path,
+                    mode.map(|value| value & 0o7777),
+                    atime.map(time_or_now_ns),
+                    mtime.map(time_or_now_ns),
+                )
+                .map_err(|_| Errno::EIO)?;
             let node = self.node(inode).ok_or(Errno::ENOENT)?;
             self.attr(inode.0, &node)
         });
@@ -824,15 +859,50 @@ fn workspace_attr(
     metadata: NodeMetadata,
     uid: u32,
     gid: u32,
-) -> (FileType, u16, u64, u32, u32, u32) {
+) -> (
+    FileType,
+    u16,
+    u64,
+    u32,
+    u32,
+    u32,
+    SystemTime,
+    SystemTime,
+    SystemTime,
+) {
     (
         file_type(metadata.kind),
         metadata.mode as u16 & 0o7777,
         metadata.size,
-        1,
+        metadata.nlink,
         uid,
         gid,
+        system_time_from_ns(metadata.accessed_unix_ns),
+        system_time_from_ns(metadata.modified_unix_ns),
+        system_time_from_ns(metadata.changed_unix_ns),
     )
+}
+
+fn time_or_now_ns(value: TimeOrNow) -> i64 {
+    match value {
+        TimeOrNow::SpecificTime(value) => unix_ns(value),
+        TimeOrNow::Now => unix_ns(SystemTime::now()),
+    }
+}
+
+fn unix_ns(value: SystemTime) -> i64 {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+fn system_time_from_ns(value: i64) -> SystemTime {
+    u64::try_from(value)
+        .ok()
+        .and_then(|value| UNIX_EPOCH.checked_add(Duration::from_nanos(value)))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 fn file_type(kind: NodeKind) -> FileType {

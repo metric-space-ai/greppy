@@ -6,6 +6,7 @@ use std::fs::{self, File, Metadata};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -26,6 +27,7 @@ pub struct BaselineEntry {
     pub kind: EntryKind,
     pub mode: u32,
     pub size: u64,
+    pub modified_unix_ns: i64,
     pub content_hash: String,
     pub chunks: Vec<ChunkId>,
 }
@@ -144,6 +146,7 @@ fn capture_entry(repository: &Path, relative: &str, store: &ChunkStore) -> Resul
                 kind: EntryKind::Tombstone,
                 mode: 0,
                 size: 0,
+                modified_unix_ns: 0,
                 content_hash: blake3::hash(&[]).to_hex().to_string(),
                 chunks: Vec::new(),
             });
@@ -159,6 +162,7 @@ fn capture_entry(repository: &Path, relative: &str, store: &ChunkStore) -> Resul
             kind: EntryKind::Symlink,
             mode: 0o120000,
             size,
+            modified_unix_ns: modified_unix_ns(&metadata),
             content_hash: blake3::hash(&bytes).to_hex().to_string(),
             chunks,
         });
@@ -176,6 +180,7 @@ fn capture_entry(repository: &Path, relative: &str, store: &ChunkStore) -> Resul
         kind: EntryKind::File,
         mode: git_mode(&metadata),
         size,
+        modified_unix_ns: modified_unix_ns(&metadata),
         content_hash,
         chunks,
     })
@@ -192,6 +197,7 @@ fn fingerprint_entry(repository: &Path, relative: &str) -> Result<BaselineEntry>
                 kind: EntryKind::Tombstone,
                 mode: 0,
                 size: 0,
+                modified_unix_ns: 0,
                 content_hash: blake3::hash(&[]).to_hex().to_string(),
                 chunks: Vec::new(),
             });
@@ -206,6 +212,7 @@ fn fingerprint_entry(repository: &Path, relative: &str) -> Result<BaselineEntry>
             kind: EntryKind::Symlink,
             mode: 0o120000,
             size: bytes.len() as u64,
+            modified_unix_ns: modified_unix_ns(&metadata),
             content_hash: blake3::hash(&bytes).to_hex().to_string(),
             chunks: Vec::new(),
         });
@@ -220,9 +227,25 @@ fn fingerprint_entry(repository: &Path, relative: &str) -> Result<BaselineEntry>
         kind: EntryKind::File,
         mode: git_mode(&metadata),
         size: metadata.len(),
+        modified_unix_ns: modified_unix_ns(&metadata),
         content_hash: hash_file(&path)?,
         chunks: Vec::new(),
     })
+}
+
+fn modified_unix_ns(metadata: &Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+                .unwrap_or(0)
+        })
 }
 
 fn observe_repository(repository: &Path) -> Result<Observation> {
