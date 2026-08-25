@@ -54,6 +54,7 @@ jobs:
       - name: Run forced-CoW private-Git integration suite
         env:
           TMPDIR: /mnt/greppy-cow-xfs
+          XDG_CACHE_HOME: /mnt/greppy-cow-xfs/cache
           GREPPY_REQUIRE_COW_TESTS: "1"
         run: |
           cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
