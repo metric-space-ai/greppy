@@ -508,7 +508,7 @@ section 3.2 rather than left as open-ended cleanup.
 reference implementation. The binding decision is a hard, purpose-specific
 fork: `greppy-rift-core` retains only writable Btrfs snapshots, Linux per-file
 reflinks, APFS `clonefile`, probing, receipts, and removal. The dependency is
-pinned at `1e93e3cd1b06fde5ea73671d5febd496473fa549`; provenance and rationale are
+pinned at `319bbd1b5a31a88d3cf1cb929e50139178d12a30`; provenance and rationale are
 recorded in `FILESYSTEM-COW-ADR.md` and `THIRD_PARTY.md`.
 
 Rift does not replace Store-CoW in 0.3.2: it clones filesystem workspaces, not
@@ -725,12 +725,13 @@ reported explicitly and never emulated by a hidden full copy.
 - no mount helper or runtime service;
 - CI covers Btrfs, XFS reflink, ext4 unsupported, cleanup, and crash tests.
 
-### macOS — supported candidate
+### macOS — explicit CoW preview, native `auto`
 
 - pinned `greppy-rift-core` APFS directory `clonefile` backend;
 - no helper, mount, extension, or install-time component;
-- `auto` selects it only after backend health/preflight succeeds and the
-  performance gates pass; otherwise native worktree fallback;
+- exact file-data CoW is available through forced `cow`, but directory cloning
+  traverses repository metadata and missed the registered large-fixture gate;
+- `auto` therefore selects the native 0.3.2 worktree backend on macOS;
 - CI on the release-supported macOS ARM64 target.
 
 ### Windows — native fallback

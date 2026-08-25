@@ -27,6 +27,12 @@ Btrfs, and Linux reflink mechanics plus capability probing and cleanup. The
 former Rift CLI, registry, hooks, FFI, workspace policy, and compatibility
 surface are not part of Greppy.
 
+Capability reporting distinguishes Btrfs subvolume snapshots from namespace-
+walking CoW trees. APFS directory `clonefile` and Linux per-file `FICLONE`
+remain exact explicit-preview backends, but `auto` does not select them because
+both traverse repository metadata; Windows continues to use the native
+fallback.
+
 Windows agent workspaces and sandbox Cargo paths now resolve from native
 `LOCALAPPDATA`/`USERPROFILE` roots instead of falling through a Unix-only
 `HOME` assumption to a mixed `/.cache\\...` path. The Windows CI executes the

@@ -443,6 +443,13 @@ preflights fall back only in `auto`; forced `cow` fails visibly. Suspected Git
 identity or containment tampering prevents publication and cleanup so the
 workspace remains available for diagnosis.
 
+Backend selection is intentionally asymmetric. Btrfs subvolume snapshots are
+the current constant-metadata backend and may be chosen by `auto`. APFS
+directory `clonefile` and Linux per-file `FICLONE` preserve file data with CoW
+but traverse the directory namespace, so they are available only through the
+explicit `cow` preview path; `auto` keeps the native 0.3.2 workspace on those
+filesystems. Windows also keeps the native backend and rejects forced `cow`.
+
 Full source bodies are not duplicated into SQLite. Exact code search reads the
 current worktree through real `grep` where available, with an in-binary literal
 fallback on clean Windows hosts. Freshness checks guard indexed graph spans and

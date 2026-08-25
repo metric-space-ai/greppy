@@ -11,7 +11,7 @@ description = "greppy agent wire layer: provider-neutral protocol types and Anth
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-greppy-rift-core = { git = "https://github.com/mkh-welsch/rift", rev = "1e93e3cd1b06fde5ea73671d5febd496473fa549" }
+greppy-rift-core = { git = "https://github.com/mkh-welsch/rift", rev = "319bbd1b5a31a88d3cf1cb929e50139178d12a30" }
 # Plain HTTP only (localhost gateway). No TLS stack.
 ureq = { version = "2", default-features = false }
 

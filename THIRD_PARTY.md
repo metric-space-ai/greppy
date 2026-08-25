@@ -102,7 +102,7 @@ SBOM, model notices, checksums, signatures, or build provenance are missing.
   `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`.
 - Greppy hard fork: [`mkh-welsch/rift`](https://github.com/mkh-welsch/rift),
   package `greppy-rift-core`, pinned by `Cargo.lock` and `Cargo.toml` at
-  `1e93e3cd1b06fde5ea73671d5febd496473fa549`.
+  `319bbd1b5a31a88d3cf1cb929e50139178d12a30`.
 - License: MIT; see `licenses/RIFT-MIT.txt`.
 - Retained scope: APFS `clonefile`, Btrfs subvolume snapshot/removal, Linux
   `FICLONE`, capability probing, and exact snapshot receipts.

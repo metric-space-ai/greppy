@@ -12,7 +12,7 @@ shipping Rift as a workspace manager or building a custom virtual filesystem.
 
 The dependency is `greppy-rift-core` from
 <https://github.com/mkh-welsch/rift>, pinned at
-`1e93e3cd1b06fde5ea73671d5febd496473fa549`. Its audited upstream base is
+`319bbd1b5a31a88d3cf1cb929e50139178d12a30`. Its audited upstream base is
 `anomalyco/rift` commit
 `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`. The retained API is limited to
 capability probing, exact snapshot creation, and snapshot removal. Greppy owns
@@ -29,7 +29,8 @@ promise API or merge compatibility with upstream.
 
 The retained backends are:
 
-- macOS: APFS directory cloning with `clonefile`;
+- macOS: exact APFS directory cloning with `clonefile`; file data is CoW but
+  directory metadata is traversed;
 - Linux Btrfs: writable snapshots of an existing subvolume;
 - Linux filesystems supporting reflinks: exact per-file `FICLONE` trees;
 - all other cases: explicit unsupported result.
@@ -50,6 +51,11 @@ constant-time metadata creation, then falls back to the unchanged 0.3.2 native
 Git-worktree backend. `native` always selects that 0.3.2 behavior. `cow`
 requires a supported, successful exact snapshot and may select a per-file
 reflink tree; otherwise it returns a typed, visible error.
+
+With the retained native primitives, Btrfs subvolume snapshots satisfy the
+constant-metadata contract. APFS directory `clonefile` and Linux per-file
+`FICLONE` are exact CoW implementations but walk the namespace; they are
+explicit `cow` previews and are not selected by `auto`.
 
 A CoW workspace receives a real private `.git` directory. The pinned base
 repository's objects are readable through `.git/objects/info/alternates`; the
@@ -81,8 +87,12 @@ blast-radius analysis, and a regression test.
 
 ## Evidence and remaining gates
 
-The fork's exact pinned commit passed its macOS, Linux, Btrfs, XFS-reflink, and
-ext4-unsupported CI matrix in GitHub Actions run `32791595854`. Greppy unit
+The fork's earlier pinned commit passed its macOS, Linux, Btrfs, XFS-reflink,
+and ext4-unsupported CI matrix in GitHub Actions run `32791595854`. A controlled
+300,000-file macOS release-gate run then showed APFS directory `clonefile`
+still inside the recursive clone after six minutes. The exact dependency was
+therefore advanced to a revision that reports APFS metadata traversal
+truthfully and locks that classification in its macOS native test. Greppy unit
 coverage currently proves private Git isolation, tamper preservation, exact
 native/CoW proposal-tree parity, cleanup, and ten concurrent CoW workspaces.
 

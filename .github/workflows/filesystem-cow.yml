@@ -20,7 +20,7 @@ env:
 
 jobs:
   macos-apfs-clone:
-    name: Greppy agent on APFS clonefile
+    name: Greppy agent on APFS explicit CoW preview
     runs-on: macos-14
     steps:
       - name: Checkout
@@ -43,7 +43,7 @@ jobs:
       - name: Run forced-CoW private-Git integration suite
         env:
           GREPPY_REQUIRE_COW_TESTS: "1"
-          GREPPY_REQUIRE_AUTO_COW_TEST: "1"
+          GREPPY_REQUIRE_AUTO_NATIVE_FALLBACK_TEST: "1"
         run: |
           cargo test -p greppy-agent auto_prefers_stable_then_uses_registered_concurrent_backend --locked
           cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
