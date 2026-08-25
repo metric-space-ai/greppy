@@ -283,72 +283,111 @@ impl AgentWorkspace {
         let stable_dir = stable_worktree_dir(&toplevel);
         let lock_path = stable_lock_path(&stable_dir);
 
-        let template_lock = match options.backend {
-            WorkspaceBackend::Native => try_acquire_lock(&lock_path)?,
-            WorkspaceBackend::Auto | WorkspaceBackend::Cow => {
-                acquire_template_lock(&lock_path, Duration::from_secs(5))?
-            }
-        };
-        match template_lock {
-            Some(lock) => {
-                let linked_git_dir =
-                    prepare_stable_worktree(&toplevel, &stable_dir, &base_commit, options.fresh)?;
-                if options.backend != WorkspaceBackend::Native {
-                    match create_cow_workspace(
+        match options.backend {
+            WorkspaceBackend::Native => match try_acquire_lock(&lock_path)? {
+                Some(lock) => {
+                    let linked_git_dir = prepare_stable_worktree(
+                        &toplevel,
                         &stable_dir,
-                        &main_common_git_dir,
-                        run_id,
                         &base_commit,
-                        options.backend == WorkspaceBackend::Auto,
-                    ) {
-                        Ok((worktree, private_git_dir)) => {
-                            return Ok(Self {
-                                repo_root: toplevel,
-                                worktree,
-                                linked_git_dir: private_git_dir,
-                                run_id: run_id.to_string(),
-                                base_commit,
-                                kind: WorktreeKind::Cow,
-                                _lock: None,
-                            });
-                        }
-                        Err(error) if options.backend == WorkspaceBackend::Auto => {
-                            eprintln!(
-                                "greppy -p: Filesystem-CoW unavailable ({error}) — using the native stable worktree"
-                            );
-                        }
-                        Err(error) => return Err(error),
+                        options.fresh,
+                    )?;
+                    Ok(Self {
+                        repo_root: toplevel,
+                        worktree: stable_dir,
+                        linked_git_dir,
+                        run_id: run_id.to_string(),
+                        base_commit,
+                        kind: WorktreeKind::Stable,
+                        _lock: Some(lock),
+                    })
+                }
+                None => {
+                    eprintln!(
+                        "greppy -p: agent worktree in use for this repository — using a temporary worktree"
+                    );
+                    let (worktree, linked_git_dir) =
+                        create_temp_worktree(&toplevel, run_id, &base_commit, options.fresh)?;
+                    Ok(Self {
+                        repo_root: toplevel,
+                        worktree,
+                        linked_git_dir,
+                        run_id: run_id.to_string(),
+                        base_commit,
+                        kind: WorktreeKind::Temp,
+                        _lock: None,
+                    })
+                }
+            },
+            WorkspaceBackend::Auto => match try_acquire_lock(&lock_path)? {
+                Some(lock) => {
+                    // Preserve the warm serial path: CoW replaces only the concurrent
+                    // temporary-worktree fallback in automatic mode.
+                    let linked_git_dir = prepare_stable_worktree(
+                        &toplevel,
+                        &stable_dir,
+                        &base_commit,
+                        options.fresh,
+                    )?;
+                    Ok(Self {
+                        repo_root: toplevel,
+                        worktree: stable_dir,
+                        linked_git_dir,
+                        run_id: run_id.to_string(),
+                        base_commit,
+                        kind: WorktreeKind::Stable,
+                        _lock: Some(lock),
+                    })
+                }
+                None => match create_cow_from_template(
+                    &toplevel,
+                    &main_common_git_dir,
+                    run_id,
+                    &base_commit,
+                    true,
+                ) {
+                    Ok((worktree, private_git_dir)) => Ok(Self {
+                        repo_root: toplevel,
+                        worktree,
+                        linked_git_dir: private_git_dir,
+                        run_id: run_id.to_string(),
+                        base_commit,
+                        kind: WorktreeKind::Cow,
+                        _lock: None,
+                    }),
+                    Err(error) => {
+                        eprintln!(
+                            "greppy -p: Filesystem-CoW unavailable ({error}) — using a temporary native worktree"
+                        );
+                        let (worktree, linked_git_dir) =
+                            create_temp_worktree(&toplevel, run_id, &base_commit, options.fresh)?;
+                        Ok(Self {
+                            repo_root: toplevel,
+                            worktree,
+                            linked_git_dir,
+                            run_id: run_id.to_string(),
+                            base_commit,
+                            kind: WorktreeKind::Temp,
+                            _lock: None,
+                        })
                     }
-                }
-                Ok(Self {
-                    repo_root: toplevel,
-                    worktree: stable_dir,
-                    linked_git_dir,
-                    run_id: run_id.to_string(),
-                    base_commit,
-                    kind: WorktreeKind::Stable,
-                    _lock: Some(lock),
-                })
-            }
-            None => {
-                if options.backend == WorkspaceBackend::Cow {
-                    return Err(WorkspaceError::CowUnavailable(
-                        "Filesystem-CoW template is currently locked by another creator".into(),
-                    ));
-                }
-                // Concurrent holder — disposable temp so two runs never share a tree.
-                eprintln!(
-                    "greppy -p: agent worktree in use for this repository — using a temporary worktree"
-                );
-                let (worktree, linked_git_dir) =
-                    create_temp_worktree(&toplevel, run_id, &base_commit, options.fresh)?;
+                },
+            },
+            WorkspaceBackend::Cow => {
+                let (worktree, private_git_dir) = create_cow_from_template(
+                    &toplevel,
+                    &main_common_git_dir,
+                    run_id,
+                    &base_commit,
+                    false,
+                )?;
                 Ok(Self {
                     repo_root: toplevel,
                     worktree,
-                    linked_git_dir,
+                    linked_git_dir: private_git_dir,
                     run_id: run_id.to_string(),
                     base_commit,
-                    kind: WorktreeKind::Temp,
+                    kind: WorktreeKind::Cow,
                     _lock: None,
                 })
             }
@@ -699,6 +738,25 @@ fn stable_lock_path(stable_dir: &Path) -> PathBuf {
     parent.join(format!("{name}.lock"))
 }
 
+fn cow_template_dir(repo_root: &Path) -> PathBuf {
+    let stable = stable_worktree_dir(repo_root);
+    let parent = stable.parent().unwrap_or_else(|| Path::new("."));
+    let name = stable
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("worktree");
+    parent.join(format!("{name}.cow-template"))
+}
+
+fn cow_template_ready_path(template: &Path) -> PathBuf {
+    let parent = template.parent().unwrap_or_else(|| Path::new("."));
+    let name = template
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cow-template");
+    parent.join(format!("{name}.ready"))
+}
+
 fn cow_worktree_dir(stable_dir: &Path, run_id: &str) -> PathBuf {
     let parent = stable_dir.parent().unwrap_or_else(|| Path::new("."));
     let template = stable_dir
@@ -711,13 +769,11 @@ fn cow_worktree_dir(stable_dir: &Path, run_id: &str) -> PathBuf {
     parent.join(format!("{template}.cow.{run_hash}"))
 }
 
-fn create_cow_workspace(
+fn snapshot_cow_workspace(
     template: &Path,
-    main_common_git_dir: &Path,
     run_id: &str,
-    base_commit: &str,
     require_constant_time_metadata: bool,
-) -> Result<(PathBuf, PathBuf), WorkspaceError> {
+) -> Result<PathBuf, WorkspaceError> {
     let destination = cow_worktree_dir(template, run_id);
     if destination.exists() {
         return Err(WorkspaceError::CowUnavailable(format!(
@@ -747,7 +803,14 @@ fn create_cow_workspace(
     greppy_rift_core::snapshot_exact(template, &destination).map_err(|error| {
         WorkspaceError::CowUnavailable(format!("native CoW snapshot failed: {error}"))
     })?;
+    Ok(destination)
+}
 
+fn finish_cow_workspace(
+    destination: PathBuf,
+    main_common_git_dir: &Path,
+    base_commit: &str,
+) -> Result<(PathBuf, PathBuf), WorkspaceError> {
     match setup_private_git(&destination, main_common_git_dir, base_commit) {
         Ok(private_git_dir) => Ok((destination, private_git_dir)),
         Err(setup_error) => match greppy_rift_core::remove_snapshot(&destination) {
@@ -758,6 +821,46 @@ fn create_cow_workspace(
             )))),
         },
     }
+}
+
+fn create_cow_from_template(
+    repo_root: &Path,
+    main_common_git_dir: &Path,
+    run_id: &str,
+    base_commit: &str,
+    require_constant_time_metadata: bool,
+) -> Result<(PathBuf, PathBuf), WorkspaceError> {
+    let template = cow_template_dir(repo_root);
+    let template_lock_path = stable_lock_path(&template);
+    let lock =
+        acquire_template_lock(&template_lock_path, Duration::from_secs(30))?.ok_or_else(|| {
+            WorkspaceError::CowUnavailable(
+                "Filesystem-CoW template is currently locked by another creator".into(),
+            )
+        })?;
+    let ready_path = cow_template_ready_path(&template);
+    let ready = template.is_dir()
+        && fs::read_to_string(&ready_path)
+            .map(|value| value.trim() == base_commit)
+            .unwrap_or(false);
+    if !ready {
+        // Publish readiness last. A killed or failed preparation leaves no
+        // trusted marker, so the next creator rebuilds under the same lock.
+        let _ = fs::remove_file(&ready_path);
+        prepare_stable_worktree(repo_root, &template, base_commit, true)?;
+        fs::write(&ready_path, format!("{base_commit}\n"))?;
+    }
+    let worktree = snapshot_cow_workspace(&template, run_id, require_constant_time_metadata)?;
+    // The template stays immutable while the native snapshot is taken. Private
+    // Git setup mutates only the destination and can proceed concurrently.
+    drop(lock);
+    let result = finish_cow_workspace(worktree, main_common_git_dir, base_commit);
+    if result.is_err() {
+        // A template that cloned but failed the private-Git cleanliness check
+        // is no longer trusted. The next creator rebuilds it under the lock.
+        let _ = fs::remove_file(ready_path);
+    }
+    result
 }
 
 fn setup_private_git(
@@ -778,7 +881,7 @@ fn setup_private_git(
 
     // Refuse user/global init templates: repository-provided hooks must never
     // be copied into the agent's private Git directory.
-    let empty_template = worktree.with_extension("empty-git-template");
+    let empty_template = worktree.join(".greppy-empty-git-template");
     fs::create_dir(&empty_template)?;
     let template_arg = format!("--template={}", path_str(&empty_template)?);
     let init = git_run_cwd(worktree, &["init", "--quiet", &template_arg]);
@@ -2008,6 +2111,75 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_cow_on_unsupported_filesystem_fails_closed() {
+        if std::env::var_os("GREPPY_REQUIRE_COW_UNAVAILABLE_TEST").is_none() {
+            return;
+        }
+        let repo = init_fixture("greppy-ws-cow-unavailable");
+        let fp_before = main_checkout_fingerprint(&repo);
+        let result = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-unavailable"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        );
+        assert!(
+            matches!(result, Err(WorkspaceError::CowUnavailable(_))),
+            "forced CoW on the hosted runner filesystem must fail closed"
+        );
+        assert_eq!(main_checkout_fingerprint(&repo), fp_before);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn auto_prefers_stable_then_uses_registered_concurrent_backend() {
+        let repo = init_fixture("greppy-ws-auto-policy");
+        let holder = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-auto-holder"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Auto,
+            },
+        )
+        .expect("first auto workspace");
+        assert_eq!(holder.kind, WorktreeKind::Stable);
+
+        let concurrent = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-auto-concurrent"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Auto,
+            },
+        )
+        .expect("concurrent auto workspace");
+        assert_ne!(concurrent.kind, WorktreeKind::Stable);
+        if std::env::var_os("GREPPY_REQUIRE_AUTO_COW_TEST").is_some() {
+            assert_eq!(concurrent.kind, WorktreeKind::Cow);
+        }
+        if std::env::var_os("GREPPY_REQUIRE_AUTO_NATIVE_FALLBACK_TEST").is_some() {
+            assert_eq!(concurrent.kind, WorktreeKind::Temp);
+        }
+
+        let concurrent_path = concurrent.worktree_path().to_path_buf();
+        concurrent
+            .cleanup()
+            .expect("cleanup concurrent auto workspace");
+        assert!(!concurrent_path.exists());
+        let stable = holder.worktree_path().to_path_buf();
+        holder.cleanup().expect("cleanup stable auto workspace");
+        destroy_stable(&repo, &stable);
+        let template = cow_template_dir(&repo);
+        destroy_stable(&repo, &template);
+        let _ = fs::remove_file(cow_template_ready_path(&template));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     fn clone_fixture(src: &Path) -> PathBuf {
         let dst = std::env::temp_dir().join(unique_tag("greppy-ws-clone"));
         let out = Command::new("git")
@@ -2114,6 +2286,50 @@ mod tests {
         ws.cleanup().expect("cleanup CoW workspace");
         assert!(!worktree.exists());
         destroy_stable(&repo, &stable);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn cow_invalidates_tampered_ready_template_and_next_run_recovers() {
+        let repo = init_fixture("greppy-ws-cow-template-recovery");
+        let Some(first) = create_cow_fixture(&repo, &unique_tag("run-cow-template-first")) else {
+            let template = cow_template_dir(&repo);
+            destroy_stable(&repo, &template);
+            let _ = fs::remove_file(cow_template_ready_path(&template));
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        };
+        first.cleanup().expect("cleanup first CoW workspace");
+        let template = cow_template_dir(&repo);
+        let ready = cow_template_ready_path(&template);
+        assert!(ready.is_file());
+        std::fs::write(template.join("hello.txt"), b"tampered template\n").unwrap();
+
+        let failed = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-template-tampered"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        );
+        assert!(matches!(failed, Err(WorkspaceError::CowUnavailable(_))));
+        assert!(!ready.exists(), "failed validation must revoke readiness");
+
+        let recovered = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-template-recovered"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        )
+        .expect("next CoW creation rebuilds the template");
+        assert!(git_c(recovered.worktree_path(), &["status", "--porcelain"]).is_empty());
+        recovered.cleanup().expect("cleanup recovered workspace");
+
+        destroy_stable(&repo, &template);
+        let _ = fs::remove_file(ready);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -2254,6 +2470,54 @@ mod tests {
 
         let stable = stable_worktree_dir(&repo);
         destroy_stable(&repo, &stable);
+        let _ = std::fs::remove_dir_all(repo.as_path());
+    }
+
+    #[test]
+    fn fifty_concurrent_cow_workspaces_stress() {
+        use std::sync::{Arc, Barrier};
+
+        let repo = Arc::new(init_fixture("greppy-ws-cow-stress-50"));
+        let Some(probe) = create_cow_fixture(&repo, &unique_tag("run-cow-stress-probe")) else {
+            let template = cow_template_dir(&repo);
+            destroy_stable(&repo, &template);
+            let _ = fs::remove_file(cow_template_ready_path(&template));
+            let _ = std::fs::remove_dir_all(repo.as_path());
+            return;
+        };
+        probe.cleanup().expect("cleanup capability probe");
+        let main_before = main_checkout_fingerprint(&repo);
+        let barrier = Arc::new(Barrier::new(50));
+        let mut handles = Vec::new();
+        for worker in 0..50 {
+            let repo = Arc::clone(&repo);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let workspace = AgentWorkspace::create_with_options(
+                    &repo,
+                    &unique_tag(&format!("run-cow-stress-{worker}")),
+                    CreateOptions {
+                        fresh: true,
+                        backend: WorkspaceBackend::Cow,
+                    },
+                )
+                .expect("stress CoW create");
+                assert_eq!(workspace.kind, WorktreeKind::Cow);
+                assert!(git_c(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
+                let path = workspace.worktree_path().to_path_buf();
+                workspace.cleanup().expect("stress CoW cleanup");
+                assert!(!path.exists());
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("stress worker");
+        }
+        assert_eq!(main_checkout_fingerprint(&repo), main_before);
+
+        let template = cow_template_dir(&repo);
+        destroy_stable(&repo, &template);
+        let _ = fs::remove_file(cow_template_ready_path(&template));
         let _ = std::fs::remove_dir_all(repo.as_path());
     }
 

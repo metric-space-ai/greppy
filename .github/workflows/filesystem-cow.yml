@@ -19,6 +19,57 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  macos-apfs-clone:
+    name: Greppy agent on APFS clonefile
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo registry and git
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: macos-cow-cargo-v1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Run forced-CoW private-Git integration suite
+        env:
+          GREPPY_REQUIRE_COW_TESTS: "1"
+          GREPPY_REQUIRE_AUTO_COW_TEST: "1"
+        run: |
+          cargo test -p greppy-agent auto_prefers_stable_then_uses_registered_concurrent_backend --locked
+          cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
+          cargo test -p greppy-agent cow_private_git_rewrite_is_rejected_and_tree_is_preserved --locked
+          cargo test -p greppy-agent cow_invalidates_tampered_ready_template_and_next_run_recovers --locked
+          cargo test -p greppy-agent native_and_cow_proposals_have_identical_trees --locked
+          cargo test -p greppy-agent ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs --locked
+          cargo test -p greppy-agent fifty_concurrent_cow_workspaces_stress --locked
+
+  linux-unsupported-fallback:
+    name: Greppy agent on unsupported Linux filesystem
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Forced CoW fails closed before agent startup
+        env:
+          GREPPY_REQUIRE_COW_UNAVAILABLE_TEST: "1"
+        run: cargo test -p greppy-agent forced_cow_on_unsupported_filesystem_fails_closed --locked
+
   linux-xfs-reflink:
     name: Greppy agent on XFS reflink
     runs-on: ubuntu-latest
@@ -56,11 +107,15 @@ jobs:
           TMPDIR: /mnt/greppy-cow-xfs
           XDG_CACHE_HOME: /mnt/greppy-cow-xfs/cache
           GREPPY_REQUIRE_COW_TESTS: "1"
+          GREPPY_REQUIRE_AUTO_NATIVE_FALLBACK_TEST: "1"
         run: |
+          cargo test -p greppy-agent auto_prefers_stable_then_uses_registered_concurrent_backend --locked
           cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
           cargo test -p greppy-agent cow_private_git_rewrite_is_rejected_and_tree_is_preserved --locked
+          cargo test -p greppy-agent cow_invalidates_tampered_ready_template_and_next_run_recovers --locked
           cargo test -p greppy-agent native_and_cow_proposals_have_identical_trees --locked
           cargo test -p greppy-agent ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs --locked
+          cargo test -p greppy-agent fifty_concurrent_cow_workspaces_stress --locked
 
       - name: Unmount XFS fixture
         if: always()
