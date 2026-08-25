@@ -20,6 +20,16 @@
 # --- Dev-only working area (SINGLE repo, dev part kept out of the public release):
 #     internal plans, scratch, transitional oracle/bench tooling, notes. ---
 /dev/
+/dev-notes/
+/NOTES-*.md
+/*-PLAN.md
+/*-ADR.md
+/bench/HANDOVER-*.md
+/bench/agent_coding/*-NOTES-*.md
+/bench/agent_coding/hard_selection.json
+/bench/agent_coding/v3/*.draft.jsonl
+/bench/agent_efficiency/FINDING_*.md
+/crates/cli/assets/*/TRAINING_STATUS.md
 
 # --- Python caches / virtualenvs ---
 __pycache__/
@@ -31,7 +41,6 @@ __pycache__/
 CLAUDE.md
 AGENTS.md
 AGENT_PROJECT_ENTRYPOINT.md
-/docs/
 /reviews/
 /marketing/
 .claude/
