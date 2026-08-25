@@ -37,6 +37,9 @@ Btrfs templates are created and sealed read-only through the retained native
 API. A warm snapshot may bypass the repeated full-tree cleanliness traversal
 only when capability probing confirms both constant-time metadata and the
 filesystem-enforced immutable source; other backends retain validation.
+The registered 300,000-file Btrfs CI fixture measures ten warm creations and
+fails above 500 ms median or 1,000 ms P95; the current candidate measured
+345.735 ms median and 385.708 ms P95.
 
 Windows agent workspaces and sandbox Cargo paths now resolve from native
 `LOCALAPPDATA`/`USERPROFILE` roots instead of falling through a Unix-only

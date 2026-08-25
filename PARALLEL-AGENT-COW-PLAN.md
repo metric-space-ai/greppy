@@ -1,10 +1,11 @@
 # greppy 0.3.2–0.3.3 — Parallel Agent CoW Release Plan
 
-Status: 0.3.2 is published. The 0.3.3 Filesystem-CoW candidate is implemented
-through the first local correctness gates and remains unreleased while platform,
-fault-recovery, packaging, stress, and performance gates are completed ·
-2026-08-25. The binding architecture decision and rollback rule are in
-`FILESYSTEM-COW-ADR.md`.
+Status: 0.3.2 is published. The 0.3.3 Filesystem-CoW candidate has passed its
+native platform matrix, private-Git parity, 10/50-workspace concurrency, and
+300,000-file Btrfs warm-creation gate. It remains isolated and unreleased while
+the final exact-commit lifecycle, packaging, artifact, and remaining end-to-end
+gates are completed · 2026-08-25. The binding architecture decision and
+rollback rule are in `FILESYSTEM-COW-ADR.md`.
 
 Scope decision: **two releases, two complete features.** The milestones below
 are implementation order, not open research branches.

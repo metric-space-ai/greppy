@@ -106,8 +106,15 @@ locks that classification in its macOS native test. Greppy unit coverage
 currently proves private Git isolation, tamper preservation, exact native/CoW
 proposal-tree parity, cleanup, and ten concurrent CoW workspaces.
 
+Greppy Filesystem-CoW run `32818624619` passed the APFS explicit-preview, XFS
+explicit-preview, unsupported-fallback, and automatic Btrfs suites, including
+50 concurrent workspaces and the sealed-template tamper contract. Its
+registered 300,000-file Btrfs gate measured ten warm workspace creations at
+median 345.735 ms and P95 385.708 ms, below the 500/1,000 ms limits. The same
+gate had measured roughly 6.25 s before source sealing exposed and safely
+removed the repeated full-tree validation.
+
 Before release, the exact Greppy candidate must still pass the complete
 workspace test matrix, packaged-artifact/license/SBOM checks, Windows native
-fallback, Greppy-integrated Linux Btrfs and reflink tests, crash/fault recovery,
-50-workspace stress, and the preregistered end-to-end latency/storage gates in
-`PARALLEL-AGENT-COW-PLAN.md`.
+fallback, crash/fault recovery, and the remaining preregistered end-to-end
+latency/storage gates in `PARALLEL-AGENT-COW-PLAN.md`.
