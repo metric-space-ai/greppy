@@ -1,7 +1,8 @@
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
+    MountOption, Notifier, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, Session, SessionACL,
+    TimeOrNow,
 };
 use greppy_workspace_core::{
     AdapterKind, NodeKind, NodeMetadata, ProviderCapabilities, ProviderManifest, ProviderState,
@@ -45,6 +46,7 @@ struct PortableFuse {
     next_inode: AtomicU64,
     uid: u32,
     gid: u32,
+    notifier: Arc<Mutex<Option<Notifier>>>,
 }
 
 impl PortableFuse {
@@ -74,6 +76,7 @@ impl PortableFuse {
             next_inode: AtomicU64::new(16),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
+            notifier: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -113,6 +116,20 @@ impl PortableFuse {
             reverse.remove(&old);
             reverse.insert(new.clone(), inode);
             nodes.insert(inode, new);
+        }
+    }
+
+    fn invalidate_rename(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        new_parent: INodeNo,
+        new_name: &OsStr,
+    ) {
+        let notifier = self.notifier.lock().unwrap().clone();
+        if let Some(notifier) = notifier {
+            let _ = notifier.inval_entry(parent, name);
+            let _ = notifier.inval_entry(new_parent, new_name);
         }
     }
 
@@ -659,7 +676,10 @@ impl Filesystem for PortableFuse {
                 Ok(())
             });
         match result {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.invalidate_rename(parent, name, new_parent, new_name);
+                reply.ok()
+            }
             Err(error) => reply.error(error),
         }
     }
@@ -915,6 +935,7 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     }));
     let core = WorkspaceCore::open(data_root.join("core")).map_err(core_io)?;
     let filesystem = PortableFuse::new(core, data_root.join("doctor"), manifest.clone())?;
+    let notifier = filesystem.notifier.clone();
     {
         let mut state = manifest.write().unwrap();
         state.state = ProviderState::Ready;
@@ -946,7 +967,9 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     config.acl = SessionACL::Owner;
     config.n_threads = Some(8);
     config.clone_fd = true;
-    let result = fuser::mount(filesystem, mount_root, &config);
+    let session = Session::new(filesystem, mount_root, &config)?;
+    *notifier.lock().unwrap() = Some(session.notifier());
+    let result = session.run();
     let mut state = manifest.write().unwrap();
     state.state = ProviderState::Broken;
     state.heartbeat_unix_ms = now_ms();
