@@ -2411,6 +2411,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    #[test]
+    fn cow_rebuilds_template_when_base_commit_changes() {
+        let repo = init_fixture("greppy-ws-cow-template-new-base");
+        let Some(first) = create_cow_fixture(&repo, &unique_tag("run-cow-base-first")) else {
+            let template = cow_template_dir(&repo);
+            destroy_stable(&repo, &template);
+            let _ = fs::remove_file(cow_template_ready_path(&template));
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        };
+        first.cleanup().expect("cleanup first base workspace");
+
+        fs::write(repo.join("hello.txt"), b"second base\n").expect("update main fixture");
+        git_c(&repo, &["add", "hello.txt"]);
+        git_c(&repo, &["commit", "-m", "second base"]);
+        let second_commit = git_c(&repo, &["rev-parse", "HEAD"]);
+
+        let second = AgentWorkspace::create_with_options(
+            &repo,
+            &unique_tag("run-cow-base-second"),
+            CreateOptions {
+                fresh: true,
+                backend: WorkspaceBackend::Cow,
+            },
+        )
+        .expect("rebuild CoW template at second base");
+        assert_eq!(second.base_commit, second_commit);
+        assert_eq!(
+            fs::read(second.worktree_path().join("hello.txt")).expect("read second base file"),
+            b"second base\n"
+        );
+        second.cleanup().expect("cleanup second base workspace");
+
+        let template = cow_template_dir(&repo);
+        assert_eq!(
+            fs::read_to_string(cow_template_ready_path(&template))
+                .expect("read rebuilt template marker")
+                .trim(),
+            second_commit
+        );
+        destroy_stable(&repo, &template);
+        let _ = fs::remove_file(cow_template_ready_path(&template));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
     #[cfg(unix)]
     #[test]
     fn cow_private_git_rewrite_is_rejected_and_tree_is_preserved() {

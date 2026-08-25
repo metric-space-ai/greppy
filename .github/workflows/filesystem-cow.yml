@@ -49,6 +49,7 @@ jobs:
           cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
           cargo test -p greppy-agent cow_private_git_rewrite_is_rejected_and_tree_is_preserved --locked
           cargo test -p greppy-agent cow_invalidates_tampered_ready_template_and_next_run_recovers --locked
+          cargo test -p greppy-agent cow_rebuilds_template_when_base_commit_changes --locked
           cargo test -p greppy-agent native_and_cow_proposals_have_identical_trees --locked
           cargo test -p greppy-agent ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs --locked
           cargo test -p greppy-agent fifty_concurrent_cow_workspaces_stress --locked
@@ -112,6 +113,7 @@ jobs:
           cargo test -p greppy-agent auto_prefers_stable_then_uses_registered_concurrent_backend --locked
           cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
           cargo test -p greppy-agent cow_invalidates_tampered_ready_template_and_next_run_recovers --locked
+          cargo test -p greppy-agent cow_rebuilds_template_when_base_commit_changes --locked
           cargo test -p greppy-agent native_and_cow_proposals_have_identical_trees --locked
           cargo test -p greppy-agent ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs --locked
           cargo test -p greppy-agent fifty_concurrent_cow_workspaces_stress --locked
@@ -174,6 +176,7 @@ jobs:
           cargo test -p greppy-agent cow_workspace_has_private_git_proposal_and_cleanup --locked
           cargo test -p greppy-agent cow_private_git_rewrite_is_rejected_and_tree_is_preserved --locked
           cargo test -p greppy-agent cow_invalidates_tampered_ready_template_and_next_run_recovers --locked
+          cargo test -p greppy-agent cow_rebuilds_template_when_base_commit_changes --locked
           cargo test -p greppy-agent native_and_cow_proposals_have_identical_trees --locked
           cargo test -p greppy-agent ten_concurrent_cow_workspaces_are_private_and_publish_distinct_refs --locked
           cargo test -p greppy-agent fifty_concurrent_cow_workspaces_stress --locked
