@@ -56,6 +56,7 @@ int32_t greppy_workspace_symlink(GreppyWorkspaceCore *core, const char *workspac
                                  const char *path, const uint8_t *target, size_t target_len);
 char *greppy_workspace_list_json(GreppyWorkspaceCore *core, const char *workspace_id,
                                  const char *path);
+char *greppy_workspace_list_workspaces_json(GreppyWorkspaceCore *core);
 char *greppy_workspace_last_error(void);
 void greppy_workspace_string_free(char *value);
 

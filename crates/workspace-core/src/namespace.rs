@@ -179,9 +179,7 @@ impl WorkspaceCore {
             |row| row.get(0),
         )?;
         if !exists {
-            return Err(Error::InvalidPath(format!(
-                "unknown or broken workspace {id}"
-            )));
+            return Err(Error::NotFound(format!("unknown or broken workspace {id}")));
         }
         Ok(WorkspaceHandle { id: id.into() })
     }
@@ -257,7 +255,7 @@ impl WorkspaceCore {
                 },
             )
             .optional()?
-            .ok_or_else(|| Error::InvalidPath(format!("unknown workspace {}", workspace.id)))
+            .ok_or_else(|| Error::NotFound(format!("unknown workspace {}", workspace.id)))
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceStatus>> {
@@ -342,9 +340,7 @@ impl WorkspaceCore {
         let path = normalize_path(path.as_ref(), false)?;
         let inode = self.materialize(workspace, &path)?;
         if inode.kind != NodeKind::File && inode.kind != NodeKind::Symlink {
-            return Err(Error::InvalidPath(format!(
-                "{path} is not readable file content"
-            )));
+            return Err(Error::IsDirectory(path));
         }
         read_chunks(&self.chunks, &inode.chunks, inode.size, offset, length)
     }
@@ -359,7 +355,7 @@ impl WorkspaceCore {
         let path = normalize_path(path.as_ref(), false)?;
         let mut inode = self.materialize(workspace, &path)?;
         if inode.kind != NodeKind::File {
-            return Err(Error::InvalidPath(format!("{path} is not a regular file")));
+            return Err(Error::IsDirectory(path));
         }
         if bytes.is_empty() {
             return Ok(0);
@@ -434,7 +430,7 @@ impl WorkspaceCore {
         let path = normalize_path(path.as_ref(), false)?;
         let mut inode = self.materialize(workspace, &path)?;
         if inode.kind != NodeKind::File {
-            return Err(Error::InvalidPath(format!("{path} is not a regular file")));
+            return Err(Error::IsDirectory(path));
         }
         let required = if new_size == 0 {
             0
@@ -548,7 +544,7 @@ impl WorkspaceCore {
         let path = normalize_path(path.as_ref(), false)?;
         let metadata = self
             .metadata(workspace, &path)?
-            .ok_or_else(|| Error::InvalidPath(format!("path does not exist: {path}")))?;
+            .ok_or_else(|| Error::NotFound(path.clone()))?;
         if metadata.kind != NodeKind::Symlink {
             return Err(Error::InvalidPath(format!("path is not a symlink: {path}")));
         }
@@ -566,9 +562,7 @@ impl WorkspaceCore {
         let source = normalize_path(source.as_ref(), false)?;
         let destination = normalize_path(destination.as_ref(), false)?;
         if self.metadata(workspace, &destination)?.is_some() {
-            return Err(Error::InvalidPath(format!(
-                "destination already exists: {destination}"
-            )));
+            return Err(Error::AlreadyExists(destination));
         }
         let inode = self.materialize(workspace, &source)?;
         if inode.kind == NodeKind::Directory {
@@ -589,11 +583,9 @@ impl WorkspaceCore {
         let path = normalize_path(path.as_ref(), false)?;
         let metadata = self
             .metadata(workspace, &path)?
-            .ok_or_else(|| Error::InvalidPath(format!("path does not exist: {path}")))?;
+            .ok_or_else(|| Error::NotFound(path.clone()))?;
         if metadata.kind == NodeKind::Directory && !self.read_dir(workspace, &path)?.is_empty() {
-            return Err(Error::InvalidPath(format!(
-                "directory is not empty: {path}"
-            )));
+            return Err(Error::DirectoryNotEmpty(path));
         }
         let inode = self.materialize(workspace, &path)?;
         let mut connection = self.lock_metadata()?;
@@ -635,16 +627,14 @@ impl WorkspaceCore {
         }
         let metadata = self
             .metadata(workspace, &source)?
-            .ok_or_else(|| Error::InvalidPath(format!("source does not exist: {source}")))?;
+            .ok_or_else(|| Error::NotFound(source.clone()))?;
         let destination_metadata = self.metadata(workspace, &destination)?;
         if metadata.kind != NodeKind::Directory {
             if destination_metadata
                 .as_ref()
                 .is_some_and(|destination| destination.kind == NodeKind::Directory)
             {
-                return Err(Error::InvalidPath(format!(
-                    "cannot replace directory with non-directory: {destination}"
-                )));
+                return Err(Error::IsDirectory(destination));
             }
             let inode = self.materialize(workspace, &source)?;
             let mut connection = self.lock_metadata()?;
@@ -697,9 +687,7 @@ impl WorkspaceCore {
         }
 
         if destination_metadata.is_some() {
-            return Err(Error::InvalidPath(format!(
-                "destination directory already exists: {destination}"
-            )));
+            return Err(Error::AlreadyExists(destination));
         }
 
         let mut connection = self.lock_metadata()?;
@@ -1058,7 +1046,7 @@ impl WorkspaceCore {
     ) -> Result<()> {
         let path = normalize_path(path, false)?;
         if self.metadata(workspace, &path)?.is_some() {
-            return Err(Error::InvalidPath(format!("path already exists: {path}")));
+            return Err(Error::AlreadyExists(path));
         }
         ensure_parent_directory(self, workspace, &path)?;
         let chunks = if kind == NodeKind::Directory {
@@ -1093,7 +1081,7 @@ impl WorkspaceCore {
                 return Ok(inode);
             }
             if ancestor_tombstoned(&connection, &workspace.id, path)? {
-                return Err(Error::InvalidPath(format!("path does not exist: {path}")));
+                return Err(Error::NotFound(path.into()));
             }
         }
         let (repository, base_commit, translated) = {
@@ -1103,7 +1091,7 @@ impl WorkspaceCore {
             (repository, base_commit, translated)
         };
         let git = git_lookup(Path::new(&repository), &base_commit, &translated)?
-            .ok_or_else(|| Error::InvalidPath(format!("path does not exist: {path}")))?;
+            .ok_or_else(|| Error::NotFound(path.into()))?;
         let chunks = match git.kind {
             NodeKind::Directory => Vec::new(),
             NodeKind::File | NodeKind::Symlink => {
@@ -1547,12 +1535,8 @@ fn ensure_parent_directory(
     };
     match core.metadata(workspace, parent)? {
         Some(metadata) if metadata.kind == NodeKind::Directory => Ok(()),
-        Some(_) => Err(Error::InvalidPath(format!(
-            "parent is not a directory: {parent}"
-        ))),
-        None => Err(Error::InvalidPath(format!(
-            "parent does not exist: {parent}"
-        ))),
+        Some(_) => Err(Error::NotDirectory(parent.into())),
+        None => Err(Error::NotFound(parent.into())),
     }
 }
 

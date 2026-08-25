@@ -495,6 +495,23 @@ pub unsafe extern "C" fn greppy_workspace_list_json(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn greppy_workspace_list_workspaces_json(
+    value: *mut GreppyWorkspaceCore,
+) -> *mut c_char {
+    let Ok(core) = core(value) else {
+        return ptr::null_mut();
+    };
+    let result = core
+        .list_workspaces()
+        .map_err(remember)
+        .and_then(|workspaces| serde_json::to_string(&workspaces).map_err(remember));
+    match result.and_then(|json| CString::new(json).map_err(remember)) {
+        Ok(json) => json.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn greppy_workspace_last_error() -> *mut c_char {
     LAST_ERROR.with(|slot| slot.borrow().clone().into_raw())
 }
