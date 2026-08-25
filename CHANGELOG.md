@@ -290,9 +290,9 @@ the concepts (which verbs exist per section, the result-line shape, that a
 footer flag holds for every command in its section, that retired vocabulary
 never returns), and one freezes the file byte for byte — changing it requires
 updating an approved hash, which is a deliberate signature rather than an
-accident. A separate gate (`dev/smoke_pass.py`, 33 cases) runs every
-advertised line against the built binary, so the manual cannot promise what
-the code does not do.
+accident. A separate 33-case release smoke gate ran every advertised line
+against the built binary, so the manual could not promise what the code did
+not do.
 
 ### Search — one family on one axis
 

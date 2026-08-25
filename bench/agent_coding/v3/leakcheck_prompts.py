@@ -15,7 +15,7 @@ reporter also happened to paste into the issue title).
 
 Usage:
   leakcheck_prompts.py --ledger-glob '/mnt/nvme1/greppy-bench-v3/*-ledger.jsonl' \
-      prompts-user-66.json prompts-go-caddy.draft.jsonl
+      prompts-user-66.json [additional-prompts.jsonl ...]
 Exit 0 = clean, 1 = leaks found.
 """
 import argparse, ast, glob, json, re, sys

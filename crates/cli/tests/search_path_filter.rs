@@ -88,8 +88,7 @@ fn search_symbol_path_with_no_hit_returns_bounded_status() {
         &["search-symbol", "parse_widget", "--path", "no-such-dir"],
     );
 
-    // grep's code, per dev/SEARCH-OUTPUT-SPEC.md "Exit codes: grep's
-    // convention, deliberately": 0 for a hit, 1 for none. The bounded status
+    // grep's convention: 0 for a hit, 1 for none. The bounded status
     // below carries the guidance; the exit code does not repeat it.
     assert_eq!(code, 1, "stdout={out}\nstderr={err}");
     assert!(
@@ -175,8 +174,7 @@ fn search_pattern_path_with_no_hit_returns_bounded_status() {
         &["search-pattern", "fn parse_widget", "--path", "no-such-dir"],
     );
 
-    // grep's code, per dev/SEARCH-OUTPUT-SPEC.md "Exit codes: grep's
-    // convention, deliberately": 0 for a hit, 1 for none. The bounded status
+    // grep's convention: 0 for a hit, 1 for none. The bounded status
     // below carries the guidance; the exit code does not repeat it.
     assert_eq!(code, 1, "stdout={out}\nstderr={err}");
     assert!(
