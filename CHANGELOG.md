@@ -31,6 +31,9 @@ Windows agent workspaces and sandbox Cargo paths now resolve from native
 `LOCALAPPDATA`/`USERPROFILE` roots instead of falling through a Unix-only
 `HOME` assumption to a mixed `/.cache\\...` path. The Windows CI executes the
 agent workspace suite so this native-fallback contract cannot regress silently.
+Canonical extended-length paths are converted to ordinary drive/UNC syntax
+only at the Git subprocess boundary because Git for Windows rejects `\\?\...`
+values passed through `--git-dir`.
 
 ## [0.3.2] — 2026-08-24
 

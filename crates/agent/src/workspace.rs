@@ -1168,7 +1168,7 @@ fn linked_git_dir_from_main(
         PorcelainMatch::None | PorcelainMatch::Ambiguous => Ok(None),
         PorcelainMatch::One(Some(gd)) => {
             let canon = gd.canonicalize().unwrap_or(gd);
-            Ok(Some(canon))
+            Ok(Some(git_cli_compatible_path(canon)))
         }
         PorcelainMatch::One(None) => {
             // No explicit gitdir line for this entry. Two possibilities:
@@ -1290,7 +1290,9 @@ fn linked_git_dir_via_common_scan(
             || pointed_canon == expected_git_file_canon;
         if points_here {
             let linked = ent.path();
-            matches.push(linked.canonicalize().unwrap_or(linked));
+            matches.push(git_cli_compatible_path(
+                linked.canonicalize().unwrap_or(linked),
+            ));
         }
     }
     if matches.len() == 1 {
@@ -1788,6 +1790,26 @@ fn path_str(p: &Path) -> Result<&str, WorkspaceError> {
             "path is not valid UTF-8",
         ))
     })
+}
+
+/// Git for Windows rejects Rust's extended-length `\\?\` canonical paths when
+/// supplied through `--git-dir`, even though Win32 filesystem APIs accept them.
+/// Normalize only the subprocess-facing copy; identity checks keep using their
+/// canonical `PathBuf`s.
+fn git_cli_compatible_path(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(text) = path.to_str() else {
+            return path;
+        };
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 /// Build a `git` Command with diagnostics pinned to the C locale.
