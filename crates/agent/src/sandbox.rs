@@ -894,7 +894,7 @@ fn preflight_linux(_roots: &[PathBuf]) -> Result<(), SandboxError> {
 #[cfg(target_os = "linux")]
 fn open_trusted_root_fds(roots: &[PathBuf]) -> Result<Vec<OwnedDirFd>, SandboxError> {
     #[cfg(test)]
-    TRUSTED_ROOT_OPEN_COUNT.fetch_add(roots.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    TRUSTED_ROOT_OPEN_COUNT.with(|count| count.set(count.get() + roots.len() as u64));
     let mut out = Vec::with_capacity(roots.len());
     for r in roots {
         out.push(OwnedDirFd::open_dir_nofollow(r)?);
@@ -902,10 +902,18 @@ fn open_trusted_root_fds(roots: &[PathBuf]) -> Result<Vec<OwnedDirFd>, SandboxEr
     Ok(out)
 }
 
-/// Test-only counter of pathname opens performed by [`open_trusted_root_fds`].
-/// Used to prove `apply_linux` never re-opens roots after preparation.
+/// Test-only per-test-thread counter of pathname opens performed by
+/// [`open_trusted_root_fds`]. Rust runs tests concurrently, so a process-wide
+/// atomic makes otherwise unrelated sandbox tests race with these assertions.
 #[cfg(all(test, target_os = "linux"))]
-static TRUSTED_ROOT_OPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static TRUSTED_ROOT_OPEN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn trusted_root_open_count() -> u64 {
+    TRUSTED_ROOT_OPEN_COUNT.with(std::cell::Cell::get)
+}
 
 /// Duplicate every held root FD for a single spawn (no pathname open).
 #[cfg(target_os = "linux")]
@@ -1553,7 +1561,7 @@ mod tests {
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
 
-        let opens_before = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_before = trusted_root_open_count();
 
         // Resolve once (may be Unsupported on old kernels — then nothing to check).
         let mode = match resolve_enforce_spec(std::slice::from_ref(&root)) {
@@ -1568,7 +1576,7 @@ mod tests {
             panic!("expected Enforce");
         };
         let original = spec.writable_roots[0].clone();
-        let opens_after_prep = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_after_prep = trusted_root_open_count();
         assert!(
             opens_after_prep > opens_before,
             "preparation must open trusted root FDs once"
@@ -1589,7 +1597,7 @@ mod tests {
         // Apply must succeed: it dups held FDs and never re-opens the (now
         // swapped) pathnames. A post-prep ancestor swap cannot redirect them.
         apply(&mut cmd, &bin, &["hi"][..], &mode).expect("apply after swap must use held FDs");
-        let opens_after_apply = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_after_apply = trusted_root_open_count();
         assert_eq!(
             opens_after_apply, opens_after_prep,
             "apply must not open any additional trusted-root pathnames"
@@ -1629,7 +1637,7 @@ mod tests {
     fn trusted_root_fds_opened_once_per_run_not_per_apply() {
         let root = unique("open-once");
         std::fs::create_dir_all(&root).unwrap();
-        let opens_before = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_before = trusted_root_open_count();
         let mode = match resolve_enforce_spec(std::slice::from_ref(&root)) {
             Ok(m) => m,
             Err(SandboxError::Unsupported) => {
@@ -1638,7 +1646,7 @@ mod tests {
             }
             Err(e) => panic!("resolve: {e}"),
         };
-        let opens_after_prep = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_after_prep = trusted_root_open_count();
         assert_eq!(
             opens_after_prep,
             opens_before + 1,
@@ -1650,7 +1658,7 @@ mod tests {
             let mut cmd = Command::new("placeholder");
             apply(&mut cmd, &bin, &["hi"][..], &mode).expect("apply");
         }
-        let opens_after_applies = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_after_applies = trusted_root_open_count();
         assert_eq!(
             opens_after_applies, opens_after_prep,
             "three applies must not open any additional pathnames"
@@ -1662,21 +1670,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn off_mode_opens_no_trusted_root_fds() {
-        let opens_before = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_before = trusted_root_open_count();
         let mut cmd = Command::new("placeholder");
         let bin = PathBuf::from("/bin/echo");
         apply(&mut cmd, &bin, &["hi"][..], &SandboxMode::Off).unwrap();
-        let opens_after = TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed);
+        let opens_after = trusted_root_open_count();
         assert_eq!(
             opens_after, opens_before,
             "Off must not open trusted root FDs"
         );
         // And constructing Off does not touch PreparedRoots either.
         let _ = SandboxMode::Off;
-        assert_eq!(
-            TRUSTED_ROOT_OPEN_COUNT.load(Ordering::Relaxed),
-            opens_before
-        );
+        assert_eq!(trusted_root_open_count(), opens_before);
     }
 
     /// Spec equality is path-based; two preparations of the same roots compare
