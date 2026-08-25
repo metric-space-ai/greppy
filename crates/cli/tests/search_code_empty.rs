@@ -2,7 +2,7 @@
 //! retirement pin for the pre-0.3.0 name `search-code` whose literal-search
 //! contract this file used to pin.
 //!
-//! 0.3.0 contract (dev/SEARCH-OUTPUT-SPEC.md, normative):
+//! 0.3.0 CLI contract (normative):
 //! * `search-code` is dead vocabulary: refused as an unknown subcommand
 //!   (exit 64) before grep passthrough — never grepped, never answered.
 //! * `search-pattern` is regex-native: a pattern with metacharacters is
@@ -89,7 +89,7 @@ fn empty_search_pattern_names_the_path_filter_and_next_actions() {
 
     assert_eq!(
         code, 1,
-        "a bounded no-match status still uses grep's code: dev/SEARCH-OUTPUT-SPEC.md \"Exit codes: grep's convention, deliberately\" — 0 for a hit, 1 for none. The status block carries the guidance; stdout={stdout}"
+        "a bounded no-match status still uses grep's convention — 0 for a hit, 1 for none. The status block carries the guidance; stdout={stdout}"
     );
     assert!(stdout.contains("status: no_matches"), "{stdout}");
     assert!(
@@ -120,7 +120,7 @@ fn metacharacter_pattern_is_just_a_pattern_without_teaching() {
 
     assert_eq!(
         code, 1,
-        "a bounded no-match status still uses grep's code: dev/SEARCH-OUTPUT-SPEC.md \"Exit codes: grep's convention, deliberately\" — 0 for a hit, 1 for none. The status block carries the guidance; stdout={stdout}"
+        "a bounded no-match status still uses grep's convention — 0 for a hit, 1 for none. The status block carries the guidance; stdout={stdout}"
     );
     assert!(stdout.contains("status: no_matches"), "{stdout}");
     assert!(

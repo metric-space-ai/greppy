@@ -8,7 +8,7 @@
 //!   - **unique**: Applied, exit 0, certificate published, file changed.
 //!   - **ambiguous**: refusal with the closest contract exit code, file
 //!     unchanged. `replace-body` maps body-resolution failure to
-//!     NotFound (10) — see NOTES-grid-rust.md for the 10-vs-11 mapping.
+//!     NotFound (10); byte-range verbs do not emit candidate lists.
 //!     The byte-splice verbs return `Err` from `apply_in_memory` when
 //!     the resolved span is out of range.
 //!   - **stale**: file mutated between resolution and apply. Resolution-time
