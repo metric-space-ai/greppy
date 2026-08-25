@@ -22,6 +22,10 @@ pub enum Error {
     Corrupt(String),
     #[error("invalid workspace path: {0}")]
     InvalidPath(String),
+    #[error("portable workspace adapter is unavailable: {0}")]
+    AdapterUnavailable(String),
+    #[error("portable workspace adapter is unhealthy: {0}")]
+    AdapterUnhealthy(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

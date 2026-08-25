@@ -8,11 +8,16 @@
 mod chunk_store;
 mod error;
 mod namespace;
+mod provider;
 mod snapshot;
 
 pub use chunk_store::{ChunkId, ChunkStore, ChunkStoreStats, CHUNK_SIZE};
 pub use error::{Error, Result};
 pub use namespace::{
     DirectoryEntry, NodeKind, NodeMetadata, WorkspaceCore, WorkspaceHandle, WorkspaceStatus,
+};
+pub use provider::{
+    AdapterKind, ProviderCapabilities, ProviderInstallation, ProviderManifest, ProviderState,
+    PROVIDER_PROTOCOL_VERSION,
 };
 pub use snapshot::{capture_repository, BaselineEntry, BaselineSnapshot, EntryKind};
