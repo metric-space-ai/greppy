@@ -6294,9 +6294,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "locator-type"
+      ],
       "known_differences": [
         "focus then keyboard.press DOM KeyboardEvent; not OS input"
       ]
