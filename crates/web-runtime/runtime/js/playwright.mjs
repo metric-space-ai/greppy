@@ -402,6 +402,13 @@ class Locator {
     });
   }
 
+  async blur() {
+    await engineCall("locator.blur", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
   async boundingBox() {
     return engineCall("locator.boundingBox", {
       page: this._page._id,
@@ -857,6 +864,18 @@ class Frame {
     return checked ? this.check(selector) : this.uncheck(selector);
   }
 
+  dblclick(selector, options) {
+    return this.locator(selector).dblclick(options);
+  }
+
+  dispatchEvent(selector, type) {
+    return this.locator(selector).dispatchEvent(type);
+  }
+
+  focus(selector) {
+    return this.locator(selector).focus();
+  }
+
   frameLocator(selector) {
     if (this._isMain()) {
       return this._page.frameLocator(selector);
@@ -905,6 +924,10 @@ class Page {
       },
       up: async () => {
         await engineCall("page.mouse.up", { page: this._id, x: 0, y: 0 });
+      },
+      dblclick: async (x, y) => {
+        await engineCall("page.mouse.click", { page: this._id, x, y });
+        await engineCall("page.mouse.click", { page: this._id, x, y });
       },
     };
     return withUnsupported(this, "Page");
@@ -1172,6 +1195,7 @@ class Page {
       headerValue: (name) => headerMap()[String(name).toLowerCase()] || null,
       headersArray: () =>
         headerList.map((h) => ({ name: String(h.name), value: h.value })),
+      allHeaders: async () => headerMap(),
       resourceType: () => (rec.main_frame ? "document" : "other"),
       isNavigationRequest: () => !!rec.main_frame,
       frame: () => this.mainFrame(),
@@ -1197,6 +1221,11 @@ class Page {
       headerValue: (name) => headers[String(name).toLowerCase()] || null,
       headersArray: () =>
         Object.keys(headers).map((name) => ({ name, value: headers[name] })),
+      allHeaders: async () => headers,
+      headerValues: async (name) => {
+        const value = headers[String(name).toLowerCase()];
+        return value == null ? [] : [value];
+      },
       body: async () => bytes(),
       text: async () => decodeUtf8(bytes()),
       json: async () => JSON.parse(decodeUtf8(bytes())),
@@ -1699,6 +1728,7 @@ class BrowserContext {
     this._browser = null;
     this._pendingRoutes = [];
     this._extraHeaders = {};
+    this._initScripts = [];
     this.tracing = {
       start: async () => unsupported("BrowserContext.tracing.start")(),
       stop: async () => unsupported("BrowserContext.tracing.stop")(),
@@ -1722,6 +1752,9 @@ class BrowserContext {
     }
     if (this._extraHeaders && Object.keys(this._extraHeaders).length) {
       await page.setExtraHTTPHeaders(this._extraHeaders);
+    }
+    for (const source of this._initScripts || []) {
+      await engineCall("page.addInitScript", { page: page._id, source });
     }
     return page;
   }
@@ -1778,6 +1811,31 @@ class BrowserContext {
     this._extraHeaders = headers || {};
     for (const page of this.pages()) {
       await page.setExtraHTTPHeaders(this._extraHeaders);
+    }
+  }
+
+  async addInitScript(script) {
+    const source =
+      typeof script === "function" ? "(" + script.toString() + ")()" : String(script);
+    this._initScripts = this._initScripts || [];
+    this._initScripts.push(source);
+    for (const page of this.pages()) {
+      await engineCall("page.addInitScript", { page: page._id, source });
+    }
+  }
+
+  async unroute(url) {
+    const pattern = String(url);
+    this._pendingRoutes = (this._pendingRoutes || []).filter((item) => item.url !== pattern);
+    for (const page of this.pages()) {
+      await page.unroute(pattern);
+    }
+  }
+
+  async unrouteAll() {
+    this._pendingRoutes = [];
+    for (const page of this.pages()) {
+      await page.unrouteAll();
     }
   }
 

@@ -842,6 +842,10 @@ impl ContentEngine {
                 self.locator_eval(&params, "nodes[0].focus(); return true")?;
                 Ok(json!({}))
             }
+            "locator.blur" => {
+                self.locator_eval(&params, "nodes[0].blur(); return true")?;
+                Ok(json!({}))
+            }
             "locator.boundingBox" => {
                 let resolved = self.resolve_actionable(&params)?;
                 Ok(json!({

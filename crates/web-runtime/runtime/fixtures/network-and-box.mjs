@@ -7,6 +7,13 @@ let onceCount = 0;
 page.once("request", () => {
   onceCount += 1;
 });
+const order = [];
+page.prependListener("request", () => {
+  order.push("pre");
+});
+page.addListener("request", () => {
+  order.push("on");
+});
 page.on("request", (request) => {
   seen.push(request.url());
 });
@@ -28,5 +35,8 @@ if (seen.length < 1 || !String(seen[0]).includes("http")) {
 await page.goto(fixtureUrl.replace(/\/?$/, "/two"));
 if (onceCount !== 1) {
   throw new Error("Page.once should fire once, got " + onceCount);
+}
+if (order[0] !== "pre") {
+  throw new Error("prependListener should fire first, got " + JSON.stringify(order));
 }
 await browser.close();

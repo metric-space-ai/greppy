@@ -27,6 +27,10 @@ if (!headerBlob.includes("x-greppy-test")) {
 if (request.headerValue("x-greppy-test") !== "yes") {
   throw new Error("headerValue " + request.headerValue("x-greppy-test"));
 }
+const allHeaders = await request.allHeaders();
+if (!JSON.stringify(allHeaders).toLowerCase().includes("x-greppy-test")) {
+  throw new Error("allHeaders " + JSON.stringify(allHeaders));
+}
 const headerArray = request.headersArray();
 if (!headerArray.some((h) => String(h.name).toLowerCase() === "x-greppy-test" && h.value === "yes")) {
   throw new Error("headersArray " + JSON.stringify(headerArray));
@@ -46,6 +50,15 @@ await ctx.route("**/ctx-route", (route) =>
 const p2 = await ctx.newPage();
 await p2.goto(fixtureUrl + "ctx-route");
 if ((await p2.innerText("#cr")).trim() !== "ctx-ok") throw new Error("context.route");
+await ctx.unrouteAll();
+await p2.goto(fixtureUrl + "ctx-cleared");
+let stillRouted = false;
+try {
+  stillRouted = (await p2.locator("#cr").innerText()).trim() === "ctx-ok";
+} catch (error) {
+  stillRouted = false;
+}
+if (stillRouted) throw new Error("context.unrouteAll");
 await ctx.close();
 const ctxHeaders = await browser.newContext();
 await ctxHeaders.setExtraHTTPHeaders({ "x-greppy-test": "yes" });

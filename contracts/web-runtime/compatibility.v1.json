@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 243,
+    "implemented": 254,
     "unsupported": 281,
-    "unverified": 830
+    "unverified": 819
   },
   "entries": [
     {
@@ -64,9 +64,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "network-and-box"
+      ],
       "known_differences": [
         "alias of Page.on"
       ]
@@ -904,9 +906,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "network-and-box"
+      ],
       "known_differences": [
         "unshifts onto the in-memory handler list"
       ]
@@ -2430,21 +2434,27 @@
       "symbol": "Frame.dblclick",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to locator.dblclick; no dedicated Frame.dblclick fixture"
+      ]
     },
     {
       "symbol": "Frame.dispatchEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "delegates to locator.dispatchEvent"
+      ]
     },
     {
       "symbol": "Frame.dragAndDrop",
@@ -2499,11 +2509,15 @@
       "symbol": "Frame.focus",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "delegates to locator.focus"
+      ]
     },
     {
       "symbol": "Frame.frameElement",
@@ -2535,12 +2549,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "main-frame delegates to Page.locator",
-        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
+        "main-frame locator.getAttribute; child frames use same-origin FrameLocator CSS"
       ]
     },
     {
@@ -2791,12 +2806,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "main-frame delegates to Page.locator",
-        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
+        "main-frame locator.isEnabled; child frames use same-origin FrameLocator CSS"
       ]
     },
     {
@@ -2804,12 +2820,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "main-frame delegates to Page.locator",
-        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
+        "main-frame locator.isHidden; child frames use same-origin FrameLocator CSS"
       ]
     },
     {
@@ -3439,11 +3456,15 @@
       "symbol": "BrowserContext.addInitScript",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "queued and applied as page.addInitScript on current and later pages; runs on subsequent setContent/goto"
+      ]
     },
     {
       "symbol": "BrowserContext.addListener",
@@ -3819,21 +3840,27 @@
       "symbol": "BrowserContext.unroute",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "filters pending context routes and Page.unroute on open pages; no dedicated fixture"
+      ]
     },
     {
       "symbol": "BrowserContext.unrouteAll",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "clears pending context routes and Page.unrouteAll on open pages"
+      ]
     },
     {
       "symbol": "BrowserContext.waitForEvent",
@@ -5912,11 +5939,15 @@
       "symbol": "Locator.blur",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "calls Element.blur on the matched node"
+      ]
     },
     {
       "symbol": "Locator.boundingBox",
@@ -9668,11 +9699,15 @@
       "symbol": "Mouse.dblclick",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "two mouse.click engine calls at the coordinates; not a single DOM dblclick event"
+      ]
     },
     {
       "symbol": "Mouse.down",
@@ -9770,11 +9805,15 @@
       "symbol": "Request.allHeaders",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "async wrapper around recorded request headers; Cookie is not synthesized"
+      ]
     },
     {
       "symbol": "Request.existingResponse",
@@ -10015,11 +10054,15 @@
       "symbol": "Response.allHeaders",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "async wrapper around intercept fulfill headers"
+      ]
     },
     {
       "symbol": "Response.body",
@@ -10088,11 +10131,15 @@
       "symbol": "Response.headerValues",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "single recorded value as a one-element array; intercept-only"
+      ]
     },
     {
       "symbol": "Response.headers",

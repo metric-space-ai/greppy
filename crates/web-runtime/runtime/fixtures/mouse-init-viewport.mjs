@@ -6,6 +6,9 @@ if (!String(browser.version()).includes("Servo")) {
 }
 const context = await browser.newContext();
 context.setDefaultTimeout(5_000);
+await context.addInitScript(() => {
+  window.__ctxinit = 1;
+});
 const page = await context.newPage();
 if (context.pages().length !== 1) throw new Error("pages");
 if (page.context() !== context) throw new Error("context");
@@ -18,12 +21,23 @@ await page.addInitScript(() => {
 await page.setContent("<!DOCTYPE html><html><body><li>a</li><li>b</li><button id='m'>M</button></body></html>");
 const init = await page.evaluate(() => window.__init);
 if (init !== 1) throw new Error("init script " + JSON.stringify(init));
+const ctxinit = await page.evaluate(() => window.__ctxinit);
+if (ctxinit !== 1) throw new Error("context init script " + JSON.stringify(ctxinit));
 const last = await page.locator("li").last().innerText();
 if (last.trim() !== "b") throw new Error("last " + last);
 const all = await page.locator("li").all();
 if (all.length !== 2) throw new Error("all " + all.length);
 await page.mouse.move(10, 10);
 await page.mouse.click(12, 12);
+await page.evaluate(() => {
+  window.__clicks = 0;
+  document.addEventListener("click", () => {
+    window.__clicks += 1;
+  });
+});
+await page.mouse.dblclick(12, 12);
+const clicks = await page.evaluate(() => window.__clicks);
+if (clicks < 2) throw new Error("mouse.dblclick clicks " + clicks);
 const main = page.mainFrame();
 if ((await main.locator("li").count()) !== 2) throw new Error("main frame count");
 if ((await main.getByText("a").count()) < 1) throw new Error("main getByText");
