@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TEST_DEADLINE: Duration = Duration::from_secs(120);
+const TEST_DEADLINE: Duration = Duration::from_secs(180);
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -621,4 +621,57 @@ fn playwright_core_methods_run_without_network() {
     run.deadline_ms = 60_000;
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn twenty_session_create_run_close_cycles() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-run-cycles-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/launch-close.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_loop", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    for i in 0..20 {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_loop",
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|error| panic!("create {i}: {error}"));
+        assert_eq!(created.status, "ok", "create {i}: {created:?}");
+        let session_id = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut run = Request::new(
+            "run_loop",
+            "web.run",
+            json!({
+                "session_id": session_id,
+                "script_source": "file",
+                "script_file": script.display().to_string(),
+                "script_text": source,
+            }),
+        );
+        run.deadline_ms = 30_000;
+        let ran = unix_request(&socket, &run, Duration::from_secs(30))
+            .unwrap_or_else(|error| panic!("run {i}: {error}"));
+        assert_eq!(ran.status, "ok", "run {i}: {ran:?}");
+        let closed = unix_request(
+            &socket,
+            &Request::new(
+                "run_loop",
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("close {i}: {error}"));
+        assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
+    }
 }

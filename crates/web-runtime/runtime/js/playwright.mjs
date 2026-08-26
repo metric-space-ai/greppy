@@ -235,6 +235,14 @@ class Browser {
     return new BrowserContext(result.context);
   }
 
+  async newPage(options) {
+    if (options != null) {
+      return unsupported("Browser.newPage.options")();
+    }
+    const context = await this.newContext();
+    return context.newPage();
+  }
+
   async close() {
     await engineCall("browser.close", { browser: this._id });
   }

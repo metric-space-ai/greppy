@@ -38,9 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 35,
+    "implemented": 36,
     "unsupported": 243,
-    "unverified": 1076
+    "unverified": 1075
   },
   "entries": [
     {
@@ -3711,11 +3711,13 @@
       "symbol": "Browser.newPage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "implemented as newContext()+newPage(); options are unsupported"
+      ]
     },
     {
       "symbol": "Browser.off",

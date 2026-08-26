@@ -165,6 +165,7 @@ fn playwright_module_methods_are_not_silent_omissions() {
     claimed.push("firefox.launch".into());
     claimed.push("webkit.launch".into());
     claimed.push("Browser.newContext".into());
+    claimed.push("Browser.newPage".into());
     claimed.push("Browser.close".into());
     claimed.push("BrowserContext.newPage".into());
     claimed.push("Locator.first".into());

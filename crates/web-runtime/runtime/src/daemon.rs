@@ -256,6 +256,7 @@ impl Daemon {
             }
         }
         self.sessions.insert(id.clone(), session);
+        self.journal(&id, "session.ready", json!({ "profile": profile }));
         Response::ok(
             request,
             json!({
@@ -307,6 +308,7 @@ impl Daemon {
                     let _ = self.engine_call("page.close", json!({ "page": page }));
                 }
                 let _ = session.transition(SessionState::Closed);
+                self.journal(&session_id, "session.closed", json!({}));
                 Response::ok(
                     request,
                     serde_json::json!({ "session_id": session_id, "state": "closed" }),
@@ -937,6 +939,7 @@ impl Daemon {
             .map_err(|error| error.to_string())?;
         content.handshake().map_err(|error| error.to_string())?;
         self.content = content;
+        let mut failed = Vec::new();
         for session in self.sessions.values_mut() {
             session.page_id = None;
             session.pages = 0;
@@ -945,9 +948,40 @@ impl Daemon {
                 && session.state != SessionState::Closed
             {
                 let _ = session.transition(SessionState::Failed);
+                failed.push(session.id.clone());
             }
         }
+        for session_id in failed {
+            self.journal(&session_id, "session.failed", json!({ "reason": reason }));
+        }
+        self.journal("runtime", "content.recovered", json!({ "reason": reason }));
         Ok(())
+    }
+
+    fn journal(&self, session_id: &str, event: &str, extra: serde_json::Value) {
+        let path = self
+            .store
+            .root()
+            .join("sessions")
+            .join(session_id)
+            .join("journal.jsonl");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let line = json!({
+            "event": event,
+            "session_id": session_id,
+            "run_id": self.run_id,
+            "extra": extra,
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
+        }
     }
 
     fn reap_idle_sessions(&mut self) {
