@@ -4,6 +4,20 @@ function engineCall(method, params) {
   return ops.op_engine_call(method, params ?? {});
 }
 
+function locatorParams(locator, extra) {
+  const params = {
+    page: locator._page._id,
+    selector: locator._selector,
+    timeout: locator._page._timeout || 30_000,
+  };
+  if (extra) {
+    for (const key of Object.keys(extra)) {
+      params[key] = extra[key];
+    }
+  }
+  return params;
+}
+
 function unsupported(symbol) {
   return async function unsupportedOperation() {
     const error = new Error(`unsupported_playwright_operation: ${symbol}`);
@@ -267,8 +281,7 @@ class Locator {
       this._page._lastFileSelector = this._selector.value;
     }
     await engineCall("locator.click", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     await this._page._flushPopups();
   }
@@ -278,8 +291,7 @@ class Locator {
       return unsupported("Locator.tap.options")();
     }
     await engineCall("locator.tap", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     await this._page._flushPopups();
   }
@@ -289,23 +301,20 @@ class Locator {
       return unsupported("Locator.fill.options")();
     }
     await engineCall("locator.fill", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
       value: String(value),
     });
   }
 
   async hover() {
     await engineCall("locator.hover", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async innerText() {
     const result = await engineCall("locator.innerText", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return result.text;
   }
@@ -316,61 +325,53 @@ class Locator {
 
   async count() {
     const result = await engineCall("locator.count", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return result.count;
   }
 
   async isVisible() {
     const result = await engineCall("locator.isVisible", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return !!result.visible;
   }
 
   async waitFor() {
     await engineCall("locator.waitFor", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async check() {
     await engineCall("locator.check", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async uncheck() {
     await engineCall("locator.uncheck", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async selectOption(value) {
     await engineCall("locator.selectOption", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
       value: Array.isArray(value) ? value[0] : value,
     });
   }
 
   async inputValue() {
     const result = await engineCall("locator.inputValue", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return result.value;
   }
 
   async getAttribute(name) {
     const result = await engineCall("locator.getAttribute", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
       name: String(name),
     });
     return result.value;
@@ -378,77 +379,67 @@ class Locator {
 
   async isChecked() {
     const result = await engineCall("locator.isChecked", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return !!result.checked;
   }
 
   async isEnabled() {
     const result = await engineCall("locator.isEnabled", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return !!result.enabled;
   }
 
   async isDisabled() {
     const result = await engineCall("locator.isDisabled", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return !!result.disabled;
   }
 
   async isHidden() {
     const result = await engineCall("locator.isHidden", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return !!result.hidden;
   }
 
   async innerHTML() {
     const result = await engineCall("locator.innerHTML", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return result.html;
   }
 
   async focus() {
     await engineCall("locator.focus", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async blur() {
     await engineCall("locator.blur", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async boundingBox() {
     return engineCall("locator.boundingBox", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async screenshot() {
     const result = await engineCall("locator.screenshot", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return decodeBase64(result.png_base64 || "").buffer;
   }
 
   async allTextContents() {
     const result = await engineCall("locator.allTextContents", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return result.values || [];
   }
@@ -465,8 +456,7 @@ class Locator {
         ? fn
         : "function(el) { return (" + fn + ")(el, " + JSON.stringify(arg) + "); }";
     const result = await engineCall("locator.evaluate", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
       source,
     });
     return result.value;
@@ -480,8 +470,7 @@ class Locator {
         ? fn
         : "function(els) { return (" + fn + ")(els, " + JSON.stringify(arg) + "); }";
     const result = await engineCall("locator.evaluateAll", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
       source,
     });
     return result.value;
@@ -492,15 +481,13 @@ class Locator {
       return unsupported("Locator.dblclick.options")();
     }
     await engineCall("locator.dblclick", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async dispatchEvent(type) {
     await engineCall("locator.dispatchEvent", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
       event: String(type),
     });
   }
@@ -511,8 +498,7 @@ class Locator {
 
   async isEditable() {
     const result = await engineCall("locator.isEditable", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
     return !!result.editable;
   }
@@ -591,15 +577,13 @@ class Locator {
 
   async scrollIntoViewIfNeeded() {
     await engineCall("locator.scrollIntoViewIfNeeded", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 
   async selectText() {
     await engineCall("locator.selectText", {
-      page: this._page._id,
-      selector: this._selector,
+      ...locatorParams(this),
     });
   }
 

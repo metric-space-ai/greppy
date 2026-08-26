@@ -1729,7 +1729,12 @@ impl ContentEngine {
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
         let script = resolve_script(&selector);
-        let deadline = Instant::now() + ACTION_TIMEOUT;
+        let timeout_ms = params
+            .get("timeout")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(ACTION_TIMEOUT.as_millis() as u64)
+            .clamp(20, 120_000);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut last;
         loop {
             if self.parent_dead() {

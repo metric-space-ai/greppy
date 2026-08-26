@@ -6145,10 +6145,12 @@
       "behavior": "unverified",
       "tests": [
         "phase1-spike",
-        "hover"
+        "hover",
+        "actionability"
       ],
       "known_differences": [
-        "options are unsupported"
+        "options are unsupported",
+        "waits until one visible enabled box exists; disabled and display:none time out using Page.setDefaultTimeout; force/trial/position options stay unsupported"
       ]
     },
     {

@@ -2140,6 +2140,11 @@ fn locator_strict_mode_rejects_ambiguous_click() {
 }
 
 #[test]
+fn locator_click_waits_for_actionable_target() {
+    run_named_fixture("actionability.mjs", "run_actab");
+}
+
+#[test]
 fn controller_module_policy_denies_host_filesystem() {
     run_named_fixture("controller-module-policy.mjs", "run_modpol");
 }
