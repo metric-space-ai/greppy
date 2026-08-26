@@ -91,23 +91,34 @@ pub(crate) fn activate(
 ) -> Result<RepositoryTrackerStatus> {
     let repository_text = path_text(repository)?;
     let transaction = connection.transaction()?;
-    let previous: Option<i64> = transaction
+    let previous: Option<(String, i64)> = transaction
         .query_row(
-            "SELECT epoch FROM cow_repository_trackers WHERE repository = ?1",
+            "SELECT state, epoch FROM cow_repository_trackers WHERE repository = ?1",
             params![repository_text],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let epoch = previous.unwrap_or(0) as u64 + 1;
-    transaction.execute(
-        "INSERT INTO cow_repository_trackers(
-             repository, state, epoch, generation, heartbeat_unix_ms, detail
-         ) VALUES(?1, 'active', ?2, 0, ?3, NULL)
-         ON CONFLICT(repository) DO UPDATE SET
-             state = 'active', epoch = excluded.epoch, generation = 0,
-             heartbeat_unix_ms = excluded.heartbeat_unix_ms, detail = NULL",
+    let (state, previous_epoch) = previous.ok_or_else(|| {
+        Error::Corrupt(format!(
+            "cannot activate unregistered repository tracker: {repository_text}"
+        ))
+    })?;
+    if state != "requested" {
+        return Err(Error::Corrupt(format!(
+            "cannot activate repository tracker from {state}: {repository_text}"
+        )));
+    }
+    let epoch = previous_epoch as u64 + 1;
+    let changed = transaction.execute(
+        "UPDATE cow_repository_trackers
+         SET state = 'active', epoch = ?2, generation = 0,
+             heartbeat_unix_ms = ?3, detail = NULL
+         WHERE repository = ?1 AND state = 'requested'",
         params![repository_text, epoch as i64, heartbeat_unix_ms as i64],
     )?;
+    if changed != 1 {
+        return Err(Error::ConcurrentRepositoryMutation);
+    }
     transaction.execute(
         "DELETE FROM cow_repository_events WHERE repository = ?1",
         params![repository_text],
@@ -167,10 +178,31 @@ pub(crate) fn mark_gap(
     let changed = connection.execute(
         "UPDATE cow_repository_trackers
          SET state = 'gap', detail = ?2, heartbeat_unix_ms = ?3
-         WHERE repository = ?1",
+         WHERE repository = ?1 AND state != 'gap'",
         params![path_text(repository)?, detail, heartbeat_unix_ms as i64],
     )?;
-    if changed != 1 {
+    if changed == 0 && status(connection, repository)?.is_none() {
+        return Err(Error::Corrupt(format!(
+            "cannot mark unknown repository tracker as gap: {}",
+            repository.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_active_gap(
+    connection: &Connection,
+    repository: &Path,
+    detail: &str,
+    heartbeat_unix_ms: u64,
+) -> Result<()> {
+    let changed = connection.execute(
+        "UPDATE cow_repository_trackers
+         SET state = 'gap', detail = ?2, heartbeat_unix_ms = ?3
+         WHERE repository = ?1 AND state = 'active'",
+        params![path_text(repository)?, detail, heartbeat_unix_ms as i64],
+    )?;
+    if changed == 0 && status(connection, repository)?.is_none() {
         return Err(Error::Corrupt(format!(
             "cannot mark unknown repository tracker as gap: {}",
             repository.display()
@@ -295,8 +327,9 @@ mod tests {
 
         mark_gap(&connection, &repository, "watcher overflow", 12).unwrap();
         assert!(changes_since(&connection, &repository, active.epoch, 1).is_err());
+        assert!(activate(&mut connection, &repository, 13).is_err());
         request(&connection, &repository).unwrap();
-        let restarted = activate(&mut connection, &repository, 13).unwrap();
+        let restarted = activate(&mut connection, &repository, 14).unwrap();
         assert!(restarted.epoch > active.epoch);
         assert_eq!(restarted.generation, 0);
     }

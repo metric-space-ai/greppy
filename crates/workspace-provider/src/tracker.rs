@@ -1,4 +1,4 @@
-use greppy_workspace_core::{RepositoryTrackerState, WorkspaceCore};
+use greppy_workspace_core::WorkspaceCore;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::io;
@@ -96,44 +96,54 @@ fn build_watcher(
                     if let Err(error) =
                         core.record_repository_changes(&repository, &paths, now_ms())
                     {
-                        if core
-                            .repository_tracker_status(&repository)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|status| status.state == RepositoryTrackerState::Requested)
-                        {
-                            // The watcher is deliberately installed before activation. Events in
-                            // this short interval are covered by the first full double-capture,
-                            // which cannot begin until the tracker reports Active.
-                            return;
-                        }
-                        let _ = core.mark_repository_tracker_gap(
+                        mark_tracker_gap(
+                            &core,
                             &repository,
                             &format!("cannot record watcher event: {error}"),
-                            now_ms(),
+                            true,
                         );
                     }
                 }
                 Ok(_) => {
-                    let _ = core.mark_repository_tracker_gap(
+                    mark_tracker_gap(
+                        &core,
                         &repository,
                         "watcher emitted an event without paths",
-                        now_ms(),
+                        true,
                     );
                 }
                 Err(detail) => {
-                    let _ = core.mark_repository_tracker_gap(&repository, &detail, now_ms());
+                    mark_tracker_gap(&core, &repository, &detail, true);
                 }
             }
         }
         Err(error) => {
-            let _ = core.mark_repository_tracker_gap(
+            mark_tracker_gap(
+                &core,
                 &repository,
                 &format!("watcher backend error: {error}"),
-                now_ms(),
+                false,
             );
         }
     })
+}
+
+fn mark_tracker_gap(
+    core: &WorkspaceCore,
+    repository: &Path,
+    detail: &str,
+    ignore_while_requested: bool,
+) {
+    if ignore_while_requested {
+        // Successful watcher events emitted before activation are covered by
+        // the first full double-capture. The conditional update makes this
+        // decision atomically with respect to activation and restart.
+        let _ = core.mark_active_repository_tracker_gap(repository, detail, now_ms());
+    } else {
+        // Backend failure during installation must prevent activation. The
+        // tracker store preserves the first gap reason.
+        let _ = core.mark_repository_tracker_gap(repository, detail, now_ms());
+    }
 }
 
 fn relative_utf8(repository: &Path, git_dir: &Path, path: &Path) -> Result<String, String> {
@@ -197,6 +207,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greppy_workspace_core::RepositoryTrackerState;
 
     #[test]
     fn path_normalization_is_relative_and_rejects_escape() {
@@ -262,5 +273,35 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn preactivation_events_are_ignored_but_backend_errors_block_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+
+        mark_tracker_gap(&core, &repository, "root event without a child", true);
+        assert_eq!(
+            core.repository_tracker_status(&repository)
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTrackerState::Requested
+        );
+
+        mark_tracker_gap(&core, &repository, "watcher backend stopped", false);
+        mark_tracker_gap(&core, &repository, "later callback noise", false);
+        let status = core
+            .repository_tracker_status(&repository)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, RepositoryTrackerState::Gap);
+        assert_eq!(status.detail.as_deref(), Some("watcher backend stopped"));
+        assert!(core
+            .activate_repository_tracker(&repository, now_ms())
+            .is_err());
     }
 }

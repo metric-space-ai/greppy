@@ -117,6 +117,7 @@ pub struct WorkspaceCore {
     root: PathBuf,
     chunks: ChunkStore,
     metadata: ConnectionPool,
+    metadata_writer: Mutex<()>,
 }
 
 struct ConnectionPool {
@@ -253,6 +254,7 @@ impl WorkspaceCore {
             root,
             chunks,
             metadata: ConnectionPool::new(metadata_path, connection),
+            metadata_writer: Mutex::new(()),
         };
         core.recover()?;
         Ok(core)
@@ -313,6 +315,7 @@ impl WorkspaceCore {
             .to_str()
             .ok_or_else(|| Error::UnsupportedRepository("repository path is not UTF-8".into()))?;
         let baseline_json = serde_json::to_vec(&baseline)?;
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let (base_id, dirty_layer_id) = repository_layers::ensure_layers(
             &mut connection,
@@ -388,6 +391,7 @@ impl WorkspaceCore {
             .ok_or_else(|| {
                 Error::AlreadyExists(format!("workspace pair {content_id} is already active"))
             })?;
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         connection.execute(
             "INSERT INTO cow_workspace_pairs(content_id, git_id, state)
@@ -426,6 +430,7 @@ impl WorkspaceCore {
         content: &WorkspaceHandle,
         git: &WorkspaceHandle,
     ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         for id in [&content.id, &git.id] {
@@ -459,6 +464,7 @@ impl WorkspaceCore {
         content: &WorkspaceHandle,
         git: &WorkspaceHandle,
     ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
@@ -503,6 +509,7 @@ impl WorkspaceCore {
         git_id: &str,
         require_ready: bool,
     ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let pair_state: Option<String> = connection
             .query_row(
@@ -627,6 +634,7 @@ impl WorkspaceCore {
     /// Drops cached repository/dirty layers that are not referenced by an
     /// active workspace or proposal, then compacts the chunk store.
     pub fn gc(&self) -> Result<ChunkGcReport> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         repository_layers::remove_unreferenced(&mut connection, &self.chunks)?;
         drop(connection);
@@ -634,6 +642,7 @@ impl WorkspaceCore {
     }
 
     pub fn request_repository_tracker(&self, repository: &Path) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         repository_tracker::request(&connection, repository)
     }
@@ -648,6 +657,7 @@ impl WorkspaceCore {
         repository: &Path,
         heartbeat_unix_ms: u64,
     ) -> Result<crate::RepositoryTrackerStatus> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         repository_tracker::activate(&mut connection, repository, heartbeat_unix_ms)
     }
@@ -658,6 +668,7 @@ impl WorkspaceCore {
         paths: &[String],
         heartbeat_unix_ms: u64,
     ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         repository_tracker::record(&mut connection, repository, paths, heartbeat_unix_ms)
     }
@@ -668,8 +679,20 @@ impl WorkspaceCore {
         detail: &str,
         heartbeat_unix_ms: u64,
     ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         repository_tracker::mark_gap(&connection, repository, detail, heartbeat_unix_ms)
+    }
+
+    pub fn mark_active_repository_tracker_gap(
+        &self,
+        repository: &Path,
+        detail: &str,
+        heartbeat_unix_ms: u64,
+    ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
+        let connection = self.lock_metadata()?;
+        repository_tracker::mark_active_gap(&connection, repository, detail, heartbeat_unix_ms)
     }
 
     pub fn repository_tracker_status(
@@ -1040,6 +1063,7 @@ impl WorkspaceCore {
         modified_unix_ns: Option<i64>,
     ) -> Result<()> {
         let changed_unix_ns = now_unix_ns();
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
             "UPDATE cow_inodes
@@ -1123,6 +1147,7 @@ impl WorkspaceCore {
                 "hard links to directories are forbidden".into(),
             ));
         }
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         connection.execute(
             "INSERT INTO cow_entries(workspace_id, path, inode_id, tombstone)
@@ -1167,6 +1192,7 @@ impl WorkspaceCore {
             return Err(Error::DirectoryNotEmpty(path));
         }
         let _inode = self.materialize(workspace, &path)?;
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         insert_tombstone(&transaction, &workspace.id, &path)?;
@@ -1199,6 +1225,7 @@ impl WorkspaceCore {
                 return Err(Error::IsDirectory(destination));
             }
             let inode = self.materialize(workspace, &source)?;
+            let _writer = self.lock_metadata_writer()?;
             let mut connection = self.lock_metadata()?;
             let transaction = connection.transaction()?;
             let replaced: Option<(i64, Vec<ChunkId>)> = transaction
@@ -1252,6 +1279,7 @@ impl WorkspaceCore {
             return Err(Error::AlreadyExists(destination));
         }
 
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let translated = translate_redirect(&connection, &workspace.id, &source)?;
         let transaction = connection.transaction()?;
@@ -1345,6 +1373,7 @@ impl WorkspaceCore {
     }
 
     pub fn keep(&self, workspace: &WorkspaceHandle) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
             "UPDATE cow_workspaces SET state = 'kept' WHERE id = ?1 AND state = 'ready'",
@@ -1386,6 +1415,7 @@ impl WorkspaceCore {
         let repository = baseline.repository.clone();
         let baseline_json = serde_json::to_vec(&baseline)?;
         let insert = (|| -> Result<()> {
+            let _writer = self.lock_metadata_writer()?;
             let connection = self.lock_metadata()?;
             connection.execute(
                 "INSERT INTO cow_proposals(
@@ -1471,6 +1501,7 @@ impl WorkspaceCore {
 
     pub fn remove_proposal(&self, ref_name: &str) -> Result<()> {
         self.proposal(ref_name)?;
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
             "DELETE FROM cow_proposals WHERE ref_name = ?1",
@@ -1484,6 +1515,7 @@ impl WorkspaceCore {
     }
 
     pub fn remove_workspace(&self, workspace: WorkspaceHandle) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let chunks = workspace_chunks(&connection, &workspace.id)?;
         let transaction = connection.transaction()?;
@@ -1521,6 +1553,7 @@ impl WorkspaceCore {
                         .map(|lease| (content_id, git_id, lease))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let _writer = self.lock_metadata_writer()?;
             let mut connection = self.lock_metadata()?;
             let transaction = connection.transaction()?;
             for (content_id, git_id, lease) in abandoned {
@@ -1557,6 +1590,7 @@ impl WorkspaceCore {
         }
         drop(connection);
         self.chunks.reconcile_references(&expected)?;
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         connection.execute("DELETE FROM cow_journal", [])?;
         Ok(())
@@ -1568,6 +1602,7 @@ impl WorkspaceCore {
         operation: &str,
         payload: &[u8],
     ) -> Result<i64> {
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         connection.execute(
             "INSERT INTO cow_journal(workspace_id, operation, state, payload)
@@ -1578,6 +1613,7 @@ impl WorkspaceCore {
     }
 
     fn complete_namespace_journal(&self, journal_id: i64) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
             "UPDATE cow_journal SET state = 'complete' WHERE id = ?1",
@@ -1614,6 +1650,7 @@ impl WorkspaceCore {
             }
             chunks
         };
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         let inode = insert_inode(
@@ -1667,6 +1704,7 @@ impl WorkspaceCore {
         for id in &source.chunks {
             self.chunks.pin(*id)?;
         }
+        let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         let inode = insert_inode(
@@ -1695,6 +1733,7 @@ impl WorkspaceCore {
         size: u64,
         chunks: &[ChunkId],
     ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
             "UPDATE cow_inodes
@@ -1725,6 +1764,12 @@ impl WorkspaceCore {
 
     fn lock_metadata(&self) -> Result<PooledConnection<'_>> {
         self.metadata.acquire()
+    }
+
+    fn lock_metadata_writer(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.metadata_writer
+            .lock()
+            .map_err(|_| Error::Corrupt("workspace metadata writer mutex poisoned".into()))
     }
 }
 
@@ -1819,7 +1864,10 @@ fn unlock_pair_lease(_file: &File) {}
 
 fn open_metadata_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    // SQLite permits one WAL writer. In-process mutations are serialized by
+    // WorkspaceCore; this bounded wait covers another Greppy process holding
+    // the database writer without turning a genuine stuck writer into a hang.
+    connection.busy_timeout(std::time::Duration::from_secs(30))?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(connection)
 }
