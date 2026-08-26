@@ -31,6 +31,7 @@ const S_IFLNK: u32 = 0o120000;
 const RENAME_NOREPLACE: u32 = 1;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct GreppyWindowsStat {
     mode: u32,
     size: u64,
@@ -45,6 +46,7 @@ type DirectoryEmitter = unsafe extern "C" fn(
     context: *mut c_void,
     name: *const c_char,
     metadata: *const GreppyWindowsStat,
+    next_offset: u64,
 ) -> c_int;
 
 #[derive(Debug)]
@@ -319,14 +321,18 @@ unsafe extern "C" fn greppy_windows_getattr(
 unsafe extern "C" fn greppy_windows_readdir(
     context: *mut c_void,
     path: *const c_char,
+    offset: u64,
     emit_context: *mut c_void,
     emit: Option<DirectoryEmitter>,
 ) -> c_int {
     ffi_result(context, path, |provider, path| {
         let emit = emit.ok_or(-EINVAL)?;
-        for (name, metadata) in provider.entries(path)? {
+        let current = provider.metadata(path)?;
+        let mut entries = vec![(".".to_string(), current), ("..".to_string(), current)];
+        entries.extend(provider.entries(path)?);
+        for (index, (name, metadata)) in entries.into_iter().enumerate().skip(offset as usize) {
             let name = CString::new(name).map_err(|_| -EINVAL)?;
-            if unsafe { emit(emit_context, name.as_ptr(), &metadata) } != 0 {
+            if unsafe { emit(emit_context, name.as_ptr(), &metadata, (index + 1) as u64) } != 0 {
                 break;
             }
         }

@@ -199,24 +199,23 @@ the binary. The prompt's compact rule is: choose one direct graph command for
 named symbols, one `search` for concept discovery, `search-pattern` for literal
 text, `read-file` for paths, and run builds/tests through `bash-smart`.
 
-The integrated agent allocates its workspace before the first model request.
-The 0.3.3 candidate defaults to `--workspace-backend auto`: use an exact native
-Filesystem-CoW snapshot only when capability probing guarantees no full-tree
-metadata traversal, otherwise retain the 0.3.2 Git-worktree behavior. Use
-`native` to force the 0.3.2 backend or `cow` to require exact CoW, including a
-per-file reflink tree, and receive an explicit error when it is unavailable:
+The integrated agent allocates its portable Chunk-CoW workspace before the
+first model request. After installing the platform package, activate and verify
+the persistent per-user adapter once:
 
 ```bash
-greppy -p "TASK" --model MODEL --workspace-backend auto
-greppy -p "TASK" --model MODEL --workspace-backend native
-greppy -p "TASK" --model MODEL --workspace-backend cow
+greppy workspace setup
+greppy workspace doctor --json
+greppy -p "TASK" --model MODEL
 ```
 
-Each CoW workspace has a real private `.git` directory. It reads the pinned
-base commit's objects through Git alternates, but its index, refs, new objects,
-and agent-created commits are private. Only the final verified proposal commit
-is imported into `refs/greppy/agent/<run-id>`; the current checkout's HEAD and
-index are not changed. CoW does not relax sandboxing or Store isolation.
+There is no filesystem/backend selector and no hidden native fallback. An
+unavailable or unhealthy adapter stops before model inference. Each workspace
+has private Git control state: it reads the pinned base commit's objects
+read-only, while its index, refs, new objects, and agent-created commits remain
+private. Only the final verified proposal is imported into
+`refs/greppy/agent/<run-id>`; the current checkout's HEAD and index are not
+changed. CoW does not relax sandboxing or Store isolation.
 
 ## CLI reference
 

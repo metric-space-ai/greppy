@@ -17,10 +17,10 @@ typedef struct GreppyWindowsStat
     int64_t changed_unix_ns;
 } GreppyWindowsStat;
 
-typedef int (*GreppyDirectoryEmitter)(void *, const char *, const GreppyWindowsStat *);
+typedef int (*GreppyDirectoryEmitter)(void *, const char *, const GreppyWindowsStat *, uint64_t);
 
 extern int greppy_windows_getattr(void *, const char *, GreppyWindowsStat *);
-extern int greppy_windows_readdir(void *, const char *, void *, GreppyDirectoryEmitter);
+extern int greppy_windows_readdir(void *, const char *, uint64_t, void *, GreppyDirectoryEmitter);
 extern int greppy_windows_create(void *, const char *, uint32_t, int);
 extern int greppy_windows_unlink(void *, const char *, int);
 extern int greppy_windows_rename(void *, const char *, const char *, uint32_t);
@@ -69,22 +69,26 @@ typedef struct GreppyEmitContext
     fuse_fill_dir_t filler;
 } GreppyEmitContext;
 
-static int greppy_emit_directory(void *opaque, const char *name, const GreppyWindowsStat *portable)
+static int greppy_emit_directory(void *opaque, const char *name,
+    const GreppyWindowsStat *portable, uint64_t next_offset)
 {
     GreppyEmitContext *context = opaque;
     struct fuse_stat value;
     copy_stat(&value, portable);
-    return context->filler(context->buffer, name, &value, 0, FUSE_FILL_DIR_PLUS);
+    return context->filler(context->buffer, name, &value, (fuse_off_t)next_offset,
+        FUSE_FILL_DIR_PLUS);
 }
 
 static int greppy_readdir(const char *path, void *buffer, fuse_fill_dir_t filler,
     fuse_off_t offset, struct fuse_file_info *file, enum fuse_readdir_flags flags)
 {
     GreppyEmitContext context = {buffer, filler};
-    (void)offset;
     (void)file;
     (void)flags;
-    return greppy_windows_readdir(greppy_context(), path, &context, greppy_emit_directory);
+    if (offset < 0)
+        return -EINVAL;
+    return greppy_windows_readdir(greppy_context(), path, (uint64_t)offset,
+        &context, greppy_emit_directory);
 }
 
 static int greppy_mkdir(const char *path, fuse_mode_t mode)
