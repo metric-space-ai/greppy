@@ -383,12 +383,23 @@ impl Filesystem for PortableFuse {
         }
     }
 
-    fn getattr(&self, _req: &Request, inode: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self
-            .node(inode)
-            .ok_or(Errno::ENOENT)
-            .and_then(|node| self.attr(inode.0, &node))
-        {
+    fn getattr(&self, _req: &Request, inode: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let result = if let Some(handle) = fh.and_then(|fh| {
+            self.open_files
+                .lock()
+                .ok()
+                .and_then(|files| files.get(&fh.0).cloned())
+        }) {
+            self.core
+                .metadata_open_file(&handle)
+                .map(|metadata| workspace_file_attr(inode.0, metadata, self.uid, self.gid))
+                .map_err(core_errno)
+        } else {
+            self.node(inode)
+                .ok_or(Errno::ENOENT)
+                .and_then(|node| self.attr(inode.0, &node))
+        };
+        match result {
             Ok(attr) => reply.attr(&TTL, &attr),
             Err(error) => reply.error(error),
         }
@@ -1203,6 +1214,28 @@ fn workspace_attr(
         system_time_from_ns(metadata.modified_unix_ns),
         system_time_from_ns(metadata.changed_unix_ns),
     )
+}
+
+fn workspace_file_attr(inode: u64, metadata: NodeMetadata, uid: u32, gid: u32) -> FileAttr {
+    let (kind, mode, size, nlink, uid, gid, atime, mtime, ctime) =
+        workspace_attr(metadata, uid, gid);
+    FileAttr {
+        ino: INodeNo(inode),
+        size,
+        blocks: size.div_ceil(512),
+        atime,
+        mtime,
+        ctime,
+        crtime: UNIX_EPOCH,
+        kind,
+        perm: mode,
+        nlink,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 4096,
+        flags: 0,
+    }
 }
 
 fn time_or_now_ns(value: TimeOrNow) -> i64 {

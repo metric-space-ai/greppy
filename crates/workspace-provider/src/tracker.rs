@@ -1,4 +1,4 @@
-use greppy_workspace_core::WorkspaceCore;
+use greppy_workspace_core::{RepositoryTrackerState, WorkspaceCore};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::io;
@@ -96,6 +96,17 @@ fn build_watcher(
                     if let Err(error) =
                         core.record_repository_changes(&repository, &paths, now_ms())
                     {
+                        if core
+                            .repository_tracker_status(&repository)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|status| status.state == RepositoryTrackerState::Requested)
+                        {
+                            // The watcher is deliberately installed before activation. Events in
+                            // this short interval are covered by the first full double-capture,
+                            // which cannot begin until the tracker reports Active.
+                            return;
+                        }
                         let _ = core.mark_repository_tracker_gap(
                             &repository,
                             &format!("cannot record watcher event: {error}"),
@@ -214,6 +225,19 @@ mod tests {
         watcher
             .watch(&repository, RecursiveMode::Recursive)
             .unwrap();
+        std::fs::write(
+            repository.join("before-active.txt"),
+            b"covered by full capture",
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            core.repository_tracker_status(&repository)
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTrackerState::Requested
+        );
         let active = core
             .activate_repository_tracker(&repository, now_ms())
             .unwrap();
