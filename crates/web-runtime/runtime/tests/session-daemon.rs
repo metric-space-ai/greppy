@@ -1567,3 +1567,20 @@ fn research_profile_denies_cloud_metadata() {
     assert_eq!(denied.status, "error", "{denied:?}");
     assert_eq!(denied.error.as_ref().unwrap().code, "policy_denied");
 }
+
+#[test]
+fn mouse_init_script_viewport_and_locator_all() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-mouse-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_mouse", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("mouse-init-viewport.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_mouse",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

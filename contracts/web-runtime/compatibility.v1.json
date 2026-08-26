@@ -39,20 +39,24 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 119,
+    "implemented": 144,
     "unsupported": 243,
-    "unverified": 992
+    "unverified": 967
   },
   "entries": [
     {
       "symbol": "Page.addInitScript",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "runs stored sources after goto/setContent; not isolated world"
+      ]
     },
     {
       "symbol": "Page.addListener",
@@ -226,11 +230,15 @@
       "symbol": "Page.context",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "returns the creating BrowserContext object"
+      ]
     },
     {
       "symbol": "Page.dblclick",
@@ -1006,21 +1014,29 @@
       "symbol": "Page.setDefaultNavigationTimeout",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "alias of setDefaultTimeout"
+      ]
     },
     {
       "symbol": "Page.setDefaultTimeout",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "stored on Page and used by waitForFunction; locator waits still use 30s engine cap"
+      ]
     },
     {
       "symbol": "Page.setExtraHTTPHeaders",
@@ -1053,11 +1069,15 @@
       "symbol": "Page.setViewportSize",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "records size only; software renderer stays 800x600"
+      ]
     },
     {
       "symbol": "Page.tap",
@@ -1159,11 +1179,15 @@
       "symbol": "Page.viewportSize",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "returns last setViewportSize, default 800x600, not layout viewport"
+      ]
     },
     {
       "symbol": "Page.waitForEvent",
@@ -2228,11 +2252,13 @@
       "symbol": "Frame.click",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to frame.locator which is main-frame CSS or the iframe element"
+      ]
     },
     {
       "symbol": "Frame.content",
@@ -2302,11 +2328,13 @@
       "symbol": "Frame.fill",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to frame.locator"
+      ]
     },
     {
       "symbol": "Frame.focus",
@@ -2362,11 +2390,13 @@
       "symbol": "Frame.getByLabel",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main frame only"
+      ]
     },
     {
       "symbol": "Frame.getByPlaceholder",
@@ -2382,11 +2412,15 @@
       "symbol": "Frame.getByRole",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "main frame only; child frames are still iframe-element locators"
+      ]
     },
     {
       "symbol": "Frame.getByTestId",
@@ -2402,11 +2436,15 @@
       "symbol": "Frame.getByText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "main frame only"
+      ]
     },
     {
       "symbol": "Frame.getByTitle",
@@ -2452,11 +2490,13 @@
       "symbol": "Frame.innerText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to frame.locator"
+      ]
     },
     {
       "symbol": "Frame.inputValue",
@@ -3291,11 +3331,15 @@
       "symbol": "BrowserContext.pages",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "in-memory list of pages created through this context"
+      ]
     },
     {
       "symbol": "BrowserContext.prependListener",
@@ -3381,11 +3425,15 @@
       "symbol": "BrowserContext.setDefaultTimeout",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "stored on the context object; not pushed to engine waits"
+      ]
     },
     {
       "symbol": "BrowserContext.setExtraHTTPHeaders",
@@ -4046,11 +4094,15 @@
       "symbol": "Browser.version",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "returns \"Servo 0.5.0\"; not a Chromium version string"
+      ]
     },
     {
       "symbol": "Browser.acceptDownloads",
@@ -5456,11 +5508,15 @@
       "symbol": "Locator.all",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "returns nth(0..count-1) locators"
+      ]
     },
     {
       "symbol": "Locator.allInnerTexts",
@@ -6037,11 +6093,15 @@
       "symbol": "Locator.last",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "nth=-1 over the current match list"
+      ]
     },
     {
       "symbol": "Locator.locator",
@@ -9017,21 +9077,25 @@
       "symbol": "Keyboard.down",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "currently same as press (keydown+keyup)"
+      ]
     },
     {
       "symbol": "Keyboard.insertText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "alias of keyboard.type DOM value append"
+      ]
     },
     {
       "symbol": "Keyboard.press",
@@ -9049,11 +9113,13 @@
       "symbol": "Keyboard.up",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "currently same as press (keydown+keyup)"
+      ]
     },
     {
       "symbol": "Keyboard.delay",
@@ -9099,11 +9165,15 @@
       "symbol": "Mouse.click",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "device-point click_at; not Playwright mouse button options"
+      ]
     },
     {
       "symbol": "Mouse.dblclick",
@@ -9119,31 +9189,43 @@
       "symbol": "Mouse.down",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "left button down at last/zero point"
+      ]
     },
     {
       "symbol": "Mouse.move",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "MouseMove InputEvent"
+      ]
     },
     {
       "symbol": "Mouse.up",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "left button up at last/zero point"
+      ]
     },
     {
       "symbol": "Mouse.wheel",
@@ -13441,11 +13523,15 @@
       "symbol": "Page.mouse",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "mouse.click/move/down/up via Servo InputEvent; no button/clickCount options"
+      ]
     },
     {
       "symbol": "Page.request",

@@ -56,6 +56,8 @@ struct Delegate {
     last_dialogs: RefCell<Vec<serde_json::Value>>,
     dialog_action: RefCell<DialogAction>,
     prompt_text: RefCell<Option<String>>,
+    init_scripts: RefCell<Vec<String>>,
+    viewport: RefCell<(u32, u32)>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
@@ -71,6 +73,8 @@ impl Delegate {
             last_dialogs: RefCell::new(Vec::new()),
             dialog_action: RefCell::new(DialogAction::Accept),
             prompt_text: RefCell::new(None),
+            init_scripts: RefCell::new(Vec::new()),
+            viewport: RefCell::new((800, 600)),
             rendering_context,
         }
     }
@@ -286,6 +290,18 @@ impl ContentEngine {
         }
         let result = saved.borrow_mut().take().expect("evaluation completed");
         result.map_err(|error| io::Error::other(format!("page JavaScript failed: {error:?}")))
+    }
+
+    fn run_init_scripts(&self, page_id: &str) -> io::Result<()> {
+        let scripts = self.page(page_id)?.1.init_scripts.borrow().clone();
+        if scripts.is_empty() {
+            return Ok(());
+        }
+        let (webview, _) = self.page(page_id)?.clone();
+        for source in scripts {
+            let _ = self.evaluate(webview.clone(), &source);
+        }
+        Ok(())
     }
 
     fn assign_pending_files(&self, page_id: &str, selector: &str) -> io::Result<serde_json::Value> {
@@ -816,6 +832,7 @@ impl ContentEngine {
                 self.evaluate(webview.clone(), &source)?;
                 webview.paint();
                 self.servo.spin_event_loop();
+                self.run_init_scripts(&page_id)?;
                 Ok(json!({}))
             }
             "page.reload" => {
@@ -1061,6 +1078,72 @@ impl ContentEngine {
                         .collect::<Vec<_>>(),
                 }))
             }
+            "page.addInitScript" => {
+                let page_id = required_str(&params, "page")?;
+                let source = required_str(&params, "source")?;
+                self.page(&page_id)?
+                    .1
+                    .init_scripts
+                    .borrow_mut()
+                    .push(source);
+                Ok(json!({}))
+            }
+            "page.setViewportSize" => {
+                let page_id = required_str(&params, "page")?;
+                let width = params.get("width").and_then(|v| v.as_u64()).unwrap_or(800) as u32;
+                let height = params.get("height").and_then(|v| v.as_u64()).unwrap_or(600) as u32;
+                *self.page(&page_id)?.1.viewport.borrow_mut() = (width, height);
+                Ok(json!({ "width": width, "height": height }))
+            }
+            "page.viewportSize" => {
+                let page_id = required_str(&params, "page")?;
+                let (width, height) = *self.page(&page_id)?.1.viewport.borrow();
+                Ok(json!({ "width": width, "height": height }))
+            }
+            "page.mouse.click" => {
+                let page_id = required_str(&params, "page")?;
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                click_at(&webview, x, y, 0.0, 0.0);
+                self.servo.spin_event_loop();
+                Ok(json!({}))
+            }
+            "page.mouse.move" => {
+                let page_id = required_str(&params, "page")?;
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                hover_at(&webview, x, y, 0.0, 0.0);
+                self.servo.spin_event_loop();
+                Ok(json!({}))
+            }
+            "page.mouse.down" => {
+                let page_id = required_str(&params, "page")?;
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
+                webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                    MouseButtonAction::Down,
+                    MouseButton::Left,
+                    point,
+                )));
+                Ok(json!({}))
+            }
+            "page.mouse.up" => {
+                let page_id = required_str(&params, "page")?;
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
+                webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                    MouseButtonAction::Up,
+                    MouseButton::Left,
+                    point,
+                )));
+                Ok(json!({}))
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported_playwright_operation: {other}"),
@@ -1240,7 +1323,8 @@ function greppyResolveNodes(selector) {
     });
   }
   if (selector.nth != null) {
-    const el = nodes[selector.nth];
+    const idx = selector.nth < 0 ? nodes.length + selector.nth : selector.nth;
+    const el = nodes[idx];
     return el ? [el] : [];
   }
   return nodes;

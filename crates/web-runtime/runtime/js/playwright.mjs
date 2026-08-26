@@ -329,6 +329,19 @@ class Locator {
     return new Locator(this._page, { ...this._selector, nth: index });
   }
 
+  last() {
+    return new Locator(this._page, { ...this._selector, nth: -1 });
+  }
+
+  async all() {
+    const n = await this.count();
+    const locators = [];
+    for (let i = 0; i < n; i++) {
+      locators.push(this.nth(i));
+    }
+    return locators;
+  }
+
   async setInputFiles(files) {
     if (this._selector.type !== "css") {
       return unsupported("Locator.setInputFiles.nonCss")();
@@ -369,7 +382,36 @@ class Frame {
   }
 
   locator(selector) {
-    return this._page.locator(`iframe:nth-of-type(${Number(this._id) + 1})`);
+    if (this._id === "main" || Number.isNaN(Number(this._id))) {
+      return this._page.locator(selector);
+    }
+    return this._page.locator("iframe:nth-of-type(" + (Number(this._id) + 1) + ")");
+  }
+
+  getByRole(role, options) {
+    return this._id === "main"
+      ? this._page.getByRole(role, options)
+      : this.locator("body").first();
+  }
+
+  getByText(text) {
+    return this._id === "main" ? this._page.getByText(text) : this.locator("body").first();
+  }
+
+  getByLabel(name) {
+    return this._id === "main" ? this._page.getByLabel(name) : this.locator("body").first();
+  }
+
+  click(selector, options) {
+    return this.locator(selector).click(options);
+  }
+
+  fill(selector, value, options) {
+    return this.locator(selector).fill(value, options);
+  }
+
+  async innerText(selector) {
+    return this.locator(selector).innerText();
   }
 }
 
@@ -377,7 +419,35 @@ class Page {
   constructor(id) {
     this._id = id;
     this._closed = false;
+    this._timeout = 30_000;
+    this._context = null;
+    this.mouse = {
+      click: async (x, y) => {
+        await engineCall("page.mouse.click", { page: this._id, x, y });
+      },
+      move: async (x, y) => {
+        await engineCall("page.mouse.move", { page: this._id, x, y });
+      },
+      down: async () => {
+        await engineCall("page.mouse.down", { page: this._id, x: 0, y: 0 });
+      },
+      up: async () => {
+        await engineCall("page.mouse.up", { page: this._id, x: 0, y: 0 });
+      },
+    };
     return withUnsupported(this, "Page");
+  }
+
+  context() {
+    return this._context;
+  }
+
+  setDefaultTimeout(ms) {
+    this._timeout = Math.max(0, Number(ms) || 0);
+  }
+
+  setDefaultNavigationTimeout(ms) {
+    this.setDefaultTimeout(ms);
   }
 
   getByRole(role, options = {}) {
@@ -528,7 +598,7 @@ class Page {
   }
 
   async waitForFunction(pageFunction, arg) {
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + (this._timeout || 30_000);
     while (Date.now() < deadline) {
       const value = await this.evaluate(pageFunction, arg);
       if (value) {
@@ -780,12 +850,41 @@ class Page {
     press: async (key) => {
       await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
     },
+    down: async (key) => {
+      await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
+    },
+    up: async (key) => {
+      await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
+    },
+    insertText: async (text) => {
+      await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
+    },
   };
+
+  async addInitScript(script) {
+    const source =
+      typeof script === "function" ? "(" + script.toString() + ")()" : String(script);
+    await engineCall("page.addInitScript", { page: this._id, source });
+  }
+
+  async setViewportSize(size) {
+    await engineCall("page.setViewportSize", {
+      page: this._id,
+      width: size.width,
+      height: size.height,
+    });
+  }
+
+  async viewportSize() {
+    const result = await engineCall("page.viewportSize", { page: this._id });
+    return { width: result.width, height: result.height };
+  }
 }
 
 class BrowserContext {
   constructor(id) {
     this._id = id;
+    this._pages = [];
     this.tracing = {
       start: async () => {
         this._tracing = true;
@@ -800,7 +899,10 @@ class BrowserContext {
   async newPage() {
     const result = await engineCall("context.newPage", { context: this._id });
     const page = new Page(result.page);
+    page._context = this;
     this._lastPage = result.page;
+    this._pages = this._pages || [];
+    this._pages.push(page);
     return page;
   }
 
@@ -832,6 +934,14 @@ class BrowserContext {
   async close() {
     await engineCall("context.close", { context: this._id });
   }
+
+  pages() {
+    return this._pages || [];
+  }
+
+  setDefaultTimeout(ms) {
+    this._timeout = Math.max(0, Number(ms) || 0);
+  }
 }
 
 class Browser {
@@ -858,6 +968,10 @@ class Browser {
 
   async close() {
     await engineCall("browser.close", { browser: this._id });
+  }
+
+  version() {
+    return "Servo 0.5.0";
   }
 }
 
