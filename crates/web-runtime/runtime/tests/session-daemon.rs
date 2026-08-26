@@ -1259,6 +1259,8 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             "pageInnerHTML": "ok",
             "textContent": "ok",
             "pageTextContent": "ok",
+            "visible": true,
+            "pageVisible": true,
         },
         "match": content_ref["includesOk"] == true
             && content_ref["includesOracle"] == true
@@ -1266,7 +1268,9 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             && content_ref["innerHTML"] == "ok"
             && content_ref["pageInnerHTML"] == "ok"
             && content_ref["textContent"] == "ok"
-            && content_ref["pageTextContent"] == "ok",
+            && content_ref["pageTextContent"] == "ok"
+            && content_ref["visible"] == true
+            && content_ref["pageVisible"] == true,
         "scope": "setContent Page.content markers, Locator.count(#x)==1, innerHTML, and textContent of #x; HTML serialization is not compared byte-for-byte",
         "known_differences": [
             "Chromium and Servo serialize quotes/doctype differently; only substring markers, count, and innerHTML of #x are compared"

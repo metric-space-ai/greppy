@@ -28,6 +28,8 @@ const innerHTML = (await setPage.locator("#x").innerHTML()).trim();
 const pageInnerHTML = (await setPage.innerHTML("#x")).trim();
 const textContent = (await setPage.locator("#x").textContent()).trim();
 const pageTextContent = (await setPage.textContent("#x")).trim();
+const visible = await setPage.locator("#x").isVisible();
+const pageVisible = await setPage.isVisible("#x");
 await setPage.close();
 
 const dialogPage = await browser.newPage();
@@ -83,6 +85,8 @@ const receipt = {
       pageInnerHTML,
       textContent,
       pageTextContent,
+      visible,
+      pageVisible,
     },
     dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
     fill: { value: filled },

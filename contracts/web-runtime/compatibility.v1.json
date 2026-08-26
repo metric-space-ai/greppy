@@ -751,12 +751,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-content"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle compares isVisible of #x after setContent equals true; hidden/offscreen not compared"
       ]
     },
     {
@@ -6459,12 +6461,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "oracle-content"
       ],
       "known_differences": [
-        "no wait; visible iff exactly one node with non-zero box"
+        "no wait; visible iff exactly one node with non-zero box",
+        "oracle compares isVisible of #x after setContent equals true; hidden/offscreen not compared"
       ]
     },
     {
@@ -15256,8 +15260,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1059,
+    "unverified": 1057,
     "unsupported": 281,
-    "passing": 14
+    "passing": 16
   }
 }

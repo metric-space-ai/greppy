@@ -30,4 +30,6 @@ if ((await page.locator("#x").textContent()).trim() !== "ok") {
 if ((await page.textContent("#x")).trim() !== "ok") {
   throw new Error("page.textContent");
 }
+if (!(await page.locator("#x").isVisible())) throw new Error("locator.isVisible");
+if (!(await page.isVisible("#x"))) throw new Error("page.isVisible");
 await browser.close();
