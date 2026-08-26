@@ -606,7 +606,14 @@ fn capture_tracked_repository(
             })?;
         if before.state != RepositoryTrackerState::Active || before.epoch != active.epoch {
             return Err(WorkspaceError::AdapterUnavailable(
-                "repository tracker restarted before snapshot capture".into(),
+                format!(
+                    "repository tracker invalid before snapshot capture: state={:?}, epoch={}, generation={}, expected_epoch={}, detail={}",
+                    before.state,
+                    before.epoch,
+                    before.generation,
+                    active.epoch,
+                    before.detail.as_deref().unwrap_or("none")
+                ),
             ));
         }
         let mut baseline = capture_repository_with_observer(&repository, core.chunks(), |phase| {
@@ -626,6 +633,24 @@ fn capture_tracked_repository(
             baseline.tracker_generation = Some(after.generation);
             return Ok((baseline, true));
         }
+        if after.state != RepositoryTrackerState::Active || after.epoch != before.epoch {
+            trace_workspace_phase(run_id, "tracker-invalidated-after-full-snapshot", started);
+            release_snapshot(core.chunks(), baseline);
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker invalidated during snapshot capture: state={:?}, epoch={}, generation={}, expected_epoch={}, expected_generation={}, detail={}",
+                after.state,
+                after.epoch,
+                after.generation,
+                before.epoch,
+                before.generation,
+                after.detail.as_deref().unwrap_or("none")
+            )));
+        }
+        trace_workspace_phase(
+            run_id,
+            "tracker-generation-changed-after-full-snapshot",
+            started,
+        );
         release_snapshot(core.chunks(), baseline);
         if attempt == 1 {
             return Err(WorkspaceError::Unsupported(
