@@ -466,6 +466,10 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
             "4",
             "--deadline-secs",
             "0",
+            // This test isolates loop deadline delivery. Base publication has
+            // its own fail-closed tests and CI fixture assets intentionally do
+            // not contain a complete embedding model.
+            "--private-store",
             "--skip-selfcheck",
         ])
         .stdout(Stdio::piped())
