@@ -678,7 +678,9 @@ class Page {
     return this.locator(selector).isEditable();
   }
 
-  async bringToFront() {}
+  async bringToFront() {
+    return unsupported("Page.bringToFront")();
+  }
 
   async addScriptTag(options = {}) {
     await engineCall("page.addScriptTag", {
@@ -818,7 +820,10 @@ class Page {
     ops.op_sleep_ms(Math.max(0, Number(ms) || 0));
   }
 
-  async waitForLoadState() {
+  async waitForLoadState(state) {
+    if (state != null && state !== "load" && state !== "domcontentloaded") {
+      return unsupported("Page.waitForLoadState.state")();
+    }
     await engineCall("page.waitForLoadState", { page: this._id });
   }
 
@@ -923,26 +928,28 @@ class Page {
     return this.on(event, handler);
   }
 
-  async emulateMedia() {}
+  async emulateMedia() {
+    return unsupported("Page.emulateMedia")();
+  }
 
   async workers() {
     return [];
   }
 
-  async pause() {}
-
-  async setExtraHTTPHeaders() {}
-
-  async dragAndDrop(source, target) {
-    await this.locator(source).hover();
-    await this.locator(target).hover();
+  async pause() {
+    return unsupported("Page.pause")();
   }
 
-  touchscreen = {
-    tap: async (x, y) => {
-      await this.mouse.click(x, y);
-    },
-  };
+  async setExtraHTTPHeaders(headers) {
+    await engineCall("page.setExtraHTTPHeaders", {
+      page: this._id,
+      headers: headers || {},
+    });
+  }
+
+  async dragAndDrop() {
+    return unsupported("Page.dragAndDrop")();
+  }
 
   async route(url, handler) {
     const route = {
@@ -973,12 +980,8 @@ class Page {
     press: async (key) => {
       await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
     },
-    down: async (key) => {
-      await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
-    },
-    up: async (key) => {
-      await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
-    },
+    down: async () => unsupported("Keyboard.down")(),
+    up: async () => unsupported("Keyboard.up")(),
     insertText: async (text) => {
       await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
     },
@@ -1055,6 +1058,10 @@ class BrowserContext {
   }
 
   async close() {
+    for (const page of this.pages()) {
+      await page.close();
+    }
+    this._pages = [];
     await engineCall("context.close", { context: this._id });
   }
 
@@ -1064,6 +1071,9 @@ class BrowserContext {
 
   setDefaultTimeout(ms) {
     this._timeout = Math.max(0, Number(ms) || 0);
+    for (const page of this.pages()) {
+      page.setDefaultTimeout(ms);
+    }
   }
 
   async route(url, handler) {

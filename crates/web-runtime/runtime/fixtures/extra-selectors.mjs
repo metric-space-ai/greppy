@@ -36,5 +36,4 @@ await page.evaluate(() => {
 });
 const injected = await page.waitForFunction(() => window.__greppy === 1);
 if (!injected) throw new Error("waitForFunction");
-await page.bringToFront();
 await browser.close();

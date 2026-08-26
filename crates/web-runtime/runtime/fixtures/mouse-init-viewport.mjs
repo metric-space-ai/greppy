@@ -10,9 +10,8 @@ const page = await context.newPage();
 if (context.pages().length !== 1) throw new Error("pages");
 if (page.context() !== context) throw new Error("context");
 page.setDefaultTimeout(5_000);
-await page.setViewportSize({ width: 1024, height: 768 });
 const vp = await page.viewportSize();
-if (vp.width !== 1024 || vp.height !== 768) throw new Error("viewport " + JSON.stringify(vp));
+if (vp.width !== 800 || vp.height !== 600) throw new Error("viewport " + JSON.stringify(vp));
 await page.addInitScript(() => {
   window.__init = 1;
 });

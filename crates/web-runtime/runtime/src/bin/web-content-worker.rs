@@ -3,8 +3,8 @@ use serde_json::json;
 use servo::{
     CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue,
     LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
-    RenderingContext, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, WebResourceLoad,
-    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    RenderingContext, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, UrlRequest,
+    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -58,6 +58,7 @@ struct Delegate {
     prompt_text: RefCell<Option<String>>,
     init_scripts: RefCell<Vec<String>>,
     viewport: RefCell<(u32, u32)>,
+    extra_headers: RefCell<Vec<(String, String)>>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
@@ -75,6 +76,7 @@ impl Delegate {
             prompt_text: RefCell::new(None),
             init_scripts: RefCell::new(Vec::new()),
             viewport: RefCell::new((800, 600)),
+            extra_headers: RefCell::new(Vec::new()),
             rendering_context,
         }
     }
@@ -434,7 +436,22 @@ impl ContentEngine {
                 let url = Url::parse(&url)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                webview.load(url.clone());
+                let extra = self.page(&page_id)?.1.extra_headers.borrow().clone();
+                if extra.is_empty() {
+                    webview.load(url.clone());
+                } else {
+                    let mut headers = http::HeaderMap::new();
+                    for (name, value) in extra {
+                        let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+                            continue;
+                        };
+                        let Ok(value) = http::HeaderValue::from_str(&value) else {
+                            continue;
+                        };
+                        headers.append(name, value);
+                    }
+                    webview.load_request(UrlRequest::new(url.clone()).headers(headers));
+                }
                 let loading = webview.clone();
                 let expected = url.clone();
                 if !self.spin_until(ACTION_TIMEOUT, move || {
@@ -456,6 +473,7 @@ impl ContentEngine {
                 self.servo.spin_event_loop();
                 thread::sleep(Duration::from_millis(20));
                 self.servo.spin_event_loop();
+                self.run_init_scripts(&page_id)?;
                 Ok(
                     json!({ "url": webview.url().map(|u| u.to_string()).unwrap_or_else(|| url.to_string()) }),
                 )
@@ -799,7 +817,22 @@ impl ContentEngine {
                 )?;
                 Ok(json!({}))
             }
-            "page.setExtraHTTPHeaders" => Ok(json!({})),
+            "page.setExtraHTTPHeaders" => {
+                let page_id = required_str(&params, "page")?;
+                let headers = params
+                    .get("headers")
+                    .and_then(|value| value.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let stored: Vec<(String, String)> = headers
+                    .into_iter()
+                    .filter_map(|(name, value)| {
+                        value.as_str().map(|value| (name, value.to_owned()))
+                    })
+                    .collect();
+                self.page(&page_id)?.1.extra_headers.replace(stored);
+                Ok(json!({}))
+            }
             "page.addScriptTag" => {
                 let page_id = required_str(&params, "page")?;
                 let content = params

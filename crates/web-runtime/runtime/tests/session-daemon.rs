@@ -1620,3 +1620,46 @@ fn locator_filter_has_text_and_scroll() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn extra_http_headers_are_sent_on_goto() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind headers");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 4096];
+            let n = stream.read(&mut buffer).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+            let body = if req.contains("x-greppy-test: yes") {
+                "HEADER_OK"
+            } else {
+                "HEADER_MISSING"
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    let origin = format!("http://{address}/");
+    let socket = std::env::temp_dir().join(format!("greppy-web-hdr-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_hdr", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("extra-headers.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_hdr",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

@@ -13,7 +13,8 @@
     "The original parser attached some nested option fields to parent types (for example Page.trial, Page.waitUntil, Browser.viewport). Those rows are preserved as parser output and are not treated as proof that the parent object has those fields.",
     "EventEmitter overloads (on/once/off and related) are represented as events plus Page.addListener-style methods where the parser emitted them; types.d.ts recovery does not re-emit every overload.",
     "Type-level inventory is necessary but not sufficient for compatibility. Schema presence does not imply source or behavior compatibility.",
-    "Oracle receipts exist only for scoped cases (setContent title/evaluate/innerText, native alert type/message, locator.fill). behavior:passing is those cases, not the 1,354-row Playwright surface."
+    "Oracle receipts exist only for scoped cases (setContent title/evaluate/innerText, native alert type/message, locator.fill). behavior:passing is those cases, not the 1,354-row Playwright surface.",
+    "Silent no-ops and ignored options are not compatibility. schema implemented requires a binding that changes observable state or returns real engine state; otherwise the row is unsupported or unverified."
   ],
   "status_vocabulary": {
     "unverified": "The symbol is inventoried for the javascript-library/chromium surface, but Phase 0 has no implementation and no executed test.",
@@ -39,8 +40,8 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 170,
-    "unsupported": 243,
+    "implemented": 162,
+    "unsupported": 251,
     "unverified": 941
   },
   "entries": [
@@ -122,14 +123,13 @@
       "symbol": "Page.bringToFront",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
-      "behavior": "unverified",
-      "tests": [
-        "extra-selectors"
-      ],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [],
       "known_differences": [
-        "no-op; software renderer has no window z-order"
+        "no-op; software renderer has no window z-order",
+        "Silent no-op is not Playwright compatibility. Calls MUST fail with unsupported_playwright_operation. Software renderer has no window z-order."
       ]
     },
     {
@@ -274,26 +274,26 @@
       "symbol": "Page.dragAndDrop",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "hover source then hover target; not HTML5 drag events"
+        "hover source then hover target; not HTML5 drag events",
+        "Hover-hover is not HTML5 drag-and-drop. Calls MUST fail with unsupported_playwright_operation until a behavioral drag test exists."
       ]
     },
     {
       "symbol": "Page.emulateMedia",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
-      "behavior": "unverified",
-      "tests": [
-        "nested-locator"
-      ],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [],
       "known_differences": [
-        "no-op; does not change prefers-color-scheme"
+        "no-op; does not change prefers-color-scheme",
+        "Silent no-op is not Playwright compatibility. Calls MUST fail with unsupported_playwright_operation. prefers-color-scheme is not applied."
       ]
     },
     {
@@ -814,14 +814,13 @@
       "symbol": "Page.pause",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
-      "behavior": "unverified",
-      "tests": [
-        "filter-scroll"
-      ],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [],
       "known_differences": [
-        "no-op; no Playwright inspector"
+        "no-op; no Playwright inspector",
+        "Silent no-op is not Playwright compatibility. Calls MUST fail with unsupported_playwright_operation. No inspector/debug UI exists."
       ]
     },
     {
@@ -1058,10 +1057,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "filter-scroll"
+        "extra-headers"
       ],
       "known_differences": [
-        "accepted and ignored; not attached to Servo requests"
+        "accepted and ignored; not attached to Servo requests",
+        "headers are attached to subsequent page.goto main-frame navigations via Servo UrlRequest",
+        "subresource requests are not rewritten; that is not claimed as Chromium extraHTTPHeaders behavior"
       ]
     },
     {
@@ -1085,14 +1086,13 @@
       "symbol": "Page.setViewportSize",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
-      "behavior": "unverified",
-      "tests": [
-        "mouse-init-viewport"
-      ],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [],
       "known_differences": [
-        "records size only; software renderer stays 800x600"
+        "records size only; software renderer stays 800x600",
+        "Recording a size without resizing the 800x600 software renderer is not compatibility. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
@@ -1106,7 +1106,8 @@
         "nested-locator"
       ],
       "known_differences": [
-        "alias of locator.click; no touch input path"
+        "alias of locator.click; no touch input path",
+        "performs locator.click (mouse path); not a Touchscreen tap"
       ]
     },
     {
@@ -1206,7 +1207,8 @@
         "mouse-init-viewport"
       ],
       "known_differences": [
-        "returns last setViewportSize, default 800x600, not layout viewport"
+        "returns last setViewportSize, default 800x600, not layout viewport",
+        "returns the software renderer size 800x600; setViewportSize is unsupported"
       ]
     },
     {
@@ -1249,7 +1251,8 @@
         "compat-core"
       ],
       "known_differences": [
-        "state argument ignored; waits for Servo LoadStatus::Complete"
+        "state argument ignored; waits for Servo LoadStatus::Complete",
+        "networkidle and other states throw unsupported_playwright_operation; load/domcontentloaded wait for Servo LoadStatus::Complete"
       ]
     },
     {
@@ -1335,7 +1338,8 @@
         "nested-locator"
       ],
       "known_differences": [
-        "always empty; Servo embedder has no Web Workers inventory"
+        "always empty; Servo embedder has no Web Workers inventory",
+        "returns an empty list because this embedder never exposes Web Workers; that is observed emptiness, not a fabricated success of a mutating API"
       ]
     },
     {
@@ -3256,7 +3260,8 @@
         "cookies"
       ],
       "known_differences": [
-        "engine no-op besides acknowledging close; pages are not torn down independently of Browser.close"
+        "engine no-op besides acknowledging close; pages are not torn down independently of Browser.close",
+        "closes tracked pages then acknowledges; not Chromium context disposal"
       ]
     },
     {
@@ -3476,7 +3481,8 @@
         "mouse-init-viewport"
       ],
       "known_differences": [
-        "stored on the context object; not pushed to engine waits"
+        "stored on the context object; not pushed to engine waits",
+        "propagates to existing context.pages() setDefaultTimeout; locator engine waits still use the 30s ACTION_TIMEOUT"
       ]
     },
     {
@@ -9157,12 +9163,13 @@
       "symbol": "Keyboard.down",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "currently same as press (keydown+keyup)"
+        "currently same as press (keydown+keyup)",
+        "Must not alias press (keydown+keyup). Calls MUST fail with unsupported_playwright_operation until a keydown-only behavioral test exists."
       ]
     },
     {
@@ -9193,12 +9200,13 @@
       "symbol": "Keyboard.up",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "currently same as press (keydown+keyup)"
+        "currently same as press (keydown+keyup)",
+        "Must not alias press (keydown+keyup). Calls MUST fail with unsupported_playwright_operation until a keyup-only behavioral test exists."
       ]
     },
     {
@@ -10055,12 +10063,13 @@
       "symbol": "Touchscreen.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "alias of mouse.click"
+        "alias of mouse.click",
+        "Alias of mouse.click is not a touch input path. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
@@ -14727,8 +14736,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1106,
-    "passing": 5,
-    "unsupported": 243
+    "unverified": 1098,
+    "unsupported": 251,
+    "passing": 5
   }
 }

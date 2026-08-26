@@ -18,6 +18,5 @@ if ((await box.getByPlaceholder("inside").count()) !== 1) throw new Error("scope
 await page.tap("#box button");
 const workers = await page.workers();
 if (!Array.isArray(workers) || workers.length !== 0) throw new Error("workers");
-await page.emulateMedia({ colorScheme: "dark" });
 await page.mainFrame().waitForSelector("#box");
 await browser.close();
