@@ -289,6 +289,22 @@ class Page {
     return engineCall("page.goForward", { page: this._id });
   }
 
+  async waitForEvent(event) {
+    if (event === "popup" || event === "page") {
+      const result = await engineCall("page.popups", { page: this._id });
+      const id = (result.pages || [])[0];
+      if (!id) {
+        return null;
+      }
+      return new Page(id);
+    }
+    if (event === "download") {
+      const result = await engineCall("page.downloads", { page: this._id });
+      return (result.downloads || [])[0] || null;
+    }
+    return unsupported(`Page.waitForEvent.${event}`)();
+  }
+
   async setInputFiles(selector, files) {
     const list = Array.isArray(files) ? files : [files];
     await engineCall("page.setInputFiles", { page: this._id, files: list.map(String) });

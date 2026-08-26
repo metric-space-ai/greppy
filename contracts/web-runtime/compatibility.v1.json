@@ -38,9 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 58,
+    "implemented": 59,
     "unsupported": 243,
-    "unverified": 1053
+    "unverified": 1052
   },
   "entries": [
     {
@@ -1018,11 +1018,13 @@
       "symbol": "Page.waitForEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "popup drains auxiliary WebViews; download returns last intercept record"
+      ]
     },
     {
       "symbol": "Page.waitForFunction",

@@ -1,8 +1,8 @@
 use dpi::PhysicalSize;
 use serde_json::json;
 use servo::{
-    DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue, LoadStatus,
-    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
+    CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue,
+    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
     RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebResourceLoad,
     WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
@@ -46,16 +46,20 @@ struct Delegate {
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
     downloads: RefCell<Vec<serde_json::Value>>,
+    popups: RefCell<Vec<WebView>>,
+    rendering_context: Rc<dyn RenderingContext>,
 }
 
-impl Default for Delegate {
-    fn default() -> Self {
+impl Delegate {
+    fn new(rendering_context: Rc<dyn RenderingContext>) -> Self {
         Self {
             new_frame_ready: RefCell::new(false),
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
             downloads: RefCell::new(Vec::new()),
+            popups: RefCell::new(Vec::new()),
+            rendering_context,
         }
     }
 }
@@ -64,6 +68,15 @@ impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
         *self.new_frame_ready.borrow_mut() = true;
         webview.paint();
+    }
+
+    fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
+        let child = request
+            .builder(Rc::clone(&self.rendering_context))
+            .delegate(Rc::new(Delegate::new(Rc::clone(&self.rendering_context))))
+            .build();
+        child.show();
+        self.popups.borrow_mut().push(child);
     }
 
     fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
@@ -240,7 +253,7 @@ impl ContentEngine {
             }
             "context.newPage" => {
                 let page = self.alloc_id("page");
-                let delegate = Rc::new(Delegate::default());
+                let delegate = Rc::new(Delegate::new(Rc::clone(&self.rendering_context)));
                 let webview = WebViewBuilder::new(&self.servo, Rc::clone(&self.rendering_context))
                     .delegate(delegate.clone())
                     .build();
@@ -574,6 +587,21 @@ impl ContentEngine {
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
                 Ok(json!({ "downloads": self.page(&page_id)?.1.downloads.borrow().clone() }))
+            }
+            "page.popups" => {
+                let page_id = required_str(&params, "page")?;
+                let taken: Vec<WebView> = {
+                    let delegate = &self.page(&page_id)?.1;
+                    delegate.popups.borrow_mut().drain(..).collect()
+                };
+                let mut ids = Vec::new();
+                for webview in taken {
+                    let id = self.alloc_id("page");
+                    let delegate = Rc::new(Delegate::new(Rc::clone(&self.rendering_context)));
+                    self.pages.insert(id.clone(), (webview, delegate));
+                    ids.push(id);
+                }
+                Ok(json!({ "pages": ids }))
             }
             "page.frames" => {
                 let page_id = required_str(&params, "page")?;
