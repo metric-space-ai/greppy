@@ -25,5 +25,22 @@ const keys = await page.evaluate(() => window.__keys);
 if (!Array.isArray(keys) || !keys.includes("Enter")) {
   throw new Error("keyboard.press Enter, got " + JSON.stringify(keys));
 }
+await page.evaluate(() => {
+  window.__down = [];
+  window.__up = [];
+  const q = document.getElementById("q");
+  q.addEventListener("keydown", (event) => window.__down.push(event.key));
+  q.addEventListener("keyup", (event) => window.__up.push(event.key));
+});
+await page.keyboard.down("Shift");
+const afterDown = await page.evaluate(() => ({ down: window.__down, up: window.__up }));
+if (!afterDown.down.includes("Shift") || afterDown.up.includes("Shift")) {
+  throw new Error("keyboard.down should be keydown-only: " + JSON.stringify(afterDown));
+}
+await page.keyboard.up("Shift");
+const afterUp = await page.evaluate(() => ({ down: window.__down, up: window.__up }));
+if (!afterUp.up.includes("Shift")) {
+  throw new Error("keyboard.up should dispatch keyup: " + JSON.stringify(afterUp));
+}
 await page.close();
 await browser.close();

@@ -1122,6 +1122,28 @@ impl ContentEngine {
                 self.evaluate(webview.clone(), &source)?;
                 Ok(json!({}))
             }
+            "page.keyboard.down" => {
+                let page_id = required_str(&params, "page")?;
+                let key = required_str(&params, "key")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(key) {{ const el = document.activeElement || document.body; el.dispatchEvent(new KeyboardEvent('keydown', {{ key: key, bubbles: true }})); return true; }})({})",
+                    serde_json::to_string(&key).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
+            "page.keyboard.up" => {
+                let page_id = required_str(&params, "page")?;
+                let key = required_str(&params, "key")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(key) {{ const el = document.activeElement || document.body; el.dispatchEvent(new KeyboardEvent('keyup', {{ key: key, bubbles: true }})); return true; }})({})",
+                    serde_json::to_string(&key).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
             "page.setDialogPolicy" => {
                 let page_id = required_str(&params, "page")?;
                 let action = params

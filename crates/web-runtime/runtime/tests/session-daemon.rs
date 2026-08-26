@@ -1903,6 +1903,11 @@ fn cookies_storage_state_includes_local_storage_origin() {
 }
 
 #[test]
+fn keyboard_down_and_up_are_separate_events() {
+    run_named_fixture("keyboard.mjs", "run_keydu");
+}
+
+#[test]
 fn locator_filter_has_text_and_scroll() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-filter-{}.sock", std::process::id()));

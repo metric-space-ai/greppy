@@ -294,6 +294,42 @@ mod tests {
     }
 
     #[test]
+    fn project_proxy_forwards_redirect_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0_u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, extra, body) = if req.contains("GET /start") {
+                    (
+                        "302 Found",
+                        format!("Location: http://{addr}/end\r\n"),
+                        "",
+                    )
+                } else {
+                    ("200 OK", String::new(), "at-end")
+                };
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        let proxy = PolicyProxy::spawn(SharedProfile::new(NetworkProfile::Project)).unwrap();
+        let (status, body) = proxy_get(&proxy, &format!("http://{addr}/start"));
+        assert_eq!(status, 302, "{body}");
+        assert!(
+            body.to_ascii_lowercase().contains("location:") && body.contains("/end"),
+            "missing Location /end: {body:?}"
+        );
+    }
+
+    #[test]
     fn research_proxy_denies_loopback_without_dialing_metadata() {
         let origin = serve_once(b"should-not-see");
         let proxy = PolicyProxy::spawn(SharedProfile::new(NetworkProfile::Research)).unwrap();

@@ -1440,15 +1440,15 @@
       "symbol": "Page.workers",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [
         "nested-locator"
       ],
       "known_differences": [
-        "always empty; Servo embedder has no Web Workers inventory",
-        "returns an empty list because this embedder never exposes Web Workers; that is observed emptiness, not a fabricated success of a mutating API"
+        "Servo embedder has no Web Workers inventory",
+        "Calls MUST fail with unsupported_playwright_operation: Page.workers"
       ]
     },
     {
@@ -9632,13 +9632,14 @@
       "symbol": "Keyboard.down",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "keyboard"
+      ],
       "known_differences": [
-        "currently same as press (keydown+keyup)",
-        "Must not alias press (keydown+keyup). Calls MUST fail with unsupported_playwright_operation until a keydown-only behavioral test exists."
+        "dispatches KeyboardEvent keydown on the active element; no native OS key repeat"
       ]
     },
     {
@@ -9673,13 +9674,14 @@
       "symbol": "Keyboard.up",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "keyboard"
+      ],
       "known_differences": [
-        "currently same as press (keydown+keyup)",
-        "Must not alias press (keydown+keyup). Calls MUST fail with unsupported_playwright_operation until a keyup-only behavioral test exists."
+        "dispatches KeyboardEvent keyup on the active element; not a native OS keyup"
       ]
     },
     {
@@ -10010,21 +10012,27 @@
       "symbol": "Request.redirectedFrom",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo HTTP client follows hops inside the policy proxy; embedder request log does not see the Location URL",
+        "Calls MUST fail with unsupported_playwright_operation: Request.redirectedFrom"
+      ]
     },
     {
       "symbol": "Request.redirectedTo",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo HTTP client follows hops inside the policy proxy; embedder request log does not see the Location URL",
+        "Calls MUST fail with unsupported_playwright_operation: Request.redirectedTo"
+      ]
     },
     {
       "symbol": "Request.resourceType",

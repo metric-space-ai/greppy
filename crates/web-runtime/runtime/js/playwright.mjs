@@ -1199,9 +1199,10 @@ class Page {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       const result = await engineCall("page.requests", { page: this._id });
-      const hit = (result.requests || []).find((rec) => String(rec.url).includes(needle));
+      const records = result.requests || [];
+      const hit = records.find((rec) => String(rec.url).includes(needle));
       if (hit) {
-        return this._requestFromRecord(hit);
+        return this._requestFromRecord(hit, records);
       }
       ops.op_sleep_ms(20);
     }
@@ -1239,8 +1240,10 @@ class Page {
     return result;
   }
 
-  _requestFromRecord(rec) {
+  _requestFromRecord(rec, all) {
     const headerList = rec.headers || [];
+    const records = all || [];
+    const index = records.indexOf(rec);
     const headerMap = () => {
       const out = {};
       headerList.forEach((h) => {
@@ -1259,6 +1262,8 @@ class Page {
       resourceType: () => (rec.main_frame ? "document" : "other"),
       isNavigationRequest: () => !!rec.main_frame,
       failure: () => rec.failure || null,
+      redirectedFrom: () => throwUnsupported("Request.redirectedFrom"),
+      redirectedTo: () => throwUnsupported("Request.redirectedTo"),
       postData: () => {
         const method = rec.method || "GET";
         if (method === "GET" || method === "HEAD") return null;
@@ -1592,6 +1597,12 @@ class Page {
       }
       return this._downloadFromRecord(rec);
     }
+    if (event === "request") {
+      return this.waitForRequest("");
+    }
+    if (event === "response") {
+      return this.waitForResponse("");
+    }
     return unsupported(`Page.waitForEvent.${event}`)();
   }
 
@@ -1683,7 +1694,8 @@ class Page {
 
   async requests() {
     const result = await engineCall("page.requests", { page: this._id });
-    return (result.requests || []).map((rec) => this._requestFromRecord(rec));
+    const records = result.requests || [];
+    return records.map((rec) => this._requestFromRecord(rec, records));
   }
 
   async opener() {
@@ -1776,8 +1788,12 @@ class Page {
     press: async (key) => {
       await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
     },
-    down: async () => unsupported("Keyboard.down")(),
-    up: async () => unsupported("Keyboard.up")(),
+    down: async (key) => {
+      await engineCall("page.keyboard.down", { page: this._id, key: String(key) });
+    },
+    up: async (key) => {
+      await engineCall("page.keyboard.up", { page: this._id, key: String(key) });
+    },
     insertText: async (text) => {
       await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
     },
