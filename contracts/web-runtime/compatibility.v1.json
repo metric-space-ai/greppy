@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 192,
+    "implemented": 193,
     "unsupported": 277,
-    "unverified": 885
+    "unverified": 884
   },
   "entries": [
     {
@@ -1334,11 +1334,15 @@
       "symbol": "Page.waitForNavigation",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "resolves after page.goto; does not observe history API or hash-only changes; no waitUntil option"
+      ]
     },
     {
       "symbol": "Page.waitForRequest",

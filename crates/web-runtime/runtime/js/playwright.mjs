@@ -599,6 +599,7 @@ class Page {
     this._popupWaiters = [];
     this._pendingPopups = [];
     this._openerId = null;
+    this._navWaiters = [];
     this.mouse = {
       click: async (x, y) => {
         await engineCall("page.mouse.click", { page: this._id, x, y });
@@ -847,6 +848,7 @@ class Page {
     }
     const result = await engineCall("page.goto", { page: this._id, url });
     await this._flushPopups();
+    await this._flushNavigation();
     await this._dispatchNetwork();
     return result;
   }
@@ -1001,6 +1003,19 @@ class Page {
       return unsupported("Page.waitForLoadState.state")();
     }
     await engineCall("page.waitForLoadState", { page: this._id });
+  }
+
+  waitForNavigation() {
+    return new Promise((resolve) => {
+      this._navWaiters.push(resolve);
+    });
+  }
+
+  async _flushNavigation() {
+    const result = await engineCall("page.url", { page: this._id });
+    while (this._navWaiters.length) {
+      this._navWaiters.shift()({ url: () => result.url });
+    }
   }
 
   async waitForSelector(selector) {

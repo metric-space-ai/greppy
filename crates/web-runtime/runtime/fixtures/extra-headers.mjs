@@ -3,7 +3,9 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
+const nav = page.waitForNavigation();
 await page.goto(fixtureUrl);
+await nav;
 await page.mainFrame().goto(fixtureUrl);
 const text = (await page.locator("body").innerText()).trim();
 if (text !== "HEADER_OK") {
