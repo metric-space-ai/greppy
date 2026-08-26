@@ -75,6 +75,15 @@ final class GreppyFSVolume: FSVolume {
         return item
     }
 
+    private func privateInode(for item: GreppyFSItem) throws -> (String, UInt64) {
+        guard let (workspaceID, relative) = item.workspaceAndPath, !relative.isEmpty else {
+            throw posix(EINVAL)
+        }
+        if let inode = item.boundPrivateInode() { return (workspaceID, inode) }
+        let inode = try core.openFileInode(workspace: workspaceID, path: relative)
+        return (workspaceID, item.bindPrivateInode(inode))
+    }
+
     private func posix(_ code: Int32) -> Error {
         fs_errorForPOSIXError(code)
     }
@@ -145,8 +154,13 @@ extension GreppyFSVolume: FSVolume.Operations {
         case .doctorPath(let relative):
             return try doctorAttributes(relative: relative, item: item)
         case .path(let workspace, let relative):
+            let metadata = if let inode = item.boundPrivateInode() {
+                try core.metadata(workspace: workspace, inode: inode)
+            } else {
+                try core.metadata(workspace: workspace, path: relative)
+            }
             return attributes(
-                metadata: try core.metadata(workspace: workspace, path: relative),
+                metadata: metadata,
                 item: item,
                 parent: parentIdentifier(of: item)
             )
@@ -178,11 +192,15 @@ extension GreppyFSVolume: FSVolume.Operations {
         if request.isValid(.mode) { valid |= 1; mode = request.mode }
         if request.isValid(.accessTime) { valid |= 2; atime = nanoseconds(request.accessTime) }
         if request.isValid(.modifyTime) { valid |= 4; mtime = nanoseconds(request.modifyTime) }
-        if request.isValid(.size) { try core.truncate(workspace: workspaceID, path: relative, size: request.size) }
+        if request.isValid(.size) {
+            let (_, inode) = try privateInode(for: item)
+            try core.truncate(workspace: workspaceID, inode: inode, size: request.size)
+        }
         if valid != 0 {
+            let (_, inode) = try privateInode(for: item)
             try core.setMetadata(
                 workspace: workspaceID,
-                path: relative,
+                inode: inode,
                 valid: valid,
                 mode: mode,
                 accessedNanoseconds: atime,
@@ -346,6 +364,9 @@ extension GreppyFSVolume: FSVolume.Operations {
         guard let (workspaceID, relative) = item.workspaceAndPath, !relative.isEmpty else {
             throw posix(EPERM)
         }
+        if try core.metadata(workspace: workspaceID, path: relative).kind == .file {
+            _ = try privateInode(for: item)
+        }
         try core.unlink(workspace: workspaceID, path: relative)
         evict(item.location)
     }
@@ -377,6 +398,9 @@ extension GreppyFSVolume: FSVolume.Operations {
               sourceWorkspace == destinationWorkspace,
               !sourcePath.isEmpty else { throw posix(EXDEV) }
         let destination = try relativePath(parent: destinationDirectory, name: destinationName)
+        if try core.metadata(workspace: sourceWorkspace, path: sourcePath).kind == .file {
+            _ = try privateInode(for: source)
+        }
         try core.rename(workspace: sourceWorkspace, source: sourcePath, destination: destination)
         evict(source.location)
         return destinationName
@@ -697,11 +721,10 @@ extension GreppyFSVolume: FSVolume.ReadWriteOperations {
                 return data.count
             }
         }
-        guard let (workspaceID, relative) = item.workspaceAndPath,
-              !relative.isEmpty else { throw posix(EINVAL) }
+        let (workspaceID, inode) = try privateInode(for: item)
         let data = try core.read(
             workspace: workspaceID,
-            path: relative,
+            inode: inode,
             offset: UInt64(offset),
             length: min(length, buffer.length)
         )
@@ -726,11 +749,10 @@ extension GreppyFSVolume: FSVolume.ReadWriteOperations {
             guard count >= 0 else { throw posix(errno) }
             return count
         }
-        guard let (workspaceID, relative) = item.workspaceAndPath,
-              !relative.isEmpty else { throw posix(EINVAL) }
+        let (workspaceID, inode) = try privateInode(for: item)
         return try core.write(
             workspace: workspaceID,
-            path: relative,
+            inode: inode,
             offset: UInt64(offset),
             contents: contents
         )

@@ -795,6 +795,22 @@ impl WorkspaceCore {
         })
     }
 
+    /// Reopen a previously materialized private inode without resolving a path.
+    pub fn open_file_inode(
+        &self,
+        workspace: &WorkspaceHandle,
+        inode: u64,
+    ) -> Result<WorkspaceFileHandle> {
+        let handle = WorkspaceFileHandle {
+            workspace_id: workspace.id.clone(),
+            inode,
+        };
+        if self.load_open_inode(&handle)?.kind != NodeKind::File {
+            return Err(Error::IsDirectory(format!("inode {inode}")));
+        }
+        Ok(handle)
+    }
+
     pub fn read_open_file(
         &self,
         handle: &WorkspaceFileHandle,
@@ -826,6 +842,24 @@ impl WorkspaceCore {
         let connection = self.lock_metadata()?;
         load_metadata_for_inode(&connection, &handle.workspace_id, inode)?
             .ok_or_else(|| Error::NotFound(format!("open inode {}", handle.inode)))
+    }
+
+    pub fn set_metadata_open_file(
+        &self,
+        handle: &WorkspaceFileHandle,
+        mode: Option<u32>,
+        accessed_unix_ns: Option<i64>,
+        modified_unix_ns: Option<i64>,
+    ) -> Result<()> {
+        let inode = i64::try_from(handle.inode)
+            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
+        self.set_inode_metadata(
+            &handle.workspace_id,
+            inode,
+            mode,
+            accessed_unix_ns,
+            modified_unix_ns,
+        )
     }
 
     pub fn write(
@@ -988,6 +1022,23 @@ impl WorkspaceCore {
     ) -> Result<()> {
         let path = normalize_path(path.as_ref(), false)?;
         let inode = self.materialize(workspace, &path)?;
+        self.set_inode_metadata(
+            &workspace.id,
+            inode.id,
+            mode,
+            accessed_unix_ns,
+            modified_unix_ns,
+        )
+    }
+
+    fn set_inode_metadata(
+        &self,
+        workspace_id: &str,
+        inode: i64,
+        mode: Option<u32>,
+        accessed_unix_ns: Option<i64>,
+        modified_unix_ns: Option<i64>,
+    ) -> Result<()> {
         let changed_unix_ns = now_unix_ns();
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
@@ -998,8 +1049,8 @@ impl WorkspaceCore {
                  changed_unix_ns = ?6
              WHERE workspace_id = ?1 AND id = ?2",
             params![
-                workspace.id,
-                inode.id,
+                workspace_id,
+                inode,
                 mode.map(i64::from),
                 accessed_unix_ns,
                 modified_unix_ns,
@@ -1007,7 +1058,7 @@ impl WorkspaceCore {
             ],
         )?;
         if changed != 1 {
-            return Err(Error::Corrupt(format!("missing inode {}", inode.id)));
+            return Err(Error::Corrupt(format!("missing inode {inode}")));
         }
         Ok(())
     }

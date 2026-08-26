@@ -15,6 +15,8 @@ final class GreppyFSItem: FSItem {
     let location: Location
     let name: FSFileName
     let identifier: FSItem.Identifier
+    private let stateLock = NSLock()
+    private var privateInode: UInt64?
 
     init(location: Location, name: FSFileName, identifier: FSItem.Identifier) {
         self.location = location
@@ -31,6 +33,19 @@ final class GreppyFSItem: FSItem {
             return (workspace, relative)
         case .root, .workspaces, .doctor, .doctorPath, .marker:
             return nil
+        }
+    }
+
+    func boundPrivateInode() -> UInt64? {
+        stateLock.withLock { privateInode }
+    }
+
+    @discardableResult
+    func bindPrivateInode(_ inode: UInt64) -> UInt64 {
+        stateLock.withLock {
+            if let privateInode { return privateInode }
+            privateInode = inode
+            return inode
         }
     }
 }

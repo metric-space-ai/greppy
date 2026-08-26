@@ -207,6 +207,135 @@ pub unsafe extern "C" fn greppy_workspace_metadata(
 }
 
 #[no_mangle]
+/// Materializes a regular file and returns its stable private inode.
+///
+/// # Safety
+/// `value` must be live and both string pointers must be valid NUL-terminated
+/// strings for the duration of this call.
+pub unsafe extern "C" fn greppy_workspace_open_file_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    path: *const c_char,
+) -> i64 {
+    let Ok(core) = core(value) else { return -1 };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    let Ok(path) = required_str(path, "path") else {
+        return -1;
+    };
+    workspace(core, id)
+        .and_then(|workspace| core.open_file(&workspace, path).map_err(remember))
+        .map(|handle| core.metadata_open_file(&handle).map(|value| value.inode))
+        .and_then(|result| result.map_err(remember))
+        .and_then(|inode| i64::try_from(inode).map_err(|_| remember("inode exceeds i64")))
+        .unwrap_or_else(i64::from)
+}
+
+#[no_mangle]
+/// Reads metadata through a stable private inode.
+///
+/// # Safety
+/// `value` must be live, `workspace_id` must be a valid NUL-terminated string,
+/// and `out` must be valid and aligned for one metadata write.
+pub unsafe extern "C" fn greppy_workspace_metadata_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    inode: u64,
+    out: *mut GreppyWorkspaceMetadata,
+) -> i32 {
+    let Ok(core) = core(value) else { return -1 };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    if out.is_null() {
+        return remember("metadata output is null");
+    }
+    let result = workspace(core, id)
+        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
+        .and_then(|handle| core.metadata_open_file(&handle).map_err(remember));
+    match result {
+        Ok(value) => {
+            out.write(metadata(value));
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+/// Reads bytes through a stable private inode.
+///
+/// # Safety
+/// Pointer requirements match [`greppy_workspace_read`].
+pub unsafe extern "C" fn greppy_workspace_read_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    inode: u64,
+    offset: u64,
+    out: *mut u8,
+    capacity: usize,
+) -> i64 {
+    let Ok(core) = core(value) else { return -1 };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    if capacity != 0 && out.is_null() {
+        return remember("read output is null") as i64;
+    }
+    let result = workspace(core, id)
+        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
+        .and_then(|handle| {
+            core.read_open_file(&handle, offset, capacity)
+                .map_err(remember)
+        });
+    match result {
+        Ok(bytes) => {
+            if !bytes.is_empty() {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+            }
+            bytes.len() as i64
+        }
+        Err(code) => code as i64,
+    }
+}
+
+#[no_mangle]
+/// Writes bytes through a stable private inode.
+///
+/// # Safety
+/// Pointer requirements match [`greppy_workspace_write`].
+pub unsafe extern "C" fn greppy_workspace_write_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    inode: u64,
+    offset: u64,
+    bytes: *const u8,
+    length: usize,
+) -> i64 {
+    let Ok(core) = core(value) else { return -1 };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    if length != 0 && bytes.is_null() {
+        return remember("write input is null") as i64;
+    }
+    let bytes = if length == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(bytes, length)
+    };
+    workspace(core, id)
+        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
+        .and_then(|handle| {
+            core.write_open_file(&handle, offset, bytes)
+                .map_err(remember)
+        })
+        .map(|written| written as i64)
+        .unwrap_or_else(i64::from)
+}
+
+#[no_mangle]
 /// Reads file bytes into a caller-provided buffer.
 ///
 /// # Safety
@@ -387,6 +516,30 @@ pub unsafe extern "C" fn greppy_workspace_truncate(
 }
 
 #[no_mangle]
+/// Changes file length through a stable private inode.
+///
+/// # Safety
+/// `value` must be live and `workspace_id` must be a valid NUL-terminated
+/// string for the duration of this call.
+pub unsafe extern "C" fn greppy_workspace_truncate_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    inode: u64,
+    size: u64,
+) -> i32 {
+    let Ok(core) = core(value) else { return -1 };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    match workspace(core, id)
+        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
+    {
+        Ok(handle) => status(core.truncate_open_file(&handle, size)),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
 /// Updates selected metadata fields for a workspace path.
 ///
 /// # Safety
@@ -416,6 +569,38 @@ pub unsafe extern "C" fn greppy_workspace_set_metadata(
         Ok(workspace) => status(core.set_metadata(
             &workspace,
             path,
+            (valid & 1 != 0).then_some(mode),
+            (valid & 2 != 0).then_some(accessed_unix_ns),
+            (valid & 4 != 0).then_some(modified_unix_ns),
+        )),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+/// Changes metadata through a stable private inode.
+///
+/// # Safety
+/// `value` must be live and `workspace_id` must be a valid NUL-terminated
+/// string for the duration of this call.
+pub unsafe extern "C" fn greppy_workspace_set_metadata_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    inode: u64,
+    valid: u32,
+    mode: u32,
+    accessed_unix_ns: i64,
+    modified_unix_ns: i64,
+) -> i32 {
+    let Ok(core) = core(value) else { return -1 };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    match workspace(core, id)
+        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
+    {
+        Ok(handle) => status(core.set_metadata_open_file(
+            &handle,
             (valid & 1 != 0).then_some(mode),
             (valid & 2 != 0).then_some(accessed_unix_ns),
             (valid & 4 != 0).then_some(modified_unix_ns),
@@ -725,6 +910,52 @@ mod tests {
                 body.len() as i64
             );
             assert_eq!(&output[..body.len()], body);
+            let inode = greppy_workspace_open_file_inode(
+                core,
+                c("ffi-test").as_ptr(),
+                c("private.txt").as_ptr(),
+            );
+            assert!(inode > 0);
+            assert_eq!(
+                greppy_workspace_rename(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("private.txt").as_ptr(),
+                    c("renamed.txt").as_ptr(),
+                ),
+                0
+            );
+            assert_eq!(
+                greppy_workspace_unlink(core, c("ffi-test").as_ptr(), c("renamed.txt").as_ptr(),),
+                0
+            );
+            assert_eq!(
+                greppy_workspace_write_inode(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    inode as u64,
+                    body.len() as u64,
+                    b" stable".as_ptr(),
+                    b" stable".len(),
+                ),
+                b" stable".len() as i64
+            );
+            output.fill(0);
+            assert_eq!(
+                greppy_workspace_read_inode(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    inode as u64,
+                    0,
+                    output.as_mut_ptr(),
+                    output.len(),
+                ),
+                (body.len() + b" stable".len()) as i64
+            );
+            assert_eq!(
+                &output[..body.len() + b" stable".len()],
+                b"through ffi stable"
+            );
             assert_eq!(greppy_workspace_remove(core, c("ffi-test").as_ptr()), 0);
             greppy_workspace_core_close(core);
         }

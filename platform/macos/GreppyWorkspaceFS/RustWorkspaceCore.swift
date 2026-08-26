@@ -99,6 +99,36 @@ final class RustWorkspaceCore {
         )
     }
 
+    func openFileInode(workspace: String, path: String) throws -> UInt64 {
+        let result = workspace.withCString { workspacePointer in
+            path.withCString { pathPointer in
+                greppy_workspace_open_file_inode(raw, workspacePointer, pathPointer)
+            }
+        }
+        guard result > 0 else { throw Self.lastError() }
+        return UInt64(result)
+    }
+
+    func metadata(workspace: String, inode: UInt64) throws -> RustWorkspaceMetadata {
+        var value = GreppyWorkspaceMetadata()
+        let result = workspace.withCString { workspacePointer in
+            greppy_workspace_metadata_inode(raw, workspacePointer, inode, &value)
+        }
+        guard result == 0, let kind = RustWorkspaceMetadata.Kind(rawValue: value.kind) else {
+            throw Self.lastError()
+        }
+        return RustWorkspaceMetadata(
+            kind: kind,
+            mode: value.mode,
+            size: value.size,
+            inode: value.inode,
+            linkCount: value.nlink,
+            accessedNanoseconds: value.accessed_unix_ns,
+            modifiedNanoseconds: value.modified_unix_ns,
+            changedNanoseconds: value.changed_unix_ns
+        )
+    }
+
     func read(workspace: String, path: String, offset: UInt64, length: Int) throws -> Data {
         var bytes = [UInt8](repeating: 0, count: length)
         let count = workspace.withCString { workspacePointer in
@@ -108,6 +138,19 @@ final class RustWorkspaceCore {
                         raw, workspacePointer, pathPointer, offset, buffer.baseAddress, buffer.count
                     )
                 }
+            }
+        }
+        guard count >= 0 else { throw Self.lastError() }
+        return Data(bytes.prefix(Int(count)))
+    }
+
+    func read(workspace: String, inode: UInt64, offset: UInt64, length: Int) throws -> Data {
+        var bytes = [UInt8](repeating: 0, count: length)
+        let count = workspace.withCString { workspacePointer in
+            bytes.withUnsafeMutableBufferPointer { buffer in
+                greppy_workspace_read_inode(
+                    raw, workspacePointer, inode, offset, buffer.baseAddress, buffer.count
+                )
             }
         }
         guard count >= 0 else { throw Self.lastError() }
@@ -128,6 +171,24 @@ final class RustWorkspaceCore {
                         buffer.count
                     )
                 }
+            }
+        }
+        guard count >= 0 else { throw Self.lastError() }
+        return Int(count)
+    }
+
+    @discardableResult
+    func write(workspace: String, inode: UInt64, offset: UInt64, contents: Data) throws -> Int {
+        let count = workspace.withCString { workspacePointer in
+            contents.withUnsafeBytes { buffer in
+                greppy_workspace_write_inode(
+                    raw,
+                    workspacePointer,
+                    inode,
+                    offset,
+                    buffer.bindMemory(to: UInt8.self).baseAddress,
+                    buffer.count
+                )
             }
         }
         guard count >= 0 else { throw Self.lastError() }
@@ -178,6 +239,13 @@ final class RustWorkspaceCore {
         }
     }
 
+    func truncate(workspace: String, inode: UInt64, size: UInt64) throws {
+        let result = workspace.withCString { workspacePointer in
+            greppy_workspace_truncate_inode(raw, workspacePointer, inode, size)
+        }
+        guard result == 0 else { throw Self.lastError() }
+    }
+
     func setMetadata(
         workspace: String,
         path: String,
@@ -197,6 +265,28 @@ final class RustWorkspaceCore {
                 modifiedNanoseconds
             )
         }
+    }
+
+    func setMetadata(
+        workspace: String,
+        inode: UInt64,
+        valid: UInt32,
+        mode: UInt32,
+        accessedNanoseconds: Int64,
+        modifiedNanoseconds: Int64
+    ) throws {
+        let result = workspace.withCString { workspacePointer in
+            greppy_workspace_set_metadata_inode(
+                raw,
+                workspacePointer,
+                inode,
+                valid,
+                mode,
+                accessedNanoseconds,
+                modifiedNanoseconds
+            )
+        }
+        guard result == 0 else { throw Self.lastError() }
     }
 
     func createFile(workspace: String, path: String, mode: UInt32) throws {
