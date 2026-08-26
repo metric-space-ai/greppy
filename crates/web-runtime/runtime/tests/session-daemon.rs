@@ -1952,6 +1952,11 @@ fn frames_content_frame_and_describe() {
 }
 
 #[test]
+fn fail_closed_clock_coverage_request_and_handles() {
+    run_named_fixture("fail-closed-surface.mjs", "run_failcl");
+}
+
+#[test]
 fn locator_screenshot_is_clipped_png() {
     run_named_fixture("screenshot.mjs", "run_locshot");
 }

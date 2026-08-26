@@ -41,8 +41,8 @@
   "entry_count": 1354,
   "status_counts": {
     "implemented": 301,
-    "unsupported": 290,
-    "unverified": 763
+    "unsupported": 330,
+    "unverified": 723
   },
   "entries": [
     {
@@ -77,11 +77,15 @@
       "symbol": "Page.addLocatorHandler",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No overlay locator handler. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.addScriptTag",
@@ -984,21 +988,29 @@
       "symbol": "Page.removeLocatorHandler",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No overlay locator handler. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.requestGC",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No GC control in Servo embedder. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.requests",
@@ -1290,7 +1302,9 @@
       "schema": "unsupported",
       "source": "unsupported",
       "behavior": "unsupported",
-      "tests": [],
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
         "No video recorder. Calls MUST fail with unsupported_playwright_operation."
       ]
@@ -2506,11 +2520,15 @@
       "symbol": "Frame.evaluateHandle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No JSHandle. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Frame.fill",
@@ -3535,11 +3553,15 @@
       "symbol": "BrowserContext.backgroundPages",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No extension background pages. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.browser",
@@ -3798,11 +3820,15 @@
       "symbol": "BrowserContext.serviceWorkers",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No service worker inventory. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.setDefaultNavigationTimeout",
@@ -3864,11 +3890,15 @@
       "symbol": "BrowserContext.setHTTPCredentials",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "HTTP credentials are not applied to Servo requests. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.setOffline",
@@ -6216,11 +6246,15 @@
       "symbol": "Locator.elementHandle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No ElementHandle lifetime/object identity. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.elementHandles",
@@ -6264,11 +6298,15 @@
       "symbol": "Locator.evaluateHandle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No JSHandle. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.fill",
@@ -7950,11 +7988,15 @@
       "symbol": "APIRequest.newContext",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No APIRequest factory. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequest.baseURL",
@@ -8190,81 +8232,113 @@
       "symbol": "APIRequestContext.delete",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.dispose",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.fetch",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.head",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.patch",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.post",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.put",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.storageState",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.data",
@@ -8710,71 +8784,99 @@
       "symbol": "Clock.fastForward",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.install",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.pauseAt",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.resume",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.runFor",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.setFixedTime",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.setSystemTime",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Clock.time",
@@ -8790,21 +8892,29 @@
       "symbol": "ConsoleMessage.args",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Servo console records text/type only; args() throws. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ConsoleMessage.location",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Servo console records have no script location. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ConsoleMessage.page",
@@ -8860,41 +8970,57 @@
       "symbol": "Coverage.startCSSCoverage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No CSS coverage. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.startJSCoverage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No JS coverage. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.stopCSSCoverage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No CSS coverage. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.stopJSCoverage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No JS coverage. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.reportAnonymousScripts",
@@ -14543,23 +14669,29 @@
       "symbol": "BrowserType.connect",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "No CDP connect transport. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
       "symbol": "BrowserType.executablePath",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No Chromium executable is shipped. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserType.launch",
@@ -14580,24 +14712,28 @@
       "symbol": "BrowserType.launchPersistentContext",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "Persistent context launch is not implemented. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
       "symbol": "BrowserType.launchServer",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "No BrowserServer. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
@@ -14630,11 +14766,15 @@
       "symbol": "APIRequestContext.get",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No standalone APIRequestContext HTTP client. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "APIRequestContext.tracing",
@@ -15102,23 +15242,29 @@
       "symbol": "chromium.connect",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "No CDP connect transport. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
       "symbol": "chromium.executablePath",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No Chromium executable is shipped. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "chromium.launch",
@@ -15140,24 +15286,28 @@
       "symbol": "chromium.launchPersistentContext",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "Persistent context launch is not implemented. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
       "symbol": "chromium.launchServer",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "No BrowserServer. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
@@ -15539,8 +15689,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1047,
-    "unsupported": 290,
+    "unverified": 1007,
+    "unsupported": 330,
     "passing": 17
   }
 }

@@ -832,6 +832,7 @@ class Frame {
     this._id = info.id;
     this._name = info.name || "";
     this._url = info.url || "";
+    return withUnsupported(this, "Frame");
   }
 
   async evaluate(pageFunction, arg) {
@@ -1205,6 +1206,13 @@ class Page {
     this._pendingConsole = [];
     this._mouseX = 0;
     this._mouseY = 0;
+    this.coverage = {
+      startJSCoverage: unsupported("Coverage.startJSCoverage"),
+      stopJSCoverage: unsupported("Coverage.stopJSCoverage"),
+      startCSSCoverage: unsupported("Coverage.startCSSCoverage"),
+      stopCSSCoverage: unsupported("Coverage.stopCSSCoverage"),
+    };
+    this.request = withUnsupported({}, "APIRequestContext");
     this.touchscreen = {
       tap: async (x, y) => {
         await engineCall("page.touch.tap", { page: this._id, x, y });
@@ -1664,11 +1672,11 @@ class Page {
     const messages = result.messages || [];
     for (let i = this._consoleSeen; i < messages.length; i++) {
       const rec = messages[i];
-      const payload = {
+      const payload = withUnsupported({
         type: () => rec.type || "log",
         text: () => rec.text || "",
         page: () => this,
-      };
+      }, "ConsoleMessage");
       const waiter = this._consoleWaiters.shift();
       if (waiter) {
         waiter(payload);
@@ -1990,11 +1998,11 @@ class Page {
 
   async consoleMessages() {
     const result = await engineCall("page.consoleMessages", { page: this._id });
-    return (result.messages || []).map((rec) => ({
+    return (result.messages || []).map((rec) => withUnsupported({
       type: () => rec.type || "log",
       text: () => rec.text || "",
       page: () => this,
-    }));
+    }, "ConsoleMessage"));
   }
 
   async pageErrors() {
@@ -2153,6 +2161,16 @@ class BrowserContext {
       start: async () => unsupported("BrowserContext.tracing.start")(),
       stop: async () => unsupported("BrowserContext.tracing.stop")(),
     };
+    this.clock = {
+      install: unsupported("Clock.install"),
+      fastForward: unsupported("Clock.fastForward"),
+      pauseAt: unsupported("Clock.pauseAt"),
+      resume: unsupported("Clock.resume"),
+      runFor: unsupported("Clock.runFor"),
+      setFixedTime: unsupported("Clock.setFixedTime"),
+      setSystemTime: unsupported("Clock.setSystemTime"),
+    };
+    this.request = withUnsupported({}, "APIRequestContext");
     return withUnsupported(this, "BrowserContext");
   }
 
