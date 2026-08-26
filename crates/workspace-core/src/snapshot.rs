@@ -724,8 +724,25 @@ fn preflight_repository_with_observer(
         }
     }
 
+    observe_phase("snapshot-preflight-filter-sources-start");
+    let filter_attributes_present = repository_may_define_filter_attributes(repository, &git_dir)?;
+    observe_phase("snapshot-preflight-filter-sources-complete");
+    if !filter_attributes_present {
+        observe_phase("snapshot-preflight-filter-check-skipped");
+        return Ok(());
+    }
+
     observe_phase("snapshot-preflight-tracked-start");
-    let tracked = git_output(repository, &["ls-files", "-z"])?;
+    let tracked = git_output(
+        repository,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
     observe_phase("snapshot-preflight-tracked-complete");
     observe_phase("snapshot-preflight-filter-check-start");
     let mut check = Command::new("git")
@@ -769,6 +786,97 @@ fn preflight_repository_with_observer(
         }
     }
     Ok(())
+}
+
+fn repository_may_define_filter_attributes(repository: &Path, git_dir: &Path) -> Result<bool> {
+    if std::env::var_os("GIT_ATTR_SOURCE").is_some() {
+        return Ok(true);
+    }
+
+    let mut candidates = BTreeSet::new();
+    for args in [
+        [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".gitattributes",
+            ":(glob)**/.gitattributes",
+        ]
+        .as_slice(),
+        [
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+            ".gitattributes",
+            ":(glob)**/.gitattributes",
+        ]
+        .as_slice(),
+    ] {
+        for relative in nul_paths(&git_output(repository, args)?)? {
+            candidates.insert(repository.join(relative));
+        }
+    }
+    candidates.insert(git_dir.join("info/attributes"));
+
+    if let Some(path) = configured_attributes_file(repository)? {
+        if !path.is_absolute() {
+            return Ok(true);
+        }
+        candidates.insert(path);
+    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let root = PathBuf::from(xdg);
+        if root.is_absolute() {
+            candidates.insert(root.join("git/attributes"));
+        } else {
+            return Ok(true);
+        }
+    } else if let Some(home) = std::env::var_os("HOME") {
+        candidates.insert(PathBuf::from(home).join(".config/git/attributes"));
+    }
+
+    let exec_path = PathBuf::from(git_text(repository, &["--exec-path"])?);
+    if let Some(prefix) = exec_path.parent().and_then(Path::parent) {
+        candidates.insert(prefix.join("etc/gitattributes"));
+    }
+
+    for path in candidates {
+        match fs::read(&path) {
+            Ok(bytes) if bytes.windows(b"filter".len()).any(|part| part == b"filter") => {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+fn configured_attributes_file(repository: &Path) -> Result<Option<PathBuf>> {
+    let output = Command::new("git")
+        .args(["config", "--path", "--get", "core.attributesFile"])
+        .current_dir(repository)
+        .output()?;
+    if output.status.success() {
+        let value = String::from_utf8(output.stdout).map_err(|_| Error::Git {
+            command: "git config --path --get core.attributesFile".into(),
+            detail: "configured attributes path is not valid UTF-8".into(),
+        })?;
+        return Ok(Some(PathBuf::from(value.trim_end())));
+    }
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    Err(git_error(
+        "git config --path --get core.attributesFile",
+        &output,
+    ))
 }
 
 fn repository_root(path: &Path) -> Result<PathBuf> {
@@ -976,10 +1084,9 @@ mod tests {
                 "snapshot-preflight-operation-markers-complete",
                 "snapshot-preflight-tree-start",
                 "snapshot-preflight-tree-complete",
-                "snapshot-preflight-tracked-start",
-                "snapshot-preflight-tracked-complete",
-                "snapshot-preflight-filter-check-start",
-                "snapshot-preflight-filter-check-complete",
+                "snapshot-preflight-filter-sources-start",
+                "snapshot-preflight-filter-sources-complete",
+                "snapshot-preflight-filter-check-skipped",
                 "snapshot-preflight-complete",
                 "snapshot-first-observation-start",
                 "snapshot-first-observation-complete",
@@ -1024,6 +1131,39 @@ mod tests {
         let error = capture_repository(repo.path(), &store).unwrap_err();
         assert!(matches!(error, Error::UnsupportedRepository(_)));
         assert_eq!(store.stats().unwrap().chunk_count, 0);
+    }
+
+    #[test]
+    fn rejects_filter_attributes_from_tracked_and_ignored_sources() {
+        let tracked = fixture();
+        fs::write(
+            tracked.path().join(".gitattributes"),
+            "*.txt filter=custom\n",
+        )
+        .unwrap();
+        git(tracked.path(), &["add", ".gitattributes"]);
+        git(tracked.path(), &["commit", "-qm", "add attributes"]);
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let error = capture_repository(tracked.path(), &store).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedRepository(_)));
+
+        let ignored = fixture();
+        fs::create_dir(ignored.path().join("ignored")).unwrap();
+        fs::write(ignored.path().join("ignored/tracked.txt"), "tracked\n").unwrap();
+        git(ignored.path(), &["add", "-f", "ignored/tracked.txt"]);
+        git(ignored.path(), &["commit", "-qm", "track ignored path"]);
+        fs::write(
+            ignored.path().join("ignored/.gitattributes"),
+            "*.txt filter=custom\n",
+        )
+        .unwrap();
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let error = capture_repository(ignored.path(), &store).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedRepository(_)));
     }
 
     #[test]
