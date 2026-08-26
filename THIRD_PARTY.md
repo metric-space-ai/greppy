@@ -111,8 +111,9 @@ SBOM, model notices, checksums, signatures, or build provenance are missing.
   separately GPL-3.0-licensed `winfsp-rs` crates.
 
 Required notice: WinFsp - Windows File System Proxy, Copyright (C) Bill
-Zissimopoulos. Source and complete license terms:
-<https://github.com/winfsp/winfsp>.
+Zissimopoulos. Source: <https://github.com/winfsp/winfsp>. The complete pinned
+license and FLOSS exception are shipped in
+[`licenses/WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt`](licenses/WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt).
 
 The Windows provider's small C ABI bridge is original Greppy Apache-2.0 source;
 all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.

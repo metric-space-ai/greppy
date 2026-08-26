@@ -66,7 +66,7 @@ struct WindowsProvider {
 pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     configure_winfsp_runtime()?;
     fs::create_dir_all(&data_root)?;
-    fs::create_dir_all(&mount_root)?;
+    prepare_mount_point(&mount_root)?;
     let doctor_root = data_root.join("provider-doctor");
     fs::create_dir_all(&doctor_root)?;
     let core = WorkspaceCore::open(data_root.join("core")).map_err(io::Error::other)?;
@@ -111,6 +111,36 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
             "WinFsp dispatcher exited with {result}"
         )))
     }
+}
+
+fn prepare_mount_point(mount_root: &Path) -> io::Result<()> {
+    let parent = mount_root
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mount point has no parent"))?;
+    fs::create_dir_all(parent)?;
+    match fs::symlink_metadata(mount_root) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "mount point {} is not an empty directory",
+                        mount_root.display()
+                    ),
+                ));
+            }
+            if fs::read_dir(mount_root)?.next().transpose()?.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::DirectoryNotEmpty,
+                    format!("mount point {} is not empty", mount_root.display()),
+                ));
+            }
+            fs::remove_dir(mount_root)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 fn configure_winfsp_runtime() -> io::Result<()> {

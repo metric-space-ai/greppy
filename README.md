@@ -434,25 +434,35 @@ summaries, and embeddings. They have the same confidentiality requirements as
 the repository itself. Agent sandboxes can read a published Base but cannot
 write it; writable Delta state remains isolated per run.
 
-Filesystem-CoW in the 0.3.3 candidate is a separate layer from the 0.3.2
-Base/Delta Store. A snapshot contains the working tree, retained ignored build
-caches unless `--fresh` is used, and private Git control state. APFS directory
-clones, Btrfs subvolume snapshots, and Linux file reflinks are provided by the
-pinned, purpose-specific `greppy-rift-core` fork. Unsupported or failed
-preflights fall back only in `auto`; forced `cow` fails visibly. Suspected Git
-identity or containment tampering prevents publication and cleanup so the
-workspace remains available for diagnosis.
+The upcoming 0.3.4 agent workspace is a separate layer from the 0.3.2
+Base/Delta index store. `greppy -p` has one workspace contract and no backend
+selector or native fallback: it starts only after the bundled portable adapter
+is mounted and healthy. Run `greppy workspace setup` once after installation,
+then use `greppy workspace doctor --json` to verify provider identity, recovery,
+CAS integrity, and mounted read/write/rename/delete behavior. A failed doctor
+prevents the first model call.
 
-Backend selection is intentionally asymmetric. Btrfs subvolume snapshots are
-the current constant-metadata backend and may be chosen by `auto`. APFS
-directory `clonefile` and Linux per-file `FICLONE` preserve file data with CoW
-but traverse the directory namespace, so they are available only through the
-explicit `cow` preview path; `auto` keeps the native 0.3.2 workspace on those
-filesystems. Windows also keeps the native backend and rejects forced `cow`.
-On Btrfs, the reusable template is sealed with the kernel read-only subvolume
-flag before its readiness marker is published. Greppy skips the repeated
-full-tree startup validation only when probing verifies both that seal and the
-constant-metadata snapshot capability.
+Workspace data uses fixed 1 MiB BLAKE3-addressed chunks in append-only segments
+and SQLite-WAL manifests. Each workspace overlays an immutable Git-commit base
+and an immutable dirty snapshot with a private namespace of changed chunks,
+tombstones, redirects, links, metadata, and private Git state. A one-byte write
+to a large file creates only the affected chunk plus metadata; it never copies
+the complete file. Ignored files and build caches are excluded from the dirty
+snapshot.
+
+The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3, a macOS 15+
+FSKit app extension, and unchanged signed WinFsp 2.1 on Windows. It does not
+require APFS clones, Btrfs subvolumes, reflinks, NTFS block cloning, or any other
+host-filesystem CoW feature. The small macOS extension host is Swift because
+FSKit requires an Apple extension boundary; all namespace, chunk, recovery,
+and Git semantics remain in Rust. See
+[Portable CoW workspaces](docs/portable-cow-workspaces.md) for setup, lifecycle,
+proposal, recovery, and platform details.
+
+Version 0.3.3 remains reproducible as the earlier limited native-CoW release:
+its APFS/Btrfs/reflink behavior, Rift-derived implementation, flags, and native
+fallback are historical 0.3.3 behavior documented in the changelog. None of
+those backends or Rift sources participate in the 0.3.4 build or runtime.
 
 Full source bodies are not duplicated into SQLite. Exact code search reads the
 current worktree through real `grep` where available, with an in-binary literal

@@ -4,6 +4,35 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Portable Chunk-CoW agent workspaces (0.3.4)
+
+`greppy -p` now has one fail-closed workspace path on macOS ARM64, Linux
+x86_64, and Windows x86_64. The 0.3.3 Rift/native snapshot backends, Git
+worktree fallback, `--workspace-backend`, and `--fresh` are removed from the
+current build. The portable Rust core stores fixed 1 MiB BLAKE3-addressed
+chunks in append-only segments and keeps namespace manifests, tombstones,
+redirects, references, and recovery journals in SQLite WAL.
+
+The initial view combines a pinned Git commit with a double-validated immutable
+snapshot of staged, unstaged, deleted, and untracked paths. Ignored files and
+build caches are excluded. Merge, rebase, cherry-pick, submodule, Git LFS, and
+arbitrary checkout/smudge-filter states fail before model startup. Partial
+writes replace only touched chunks; private Git indexes, refs, and new objects
+remain isolated while existing objects are read-only.
+
+New `workspace setup`, `workspace doctor --json`, `workspace status --json`,
+and `workspace gc` commands manage one persistent per-user provider mount.
+Linux uses FUSE3, macOS 15+ uses a bundled FSKit app extension with a minimal
+Swift system boundary, and Windows uses the official unchanged WinFsp 2.1
+runtime through Greppy's Rust provider. Adapter failure has no hidden native
+fallback.
+
+Dirty-based proposals record the pinned commit as parent but expose only the
+initial-snapshot-to-final patch. `greppy agent apply REF` verifies the exact
+baseline hash, preserves the existing Git index, applies only the agent delta,
+and journals backup/recovery state. Ordinary cherry-pick is not advertised as
+safe for dirty-based proposals.
+
 ## [0.3.3] — 2026-08-25
 
 ### Filesystem-CoW agent workspaces
