@@ -1760,6 +1760,11 @@ fn console_messages_are_captured_from_page_evaluate() {
     run_named_fixture("console-messages.mjs", "run_console");
 }
 
+
+#[test]
+fn hydrated_spa_wait_for_function_sees_async_dom_update() {
+    run_named_fixture("spa-hydrate.mjs", "run_spa");
+}
 #[test]
 fn frame_locator_queries_same_origin_iframe_document() {
     run_named_fixture("frame-locator.mjs", "run_frloc");
