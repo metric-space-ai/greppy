@@ -25,9 +25,13 @@ struct Args {
     #[arg(long)]
     provider_binary: PathBuf,
     #[arg(long)]
+    native_baseline_root: PathBuf,
+    #[arg(long)]
     hardware: String,
     #[arg(long, default_value_t = 25)]
     iterations: usize,
+    #[arg(long, default_value_t = 5)]
+    native_baseline_iterations: usize,
     #[arg(long, default_value_t = 50)]
     parallel: usize,
     #[arg(long, default_value_t = 300_000)]
@@ -70,6 +74,7 @@ fn main() {
         || !args.data_root.is_absolute()
         || !args.output.is_absolute()
         || !args.provider_binary.is_absolute()
+        || !args.native_baseline_root.is_absolute()
     {
         fail("repository, data-root, output and provider-binary must be absolute");
     }
@@ -141,22 +146,32 @@ fn main() {
     }
 
     let parallel_started = Instant::now();
-    let repository = args.repository.clone();
+    let parallel_baseline = capture_repository(&args.repository, core.chunks()).unwrap();
+    let parallel_owner = core
+        .create_workspace("perf-parallel-owner", parallel_baseline.clone())
+        .unwrap();
+    let owner_root = provider.workspace_path(parallel_owner.id()).unwrap();
+    assert_eq!(
+        fs::read(owner_root.join(&args.probe_path)).unwrap(),
+        probe_expected
+    );
     let data_root = args.data_root.clone();
     let probe_path = args.probe_path.clone();
     let probe_expected_parallel = probe_expected.clone();
-    let workers = (0..args.parallel)
+    let workers = (1..args.parallel)
         .map(|index| {
-            let repository = repository.clone();
             let data_root = data_root.clone();
             let probe_path = probe_path.clone();
             let expected = probe_expected_parallel.clone();
+            let baseline = parallel_baseline.clone();
             thread::spawn(move || {
                 let core = WorkspaceCore::open(data_root.join("core")).unwrap();
                 let provider = ProviderInstallation::require_healthy(&data_root).unwrap();
-                let baseline = capture_repository(&repository, core.chunks()).unwrap();
                 let handle = core
-                    .create_workspace(&format!("perf-parallel-{index}"), baseline)
+                    .create_workspace_from_shared_baseline(
+                        &format!("perf-parallel-{index}"),
+                        &baseline,
+                    )
                     .unwrap();
                 let root = provider.workspace_path(handle.id()).unwrap();
                 assert_eq!(fs::read(root.join(probe_path)).unwrap(), expected);
@@ -164,14 +179,21 @@ fn main() {
             })
         })
         .collect::<Vec<_>>();
-    let handles = workers
+    let mut handles = workers
         .into_iter()
         .map(|worker| worker.join().unwrap())
         .collect::<Vec<_>>();
+    handles.push(parallel_owner);
     let parallel_ms = parallel_started.elapsed().as_secs_f64() * 1_000.0;
     for handle in handles {
         core.remove_workspace(handle).unwrap();
     }
+
+    let (native_worktree_ms, native_worktree_physical_bytes) = measure_native_worktrees(
+        &args.repository,
+        &args.native_baseline_root,
+        args.native_baseline_iterations,
+    );
 
     let large_path = args.repository.join(".greppy-perf-large.bin");
     if large_path.exists() {
@@ -221,6 +243,20 @@ fn main() {
     let snapshot_p95_ms = percentile(&snapshot_ms, 95);
     let provider_sha256 = sha256_file(&args.provider_binary);
     let fixture_commit = git(&args.repository, &["rev-parse", "HEAD"]);
+    let native_worktree_p50_ms = percentile(&native_worktree_ms, 50);
+    let native_worktree_p95_ms = percentile(&native_worktree_ms, 95);
+    let native_worktree_physical_p50_bytes = percentile_u64(&native_worktree_physical_bytes, 50);
+    let creation_improvement_percent = if native_worktree_p95_ms == 0.0 {
+        0.0
+    } else {
+        (native_worktree_p95_ms - end_to_end_p95_ms) * 100.0 / native_worktree_p95_ms
+    };
+    let untouched_space_reduction_percent = if native_worktree_physical_p50_bytes == 0 {
+        0.0
+    } else {
+        (native_worktree_physical_p50_bytes as f64 - untouched_physical_delta as f64) * 100.0
+            / native_worktree_physical_p50_bytes as f64
+    };
     let evidence = serde_json::json!({
         "schema": "greppy.portable-cow-performance.v1",
         "source_commit": args.source_commit,
@@ -243,6 +279,17 @@ fn main() {
             "end_to_end_p50_ms": end_to_end_p50_ms,
             "end_to_end_p95_ms": end_to_end_p95_ms,
             "end_to_end_p95_gate_ms": args.max_visible_p95_ms,
+        },
+        "native_git_worktree_baseline": {
+            "description": "warm git worktree add --detach checkout on the identical repository and host",
+            "iterations": args.native_baseline_iterations,
+            "p50_ms": native_worktree_p50_ms,
+            "p95_ms": native_worktree_p95_ms,
+            "physical_p50_bytes": native_worktree_physical_p50_bytes,
+        },
+        "comparison": {
+            "portable_creation_improvement_percent_vs_git_worktree": creation_improvement_percent,
+            "portable_untouched_space_reduction_percent_vs_git_worktree": untouched_space_reduction_percent,
         },
         "space": {
             "untouched_physical_delta_bytes": untouched_physical_delta,
@@ -339,6 +386,69 @@ fn measure_toolchain(
     }
 }
 
+fn measure_native_worktrees(
+    repository: &Path,
+    root: &Path,
+    iterations: usize,
+) -> (Vec<f64>, Vec<u64>) {
+    if iterations < 3 {
+        fail("at least three native Git-worktree baseline iterations are required");
+    }
+    if root.exists() {
+        fail("native baseline root must not exist before the measurement");
+    }
+    fs::create_dir_all(root).unwrap();
+    let git_worktrees = PathBuf::from(git(
+        repository,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "worktrees",
+        ],
+    ));
+    let mut elapsed = Vec::with_capacity(iterations);
+    let mut physical = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let target = root.join(format!("native-{iteration}"));
+        let metadata_before = allocated_tree_bytes_if_exists(&git_worktrees);
+        let started = Instant::now();
+        let output = Command::new("git")
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&target)
+            .arg("HEAD")
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            fail(&format!(
+                "native git worktree baseline failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let metadata_after = allocated_tree_bytes_if_exists(&git_worktrees);
+        physical.push(
+            allocated_tree_bytes(&target)
+                .saturating_add(metadata_after.saturating_sub(metadata_before)),
+        );
+        let output = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&target)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            fail(&format!(
+                "native git worktree cleanup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    fs::remove_dir(root).unwrap();
+    (elapsed, physical)
+}
+
 fn run_argv(cwd: &Path, argv: &[String]) {
     let status = Command::new(&argv[0])
         .args(&argv[1..])
@@ -364,6 +474,13 @@ fn tracked_file_count(repository: &Path) -> usize {
 fn percentile(samples: &[f64], percentile: usize) -> f64 {
     let mut values = samples.to_vec();
     values.sort_by(f64::total_cmp);
+    let rank = (values.len() * percentile).div_ceil(100).saturating_sub(1);
+    values[rank]
+}
+
+fn percentile_u64(samples: &[u64], percentile: usize) -> u64 {
+    let mut values = samples.to_vec();
+    values.sort_unstable();
     let rank = (values.len() * percentile).div_ceil(100).saturating_sub(1);
     values[rank]
 }
@@ -414,6 +531,14 @@ fn allocated_tree_bytes(root: &Path) -> u64 {
         }
     }
     total
+}
+
+fn allocated_tree_bytes_if_exists(root: &Path) -> u64 {
+    if root.exists() {
+        allocated_tree_bytes(root)
+    } else {
+        0
+    }
 }
 
 #[cfg(unix)]

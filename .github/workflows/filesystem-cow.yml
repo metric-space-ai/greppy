@@ -208,6 +208,7 @@ jobs:
             --output "$evidence" \
             --source-commit "$GITHUB_SHA" \
             --provider-binary "$GITHUB_WORKSPACE/target/release/greppy-workspace-provider" \
+            --native-baseline-root "$RUNNER_TEMP/greppy-native-worktree-baseline" \
             --hardware "$hardware" \
             --toolchain-case '{"name":"rust","cwd":"rust","argv":["rustc","main.rs","-o","/tmp/greppy-perf-rust"]}' \
             --toolchain-case '{"name":"python","cwd":"python","argv":["python3","-B","test_sample.py"]}' \

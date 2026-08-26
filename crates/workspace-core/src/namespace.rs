@@ -239,6 +239,37 @@ impl WorkspaceCore {
         Ok(WorkspaceHandle { id: id.into() })
     }
 
+    /// Creates another namespace over an already pinned immutable baseline.
+    /// The new namespace acquires its own snapshot references before the
+    /// regular namespace references, so removing either workspace cannot make
+    /// chunks used by the other collectible.
+    pub fn create_workspace_from_shared_baseline(
+        &self,
+        id: &str,
+        baseline: &BaselineSnapshot,
+    ) -> Result<WorkspaceHandle> {
+        let snapshot = snapshot_chunks(baseline);
+        let mut retained = Vec::with_capacity(snapshot.len());
+        for chunk in snapshot {
+            if let Err(error) = self.chunks.pin(chunk) {
+                for pinned in retained {
+                    let _ = self.chunks.unpin(pinned);
+                }
+                return Err(error);
+            }
+            retained.push(chunk);
+        }
+        match self.create_workspace(id, baseline.clone()) {
+            Ok(workspace) => Ok(workspace),
+            Err(error) => {
+                for chunk in retained {
+                    let _ = self.chunks.unpin(chunk);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn status(&self, workspace: &WorkspaceHandle) -> Result<WorkspaceStatus> {
         let connection = self.lock_metadata()?;
         connection
@@ -1776,14 +1807,19 @@ mod tests {
 
         let storage = tempfile::tempdir().unwrap();
         let core = std::sync::Arc::new(WorkspaceCore::open(storage.path()).unwrap());
+        let baseline = crate::capture_repository(repo.path(), core.chunks()).unwrap();
+        let owner = core
+            .create_workspace("parallel-owner", baseline.clone())
+            .unwrap();
         let mut workers = Vec::new();
-        for number in 0..50 {
+        for number in 0..49 {
             let core = core.clone();
-            let repository = repo.path().to_path_buf();
+            let baseline = baseline.clone();
             workers.push(std::thread::spawn(move || {
                 let id = format!("parallel-{number:02}");
-                let baseline = crate::capture_repository(&repository, core.chunks()).unwrap();
-                let workspace = core.create_workspace(&id, baseline).unwrap();
+                let workspace = core
+                    .create_workspace_from_shared_baseline(&id, &baseline)
+                    .unwrap();
                 let private = format!("private-{number:02}.txt");
                 core.create_file(&workspace, &private, 0o100600).unwrap();
                 core.write(&workspace, &private, 0, id.as_bytes()).unwrap();
@@ -1801,6 +1837,7 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
+        core.remove_workspace(owner).unwrap();
         assert!(core.list_workspaces().unwrap().is_empty());
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
     }
