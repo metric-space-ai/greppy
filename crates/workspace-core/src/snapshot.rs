@@ -126,8 +126,10 @@ fn capture_once(
         }
     }
 
-    let canonical =
-        serde_json::to_vec(&(&first.head, &first.index_hash, &first.status_hash, &entries))?;
+    // The baseline identity is content-derived rather than dependent on Git's
+    // porcelain serialization. Full and journal-incremental captures must
+    // produce the same identity for the same visible repository state.
+    let canonical = serde_json::to_vec(&(&first.head, &first.index_hash, &entries))?;
     let baseline_hash = blake3::hash(&canonical).to_hex().to_string();
     Ok(BaselineSnapshot {
         repository: repository.to_path_buf(),
@@ -139,6 +141,173 @@ fn capture_once(
         tracker_epoch: None,
         tracker_generation: None,
     })
+}
+
+/// Rebuild a dirty baseline from a previously verified snapshot and the
+/// generation-bound paths reported by the persistent repository tracker.
+/// Returns `None` when the commit changed or the candidate set is too broad;
+/// callers then perform the normal fail-closed full capture.
+pub fn capture_repository_incremental(
+    repository: impl AsRef<Path>,
+    store: &ChunkStore,
+    cached: &BaselineSnapshot,
+    journal_paths: &[String],
+    tracker_epoch: u64,
+    tracker_generation: u64,
+) -> Result<Option<BaselineSnapshot>> {
+    let repository = repository_root(repository.as_ref())?;
+    if repository != cached.repository {
+        return Ok(None);
+    }
+    preflight_repository(&repository)?;
+    let head = git_text(&repository, &["rev-parse", "HEAD"])?;
+    if head != cached.base_commit {
+        return Ok(None);
+    }
+    let index_path = PathBuf::from(git_text(
+        &repository,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?);
+    let index = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let index_hash = blake3::hash(&index).to_hex().to_string();
+
+    let mut candidates = cached
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut git_metadata_changed = index_hash != cached.index_hash;
+    for path in journal_paths {
+        if let Some(path) = path.strip_prefix(".git/") {
+            if path == "index" || path == "index.lock" {
+                git_metadata_changed = true;
+            } else if !path.starts_with("greppy-tracker-fence-")
+                && (path == "HEAD"
+                    || path == "packed-refs"
+                    || path.starts_with("refs/")
+                    || path.starts_with("rebase-")
+                    || path.ends_with("_HEAD"))
+            {
+                return Ok(None);
+            }
+            continue;
+        }
+        if !path.is_empty() {
+            validate_relative_path(path)?;
+            candidates.insert(path.clone());
+        }
+    }
+    if git_metadata_changed {
+        for path in nul_paths(&git_output(
+            &repository,
+            &["diff", "--cached", "--name-only", "-z", "HEAD", "--"],
+        )?)? {
+            candidates.insert(path);
+        }
+    }
+    // A huge candidate set means the journal no longer gives a meaningful
+    // O(changes) bound. Fall back instead of constructing an oversized argv or
+    // quietly turning the incremental path into another tree scan.
+    if candidates.len() > 10_000 {
+        return Ok(None);
+    }
+
+    let candidate_vec = candidates.into_iter().collect::<Vec<_>>();
+    let dirty_paths = dirty_paths_for_candidates(&repository, &candidate_vec)?;
+    let mut pinned = Vec::new();
+    let captured = (|| -> Result<BaselineSnapshot> {
+        let mut entries = Vec::with_capacity(dirty_paths.len());
+        for path in dirty_paths {
+            let entry = capture_entry(&repository, &path, store)?;
+            for chunk in &entry.chunks {
+                store.pin(*chunk)?;
+                pinned.push(*chunk);
+            }
+            entries.push(entry);
+        }
+        let (index_chunks, _) = store.put_stream(index.as_slice())?;
+        for chunk in &index_chunks {
+            store.pin(*chunk)?;
+            pinned.push(*chunk);
+        }
+
+        let second_head = git_text(&repository, &["rev-parse", "HEAD"])?;
+        let second_index = match fs::read(&index_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if second_head != head || blake3::hash(&second_index).to_hex().as_str() != index_hash {
+            return Err(Error::ConcurrentRepositoryMutation);
+        }
+        for expected in &entries {
+            let actual = fingerprint_entry(&repository, &expected.path)?;
+            if actual.kind != expected.kind
+                || actual.mode != expected.mode
+                || actual.size != expected.size
+                || actual.content_hash != expected.content_hash
+            {
+                return Err(Error::ConcurrentRepositoryMutation);
+            }
+        }
+        let canonical = serde_json::to_vec(&(&head, &index_hash, &entries))?;
+        Ok(BaselineSnapshot {
+            repository,
+            base_commit: head,
+            baseline_hash: blake3::hash(&canonical).to_hex().to_string(),
+            index_hash,
+            index_chunks,
+            entries,
+            tracker_epoch: Some(tracker_epoch),
+            tracker_generation: Some(tracker_generation),
+        })
+    })();
+    match captured {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) => {
+            for chunk in pinned {
+                let _ = store.unpin(chunk);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn dirty_paths_for_candidates(repository: &Path, candidates: &[String]) -> Result<Vec<String>> {
+    let mut dirty = BTreeSet::new();
+    for batch in candidates.chunks(256) {
+        let mut diff = Command::new("git");
+        diff.args(["diff", "--name-only", "-z", "HEAD", "--"])
+            .args(batch)
+            .current_dir(repository);
+        let output = diff.output()?;
+        if !output.status.success() {
+            return Err(git_error(
+                "git diff --name-only HEAD -- <journal paths>",
+                &output,
+            ));
+        }
+        dirty.extend(nul_paths(&output.stdout)?);
+
+        let mut untracked = Command::new("git");
+        untracked
+            .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+            .args(batch)
+            .current_dir(repository);
+        let output = untracked.output()?;
+        if !output.status.success() {
+            return Err(git_error(
+                "git ls-files --others -- <journal paths>",
+                &output,
+            ));
+        }
+        dirty.extend(nul_paths(&output.stdout)?);
+    }
+    Ok(dirty.into_iter().collect())
 }
 
 fn capture_entry(repository: &Path, relative: &str, store: &ChunkStore) -> Result<BaselineEntry> {
@@ -584,5 +753,66 @@ mod tests {
         let snapshot = capture_repository(repo.path(), &store).unwrap();
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].kind, EntryKind::Tombstone);
+    }
+
+    #[test]
+    fn journal_incremental_capture_matches_full_staged_unstaged_and_untracked_state() {
+        let repo = fixture();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let mut cached = capture_repository(repo.path(), &store).unwrap();
+        cached.tracker_epoch = Some(7);
+        cached.tracker_generation = Some(10);
+
+        fs::write(repo.path().join("tracked.txt"), "staged\n").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        fs::write(repo.path().join("tracked.txt"), "visible\n").unwrap();
+        fs::write(repo.path().join("new.txt"), "untracked\n").unwrap();
+
+        let incremental = capture_repository_incremental(
+            repo.path(),
+            &store,
+            &cached,
+            &[".git/index".into(), "tracked.txt".into(), "new.txt".into()],
+            7,
+            13,
+        )
+        .unwrap()
+        .unwrap();
+        let full = capture_repository(repo.path(), &store).unwrap();
+        assert_eq!(incremental.baseline_hash, full.baseline_hash);
+        assert_eq!(incremental.index_hash, full.index_hash);
+        assert_eq!(incremental.entries, full.entries);
+        assert_eq!(incremental.tracker_epoch, Some(7));
+        assert_eq!(incremental.tracker_generation, Some(13));
+    }
+
+    #[test]
+    fn journal_incremental_capture_removes_reverted_and_deleted_dirty_paths() {
+        let repo = fixture();
+        fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+        fs::write(repo.path().join("temporary.txt"), "temporary\n").unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let mut cached = capture_repository(repo.path(), &store).unwrap();
+        cached.tracker_epoch = Some(9);
+        cached.tracker_generation = Some(2);
+
+        fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        fs::remove_file(repo.path().join("temporary.txt")).unwrap();
+        let incremental = capture_repository_incremental(
+            repo.path(),
+            &store,
+            &cached,
+            &["tracked.txt".into(), "temporary.txt".into()],
+            9,
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        let full = capture_repository(repo.path(), &store).unwrap();
+        assert!(incremental.entries.is_empty());
+        assert_eq!(incremental.baseline_hash, full.baseline_hash);
+        assert_eq!(incremental.entries, full.entries);
     }
 }

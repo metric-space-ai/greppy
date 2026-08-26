@@ -27,4 +27,6 @@ pub use provider::{
 pub use repository_tracker::{
     RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,
 };
-pub use snapshot::{capture_repository, BaselineEntry, BaselineSnapshot, EntryKind};
+pub use snapshot::{
+    capture_repository, capture_repository_incremental, BaselineEntry, BaselineSnapshot, EntryKind,
+};

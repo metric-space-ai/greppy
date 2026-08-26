@@ -5,8 +5,9 @@
 //! repository and before any model request can be made.
 
 use greppy_workspace_core::{
-    capture_repository, BaselineEntry, BaselineSnapshot, ChunkStore, EntryKind,
-    ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
+    capture_repository, capture_repository_incremental, BaselineEntry, BaselineSnapshot,
+    ChunkStore, EntryKind, ProviderInstallation, RepositoryTrackerState, WorkspaceCore,
+    WorkspaceHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -455,6 +456,38 @@ fn capture_tracked_repository(
         {
             cached.tracker_generation = Some(fenced_generation);
             return Ok((cached, false));
+        }
+        if changes.generation == fenced_generation {
+            match capture_repository_incremental(
+                &repository,
+                core.chunks(),
+                &cached,
+                &changes.paths,
+                active.epoch,
+                fenced_generation,
+            ) {
+                Ok(Some(mut incremental)) => {
+                    let after_generation =
+                        repository_tracker_fence(&repository, core, active.epoch)?;
+                    let trailing = core.repository_changes_since(
+                        &repository,
+                        active.epoch,
+                        fenced_generation,
+                    )?;
+                    if trailing.generation == after_generation
+                        && trailing
+                            .paths
+                            .iter()
+                            .all(|path| path.starts_with(".git/greppy-tracker-fence-"))
+                    {
+                        incremental.tracker_generation = Some(after_generation);
+                        return Ok((incremental, true));
+                    }
+                    release_snapshot(core.chunks(), incremental);
+                }
+                Ok(None) | Err(greppy_workspace_core::Error::ConcurrentRepositoryMutation) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
 
