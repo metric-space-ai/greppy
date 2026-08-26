@@ -62,6 +62,11 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
     let handle = thread::spawn(move || {
         let mut manifest = manifest;
         let mut core = None;
+        let tracked_repo = std::fs::canonicalize(&repo_thread).unwrap();
+        let git_dir = tracked_repo.join(".git");
+        let mut tracker_active = false;
+        let mut tracker_generation = 0_u64;
+        let mut tracker_fences = HashSet::new();
         let mut mirrored = HashSet::new();
         let mut last_heartbeat = 0;
         while !stop_thread.load(Ordering::SeqCst) {
@@ -76,6 +81,32 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
                 core = WorkspaceCore::open(data_thread.join("core")).ok();
             }
             if let Some(core) = &core {
+                if !tracker_active {
+                    core.request_repository_tracker(&tracked_repo).unwrap();
+                    core.activate_repository_tracker(&tracked_repo, unix_milliseconds())
+                        .unwrap();
+                    tracker_active = true;
+                }
+                let current_fences = std::fs::read_dir(&git_dir)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.starts_with("greppy-tracker-fence-"))
+                    .collect::<HashSet<_>>();
+                let fence_changes = current_fences
+                    .symmetric_difference(&tracker_fences)
+                    .map(|name| format!(".git/{name}"))
+                    .collect::<Vec<_>>();
+                if !fence_changes.is_empty() {
+                    tracker_generation += 1;
+                    core.record_repository_changes(
+                        &tracked_repo,
+                        &fence_changes,
+                        tracker_generation,
+                    )
+                    .unwrap();
+                    tracker_fences = current_fences;
+                }
                 if let Ok(workspaces) = core.list_workspaces() {
                     let active = workspaces
                         .iter()
@@ -84,8 +115,18 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
                     for workspace in &workspaces {
                         let destination = mount_thread.join("workspaces").join(&workspace.id);
                         if !destination.exists() {
-                            std::fs::create_dir_all(&destination).unwrap();
-                            copy_fixture_tree(&repo_thread, &destination);
+                            let temporary = mount_thread
+                                .join("workspaces")
+                                .join(format!(".{}.materializing", workspace.id));
+                            let _ = std::fs::remove_dir_all(&temporary);
+                            std::fs::create_dir_all(&temporary).unwrap();
+                            if workspace.id.starts_with("git-") {
+                                let payload = git_control_payload(&data_thread).unwrap();
+                                copy_directory_tree(&payload, &temporary, false);
+                            } else {
+                                copy_directory_tree(&repo_thread, &temporary, true);
+                            }
+                            std::fs::rename(temporary, &destination).unwrap();
                             mirrored.insert(workspace.id.clone());
                         }
                     }
@@ -120,16 +161,25 @@ fn publish_mount_manifest(mount: &Path, manifest: &ProviderManifest) {
     std::fs::rename(temporary, mount.join(".greppy-provider.json")).unwrap();
 }
 
-fn copy_fixture_tree(source: &Path, destination: &Path) {
+fn git_control_payload(data: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(data.join("git-control-templates"))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.join("COMPLETE").is_file())
+        .map(|path| path.join("payload"))
+}
+
+fn copy_directory_tree(source: &Path, destination: &Path, skip_dot_git: bool) {
     for entry in std::fs::read_dir(source).unwrap() {
         let entry = entry.unwrap();
-        if entry.file_name() == ".git" {
+        if skip_dot_git && entry.file_name() == ".git" {
             continue;
         }
         let target = destination.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             std::fs::create_dir_all(&target).unwrap();
-            copy_fixture_tree(&entry.path(), &target);
+            copy_directory_tree(&entry.path(), &target, skip_dot_git);
         } else {
             std::fs::copy(entry.path(), target).unwrap();
         }

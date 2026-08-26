@@ -78,6 +78,10 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
              workspace_id TEXT PRIMARY KEY REFERENCES cow_workspaces(id) ON DELETE CASCADE,
              base_id TEXT NOT NULL REFERENCES cow_repository_bases(id),
              dirty_layer_id TEXT NOT NULL REFERENCES cow_dirty_layers(id)
+         );
+         CREATE TABLE IF NOT EXISTS cow_overlay_templates (
+             id TEXT PRIMARY KEY,
+             dirty_layer_id TEXT NOT NULL UNIQUE REFERENCES cow_dirty_layers(id)
          );",
     )?;
     Ok(())
@@ -88,8 +92,13 @@ pub(crate) fn ensure_layers(
     store: &ChunkStore,
     baseline: &BaselineSnapshot,
     captured_snapshot_owns_chunks: bool,
+    empty_base: bool,
 ) -> Result<(String, String)> {
-    let base_id = ensure_repository_base(connection, store, baseline)?;
+    let base_id = if empty_base {
+        ensure_empty_base(connection, baseline)?
+    } else {
+        ensure_repository_base(connection, store, baseline)?
+    };
     let dirty_id = format!("dirty:{}", baseline.baseline_hash);
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM cow_dirty_layers WHERE id = ?1)",
@@ -143,6 +152,38 @@ pub(crate) fn ensure_layers(
         return Err(error);
     }
     Ok((base_id, dirty_id))
+}
+
+fn ensure_empty_base(connection: &mut Connection, baseline: &BaselineSnapshot) -> Result<String> {
+    if !baseline.base_commit.starts_with("virtual-empty:") {
+        return Err(Error::UnsupportedRepository(
+            "empty overlay base is missing its virtual-empty identity".into(),
+        ));
+    }
+    let repository = baseline.repository.to_str().ok_or_else(|| {
+        Error::UnsupportedRepository("overlay identity is not valid UTF-8".into())
+    })?;
+    if let Some(id) = connection
+        .query_row(
+            "SELECT id FROM cow_repository_bases
+             WHERE repository = ?1 AND base_commit = ?2 AND state = 'ready'",
+            params![repository, baseline.base_commit],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+    let base_id = format!(
+        "empty-base:{}",
+        blake3::hash(format!("{repository}\0{}", baseline.base_commit).as_bytes()).to_hex()
+    );
+    connection.execute(
+        "INSERT INTO cow_repository_bases(id, repository, base_commit, state)
+         VALUES(?1, ?2, ?3, 'ready')",
+        params![base_id, repository, baseline.base_commit],
+    )?;
+    Ok(base_id)
 }
 
 fn ensure_repository_base(
@@ -232,6 +273,28 @@ pub(crate) fn link_workspace(
          VALUES(?1, ?2, ?3)",
         params![workspace_id, base_id, dirty_layer_id],
     )?;
+    Ok(())
+}
+
+pub(crate) fn retain_overlay_template(
+    transaction: &rusqlite::Transaction<'_>,
+    baseline_hash: &str,
+    dirty_layer_id: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO cow_overlay_templates(id, dirty_layer_id) VALUES(?1, ?2)",
+        params![baseline_hash, dirty_layer_id],
+    )?;
+    let observed: String = transaction.query_row(
+        "SELECT dirty_layer_id FROM cow_overlay_templates WHERE id = ?1",
+        params![baseline_hash],
+        |row| row.get(0),
+    )?;
+    if observed != dirty_layer_id {
+        return Err(Error::Corrupt(format!(
+            "overlay template {baseline_hash} points at an unexpected immutable layer"
+        )));
+    }
     Ok(())
 }
 
@@ -358,6 +421,8 @@ pub(crate) fn remove_unreferenced(connection: &mut Connection, store: &ChunkStor
              ) AND NOT EXISTS(
                  SELECT 1 FROM cow_proposals p
                  WHERE ('dirty:' || p.baseline_hash) = d.id
+             ) AND NOT EXISTS(
+                 SELECT 1 FROM cow_overlay_templates t WHERE t.dirty_layer_id = d.id
              )",
         )?;
         let ids = statement

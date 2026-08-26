@@ -957,6 +957,32 @@ pub(crate) fn index_embeddings_into_temp_store(
             reason: "test failpoint: embedding backend unavailable".into(),
         });
     }
+    if test_embedding_completion_forced() {
+        let key = embedding_complete_key(project);
+        store
+            .conn()
+            .execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
+            )
+            .map_err(|error| {
+                Error::Store(format!("record test embedding completeness: {error}"))
+            })?;
+        return Ok(EmbeddingBuildOutcome::Complete(
+            greppy_indexer::EmbeddingIndexReport {
+                nodes_considered: 0,
+                nodes_embedded: 0,
+                nodes_reused: 0,
+                nodes_skipped_non_definition: 0,
+                nodes_skipped_missing_file: 0,
+                nodes_skipped_invalid_span: 0,
+                nodes_skipped_oversize: 0,
+                stale_rows_pruned: 0,
+                nodes_failed: 0,
+            },
+        ));
+    }
     if let Some(job) = background_job.as_deref_mut() {
         job.embedding_loading();
     }

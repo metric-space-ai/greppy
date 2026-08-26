@@ -174,6 +174,12 @@ const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD
     any(debug_assertions, feature = "store-cow-release-perf")
 ))]
 const ENV_TEST_SKIP_INFERENCE: &str = "GREPPY_TEST_SKIP_INFERENCE";
+#[cfg(any(
+    feature = "ci-test-assets",
+    debug_assertions,
+    feature = "store-cow-release-perf"
+))]
+const ENV_TEST_FORCE_EMBED_COMPLETION: &str = "GREPPY_TEST_FORCE_EMBED_COMPLETION";
 /// Test-only failpoint: simulate an unavailable embedding backend so tests
 /// can pin the degraded-index contract (graph publishes, embeddings retry
 /// in the background) without a real inference failure.
@@ -204,6 +210,24 @@ fn test_inference_skipped() -> bool {
     not(feature = "store-cow-release-perf")
 ))]
 fn test_inference_skipped() -> bool {
+    false
+}
+
+#[cfg(any(
+    feature = "ci-test-assets",
+    debug_assertions,
+    feature = "store-cow-release-perf"
+))]
+fn test_embedding_completion_forced() -> bool {
+    test_inference_skipped() && std::env::var_os(ENV_TEST_FORCE_EMBED_COMPLETION).is_some()
+}
+
+#[cfg(all(
+    not(feature = "ci-test-assets"),
+    not(debug_assertions),
+    not(feature = "store-cow-release-perf")
+))]
+fn test_embedding_completion_forced() -> bool {
     false
 }
 

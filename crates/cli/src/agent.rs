@@ -384,6 +384,7 @@ fn run_agent(args: AgentArgs) -> u8 {
     let sandbox_mode = match resolve_sandbox_mode(
         &args,
         workspace.worktree_path(),
+        workspace.linked_git_dir(),
         &run_id,
         &scratch_dir,
         &agent_data,
@@ -404,9 +405,7 @@ fn run_agent(args: AgentArgs) -> u8 {
     std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env
-            .with_git_index_file(workspace.git_index_path().to_path_buf())
-            .with_sandbox(sandbox_mode),
+        Ok(env) => env.with_sandbox(sandbox_mode),
         Err(e) => {
             eprintln!("greppy -p: cannot build greppy env: {e}");
             keep_worktree_on_error(&workspace);
@@ -808,6 +807,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 fn resolve_sandbox_mode(
     args: &AgentArgs,
     worktree_path: &Path,
+    git_dir: &Path,
     run_id: &str,
     scratch_dir: &Path,
     agent_data: &Path,
@@ -816,7 +816,7 @@ fn resolve_sandbox_mode(
         eprintln!("sandbox disabled");
         return Ok(SandboxMode::Off);
     }
-    let raw = writable_roots_for(worktree_path, run_id, scratch_dir, agent_data);
+    let raw = writable_roots_for(worktree_path, git_dir, run_id, scratch_dir, agent_data);
     match agent_sandbox::resolve_enforce_spec(&raw) {
         Ok(mode) => Ok(mode),
         Err(SandboxError::Unsupported) => {
@@ -839,14 +839,21 @@ fn resolve_sandbox_mode(
 /// whole Cargo home: those defeat per-worktree isolation and the stable-tree lock.
 fn writable_roots_for(
     worktree_path: &Path,
+    git_dir: &Path,
     run_id: &str,
     scratch_dir: &Path,
     agent_data: &Path,
 ) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::with_capacity(6);
+    let mut roots = Vec::with_capacity(7);
 
     // Worktree: agent proposal edits and worktree-local builds land here.
     roots.push(worktree_path.to_path_buf());
+
+    // Private Git control namespace: index, refs, locks and new objects are a
+    // second WorkspaceCore CoW namespace. Normal Git commands must be able to
+    // update it without granting the provider mount parent or another Agent's
+    // Git state.
+    roots.push(git_dir.to_path_buf());
 
     // Scratch: per-run temp only (TMPDIR points here). Never the global temp root.
     roots.push(scratch_dir.to_path_buf());
@@ -1269,6 +1276,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let wt = unique("roots-wt");
         fs::create_dir_all(&wt).unwrap();
+        let git_dir = unique("roots-git-state");
+        fs::create_dir_all(&git_dir).unwrap();
         let run_id = "run-roots-test";
         let scratch = unique("roots-scratch");
         fs::create_dir_all(&scratch).unwrap();
@@ -1279,12 +1288,16 @@ mod tests {
         let prev_store = std::env::var_os("GREPPY_STORE_DIR");
         std::env::set_var("GREPPY_STORE_DIR", &agent_data);
 
-        let roots = writable_roots_for(&wt, run_id, &scratch, &agent_data);
+        let roots = writable_roots_for(&wt, &git_dir, run_id, &scratch, &agent_data);
 
         // Worktree + scratch + isolated agent data present.
         assert!(
             roots.iter().any(|r| r == &wt),
             "worktree missing: {roots:?}"
+        );
+        assert!(
+            roots.iter().any(|r| r == &git_dir),
+            "private Git CoW namespace missing: {roots:?}"
         );
         assert!(
             roots.iter().any(|r| r == &scratch),
@@ -1341,6 +1354,7 @@ mod tests {
             None => std::env::remove_var("GREPPY_STORE_DIR"),
         }
         let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&git_dir);
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&agent_data);
     }
@@ -1362,14 +1376,18 @@ mod tests {
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
+        let git_dir = unique("sb-off-git-state");
+        fs::create_dir_all(&git_dir).unwrap();
         let run_id = wt.file_name().unwrap().to_string_lossy().into_owned();
         let scratch = unique("sb-off-scratch");
         fs::create_dir_all(&scratch).unwrap();
         let agent_data = unique("sb-off-agent-data");
         fs::create_dir_all(&agent_data).unwrap();
-        let mode = resolve_sandbox_mode(&a, &wt, &run_id, &scratch, &agent_data).expect("ok");
+        let mode =
+            resolve_sandbox_mode(&a, &wt, &git_dir, &run_id, &scratch, &agent_data).expect("ok");
         assert!(matches!(mode, SandboxMode::Off));
         let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&git_dir);
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&agent_data);
     }
@@ -1391,12 +1409,15 @@ mod tests {
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();
+        let git_dir = unique("sb-on-git-state");
+        fs::create_dir_all(&git_dir).unwrap();
         let run_id = wt.file_name().unwrap().to_string_lossy().into_owned();
         let scratch = unique("sb-on-scratch");
         fs::create_dir_all(&scratch).unwrap();
         let agent_data = unique("sb-on-agent-data");
         fs::create_dir_all(&agent_data).unwrap();
-        let mode = resolve_sandbox_mode(&a, &wt, &run_id, &scratch, &agent_data).expect("ok");
+        let mode =
+            resolve_sandbox_mode(&a, &wt, &git_dir, &run_id, &scratch, &agent_data).expect("ok");
         match mode {
             SandboxMode::Enforce(spec) => {
                 assert!(!spec.writable_roots.is_empty());
@@ -1405,6 +1426,12 @@ mod tests {
                 assert!(
                     spec.writable_roots.iter().any(|r| r == &wt_canon),
                     "worktree missing from resolved roots: {:?} (want {wt_canon:?})",
+                    spec.writable_roots
+                );
+                let git_canon = fs::canonicalize(&git_dir).unwrap();
+                assert!(
+                    spec.writable_roots.iter().any(|r| r == &git_canon),
+                    "private Git namespace missing from resolved roots: {:?}",
                     spec.writable_roots
                 );
                 // Every root must be absolute (resolve-once invariant).
@@ -1427,6 +1454,7 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&git_dir);
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&agent_data);
     }

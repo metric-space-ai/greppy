@@ -84,6 +84,121 @@ pub fn capture_repository(repo: impl AsRef<Path>, store: &ChunkStore) -> Result<
     Err(Error::ConcurrentRepositoryMutation)
 }
 
+/// Capture an ordinary directory as the complete immutable layer over a
+/// synthetic empty base. This is used for provider-managed control
+/// namespaces (for example a private Git directory) that need the same Chunk-
+/// CoW, journaling and crash semantics as repository content without being a
+/// second source checkout.
+pub fn capture_overlay_directory(
+    identity: impl AsRef<Path>,
+    directory: impl AsRef<Path>,
+    store: &ChunkStore,
+) -> Result<BaselineSnapshot> {
+    let identity = identity.as_ref();
+    if !identity.is_absolute() {
+        return Err(Error::UnsupportedRepository(
+            "overlay namespace identity must be absolute".into(),
+        ));
+    }
+    let directory = fs::canonicalize(directory.as_ref())?;
+    if !directory.is_dir() {
+        return Err(Error::UnsupportedRepository(format!(
+            "overlay source is not a directory: {}",
+            directory.display()
+        )));
+    }
+    for attempt in 0..2 {
+        let first_paths = overlay_paths(&directory)?;
+        let mut pinned = Vec::new();
+        let captured = (|| -> Result<BaselineSnapshot> {
+            let mut entries = Vec::with_capacity(first_paths.len());
+            for path in &first_paths {
+                let entry = capture_entry(&directory, path, store)?;
+                for chunk in &entry.chunks {
+                    store.pin(*chunk)?;
+                    pinned.push(*chunk);
+                }
+                entries.push(entry);
+            }
+            if overlay_paths(&directory)? != first_paths {
+                return Err(Error::ConcurrentRepositoryMutation);
+            }
+            for expected in &entries {
+                let actual = fingerprint_entry(&directory, &expected.path)?;
+                if actual.kind != expected.kind
+                    || actual.mode != expected.mode
+                    || actual.size != expected.size
+                    || actual.content_hash != expected.content_hash
+                {
+                    return Err(Error::ConcurrentRepositoryMutation);
+                }
+            }
+            let identity_text = identity.to_string_lossy();
+            let canonical = serde_json::to_vec(&(
+                "greppy.overlay-directory.v1",
+                identity_text.as_ref(),
+                &entries,
+            ))?;
+            let baseline_hash = blake3::hash(&canonical).to_hex().to_string();
+            Ok(BaselineSnapshot {
+                repository: identity.to_path_buf(),
+                base_commit: format!("virtual-empty:{baseline_hash}"),
+                baseline_hash,
+                index_hash: blake3::hash(&[]).to_hex().to_string(),
+                index_chunks: Vec::new(),
+                entries,
+                tracker_epoch: None,
+                tracker_generation: None,
+            })
+        })();
+        match captured {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(Error::ConcurrentRepositoryMutation) if attempt == 0 => {
+                for chunk in pinned {
+                    let _ = store.unpin(chunk);
+                }
+            }
+            Err(error) => {
+                for chunk in pinned {
+                    let _ = store.unpin(chunk);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(Error::ConcurrentRepositoryMutation)
+}
+
+fn overlay_paths(root: &Path) -> Result<Vec<String>> {
+    fn visit(root: &Path, relative: &Path, paths: &mut Vec<String>) -> Result<()> {
+        let mut entries =
+            fs::read_dir(root.join(relative))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let child = relative.join(entry.file_name());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                visit(root, &child, paths)?;
+                continue;
+            }
+            let path = child.to_str().ok_or_else(|| {
+                Error::UnsupportedRepository(format!(
+                    "overlay path is not UTF-8: {}",
+                    child.display()
+                ))
+            })?;
+            validate_relative_path(path)?;
+            paths.push(path.replace('\\', "/"));
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    visit(root, Path::new(""), &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
 fn capture_once(
     repository: &Path,
     store: &ChunkStore,
@@ -155,7 +270,32 @@ pub fn capture_repository_incremental(
     tracker_epoch: u64,
     tracker_generation: u64,
 ) -> Result<Option<BaselineSnapshot>> {
-    let repository = repository_root(repository.as_ref())?;
+    let repository = repository.as_ref();
+    for attempt in 0..2 {
+        match capture_repository_incremental_once(
+            repository,
+            store,
+            cached,
+            journal_paths,
+            tracker_epoch,
+            tracker_generation,
+        ) {
+            Err(Error::ConcurrentRepositoryMutation) if attempt == 0 => continue,
+            result => return result,
+        }
+    }
+    Err(Error::ConcurrentRepositoryMutation)
+}
+
+fn capture_repository_incremental_once(
+    repository: &Path,
+    store: &ChunkStore,
+    cached: &BaselineSnapshot,
+    journal_paths: &[String],
+    tracker_epoch: u64,
+    tracker_generation: u64,
+) -> Result<Option<BaselineSnapshot>> {
+    let repository = repository_root(repository)?;
     if repository != cached.repository {
         return Ok(None);
     }
@@ -281,7 +421,8 @@ fn dirty_paths_for_candidates(repository: &Path, candidates: &[String]) -> Resul
     let mut dirty = BTreeSet::new();
     for batch in candidates.chunks(256) {
         let mut diff = Command::new("git");
-        diff.args(["diff", "--name-only", "-z", "HEAD", "--"])
+        diff.env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["diff", "--name-only", "-z", "HEAD", "--"])
             .args(batch)
             .current_dir(repository);
         let output = diff.output()?;
@@ -295,6 +436,7 @@ fn dirty_paths_for_candidates(repository: &Path, candidates: &[String]) -> Resul
 
         let mut untracked = Command::new("git");
         untracked
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
             .args(batch)
             .current_dir(repository);
@@ -575,6 +717,7 @@ fn git_text(repository: &Path, args: &[&str]) -> Result<String> {
 
 fn git_output(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .current_dir(repository)
         .output()?;

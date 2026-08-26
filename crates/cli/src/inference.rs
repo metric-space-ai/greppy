@@ -241,7 +241,7 @@ pub(crate) fn embedding_asset_missing_error(error: &Error) -> bool {
 pub(crate) fn embedding_config_for_index(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<Option<EmbeddingModelConfig>> {
-    if test_inference_skipped() {
+    if test_inference_skipped() && !test_embedding_completion_forced() {
         return Ok(None);
     }
     Ok(Some(embedding_config_required(args)?))

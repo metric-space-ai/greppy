@@ -5,9 +5,9 @@
 //! repository and before any model request can be made.
 
 use greppy_workspace_core::{
-    capture_repository, capture_repository_incremental, BaselineEntry, BaselineSnapshot,
-    ChunkStore, EntryKind, ProviderInstallation, RepositoryTrackerState, WorkspaceCore,
-    WorkspaceHandle,
+    capture_overlay_directory, capture_repository, capture_repository_incremental, BaselineEntry,
+    BaselineSnapshot, ChunkStore, EntryKind, ProviderInstallation, RepositoryTrackerState,
+    WorkspaceCore, WorkspaceHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +24,7 @@ pub struct AgentWorkspace {
     worktree: PathBuf,
     private_git_dir: PathBuf,
     private_index: PathBuf,
+    git_handle: WorkspaceHandle,
     run_id: String,
     base_commit: String,
     baseline_hash: String,
@@ -180,38 +181,91 @@ impl AgentWorkspace {
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
         let baseline_for_git = baseline.clone();
+        let git_run_id = git_workspace_id(run_id);
+        core.begin_workspace_pair(run_id, &git_run_id)?;
         let handle = if captured_snapshot_owns_chunks {
-            core.create_workspace(run_id, baseline)?
+            core.create_workspace(run_id, baseline)
         } else {
-            core.create_workspace_from_shared_baseline(run_id, &baseline)?
+            core.create_workspace_from_shared_baseline(run_id, &baseline)
         };
-        let worktree = provider.workspace_path(run_id)?;
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                return Err(error.into());
+            }
+        };
+        let worktree = match provider.workspace_path(run_id) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                return Err(error.into());
+            }
+        };
         if let Err(error) = wait_for_workspace(&worktree) {
-            let _ = core.remove_workspace(handle);
+            let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error);
         }
-        let private_git_dir = data_root.join("private-git").join(run_id);
+        let (git_baseline, git_baseline_owns_chunks, baseline_tree) =
+            match prepare_git_control_baseline(
+                &repo_root,
+                &worktree,
+                &data_root,
+                &baseline_for_git,
+                core.chunks(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                    return Err(error);
+                }
+            };
+        let git_handle = if git_baseline_owns_chunks {
+            core.create_overlay_workspace(&git_run_id, git_baseline)
+        } else {
+            core.create_overlay_workspace_from_shared_baseline(&git_run_id, &git_baseline)
+        };
+        let git_handle = match git_handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                return Err(error.into());
+            }
+        };
+        let private_git_dir = match provider.workspace_path(&git_run_id) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = wait_for_workspace(&private_git_dir) {
+            let _ = core.abort_workspace_pair(run_id, &git_run_id);
+            return Err(error);
+        }
         let initialized = initialize_private_git(
-            &repo_root,
             &worktree,
             &private_git_dir,
-            &data_root,
             &baseline_for_git,
-            core.chunks(),
+            &baseline_tree,
         );
         let (baseline_tree, baseline_view_commit, private_index) = match initialized {
             Ok(result) => result,
             Err(error) => {
-                let _ = core.remove_workspace(handle);
-                let _ = fs::remove_dir_all(&private_git_dir);
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
                 return Err(error);
             }
         };
+        if let Err(error) = core.complete_workspace_pair(&handle, &git_handle) {
+            let _ = core.abort_workspace_pair(run_id, &git_run_id);
+            return Err(error.into());
+        }
         Ok(Self {
             repo_root,
             worktree,
             private_git_dir,
             private_index,
+            git_handle,
             run_id: run_id.into(),
             base_commit,
             baseline_hash,
@@ -276,7 +330,8 @@ impl AgentWorkspace {
 
     pub fn keep(&self) -> Result<(), WorkspaceError> {
         self.verify_identity()?;
-        self.core.keep(&self.handle)?;
+        self.core
+            .keep_workspace_pair(&self.handle, &self.git_handle)?;
         Ok(())
     }
 
@@ -372,17 +427,8 @@ impl AgentWorkspace {
                 Err(error) => return Err(error.into()),
             }
         }
-        match fs::remove_dir_all(&self.private_git_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        match fs::remove_file(&self.private_index) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.core.remove_workspace(self.handle)?;
+        self.core
+            .remove_workspace_pair(self.handle, self.git_handle)?;
         Ok(())
     }
 
@@ -394,7 +440,9 @@ impl AgentWorkspace {
                 detail: "provider instance changed during the agent run".into(),
             });
         }
-        if provider.workspace_path(&self.run_id)? != self.worktree || !self.private_git_dir.is_dir()
+        if provider.workspace_path(&self.run_id)? != self.worktree
+            || provider.workspace_path(self.git_handle.id())? != self.private_git_dir
+            || !self.private_git_dir.is_dir()
         {
             return Err(WorkspaceError::Tampered {
                 path: self.worktree.clone(),
@@ -406,6 +454,13 @@ impl AgentWorkspace {
             return Err(WorkspaceError::Tampered {
                 path: self.worktree.clone(),
                 detail: "workspace baseline metadata changed".into(),
+            });
+        }
+        let git_status = self.core.status(&self.git_handle)?;
+        if !git_status.base_commit.starts_with("virtual-empty:") {
+            return Err(WorkspaceError::Tampered {
+                path: self.private_git_dir.clone(),
+                detail: "private Git namespace lost its virtual empty-base binding".into(),
             });
         }
         Ok(())
@@ -1175,25 +1230,13 @@ fn home_dir() -> Result<PathBuf, WorkspaceError> {
         .ok_or_else(|| WorkspaceError::AdapterUnavailable("home directory is unavailable".into()))
 }
 
-fn initialize_private_git(
+fn prepare_git_control_baseline(
     repo_root: &Path,
     worktree: &Path,
-    private_git_dir: &Path,
     data_root: &Path,
     baseline: &BaselineSnapshot,
     chunks: &ChunkStore,
-) -> Result<(String, String, PathBuf), WorkspaceError> {
-    if private_git_dir.exists() {
-        return Err(WorkspaceError::Tampered {
-            path: private_git_dir.into(),
-            detail: "private Git state already exists for this run id".into(),
-        });
-    }
-    fs::create_dir_all(
-        private_git_dir
-            .parent()
-            .ok_or_else(|| io::Error::other("invalid private Git path"))?,
-    )?;
+) -> Result<(BaselineSnapshot, bool, String), WorkspaceError> {
     let object_format = git_ok(repo_root, &["rev-parse", "--show-object-format"])?;
     let common = git_ok(
         repo_root,
@@ -1209,17 +1252,143 @@ fn initialize_private_git(
         &objects,
     )?;
 
-    init_bare(private_git_dir, &object_format)?;
-    let alternates = private_git_dir.join("objects/info/alternates");
-    fs::create_dir_all(
-        alternates
-            .parent()
-            .ok_or_else(|| io::Error::other("invalid alternates path"))?,
+    let (control, owns_chunks) = ensure_git_control_template(
+        data_root,
+        baseline,
+        chunks,
+        &layer,
+        &objects,
+        &object_format,
+    )?;
+    Ok((control, owns_chunks, layer.baseline_tree))
+}
+
+fn ensure_git_control_template(
+    data_root: &Path,
+    repository_baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+    layer: &SharedGitLayer,
+    source_objects: &Path,
+    object_format: &str,
+) -> Result<(BaselineSnapshot, bool), WorkspaceError> {
+    let templates = data_root.join("git-control-templates");
+    fs::create_dir_all(&templates)?;
+    let final_root = templates.join(&repository_baseline.baseline_hash);
+    if final_root.exists() {
+        return Ok((load_git_control_template(&final_root)?, false));
+    }
+
+    let temporary = templates.join(format!(
+        ".{}.tmp.{}.{}",
+        repository_baseline.baseline_hash,
+        std::process::id(),
+        now_unix_ns()
+    ));
+    let payload = temporary.join("payload");
+    fs::create_dir(&temporary)?;
+    let build = (|| -> Result<BaselineSnapshot, WorkspaceError> {
+        init_bare(&payload, object_format)?;
+        let alternates = payload.join("objects/info/alternates");
+        fs::create_dir_all(
+            alternates
+                .parent()
+                .ok_or_else(|| io::Error::other("invalid template alternates path"))?,
+        )?;
+        fs::write(
+            &alternates,
+            format!(
+                "{}\n{}\n",
+                layer.objects.display(),
+                source_objects.display()
+            ),
+        )?;
+        fs::copy(&layer.index, payload.join("index"))?;
+        let shared_name = layer
+            .shared_index
+            .file_name()
+            .ok_or_else(|| io::Error::other("shared Git index has no file name"))?;
+        fs::copy(&layer.shared_index, payload.join(shared_name))?;
+        capture_overlay_directory(final_root.join("namespace"), &payload, chunks)
+            .map_err(Into::into)
+    })();
+    let snapshot = match build {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    };
+    fs::write(
+        temporary.join("baseline.json"),
+        serde_json::to_vec(&snapshot).map_err(|error| io::Error::other(error.to_string()))?,
     )?;
     fs::write(
-        &alternates,
-        format!("{}\n{}\n", layer.objects.display(), objects.display()),
+        temporary.join("COMPLETE"),
+        b"greppy.git-control-template.v1\n",
     )?;
+    match fs::rename(&temporary, &final_root) {
+        Ok(()) => Ok((snapshot, true)),
+        Err(_error) if final_root.exists() => {
+            let _ = fs::remove_dir_all(&temporary);
+            release_snapshot(chunks, snapshot);
+            Ok((load_git_control_template(&final_root)?, false))
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            release_snapshot(chunks, snapshot);
+            Err(error.into())
+        }
+    }
+}
+
+fn load_git_control_template(root: &Path) -> Result<BaselineSnapshot, WorkspaceError> {
+    if !root.join("COMPLETE").is_file() || !root.join("payload").is_dir() {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "Git control template is incomplete".into(),
+        });
+    }
+    let baseline: BaselineSnapshot = serde_json::from_slice(&fs::read(root.join("baseline.json"))?)
+        .map_err(|error| WorkspaceError::Tampered {
+            path: root.join("baseline.json"),
+            detail: error.to_string(),
+        })?;
+    if baseline.repository != root.join("namespace")
+        || !baseline.base_commit.starts_with("virtual-empty:")
+    {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "Git control template identity is invalid".into(),
+        });
+    }
+    Ok(baseline)
+}
+
+fn git_workspace_id(run_id: &str) -> String {
+    let digest = blake3::hash(run_id.as_bytes()).to_hex().to_string();
+    format!("git-{}", &digest[..32])
+}
+
+fn initialize_private_git(
+    worktree: &Path,
+    private_git_dir: &Path,
+    baseline: &BaselineSnapshot,
+    baseline_tree: &str,
+) -> Result<(String, String, PathBuf), WorkspaceError> {
+    if !private_git_dir.is_dir() {
+        return Err(WorkspaceError::Tampered {
+            path: private_git_dir.into(),
+            detail: "provider did not expose the private Git CoW namespace".into(),
+        });
+    }
+    let private_index = private_git_dir.join("index");
+    if !private_index.is_file() {
+        return Err(WorkspaceError::Tampered {
+            path: private_index,
+            detail: "private Git CoW namespace has no split index".into(),
+        });
+    }
+
     git_private(
         private_git_dir,
         worktree,
@@ -1249,30 +1418,9 @@ fn initialize_private_git(
         format!("gitdir: {}\n", private_git_dir.display()),
     )?;
 
-    let private_index = layer
-        .index
-        .parent()
-        .ok_or_else(|| io::Error::other("shared Git index has no parent"))?
-        .join(format!(
-            "workspace-{}.index",
-            private_git_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| WorkspaceError::Unsupported(
-                    "private Git run id is not valid UTF-8".into()
-                ))?
-        ));
-    if private_index.exists() {
-        return Err(WorkspaceError::Tampered {
-            path: private_index,
-            detail: "private split index already exists".into(),
-        });
-    }
-    fs::copy(&layer.index, &private_index)?;
-    let baseline_tree = layer.baseline_tree;
     let baseline_view_commit = commit_tree(
         worktree,
-        &baseline_tree,
+        baseline_tree,
         &baseline.base_commit,
         "greppy private baseline view",
     )?;
@@ -1288,7 +1436,7 @@ fn initialize_private_git(
         worktree,
         &["symbolic-ref", "HEAD", "refs/heads/greppy-baseline"],
     )?;
-    Ok((baseline_tree, baseline_view_commit, private_index))
+    Ok((baseline_tree.into(), baseline_view_commit, private_index))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1303,6 +1451,7 @@ struct SharedGitLayerManifest {
 struct SharedGitLayer {
     objects: PathBuf,
     index: PathBuf,
+    shared_index: PathBuf,
     baseline_tree: String,
 }
 
@@ -1460,9 +1609,26 @@ fn open_shared_git_layer(
             detail: "shared Git layer is missing index or objects".into(),
         });
     }
+    let mut shared_indexes = fs::read_dir(root.join("indexes"))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("sharedindex."))
+        })
+        .collect::<Vec<_>>();
+    shared_indexes.sort();
+    if shared_indexes.len() != 1 || !shared_indexes[0].is_file() {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "shared Git layer must contain exactly one complete shared index".into(),
+        });
+    }
     Ok(SharedGitLayer {
         objects,
         index,
+        shared_index: shared_indexes.remove(0),
         baseline_tree: manifest.baseline_tree,
     })
 }
@@ -1607,6 +1773,10 @@ fn filter_ignored_paths(
     index: &Path,
     paths: Vec<String>,
 ) -> Result<Vec<String>, WorkspaceError> {
+    let paths = paths
+        .into_iter()
+        .filter(|path| path != ".git" && !path.starts_with(".git/"))
+        .collect::<Vec<_>>();
     if paths.is_empty() {
         return Ok(paths);
     }
@@ -1749,6 +1919,9 @@ mod tests {
 
     fn git(path: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .args(["-C", path.to_str().unwrap()])
             .args(args)
             .output()
@@ -1788,6 +1961,27 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).unwrap();
         fs::write(data.join("provider.json"), &bytes).unwrap();
         fs::write(mount.join(".greppy-provider.json"), bytes).unwrap();
+    }
+
+    fn copy_test_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path).unwrap();
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                copy_test_tree(&source_path, &destination_path);
+            } else if metadata.file_type().is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(fs::read_link(source_path).unwrap(), destination_path)
+                    .unwrap();
+                #[cfg(windows)]
+                panic!("test Git control template unexpectedly contains a symbolic link");
+            } else {
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -1872,19 +2066,140 @@ mod tests {
         fs::write(worktree.join("tracked.txt"), "dirty\n").unwrap();
         fs::write(worktree.join("untracked.txt"), "user\n").unwrap();
 
+        // The unit test uses an ordinary directory instead of a mounted
+        // provider. Mirror the immutable Git-control template exactly once so
+        // AgentWorkspace still exercises the paired namespace contract.
+        let data_for_git = data.clone();
+        let mount_for_git = mount.clone();
+        let git_mount_emulator = std::thread::spawn(move || {
+            let templates = data_for_git.join("git-control-templates");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(entries) = fs::read_dir(&templates) {
+                    if let Some(template) = entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.path())
+                        .find(|path| path.join("COMPLETE").is_file())
+                    {
+                        copy_test_tree(
+                            &template.join("payload"),
+                            &mount_for_git
+                                .join("workspaces")
+                                .join(git_workspace_id("test-run")),
+                        );
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Git control namespace emulator timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
         let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
         std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
         let workspace = AgentWorkspace::create(&repo, "test-run").unwrap();
         fence_emulator.join().unwrap();
-        assert!(!workspace.linked_git_dir().join("index").exists());
+        git_mount_emulator.join().unwrap();
+        assert_eq!(
+            workspace.git_index_path(),
+            workspace.linked_git_dir().join("index")
+        );
+        assert!(workspace.linked_git_dir().join("index").is_file());
         assert!(fs::metadata(workspace.git_index_path()).unwrap().len() <= 512 * 1024);
-        assert!(fs::read_dir(workspace.git_index_path().parent().unwrap())
+        assert!(fs::read_dir(workspace.linked_git_dir())
             .unwrap()
             .filter_map(|entry| entry.ok())
             .any(|entry| entry
                 .file_name()
                 .to_string_lossy()
                 .starts_with("sharedindex.")));
+        assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
+        assert_eq!(
+            filter_ignored_paths(
+                workspace.worktree_path(),
+                workspace.git_index_path(),
+                vec![".git".into(), ".git/config".into(), "tracked.txt".into()],
+            )
+            .unwrap(),
+            ["tracked.txt"]
+        );
+        assert_eq!(
+            fs::canonicalize(git(workspace.worktree_path(), &["rev-parse", "--git-dir"])).unwrap(),
+            fs::canonicalize(workspace.linked_git_dir()).unwrap()
+        );
+        fs::write(workspace.worktree_path().join("tracked.txt"), "tool-edit\n").unwrap();
+        assert_eq!(
+            git(workspace.worktree_path(), &["status", "--porcelain"]),
+            " M tracked.txt"
+        );
+        assert!(
+            git(workspace.worktree_path(), &["diff", "--", "tracked.txt"]).contains("+tool-edit")
+        );
+        git(workspace.worktree_path(), &["add", "--", "tracked.txt"]);
+        assert!(git(
+            workspace.worktree_path(),
+            &["diff", "--cached", "--", "tracked.txt"]
+        )
+        .contains("+tool-edit"));
+        git(
+            workspace.worktree_path(),
+            &["reset", "--quiet", "HEAD", "--", "tracked.txt"],
+        );
+        fs::write(workspace.worktree_path().join("tracked.txt"), "dirty\n").unwrap();
+        assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
+        git(
+            workspace.worktree_path(),
+            &["branch", "workspace-private-branch"],
+        );
+        assert!(!git(
+            workspace.worktree_path(),
+            &[
+                "show-ref",
+                "--verify",
+                "refs/heads/workspace-private-branch"
+            ]
+        )
+        .is_empty());
+        git(
+            workspace.worktree_path(),
+            &["branch", "-D", "workspace-private-branch"],
+        );
+        git(
+            workspace.worktree_path(),
+            &["config", "user.email", "workspace@example.test"],
+        );
+        git(
+            workspace.worktree_path(),
+            &["config", "user.name", "Workspace Test"],
+        );
+        fs::write(
+            workspace.worktree_path().join("commit.txt"),
+            "private commit\n",
+        )
+        .unwrap();
+        git(workspace.worktree_path(), &["add", "--", "commit.txt"]);
+        git(
+            workspace.worktree_path(),
+            &["commit", "--quiet", "-m", "private workspace commit"],
+        );
+        assert_eq!(
+            git(workspace.worktree_path(), &["rev-parse", "HEAD^1"]),
+            workspace.baseline_view_commit
+        );
+        git(
+            workspace.worktree_path(),
+            &[
+                "reset",
+                "--hard",
+                "--quiet",
+                &workspace.baseline_view_commit,
+            ],
+        );
+        assert!(!workspace.worktree_path().join("commit.txt").exists());
+        assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
         let agent_data = workspace.agent_data_root();
         assert!(agent_data.starts_with(&data));
         assert!(!agent_data.starts_with(&mount));

@@ -361,6 +361,14 @@ pub(crate) fn prepare_base_store(
         .map_err(|error| Error::io("resolve current greppy binary for Base build", error))?;
     let mut command = Command::new(binary);
     command.arg("index");
+    #[cfg(any(
+        feature = "ci-test-assets",
+        debug_assertions,
+        feature = "store-cow-release-perf"
+    ))]
+    if crate::test_inference_skipped() {
+        command.env(crate::ENV_TEST_FORCE_EMBED_COMPLETION, "1");
+    }
     append_embedding_cli_args(&mut command, embedding_args);
     let status = command
         .current_dir(workspace.worktree_path())

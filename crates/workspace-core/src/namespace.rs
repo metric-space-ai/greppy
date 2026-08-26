@@ -162,6 +162,11 @@ impl WorkspaceCore {
                  baseline_json BLOB NOT NULL,
                  state TEXT NOT NULL CHECK(state IN ('ready', 'kept', 'broken'))
              );
+             CREATE TABLE IF NOT EXISTS cow_workspace_pairs (
+                 content_id TEXT PRIMARY KEY,
+                 git_id TEXT NOT NULL UNIQUE,
+                 state TEXT NOT NULL CHECK(state IN ('creating', 'ready', 'kept', 'removing'))
+             );
              CREATE TABLE IF NOT EXISTS cow_inodes (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  workspace_id TEXT NOT NULL REFERENCES cow_workspaces(id) ON DELETE CASCADE,
@@ -246,7 +251,19 @@ impl WorkspaceCore {
         id: &str,
         baseline: BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        self.create_workspace_internal(id, baseline, true)
+        self.create_workspace_internal(id, baseline, true, false)
+    }
+
+    /// Create a provider-managed namespace over a synthetic empty base. Its
+    /// immutable entries and subsequent delta use exactly the same CAS,
+    /// journaling and recovery path as repository workspaces, but no Git tree
+    /// is imported behind the caller's back.
+    pub fn create_overlay_workspace(
+        &self,
+        id: &str,
+        baseline: BaselineSnapshot,
+    ) -> Result<WorkspaceHandle> {
+        self.create_workspace_internal(id, baseline, true, true)
     }
 
     fn create_workspace_internal(
@@ -254,6 +271,7 @@ impl WorkspaceCore {
         id: &str,
         baseline: BaselineSnapshot,
         captured_snapshot_owns_chunks: bool,
+        empty_base: bool,
     ) -> Result<WorkspaceHandle> {
         validate_workspace_id(id)?;
         let repository = baseline
@@ -267,8 +285,16 @@ impl WorkspaceCore {
             &self.chunks,
             &baseline,
             captured_snapshot_owns_chunks,
+            empty_base,
         )?;
         let transaction = connection.transaction()?;
+        if empty_base {
+            repository_layers::retain_overlay_template(
+                &transaction,
+                &baseline.baseline_hash,
+                &dirty_layer_id,
+            )?;
+        }
         transaction.execute(
             "INSERT INTO cow_workspaces(
                  id, repository, base_commit, baseline_hash, baseline_json, state
@@ -295,7 +321,167 @@ impl WorkspaceCore {
         id: &str,
         baseline: &BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        self.create_workspace_internal(id, baseline.clone(), false)
+        self.create_workspace_internal(id, baseline.clone(), false, false)
+    }
+
+    /// Clone a provider-managed control namespace from an already retained
+    /// immutable overlay without copying its file bytes.
+    pub fn create_overlay_workspace_from_shared_baseline(
+        &self,
+        id: &str,
+        baseline: &BaselineSnapshot,
+    ) -> Result<WorkspaceHandle> {
+        self.create_workspace_internal(id, baseline.clone(), false, true)
+    }
+
+    /// Begin the crash-recoverable creation of the content/Git-state pair.
+    /// Neither namespace is considered an Agent worktree until `complete` has
+    /// atomically proven that both exist.
+    pub fn begin_workspace_pair(&self, content_id: &str, git_id: &str) -> Result<()> {
+        validate_workspace_id(content_id)?;
+        validate_workspace_id(git_id)?;
+        if content_id == git_id {
+            return Err(Error::InvalidPath(
+                "content and Git workspace IDs must differ".into(),
+            ));
+        }
+        let connection = self.lock_metadata()?;
+        connection.execute(
+            "INSERT INTO cow_workspace_pairs(content_id, git_id, state)
+             VALUES(?1, ?2, 'creating')",
+            params![content_id, git_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_workspace_pair(
+        &self,
+        content: &WorkspaceHandle,
+        git: &WorkspaceHandle,
+    ) -> Result<()> {
+        let mut connection = self.lock_metadata()?;
+        let transaction = connection.transaction()?;
+        for id in [&content.id, &git.id] {
+            let ready: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE id = ?1 AND state = 'ready')",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if !ready {
+                return Err(Error::NotFound(format!(
+                    "workspace pair member {id} is not ready"
+                )));
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE cow_workspace_pairs SET state = 'ready'
+             WHERE content_id = ?1 AND git_id = ?2 AND state = 'creating'",
+            params![content.id, git.id],
+        )?;
+        if changed != 1 {
+            return Err(Error::Corrupt(
+                "workspace pair creation journal is missing".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn keep_workspace_pair(
+        &self,
+        content: &WorkspaceHandle,
+        git: &WorkspaceHandle,
+    ) -> Result<()> {
+        let mut connection = self.lock_metadata()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE cow_workspaces SET state = 'kept'
+             WHERE id IN (?1, ?2) AND state = 'ready'",
+            params![content.id, git.id],
+        )?;
+        if changed != 2 {
+            return Err(Error::InvalidPath(
+                "both workspace pair members must be ready before keep".into(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE cow_workspace_pairs SET state = 'kept'
+             WHERE content_id = ?1 AND git_id = ?2 AND state = 'ready'",
+            params![content.id, git.id],
+        )?;
+        if changed != 1 {
+            return Err(Error::Corrupt("workspace pair journal is not ready".into()));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_workspace_pair(
+        &self,
+        content: WorkspaceHandle,
+        git: WorkspaceHandle,
+    ) -> Result<()> {
+        self.remove_workspace_pair_ids(&content.id, &git.id, true)
+    }
+
+    pub fn abort_workspace_pair(&self, content_id: &str, git_id: &str) -> Result<()> {
+        validate_workspace_id(content_id)?;
+        validate_workspace_id(git_id)?;
+        self.remove_workspace_pair_ids(content_id, git_id, false)
+    }
+
+    fn remove_workspace_pair_ids(
+        &self,
+        content_id: &str,
+        git_id: &str,
+        require_ready: bool,
+    ) -> Result<()> {
+        let mut connection = self.lock_metadata()?;
+        let pair_state: Option<String> = connection
+            .query_row(
+                "SELECT state FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
+                params![content_id, git_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pair_state) = pair_state else {
+            return Err(Error::NotFound("workspace pair journal is missing".into()));
+        };
+        if require_ready && pair_state != "ready" {
+            return Err(Error::InvalidPath(format!(
+                "workspace pair is {pair_state}, not ready"
+            )));
+        }
+        let mut chunks = Vec::new();
+        for id in [content_id, git_id] {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                chunks.extend(workspace_chunks(&connection, id)?);
+            }
+        }
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE cow_workspace_pairs SET state = 'removing'
+             WHERE content_id = ?1 AND git_id = ?2",
+            params![content_id, git_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM cow_workspaces WHERE id IN (?1, ?2)",
+            params![content_id, git_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
+            params![content_id, git_id],
+        )?;
+        transaction.commit()?;
+        for chunk in chunks {
+            self.chunks.unpin(chunk)?;
+        }
+        Ok(())
     }
 
     pub fn status(&self, workspace: &WorkspaceHandle) -> Result<WorkspaceStatus> {
@@ -1118,6 +1304,33 @@ impl WorkspaceCore {
     }
 
     pub fn recover(&self) -> Result<()> {
+        {
+            let mut connection = self.lock_metadata()?;
+            let incomplete = {
+                let mut statement = connection.prepare(
+                    "SELECT content_id, git_id FROM cow_workspace_pairs
+                     WHERE state IN ('creating', 'removing')",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let transaction = connection.transaction()?;
+            for (content_id, git_id) in incomplete {
+                transaction.execute(
+                    "DELETE FROM cow_workspaces WHERE id IN (?1, ?2)",
+                    params![content_id, git_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
+                    params![content_id, git_id],
+                )?;
+            }
+            transaction.commit()?;
+        }
         self.chunks.verify()?;
         let mut expected = HashMap::<ChunkId, u64>::new();
         let connection = self.lock_metadata()?;
@@ -1965,6 +2178,97 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.name == ".git"));
+    }
+
+    #[test]
+    fn private_git_control_templates_are_shared_chunk_cow_namespaces() {
+        let storage = tempfile::tempdir().unwrap();
+        let template = tempfile::tempdir().unwrap();
+        fs::write(template.path().join("HEAD"), b"ref: refs/heads/base\n").unwrap();
+        fs::write(template.path().join("index"), vec![3_u8; CHUNK_SIZE * 2]).unwrap();
+        fs::write(
+            template.path().join("sharedindex.0123456789"),
+            vec![5_u8; CHUNK_SIZE * 2],
+        )
+        .unwrap();
+        let core = WorkspaceCore::open(storage.path()).unwrap();
+        let baseline = crate::capture_overlay_directory(
+            storage.path().join("git-control-template"),
+            template.path(),
+            core.chunks(),
+        )
+        .unwrap();
+        let first = core
+            .create_overlay_workspace("git-state-first", baseline.clone())
+            .unwrap();
+        let second = core
+            .create_overlay_workspace_from_shared_baseline("git-state-second", &baseline)
+            .unwrap();
+
+        assert!(core
+            .status(&first)
+            .unwrap()
+            .base_commit
+            .starts_with("virtual-empty:"));
+        assert_eq!(
+            core.read(&first, "HEAD", 0, 128).unwrap(),
+            b"ref: refs/heads/base\n"
+        );
+        assert_eq!(
+            core.read(&second, "index", CHUNK_SIZE as u64, 1).unwrap(),
+            [3]
+        );
+        let before = core.chunks().stats().unwrap().chunk_count;
+        core.write(&first, "index", CHUNK_SIZE as u64 + 7, &[9])
+            .unwrap();
+        assert_eq!(
+            core.read(&first, "index", CHUNK_SIZE as u64 + 7, 1)
+                .unwrap(),
+            [9]
+        );
+        assert_eq!(
+            core.read(&second, "index", CHUNK_SIZE as u64 + 7, 1)
+                .unwrap(),
+            [3]
+        );
+        assert_eq!(core.chunks().stats().unwrap().chunk_count, before + 1);
+        core.remove_workspace(first).unwrap();
+        core.remove_workspace(second).unwrap();
+        core.gc().unwrap();
+        let after_gc = core
+            .create_overlay_workspace_from_shared_baseline("git-state-after-gc", &baseline)
+            .unwrap();
+        assert_eq!(
+            core.read(&after_gc, "sharedindex.0123456789", 0, 1)
+                .unwrap(),
+            [5]
+        );
+    }
+
+    #[test]
+    fn recovery_rolls_back_an_incomplete_content_git_workspace_pair() {
+        let (_repo, storage, core, content) = fixture();
+        let template = tempfile::tempdir().unwrap();
+        fs::write(template.path().join("HEAD"), b"ref: refs/heads/base\n").unwrap();
+        let baseline = crate::capture_overlay_directory(
+            storage.path().join("git-control-recovery"),
+            template.path(),
+            core.chunks(),
+        )
+        .unwrap();
+        core.begin_workspace_pair(content.id(), "git-state-recovery")
+            .unwrap();
+        let git = core
+            .create_overlay_workspace("git-state-recovery", baseline)
+            .unwrap();
+        assert!(core.status(&content).is_ok());
+        assert!(core.status(&git).is_ok());
+        drop(core);
+
+        let recovered = WorkspaceCore::open(storage.path()).unwrap();
+        assert!(recovered.open_workspace(content.id()).is_err());
+        assert!(recovered.open_workspace(git.id()).is_err());
+        assert!(recovered.list_workspaces().unwrap().is_empty());
     }
 
     #[test]
