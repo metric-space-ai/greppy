@@ -1,8 +1,7 @@
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption, Notifier, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, Session, SessionACL,
-    TimeOrNow,
+    MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, Session, SessionACL, TimeOrNow,
 };
 use greppy_workspace_core::{
     AdapterKind, Error as CoreError, ErrorKind, NodeKind, NodeMetadata, ProviderCapabilities,
@@ -10,39 +9,26 @@ use greppy_workspace_core::{
     PROVIDER_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TTL: Duration = Duration::from_millis(250);
+const ATTR_TTL: Duration = Duration::from_millis(250);
+// Successful FUSE namespace operations are committed to the dcache by VFS;
+// reverse notifications from the active request can deadlock its worker pool.
+// Cache entries only for the same deliberately short period as attributes.
+const ENTRY_TTL: Duration = Duration::from_millis(250);
 const ROOT: u64 = 1;
 const WORKSPACES: u64 = 2;
 const DOCTOR: u64 = 3;
 const MARKER: u64 = 4;
-const INVALIDATION_QUEUE_CAPACITY: usize = 1_024;
-
-struct RenameInvalidation {
-    parent: INodeNo,
-    name: OsString,
-    new_parent: INodeNo,
-    new_name: OsString,
-}
-
-fn enqueue_rename_invalidation(
-    sender: &SyncSender<RenameInvalidation>,
-    invalidation: RenameInvalidation,
-) -> bool {
-    sender.try_send(invalidation).is_ok()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Node {
     Root,
@@ -66,7 +52,6 @@ struct PortableFuse {
     next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
-    invalidations: SyncSender<RenameInvalidation>,
 }
 
 impl PortableFuse {
@@ -74,10 +59,8 @@ impl PortableFuse {
         core: WorkspaceCore,
         doctor_root: PathBuf,
         manifest: Arc<RwLock<ProviderManifest>>,
-    ) -> io::Result<(Self, Receiver<RenameInvalidation>)> {
+    ) -> io::Result<Self> {
         fs::create_dir_all(&doctor_root)?;
-        let (invalidations, pending_invalidations) =
-            mpsc::sync_channel(INVALIDATION_QUEUE_CAPACITY);
         let mut nodes = HashMap::new();
         let mut reverse = HashMap::new();
         for (inode, node) in [
@@ -89,23 +72,19 @@ impl PortableFuse {
             nodes.insert(inode, node.clone());
             reverse.insert(node, inode);
         }
-        Ok((
-            Self {
-                core,
-                doctor_root,
-                manifest,
-                nodes: Mutex::new(nodes),
-                reverse: Mutex::new(reverse),
-                workspace_inodes: Mutex::new(HashMap::new()),
-                open_files: Mutex::new(HashMap::new()),
-                next_inode: AtomicU64::new(16),
-                next_file_handle: AtomicU64::new(1),
-                uid: unsafe { libc::geteuid() },
-                gid: unsafe { libc::getegid() },
-                invalidations,
-            },
-            pending_invalidations,
-        ))
+        Ok(Self {
+            core,
+            doctor_root,
+            manifest,
+            nodes: Mutex::new(nodes),
+            reverse: Mutex::new(reverse),
+            workspace_inodes: Mutex::new(HashMap::new()),
+            open_files: Mutex::new(HashMap::new()),
+            next_inode: AtomicU64::new(16),
+            next_file_handle: AtomicU64::new(1),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        })
     }
 
     fn node(&self, inode: INodeNo) -> Option<Node> {
@@ -234,29 +213,6 @@ impl PortableFuse {
         }
     }
 
-    fn invalidate_rename(
-        &self,
-        parent: INodeNo,
-        name: &OsStr,
-        new_parent: INodeNo,
-        new_name: &OsStr,
-    ) {
-        // Reverse notifications wait for a kernel acknowledgement. Running
-        // one synchronously in a FUSE callback can consume every session
-        // worker under concurrent renames and deadlock the mount. Queue the
-        // best-effort cache eviction for the dedicated notifier thread. A
-        // full queue safely falls back to the short entry TTL.
-        let _ = enqueue_rename_invalidation(
-            &self.invalidations,
-            RenameInvalidation {
-                parent,
-                name: name.to_os_string(),
-                new_parent,
-                new_name: new_name.to_os_string(),
-            },
-        );
-    }
-
     fn child(&self, parent: &Node, name: &OsStr) -> Result<Node, Errno> {
         match parent {
             Node::Root if name == OsStr::new("workspaces") => Ok(Node::Workspaces),
@@ -269,9 +225,15 @@ impl PortableFuse {
             }
             Node::WorkspaceRoot(workspace) => self.workspace_child(workspace, "", name),
             Node::WorkspacePath { workspace, path } => self.workspace_child(workspace, path, name),
-            Node::DoctorRoot => Ok(Node::Doctor(PathBuf::from(name))),
+            Node::DoctorRoot => {
+                let child = PathBuf::from(name);
+                fs::symlink_metadata(self.doctor_path(&child)?).map_err(io_errno)?;
+                Ok(Node::Doctor(child))
+            }
             Node::Doctor(path) if self.doctor_root.join(path).is_dir() => {
-                Ok(Node::Doctor(path.join(name)))
+                let child = path.join(name);
+                fs::symlink_metadata(self.doctor_path(&child)?).map_err(io_errno)?;
+                Ok(Node::Doctor(child))
             }
             _ => Err(Errno::ENOENT),
         }
@@ -408,7 +370,7 @@ impl Filesystem for PortableFuse {
                 self.attr(inode, &node).map(|attr| (attr, node))
             });
         match result {
-            Ok((attr, _)) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok((attr, _)) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -430,7 +392,7 @@ impl Filesystem for PortableFuse {
                 .and_then(|node| self.attr(inode.0, &node))
         };
         match result {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(error) => reply.error(error),
         }
     }
@@ -488,7 +450,7 @@ impl Filesystem for PortableFuse {
             self.attr(inode.0, &node)
         });
         match result {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(error) => reply.error(error),
         }
     }
@@ -786,7 +748,9 @@ impl Filesystem for PortableFuse {
                     None => Err(Errno::ENOENT),
                 };
                 match file_handle {
-                    Ok(fh) => reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty()),
+                    Ok(fh) => {
+                        reply.created(&ENTRY_TTL, &attr, Generation(0), fh, FopenFlags::empty())
+                    }
                     Err(error) => reply.error(error),
                 }
             }
@@ -804,7 +768,7 @@ impl Filesystem for PortableFuse {
         reply: ReplyEntry,
     ) {
         match self.create_node(parent, name, mode, true) {
-            Ok((_inode, attr)) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok((_inode, attr)) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -889,13 +853,7 @@ impl Filesystem for PortableFuse {
                 Ok(())
             });
         match result {
-            Ok(()) => {
-                // The kernel cannot process a notification that invalidates the
-                // dentry for the rename request it is still waiting to finish.
-                // Complete the request first, then evict both cached names.
-                reply.ok();
-                self.invalidate_rename(parent, name, new_parent, new_name);
-            }
+            Ok(()) => reply.ok(),
             Err(error) => reply.error(error),
         }
     }
@@ -919,7 +877,7 @@ impl Filesystem for PortableFuse {
             self.attr(inode, &node)
         });
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -956,7 +914,7 @@ impl Filesystem for PortableFuse {
                 self.attr(child_inode, &node)
             });
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -964,10 +922,14 @@ impl Filesystem for PortableFuse {
 
 fn relocated_node(node: &Node, source: &Node, destination: &Node) -> Option<Node> {
     match (node, source, destination) {
-        (Node::Doctor(path), Node::Doctor(from), Node::Doctor(to)) => path
-            .strip_prefix(from)
-            .ok()
-            .map(|suffix| Node::Doctor(to.join(suffix))),
+        (Node::Doctor(path), Node::Doctor(from), Node::Doctor(to)) => {
+            let suffix = path.strip_prefix(from).ok()?;
+            Some(Node::Doctor(if suffix.as_os_str().is_empty() {
+                to.clone()
+            } else {
+                to.join(suffix)
+            }))
+        }
         (
             Node::WorkspacePath { workspace, path },
             Node::WorkspacePath {
@@ -978,13 +940,17 @@ fn relocated_node(node: &Node, source: &Node, destination: &Node) -> Option<Node
                 workspace: destination_workspace,
                 path: to,
             },
-        ) if workspace == source_workspace && workspace == destination_workspace => Path::new(path)
-            .strip_prefix(from)
-            .ok()
-            .map(|suffix| Node::WorkspacePath {
+        ) if workspace == source_workspace && workspace == destination_workspace => {
+            let suffix = Path::new(path).strip_prefix(from).ok()?;
+            Some(Node::WorkspacePath {
                 workspace: workspace.clone(),
-                path: Path::new(to).join(suffix).to_string_lossy().into_owned(),
-            }),
+                path: if suffix.as_os_str().is_empty() {
+                    to.clone()
+                } else {
+                    Path::new(to).join(suffix).to_string_lossy().into_owned()
+                },
+            })
+        }
         _ => None,
     }
 }
@@ -1118,13 +1084,6 @@ impl PortableFuse {
     }
 }
 
-fn dispatch_invalidations(notifier: Notifier, invalidations: Receiver<RenameInvalidation>) {
-    while let Ok(invalidation) = invalidations.recv() {
-        let _ = notifier.inval_entry(invalidation.parent, &invalidation.name);
-        let _ = notifier.inval_entry(invalidation.new_parent, &invalidation.new_name);
-    }
-}
-
 pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     fs::create_dir_all(&data_root)?;
     fs::create_dir_all(&mount_root)?;
@@ -1154,8 +1113,7 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
         },
     }));
     let core = WorkspaceCore::open(data_root.join("core")).map_err(core_io)?;
-    let (filesystem, invalidations) =
-        PortableFuse::new(core, data_root.join("doctor"), manifest.clone())?;
+    let filesystem = PortableFuse::new(core, data_root.join("doctor"), manifest.clone())?;
     {
         let mut state = manifest.write().unwrap();
         state.state = ProviderState::Ready;
@@ -1188,10 +1146,6 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     config.n_threads = Some(8);
     config.clone_fd = true;
     let session = Session::new(filesystem, mount_root, &config)?;
-    let notifier = session.notifier();
-    thread::Builder::new()
-        .name("greppy-fuse-invalidate".into())
-        .spawn(move || dispatch_invalidations(notifier, invalidations))?;
     let result = session.run();
     let mut state = manifest.write().unwrap();
     state.state = ProviderState::Broken;
@@ -1363,22 +1317,41 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    fn invalidation(name: &str) -> RenameInvalidation {
-        RenameInvalidation {
-            parent: INodeNo(1),
-            name: OsString::from(name),
-            new_parent: INodeNo(2),
-            new_name: OsString::from(format!("new-{name}")),
-        }
+    #[test]
+    fn exact_rename_relocation_does_not_turn_a_file_into_a_directory_path() {
+        assert_eq!(
+            relocated_node(
+                &Node::Doctor(PathBuf::from("before")),
+                &Node::Doctor(PathBuf::from("before")),
+                &Node::Doctor(PathBuf::from("after")),
+            ),
+            Some(Node::Doctor(PathBuf::from("after")))
+        );
+        assert_eq!(
+            relocated_node(
+                &Node::WorkspacePath {
+                    workspace: "workspace".into(),
+                    path: "before".into(),
+                },
+                &Node::WorkspacePath {
+                    workspace: "workspace".into(),
+                    path: "before".into(),
+                },
+                &Node::WorkspacePath {
+                    workspace: "workspace".into(),
+                    path: "after".into(),
+                },
+            ),
+            Some(Node::WorkspacePath {
+                workspace: "workspace".into(),
+                path: "after".into(),
+            })
+        );
     }
 
     #[test]
-    fn saturated_invalidation_queue_never_blocks_a_fuse_callback() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        assert!(enqueue_rename_invalidation(&sender, invalidation("first")));
-        assert!(!enqueue_rename_invalidation(
-            &sender,
-            invalidation("second")
-        ));
+    fn mutable_namespace_cache_is_short_lived() {
+        assert_eq!(ENTRY_TTL, Duration::from_millis(250));
+        assert_eq!(ATTR_TTL, ENTRY_TTL);
     }
 }

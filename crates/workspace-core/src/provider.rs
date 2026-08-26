@@ -164,10 +164,16 @@ impl ProviderInstallation {
             }
             drop(file);
             fs::rename(&first, &second)?;
-            if first.exists() || !second.is_file() {
+            let source_exists = first.exists();
+            let destination_is_file = second.is_file();
+            if source_exists || !destination_is_file {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "atomic rename contract was not preserved",
+                    format!(
+                        "atomic rename contract was not preserved \
+                         (source_exists={source_exists}, \
+                         destination_is_file={destination_is_file})"
+                    ),
                 ));
             }
             fs::remove_file(&second)?;
