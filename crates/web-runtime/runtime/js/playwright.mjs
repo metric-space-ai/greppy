@@ -2010,6 +2010,6 @@ const webkit = withUnsupported(
 export { chromium, firefox, webkit };
 export const request = withUnsupported({}, "APIRequest");
 export const selectors = withUnsupported({}, "Selectors");
-export const devices = {};
+export const devices = withUnsupported({}, "devices");
 export const errors = withUnsupported({}, "errors");
 export default { chromium, firefox, webkit, request, selectors, devices, errors };

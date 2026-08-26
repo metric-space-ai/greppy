@@ -1642,6 +1642,28 @@ fn research_profile_denies_cloud_metadata() {
     assert_eq!(denied.error.as_ref().unwrap().code, "policy_denied");
 }
 
+
+#[test]
+fn wrong_run_id_is_session_not_owned() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-owned-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_owner", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let denied = unix_request(
+        &socket,
+        &Request::new("other_run", "web.status", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("status");
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert_eq!(denied.error.as_ref().unwrap().code, "session_not_owned");
+}
+
+#[test]
+fn playwright_goto_denies_cloud_metadata() {
+    run_named_fixture("metadata-deny.mjs", "run_metad");
+}
 #[test]
 fn mouse_init_script_viewport_and_locator_all() {
     let socket = std::env::temp_dir().join(format!("greppy-web-mouse-{}.sock", std::process::id()));

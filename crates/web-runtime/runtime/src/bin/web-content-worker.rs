@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
+use web_runtime::policy::{decide_url, NetworkProfile, UrlDecision};
 use web_runtime::protocol::{read_message, write_message, Message, WorkerKind};
 use web_runtime::worker::require_capability;
 
@@ -196,6 +197,14 @@ impl WebViewDelegate for Delegate {
             "redirect": load.request.is_redirect,
             "headers": headers,
         }));
+        if let UrlDecision::Deny {
+            reason: "cloud metadata endpoint denied",
+        } = decide_url(NetworkProfile::Project, &url)
+        {
+            let denied_url = load.request.url.clone();
+            load.intercept(WebResourceResponse::new(denied_url)).cancel();
+            return;
+        }
         let matched = self
             .routes
             .borrow()
@@ -291,6 +300,7 @@ struct ContentEngine {
     next_id: u64,
     parent_alive: Arc<AtomicBool>,
     wake: Arc<AtomicBool>,
+    profile: NetworkProfile,
 }
 
 impl ContentEngine {
@@ -321,6 +331,7 @@ impl ContentEngine {
             next_id: 1,
             parent_alive,
             wake,
+            profile: NetworkProfile::Research,
         })
     }
 
@@ -519,9 +530,22 @@ impl ContentEngine {
                 self.pages.insert(page.clone(), (webview, delegate));
                 Ok(json!({ "page": page }))
             }
+            "session.setProfile" => {
+                let name = required_str(&params, "profile")?;
+                self.profile = NetworkProfile::parse(&name).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "profile must be research or project")
+                })?;
+                Ok(json!({ "profile": self.profile.as_str() }))
+            }
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
+                if let UrlDecision::Deny { reason } = decide_url(self.profile, &url) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("policy_denied: {reason}"),
+                    ));
+                }
                 let url = Url::parse(&url)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 let (webview, _) = self.page(&page_id)?.clone();

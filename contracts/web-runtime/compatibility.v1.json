@@ -41,8 +41,8 @@
   "entry_count": 1354,
   "status_counts": {
     "implemented": 263,
-    "unsupported": 289,
-    "unverified": 802
+    "unsupported": 290,
+    "unverified": 801
   },
   "entries": [
     {
@@ -15186,11 +15186,15 @@
       "symbol": "devices",
       "kind": "const",
       "origin": "parser export / types.d.ts",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "empty device descriptor table; lookups MUST fail with unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "AndroidElementInfo",
@@ -15365,8 +15369,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1048,
-    "unsupported": 289,
+    "unverified": 1047,
+    "unsupported": 290,
     "passing": 17
   }
 }

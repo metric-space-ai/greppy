@@ -1,9 +1,16 @@
-import { chromium } from "playwright";
+import { chromium, devices } from "playwright";
 
 const browser = await chromium.launch();
 if (!String(browser.version()).includes("Servo")) {
   throw new Error("version " + browser.version());
 }
+let devicesClosed = false;
+try {
+  await devices.iPhone();
+} catch (error) {
+  devicesClosed = String(error.message).includes("unsupported_playwright_operation");
+}
+if (!devicesClosed) throw new Error("devices must fail closed");
 const context = await browser.newContext();
 context.setDefaultTimeout(5_000);
 await context.addInitScript(() => {

@@ -413,6 +413,18 @@ impl Daemon {
                 return engine_error(request, error, 33);
             }
         }
+        let profile = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.profile)
+            .unwrap_or(NetworkProfile::Research);
+        if let Err(error) = self.engine_call(
+            "session.setProfile",
+            json!({ "profile": profile.as_str() }),
+        ) {
+            self.finish_session(&session_id);
+            return engine_error(request, error, 34);
+        }
         let started = Instant::now();
         let outcome = run_script_on_workers(
             &mut self.controller,
