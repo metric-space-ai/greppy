@@ -49,7 +49,7 @@ struct PortableFuse {
     reverse: Mutex<HashMap<Node, u64>>,
     workspace_inodes: Mutex<HashMap<(String, u64), u64>>,
     workspace_handles: Mutex<HashMap<String, WorkspaceHandle>>,
-    workspace_directories: Mutex<HashMap<(String, String), BTreeMap<String, NodeMetadata>>>,
+    workspace_directories: Mutex<HashMap<(String, String), Arc<BTreeMap<String, NodeMetadata>>>>,
     open_files: Mutex<HashMap<u64, WorkspaceFileHandle>>,
     next_inode: AtomicU64,
     next_file_handle: AtomicU64,
@@ -119,7 +119,7 @@ impl PortableFuse {
         &self,
         workspace: &str,
         path: &str,
-    ) -> Result<BTreeMap<String, NodeMetadata>, Errno> {
+    ) -> Result<Arc<BTreeMap<String, NodeMetadata>>, Errno> {
         let key = (workspace.to_string(), path.to_string());
         if let Some(entries) = self
             .workspace_directories
@@ -142,7 +142,8 @@ impl PortableFuse {
         if directories.len() >= WORKSPACE_CACHE_LIMIT {
             directories.clear();
         }
-        directories.insert(key, entries.clone());
+        let entries = Arc::new(entries);
+        directories.insert(key, Arc::clone(&entries));
         Ok(entries)
     }
 
@@ -1101,14 +1102,14 @@ impl PortableFuse {
         path: &str,
         children: &mut Vec<(u64, FileType, Vec<u8>)>,
     ) -> Result<(), Errno> {
-        for (name, metadata) in self.workspace_directory(workspace, path)? {
-            let child_path = join_virtual(path, &name);
+        for (name, metadata) in self.workspace_directory(workspace, path)?.iter() {
+            let child_path = join_virtual(path, name);
             let node = Node::WorkspacePath {
                 workspace: workspace.into(),
                 path: child_path,
             };
-            let inode = self.inode_with_metadata(node, Some(&metadata));
-            children.push((inode, file_type(metadata.kind), name.into_bytes()));
+            let inode = self.inode_with_metadata(node, Some(metadata));
+            children.push((inode, file_type(metadata.kind), name.as_bytes().to_vec()));
         }
         Ok(())
     }
