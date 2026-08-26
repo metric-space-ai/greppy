@@ -1643,7 +1643,10 @@ mod tests {
         assert!(fs::read_dir(workspace.git_index_path().parent().unwrap())
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .any(|entry| entry.file_name().to_string_lossy().starts_with("sharedindex.")));
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sharedindex.")));
         let agent_data = workspace.agent_data_root();
         assert!(agent_data.starts_with(&data));
         assert!(!agent_data.starts_with(&mount));

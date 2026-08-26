@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
@@ -80,7 +81,65 @@ struct InodeRecord {
 pub struct WorkspaceCore {
     root: PathBuf,
     chunks: ChunkStore,
-    metadata: Mutex<Connection>,
+    metadata: ConnectionPool,
+}
+
+struct ConnectionPool {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+}
+
+struct PooledConnection<'a> {
+    pool: &'a ConnectionPool,
+    connection: Option<Connection>,
+}
+
+impl ConnectionPool {
+    fn new(path: PathBuf, connection: Connection) -> Self {
+        Self {
+            path,
+            idle: Mutex::new(vec![connection]),
+        }
+    }
+
+    fn acquire(&self) -> Result<PooledConnection<'_>> {
+        let connection = self
+            .idle
+            .lock()
+            .map_err(|_| Error::Corrupt("workspace connection pool poisoned".into()))?
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| open_metadata_connection(&self.path))?;
+        Ok(PooledConnection {
+            pool: self,
+            connection: Some(connection),
+        })
+    }
+}
+
+impl Deref for PooledConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().expect("pooled connection present")
+    }
+}
+
+impl DerefMut for PooledConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().expect("pooled connection present")
+    }
+}
+
+impl Drop for PooledConnection<'_> {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if let Ok(mut idle) = self.pool.idle.lock() {
+            idle.push(connection);
+        }
+    }
 }
 
 impl WorkspaceCore {
@@ -88,8 +147,8 @@ impl WorkspaceCore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let chunks = ChunkStore::open(&root)?;
-        let connection = Connection::open(root.join("workspace.sqlite3"))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let metadata_path = root.join("workspace.sqlite3");
+        let connection = open_metadata_connection(&metadata_path)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -152,7 +211,7 @@ impl WorkspaceCore {
         let core = Self {
             root,
             chunks,
-            metadata: Mutex::new(connection),
+            metadata: ConnectionPool::new(metadata_path, connection),
         };
         core.recover()?;
         Ok(core)
@@ -1168,11 +1227,16 @@ impl WorkspaceCore {
         Ok(())
     }
 
-    fn lock_metadata(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.metadata
-            .lock()
-            .map_err(|_| Error::Corrupt("workspace metadata mutex poisoned".into()))
+    fn lock_metadata(&self) -> Result<PooledConnection<'_>> {
+        self.metadata.acquire()
     }
+}
+
+fn open_metadata_connection(path: &Path) -> Result<Connection> {
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(connection)
 }
 
 fn insert_inode(

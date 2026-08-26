@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// Logical CoW block size. Every file, including a small one, is represented
 /// exclusively by one or more chunks of at most this size.
@@ -82,6 +82,15 @@ pub struct ChunkGcReport {
 pub struct ChunkStore {
     root: PathBuf,
     connection: Mutex<Connection>,
+    locations: RwLock<HashMap<ChunkId, ChunkLocation>>,
+    gc_guard: RwLock<()>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkLocation {
+    segment_id: i64,
+    offset: u64,
+    len: usize,
 }
 
 impl ChunkStore {
@@ -114,9 +123,12 @@ impl ChunkStore {
         let store = Self {
             root,
             connection: Mutex::new(connection),
+            locations: RwLock::new(HashMap::new()),
+            gc_guard: RwLock::new(()),
         };
         store.recover_uncommitted_tails()?;
         store.remove_orphan_segment_files()?;
+        store.refresh_read_cache()?;
         Ok(store)
     }
 
@@ -200,6 +212,17 @@ impl ChunkStore {
             params![segment_id, new_committed_len as i64],
         )?;
         transaction.commit()?;
+        self.locations
+            .write()
+            .map_err(|_| Error::Corrupt("chunk location cache poisoned".into()))?
+            .insert(
+                id,
+                ChunkLocation {
+                    segment_id,
+                    offset: payload_offset,
+                    len: bytes.len(),
+                },
+            );
         Ok(id)
     }
 
@@ -230,30 +253,21 @@ impl ChunkStore {
     }
 
     pub fn read(&self, id: ChunkId) -> Result<Vec<u8>> {
-        let (segment_id, offset, len): (i64, u64, usize) = {
-            let connection = self
-                .connection
-                .lock()
-                .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
-            connection
-                .query_row(
-                    "SELECT segment_id, payload_offset, len FROM cow_chunks WHERE hash = ?1",
-                    params![&id.0[..]],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get::<_, i64>(1)? as u64,
-                            row.get::<_, i64>(2)? as usize,
-                        ))
-                    },
-                )
-                .optional()?
-                .ok_or_else(|| Error::Corrupt(format!("unknown chunk {id}")))?
+        let _read_guard = self
+            .gc_guard
+            .read()
+            .map_err(|_| Error::Corrupt("chunk GC guard poisoned".into()))?;
+        let mut location = self.chunk_location(id, false)?;
+        let segment = match File::open(self.segment_path(location.segment_id)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                location = self.chunk_location(id, true)?;
+                File::open(self.segment_path(location.segment_id))?
+            }
+            Err(error) => return Err(error.into()),
         };
-        let mut segment = File::open(self.segment_path(segment_id))?;
-        segment.seek(SeekFrom::Start(offset))?;
-        let mut bytes = vec![0_u8; len];
-        segment.read_exact(&mut bytes)?;
+        let mut bytes = vec![0_u8; location.len];
+        read_exact_at(&segment, location.offset, &mut bytes)?;
         let actual = ChunkId(*blake3::hash(&bytes).as_bytes());
         if actual != id {
             return Err(Error::Corrupt(format!(
@@ -401,6 +415,10 @@ impl ChunkStore {
     /// old files are deleted only after that commit. Either side of a crash is
     /// therefore recoverable without guessing which bytes are authoritative.
     pub fn gc(&self) -> Result<ChunkGcReport> {
+        let _exclusive = self
+            .gc_guard
+            .write()
+            .map_err(|_| Error::Corrupt("chunk GC guard poisoned".into()))?;
         let mut connection = self
             .connection
             .lock()
@@ -467,7 +485,13 @@ impl ChunkStore {
             current.write_all(&(*len as u32).to_le_bytes())?;
             current.write_all(&id.0)?;
             current.write_all(&bytes)?;
-            updates.push((*id, segment_id, segment_len + RECORD_HEADER_LEN, *refs));
+            updates.push((
+                *id,
+                segment_id,
+                segment_len + RECORD_HEADER_LEN,
+                *len,
+                *refs,
+            ));
             segment_len += record_len;
         }
         current.sync_data()?;
@@ -482,7 +506,7 @@ impl ChunkStore {
             )?;
         }
         transaction.execute("DELETE FROM cow_chunks WHERE refs = 0", [])?;
-        for (id, new_segment, offset, refs) in &updates {
+        for (id, new_segment, offset, _len, refs) in &updates {
             let changed = transaction.execute(
                 "UPDATE cow_chunks
                  SET segment_id = ?2, payload_offset = ?3, refs = ?4
@@ -497,6 +521,23 @@ impl ChunkStore {
             transaction.execute("DELETE FROM cow_segments WHERE id = ?1", params![id])?;
         }
         transaction.commit()?;
+        {
+            let mut locations = self
+                .locations
+                .write()
+                .map_err(|_| Error::Corrupt("chunk location cache poisoned".into()))?;
+            locations.clear();
+            for (id, segment_id, offset, len, _) in &updates {
+                locations.insert(
+                    *id,
+                    ChunkLocation {
+                        segment_id: *segment_id,
+                        offset: *offset,
+                        len: *len,
+                    },
+                );
+            }
+        }
         for id in old_segments {
             match fs::remove_file(self.segment_path(id)) {
                 Ok(()) => {}
@@ -550,6 +591,77 @@ impl ChunkStore {
         Ok(())
     }
 
+    fn refresh_read_cache(&self) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        let mut statement = connection.prepare(
+            "SELECT hash, segment_id, payload_offset, len FROM cow_chunks ORDER BY hash",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let hash: Vec<u8> = row.get(0)?;
+            let mut bytes = [0_u8; 32];
+            bytes.copy_from_slice(&hash);
+            Ok((
+                ChunkId(bytes),
+                ChunkLocation {
+                    segment_id: row.get(1)?,
+                    offset: row.get::<_, i64>(2)? as u64,
+                    len: row.get::<_, i64>(3)? as usize,
+                },
+            ))
+        })?;
+        let mut locations = self
+            .locations
+            .write()
+            .map_err(|_| Error::Corrupt("chunk location cache poisoned".into()))?;
+        locations.clear();
+        for row in rows {
+            let (id, location) = row?;
+            locations.insert(id, location);
+        }
+        Ok(())
+    }
+
+    fn chunk_location(&self, id: ChunkId, force_refresh: bool) -> Result<ChunkLocation> {
+        if !force_refresh {
+            if let Some(location) = self
+                .locations
+                .read()
+                .map_err(|_| Error::Corrupt("chunk location cache poisoned".into()))?
+                .get(&id)
+                .copied()
+            {
+                return Ok(location);
+            }
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        let location = connection
+            .query_row(
+                "SELECT segment_id, payload_offset, len FROM cow_chunks WHERE hash = ?1",
+                params![&id.0[..]],
+                |row| {
+                    Ok(ChunkLocation {
+                        segment_id: row.get(0)?,
+                        offset: row.get::<_, i64>(1)? as u64,
+                        len: row.get::<_, i64>(2)? as usize,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::Corrupt(format!("unknown chunk {id}")))?;
+        drop(connection);
+        self.locations
+            .write()
+            .map_err(|_| Error::Corrupt("chunk location cache poisoned".into()))?
+            .insert(id, location);
+        Ok(location)
+    }
+
     fn remove_orphan_segment_files(&self) -> Result<()> {
         let known: std::collections::HashSet<PathBuf> = {
             let connection = self
@@ -597,6 +709,40 @@ fn new_segment_file(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(path)?)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buffer.is_empty() {
+        let read = file.read_at(buffer, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "segment ended before chunk payload",
+            ));
+        }
+        offset += read as u64;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        let read = file.seek_read(buffer, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "segment ended before chunk payload",
+            ));
+        }
+        offset += read as u64;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -680,5 +826,18 @@ mod tests {
         assert_eq!(store.read(kept).unwrap(), b"kept");
         assert!(store.read(removed).is_err());
         store.verify().unwrap();
+    }
+
+    #[test]
+    fn read_cache_discovers_external_writes_and_refreshes_after_external_gc() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ChunkStore::open(temp.path()).unwrap();
+        let writer = ChunkStore::open(temp.path()).unwrap();
+        let id = writer.put(b"cross-process chunk").unwrap();
+        writer.pin(id).unwrap();
+        assert_eq!(reader.read(id).unwrap(), b"cross-process chunk");
+
+        writer.gc().unwrap();
+        assert_eq!(reader.read(id).unwrap(), b"cross-process chunk");
     }
 }
