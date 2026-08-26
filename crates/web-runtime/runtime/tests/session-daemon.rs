@@ -1474,3 +1474,24 @@ fn page_selector_actions_delegate_to_locators() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn locator_box_and_request_events_after_goto() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-netbox-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
+    let _guard = Supervisor::spawn(&socket, "run_netbox", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("network-and-box.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_netbox",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

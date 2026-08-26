@@ -39,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 96,
+    "implemented": 101,
     "unsupported": 243,
-    "unverified": 1015
+    "unverified": 1010
   },
   "entries": [
     {
@@ -714,14 +714,16 @@
       "behavior": "unverified",
       "tests": [
         "embedder-surface",
-        "native-dialog"
+        "native-dialog",
+        "network-and-box"
       ],
       "known_differences": [
         "dialog handler is a policy probe; request/download/popup listeners are stored but not dispatched as Playwright events",
         "native alert is auto-accepted after diverting Servo ALERT stdout off the protocol pipe",
         "dialog handler is a policy probe invoked before the native dialog; Chromium invokes it during the dialog with the live Dialog object",
         "native alert/confirm/prompt are auto-accepted or dismissed according to that probe after diverting Servo ALERT stdout off the protocol pipe",
-        "request/download/popup listeners are stored but not dispatched as Playwright events"
+        "request/download/popup listeners are stored but not dispatched as Playwright events",
+        "request/response handlers run after goto against retained load_web_resource records; not live Chromium network events; method is always GET and status is always 200"
       ]
     },
     {
@@ -2076,11 +2078,15 @@
       "symbol": "Page.event.request",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "dispatched after goto from retained records, not during the load"
+      ]
     },
     {
       "symbol": "Page.event.requestfailed",
@@ -5414,21 +5420,29 @@
       "symbol": "Locator.allInnerTexts",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "alias of allTextContents"
+      ]
     },
     {
       "symbol": "Locator.allTextContents",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "trimmed innerText/textContent of every matched node; no all() locator objects"
+      ]
     },
     {
       "symbol": "Locator.and",
@@ -5464,11 +5478,15 @@
       "symbol": "Locator.boundingBox",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "getBoundingClientRect after actionability wait; not Chromium layout"
+      ]
     },
     {
       "symbol": "Locator.check",
@@ -9305,11 +9323,15 @@
       "symbol": "Request.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "stub Request.url from Servo load_web_resource records after goto"
+      ]
     },
     {
       "symbol": "Response.allHeaders",

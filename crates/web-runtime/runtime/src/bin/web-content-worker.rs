@@ -693,6 +693,27 @@ impl ContentEngine {
                 self.locator_eval(&params, "nodes[0].focus(); return true")?;
                 Ok(json!({}))
             }
+            "locator.boundingBox" => {
+                let resolved = self.resolve_actionable(&params)?;
+                Ok(json!({
+                    "x": resolved.x,
+                    "y": resolved.y,
+                    "width": resolved.width,
+                    "height": resolved.height,
+                }))
+            }
+            "locator.allTextContents" => {
+                let page_id = required_str(&params, "page")?;
+                let selector = params
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(selector) {{ {SELECTOR_RUNTIME} return greppyResolveNodes(selector).map(function(el) {{ return ((el.innerText || el.textContent || '') + '').trim(); }}); }})({selector})"
+                );
+                Ok(json!({ "values": jsvalue_to_json(self.evaluate(webview, &source)?) }))
+            }
             "page.setContent" => {
                 let page_id = required_str(&params, "page")?;
                 let html = required_str(&params, "html")?;

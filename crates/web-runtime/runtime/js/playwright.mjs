@@ -257,6 +257,25 @@ class Locator {
     });
   }
 
+  async boundingBox() {
+    return engineCall("locator.boundingBox", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
+  async allTextContents() {
+    const result = await engineCall("locator.allTextContents", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return result.values || [];
+  }
+
+  async allInnerTexts() {
+    return this.allTextContents();
+  }
+
   first() {
     return new Locator(this._page, { ...this._selector, nth: 0 });
   }
@@ -418,7 +437,31 @@ class Page {
     if (options != null) {
       return unsupported("Page.goto.options")();
     }
-    return engineCall("page.goto", { page: this._id, url });
+    const result = await engineCall("page.goto", { page: this._id, url });
+    await this._dispatchNetwork();
+    return result;
+  }
+
+  async _dispatchNetwork() {
+    const result = await engineCall("page.requests", { page: this._id });
+    const requests = result.requests || [];
+    for (const rec of requests) {
+      const request = {
+        url: () => rec.url,
+        method: () => "GET",
+        resourceType: () => (rec.main_frame ? "document" : "other"),
+        frame: () => this.mainFrame(),
+      };
+      if (this._requestHandler) this._requestHandler(request);
+      if (this._responseHandler) {
+        this._responseHandler({
+          url: () => rec.url,
+          status: () => 200,
+          ok: () => true,
+          request: () => request,
+        });
+      }
+    }
   }
 
   async evaluate(pageFunction, arg) {

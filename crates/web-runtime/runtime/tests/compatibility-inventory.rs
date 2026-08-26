@@ -184,6 +184,9 @@ fn playwright_module_methods_are_not_silent_omissions() {
     claimed.push("BrowserContext.close".into());
     claimed.push("BrowserContext.clearCookies".into());
     claimed.push("Page.isClosed".into());
+    claimed.push("Locator.boundingBox".into());
+    claimed.push("Locator.allTextContents".into());
+    claimed.push("Request.url".into());
     claimed.push("Dialog.accept".into());
     claimed.push("Dialog.dismiss".into());
     claimed.push("Dialog.message".into());
