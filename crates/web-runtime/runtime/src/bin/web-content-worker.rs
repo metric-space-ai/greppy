@@ -1148,6 +1148,17 @@ impl ContentEngine {
                 self.evaluate(webview, &source)?;
                 Ok(json!({}))
             }
+            "page.keyboard.insertText" => {
+                let page_id = required_str(&params, "page")?;
+                let text = required_str(&params, "text")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(text) {{ var el = document.activeElement || document.body; if (el && 'value' in el) {{ el.value = String(el.value || '') + text; el.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: text, inputType: 'insertText' }})); }} return true; }})({})",
+                    serde_json::to_string(&text).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
             "page.keyboard.press" => {
                 let page_id = required_str(&params, "page")?;
                 let key = required_str(&params, "key")?;

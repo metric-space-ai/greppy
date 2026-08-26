@@ -295,13 +295,14 @@
       "symbol": "Page.dragAndDrop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "drag-to"
+      ],
       "known_differences": [
-        "hover source then hover target; not HTML5 drag events",
-        "Hover-hover is not HTML5 drag-and-drop. Calls MUST fail with unsupported_playwright_operation until a behavioral drag test exists."
+        "mouse down/move/up between locator boxes; not HTML5 dragstart/drop"
       ]
     },
     {
@@ -6070,11 +6071,15 @@
       "symbol": "Locator.contentFrame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "CSS iframe locators only; returns FrameLocator"
+      ]
     },
     {
       "symbol": "Locator.count",
@@ -6111,11 +6116,15 @@
       "symbol": "Locator.describe",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "stores a description string for toString"
+      ]
     },
     {
       "symbol": "Locator.description",
@@ -6145,11 +6154,15 @@
       "symbol": "Locator.dragTo",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "drag-to"
+      ],
+      "known_differences": [
+        "mouse down/move/up between bounding boxes; not HTML5 drag events"
+      ]
     },
     {
       "symbol": "Locator.drop",
@@ -6280,11 +6293,15 @@
       "symbol": "Locator.frameLocator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "CSS descendant iframe selector; nested child-frame Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "Locator.getAttribute",
@@ -6795,11 +6812,15 @@
       "symbol": "Locator.toString",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "returns describe() text or JSON of the internal selector"
+      ]
     },
     {
       "symbol": "Locator.uncheck",
@@ -9689,7 +9710,7 @@
         "keyboard"
       ],
       "known_differences": [
-        "alias of keyboard.type DOM value append"
+        "appends to the focused control and dispatches InputEvent inputType=insertText; no keydown"
       ]
     },
     {

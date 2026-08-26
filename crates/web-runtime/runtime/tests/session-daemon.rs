@@ -1908,6 +1908,11 @@ fn keyboard_down_and_up_are_separate_events() {
 }
 
 #[test]
+fn frames_content_frame_and_describe() {
+    run_named_fixture("frames.mjs", "run_frames2");
+}
+
+#[test]
 fn locator_screenshot_is_clipped_png() {
     run_named_fixture("screenshot.mjs", "run_locshot");
 }
@@ -1920,6 +1925,11 @@ fn tap_dispatches_touch_events() {
 #[test]
 fn mouse_wheel_dispatches_wheel_events() {
     run_named_fixture("mouse-wheel.mjs", "run_wheel");
+}
+
+#[test]
+fn drag_to_uses_mouse_down_move_up() {
+    run_named_fixture("drag-to.mjs", "run_drag");
 }
 
 #[test]

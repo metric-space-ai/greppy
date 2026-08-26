@@ -628,6 +628,41 @@ class Locator {
   async pressSequentially(text) {
     return this.type(text);
   }
+
+  describe(description) {
+    this._description = String(description);
+    return this;
+  }
+
+  toString() {
+    return this._description || JSON.stringify(this._selector);
+  }
+
+  contentFrame() {
+    if (!this._selector || this._selector.type !== "css" || !this._selector.value) {
+      throwUnsupported("Locator.contentFrame.nonCss");
+    }
+    return new FrameLocator(this._page, this._selector.value);
+  }
+
+  frameLocator(selector) {
+    if (!this._selector || this._selector.type !== "css" || !this._selector.value) {
+      throwUnsupported("Locator.frameLocator.nonCss");
+    }
+    return new FrameLocator(this._page, this._selector.value + " " + selector);
+  }
+
+  async dragTo(target) {
+    const from = await this.boundingBox();
+    const to = await target.boundingBox();
+    if (!from || !to) {
+      throw new Error("dragTo requires visible bounding boxes");
+    }
+    await this._page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+    await this._page.mouse.down();
+    await this._page.mouse.move(to.x + to.width / 2, to.y + to.height / 2);
+    await this._page.mouse.up();
+  }
 }
 
 class FrameLocator {
@@ -1827,8 +1862,8 @@ class Page {
     });
   }
 
-  async dragAndDrop() {
-    return unsupported("Page.dragAndDrop")();
+  async dragAndDrop(source, target) {
+    await this.locator(source).dragTo(this.locator(target));
   }
 
   async route(url, handler) {
@@ -1868,7 +1903,7 @@ class Page {
       await engineCall("page.keyboard.up", { page: this._id, key: String(key) });
     },
     insertText: async (text) => {
-      await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
+      await engineCall("page.keyboard.insertText", { page: this._id, text: String(text) });
     },
   };
 

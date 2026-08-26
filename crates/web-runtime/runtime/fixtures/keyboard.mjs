@@ -9,10 +9,24 @@ const value = await page.evaluate(() => document.querySelector("#q").value);
 if (value !== "hi") {
   throw new Error("keyboard.type expected hi, got " + JSON.stringify(value));
 }
+await page.evaluate(() => {
+  window.__input = [];
+  window.__keysDuringInsert = [];
+  const q = document.getElementById("q");
+  q.addEventListener("input", (event) => window.__input.push(event.inputType || "input"));
+  q.addEventListener("keydown", (event) => window.__keysDuringInsert.push(event.key));
+});
 await page.keyboard.insertText("!");
 const inserted = await page.evaluate(() => document.querySelector("#q").value);
 if (inserted !== "hi!") {
   throw new Error("insertText expected hi!, got " + JSON.stringify(inserted));
+}
+const insertEvents = await page.evaluate(() => ({ input: window.__input, keys: window.__keysDuringInsert }));
+if (!insertEvents.input.length) {
+  throw new Error("insertText must fire input: " + JSON.stringify(insertEvents));
+}
+if (insertEvents.keys.length) {
+  throw new Error("insertText must not fire keydown: " + JSON.stringify(insertEvents));
 }
 await page.evaluate(() => {
   window.__keys = [];

@@ -42,6 +42,14 @@ try {
   if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
 }
 if (nested) throw new Error("nested childFrames must fail closed");
+const described = page.locator("iframe").describe("child-iframe");
+if (!String(described.toString()).includes("child-iframe")) {
+  throw new Error("locator.describe/toString " + described.toString());
+}
+const viaContent = await page.locator("iframe").contentFrame().locator("#in").innerText();
+if (viaContent.trim() !== "frame-ok") throw new Error("contentFrame " + viaContent);
+const viaNested = await page.locator("body").frameLocator("iframe").locator("#in").innerText();
+if (viaNested.trim() !== "frame-ok") throw new Error("locator.frameLocator " + viaNested);
 const mainNested = await main.frameLocator("iframe").locator("#in").innerText();
 if (mainNested.trim() !== "frame-ok") throw new Error("main frameLocator " + mainNested);
 
