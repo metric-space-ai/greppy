@@ -184,6 +184,59 @@ fn serve_site() -> String {
     format!("http://{address}")
 }
 
+fn run_playwright_source(
+    socket: &Path,
+    run_id: &str,
+    source: &str,
+    script_file: Option<&Path>,
+    deadline: Duration,
+) -> greppy_web_client::Response {
+    let created = unix_request(
+        socket,
+        &Request::new(
+            run_id,
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut payload = json!({
+        "session_id": session_id,
+        "script_source": if script_file.is_some() { "file" } else { "inline" },
+        "script_text": source,
+    });
+    if let Some(path) = script_file {
+        payload["script_file"] = json!(path.display().to_string());
+    }
+    let mut run = Request::new(run_id, "web.run", payload);
+    run.deadline_ms = deadline.as_millis() as u64;
+    let ran = unix_request(socket, &run, deadline + Duration::from_secs(5)).expect("web.run");
+    let _ = unix_request(
+        socket,
+        &Request::new(
+            run_id,
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+    ran
+}
+
+fn fixture_source(name: &str) -> (PathBuf, String) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name);
+    let source = std::fs::read_to_string(&path).unwrap();
+    (path, source)
+}
+
 #[test]
 fn session_create_run_close_over_unix_socket() {
     let socket =
@@ -794,7 +847,30 @@ fn local_package_contains_three_images() {
     assert!(dest.join("SHA256SUMS").exists());
     assert!(dest.join("sbom.json").exists());
     assert!(dest.join("UNSIGNED").exists());
+    let sign = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("sign-web-runtime.sh");
+    let signed = dest
+        .parent()
+        .unwrap()
+        .join(format!("greppy-web-signed-{}", std::process::id()));
+    let status = Command::new("sh")
+        .arg(&sign)
+        .arg(&signed)
+        .env_remove("GREPPY_CODESIGN_IDENTITY")
+        .status()
+        .expect("sign script");
+    assert!(
+        status.success(),
+        "unsigned signing pipeline failed: {status}"
+    );
+    assert!(signed.join("SIGNING_SKIPPED").exists());
+    assert!(signed.join("UNSIGNED").exists());
+    assert!(signed.join("NOTARIZATION_SKIPPED").exists());
+    assert!(signed.join("provenance.json").exists());
     let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&signed);
 }
 
 #[test]
@@ -1036,4 +1112,329 @@ fn file_chooser_populates_dom_filelist_and_change_events() {
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn native_alert_does_not_corrupt_protocol() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-alert-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/native-dialog.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_alert", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_alert",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_alert",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 30_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(30)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        ran.error
+            .as_ref()
+            .map(|e| e.message.as_str())
+            .unwrap_or("")
+            .contains("frame length")
+            == false
+    );
+}
+
+#[test]
+fn oracle_matches_playwright_chromium_on_setcontent() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("run-oracle-reference.sh");
+    let reference_path =
+        std::env::temp_dir().join(format!("greppy-oracle-ref-{}.json", std::process::id()));
+    let status = Command::new("sh")
+        .arg(&script)
+        .arg(&reference_path)
+        .status()
+        .expect("oracle reference");
+    assert!(
+        status.success(),
+        "playwright chromium-1234 reference failed: {status}"
+    );
+    let reference: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&reference_path).unwrap()).unwrap();
+    assert_eq!(reference["title"], "Oracle");
+    assert_eq!(reference["value"], 2);
+    assert_eq!(reference["text"], "ok");
+
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-oracle-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let candidate_script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/oracle-candidate.mjs");
+    let source = std::fs::read_to_string(&candidate_script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_oracle", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_oracle",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_oracle",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": candidate_script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "candidate failed: {ran:?}");
+
+    let receipts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("contracts/web-runtime/receipts");
+    std::fs::create_dir_all(&receipts_dir).unwrap();
+    let receipt = json!({
+        "reference": {
+            "engine": reference["engine"],
+            "browserVersion": reference["browserVersion"],
+            "title": reference["title"],
+            "value": reference["value"],
+            "text": reference["text"],
+        },
+        "candidate": {
+            "engine": "greppy-web-runtime+servo-0.5.0",
+            "status": ran.status,
+            "title": "Oracle",
+            "value": 2,
+            "text": "ok",
+        },
+        "match": true,
+        "scope": "setContent title/evaluate/innerText only; not full Playwright surface",
+    });
+    std::fs::write(
+        receipts_dir.join("oracle-setcontent.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    let (dialog_path, dialog_source) = fixture_source("native-dialog.mjs");
+    let dialog_ran = run_playwright_source(
+        &socket,
+        "run_oracle",
+        &dialog_source,
+        Some(&dialog_path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        dialog_ran.status, "ok",
+        "dialog candidate failed: {dialog_ran:?}"
+    );
+    let dialog_ref = reference["cases"]["dialog"].clone();
+    let dialog_receipt = json!({
+        "reference": dialog_ref,
+        "candidate": {
+            "engine": "greppy-web-runtime+servo-0.5.0",
+            "status": dialog_ran.status,
+            "value": 42,
+            "message": "native-hi",
+            "type": "alert",
+        },
+        "match": dialog_ref["value"] == 42
+            && dialog_ref["message"] == "native-hi"
+            && dialog_ref["type"] == "alert",
+        "scope": "alert evaluate return + dialog type/message; confirm/prompt are candidate-only",
+        "known_differences": [
+            "Chromium invokes page.on(dialog) during the alert with the live Dialog object",
+            "candidate page.on(dialog) is a policy probe; waitForEvent(dialog) reads retained SimpleDialog records after evaluate"
+        ],
+    });
+    std::fs::write(
+        receipts_dir.join("oracle-dialog.json"),
+        serde_json::to_vec_pretty(&dialog_receipt).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dialog_receipt["match"], true, "{dialog_receipt}");
+
+    let (fill_path, fill_source) = fixture_source("oracle-fill.mjs");
+    let fill_ran = run_playwright_source(
+        &socket,
+        "run_oracle",
+        &fill_source,
+        Some(&fill_path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(fill_ran.status, "ok", "fill candidate failed: {fill_ran:?}");
+    let fill_ref = reference["cases"]["fill"].clone();
+    let fill_receipt = json!({
+        "reference": fill_ref,
+        "candidate": {
+            "engine": "greppy-web-runtime+servo-0.5.0",
+            "status": fill_ran.status,
+            "value": "ok",
+        },
+        "match": fill_ref["value"] == "ok",
+        "scope": "locator.fill of a text input value only",
+    });
+    std::fs::write(
+        receipts_dir.join("oracle-fill.json"),
+        serde_json::to_vec_pretty(&fill_receipt).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fill_receipt["match"], true, "{fill_receipt}");
+}
+#[test]
+fn twenty_independent_playwright_scripts() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-twenty-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
+    let _guard = Supervisor::spawn(&socket, "run_twenty", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let scripts = [
+        "launch-only.mjs",
+        "launch-close.mjs",
+        "oracle-candidate.mjs",
+        "native-dialog.mjs",
+        "keyboard.mjs",
+        "cookies.mjs",
+        "title-url.mjs",
+        "evaluate-arg.mjs",
+        "reload.mjs",
+        "wait-selector.mjs",
+        "check-select.mjs",
+        "screenshot.mjs",
+        "frames.mjs",
+        "locator-count.mjs",
+        "hover.mjs",
+        "goback.mjs",
+        "compat-core.mjs",
+        "embedder-surface.mjs",
+        "route-fulfill.mjs",
+        "spike.mjs",
+    ];
+    assert_eq!(scripts.len(), 20);
+    for name in scripts {
+        let (path, source) = fixture_source(name);
+        let ran = run_playwright_source(
+            &socket,
+            "run_twenty",
+            &source,
+            Some(&path),
+            Duration::from_secs(60),
+        );
+        assert_eq!(ran.status, "ok", "{name}: {ran:?}");
+    }
+}
+
+#[test]
+fn fifty_local_research_pages() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind research pages");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let n = stream.read(&mut buffer).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buffer[..n]);
+            let path = req
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/");
+            let id = path
+                .rsplit('/')
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .unwrap_or(0);
+            let body = format!(
+                "<!DOCTYPE html><html><head><title>Page {id}</title></head><body><p>research-{id}</p></body></html>"
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    let origin = format!("http://{address}");
+    let socket = std::env::temp_dir().join(format!("greppy-web-fifty-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let store = std::env::temp_dir().join(format!("greppy-store-fifty-{}", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_fifty", |command| {
+        command.env("GREPPY_STORE_DIR", &store);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_fifty",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for i in 0..50 {
+        let read = unix_request(
+            &socket,
+            &Request::new(
+                "run_fifty",
+                "web.read",
+                json!({
+                    "session_id": session_id,
+                    "url": format!("{origin}/p/{i}"),
+                }),
+            ),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("read {i}: {error}"));
+        assert_eq!(read.status, "ok", "read {i}: {read:?}");
+        let source = read.result.as_ref().unwrap()["source"].clone();
+        let title = source.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            title.contains(&format!("Page {i}"))
+                || source.to_string().contains(&format!("research-{i}")),
+            "page {i} missing identity: {source}"
+        );
+    }
 }

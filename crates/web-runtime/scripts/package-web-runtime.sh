@@ -32,13 +32,38 @@ fi
     sha256sum $bins > ../SHA256SUMS
   fi
 )
-cat > "$dest/sbom.json" <<JSON
-{"bomFormat":"CycloneDX","specVersion":"1.5","components":[
- {"type":"application","name":"web-runtime-supervisor"},
- {"type":"application","name":"web-controller-worker"},
- {"type":"application","name":"web-content-worker"}
-]}
-JSON
+python3 - "$dest" <<'PY'
+import hashlib, json, os, platform, sys, time
+dest = sys.argv[1]
+bins = ["web-runtime-supervisor", "web-controller-worker", "web-content-worker"]
+components = []
+for name in bins:
+    path = os.path.join(dest, "bin", name)
+    data = open(path, "rb").read()
+    digest = hashlib.sha256(data).hexdigest()
+    components.append({
+        "type": "application",
+        "name": name,
+        "hashes": [{"alg": "SHA-256", "content": digest}],
+        "size": len(data),
+    })
+sbom = {
+    "bomFormat": "CycloneDX",
+    "specVersion": "1.5",
+    "components": components,
+}
+open(os.path.join(dest, "sbom.json"), "w").write(json.dumps(sbom, indent=2) + "\n")
+prov = {
+    "predicateType": "https://slsa.dev/provenance/v1",
+    "buildType": "greppy.web-runtime.package.v1",
+    "platform": f"{platform.system()}-{platform.machine()}",
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "images": components,
+    "production_signed": False,
+    "note": "Local unsigned package. Production signatures require GREPPY_CODESIGN_IDENTITY; notarization requires GREPPY_NOTARY_PROFILE or Apple notary credentials.",
+}
+open(os.path.join(dest, "provenance.json"), "w").write(json.dumps(prov, indent=2) + "\n")
+PY
 cat > "$dest/README.txt" <<TXT
 Greppy web-runtime local distributable
 Contains three separately linked images. This archive is not signed.

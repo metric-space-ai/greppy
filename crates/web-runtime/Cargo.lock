@@ -8815,6 +8815,7 @@ dependencies = [
  "deno_error",
  "dpi",
  "greppy-web-client",
+ "libc",
  "png 0.17.16",
  "serde",
  "serde_json",

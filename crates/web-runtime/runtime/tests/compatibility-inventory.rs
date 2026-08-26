@@ -181,6 +181,14 @@ fn playwright_module_methods_are_not_silent_omissions() {
     claimed.push("Frame.evaluate".into());
     claimed.push("BrowserContext.cookies".into());
     claimed.push("BrowserContext.addCookies".into());
+    claimed.push("BrowserContext.close".into());
+    claimed.push("Dialog.accept".into());
+    claimed.push("Dialog.dismiss".into());
+    claimed.push("Dialog.message".into());
+    claimed.push("Dialog.type".into());
+    claimed.push("Dialog.defaultValue".into());
+    claimed.push("Page.close".into());
+    claimed.push("Page.waitForEvent".into());
 
     let missing: Vec<_> = claimed
         .iter()

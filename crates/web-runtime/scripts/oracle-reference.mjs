@@ -1,0 +1,63 @@
+import { pathToFileURL } from "node:url";
+import { writeFileSync } from "node:fs";
+
+const pw = process.env.PLAYWRIGHT_PACKAGE;
+if (!pw) {
+  throw new Error("PLAYWRIGHT_PACKAGE is required");
+}
+const mod = await import(pathToFileURL(`${pw}/index.mjs`).href);
+const { chromium } = mod;
+
+const executablePath =
+  process.env.GREPPY_ORACLE_CHROMIUM ||
+  `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
+
+const out = process.argv[2] || "oracle-reference.json";
+const browser = await chromium.launch({ executablePath, headless: true });
+
+const setPage = await browser.newPage();
+await setPage.setContent(
+  "<!DOCTYPE html><html><head><title>Oracle</title></head><body><p id='x'>ok</p></body></html>",
+);
+const title = await setPage.title();
+const value = await setPage.evaluate(() => 1 + 1);
+const text = (await setPage.locator("#x").innerText()).trim();
+await setPage.close();
+
+const dialogPage = await browser.newPage();
+let dialogMessage = null;
+let dialogType = null;
+dialogPage.on("dialog", async (dialog) => {
+  dialogType = dialog.type();
+  dialogMessage = dialog.message();
+  await dialog.accept();
+});
+const dialogValue = await dialogPage.evaluate(() => {
+  alert("native-hi");
+  return 42;
+});
+await dialogPage.close();
+
+const fillPage = await browser.newPage();
+await fillPage.setContent(
+  "<!DOCTYPE html><html><body><input id='q'><p id='out'></p></body></html>",
+);
+await fillPage.locator("#q").fill("ok");
+const filled = await fillPage.evaluate(() => document.querySelector("#q").value);
+await fillPage.close();
+
+await browser.close();
+const receipt = {
+  engine: "playwright@1.62.1+chromium-1234",
+  browserVersion: "151.0.7922.34",
+  title,
+  value,
+  text,
+  cases: {
+    setContent: { title, value, text },
+    dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
+    fill: { value: filled },
+  },
+};
+writeFileSync(out, JSON.stringify(receipt, null, 2) + "\n");
+console.log(JSON.stringify(receipt));

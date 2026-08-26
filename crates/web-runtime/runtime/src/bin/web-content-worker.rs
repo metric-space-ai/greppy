@@ -3,7 +3,7 @@ use serde_json::json;
 use servo::{
     CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue,
     LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
-    RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebResourceLoad,
+    RenderingContext, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, WebResourceLoad,
     WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use std::cell::RefCell;
@@ -40,6 +40,12 @@ struct RouteRule {
     body: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DialogAction {
+    Accept,
+    Dismiss,
+}
+
 struct Delegate {
     new_frame_ready: RefCell<bool>,
     routes: RefCell<Vec<RouteRule>>,
@@ -47,6 +53,9 @@ struct Delegate {
     requests: RefCell<Vec<serde_json::Value>>,
     downloads: RefCell<Vec<serde_json::Value>>,
     popups: RefCell<Vec<WebView>>,
+    last_dialogs: RefCell<Vec<serde_json::Value>>,
+    dialog_action: RefCell<DialogAction>,
+    prompt_text: RefCell<Option<String>>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
@@ -59,6 +68,9 @@ impl Delegate {
             requests: RefCell::new(Vec::new()),
             downloads: RefCell::new(Vec::new()),
             popups: RefCell::new(Vec::new()),
+            last_dialogs: RefCell::new(Vec::new()),
+            dialog_action: RefCell::new(DialogAction::Accept),
+            prompt_text: RefCell::new(None),
             rendering_context,
         }
     }
@@ -80,14 +92,49 @@ impl WebViewDelegate for Delegate {
     }
 
     fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
-        if let EmbedderControl::FilePicker(mut picker) = embedder_control {
-            let paths = self.file_paths.borrow().clone();
-            if paths.is_empty() {
-                picker.dismiss();
-            } else {
-                picker.select(&paths);
-                picker.submit();
+        match embedder_control {
+            EmbedderControl::FilePicker(mut picker) => {
+                let paths = self.file_paths.borrow().clone();
+                if paths.is_empty() {
+                    picker.dismiss();
+                } else {
+                    picker.select(&paths);
+                    picker.submit();
+                }
             }
+            EmbedderControl::SimpleDialog(dialog) => {
+                let kind = match &dialog {
+                    SimpleDialog::Alert(_) => "alert",
+                    SimpleDialog::Confirm(_) => "confirm",
+                    SimpleDialog::Prompt(_) => "prompt",
+                };
+                let default_value = match &dialog {
+                    SimpleDialog::Prompt(prompt_dialog) => prompt_dialog.current_value().to_owned(),
+                    _ => String::new(),
+                };
+                let action = *self.dialog_action.borrow();
+                let prompt = self.prompt_text.borrow().clone();
+                self.last_dialogs.borrow_mut().push(json!({
+                    "type": kind,
+                    "message": dialog.message(),
+                    "defaultValue": default_value,
+                    "action": match action {
+                        DialogAction::Accept => "accept",
+                        DialogAction::Dismiss => "dismiss",
+                    },
+                }));
+                match (action, dialog) {
+                    (DialogAction::Accept, SimpleDialog::Prompt(mut prompt_dialog)) => {
+                        if let Some(text) = prompt {
+                            prompt_dialog.set_current_value(&text);
+                        }
+                        prompt_dialog.confirm();
+                    }
+                    (DialogAction::Accept, other) => other.confirm(),
+                    (DialogAction::Dismiss, dialog) => dialog.dismiss(),
+                }
+            }
+            other => drop(other),
         }
     }
 
@@ -241,6 +288,89 @@ impl ContentEngine {
         result.map_err(|error| io::Error::other(format!("page JavaScript failed: {error:?}")))
     }
 
+    fn assign_pending_files(&self, page_id: &str, selector: &str) -> io::Result<serde_json::Value> {
+        let paths = self.page(page_id)?.1.file_paths.borrow().clone();
+        if paths.is_empty() {
+            return Ok(json!({ "dom_files": 0, "changed": 0, "skipped": true }));
+        }
+        let mut payloads = Vec::new();
+        for path in &paths {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(json!({
+                        "dom_files": 0,
+                        "changed": 0,
+                        "error": format!("cannot read {}: {error}", path.display()),
+                    }));
+                }
+            };
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("upload.bin")
+                .to_owned();
+            payloads.push(json!({
+                "name": name,
+                "type": "application/octet-stream",
+                "b64": base64_encode(&bytes),
+            }));
+        }
+        let (webview, _) = self.page(page_id)?.clone();
+        let selector_json = serde_json::to_string(&selector).map_err(io::Error::other)?;
+        let files_json = serde_json::to_string(&payloads).map_err(io::Error::other)?;
+        let script = format!(
+            r#"(function(selector, files) {{
+  var input = document.querySelector(selector);
+  if (!input) return {{ dom_files: 0, changed: 0, error: "no input" }};
+  try {{
+    if (typeof DataTransfer === "undefined" || typeof File === "undefined") {{
+      return {{
+        dom_files: 0,
+        changed: 0,
+        error: "Servo 0.5.0 page JS has no DataTransfer/File constructors; HTMLInputElement.files cannot be assigned without FilePicker"
+      }};
+    }}
+    var dt = new DataTransfer();
+    files.forEach(function(file) {{
+      var raw = atob(file.b64);
+      var buf = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream" }}));
+    }});
+    input.files = dt.files;
+    var changed = 0;
+    var onChange = function() {{ changed += 1; }};
+    input.addEventListener("input", onChange);
+    input.addEventListener("change", onChange);
+    input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    input.removeEventListener("input", onChange);
+    input.removeEventListener("change", onChange);
+    return {{
+      dom_files: input.files ? input.files.length : 0,
+      changed: changed,
+      name: input.files && input.files[0] ? input.files[0].name : ""
+    }};
+  }} catch (error) {{
+    return {{
+      dom_files: 0,
+      changed: 0,
+      error: String(error)
+    }};
+  }}
+}})({selector_json}, {files_json})"#
+        );
+        match self.evaluate(webview, &script) {
+            Ok(value) => Ok(jsvalue_to_json(value)),
+            Err(error) => Ok(json!({
+                "dom_files": 0,
+                "changed": 0,
+                "error": error.to_string(),
+            })),
+        }
+    }
+
     fn handle(&mut self, method: &str, params: serde_json::Value) -> io::Result<serde_json::Value> {
         match method {
             "chromium.launch" => {
@@ -313,6 +443,13 @@ impl ContentEngine {
                     resolved.height,
                 );
                 self.servo.spin_event_loop();
+                if let Some(selector) = params
+                    .get("selector")
+                    .and_then(|value| value.get("value"))
+                    .and_then(|value| value.as_str())
+                {
+                    let _ = self.assign_pending_files(&page_id, selector);
+                }
                 Ok(json!({}))
             }
             "locator.fill" => {
@@ -527,7 +664,7 @@ impl ContentEngine {
                 let text = required_str(&params, "text")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let source = format!(
-                    "(function(text) {{ var el = document.activeElement || document.body; if (el && el.value !== undefined) {{ el.value = (el.value || ) + text; }} return true; }})({})",
+                    "(function(text) {{ var el = document.activeElement || document.body; if (el && 'value' in el) {{ el.value = String(el.value || '') + text; }} return true; }})({})",
                     serde_json::to_string(&text).map_err(io::Error::other)?
                 );
                 self.evaluate(webview, &source)?;
@@ -538,13 +675,51 @@ impl ContentEngine {
                 let key = required_str(&params, "key")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let source = format!(
-                    "(function(key) {{ const el = document.activeElement || document.body; el.dispatchEvent(new KeyboardEvent(keydown, {{ key, bubbles: true }})); el.dispatchEvent(new KeyboardEvent(keyup, {{ key, bubbles: true }})); return true; }})({})",
+                    "(function(key) {{ const el = document.activeElement || document.body; el.dispatchEvent(new KeyboardEvent('keydown', {{ key: key, bubbles: true }})); el.dispatchEvent(new KeyboardEvent('keyup', {{ key: key, bubbles: true }})); return true; }})({})",
                     serde_json::to_string(&key).map_err(io::Error::other)?
                 );
                 self.evaluate(webview.clone(), &source)?;
                 Ok(json!({}))
             }
-            "page.setDialogPolicy" => Ok(json!({})),
+            "page.setDialogPolicy" => {
+                let page_id = required_str(&params, "page")?;
+                let action = params
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("accept");
+                let delegate = &self.page(&page_id)?.1;
+                *delegate.dialog_action.borrow_mut() = if action == "dismiss" {
+                    DialogAction::Dismiss
+                } else {
+                    DialogAction::Accept
+                };
+                delegate.prompt_text.replace(
+                    params
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                );
+                Ok(json!({}))
+            }
+            "page.dialogs" => {
+                let page_id = required_str(&params, "page")?;
+                let consume = params
+                    .get("consume")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let dialogs = if consume {
+                    self.page(&page_id)?
+                        .1
+                        .last_dialogs
+                        .borrow_mut()
+                        .drain(..)
+                        .collect::<Vec<_>>()
+                } else {
+                    self.page(&page_id)?.1.last_dialogs.borrow().clone()
+                };
+                Ok(json!({ "dialogs": dialogs }))
+            }
+            "context.close" => Ok(json!({})),
             "page.addRoute" => {
                 let page_id = required_str(&params, "page")?;
                 let pattern = required_str(&params, "pattern")?;
@@ -582,79 +757,16 @@ impl ContentEngine {
                     .iter()
                     .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
                     .collect();
-                let mut payloads = Vec::new();
                 for path in &paths {
-                    let bytes = std::fs::read(path).map_err(|error| {
+                    std::fs::read(path).map_err(|error| {
                         io::Error::new(
                             error.kind(),
                             format!("setInputFiles cannot read {}: {error}", path.display()),
                         )
                     })?;
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("upload.bin")
-                        .to_owned();
-                    payloads.push(json!({
-                        "name": name,
-                        "type": "application/octet-stream",
-                        "b64": base64_encode(&bytes),
-                    }));
                 }
                 self.page(&page_id)?.1.file_paths.replace(paths);
-                let (webview, _) = self.page(&page_id)?.clone();
-                let selector_json = serde_json::to_string(&selector).map_err(io::Error::other)?;
-                let files_json = serde_json::to_string(&payloads).map_err(io::Error::other)?;
-                let script = format!(
-                    r#"(function(selector, files) {{
-  var input = document.querySelector(selector);
-  if (!input) return {{ dom_files: 0, changed: 0, error: "no input" }};
-  try {{
-    if (typeof DataTransfer === "undefined" || typeof File === "undefined") {{
-      return {{
-        dom_files: 0,
-        changed: 0,
-        error: "Servo 0.5.0 page JS has no DataTransfer/File constructors; HTMLInputElement.files cannot be assigned without FilePicker"
-      }};
-    }}
-    var dt = new DataTransfer();
-    files.forEach(function(file) {{
-      var raw = atob(file.b64);
-      var buf = new Uint8Array(raw.length);
-      for (var i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream" }}));
-    }});
-    input.files = dt.files;
-    var changed = 0;
-    var onChange = function() {{ changed += 1; }};
-    input.addEventListener("input", onChange);
-    input.addEventListener("change", onChange);
-    input.dispatchEvent(new Event("input", {{ bubbles: true }}));
-    input.dispatchEvent(new Event("change", {{ bubbles: true }}));
-    input.removeEventListener("input", onChange);
-    input.removeEventListener("change", onChange);
-    return {{
-      dom_files: input.files ? input.files.length : 0,
-      changed: changed,
-      name: input.files && input.files[0] ? input.files[0].name : ""
-    }};
-  }} catch (error) {{
-    return {{
-      dom_files: 0,
-      changed: 0,
-      error: String(error)
-    }};
-  }}
-}})({selector_json}, {files_json})"#
-                );
-                match self.evaluate(webview, &script) {
-                    Ok(value) => Ok(jsvalue_to_json(value)),
-                    Err(error) => Ok(json!({
-                        "dom_files": 0,
-                        "changed": 0,
-                        "error": error.to_string(),
-                    })),
-                }
+                self.assign_pending_files(&page_id, &selector)
             }
             "page.requests" => {
                 let page_id = required_str(&params, "page")?;
@@ -1107,8 +1219,30 @@ fn is_parent_eof(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(unix)]
+fn steal_protocol_stdout() -> io::Result<std::fs::File> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let protocol = std::io::stdout().as_fd().try_clone_to_owned()?;
+    let err = std::io::stderr().as_raw_fd();
+    let rc = unsafe { libc::dup2(err, libc::STDOUT_FILENO) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std::fs::File::from(protocol))
+}
+
+#[cfg(not(unix))]
+fn steal_protocol_stdout() -> io::Result<std::fs::File> {
+    // Best-effort: keep stdout as the protocol stream on non-Unix.
+    use std::os::fd::AsFd;
+    Ok(std::fs::File::from(
+        std::io::stdout().as_fd().try_clone_to_owned()?,
+    ))
+}
+
 fn main() -> io::Result<()> {
     let _capability = require_capability(std::env::args_os().skip(1))?;
+    let mut protocol_out = steal_protocol_stdout()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
     let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
     let stdin = io::stdin();
@@ -1126,7 +1260,7 @@ fn main() -> io::Result<()> {
         }
     }
     drop(stdin);
-    write_message(&mut io::stdout(), &Message::ready(WorkerKind::Content))?;
+    write_message(&mut protocol_out, &Message::ready(WorkerKind::Content))?;
 
     let (tx, rx) = mpsc::channel();
     let parent_for_reader = Arc::clone(&parent_alive);
@@ -1188,12 +1322,12 @@ fn main() -> io::Result<()> {
                     ),
                 };
                 engine.wake.store(true, Ordering::Relaxed);
-                write_message(&mut io::stdout(), &reply)?;
+                write_message(&mut protocol_out, &reply)?;
             }
             Ok(Ok(Message::Shutdown { .. })) => {
                 drop(engine);
                 write_message(
-                    &mut io::stdout(),
+                    &mut protocol_out,
                     &Message::shutdown_ack(WorkerKind::Content),
                 )?;
                 return Ok(());

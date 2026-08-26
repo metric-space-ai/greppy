@@ -201,9 +201,14 @@ impl Daemon {
                 "last_crash": self.last_crash.clone(),
                 "engines_linked_into_greppy_parent": false,
                 "signed_distributable": false,
-                "oracle_receipt": "contracts/web-runtime/receipts/oracle-skip.json",
+                "oracle_receipt": "contracts/web-runtime/receipts/oracle-setcontent.json",
+                "oracle_receipts": [
+                    "contracts/web-runtime/receipts/oracle-setcontent.json",
+                    "contracts/web-runtime/receipts/oracle-dialog.json",
+                    "contracts/web-runtime/receipts/oracle-fill.json"
+                ],
                 "inventory_entries": 1354,
-                "compatibility_coverage_level_note": "schema implemented is not Chromium oracle behavior",
+                "compatibility_coverage_level_note": "schema implemented is not Chromium oracle behavior; oracle receipts are scoped cases only",
             }),
         )
     }

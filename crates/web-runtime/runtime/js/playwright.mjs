@@ -29,6 +29,27 @@ function withUnsupported(target, prefix) {
   });
 }
 
+function decodeBase64(binary) {
+  if (typeof atob === "function") {
+    return Uint8Array.from(atob(binary), (c) => c.charCodeAt(0));
+  }
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = String(binary).replace(/[^A-Za-z0-9+/]/g, "");
+  const out = [];
+  for (let i = 0; i < clean.length; i += 4) {
+    const a = alphabet.indexOf(clean[i] || "A");
+    const b = alphabet.indexOf(clean[i + 1] || "A");
+    const c = alphabet.indexOf(clean[i + 2] || "A");
+    const d = alphabet.indexOf(clean[i + 3] || "A");
+    const n = (a << 18) | (b << 12) | (c << 6) | d;
+    out.push((n >> 16) & 255);
+    if (clean[i + 2] && clean[i + 2] !== "=") out.push((n >> 8) & 255);
+    if (clean[i + 3] && clean[i + 3] !== "=") out.push(n & 255);
+  }
+  return Uint8Array.from(out);
+}
+
 function serializeEvaluate(pageFunction, arg) {
   if (typeof pageFunction === "function") {
     const source = pageFunction.toString();
@@ -38,6 +59,44 @@ function serializeEvaluate(pageFunction, arg) {
     return `(${source})(${JSON.stringify(arg)})`;
   }
   return String(pageFunction);
+}
+
+class Dialog {
+  constructor(page, record) {
+    this._page = page;
+    this._record = record || { type: "alert", message: "", defaultValue: "" };
+  }
+
+  type() {
+    return this._record.type || "alert";
+  }
+
+  message() {
+    return this._record.message || "";
+  }
+
+  defaultValue() {
+    return this._record.defaultValue || "";
+  }
+
+  page() {
+    return this._page;
+  }
+
+  async accept(prompt) {
+    return engineCall("page.setDialogPolicy", {
+      page: this._page._id,
+      action: "accept",
+      prompt: prompt ?? null,
+    });
+  }
+
+  async dismiss() {
+    return engineCall("page.setDialogPolicy", {
+      page: this._page._id,
+      action: "dismiss",
+    });
+  }
 }
 
 class Locator {
@@ -244,8 +303,7 @@ class Page {
     }
     const result = await engineCall("page.screenshot", { page: this._id });
     const binary = result.png_base64 || "";
-    const bytes = Uint8Array.from(atob(binary), (c) => c.charCodeAt(0));
-    return bytes.buffer;
+    return decodeBase64(binary).buffer;
   }
 
   async setContent(html) {
@@ -296,7 +354,19 @@ class Page {
     return engineCall("page.goForward", { page: this._id });
   }
 
+  async close() {
+    await engineCall("page.close", { page: this._id });
+  }
+
   async waitForEvent(event) {
+    if (event === "dialog") {
+      const result = await engineCall("page.dialogs", { page: this._id, consume: true });
+      const rec = (result.dialogs || [])[0];
+      if (!rec) {
+        return unsupported("Page.waitForEvent.dialog.empty")();
+      }
+      return new Dialog(this, rec);
+    }
     if (event === "popup" || event === "page") {
       const result = await engineCall("page.popups", { page: this._id });
       const id = (result.pages || [])[0];
@@ -323,19 +393,8 @@ class Page {
 
   on(event, handler) {
     if (event === "dialog") {
-      const dialog = {
-        type: () => "alert",
-        message: () => "",
-        defaultValue: () => "",
-        accept: (prompt) =>
-          engineCall("page.setDialogPolicy", {
-            page: this._id,
-            action: "accept",
-            prompt: prompt ?? null,
-          }),
-        dismiss: () =>
-          engineCall("page.setDialogPolicy", { page: this._id, action: "dismiss" }),
-      };
+      this._dialogHandler = handler;
+      const dialog = new Dialog(this, { type: "alert", message: "", defaultValue: "" });
       const result = handler(dialog);
       if (result && typeof result.then === "function") {
         result.catch(() => {});
@@ -424,6 +483,10 @@ class BrowserContext {
 
   async storageState() {
     return { cookies: await this.cookies(), origins: [] };
+  }
+
+  async close() {
+    await engineCall("context.close", { context: this._id });
   }
 }
 

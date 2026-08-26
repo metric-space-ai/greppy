@@ -1,0 +1,12 @@
+{
+  "reference": {
+    "value": "ok"
+  },
+  "candidate": {
+    "engine": "greppy-web-runtime+servo-0.5.0",
+    "status": "ok",
+    "value": "ok"
+  },
+  "match": true,
+  "scope": "locator.fill of a text input value only"
+}

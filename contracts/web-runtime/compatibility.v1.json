@@ -12,7 +12,8 @@
     "Electron, Android, and nested option-object members may also be incomplete in the original parser output.",
     "The original parser attached some nested option fields to parent types (for example Page.trial, Page.waitUntil, Browser.viewport). Those rows are preserved as parser output and are not treated as proof that the parent object has those fields.",
     "EventEmitter overloads (on/once/off and related) are represented as events plus Page.addListener-style methods where the parser emitted them; types.d.ts recovery does not re-emit every overload.",
-    "Type-level inventory is necessary but not sufficient for compatibility. Schema presence does not imply source or behavior compatibility."
+    "Type-level inventory is necessary but not sufficient for compatibility. Schema presence does not imply source or behavior compatibility.",
+    "Oracle receipts exist only for scoped cases (setContent title/evaluate/innerText, native alert type/message, locator.fill). behavior:passing is those cases, not the 1,354-row Playwright surface."
   ],
   "status_vocabulary": {
     "unverified": "The symbol is inventoried for the javascript-library/chromium surface, but Phase 0 has no implementation and no executed test.",
@@ -38,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 60,
+    "implemented": 67,
     "unsupported": 243,
-    "unverified": 1051
+    "unverified": 1044
   },
   "entries": [
     {
@@ -167,11 +168,15 @@
       "symbol": "Page.close",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "keyboard"
+      ],
+      "known_differences": [
+        "drops the Servo WebView from the content worker; not Chromium target close"
+      ]
     },
     {
       "symbol": "Page.consoleMessages",
@@ -191,7 +196,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "session-daemon"
+        "session-daemon",
+        "title-url"
       ],
       "known_differences": []
     },
@@ -251,12 +257,18 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "phase1-spike",
-        "compat-core"
+        "compat-core",
+        "native-dialog",
+        "oracle-setcontent",
+        "evaluate-arg"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle-setcontent.json covers numeric evaluate 1+1 only",
+        "native alert/confirm/prompt complete because SimpleDialog is auto-handled in the content worker after stdout is diverted off the protocol pipe"
+      ]
     },
     {
       "symbol": "Page.evaluateHandle",
@@ -316,7 +328,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "frames"
       ],
       "known_differences": [
         "selects by name or url substring"
@@ -340,7 +353,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "frames"
       ],
       "known_differences": [
         "same-origin iframes via querySelectorAll"
@@ -439,9 +453,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "goback"
+      ],
       "known_differences": [
         "Servo WebView::go_back"
       ]
@@ -636,10 +652,15 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "native-dialog"
       ],
       "known_differences": [
-        "dialog handler is a policy probe; request/download/popup listeners are stored but not dispatched as Playwright events"
+        "dialog handler is a policy probe; request/download/popup listeners are stored but not dispatched as Playwright events",
+        "native alert is auto-accepted after diverting Servo ALERT stdout off the protocol pipe",
+        "dialog handler is a policy probe invoked before the native dialog; Chromium invokes it during the dialog with the live Dialog object",
+        "native alert/confirm/prompt are auto-accepted or dismissed according to that probe after diverting Servo ALERT stdout off the protocol pipe",
+        "request/download/popup listeners are stored but not dispatched as Playwright events"
       ]
     },
     {
@@ -729,9 +750,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "reload"
+      ],
       "known_differences": [
         "reload re-navigates the current URL; options are unsupported"
       ]
@@ -830,7 +853,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "session-daemon"
+        "session-daemon",
+        "screenshot"
       ],
       "known_differences": [
         "options are unsupported; returns PNG bytes"
@@ -862,11 +886,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "oracle-setcontent"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle-setcontent.json covers setContent of a static HTML document only"
+      ]
     },
     {
       "symbol": "Page.setDefaultNavigationTimeout",
@@ -951,11 +978,15 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "session-daemon"
+        "session-daemon",
+        "oracle-setcontent",
+        "title-url"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle-setcontent.json covers document.title after setContent only"
+      ]
     },
     {
       "symbol": "Page.uncheck",
@@ -1024,11 +1055,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "native-dialog"
+      ],
       "known_differences": [
-        "popup drains auxiliary WebViews; download returns last intercept record"
+        "popup drains auxiliary WebViews; download returns last intercept record",
+        "dialog waitForEvent consumes retained SimpleDialog records after evaluate; Chromium requires waiting before the alert"
       ]
     },
     {
@@ -1090,9 +1124,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "wait-selector"
+      ],
       "known_differences": [
         "implemented as locator(selector).waitFor(); no state/timeout options"
       ]
@@ -2927,7 +2963,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "cookies"
       ],
       "known_differences": [
         "assigns document.cookie"
@@ -2997,11 +3034,15 @@
       "symbol": "BrowserContext.close",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "cookies"
+      ],
+      "known_differences": [
+        "engine no-op besides acknowledging close; pages are not torn down independently of Browser.close"
+      ]
     },
     {
       "symbol": "BrowserContext.cookies",
@@ -3011,7 +3052,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "cookies"
       ],
       "known_differences": [
         "document.cookie on last page"
@@ -3713,7 +3755,8 @@
       "behavior": "unverified",
       "tests": [
         "phase1-spike",
-        "compat-core"
+        "compat-core",
+        "launch-close"
       ],
       "known_differences": []
     },
@@ -5354,7 +5397,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "check-select"
       ],
       "known_differences": [
         "sets input.checked; no actionability beyond waitFor"
@@ -5378,7 +5422,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "phase1-spike"
+        "phase1-spike",
+        "hover"
       ],
       "known_differences": [
         "options are unsupported"
@@ -5403,7 +5448,8 @@
       "behavior": "unverified",
       "tests": [
         "compat-core",
-        "session-daemon"
+        "session-daemon",
+        "locator-count"
       ],
       "known_differences": []
     },
@@ -5523,13 +5569,15 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "phase1-spike",
-        "compat-core"
+        "compat-core",
+        "oracle-fill"
       ],
       "known_differences": [
-        "options are unsupported"
+        "options are unsupported",
+        "oracle-fill.json covers assigning input.value via locator.fill; options are unsupported"
       ]
     },
     {
@@ -5682,7 +5730,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "hover"
       ],
       "known_differences": [
         "mousemove to box center; no pointer-event guarantees"
@@ -5704,11 +5753,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "phase1-spike"
+        "phase1-spike",
+        "oracle-setcontent"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle-setcontent.json covers #x innerText after setContent only"
+      ]
     },
     {
       "symbol": "Locator.inputValue",
@@ -5819,9 +5871,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "locator-count"
+      ],
       "known_differences": [
         "nth is applied in the selector runtime; first() uses nth=0"
       ]
@@ -5894,7 +5948,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "check-select"
       ],
       "known_differences": [
         "assigns select.value; no label/index matching"
@@ -5974,9 +6029,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "check-select"
+      ],
       "known_differences": [
         "clears input.checked"
       ]
@@ -8257,41 +8314,57 @@
       "symbol": "Dialog.accept",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "sets the next SimpleDialog policy; does not accept an already-shown Chromium-style live dialog object"
+      ]
     },
     {
       "symbol": "Dialog.defaultValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "prompt default is Servo PromptDialog.current_value at show_embedder_control time"
+      ]
     },
     {
       "symbol": "Dialog.dismiss",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "sets the next SimpleDialog policy"
+      ]
     },
     {
       "symbol": "Dialog.message",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "reads retained SimpleDialog.message after evaluate via waitForEvent(dialog)"
+      ]
     },
     {
       "symbol": "Dialog.page",
@@ -13140,9 +13213,11 @@
       "kind": "property",
       "origin": "types.d.ts recovery",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "keyboard"
+      ],
       "known_differences": [
         "keyboard object exists; type/press are DOM-level, not OS input"
       ]
@@ -13422,11 +13497,15 @@
       "symbol": "Dialog.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "reads retained SimpleDialog kind after evaluate via waitForEvent(dialog)"
+      ]
     },
     {
       "symbol": "Keyboard.type",
@@ -14273,5 +14352,10 @@
       "tests": [],
       "known_differences": []
     }
-  ]
+  ],
+  "behavior_counts": {
+    "unverified": 1106,
+    "passing": 5,
+    "unsupported": 243
+  }
 }

@@ -1,0 +1,20 @@
+{
+  "reference": {
+    "value": 42,
+    "type": "alert",
+    "message": "native-hi"
+  },
+  "candidate": {
+    "engine": "greppy-web-runtime+servo-0.5.0",
+    "status": "ok",
+    "value": 42,
+    "message": "native-hi",
+    "type": "alert"
+  },
+  "match": true,
+  "scope": "alert evaluate return + dialog type/message; confirm/prompt are candidate-only",
+  "known_differences": [
+    "Chromium invokes page.on(dialog) during the alert with the live Dialog object",
+    "candidate page.on(dialog) is a policy probe; waitForEvent(dialog) reads retained SimpleDialog records after evaluate"
+  ]
+}
