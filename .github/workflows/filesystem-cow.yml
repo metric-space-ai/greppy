@@ -52,17 +52,23 @@ jobs:
       - name: Compile shared provider binary surface
         run: cargo check -p greppy-workspace-provider --locked
 
-      - name: Build FSKit Rust static library
+      - name: Build and validate macOS 15.4 FSKit application bundle
         if: runner.os == 'macOS'
         run: |
-          cargo build -p greppy-workspace-ffi --release --locked
-          swiftc -typecheck \
-            -I crates/workspace-ffi/include \
-            platform/macos/GreppyWorkspaceFS/RustWorkspaceCore.swift
+          platform/macos/build-fskit-app.sh "$RUNNER_TEMP/greppy-fskit"
+          test -x "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app/Contents/MacOS/GreppyWorkspaceFS"
+          test -x "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex/Contents/MacOS/GreppyWorkspaceFSExtension"
+          codesign --verify --deep --strict "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app"
+          plutil -lint \
+            platform/macos/GreppyWorkspaceApp/Info.plist \
+            platform/macos/GreppyWorkspaceFS/Info.plist \
+            platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.entitlements \
+            platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements
 
   linux-fuse3:
     name: Linux FUSE3 provider
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -84,7 +90,7 @@ jobs:
       - name: Mount and exercise Chunk-CoW plus private Git namespace
         env:
           GREPPY_RUN_FUSE_TEST: "1"
-        run: cargo test -p greppy-workspace-provider --test linux_mount --locked -- --nocapture
+        run: timeout 300s cargo test -p greppy-workspace-provider --test linux_mount --locked -- --nocapture
 
       - name: Reject legacy native backend source and dependencies
         shell: bash

@@ -89,7 +89,7 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
 }
 
 #[cfg(target_os = "macos")]
-fn start_platform_adapter(data_root: &Path, _mount_root: &Path) -> Result<(), String> {
+fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
     let app = sibling(&current, "GreppyWorkspaceFS.app")?;
@@ -104,12 +104,90 @@ fn start_platform_adapter(data_root: &Path, _mount_root: &Path) -> Result<(), St
             app.display()
         ));
     }
+    let device = attach_fskit_anchor(data_root)?;
+    let mount = Command::new("/sbin/mount")
+        .arg("-t")
+        .arg("greppy-cow")
+        .arg(&device)
+        .arg(mount_root)
+        .status()
+        .map_err(|error| format!("cannot invoke macOS mount for Greppy FSKit: {error}"))?;
+    if mount.success() {
+        fs::write(
+            data_root.join("fskit-device"),
+            format!("{}\n", device.display()),
+        )
+        .map_err(|error| format!("cannot record FSKit anchor device: {error}"))?;
+        let _ = fs::remove_file(data_root.join("activation-required"));
+        return Ok(());
+    }
+    let _ = Command::new("/usr/bin/hdiutil")
+        .arg("detach")
+        .arg(&device)
+        .status();
     fs::write(data_root.join("activation-required"), b"fskit\n")
         .map_err(|error| format!("cannot record FSKit activation state: {error}"))?;
+    let _ = Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
+        .status();
     Err(
-        "FSKit activation is not complete; enable Greppy Workspace FS in System Settings > General > Login Items & Extensions, then run `greppy workspace setup` again"
+        "macOS did not mount Greppy Workspace FS; enable it once in System Settings > General > Login Items & Extensions > File System Extensions, then rerun `greppy workspace setup`"
             .into(),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn attach_fskit_anchor(data_root: &Path) -> Result<PathBuf, String> {
+    let anchor = data_root.join("fskit-anchor.sparseimage");
+    if !anchor.is_file() {
+        let output_base = data_root.join("fskit-anchor");
+        let created = Command::new("/usr/bin/hdiutil")
+            .arg("create")
+            .arg("-size")
+            .arg("8m")
+            .arg("-layout")
+            .arg("NONE")
+            .arg("-type")
+            .arg("SPARSE")
+            .arg(&output_base)
+            .output()
+            .map_err(|error| format!("cannot create FSKit anchor image: {error}"))?;
+        if !created.status.success() || !anchor.is_file() {
+            return Err(format!(
+                "macOS failed to create the private FSKit anchor image: {}",
+                String::from_utf8_lossy(&created.stderr).trim()
+            ));
+        }
+    }
+    let attached = Command::new("/usr/bin/hdiutil")
+        .arg("attach")
+        .arg("-nomount")
+        .arg("-nobrowse")
+        .arg("-noverify")
+        .arg(&anchor)
+        .output()
+        .map_err(|error| format!("cannot attach FSKit anchor image: {error}"))?;
+    if !attached.status.success() {
+        return Err(format!(
+            "macOS failed to attach the private FSKit anchor image: {}",
+            String::from_utf8_lossy(&attached.stderr).trim()
+        ));
+    }
+    parse_hdiutil_device(&String::from_utf8_lossy(&attached.stdout)).ok_or_else(|| {
+        format!(
+            "hdiutil attached the FSKit anchor without reporting a device: {}",
+            String::from_utf8_lossy(&attached.stdout).trim()
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_hdiutil_device(output: &str) -> Option<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|value| value.starts_with("/dev/disk"))
+        .map(PathBuf::from)
 }
 
 #[cfg(target_os = "windows")]
@@ -201,5 +279,15 @@ mod tests {
             sibling(Path::new("/opt/greppy/bin/greppy"), "provider").unwrap(),
             Path::new("/opt/greppy/bin/provider")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_hdiutil_anchor_device_without_localized_columns() {
+        assert_eq!(
+            parse_hdiutil_device("/dev/disk9\tApple_partition_scheme\n"),
+            Some(PathBuf::from("/dev/disk9"))
+        );
+        assert_eq!(parse_hdiutil_device("hdiutil: no device\n"), None);
     }
 }

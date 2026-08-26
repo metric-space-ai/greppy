@@ -766,7 +766,9 @@ pub fn workspace_data_root() -> Result<PathBuf, WorkspaceError> {
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(home_dir()?.join("Library/Application Support/greppy/workspace"));
+        return Ok(
+            home_dir()?.join("Library/Group Containers/group.ai.metricspace.greppy/workspace")
+        );
     }
     #[cfg(target_os = "windows")]
     {

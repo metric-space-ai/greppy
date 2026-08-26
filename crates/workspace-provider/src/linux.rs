@@ -677,8 +677,11 @@ impl Filesystem for PortableFuse {
             });
         match result {
             Ok(()) => {
+                // The kernel cannot process a notification that invalidates the
+                // dentry for the rename request it is still waiting to finish.
+                // Complete the request first, then evict both cached names.
+                reply.ok();
                 self.invalidate_rename(parent, name, new_parent, new_name);
-                reply.ok()
             }
             Err(error) => reply.error(error),
         }

@@ -28,6 +28,35 @@ struct RustWorkspaceMetadata {
     let changedNanoseconds: Int64
 }
 
+struct RustWorkspaceDirectoryEntry: Decodable {
+    let name: String
+    let metadata: RustWorkspaceDirectoryMetadata
+}
+
+struct RustWorkspaceDirectoryMetadata: Decodable {
+    enum Kind: String, Decodable {
+        case file = "File"
+        case directory = "Directory"
+        case symbolicLink = "Symlink"
+    }
+
+    let kind: Kind
+    let mode: UInt32
+    let size: UInt64
+    let inode: UInt64
+    let nlink: UInt32
+    let accessedUnixNanoseconds: Int64
+    let modifiedUnixNanoseconds: Int64
+    let changedUnixNanoseconds: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case kind, mode, size, inode, nlink
+        case accessedUnixNanoseconds = "accessed_unix_ns"
+        case modifiedUnixNanoseconds = "modified_unix_ns"
+        case changedUnixNanoseconds = "changed_unix_ns"
+    }
+}
+
 final class RustWorkspaceCore {
     private let raw: OpaquePointer
 
@@ -112,12 +141,138 @@ final class RustWorkspaceCore {
         return Data(String(cString: value).utf8)
     }
 
+    func directory(workspace: String, path: String) throws -> [RustWorkspaceDirectoryEntry] {
+        try JSONDecoder().decode(
+            [RustWorkspaceDirectoryEntry].self,
+            from: directoryJSON(workspace: workspace, path: path)
+        )
+    }
+
+    func readSymbolicLink(workspace: String, path: String) throws -> Data {
+        var capacity = 256
+        while capacity <= 1_048_576 {
+            var bytes = [UInt8](repeating: 0, count: capacity)
+            let count = workspace.withCString { workspacePointer in
+                path.withCString { pathPointer in
+                    bytes.withUnsafeMutableBufferPointer { buffer in
+                        greppy_workspace_read_symlink(
+                            raw, workspacePointer, pathPointer, buffer.baseAddress, buffer.count
+                        )
+                    }
+                }
+            }
+            guard count >= 0 else { throw Self.lastError() }
+            if count <= capacity { return Data(bytes.prefix(Int(count))) }
+            capacity = Int(count)
+        }
+        throw RustWorkspaceError.operation("symbolic-link target exceeds 1 MiB")
+    }
+
+    func truncate(workspace: String, path: String, size: UInt64) throws {
+        try check(workspace: workspace, path: path) { workspacePointer, pathPointer in
+            greppy_workspace_truncate(raw, workspacePointer, pathPointer, size)
+        }
+    }
+
+    func setMetadata(
+        workspace: String,
+        path: String,
+        valid: UInt32,
+        mode: UInt32,
+        accessedNanoseconds: Int64,
+        modifiedNanoseconds: Int64
+    ) throws {
+        try check(workspace: workspace, path: path) { workspacePointer, pathPointer in
+            greppy_workspace_set_metadata(
+                raw,
+                workspacePointer,
+                pathPointer,
+                valid,
+                mode,
+                accessedNanoseconds,
+                modifiedNanoseconds
+            )
+        }
+    }
+
+    func createFile(workspace: String, path: String, mode: UInt32) throws {
+        try check(workspace: workspace, path: path) { workspacePointer, pathPointer in
+            greppy_workspace_create_file(raw, workspacePointer, pathPointer, mode)
+        }
+    }
+
+    func createDirectory(workspace: String, path: String, mode: UInt32) throws {
+        try check(workspace: workspace, path: path) { workspacePointer, pathPointer in
+            greppy_workspace_mkdir(raw, workspacePointer, pathPointer, mode)
+        }
+    }
+
+    func unlink(workspace: String, path: String) throws {
+        try check(workspace: workspace, path: path) { workspacePointer, pathPointer in
+            greppy_workspace_unlink(raw, workspacePointer, pathPointer)
+        }
+    }
+
+    func rename(workspace: String, source: String, destination: String) throws {
+        let result = workspace.withCString { workspacePointer in
+            source.withCString { sourcePointer in
+                destination.withCString { destinationPointer in
+                    greppy_workspace_rename(raw, workspacePointer, sourcePointer, destinationPointer)
+                }
+            }
+        }
+        guard result == 0 else { throw Self.lastError() }
+    }
+
+    func hardLink(workspace: String, source: String, destination: String) throws {
+        let result = workspace.withCString { workspacePointer in
+            source.withCString { sourcePointer in
+                destination.withCString { destinationPointer in
+                    greppy_workspace_hard_link(raw, workspacePointer, sourcePointer, destinationPointer)
+                }
+            }
+        }
+        guard result == 0 else { throw Self.lastError() }
+    }
+
+    func symbolicLink(workspace: String, path: String, target: Data) throws {
+        let result = workspace.withCString { workspacePointer in
+            path.withCString { pathPointer in
+                target.withUnsafeBytes { bytes in
+                    greppy_workspace_symlink(
+                        raw,
+                        workspacePointer,
+                        pathPointer,
+                        bytes.bindMemory(to: UInt8.self).baseAddress,
+                        bytes.count
+                    )
+                }
+            }
+        }
+        guard result == 0 else { throw Self.lastError() }
+    }
+
     func workspacesJSON() throws -> Data {
         guard let value = greppy_workspace_list_workspaces_json(raw) else {
             throw Self.lastError()
         }
         defer { greppy_workspace_string_free(value) }
         return Data(String(cString: value).utf8)
+    }
+
+    func workspaces() throws -> [String] {
+        try JSONDecoder().decode([String].self, from: workspacesJSON())
+    }
+
+    private func check(
+        workspace: String,
+        path: String,
+        operation: (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
+    ) throws {
+        let result = workspace.withCString { workspacePointer in
+            path.withCString { pathPointer in operation(workspacePointer, pathPointer) }
+        }
+        guard result == 0 else { throw Self.lastError() }
     }
 
     private static func lastError() -> RustWorkspaceError {
