@@ -104,19 +104,27 @@ static int greppy_mkdir(const char *path, fuse_mode_t mode)
     return greppy_windows_create(greppy_context(), path, mode, 1);
 }
 
+static int greppy_open_is_read_only(const struct fuse_file_info *file)
+{
+    /* MSVC's CRT headers do not expose POSIX O_ACCMODE. WinFsp uses the
+       standard low access bits, so the absence of either write bit is the
+       portable read-only test. */
+    return 0 == (file->flags & (O_WRONLY | O_RDWR));
+}
+
 static int greppy_create(const char *path, fuse_mode_t mode, struct fuse_file_info *file)
 {
     int result = greppy_windows_create(greppy_context(), path, mode, 0);
     if (0 != result)
         return result;
     return greppy_windows_open(greppy_context(), path,
-        (file->flags & O_ACCMODE) == O_RDONLY, &file->fh);
+        greppy_open_is_read_only(file), &file->fh);
 }
 
 static int greppy_open(const char *path, struct fuse_file_info *file)
 {
     return greppy_windows_open(greppy_context(), path,
-        (file->flags & O_ACCMODE) == O_RDONLY, &file->fh);
+        greppy_open_is_read_only(file), &file->fh);
 }
 
 static int greppy_unlink(const char *path)

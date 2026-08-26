@@ -748,11 +748,16 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let temporary = path.with_extension("publishing");
         let script = format!("#!/bin/sh\n{body}\n");
-        fs::write(&path, script).expect("write stub");
-        let mut perms = fs::metadata(&path).expect("meta").permissions();
+        let mut file = fs::File::create(&temporary).expect("create temporary stub");
+        std::io::Write::write_all(&mut file, script.as_bytes()).expect("write temporary stub");
+        file.sync_all().expect("sync temporary stub");
+        drop(file);
+        let mut perms = fs::metadata(&temporary).expect("meta").permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod");
+        fs::set_permissions(&temporary, perms).expect("chmod");
+        fs::rename(&temporary, &path).expect("publish stub atomically");
         path
     }
 
