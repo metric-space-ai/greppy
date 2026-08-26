@@ -51,6 +51,25 @@ if ((await main.locator("#q").count()) !== 1) throw new Error("frame locator");
 await main.click("#b");
 await main.check("#c");
 if (!(await page.isChecked("#c"))) throw new Error("frame check");
+if (main.page() !== page && main.page()._id !== page._id) throw new Error("frame.page");
+if (page.locator("#q").page() !== page && page.locator("#q").page()._id !== page._id) {
+  throw new Error("locator.page");
+}
+if (main.isDetached()) throw new Error("main frame detached");
+if ((await main.getByPlaceholder("search").count()) !== 1) throw new Error("frame placeholder");
+if ((await main.getByLabel("Name").count()) !== 1) throw new Error("frame label");
+if ((await main.getByAltText("logo").count()) !== 1) throw new Error("frame alt");
+if ((await main.getByTitle("brand").count()) !== 1) throw new Error("frame title attr");
+if ((await main.getByTestId("hero").count()) !== 1) throw new Error("frame testid");
+if ((await main.innerHTML("#t")).trim() !== "dbl") throw new Error("frame innerHTML");
+if ((await main.innerText("#t")).trim() !== "dbl") throw new Error("frame innerText");
+if ((await main.textContent("#t")).trim() !== "dbl") throw new Error("frame textContent");
+await main.uncheck("#c");
+await page.locator("#c").setChecked(true);
+if (!(await main.isChecked("#c"))) throw new Error("setChecked");
+await main.type("#q", "!");
+await page.locator("#q").pressSequentially("?");
+if (!(await main.inputValue("#q")).includes("!")) throw new Error("frame type");
 await main.setContent("<!DOCTYPE html><html><body><p id=fsc>frame-set</p></body></html>");
 if ((await page.innerText("#fsc")).trim() !== "frame-set") throw new Error("frame setContent");
 const frameHtml = await main.content();

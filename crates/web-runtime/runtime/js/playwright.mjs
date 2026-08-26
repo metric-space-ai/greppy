@@ -552,6 +552,18 @@ class Locator {
     await this.focus();
     await this._page.keyboard.press(key);
   }
+
+  page() {
+    return this._page;
+  }
+
+  async setChecked(checked) {
+    return checked ? this.check() : this.uncheck();
+  }
+
+  async pressSequentially(text) {
+    return this.type(text);
+  }
 }
 
 class FrameLocator {
@@ -716,6 +728,80 @@ class Frame {
   isEditable(selector) {
     return this.locator(selector).isEditable();
   }
+
+  page() {
+    return this._page;
+  }
+
+  isDetached() {
+    return false;
+  }
+
+  getByPlaceholder(name) {
+    return this._id === "main"
+      ? this._page.getByPlaceholder(name)
+      : this.locator("body").first();
+  }
+
+  getByAltText(name) {
+    return this._id === "main" ? this._page.getByAltText(name) : this.locator("body").first();
+  }
+
+  getByTitle(name) {
+    return this._id === "main" ? this._page.getByTitle(name) : this.locator("body").first();
+  }
+
+  getByTestId(name) {
+    return this._id === "main" ? this._page.getByTestId(name) : this.locator("body").first();
+  }
+
+  getAttribute(selector, name) {
+    return this.locator(selector).getAttribute(name);
+  }
+
+  textContent(selector) {
+    return this.locator(selector).textContent();
+  }
+
+  title() {
+    return this._id === "main" ? this._page.title() : this.evaluate(() => document.title);
+  }
+
+  isChecked(selector) {
+    return this.locator(selector).isChecked();
+  }
+
+  isEnabled(selector) {
+    return this.locator(selector).isEnabled();
+  }
+
+  isDisabled(selector) {
+    return this.locator(selector).isDisabled();
+  }
+
+  isHidden(selector) {
+    return this.locator(selector).isHidden();
+  }
+
+  press(selector, key) {
+    return this.locator(selector).press(key);
+  }
+
+  selectOption(selector, value) {
+    return this.locator(selector).selectOption(value);
+  }
+
+  uncheck(selector) {
+    return this.locator(selector).uncheck();
+  }
+
+  setChecked(selector, checked) {
+    return checked ? this.check(selector) : this.uncheck(selector);
+  }
+
+  frameLocator(selector) {
+    return this._page.frameLocator(selector);
+  }
 }
 
 class Page {
@@ -730,6 +816,8 @@ class Page {
     this._pendingPopups = [];
     this._openerId = null;
     this._navWaiters = [];
+    this._consoleWaiters = [];
+    this._pendingConsole = [];
     this.mouse = {
       click: async (x, y) => {
         await engineCall("page.mouse.click", { page: this._id, x, y });
@@ -995,17 +1083,22 @@ class Page {
 
   _requestFromRecord(rec) {
     const headerList = rec.headers || [];
+    const headerMap = () => {
+      const out = {};
+      headerList.forEach((h) => {
+        out[String(h.name).toLowerCase()] = h.value;
+      });
+      return out;
+    };
     return {
       url: () => rec.url,
       method: () => rec.method || "GET",
-      headers: () => {
-        const out = {};
-        headerList.forEach((h) => {
-          out[String(h.name).toLowerCase()] = h.value;
-        });
-        return out;
-      },
+      headers: headerMap,
+      headerValue: (name) => headerMap()[String(name).toLowerCase()] || null,
+      headersArray: () =>
+        headerList.map((h) => ({ name: String(h.name), value: h.value })),
       resourceType: () => (rec.main_frame ? "document" : "other"),
+      isNavigationRequest: () => !!rec.main_frame,
       frame: () => this.mainFrame(),
     };
   }
@@ -1021,6 +1114,8 @@ class Page {
       ok: () => (rec.ok == null ? status < 400 : !!rec.ok),
       headers: () => headers,
       headerValue: (name) => headers[String(name).toLowerCase()] || null,
+      headersArray: () =>
+        Object.keys(headers).map((name) => ({ name, value: headers[name] })),
       body: async () => bytes(),
       text: async () => decodeUtf8(bytes()),
       json: async () => JSON.parse(decodeUtf8(bytes())),
@@ -1089,16 +1184,36 @@ class Page {
   }
 
   async _dispatchConsole() {
+    this._consoleWaiters = this._consoleWaiters || [];
+    this._pendingConsole = this._pendingConsole || [];
     const result = await engineCall("page.consoleMessages", { page: this._id });
     const messages = result.messages || [];
     for (let i = this._consoleSeen; i < messages.length; i++) {
       const rec = messages[i];
-      this._emit("console", {
+      const payload = {
         type: () => rec.type || "log",
         text: () => rec.text || "",
-      });
+      };
+      const waiter = this._consoleWaiters.shift();
+      if (waiter) {
+        waiter(payload);
+      } else {
+        this._pendingConsole.push(payload);
+      }
+      this._emit("console", payload);
     }
     this._consoleSeen = messages.length;
+  }
+
+  _waitForConsole() {
+    this._pendingConsole = this._pendingConsole || [];
+    this._consoleWaiters = this._consoleWaiters || [];
+    if (this._pendingConsole.length) {
+      return Promise.resolve(this._pendingConsole.shift());
+    }
+    return new Promise((resolve) => {
+      this._consoleWaiters.push(resolve);
+    });
   }
 
   _adoptPopup(rec) {
@@ -1273,6 +1388,9 @@ class Page {
     }
     if (event === "popup" || event === "page") {
       return this._waitForPopup();
+    }
+    if (event === "console") {
+      return this._waitForConsole();
     }
     if (event === "download") {
       const result = await engineCall("page.downloads", { page: this._id });
@@ -1493,11 +1611,17 @@ class BrowserContext {
   constructor(id) {
     this._id = id;
     this._pages = [];
+    this._browser = null;
+    this._pendingRoutes = [];
     this.tracing = {
       start: async () => unsupported("BrowserContext.tracing.start")(),
       stop: async () => unsupported("BrowserContext.tracing.stop")(),
     };
     return withUnsupported(this, "BrowserContext");
+  }
+
+  browser() {
+    return this._browser;
   }
 
   async newPage() {
@@ -1507,6 +1631,9 @@ class BrowserContext {
     this._lastPage = result.page;
     this._pages = this._pages || [];
     this._pages.push(page);
+    for (const pending of this._pendingRoutes || []) {
+      await page.route(pending.url, pending.handler);
+    }
     return page;
   }
 
@@ -1554,11 +1681,20 @@ class BrowserContext {
     }
   }
 
+  setDefaultNavigationTimeout(ms) {
+    this.setDefaultTimeout(ms);
+  }
+
   async route(url, handler) {
     const pages = this.pages();
-    if (pages[0]) {
-      return pages[0].route(url, handler);
+    if (pages.length) {
+      for (const page of pages) {
+        await page.route(url, handler);
+      }
+      return;
     }
+    this._pendingRoutes = this._pendingRoutes || [];
+    this._pendingRoutes.push({ url, handler });
   }
 }
 
@@ -1573,7 +1709,9 @@ class Browser {
       return unsupported("Browser.newContext.options")();
     }
     const result = await engineCall("browser.newContext", { browser: this._id });
-    return new BrowserContext(result.context);
+    const context = new BrowserContext(result.context);
+    context._browser = this;
+    return context;
   }
 
   async newPage(options) {

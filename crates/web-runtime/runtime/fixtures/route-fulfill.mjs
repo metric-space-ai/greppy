@@ -41,6 +41,10 @@ if (!JSON.stringify(headers).toLowerCase().includes("text/html")) {
 if (response.headerValue("content-type") !== "text/html") {
   throw new Error("headerValue " + response.headerValue("content-type"));
 }
+const headerArray = response.headersArray();
+if (!headerArray.some((h) => String(h.name).toLowerCase() === "content-type")) {
+  throw new Error("headersArray " + JSON.stringify(headerArray));
+}
 const associated = response.request();
 if (!associated || !String(associated.url()).includes("intercepted")) {
   throw new Error("response.request");

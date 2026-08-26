@@ -18,6 +18,9 @@ if (alertDialog.type() !== "alert" || alertDialog.message() !== "native-hi") {
       JSON.stringify({ type: alertDialog.type(), message: alertDialog.message() }),
   );
 }
+if (alertDialog.page() !== page && alertDialog.page()._id !== page._id) {
+  throw new Error("dialog.page");
+}
 
 const confirmed = await page.evaluate(() => confirm("native-confirm"));
 if (confirmed !== true) {

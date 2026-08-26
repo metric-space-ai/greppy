@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 210,
+    "implemented": 238,
     "unsupported": 281,
-    "unverified": 863
+    "unverified": 835
   },
   "entries": [
     {
@@ -1305,12 +1305,14 @@
       "behavior": "unverified",
       "tests": [
         "native-dialog",
-        "file-chooser-event"
+        "file-chooser-event",
+        "console-messages"
       ],
       "known_differences": [
         "popup drains auxiliary WebViews; download returns last intercept record",
         "dialog waitForEvent consumes retained SimpleDialog records after evaluate; Chromium requires waiting before the alert",
-        "filechooser consumes retained FilePicker records after click; Chromium emits during the picker"
+        "filechooser consumes retained FilePicker records after click; Chromium emits during the picker",
+        "console uses a waiter queue flushed after evaluate, like popup; dialog/filechooser still consume recorded embedder events"
       ]
     },
     {
@@ -2509,34 +2511,16 @@
       "symbol": "Frame.frameLocator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to Page.frameLocator"
+      ]
     },
     {
       "symbol": "Frame.getAttribute",
-      "kind": "method",
-      "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
-    },
-    {
-      "symbol": "Frame.getByAltText",
-      "kind": "method",
-      "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
-    },
-    {
-      "symbol": "Frame.getByLabel",
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
@@ -2544,18 +2528,50 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main frame only"
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
+    },
+    {
+      "symbol": "Frame.getByAltText",
+      "kind": "method",
+      "origin": "parser",
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
+    },
+    {
+      "symbol": "Frame.getByLabel",
+      "kind": "method",
+      "origin": "parser",
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
       ]
     },
     {
       "symbol": "Frame.getByPlaceholder",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.getByRole",
@@ -2575,11 +2591,15 @@
       "symbol": "Frame.getByTestId",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.getByText",
@@ -2599,11 +2619,15 @@
       "symbol": "Frame.getByTitle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.goto",
@@ -2638,11 +2662,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "delegates to locator.innerHTML"
+        "main-frame delegates to Page; child frames are not in-document locators"
       ]
     },
     {
@@ -2650,11 +2676,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "delegates to frame.locator"
+        "main-frame delegates to Page; child frames are not in-document locators"
       ]
     },
     {
@@ -2676,31 +2704,41 @@
       "symbol": "Frame.isChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.isDetached",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "always false for the live main frame; iframe detach is not tracked"
+      ]
     },
     {
       "symbol": "Frame.isDisabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.isEditable",
@@ -2720,21 +2758,25 @@
       "symbol": "Frame.isEnabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.isHidden",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.isVisible",
@@ -2781,11 +2823,15 @@
       "symbol": "Frame.page",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "returns the owning Page"
+      ]
     },
     {
       "symbol": "Frame.parentFrame",
@@ -2801,31 +2847,39 @@
       "symbol": "Frame.press",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.selectOption",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.setChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.setContent",
@@ -2866,31 +2920,41 @@
       "symbol": "Frame.textContent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.title",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main frame delegates to Page.title"
+      ]
     },
     {
       "symbol": "Frame.uncheck",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main-frame delegates to Page; child frames are not in-document locators"
+      ]
     },
     {
       "symbol": "Frame.url",
@@ -3361,11 +3425,15 @@
       "symbol": "BrowserContext.browser",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "the Browser that created the context"
+      ]
     },
     {
       "symbol": "BrowserContext.clearCookies",
@@ -3565,11 +3633,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
-        "delegates to the first page in context.pages()"
+        "queued until newPage if the context has no pages yet; then registered as Page.route intercepts"
       ]
     },
     {
@@ -3606,11 +3676,15 @@
       "symbol": "BrowserContext.setDefaultNavigationTimeout",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "alias of setDefaultTimeout; does not change Servo navigation timeout independently"
+      ]
     },
     {
       "symbol": "BrowserContext.setDefaultTimeout",
@@ -6415,11 +6489,15 @@
       "symbol": "Locator.page",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "returns the Page that created the locator"
+      ]
     },
     {
       "symbol": "Locator.press",
@@ -6439,11 +6517,15 @@
       "symbol": "Locator.pressSequentially",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "alias of locator.type / keyboard.type value append; not per-character delay"
+      ]
     },
     {
       "symbol": "Locator.screenshot",
@@ -6502,11 +6584,15 @@
       "symbol": "Locator.setChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "delegates to check/uncheck"
+      ]
     },
     {
       "symbol": "Locator.setInputFiles",
@@ -8912,11 +8998,15 @@
       "symbol": "Dialog.page",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "returns the Page that owns the SimpleDialog record"
+      ]
     },
     {
       "symbol": "Disposable.dispose",
@@ -9668,11 +9758,15 @@
       "symbol": "Request.headerValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "lookup on recorded WebResourceRequest headers"
+      ]
     },
     {
       "symbol": "Request.headers",
@@ -9692,21 +9786,29 @@
       "symbol": "Request.headersArray",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "array form of recorded request headers"
+      ]
     },
     {
       "symbol": "Request.isNavigationRequest",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "true when Servo is_for_main_frame"
+      ]
     },
     {
       "symbol": "Request.method",
@@ -9948,11 +10050,15 @@
       "symbol": "Response.headersArray",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "array form of intercept fulfill headers; not Chromium-oracle compared"
+      ]
     },
     {
       "symbol": "Response.httpVersion",
@@ -14016,11 +14122,13 @@
       "kind": "method",
       "origin": "types.d.ts recovery",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "delegates to locator.type; main-frame CSS or iframe-element locator"
+        "main-frame delegates to Page; child frames are not in-document locators"
       ]
     },
     {

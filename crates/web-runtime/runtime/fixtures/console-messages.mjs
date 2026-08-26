@@ -7,10 +7,15 @@ const handler = (msg) => {
   seen.push(msg.text());
 };
 page.on("console", handler);
+const waited = page.waitForEvent("console");
 await page.evaluate(() => {
   console.log("hello-console");
   return 1;
 });
+const waitedMsg = await waited;
+if (waitedMsg.text() !== "hello-console") {
+  throw new Error("waitForEvent console " + waitedMsg.text());
+}
 const messages = await page.consoleMessages();
 const texts = messages.map((msg) => msg.text());
 if (!texts.some((text) => String(text).includes("hello-console")) && !seen.some((text) => String(text).includes("hello-console"))) {
