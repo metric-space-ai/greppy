@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 260,
-    "unsupported": 287,
-    "unverified": 807
+    "implemented": 263,
+    "unsupported": 289,
+    "unverified": 802
   },
   "entries": [
     {
@@ -9970,36 +9970,38 @@
       "symbol": "Request.postData",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
-        "Servo WebResourceRequest has no request body; not implemented as empty/null stub"
+        "GET/HEAD return null; POST/PUT throw unsupported_playwright_operation because Servo WebResourceRequest has no body"
       ]
     },
     {
       "symbol": "Request.postDataBuffer",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "Servo WebResourceRequest has no request body; not implemented as empty/null stub"
+        "GET/HEAD return null; other methods throw unsupported_playwright_operation"
       ]
     },
     {
       "symbol": "Request.postDataJSON",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "Servo WebResourceRequest has no request body; not implemented as empty/null stub"
+        "GET/HEAD return null; other methods throw unsupported_playwright_operation"
       ]
     },
     {
@@ -10065,21 +10067,25 @@
       "symbol": "Request.sizes",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation. No Chromium resource timing/sizes."
+      ]
     },
     {
       "symbol": "Request.timing",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation. No Chromium resource timing/sizes."
+      ]
     },
     {
       "symbol": "Request.url",
@@ -15359,8 +15365,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1050,
-    "unsupported": 287,
+    "unverified": 1048,
+    "unsupported": 289,
     "passing": 17
   }
 }

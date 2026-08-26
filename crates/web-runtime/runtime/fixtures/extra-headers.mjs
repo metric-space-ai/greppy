@@ -39,6 +39,7 @@ if (!headerArray.some((h) => String(h.name).toLowerCase() === "x-greppy-test" &&
 }
 if (!request.isNavigationRequest()) throw new Error("isNavigationRequest");
 if (request.failure() !== null) throw new Error("request.failure");
+if (request.postData() !== null) throw new Error("GET postData");
 const ctx = await browser.newContext();
 if (ctx.browser() !== browser && ctx.browser()._id !== browser._id) {
   throw new Error("context.browser");

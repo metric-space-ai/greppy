@@ -1227,6 +1227,23 @@ class Page {
       resourceType: () => (rec.main_frame ? "document" : "other"),
       isNavigationRequest: () => !!rec.main_frame,
       failure: () => null,
+      postData: () => {
+        const method = rec.method || "GET";
+        if (method === "GET" || method === "HEAD") return null;
+        throwUnsupported("Request.postData");
+      },
+      postDataJSON: () => {
+        const method = rec.method || "GET";
+        if (method === "GET" || method === "HEAD") return null;
+        throwUnsupported("Request.postDataJSON");
+      },
+      postDataBuffer: () => {
+        const method = rec.method || "GET";
+        if (method === "GET" || method === "HEAD") return null;
+        throwUnsupported("Request.postDataBuffer");
+      },
+      timing: () => throwUnsupported("Request.timing"),
+      sizes: () => throwUnsupported("Request.sizes"),
       frame: () => this.mainFrame(),
       response: async () => {
         const result = await engineCall("page.responses", { page: this._id });
