@@ -25,6 +25,7 @@ greppy-indexer = { path = "../indexer" }
 greppy-qwen35-native = { path = "../qwen35-native" }
 greppy-search = { path = "../search" }
 greppy-store = { path = "../store" }
+greppy-web-client = { path = "../web-client" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

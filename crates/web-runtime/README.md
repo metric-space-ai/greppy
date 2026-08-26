@@ -106,6 +106,18 @@ greppy bash-smart -- cargo test --manifest-path crates/web-runtime/Cargo.toml -p
 
 `unchanged_playwright_script_controls_servo_across_process_boundary` passed in 9.35s (exit 0) on macOS. The fixture hydrates the button/label/main tree with `queueMicrotask` after first paint. This is an **experimental web-runtime spike**, not product Playwright compatibility, not a signed distributable, and not a Linux/Windows CI receipt.
 
+### Client/supervisor daemon (verified locally)
+
+`web-runtime-supervisor --socket PATH --run-id ID` accepts length-delimited `greppy.web-runtime.v1` requests on a Unix socket. `web.session.create`, `web.run` (script text in the payload, not argv), and `web.session.close` were verified by `tests/session-daemon.rs` (exit 0). The Greppy parent talks to that socket through `crates/web-client` and does not link either engine.
+
+Verified CLI wiring (CI sentinel models, no engine binaries):
+
+```
+CI=true greppy bash-smart -- cargo test -p greppy --features ci-test-assets --test web_cli -- --nocapture
+```
+
+`web` is a real subcommand (not grep passthrough). `greppy web status --json` exits 31 when the runtime images are missing. `greppy web run` requires `--session`.
+
 ### Alternative one-process experiment
 
 The alternative one-process experiment is: vendor `mozjs_sys`, rebuild with `MOZJS_FROM_SOURCE`, namespace irregexp away from `v8::internal`, then re-run `servo-only`, `deno-only`, `deno-then-servo`, and `servo-then-deno` with normal return (no `process::exit`, no skipped `Drop`). Only if those pass repeatedly is a one-binary claim allowed. ICU overlap remains a follow-on risk after irregexp.
@@ -114,4 +126,4 @@ The alternative one-process experiment is: vendor `mozjs_sys`, rebuild with `MOZ
 
 Worker IPC v1 is length-delimited (32-bit unsigned big-endian payload length, compact UTF-8 JSON, 1 MiB maximum), never JSON Lines. Every message carries schema `greppy.web-runtime.worker.v1` and version `1`. The closed message set is `Hello`, `Ready`, `Shutdown`, `ShutdownAck`, `RunScript`, `ScriptComplete`, `EngineCall`, and `EngineResult`.
 
-This worker protocol is still smaller than the Greppy client/supervisor protocol in `contracts/web-runtime/protocol.v1.schema.json`.
+This worker protocol is still smaller than the Greppy client/supervisor protocol in `contracts/web-runtime/protocol.v1.schema.json`, which is implemented by `crates/web-client` as schema `greppy.web-runtime.v1` over the same length-delimited framing.

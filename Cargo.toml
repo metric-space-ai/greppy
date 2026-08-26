@@ -15,6 +15,7 @@ members = [
     "crates/cli",
     "crates/edit",
     "crates/agent",
+    "crates/web-client",
 ]
 
 [workspace.package]

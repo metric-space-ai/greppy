@@ -743,7 +743,7 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum WebCommand {
-    /// Report experimental web-runtime availability. Does not link engines.
+    /// Report web-runtime availability. Does not link engines.
     Status {
         #[arg(long)]
         json: bool,
@@ -753,12 +753,96 @@ pub enum WebCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Run one unchanged Playwright script through the isolated supervisor.
+    /// Create, list, or close a run-owned web session.
+    Session {
+        #[command(subcommand)]
+        command: WebSessionCommand,
+    },
+    /// Run an unchanged Playwright script in a session.
     Run {
+        #[arg(long)]
+        session: Option<String>,
         #[arg(long)]
         script_file: Option<String>,
         #[arg(long)]
         script_stdin: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Return a compact observation of the current page.
+    Observe {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture a screenshot into an artifact path.
+    Screenshot {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search the public web through the runtime.
+    Search {
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read one URL through the runtime.
+    Read {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bounded research over the runtime.
+    Research {
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "max-sources")]
+        max_sources: Option<u32>,
+        #[arg(long)]
+        depth: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List artifacts for a session.
+    Artifacts {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebSessionCommand {
+    Create {
+        #[arg(long, default_value = "research")]
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Close {
+        session: String,
         #[arg(long)]
         json: bool,
     },

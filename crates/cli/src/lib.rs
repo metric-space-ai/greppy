@@ -984,7 +984,9 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
         }
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
-        "web" => "greppy web status|doctor|run [--json] [--script-file FILE|--script-stdin]",
+        "web" => {
+            "greppy web status|doctor|session|run|observe|screenshot|search|read|research|artifacts [--json]"
+        }
         _ => return None,
     })
 }
@@ -1802,7 +1804,7 @@ fn dispatch_subcommand(
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
-        Command::Web { command } => web::dispatch(command),
+        Command::Web { command } => web::dispatch(command, root),
         Command::WhoCalls {
             symbols,
             path_opts,

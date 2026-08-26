@@ -18,6 +18,8 @@ pub struct Config {
     pub content_worker: PathBuf,
     pub scripts: Vec<PathBuf>,
     pub fixture_url: Option<String>,
+    pub socket: Option<PathBuf>,
+    pub run_id: Option<String>,
 }
 
 impl Config {
@@ -26,6 +28,8 @@ impl Config {
         let mut content_worker = None;
         let mut scripts = Vec::new();
         let mut fixture_url = None;
+        let mut socket = None;
+        let mut run_id = None;
         let mut args = args.into_iter();
 
         while let Some(argument) = args.next() {
@@ -55,6 +59,23 @@ impl Config {
                         return Err("duplicate --fixture-url".to_owned());
                     }
                 }
+                Some("--socket") => {
+                    set_path(&mut socket, "--socket", args.next())?;
+                }
+                Some("--run-id") => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "missing value after --run-id".to_owned())?;
+                    let value = value
+                        .into_string()
+                        .map_err(|value| format!("invalid --run-id {value:?}"))?;
+                    if value.is_empty() {
+                        return Err("empty value after --run-id".to_owned());
+                    }
+                    if run_id.replace(value).is_some() {
+                        return Err("duplicate --run-id".to_owned());
+                    }
+                }
                 _ => return Err(format!("unknown argument {argument:?}")),
             }
         }
@@ -66,6 +87,8 @@ impl Config {
                 .ok_or_else(|| "missing --content-worker PATH".to_owned())?,
             scripts,
             fixture_url,
+            socket,
+            run_id,
         })
     }
 }
@@ -87,6 +110,31 @@ fn set_path(
 }
 
 pub fn run(config: Config) -> io::Result<()> {
+    if let Some(socket) = config.socket.clone() {
+        let run_id = config
+            .run_id
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --run-id"))?;
+        #[cfg(unix)]
+        {
+            return crate::daemon::serve(crate::daemon::DaemonConfig {
+                socket,
+                run_id,
+                controller_worker: config.controller_worker,
+                content_worker: config.content_worker,
+                fixture_url: config.fixture_url,
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (socket, run_id);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "web-runtime supervisor socket mode requires Unix domain sockets",
+            ));
+        }
+    }
+
     let mut controller = WorkerProcess::spawn(
         &config.controller_worker,
         WorkerKind::Controller,
@@ -141,14 +189,21 @@ fn run_script(
         .to_string_lossy()
         .into_owned();
     controller.send(&Message::run_script(specifier, source, fixture_url))?;
+    route_until_script_complete(controller, content, SCRIPT_TIMEOUT)
+}
 
-    let deadline = Instant::now() + SCRIPT_TIMEOUT;
+pub(crate) fn route_until_script_complete(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("timed out after {SCRIPT_TIMEOUT:?} running controller script"),
+                format!("timed out after {timeout:?} running controller script"),
             ));
         }
         match recv_any(controller, content, remaining)? {
@@ -238,7 +293,7 @@ fn recv_any(
     }
 }
 
-struct WorkerProcess {
+pub(crate) struct WorkerProcess {
     worker: WorkerKind,
     child: Child,
     input: Option<BufWriter<ChildStdin>>,
@@ -248,7 +303,7 @@ struct WorkerProcess {
 }
 
 impl WorkerProcess {
-    fn spawn(path: &Path, worker: WorkerKind, capability: String) -> io::Result<Self> {
+    pub(crate) fn spawn(path: &Path, worker: WorkerKind, capability: String) -> io::Result<Self> {
         let mut child = Command::new(path)
             .arg("--capability")
             .arg(capability)
@@ -312,12 +367,12 @@ impl WorkerProcess {
         })
     }
 
-    fn handshake(&mut self) -> io::Result<()> {
+    pub(crate) fn handshake(&mut self) -> io::Result<()> {
         self.send(&Message::hello(self.worker))?;
         self.expect(Message::ready(self.worker))
     }
 
-    fn shutdown(&mut self) -> io::Result<()> {
+    pub(crate) fn shutdown(&mut self) -> io::Result<()> {
         self.send(&Message::shutdown())?;
         self.expect(Message::shutdown_ack(self.worker))?;
         self.input.take();
@@ -334,7 +389,7 @@ impl WorkerProcess {
         Ok(())
     }
 
-    fn send(&mut self, message: &Message) -> io::Result<()> {
+    pub(crate) fn send(&mut self, message: &Message) -> io::Result<()> {
         let input = self.input.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin is already closed")
         })?;
@@ -428,6 +483,7 @@ mod tests {
         assert_eq!(config.controller_worker, PathBuf::from("controller"));
         assert_eq!(config.content_worker, PathBuf::from("content"));
         assert_eq!(config.scripts, Vec::<PathBuf>::new());
+        assert_eq!(config.socket, None);
     }
 
     #[test]

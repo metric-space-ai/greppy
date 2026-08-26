@@ -712,6 +712,7 @@ dependencies = [
  "greppy-qwen35-native",
  "greppy-search",
  "greppy-store",
+ "greppy-web-client",
  "libc",
  "regex",
  "rusqlite",
@@ -983,6 +984,14 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "greppy-web-client"
+version = "0.3.3"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

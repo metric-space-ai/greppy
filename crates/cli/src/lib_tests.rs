@@ -1247,6 +1247,18 @@ fn parse_index_status_json_and_doctor_json() {
 
     let cli = Cli::try_parse_from(["greppy", "doctor", "--json"]).unwrap();
     assert!(matches!(cli.command, Some(Command::Doctor { json: true })));
+
+    let cli = Cli::try_parse_from(["greppy", "web", "status", "--json"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Web {
+            command: WebCommand::Status { json: true }
+        })
+    ));
+    assert!(
+        super::SUBCOMMANDS.contains(&"web"),
+        "web must be a registered verb, not grep passthrough"
+    );
 }
 
 #[test]
