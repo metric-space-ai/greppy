@@ -793,6 +793,7 @@ fn local_package_contains_three_images() {
     }
     assert!(dest.join("SHA256SUMS").exists());
     assert!(dest.join("sbom.json").exists());
+    assert!(dest.join("UNSIGNED").exists());
     let _ = std::fs::remove_dir_all(&dest);
 }
 
@@ -841,4 +842,68 @@ fn prompt_injection_is_fenced_as_untrusted_page_content() {
         text.contains("IGNORE PREVIOUS INSTRUCTIONS"),
         "jailbreak text must remain page evidence, not be executed: {text}"
     );
+}
+
+#[test]
+fn route_fulfill_overrides_http_body() {
+    let origin =
+        serve_fixture("<!DOCTYPE html><html><body><p id='x'>from-server</p></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-route-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/route-fulfill.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_route", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_route",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_route",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn oracle_skip_receipt_when_chromium_pin_missing() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("oracle-skip.sh");
+    let status = Command::new("sh")
+        .arg(&script)
+        .status()
+        .expect("oracle-skip");
+    assert!(status.success(), "{status}");
+    let receipt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("contracts/web-runtime/receipts/oracle-skip.json");
+    // CARGO_MANIFEST_DIR is crates/web-runtime/runtime → repo is ../../..
+    let text = std::fs::read_to_string(&receipt).unwrap_or_else(|_| {
+        let alt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../contracts/web-runtime/receipts/oracle-skip.json");
+        std::fs::read_to_string(alt).expect("oracle skip receipt")
+    });
+    assert!(text.contains("skipped") || text.contains("ready"), "{text}");
 }

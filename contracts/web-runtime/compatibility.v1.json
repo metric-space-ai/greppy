@@ -794,10 +794,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "route-fulfill"
       ],
       "known_differences": [
-        "handler is invoked with a stub Route that registers abort/fulfill/continue patterns"
+        "handler is invoked with a stub Route that registers abort/fulfill/continue patterns",
+        "Servo load_web_resource intercept in content-worker only"
       ]
     },
     {

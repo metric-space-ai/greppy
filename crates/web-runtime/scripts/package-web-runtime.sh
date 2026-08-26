@@ -43,4 +43,10 @@ cat > "$dest/README.txt" <<TXT
 Greppy web-runtime local distributable
 Contains three separately linked images. This archive is not signed.
 TXT
-echo "packed $dest"
+echo "NOT_PRODUCTION_SIGNED" > "$dest/UNSIGNED"
+parent="$(dirname "$dest")"
+base="$(basename "$dest")"
+archive="$parent/${base}.tar.gz"
+rm -f "$archive"
+tar -C "$parent" -czf "$archive" "$base"
+echo "packed $dest and $archive (unsigned)"

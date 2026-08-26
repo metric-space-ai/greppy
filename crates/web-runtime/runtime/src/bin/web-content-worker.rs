@@ -1,9 +1,10 @@
 use dpi::PhysicalSize;
 use serde_json::json;
 use servo::{
-    DevicePoint, EventLoopWaker, InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, Preferences, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue, LoadStatus,
+    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
+    RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebResourceLoad,
+    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,14 +34,28 @@ impl EventLoopWaker for WakeFlag {
     }
 }
 
+struct RouteRule {
+    pattern: String,
+    action: String,
+    body: Vec<u8>,
+}
+
 struct Delegate {
     new_frame_ready: RefCell<bool>,
+    routes: RefCell<Vec<RouteRule>>,
+    file_paths: RefCell<Vec<std::path::PathBuf>>,
+    requests: RefCell<Vec<serde_json::Value>>,
+    downloads: RefCell<Vec<serde_json::Value>>,
 }
 
 impl Default for Delegate {
     fn default() -> Self {
         Self {
             new_frame_ready: RefCell::new(false),
+            routes: RefCell::new(Vec::new()),
+            file_paths: RefCell::new(Vec::new()),
+            requests: RefCell::new(Vec::new()),
+            downloads: RefCell::new(Vec::new()),
         }
     }
 }
@@ -50,6 +65,68 @@ impl WebViewDelegate for Delegate {
         *self.new_frame_ready.borrow_mut() = true;
         webview.paint();
     }
+
+    fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
+        if let EmbedderControl::FilePicker(mut picker) = embedder_control {
+            let paths = self.file_paths.borrow().clone();
+            if paths.is_empty() {
+                picker.dismiss();
+            } else {
+                picker.select(&paths);
+                picker.submit();
+            }
+        }
+    }
+
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        let url = load.request.url.to_string();
+        self.requests.borrow_mut().push(json!({
+            "url": url,
+            "main_frame": load.request.is_for_main_frame,
+            "redirect": load.request.is_redirect,
+        }));
+        let matched = self
+            .routes
+            .borrow()
+            .iter()
+            .find(|rule| pattern_matches(&rule.pattern, &url))
+            .map(|rule| (rule.action.clone(), rule.body.clone()));
+        let Some((action, body)) = matched else {
+            return;
+        };
+        let request_url = load.request.url.clone();
+        match action.as_str() {
+            "abort" => {
+                load.intercept(WebResourceResponse::new(request_url))
+                    .cancel();
+            }
+            "fulfill" => {
+                let mut intercepted = load.intercept(WebResourceResponse::new(request_url.clone()));
+                if !body.is_empty() {
+                    intercepted.send_body_data(body.clone());
+                }
+                intercepted.finish();
+                self.downloads.borrow_mut().push(json!({
+                    "url": request_url.to_string(),
+                    "bytes": body.len(),
+                }));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn pattern_matches(pattern: &str, url: &str) -> bool {
+    if pattern == "**/*" || pattern == "*" {
+        return true;
+    }
+    if let Some(rest) = pattern.strip_prefix("**/") {
+        return url.contains(rest.trim_end_matches('*'));
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return url.starts_with(prefix);
+    }
+    url == pattern || url.contains(pattern)
 }
 
 struct ContentEngine {
@@ -455,8 +532,49 @@ impl ContentEngine {
                 Ok(json!({}))
             }
             "page.setDialogPolicy" => Ok(json!({})),
-            "page.addRoute" => Ok(json!({})),
-            "page.setInputFiles" => Ok(json!({})),
+            "page.addRoute" => {
+                let page_id = required_str(&params, "page")?;
+                let pattern = required_str(&params, "pattern")?;
+                let action = params
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("continue")
+                    .to_owned();
+                let body = params
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .as_bytes()
+                    .to_vec();
+                self.page(&page_id)?.1.routes.borrow_mut().push(RouteRule {
+                    pattern,
+                    action,
+                    body,
+                });
+                Ok(json!({}))
+            }
+            "page.setInputFiles" => {
+                let page_id = required_str(&params, "page")?;
+                let files = params
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let paths: Vec<std::path::PathBuf> = files
+                    .iter()
+                    .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                    .collect();
+                self.page(&page_id)?.1.file_paths.replace(paths);
+                Ok(json!({}))
+            }
+            "page.requests" => {
+                let page_id = required_str(&params, "page")?;
+                Ok(json!({ "requests": self.page(&page_id)?.1.requests.borrow().clone() }))
+            }
+            "page.downloads" => {
+                let page_id = required_str(&params, "page")?;
+                Ok(json!({ "downloads": self.page(&page_id)?.1.downloads.borrow().clone() }))
+            }
             "page.frames" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
@@ -523,7 +641,14 @@ impl ContentEngine {
                     _ => Ok(json!({ "cookie": "" })),
                 }
             }
-            "page.tracing" => Ok(json!({ "requests": [], "dialogs": [], "console": [] })),
+            "page.tracing" => {
+                let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                Ok(json!({
+                    "requests": delegate.requests.borrow().clone(),
+                    "downloads": delegate.downloads.borrow().clone(),
+                }))
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported_playwright_operation: {other}"),

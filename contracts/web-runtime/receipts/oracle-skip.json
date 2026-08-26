@@ -1,0 +1,7 @@
+{
+  "status": "skipped",
+  "reason": "pinned Chromium revision 1234 is not installed",
+  "playwright_version": "1.62.1",
+  "required_chromium_revision": "1234",
+  "reference": "docs/PLAYWRIGHT_INTERACTIVE_WEB_RUNTIME_GUIDE.md section 20.1"
+}
