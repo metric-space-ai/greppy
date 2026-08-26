@@ -31,6 +31,8 @@ struct Args {
     hardware: String,
     #[arg(long, default_value_t = 25)]
     iterations: usize,
+    #[arg(long, default_value_t = 20)]
+    warmup_iterations: usize,
     #[arg(long, default_value_t = 5)]
     native_baseline_iterations: usize,
     #[arg(long, default_value_t = 50)]
@@ -101,8 +103,10 @@ fn main() {
             "repository, data-root, output, provider-binary, native-baseline-root and phase-trace-dir must be absolute",
         );
     }
-    if args.iterations < 5 || args.parallel == 0 {
-        fail("at least five iterations and one parallel workspace are required");
+    if args.iterations < 5 || args.warmup_iterations < 5 || args.parallel == 0 {
+        fail(
+            "at least five measured and warmup iterations and one parallel workspace are required",
+        );
     }
     let provider = ProviderInstallation::require_healthy(&args.data_root)
         .unwrap_or_else(|error| fail(&format!("provider is not healthy: {error}")));
@@ -186,6 +190,35 @@ fn main() {
         serde_json::json!({"untouched_physical_delta_bytes": untouched_physical_delta}),
     );
 
+    write_checkpoint(
+        &args.output,
+        "warm-workspaces-started",
+        serde_json::json!({"iterations": args.warmup_iterations}),
+    );
+    let mut warmup_ms = Vec::with_capacity(args.warmup_iterations);
+    for iteration in 0..args.warmup_iterations {
+        let started = Instant::now();
+        let workspace =
+            AgentWorkspace::create(&args.repository, &format!("perf-warmup-{iteration}")).unwrap();
+        let root = workspace.worktree_path();
+        assert_eq!(
+            fs::read(root.join(&args.probe_path)).unwrap(),
+            probe_expected
+        );
+        warmup_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        workspace.cleanup().unwrap();
+    }
+    let steady_state_window = &warmup_ms[warmup_ms.len() - 5..];
+    let warmup_steady_state_p95_ms = percentile(steady_state_window, 95);
+    write_checkpoint(
+        &args.output,
+        "warm-workspaces-measured",
+        serde_json::json!({
+            "samples_ms": &warmup_ms,
+            "steady_state_window": steady_state_window,
+            "steady_state_p95_ms": warmup_steady_state_p95_ms,
+        }),
+    );
     write_checkpoint(
         &args.output,
         "serial-workspaces-started",
@@ -395,6 +428,13 @@ fn main() {
             "end_to_end_p95_gate_ms": args.max_visible_p95_ms,
             "visible_samples_ms": visible_ms,
             "end_to_end_samples_ms": end_to_end_ms,
+            "warmup": {
+                "iterations": args.warmup_iterations,
+                "samples_ms": warmup_ms,
+                "steady_state_window_iterations": 5,
+                "steady_state_p95_ms": warmup_steady_state_p95_ms,
+                "steady_state_p95_gate_ms": args.max_visible_p95_ms,
+            },
         },
         "native_git_worktree_baseline": {
             "description": "warm git worktree add --detach checkout on the identical repository and host",
@@ -440,6 +480,11 @@ fn main() {
         if end_to_end_p95_ms > args.max_visible_p95_ms {
             fail(&format!(
                 "end-to-end workspace P95 {end_to_end_p95_ms:.3} ms exceeds gate"
+            ));
+        }
+        if warmup_steady_state_p95_ms > args.max_visible_p95_ms {
+            fail(&format!(
+                "workspace warmup did not reach the steady-state P95 gate: {warmup_steady_state_p95_ms:.3} ms"
             ));
         }
         if untouched_physical_delta > args.max_untouched_bytes {
