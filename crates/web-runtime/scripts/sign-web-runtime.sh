@@ -4,9 +4,12 @@ set -eu
 # GREPPY_CODESIGN_IDENTITY for a real Developer ID identity. Without it,
 # package unsigned/ad-hoc and record an explicit skip. Ad-hoc linker
 # signatures on macOS are not production signatures.
-root="$(cd "$(dirname "$0")/../../.." && pwd)"
-dest="${1:-$root/target/web-runtime-dist}"
-"$root/crates/web-runtime/scripts/package-web-runtime.sh" "$dest"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/web-runtime-dest-guard.sh"
+root="$(web_runtime_repo_root)"
+dest="$(web_runtime_validate_dest_shape "${1:-$root/target/web-runtime-dist}")"
+"$SCRIPT_DIR/package-web-runtime.sh" "$dest"
 bins="web-runtime-supervisor web-controller-worker web-content-worker"
 receipt="$dest/SIGNING_RECEIPT"
 skip="$dest/SIGNING_SKIPPED"

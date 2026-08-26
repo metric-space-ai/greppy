@@ -1,9 +1,15 @@
 #!/bin/sh
 set -eu
-root="$(cd "$(dirname "$0")/../../.." && pwd)"
-dest="${1:-"$root/target/web-runtime-dist"}"
+# Package the three separately linked runtime images into a local unsigned
+# dist. Dest must be an allowed staging directory; existing dest is replaced
+# only when it is a previous web-runtime dist owned by this user.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/web-runtime-dest-guard.sh"
+
+root="$(web_runtime_repo_root)"
+dest="$(web_runtime_require_package_dest "${1:-}")"
 bins="web-runtime-supervisor web-controller-worker web-content-worker"
-rm -rf "$dest"
 mkdir -p "$dest/bin"
 found=0
 for bin in $bins; do
@@ -13,7 +19,7 @@ for bin in $bins; do
     "$root/target/debug/$bin" \
     "$root/target/release/$bin"
   do
-    if [ -x "$candidate" ]; then
+    if [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
       cp "$candidate" "$dest/bin/$bin"
       found=$((found + 1))
       break
@@ -69,9 +75,17 @@ Greppy web-runtime local distributable
 Contains three separately linked images. This archive is not signed.
 TXT
 echo "NOT_PRODUCTION_SIGNED" > "$dest/UNSIGNED"
+web_runtime_write_stamp "$dest"
 parent="$(dirname "$dest")"
 base="$(basename "$dest")"
 archive="$parent/${base}.tar.gz"
-rm -f "$archive"
+if [ -e "$archive" ]; then
+  [ -L "$archive" ] && web_runtime_die "refusing to overwrite symlink archive: $archive"
+  [ -f "$archive" ] || web_runtime_die "archive exists and is not a file: $archive"
+  owner=$(web_runtime_owner_uid "$archive")
+  me=$(web_runtime_uid)
+  [ "$owner" = "$me" ] || web_runtime_die "refusing non-owned archive $archive"
+  rm -f "$archive"
+fi
 tar -C "$parent" -czf "$archive" "$base"
 echo "packed $dest and $archive (unsigned)"

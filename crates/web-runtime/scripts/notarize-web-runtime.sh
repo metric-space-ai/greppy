@@ -4,15 +4,17 @@ set -eu
 # GREPPY_NOTARY_PROFILE (notarytool keychain profile) or APPLE_ID +
 # APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID. Missing credentials write
 # NOTARIZATION_SKIPPED and exit 0; they do not fail local unsigned verification.
-root="$(cd "$(dirname "$0")/../../.." && pwd)"
-dest="${1:-$root/target/web-runtime-dist}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/web-runtime-dest-guard.sh"
+root="$(web_runtime_repo_root)"
+dest="$(web_runtime_validate_dest_shape "${1:-$root/target/web-runtime-dist}")"
+[ -d "$dest" ] || web_runtime_die "missing package $dest"
+web_runtime_check_owned_dir "$dest"
+web_runtime_is_owned_dist "$dest" || web_runtime_die "not a web-runtime dist: $dest"
 receipt="$dest/NOTARIZATION_RECEIPT"
 skip="$dest/NOTARIZATION_SKIPPED"
 archive="$(dirname "$dest")/$(basename "$dest").tar.gz"
-if [ ! -d "$dest" ]; then
-  echo "notarize-web-runtime: missing package $dest" >&2
-  exit 1
-fi
 if [ ! -f "$dest/SIGNING_RECEIPT" ]; then
   echo "GREPPY_CODESIGN_IDENTITY unset or unsigned package" > "$skip"
   echo "production_notarized=false" >> "$skip"

@@ -925,6 +925,12 @@ fn local_package_contains_three_images() {
     assert!(dest.join("sbom.json").exists());
     assert!(dest.join("UNSIGNED").exists());
     assert!(dest.join("provenance.json").exists());
+    assert!(dest.join(".greppy-web-runtime-dist").exists());
+    let stamp = std::fs::read_to_string(dest.join(".greppy-web-runtime-dist")).unwrap();
+    assert!(
+        stamp.contains("greppy.web-runtime.package.v1"),
+        "stamp {stamp}"
+    );
     assert!(!dest.join("bin").join("phase1-probe").exists());
     let mut hashes = Vec::new();
     for name in [
@@ -989,6 +995,125 @@ fn local_package_contains_three_images() {
     assert!(status.success(), "uninstall failed: {status}");
     assert!(!dest.exists(), "uninstall left {dest:?}");
     let _ = std::fs::remove_dir_all(&signed);
+}
+
+fn package_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("package-web-runtime.sh")
+}
+
+fn uninstall_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("uninstall-web-runtime.sh")
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("repo root")
+}
+
+fn run_script(script: &Path, dest: Option<&Path>) -> (i32, String, String) {
+    let mut command = Command::new("sh");
+    command.arg(script);
+    if let Some(dest) = dest {
+        command.arg(dest);
+    }
+    let output = command.output().expect("run script");
+    (
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn assert_refused(script: &Path, dest: Option<&Path>, because: &str) {
+    let (code, stdout, stderr) = run_script(script, dest);
+    assert_ne!(code, 0, "{because}: succeeded stdout={stdout} stderr={stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("refusing")
+            || combined.contains("empty dest")
+            || combined.contains("required")
+            || combined.contains("web-runtime-dest-guard"),
+        "{because}: expected guard failure, stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn package_and_uninstall_refuse_hostile_destinations() {
+    let package = package_script();
+    let uninstall = uninstall_script();
+    let repo = repo_root();
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+
+    assert_refused(&uninstall, None, "uninstall without dest");
+    assert_refused(&uninstall, Some(Path::new("")), "uninstall empty dest");
+    assert_refused(&uninstall, Some(Path::new("/")), "uninstall root");
+    assert_refused(&package, Some(Path::new("/")), "package root");
+    assert_refused(&uninstall, Some(&home), "uninstall home");
+    assert_refused(&package, Some(&home), "package home");
+    assert_refused(&uninstall, Some(&repo), "uninstall repo root");
+    assert_refused(&package, Some(&repo), "package repo root");
+    assert_refused(
+        &package,
+        Some(&repo.join("crates")),
+        "package workspace crates dir",
+    );
+    assert_refused(
+        &uninstall,
+        Some(Path::new("greppy-web-dist-relative")),
+        "uninstall relative dest",
+    );
+    assert_refused(
+        &package,
+        Some(&std::env::temp_dir().join("greppy-web-dist-x/../greppy-web-dist-y")),
+        "package dest with ..",
+    );
+
+    let pid = std::process::id();
+    let canary_dir = std::env::temp_dir().join(format!("greppy-web-dist-canary-{pid}"));
+    let _ = std::fs::remove_dir_all(&canary_dir);
+    std::fs::create_dir_all(&canary_dir).unwrap();
+    let canary = canary_dir.join("DO_NOT_DELETE");
+    std::fs::write(&canary, "keep-me").unwrap();
+    let (code, stdout, stderr) = run_script(&package, Some(&canary_dir));
+    assert_ne!(code, 0, "package non-dist dir: stdout={stdout} stderr={stderr}");
+    assert!(canary.exists(), "package deleted canary in {canary_dir:?}");
+    let (code, stdout, stderr) = run_script(&uninstall, Some(&canary_dir));
+    assert_ne!(
+        code, 0,
+        "uninstall non-dist dir: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        canary.exists(),
+        "uninstall deleted canary in {canary_dir:?}"
+    );
+    std::fs::remove_dir_all(&canary_dir).unwrap();
+
+    let real = std::env::temp_dir().join(format!("greppy-web-dist-real-{pid}"));
+    let link = std::env::temp_dir().join(format!("greppy-web-dist-link-{pid}"));
+    let _ = std::fs::remove_dir_all(&real);
+    let _ = std::fs::remove_file(&link);
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (code, stdout, stderr) = run_script(&package, Some(&link));
+    assert_ne!(code, 0, "package symlink: stdout={stdout} stderr={stderr}");
+    assert!(
+        real.exists() && link.exists(),
+        "symlink dest should be refused without following"
+    );
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&real);
+
+    assert!(repo.join("Cargo.toml").exists(), "repo still present");
 }
 
 #[test]
