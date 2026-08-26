@@ -325,6 +325,72 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
     let _ = std::fs::remove_dir_all(&provider_root);
 }
 
+#[test]
+fn greppy_p_aborts_before_model_turn_when_base_preparation_fails() {
+    let repo = unique_temp("base-fail-repo");
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), b"pub fn value() -> usize { 7 }\n").unwrap();
+    git(&repo, &["add", "src/lib.rs"]);
+    git(&repo, &["commit", "-m", "code"]);
+    let store = unique_temp("base-fail-store");
+    let provider_root = unique_temp("base-fail-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, handle) = spawn_stub_gateway();
+
+    let output = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BASE_SUMMARY_FAIL", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "must not reach the model",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "1",
+            "--skip-selfcheck",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn greppy -p");
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "Base failure must abort the agent; stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("shared Base unavailable")
+            && stderr.contains("agent start aborted before the first model call"),
+        "agent failure must identify the fail-closed Base boundary; stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("hi from stub") && !stdout.contains("no changes proposed"),
+        "no model turn or proposal outcome may run after Base failure; stdout={stdout}"
+    );
+    assert!(
+        try_find_file_named(&store, "COMPLETE").is_none(),
+        "failed agent Base preparation must not publish COMPLETE"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&provider_root);
+}
+
 /// F9: leading `-p` is reserved for the agent, but `greppy -e -p X` must reach
 /// the grep passthrough (not the agent interceptor).
 #[test]

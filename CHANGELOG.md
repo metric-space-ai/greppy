@@ -33,6 +33,14 @@ baseline hash, preserves the existing Git index, applies only the agent delta,
 and journals backup/recovery state. Ordinary cherry-pick is not advertised as
 safe for dirty-based proposals.
 
+Agent Base prewarming is now fail-closed as well: a graph, embedding, summary,
+manifest, or publication failure aborts `index --agent-worktree` and `greppy
+-p` before the first model call instead of silently switching to a private
+Store and returning success. Summary inference deterministically bounds very
+large individual source spans while retaining the complete span for cache
+identity and Base-completeness checks. The regression fixture is the exact
+30,716-byte EODAG JSON input that exposed the CUDA prewarm failure.
+
 ## [0.3.3] — 2026-08-25
 
 ### Filesystem-CoW agent workspaces
