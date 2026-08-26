@@ -587,25 +587,76 @@ fn observe_repository(repository: &Path) -> Result<Observation> {
             "--ignore-submodules=dirty",
         ],
     )?;
-    let mut paths = BTreeSet::new();
-    for path in nul_paths(&git_output(
-        repository,
-        &["diff", "--name-only", "-z", "HEAD", "--"],
-    )?)? {
-        paths.insert(path);
-    }
-    for path in nul_paths(&git_output(
-        repository,
-        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
-    )?)? {
-        paths.insert(path);
-    }
+    let paths = porcelain_v2_paths(&status)?;
     Ok(Observation {
         head,
         index_path,
         index_hash: blake3::hash(&index).to_hex().to_string(),
         status_hash: blake3::hash(&status).to_hex().to_string(),
-        dirty_paths: paths.into_iter().collect(),
+        dirty_paths: paths,
+    })
+}
+
+fn porcelain_v2_paths(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut records = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    let mut paths = BTreeSet::new();
+    while let Some(record) = records.next() {
+        match record.first().copied() {
+            Some(b'1') if record.get(1) == Some(&b' ') => {
+                paths.insert(status_path_field(record, 9)?);
+            }
+            Some(b'2') if record.get(1) == Some(&b' ') => {
+                paths.insert(status_path_field(record, 10)?);
+                let original = records.next().ok_or_else(|| Error::Git {
+                    command: "git status --porcelain=v2 -z".into(),
+                    detail: "rename/copy record has no original path".into(),
+                })?;
+                paths.insert(git_path(original)?);
+            }
+            Some(b'?') if record.get(1) == Some(&b' ') => {
+                paths.insert(git_path(&record[2..])?);
+            }
+            Some(b'!') if record.get(1) == Some(&b' ') => {}
+            Some(b'u') if record.get(1) == Some(&b' ') => {
+                return Err(Error::UnsupportedRepository(
+                    "unmerged Git paths are not supported by portable workspaces".into(),
+                ));
+            }
+            _ => {
+                return Err(Error::Git {
+                    command: "git status --porcelain=v2 -z".into(),
+                    detail: "unexpected status record".into(),
+                });
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn status_path_field(record: &[u8], fields: usize) -> Result<String> {
+    let path = record
+        .splitn(fields, |byte| *byte == b' ')
+        .nth(fields - 1)
+        .ok_or_else(|| Error::Git {
+            command: "git status --porcelain=v2 -z".into(),
+            detail: "status record has no path".into(),
+        })?;
+    git_path(path)
+}
+
+fn git_path(path: &[u8]) -> Result<String> {
+    if path.is_empty() {
+        return Err(Error::Git {
+            command: "git status --porcelain=v2 -z".into(),
+            detail: "status record has an empty path".into(),
+        });
+    }
+    String::from_utf8(path.to_vec()).map_err(|_| {
+        Error::UnsupportedRepository(
+            "non-UTF-8 Git paths are not supported by the cross-platform workspace".into(),
+        )
     })
 }
 
@@ -840,6 +891,30 @@ mod tests {
         git(temp.path(), &["add", "."]);
         git(temp.path(), &["commit", "-qm", "base"]);
         temp
+    }
+
+    #[test]
+    fn porcelain_v2_status_is_the_single_dirty_path_inventory() {
+        let status = b"1 .M N... 100644 100644 100644 aaaaaaa bbbbbbb path with space.txt\0\
+2 R. N... 100644 100644 100644 aaaaaaa bbbbbbb R100 renamed.txt\0original.txt\0\
+? untracked file.txt\0";
+        assert_eq!(
+            porcelain_v2_paths(status).unwrap(),
+            [
+                "original.txt",
+                "path with space.txt",
+                "renamed.txt",
+                "untracked file.txt",
+            ]
+        );
+        assert!(porcelain_v2_paths(
+            b"u UU N... 100644 100644 100644 100644 a b c conflicted.txt\0"
+        )
+        .is_err());
+        assert!(porcelain_v2_paths(
+            b"2 R. N... 100644 100644 100644 aaaaaaa bbbbbbb R100 renamed.txt\0"
+        )
+        .is_err());
     }
 
     #[test]
