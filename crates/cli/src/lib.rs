@@ -430,6 +430,7 @@ const SUBCOMMANDS: &[&str] = &[
     "index",
     "where-am-i",
     "cache",
+    "web",
     "trial",
     "stats",
     "diagnostics",
@@ -983,6 +984,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
         }
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
+        "web" => "greppy web status|doctor|run [--json] [--script-file FILE|--script-stdin]",
         _ => return None,
     })
 }
@@ -8201,10 +8203,6 @@ fn command_requests_json(command: Option<&Command>) -> bool {
         | Some(Command::Plus { json, .. })
         | Some(Command::Search { json, .. })
         | Some(Command::Context { json, .. }) => *json,
-        Some(Command::Web {
-            command:
-                WebCommand::Status { json } | WebCommand::Doctor { json } | WebCommand::Run { json, .. },
-        }) => *json,
         _ => false,
     }
 }
