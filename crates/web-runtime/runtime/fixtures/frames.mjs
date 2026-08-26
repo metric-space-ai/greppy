@@ -131,5 +131,6 @@ expectUnsupported("child getByTitle", () => child.getByTitle("brand"));
 expectUnsupported("child getByTestId", () => child.getByTestId("hero"));
 expectUnsupported("child getByLabel", () => child.getByLabel("Name"));
 expectUnsupported("child frameLocator", () => child.frameLocator("iframe"));
+expectUnsupported("child waitForNavigation", () => child.waitForNavigation());
 expectUnsupported("nested FrameLocator.frameLocator", () => page.frameLocator("iframe").frameLocator("iframe"));
 await browser.close();

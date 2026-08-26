@@ -2030,7 +2030,8 @@ fn resolve_script(selector: &serde_json::Value) -> String {
           }}
           function greppyHitTarget(el, rect) {{
             if (rect.width <= 0 || rect.height <= 0) return false;
-            var top = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+            var doc = el.ownerDocument || document;
+            var top = doc.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
             if (!top) return false;
             return el === top || el.contains(top);
           }}

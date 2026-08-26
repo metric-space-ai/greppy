@@ -48,5 +48,21 @@ await download.saveAs(dest);
 const saved = await download.path();
 if (saved !== dest) throw new Error("path after saveAs " + saved);
 if ((await download.failure()) !== null) throw new Error("failure");
+let stream = false;
+try {
+  await download.createReadStream();
+  stream = true;
+} catch (error) {
+  if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
+}
+if (stream) throw new Error("Download.createReadStream must fail closed");
+let deleted = false;
+try {
+  await download.delete();
+  deleted = true;
+} catch (error) {
+  if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
+}
+if (deleted) throw new Error("Download.delete must fail closed");
 await page.setContent("<!DOCTYPE html><html><body><input id='f' type='file'></body></html>");
 await browser.close();

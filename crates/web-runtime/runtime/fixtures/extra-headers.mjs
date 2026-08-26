@@ -26,7 +26,9 @@ await page.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
 const nav = page.waitForNavigation();
 await page.goto(fixtureUrl);
 await nav;
+const frameNav = page.mainFrame().waitForNavigation();
 await page.mainFrame().goto(fixtureUrl);
+await frameNav;
 const text = (await page.locator("body").innerText()).trim();
 if (text !== "HEADER_OK") {
   throw new Error("expected HEADER_OK from extra headers, got " + JSON.stringify(text));

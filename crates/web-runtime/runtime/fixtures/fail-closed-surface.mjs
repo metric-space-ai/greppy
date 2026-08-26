@@ -28,6 +28,9 @@ await page.evaluate(() => console.log("closed-log"));
 
 await expectUnsupported("Selectors.register", () => selectors.register("foo"));
 await expectUnsupported("Page.workers", () => page.workers());
+await expectUnsupported("Page.on websocket", () => page.on("websocket", () => {}));
+await expectUnsupported("Page.on worker", () => page.on("worker", () => {}));
+await expectUnsupported("Page.on crash", () => page.on("crash", () => {}));
 await expectUnsupported("Tracing.group", () => context.tracing.group("g"));
 await expectUnsupported("Tracing.startChunk", () => context.tracing.startChunk());
 await expectUnsupported("Tracing.groupEnd", () => context.tracing.groupEnd());

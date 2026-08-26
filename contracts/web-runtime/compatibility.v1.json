@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 324,
-    "unsupported": 438,
-    "unverified": 592
+    "implemented": 330,
+    "unsupported": 458,
+    "unverified": 566
   },
   "entries": [
     {
@@ -2195,11 +2195,15 @@
       "symbol": "Page.event.close",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "emitted from Page.close; context.close closes remaining pages and therefore emits page close"
+      ]
     },
     {
       "symbol": "Page.event.console",
@@ -2212,28 +2216,37 @@
         "console-messages"
       ],
       "known_differences": [
-        "page.on(console) emits ConsoleMessage {text,type,page} from Servo show_console_message records after evaluate; not Chromium ConsoleMessage.args/location"
+        "page.on(console) emits ConsoleMessage {text,type,page} from Servo show_console_message records after evaluate; not Chromium ConsoleMessage.args/location",
+        "Servo show_console_message records dispatched to page.on('console')"
       ]
     },
     {
       "symbol": "Page.event.crash",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('crash') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.event.dialog",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "native-dialog"
+      ],
+      "known_differences": [
+        "native alert is auto-accepted after diverting Servo ALERT stdout"
+      ]
     },
     {
       "symbol": "Page.event.domcontentloaded",
@@ -2249,21 +2262,29 @@
       "symbol": "Page.event.download",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "waitForEvent('download') returns the recorded binary download"
+      ]
     },
     {
       "symbol": "Page.event.filechooser",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "file-chooser-event"
+      ],
+      "known_differences": [
+        "waitForEvent('filechooser') consumes recorded choosers"
+      ]
     },
     {
       "symbol": "Page.event.frameattached",
@@ -2317,18 +2338,23 @@
       ],
       "known_differences": [
         "waitForEvent(pageerror) returns console.error Errors; not window.onerror",
-        "page.on(pageerror) is emitted from console.error records during _dispatchConsole"
+        "page.on(pageerror) is emitted from console.error records during _dispatchConsole",
+        "console.error records are also emitted as pageerror"
       ]
     },
     {
       "symbol": "Page.event.popup",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "popup-opener"
+      ],
+      "known_differences": [
+        "popup pages are adopted after window.open / target=_blank"
+      ]
     },
     {
       "symbol": "Page.event.request",
@@ -2338,10 +2364,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "network-and-box"
+        "network-and-box",
+        "extra-headers"
       ],
       "known_differences": [
-        "dispatched after goto from retained records, not during the load"
+        "dispatched after goto from retained records, not during the load",
+        "listeners stored and waitForRequest reads Servo load_web_resource records"
       ]
     },
     {
@@ -2368,31 +2396,44 @@
       "symbol": "Page.event.response",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers",
+        "download-and-file"
+      ],
+      "known_differences": [
+        "waitForResponse reads Servo recorded responses after intercept or navigation"
+      ]
     },
     {
       "symbol": "Page.event.websocket",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws unsupported_playwright_operation; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "Page.event.worker",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('worker') throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Frame.addScriptTag",
@@ -3147,9 +3188,12 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers",
+        "frames"
+      ],
       "known_differences": [
         "main-frame only; child frames throw unsupported_playwright_operation"
       ]
@@ -3166,7 +3210,8 @@
         "frames"
       ],
       "known_differences": [
-        "locator.waitFor; child frames use same-origin FrameLocator CSS"
+        "locator.waitFor; child frames use same-origin FrameLocator CSS",
+        "child-frame waitFor/hit-test uses the iframe document elementFromPoint, not the parent composed overlay tree"
       ]
     },
     {
@@ -5492,21 +5537,29 @@
       "symbol": "Worker.event.close",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('worker') throws; Worker events are not emitted."
+      ]
     },
     {
       "symbol": "Worker.event.console",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('worker') throws; Worker events are not emitted."
+      ]
     },
     {
       "symbol": "JSHandle.asElement",
@@ -9834,21 +9887,29 @@
       "symbol": "Download.createReadStream",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "Download.createReadStream is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Download.delete",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "Download.delete is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Download.failure",
@@ -11803,131 +11864,183 @@
       "symbol": "WebSocket.addListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.isClosed",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.off",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.on",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.once",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.prependListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.removeListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.waitForEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket objects are not created."
+      ]
     },
     {
       "symbol": "WebSocket.event.close",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket events are not emitted."
+      ]
     },
     {
       "symbol": "WebSocket.event.framereceived",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket events are not emitted."
+      ]
     },
     {
       "symbol": "WebSocket.event.framesent",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket events are not emitted."
+      ]
     },
     {
       "symbol": "WebSocket.event.socketerror",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "page.on('websocket') throws; WebSocket events are not emitted."
+      ]
     },
     {
       "symbol": "WebStorage.clear",
@@ -16251,8 +16364,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 899,
-    "unsupported": 438,
+    "unverified": 879,
+    "unsupported": 458,
     "passing": 17
   }
 }

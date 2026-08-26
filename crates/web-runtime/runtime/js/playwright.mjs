@@ -1986,6 +1986,7 @@ class Page {
   async close() {
     await engineCall("page.close", { page: this._id });
     this._closed = true;
+    this._emit("close", this);
   }
 
   async isClosed() {
@@ -2042,6 +2043,12 @@ class Page {
       }
       return unsupported("Page.waitForEvent.pageerror.empty")();
     }
+    if (event === "close") {
+      if (this._closed) return this;
+      return new Promise((resolve) => {
+        this.once("close", () => resolve(this));
+      });
+    }
     return unsupported(`Page.waitForEvent.${event}`)();
   }
 
@@ -2072,7 +2079,8 @@ class Page {
       event === "download" ||
       event === "popup" ||
       event === "console" ||
-      event === "pageerror"
+      event === "pageerror" ||
+      event === "close"
     ) {
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);
