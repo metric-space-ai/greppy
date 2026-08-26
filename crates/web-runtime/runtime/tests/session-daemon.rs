@@ -2,6 +2,7 @@
 
 use greppy_web_client::{unix_request, Request, SCHEMA};
 use serde_json::json;
+use std::collections::HashSet;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
+const SOCKET_WAIT: Duration = Duration::from_secs(60);
+const PROCESS_GROUP_WAIT: Duration = Duration::from_secs(15);
 
 fn supervisor_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -19,15 +22,28 @@ fn supervisor_lock() -> &'static Mutex<()> {
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
+    wait_for_accepting(path, timeout, None);
+}
+
+fn wait_for_accepting(path: &Path, timeout: Duration, mut child: Option<&mut Child>) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if UnixStream::connect(path).is_ok() {
             return;
         }
+        if let Some(child) = child.as_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!(
+                    "supervisor exited {status} before socket {} accepted connections",
+                    path.display()
+                );
+            }
+        }
         thread::sleep(Duration::from_millis(20));
     }
+    let pid = child.as_ref().map(|child| child.id());
     panic!(
-        "supervisor socket {} was not accepting connections within {timeout:?}",
+        "supervisor socket {} was not accepting connections within {timeout:?} (pid {pid:?})",
         path.display()
     );
 }
@@ -40,14 +56,64 @@ fn process_group_pids(pgid: u32) -> Vec<u32> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.trim().parse().ok())
-        .filter(|pid| *pid != pgid)
         .collect()
+}
+
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if pid != root {
+            out.push(pid);
+        }
+        stack.extend(child_pids(pid));
+    }
+    out
+}
+
+fn wait_pids_gone(pids: &[u32], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let leftover: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| pid_alive(*pid))
+            .collect();
+        if leftover.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            for pid in &leftover {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            thread::sleep(Duration::from_millis(50));
+            let leftover: Vec<u32> = leftover
+                .iter()
+                .copied()
+                .filter(|pid| pid_alive(*pid))
+                .collect();
+            if leftover.is_empty() {
+                return;
+            }
+            panic!("supervisor worker pids still alive: {leftover:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_process_group_gone(pgid: u32, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let leftover = process_group_pids(pgid);
+        let leftover: Vec<u32> = process_group_pids(pgid)
+            .into_iter()
+            .filter(|pid| *pid != pgid)
+            .collect();
         if leftover.is_empty() {
             return;
         }
@@ -56,7 +122,10 @@ fn wait_process_group_gone(pgid: u32, timeout: Duration) {
                 .args(["-KILL", &format!("-{pgid}")])
                 .status();
             thread::sleep(Duration::from_millis(50));
-            let leftover = process_group_pids(pgid);
+            let leftover: Vec<u32> = process_group_pids(pgid)
+                .into_iter()
+                .filter(|pid| *pid != pgid)
+                .collect();
             if leftover.is_empty() {
                 return;
             }
@@ -95,6 +164,7 @@ fn arm_deadline(label: &'static str) -> Deadline {
 
 struct Supervisor {
     child: Child,
+    socket: PathBuf,
     _deadline: Deadline,
     kill_group: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -103,16 +173,27 @@ struct Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         let pid = self.child.id();
+        let mut tracked = descendant_pids(pid);
+        tracked.push(pid);
         if self.kill_group {
             let _ = Command::new("kill")
                 .args(["-KILL", &format!("-{pid}")])
                 .status();
+            for extra in &tracked {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &extra.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if self.kill_group {
-            wait_process_group_gone(pid, Duration::from_secs(5));
+            wait_pids_gone(&tracked, PROCESS_GROUP_WAIT);
+            wait_process_group_gone(pid, Duration::from_secs(2));
         }
+        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
@@ -137,12 +218,15 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let child = command.spawn().expect("spawn supervisor daemon");
-        Self {
+        let mut supervisor = Self {
             child,
+            socket: socket.to_path_buf(),
             _deadline: arm_deadline("supervisor"),
             kill_group: true,
             _lock: lock,
-        }
+        };
+        wait_for_accepting(&supervisor.socket, SOCKET_WAIT, Some(&mut supervisor.child));
+        supervisor
     }
 
     fn kill_leader_only(&mut self) {
@@ -2592,8 +2676,10 @@ fn run_named_fixture(name: &str, run_id: &str) {
 
 #[test]
 fn sequential_named_fixtures_do_not_leave_a_dead_supervisor() {
-    // Proportional reproduction of: one fixture exits, the next must bind a
-    // fresh supervisor without waiting 30s for a leftover Servo worker.
+    // Supervisor-observed flake: getby_options passed, then an isolated
+    // locator_click actionability run missed the Unix socket for 30s because
+    // leftover Servo workers were still dying. Reap descendants, wait until
+    // the socket accepts, and require the same back-to-back sequence here.
     run_named_fixture("locator-options.mjs", "run_seq1");
     run_named_fixture("actionability.mjs", "run_seq2");
 }
