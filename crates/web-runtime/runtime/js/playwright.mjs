@@ -375,6 +375,28 @@ class Locator {
     });
   }
 
+  filter(options = {}) {
+    return new Locator(this._page, {
+      type: "filter",
+      hasText: options.hasText != null ? String(options.hasText) : null,
+      scope: this._selector,
+    });
+  }
+
+  async scrollIntoViewIfNeeded() {
+    await engineCall("locator.scrollIntoViewIfNeeded", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
+  async selectText() {
+    await engineCall("locator.selectText", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
   async all() {
     const n = await this.count();
     const locators = [];
@@ -472,6 +494,18 @@ class Frame {
 
   async waitForSelector(selector) {
     await this.locator(selector).waitFor();
+  }
+
+  hover(selector) {
+    return this.locator(selector).hover();
+  }
+
+  check(selector) {
+    return this.locator(selector).check();
+  }
+
+  isVisible(selector) {
+    return this.locator(selector).isVisible();
   }
 }
 
@@ -894,6 +928,21 @@ class Page {
   async workers() {
     return [];
   }
+
+  async pause() {}
+
+  async setExtraHTTPHeaders() {}
+
+  async dragAndDrop(source, target) {
+    await this.locator(source).hover();
+    await this.locator(target).hover();
+  }
+
+  touchscreen = {
+    tap: async (x, y) => {
+      await this.mouse.click(x, y);
+    },
+  };
 
   async route(url, handler) {
     const route = {

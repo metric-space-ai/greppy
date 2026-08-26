@@ -1602,3 +1602,21 @@ fn nested_locators_tap_and_empty_workers() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn locator_filter_has_text_and_scroll() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-filter-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_filter", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("filter-scroll.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_filter",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

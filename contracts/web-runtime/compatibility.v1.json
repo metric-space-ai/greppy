@@ -39,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 160,
+    "implemented": 170,
     "unsupported": 243,
-    "unverified": 951
+    "unverified": 941
   },
   "entries": [
     {
@@ -274,11 +274,13 @@
       "symbol": "Page.dragAndDrop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "hover source then hover target; not HTML5 drag events"
+      ]
     },
     {
       "symbol": "Page.emulateMedia",
@@ -812,11 +814,15 @@
       "symbol": "Page.pause",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "no-op; no Playwright inspector"
+      ]
     },
     {
       "symbol": "Page.pdf",
@@ -1048,11 +1054,15 @@
       "symbol": "Page.setExtraHTTPHeaders",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "accepted and ignored; not attached to Servo requests"
+      ]
     },
     {
       "symbol": "Page.setInputFiles",
@@ -2246,11 +2256,13 @@
       "symbol": "Frame.check",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to frame.locator().check"
+      ]
     },
     {
       "symbol": "Frame.childFrames",
@@ -2486,11 +2498,15 @@
       "symbol": "Frame.hover",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "delegates to frame.locator().hover"
+      ]
     },
     {
       "symbol": "Frame.innerHTML",
@@ -2588,11 +2604,15 @@
       "symbol": "Frame.isVisible",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "delegates to frame.locator().isVisible"
+      ]
     },
     {
       "symbol": "Frame.locator",
@@ -5825,11 +5845,15 @@
       "symbol": "Locator.filter",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "hasText substring only; has/hasNot locators are not implemented"
+      ]
     },
     {
       "symbol": "Locator.first",
@@ -6239,11 +6263,15 @@
       "symbol": "Locator.scrollIntoViewIfNeeded",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "Element.scrollIntoView(); no visibility check"
+      ]
     },
     {
       "symbol": "Locator.selectOption",
@@ -6264,11 +6292,15 @@
       "symbol": "Locator.selectText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "filter-scroll"
+      ],
+      "known_differences": [
+        "HTMLInputElement.select or setSelectionRange"
+      ]
     },
     {
       "symbol": "Locator.setChecked",
@@ -10023,11 +10055,13 @@
       "symbol": "Touchscreen.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "alias of mouse.click"
+      ]
     },
     {
       "symbol": "Tracing.group",

@@ -788,6 +788,18 @@ impl ContentEngine {
                 JSValue::Boolean(value) => Ok(json!({ "editable": value })),
                 _ => Ok(json!({ "editable": false })),
             },
+            "locator.scrollIntoViewIfNeeded" => {
+                self.locator_eval(&params, "nodes[0].scrollIntoView(); return true")?;
+                Ok(json!({}))
+            }
+            "locator.selectText" => {
+                self.locator_eval(
+                    &params,
+                    "if (nodes[0].select) { nodes[0].select(); } else if (nodes[0].setSelectionRange && typeof nodes[0].value === 'string') { nodes[0].setSelectionRange(0, nodes[0].value.length); } return true",
+                )?;
+                Ok(json!({}))
+            }
+            "page.setExtraHTTPHeaders" => Ok(json!({})),
             "page.addScriptTag" => {
                 let page_id = required_str(&params, "page")?;
                 let content = params
@@ -1324,9 +1336,25 @@ function greppyResolveIn(root, selector) {
     const attr = selector.attr || 'data-testid';
     return pool.filter((el) => (el.getAttribute(attr) || '') === selector.name);
   }
+  if (selector.type === 'filter') {
+    return pool;
+  }
   return [];
 }
 function greppyResolveNodes(selector) {
+  if (selector.type === 'filter') {
+    let nodes = greppyResolveNodes(selector.scope);
+    if (selector.hasText) {
+      const wanted = String(selector.hasText);
+      nodes = nodes.filter((el) => ((el.innerText || el.textContent || '') + '').indexOf(wanted) !== -1);
+    }
+    if (selector.nth != null) {
+      const idx = selector.nth < 0 ? nodes.length + selector.nth : selector.nth;
+      const el = nodes[idx];
+      return el ? [el] : [];
+    }
+    return nodes;
+  }
   let roots = [document];
   if (selector.scope) {
     roots = greppyResolveNodes(selector.scope);
