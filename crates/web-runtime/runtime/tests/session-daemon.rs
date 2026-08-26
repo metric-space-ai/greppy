@@ -2,25 +2,68 @@
 
 use greppy_web_client::{unix_request, Request, SCHEMA};
 use serde_json::json;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 
+fn supervisor_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn wait_for_socket(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if path.exists() {
+        if UnixStream::connect(path).is_ok() {
             return;
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("supervisor socket {} was not created", path.display());
+    panic!(
+        "supervisor socket {} was not accepting connections within {timeout:?}",
+        path.display()
+    );
+}
+
+fn process_group_pids(pgid: u32) -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-g", &pgid.to_string()])
+        .output()
+        .expect("pgrep -g");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .filter(|pid| *pid != pgid)
+        .collect()
+}
+
+fn wait_process_group_gone(pgid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let leftover = process_group_pids(pgid);
+        if leftover.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{pgid}")])
+                .status();
+            thread::sleep(Duration::from_millis(50));
+            let leftover = process_group_pids(pgid);
+            if leftover.is_empty() {
+                return;
+            }
+            panic!("supervisor process group {pgid} still alive: {leftover:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 struct Deadline(Arc<AtomicBool>);
@@ -54,6 +97,7 @@ struct Supervisor {
     child: Child,
     _deadline: Deadline,
     kill_group: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for Supervisor {
@@ -66,6 +110,9 @@ impl Drop for Supervisor {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if self.kill_group {
+            wait_process_group_gone(pid, Duration::from_secs(5));
+        }
     }
 }
 
@@ -86,11 +133,15 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
+        let lock = supervisor_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let child = command.spawn().expect("spawn supervisor daemon");
         Self {
             child,
             _deadline: arm_deadline("supervisor"),
             kill_group: true,
+            _lock: lock,
         }
     }
 
@@ -2532,6 +2583,14 @@ fn run_named_fixture(name: &str, run_id: &str) {
         Duration::from_secs(60),
     );
     assert_eq!(ran.status, "ok", "{name}: {ran:?}");
+}
+
+#[test]
+fn sequential_named_fixtures_do_not_leave_a_dead_supervisor() {
+    // Proportional reproduction of: one fixture exits, the next must bind a
+    // fresh supervisor without waiting 30s for a leftover Servo worker.
+    run_named_fixture("locator-options.mjs", "run_seq1");
+    run_named_fixture("actionability.mjs", "run_seq2");
 }
 
 #[test]

@@ -31,9 +31,15 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     let _ = std::fs::remove_file(&config.socket);
     let mut daemon = Daemon::start(config)?;
     let listener = UnixListener::bind(&daemon.socket)?;
+    // A closed probe connection or a single malformed client must not take
+    // down the supervisor; leftover-worker flakes showed up as "socket never
+    // created" when this loop exited.
     for connection in listener.incoming() {
-        let stream = connection?;
-        serve_connection(stream, |request| daemon.handle(request)).map_err(io::Error::other)?;
+        let stream = match connection {
+            Ok(stream) => stream,
+            Err(_) => continue,
+        };
+        let _ = serve_connection(stream, |request| daemon.handle(request));
     }
     Ok(())
 }
