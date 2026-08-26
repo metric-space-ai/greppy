@@ -684,6 +684,13 @@ class Page {
     return this.locator(selector).uncheck();
   }
 
+  async setChecked(selector, checked) {
+    if (checked) {
+      return this.locator(selector).check();
+    }
+    return this.locator(selector).uncheck();
+  }
+
   selectOption(selector, value) {
     return this.locator(selector).selectOption(value);
   }
@@ -1101,6 +1108,36 @@ class Page {
       type: () => rec.type || "log",
       text: () => rec.text || "",
     }));
+  }
+
+  async clearConsoleMessages() {
+    await engineCall("page.clearConsoleMessages", { page: this._id });
+    this._consoleSeen = 0;
+  }
+
+  async requests() {
+    const result = await engineCall("page.requests", { page: this._id });
+    return (result.requests || []).map((rec) => this._requestFromRecord(rec));
+  }
+
+  opener() {
+    return null;
+  }
+
+  async unroute(url) {
+    await engineCall("page.unroute", { page: this._id, pattern: String(url) });
+  }
+
+  async unrouteAll() {
+    await engineCall("page.unrouteAll", { page: this._id });
+  }
+
+  async routeFromHAR() {
+    return unsupported("Page.routeFromHAR")();
+  }
+
+  async routeWebSocket() {
+    return unsupported("Page.routeWebSocket")();
   }
 
   async emulateMedia() {

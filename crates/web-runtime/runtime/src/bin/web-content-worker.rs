@@ -1007,6 +1007,11 @@ impl ContentEngine {
                     "messages": self.page(&page_id)?.1.last_console.borrow().clone()
                 }))
             }
+            "page.clearConsoleMessages" => {
+                let page_id = required_str(&params, "page")?;
+                self.page(&page_id)?.1.last_console.borrow_mut().clear();
+                Ok(json!({}))
+            }
             "page.fileChoosers" => {
                 let page_id = required_str(&params, "page")?;
                 let consume = params
@@ -1045,6 +1050,21 @@ impl ContentEngine {
                     action,
                     body,
                 });
+                Ok(json!({}))
+            }
+            "page.unroute" => {
+                let page_id = required_str(&params, "page")?;
+                let pattern = required_str(&params, "pattern")?;
+                self.page(&page_id)?
+                    .1
+                    .routes
+                    .borrow_mut()
+                    .retain(|rule| rule.pattern != pattern);
+                Ok(json!({}))
+            }
+            "page.unrouteAll" => {
+                let page_id = required_str(&params, "page")?;
+                self.page(&page_id)?.1.routes.borrow_mut().clear();
                 Ok(json!({}))
             }
             "page.setInputFiles" => {

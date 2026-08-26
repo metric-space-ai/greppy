@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 188,
-    "unsupported": 275,
-    "unverified": 891
+    "implemented": 194,
+    "unsupported": 277,
+    "unverified": 883
   },
   "entries": [
     {
@@ -164,11 +164,15 @@
       "symbol": "Page.clearConsoleMessages",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "clears Servo show_console_message records"
+      ]
     },
     {
       "symbol": "Page.clearPageErrors",
@@ -824,11 +828,15 @@
       "symbol": "Page.opener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "always null; popup opener is not wired"
+      ]
     },
     {
       "symbol": "Page.pageErrors",
@@ -922,9 +930,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "console-messages"
+      ],
       "known_differences": [
         "clears in-memory handler lists; not Node EventEmitter"
       ]
@@ -967,11 +977,15 @@
       "symbol": "Page.requests",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "returns recorded WebResourceRequest objects, not Playwright Request events"
+      ]
     },
     {
       "symbol": "Page.route",
@@ -993,21 +1007,25 @@
       "symbol": "Page.routeFromHAR",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "HAR replay is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.routeWebSocket",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "WebSocket routing is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.screenshot",
@@ -1042,11 +1060,15 @@
       "symbol": "Page.setChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "check-select"
+      ],
+      "known_differences": [
+        "check() if true else uncheck(); no force/trial options"
+      ]
     },
     {
       "symbol": "Page.setContent",
@@ -1200,21 +1222,27 @@
       "symbol": "Page.unroute",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "removes RouteRule entries with exact pattern string match"
+      ]
     },
     {
       "symbol": "Page.unrouteAll",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "clears all RouteRule entries"
+      ]
     },
     {
       "symbol": "Page.url",
@@ -14902,8 +14930,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1071,
-    "unsupported": 275,
+    "unverified": 1069,
+    "unsupported": 277,
     "passing": 8
   }
 }

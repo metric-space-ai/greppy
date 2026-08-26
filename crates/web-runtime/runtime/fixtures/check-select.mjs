@@ -19,4 +19,12 @@ const unchecked = await page.evaluate(() => document.querySelector("#c").checked
 if (unchecked) {
   throw new Error("uncheck failed");
 }
+await page.setChecked("#c", true);
+if (!(await page.evaluate(() => document.querySelector("#c").checked))) {
+  throw new Error("setChecked true failed");
+}
+await page.setChecked("#c", false);
+if (await page.evaluate(() => document.querySelector("#c").checked)) {
+  throw new Error("setChecked false failed");
+}
 await browser.close();

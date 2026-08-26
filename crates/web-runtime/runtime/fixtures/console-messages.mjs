@@ -18,4 +18,7 @@ if (!texts.some((text) => String(text).includes("hello-console")) && !seen.some(
 }
 page.off("console", handler);
 page.removeAllListeners("console");
+await page.clearConsoleMessages();
+const after = await page.consoleMessages();
+if (after.length !== 0) throw new Error("clearConsoleMessages left " + after.length);
 await browser.close();
