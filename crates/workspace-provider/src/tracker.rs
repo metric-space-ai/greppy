@@ -90,51 +90,61 @@ fn build_watcher(
     let git_dir = git_dir.to_path_buf();
     let armed = Arc::new(AtomicBool::new(false));
     let callback_armed = armed.clone();
-    let watcher =
-        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+    let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        match event {
             Ok(_) if !callback_armed.load(Ordering::Acquire) => {
                 // Successful events emitted while watch roots are being installed
                 // are covered by the first full double-capture after activation.
             }
-            Ok(event) => {
-                let paths = event
-                    .paths
-                    .iter()
-                    .map(|path| relative_utf8(&repository, &git_dir, path))
-                    .collect::<Result<Vec<_>, _>>();
-                match paths {
-                    Ok(paths) if !paths.is_empty() => {
-                        if let Err(error) =
-                            core.record_repository_changes(&repository, &paths, now_ms())
-                        {
-                            mark_tracker_gap(
-                                &core,
-                                &repository,
-                                &format!("cannot record watcher event: {error}"),
-                            );
-                        }
-                    }
-                    Ok(_) => {
+            event => handle_armed_event(&core, &repository, &git_dir, event),
+        }
+    })?;
+    Ok((watcher, armed))
+}
+
+fn handle_armed_event(
+    core: &WorkspaceCore,
+    repository: &Path,
+    git_dir: &Path,
+    event: notify::Result<notify::Event>,
+) {
+    match event {
+        Ok(event) if event.kind.is_access() => {
+            // notify defines every Access variant as non-mutating. Linux emits
+            // noisy open/close-read events for Git's tree scans, including an
+            // event naming the watched repository root itself. These are not
+            // repository changes and must not advance or invalidate the
+            // generation-bound mutation journal.
+        }
+        Ok(event) => {
+            let paths = event
+                .paths
+                .iter()
+                .map(|path| relative_utf8(repository, git_dir, path))
+                .collect::<Result<Vec<_>, _>>();
+            match paths {
+                Ok(paths) if !paths.is_empty() => {
+                    if let Err(error) = core.record_repository_changes(repository, &paths, now_ms())
+                    {
                         mark_tracker_gap(
-                            &core,
-                            &repository,
-                            "watcher emitted an event without paths",
+                            core,
+                            repository,
+                            &format!("cannot record watcher event: {error}"),
                         );
                     }
-                    Err(detail) => {
-                        mark_tracker_gap(&core, &repository, &detail);
-                    }
+                }
+                Ok(_) => {
+                    mark_tracker_gap(core, repository, "watcher emitted an event without paths");
+                }
+                Err(detail) => {
+                    mark_tracker_gap(core, repository, &detail);
                 }
             }
-            Err(error) => {
-                mark_tracker_gap(
-                    &core,
-                    &repository,
-                    &format!("watcher backend error: {error}"),
-                );
-            }
-        })?;
-    Ok((watcher, armed))
+        }
+        Err(error) => {
+            mark_tracker_gap(core, repository, &format!("watcher backend error: {error}"));
+        }
+    }
 }
 
 fn mark_tracker_gap(core: &WorkspaceCore, repository: &Path, detail: &str) {
@@ -303,5 +313,45 @@ mod tests {
         assert!(core
             .activate_repository_tracker(&repository, now_ms())
             .is_err());
+    }
+
+    #[test]
+    fn access_events_do_not_mutate_or_invalidate_the_tracker() {
+        use notify::event::{AccessKind, AccessMode, ModifyKind};
+        use notify::{Event, EventKind};
+
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let git_dir = repository.join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+        let active = core
+            .activate_repository_tracker(&repository, now_ms())
+            .unwrap();
+
+        let read = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(repository.clone());
+        handle_armed_event(&core, &repository, &git_dir, Ok(read));
+        let after_read = core
+            .repository_tracker_status(&repository)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_read.state, RepositoryTrackerState::Active);
+        assert_eq!(after_read.epoch, active.epoch);
+        assert_eq!(after_read.generation, active.generation);
+
+        let mutation = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(repository.clone());
+        handle_armed_event(&core, &repository, &git_dir, Ok(mutation));
+        let after_mutation = core
+            .repository_tracker_status(&repository)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_mutation.state, RepositoryTrackerState::Gap);
+        assert_eq!(
+            after_mutation.detail.as_deref(),
+            Some("watcher reported the repository root without a child path")
+        );
     }
 }
