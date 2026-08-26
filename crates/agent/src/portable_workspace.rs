@@ -5,9 +5,10 @@
 //! repository and before any model request can be made.
 
 use greppy_workspace_core::{
-    capture_overlay_directory, capture_repository, capture_repository_incremental, BaselineEntry,
-    BaselineSnapshot, ChunkStore, EntryKind, ProviderInstallation, RepositoryTrackerState,
-    WorkspaceCore, WorkspaceHandle, WorkspacePairLease,
+    capture_overlay_directory, capture_repository, capture_repository_incremental,
+    capture_repository_with_observer, BaselineEntry, BaselineSnapshot, ChunkStore, EntryKind,
+    ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
+    WorkspacePairLease,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -183,7 +184,7 @@ impl AgentWorkspace {
         recover_apply_journals(&core)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
         let (baseline, captured_snapshot_owns_chunks) =
-            capture_tracked_repository(repo_root, &core)?;
+            capture_tracked_repository(repo_root, &core, run_id, started)?;
         trace_workspace_phase(run_id, "snapshot-captured", started);
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
@@ -514,13 +515,17 @@ fn trace_workspace_phase(run_id: &str, phase: &str, started: Instant) {
 fn capture_tracked_repository(
     repository: &Path,
     core: &WorkspaceCore,
+    run_id: &str,
+    started: Instant,
 ) -> Result<(BaselineSnapshot, bool), WorkspaceError> {
     let repository = fs::canonicalize(repository)?;
     core.request_repository_tracker(&repository)?;
+    trace_workspace_phase(run_id, "tracker-requested", started);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let active = loop {
         if let Some(status) = core.repository_tracker_status(&repository)? {
             if status.state == RepositoryTrackerState::Active {
+                trace_workspace_phase(run_id, "tracker-active", started);
                 break status;
             }
             if status.state == RepositoryTrackerState::Gap {
@@ -540,8 +545,11 @@ fn capture_tracked_repository(
         thread::sleep(Duration::from_millis(20));
     };
 
+    trace_workspace_phase(run_id, "tracker-fence-start", started);
     let fenced_generation = repository_tracker_fence(&repository, core, active.epoch)?;
+    trace_workspace_phase(run_id, "tracker-fence-complete", started);
     if let Some(mut cached) = core.cached_repository_snapshot(&repository, active.epoch)? {
+        trace_workspace_phase(run_id, "cached-snapshot-found", started);
         let cached_generation = cached.tracker_generation.ok_or_else(|| {
             WorkspaceError::AdapterUnavailable("cached baseline has no tracker generation".into())
         })?;
@@ -601,7 +609,10 @@ fn capture_tracked_repository(
                 "repository tracker restarted before snapshot capture".into(),
             ));
         }
-        let mut baseline = capture_repository(&repository, core.chunks())?;
+        let mut baseline = capture_repository_with_observer(&repository, core.chunks(), |phase| {
+            trace_workspace_phase(run_id, phase, started)
+        })?;
+        trace_workspace_phase(run_id, "full-snapshot-captured", started);
         let after = core
             .repository_tracker_status(&repository)?
             .ok_or_else(|| {

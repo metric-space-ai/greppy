@@ -59,13 +59,25 @@ struct Observation {
 /// state. Ignored files are deliberately absent. The complete observation and
 /// every captured path are verified a second time; one retry is allowed.
 pub fn capture_repository(repo: impl AsRef<Path>, store: &ChunkStore) -> Result<BaselineSnapshot> {
+    capture_repository_with_observer(repo, store, |_| {})
+}
+
+pub fn capture_repository_with_observer(
+    repo: impl AsRef<Path>,
+    store: &ChunkStore,
+    mut observe_phase: impl FnMut(&'static str),
+) -> Result<BaselineSnapshot> {
     let repository = repository_root(repo.as_ref())?;
+    observe_phase("snapshot-preflight-start");
     preflight_repository(&repository)?;
+    observe_phase("snapshot-preflight-complete");
 
     for attempt in 0..2 {
+        observe_phase("snapshot-first-observation-start");
         let first = observe_repository(&repository)?;
+        observe_phase("snapshot-first-observation-complete");
         let mut pinned = Vec::new();
-        let result = capture_once(&repository, store, &first, &mut pinned);
+        let result = capture_once(&repository, store, &first, &mut pinned, &mut observe_phase);
         match result {
             Ok(snapshot) => return Ok(snapshot),
             Err(Error::ConcurrentRepositoryMutation) if attempt == 0 => {
@@ -204,7 +216,9 @@ fn capture_once(
     store: &ChunkStore,
     first: &Observation,
     pinned: &mut Vec<ChunkId>,
+    observe_phase: &mut impl FnMut(&'static str),
 ) -> Result<BaselineSnapshot> {
+    observe_phase("snapshot-dirty-entries-start");
     let mut entries = Vec::with_capacity(first.dirty_paths.len());
     for relative in &first.dirty_paths {
         let entry = capture_entry(repository, relative, store)?;
@@ -214,7 +228,9 @@ fn capture_once(
         }
         entries.push(entry);
     }
+    observe_phase("snapshot-dirty-entries-complete");
 
+    observe_phase("snapshot-index-capture-start");
     let index_bytes = match fs::read(&first.index_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -225,11 +241,15 @@ fn capture_once(
         store.pin(*id)?;
         pinned.push(*id);
     }
+    observe_phase("snapshot-index-capture-complete");
 
+    observe_phase("snapshot-second-observation-start");
     let second = observe_repository(repository)?;
+    observe_phase("snapshot-second-observation-complete");
     if &second != first {
         return Err(Error::ConcurrentRepositoryMutation);
     }
+    observe_phase("snapshot-fingerprint-verification-start");
     for expected in &entries {
         let actual = fingerprint_entry(repository, &expected.path)?;
         if actual.kind != expected.kind
@@ -240,6 +260,7 @@ fn capture_once(
             return Err(Error::ConcurrentRepositoryMutation);
         }
     }
+    observe_phase("snapshot-fingerprint-verification-complete");
 
     // The baseline identity is content-derived rather than dependent on Git's
     // porcelain serialization. Full and journal-incremental captures must
@@ -928,7 +949,27 @@ mod tests {
         fs::write(repo.path().join("ignored/cache"), "cache\n").unwrap();
         let store_root = tempfile::tempdir().unwrap();
         let store = ChunkStore::open(store_root.path()).unwrap();
-        let snapshot = capture_repository(repo.path(), &store).unwrap();
+        let mut phases = Vec::new();
+        let snapshot =
+            capture_repository_with_observer(repo.path(), &store, |phase| phases.push(phase))
+                .unwrap();
+        assert_eq!(
+            phases,
+            [
+                "snapshot-preflight-start",
+                "snapshot-preflight-complete",
+                "snapshot-first-observation-start",
+                "snapshot-first-observation-complete",
+                "snapshot-dirty-entries-start",
+                "snapshot-dirty-entries-complete",
+                "snapshot-index-capture-start",
+                "snapshot-index-capture-complete",
+                "snapshot-second-observation-start",
+                "snapshot-second-observation-complete",
+                "snapshot-fingerprint-verification-start",
+                "snapshot-fingerprint-verification-complete",
+            ]
+        );
         let names: Vec<_> = snapshot
             .entries
             .iter()

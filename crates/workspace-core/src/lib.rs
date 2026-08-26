@@ -28,6 +28,6 @@ pub use repository_tracker::{
     RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,
 };
 pub use snapshot::{
-    capture_overlay_directory, capture_repository, capture_repository_incremental, BaselineEntry,
-    BaselineSnapshot, EntryKind,
+    capture_overlay_directory, capture_repository, capture_repository_incremental,
+    capture_repository_with_observer, BaselineEntry, BaselineSnapshot, EntryKind,
 };
