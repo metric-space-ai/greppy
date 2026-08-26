@@ -201,7 +201,7 @@ jobs:
           done
           mountpoint -q "$mount"
           hardware="$(lscpu | tr '\n' ';')"
-          target/release/examples/release_performance \
+          timeout --signal=TERM --kill-after=15s 8m target/release/examples/release_performance \
             --repository "$RUNNER_TEMP/greppy-cow-perf-repo" \
             --data-root "$data" \
             --probe-path files/000/000000.txt \

@@ -117,6 +117,11 @@ fn main() {
 
     // Prime the complete production lifecycle: tracker activation and fence,
     // full Base/Dirty import, shared Git layer and mounted visibility.
+    write_checkpoint(
+        &args.output,
+        "cold-prime-started",
+        serde_json::json!({"source_commit": args.source_commit}),
+    );
     let cold_prime_started = Instant::now();
     let previous_trace_dir = std::env::var_os("GREPPY_WORKSPACE_PHASE_TRACE_DIR");
     if let Some(path) = &args.phase_trace_dir {
@@ -146,6 +151,11 @@ fn main() {
         }),
     );
 
+    write_checkpoint(
+        &args.output,
+        "untouched-space-started",
+        serde_json::json!({"cold_prime_ms": cold_prime_ms}),
+    );
     let physical_before = allocated_tree_bytes(&args.data_root);
     let untouched = AgentWorkspace::create(&args.repository, "perf-untouched").unwrap();
     let untouched_root = untouched.worktree_path();
@@ -162,6 +172,11 @@ fn main() {
         serde_json::json!({"untouched_physical_delta_bytes": untouched_physical_delta}),
     );
 
+    write_checkpoint(
+        &args.output,
+        "serial-workspaces-started",
+        serde_json::json!({"iterations": args.iterations}),
+    );
     let mut visible_ms = Vec::with_capacity(args.iterations);
     let mut end_to_end_ms = Vec::with_capacity(args.iterations);
     for iteration in 0..args.iterations {
@@ -184,6 +199,11 @@ fn main() {
         serde_json::json!({"measurement": "AgentWorkspace::create through tracker fence, cached baseline, private Git state and mounted visibility", "visible_ms": &visible_ms, "end_to_end_ms": &end_to_end_ms}),
     );
 
+    write_checkpoint(
+        &args.output,
+        "parallel-workspaces-started",
+        serde_json::json!({"workspaces": args.parallel}),
+    );
     let parallel_started = Instant::now();
     let parallel_owner = AgentWorkspace::create(&args.repository, "perf-parallel-owner").unwrap();
     let owner_root = parallel_owner.worktree_path();
@@ -222,6 +242,11 @@ fn main() {
         serde_json::json!({"workspaces": args.parallel, "wall_ms": parallel_ms}),
     );
 
+    write_checkpoint(
+        &args.output,
+        "native-git-worktrees-started",
+        serde_json::json!({"iterations": args.native_baseline_iterations}),
+    );
     let (native_worktree_ms, native_worktree_physical_bytes) = measure_native_worktrees(
         &args.repository,
         &args.native_baseline_root,
@@ -236,6 +261,11 @@ fn main() {
         }),
     );
 
+    write_checkpoint(
+        &args.output,
+        "one-byte-write-started",
+        serde_json::json!({"chunk_size": CHUNK_SIZE}),
+    );
     let large_path = args.repository.join(".greppy-perf-large.bin");
     if large_path.exists() {
         fail("fixture unexpectedly contains .greppy-perf-large.bin");
@@ -274,6 +304,11 @@ fn main() {
         }),
     );
 
+    write_checkpoint(
+        &args.output,
+        "toolchains-started",
+        serde_json::json!({"cases": args.toolchain_cases.len()}),
+    );
     let toolchains = args
         .toolchain_cases
         .iter()
