@@ -14,7 +14,7 @@ use std::io;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct DaemonConfig {
     pub socket: PathBuf,
@@ -51,6 +51,7 @@ struct Daemon {
     sessions: HashMap<String, Session>,
     next_engine_id: AtomicU64,
     last_crash: Option<String>,
+    crash_receipts: Vec<serde_json::Value>,
     last_request: Instant,
 }
 
@@ -79,6 +80,7 @@ impl Daemon {
             sessions: HashMap::new(),
             next_engine_id: AtomicU64::new(1),
             last_crash: None,
+            crash_receipts: Vec::new(),
             last_request: Instant::now(),
         })
     }
@@ -199,6 +201,7 @@ impl Daemon {
                 "controller_alive": self.controller.is_running(),
                 "content_alive": self.content.is_running(),
                 "last_crash": self.last_crash.clone(),
+                "crash_receipts": self.crash_receipts.clone(),
                 "engines_linked_into_greppy_parent": false,
                 "signed_distributable": false,
                 "oracle_receipt": "contracts/web-runtime/receipts/oracle-setcontent.json",
@@ -976,24 +979,68 @@ impl Daemon {
         }
     }
 
-    fn recover_controller(&mut self, reason: &str) -> Result<(), String> {
+    fn record_crash(&mut self, worker: &str, reason: &str, recovered: bool) {
         self.last_crash = Some(reason.to_owned());
-        let token = random_token().map_err(|error| error.to_string())?;
+        let recovered_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        self.crash_receipts.push(json!({
+            "kind": "worker_crash",
+            "worker": worker,
+            "reason": reason,
+            "recovered": recovered,
+            "recovered_at_unix_ms": recovered_at_unix_ms,
+        }));
+    }
+
+    fn recover_controller(&mut self, reason: &str) -> Result<(), String> {
+        let token = match random_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.record_crash("controller", reason, false);
+                return Err(error.to_string());
+            }
+        };
         let mut controller =
-            WorkerProcess::spawn(&self.controller_worker, WorkerKind::Controller, token)
-                .map_err(|error| error.to_string())?;
-        controller.handshake().map_err(|error| error.to_string())?;
+            match WorkerProcess::spawn(&self.controller_worker, WorkerKind::Controller, token) {
+                Ok(controller) => controller,
+                Err(error) => {
+                    self.record_crash("controller", reason, false);
+                    return Err(error.to_string());
+                }
+            };
+        if let Err(error) = controller.handshake() {
+            self.record_crash("controller", reason, false);
+            return Err(error.to_string());
+        }
         self.controller = controller;
+        self.record_crash("controller", reason, true);
         Ok(())
     }
 
     fn recover_content(&mut self, reason: &str) -> Result<(), String> {
-        self.last_crash = Some(reason.to_owned());
-        let token = random_token().map_err(|error| error.to_string())?;
-        let mut content = WorkerProcess::spawn(&self.content_worker, WorkerKind::Content, token)
-            .map_err(|error| error.to_string())?;
-        content.handshake().map_err(|error| error.to_string())?;
+        let token = match random_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.record_crash("content", reason, false);
+                return Err(error.to_string());
+            }
+        };
+        let mut content = match WorkerProcess::spawn(&self.content_worker, WorkerKind::Content, token)
+        {
+            Ok(content) => content,
+            Err(error) => {
+                self.record_crash("content", reason, false);
+                return Err(error.to_string());
+            }
+        };
+        if let Err(error) = content.handshake() {
+            self.record_crash("content", reason, false);
+            return Err(error.to_string());
+        }
         self.content = content;
+        self.record_crash("content", reason, true);
         let mut failed = Vec::new();
         for session in self.sessions.values_mut() {
             session.page_id = None;

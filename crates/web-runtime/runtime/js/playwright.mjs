@@ -940,22 +940,54 @@ class Page {
     this._navWaiters = [];
     this._consoleWaiters = [];
     this._pendingConsole = [];
+    this._mouseX = 0;
+    this._mouseY = 0;
     this.mouse = {
       click: async (x, y) => {
-        await engineCall("page.mouse.click", { page: this._id, x, y });
+        this._mouseX = Number(x) || 0;
+        this._mouseY = Number(y) || 0;
+        await engineCall("page.mouse.click", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+        });
       },
       move: async (x, y) => {
-        await engineCall("page.mouse.move", { page: this._id, x, y });
+        this._mouseX = Number(x) || 0;
+        this._mouseY = Number(y) || 0;
+        await engineCall("page.mouse.move", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+        });
       },
       down: async () => {
-        await engineCall("page.mouse.down", { page: this._id, x: 0, y: 0 });
+        await engineCall("page.mouse.down", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+        });
       },
       up: async () => {
-        await engineCall("page.mouse.up", { page: this._id, x: 0, y: 0 });
+        await engineCall("page.mouse.up", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+        });
       },
       dblclick: async (x, y) => {
-        await engineCall("page.mouse.click", { page: this._id, x, y });
-        await engineCall("page.mouse.click", { page: this._id, x, y });
+        this._mouseX = Number(x) || 0;
+        this._mouseY = Number(y) || 0;
+        await engineCall("page.mouse.click", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+        });
+        await engineCall("page.mouse.click", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+        });
       },
     };
     return withUnsupported(this, "Page");

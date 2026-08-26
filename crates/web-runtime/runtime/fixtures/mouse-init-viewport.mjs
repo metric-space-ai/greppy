@@ -34,14 +34,32 @@ const last = await page.locator("li").last().innerText();
 if (last.trim() !== "b") throw new Error("last " + last);
 const all = await page.locator("li").all();
 if (all.length !== 2) throw new Error("all " + all.length);
-await page.mouse.move(10, 10);
-await page.mouse.click(12, 12);
 await page.evaluate(() => {
   window.__clicks = 0;
+  window.__downs = [];
   document.addEventListener("click", () => {
     window.__clicks += 1;
   });
+  document.addEventListener("mousedown", (event) => {
+    window.__downs.push({
+      id: event.target && event.target.id,
+      x: event.clientX,
+      y: event.clientY,
+    });
+  });
 });
+const box = await page.locator("#m").boundingBox();
+if (!box) throw new Error("missing #m box");
+const mx = box.x + box.width / 2;
+const my = box.y + box.height / 2;
+await page.mouse.move(mx, my);
+await page.mouse.down();
+await page.mouse.up();
+const downs = await page.evaluate(() => window.__downs);
+if (!downs.some((down) => down.id === "m")) {
+  throw new Error("mouse.down should hit last move target #m: " + JSON.stringify(downs));
+}
+await page.mouse.click(12, 12);
 await page.mouse.dblclick(12, 12);
 const clicks = await page.evaluate(() => window.__clicks);
 if (clicks < 2) throw new Error("mouse.dblclick clicks " + clicks);

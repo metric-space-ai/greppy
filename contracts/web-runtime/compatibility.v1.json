@@ -9789,7 +9789,7 @@
         "mouse-init-viewport"
       ],
       "known_differences": [
-        "left button up at last/zero point"
+        "left button up at last move/click coordinates, not origin"
       ]
     },
     {

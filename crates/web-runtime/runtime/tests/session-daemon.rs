@@ -624,6 +624,25 @@ fn content_worker_crash_is_recovered_without_hanging() {
         crash.is_some() && !crash.unwrap().is_null(),
         "expected last_crash after worker kill: {status:?}"
     );
+    let receipts = status
+        .result
+        .as_ref()
+        .and_then(|value| value.get("crash_receipts"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        receipts.iter().any(|receipt| {
+            receipt.get("kind").and_then(|value| value.as_str()) == Some("worker_crash")
+                && receipt.get("worker").and_then(|value| value.as_str()) == Some("content")
+                && receipt.get("recovered").and_then(|value| value.as_bool()) == Some(true)
+                && receipt
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|reason| !reason.is_empty())
+        }),
+        "expected typed content crash receipt: {status:?}"
+    );
 
     let created_again = unix_request(
         &socket,
