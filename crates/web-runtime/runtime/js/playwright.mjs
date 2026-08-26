@@ -303,6 +303,7 @@ class Locator {
     await engineCall("locator.fill", {
       ...locatorParams(this),
       value: String(value),
+      editable: true,
     });
   }
 
@@ -337,10 +338,23 @@ class Locator {
     return !!result.visible;
   }
 
-  async waitFor() {
-    await engineCall("locator.waitFor", {
-      ...locatorParams(this),
-    });
+  async waitFor(options) {
+    if (options != null) {
+      const keys = Object.keys(options).filter((key) => options[key] !== undefined);
+      if (keys.some((key) => key !== "state" && key !== "timeout")) {
+        return unsupported("Locator.waitFor.options")();
+      }
+      if (
+        options.state != null &&
+        options.state !== "visible" &&
+        options.state !== "attached"
+      ) {
+        return unsupported("Locator.waitFor.state")();
+      }
+    }
+    await engineCall("locator.waitFor", locatorParams(this, {
+      timeout: (options && options.timeout) || this._page._timeout || 30_000,
+    }));
   }
 
   async check() {

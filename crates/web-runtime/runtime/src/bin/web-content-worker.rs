@@ -877,9 +877,12 @@ impl ContentEngine {
                 match self.evaluate(webview, &resolve_script(&selector))? {
                     JSValue::Object(values) => {
                         let count = number_field(&values, "count").unwrap_or(0.0);
-                        let width = number_field(&values, "width").unwrap_or(0.0);
-                        let height = number_field(&values, "height").unwrap_or(0.0);
-                        Ok(json!({ "visible": count == 1.0 && width > 0.0 && height > 0.0 }))
+                        let visible = bool_field(&values, "visible").unwrap_or_else(|_| {
+                            let width = number_field(&values, "width").unwrap_or(0.0);
+                            let height = number_field(&values, "height").unwrap_or(0.0);
+                            count == 1.0 && width > 0.0 && height > 0.0
+                        });
+                        Ok(json!({ "visible": count == 1.0 && visible }))
                     }
                     _ => Ok(json!({ "visible": false })),
                 }
@@ -1746,9 +1749,18 @@ impl ContentEngine {
                     let width = number_field(&values, "width").unwrap_or(0.0);
                     let height = number_field(&values, "height").unwrap_or(0.0);
                     let disabled = bool_field(&values, "disabled").unwrap_or(false);
-                    last =
-                        format!("count={count} width={width} height={height} disabled={disabled}");
-                    if count == 1 && width > 0.0 && height > 0.0 && !disabled {
+                    let readonly = bool_field(&values, "readonly").unwrap_or(false);
+                    let visible =
+                        bool_field(&values, "visible").unwrap_or(width > 0.0 && height > 0.0);
+                    let hit = bool_field(&values, "hit").unwrap_or(visible);
+                    let need_editable = params
+                        .get("editable")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    last = format!(
+                        "count={count} width={width} height={height} disabled={disabled} readonly={readonly} visible={visible} hit={hit}"
+                    );
+                    if count == 1 && visible && hit && !disabled && (!need_editable || !readonly) {
                         return Ok(ResolvedNode {
                             x: number_field(&values, "x")?,
                             y: number_field(&values, "y")?,
@@ -2005,20 +2017,50 @@ function greppyResolveNodes(selector) {
 fn resolve_script(selector: &serde_json::Value) -> String {
     format!(
         "(function(selector) {{ {SELECTOR_RUNTIME}
+          function greppyStyleHidden(el) {{
+            var n = el;
+            while (n && n.nodeType === 1) {{
+              var style = getComputedStyle(n);
+              if (style && (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse')) {{
+                return true;
+              }}
+              n = n.parentElement;
+            }}
+            return false;
+          }}
+          function greppyHitTarget(el, rect) {{
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            var top = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+            if (!top) return false;
+            return el === top || el.contains(top);
+          }}
           const nodes = greppyResolveNodes(selector);
           if (nodes.length !== 1) {{
-            return {{ count: nodes.length, x: 0, y: 0, width: 0, height: 0, disabled: false }};
+            return {{ count: nodes.length, x: 0, y: 0, width: 0, height: 0, disabled: false, readonly: false, visible: false, hit: false }};
           }}
           const el = nodes[0];
           void document.body.offsetHeight;
-          const rect = el.getBoundingClientRect();
+          var rect = el.getBoundingClientRect();
+          var hidden = greppyStyleHidden(el);
+          var hit = greppyHitTarget(el, rect);
+          if (!hidden && (!hit || rect.width <= 0 || rect.height <= 0) && el.scrollIntoView) {{
+            el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
+            void document.body.offsetHeight;
+            rect = el.getBoundingClientRect();
+            hidden = greppyStyleHidden(el);
+            hit = greppyHitTarget(el, rect);
+          }}
+          var visible = !hidden && rect.width > 0 && rect.height > 0;
           return {{
             count: 1,
             x: rect.x,
             y: rect.y,
             width: rect.width,
             height: rect.height,
-            disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true')
+            disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+            readonly: !!(el.readOnly || el.getAttribute('readonly') != null || el.getAttribute('aria-readonly') === 'true'),
+            visible: visible,
+            hit: !!(hit && visible)
           }};
         }})({selector})"
     )

@@ -511,7 +511,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "phase1-spike"
+        "phase1-spike",
+        "actionability"
       ],
       "known_differences": []
     },
@@ -1144,10 +1145,11 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "mouse-init-viewport"
+        "mouse-init-viewport",
+        "actionability"
       ],
       "known_differences": [
-        "stored on Page and used by waitForFunction; locator waits still use 30s engine cap"
+        "stored on Page and passed as timeout to locator engine calls including actionability waits"
       ]
     },
     {
@@ -6150,7 +6152,7 @@
       ],
       "known_differences": [
         "options are unsupported",
-        "waits until one visible enabled box exists; disabled and display:none time out using Page.setDefaultTimeout; force/trial/position options stay unsupported"
+        "visible = non-empty box plus computed display/visibility; hit-target is elementFromPoint at box center (element or descendant); overlay and visibility:hidden time out; not Chromium animation-stability or force"
       ]
     },
     {
@@ -6344,11 +6346,13 @@
       "tests": [
         "phase1-spike",
         "compat-core",
-        "oracle-fill"
+        "oracle-fill",
+        "actionability"
       ],
       "known_differences": [
         "options are unsupported",
-        "oracle-fill.json covers assigning input.value via locator.fill; options are unsupported"
+        "oracle-fill.json covers assigning input.value via locator.fill; options are unsupported",
+        "fill waits for visible enabled non-readonly hit-target; readonly times out; force/noWaitAfter stay unsupported"
       ]
     },
     {
@@ -6684,11 +6688,13 @@
       "behavior": "passing",
       "tests": [
         "compat-core",
-        "oracle-content"
+        "oracle-content",
+        "actionability"
       ],
       "known_differences": [
         "no wait; visible iff exactly one node with non-zero box",
-        "oracle compares isVisible of #x after setContent equals true; hidden/offscreen not compared"
+        "oracle compares isVisible of #x after setContent equals true; hidden/offscreen not compared",
+        "false for display:none and visibility:hidden via getComputedStyle walk; not Chromium visibility including opacity/aria-hidden"
       ]
     },
     {
@@ -6950,10 +6956,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "actionability"
       ],
       "known_differences": [
-        "waits until the locator is actionable"
+        "waits until the locator is actionable",
+        "default and state=visible/attached wait for the actionable snapshot; hidden/detached and other options throw unsupported_playwright_operation"
       ]
     },
     {

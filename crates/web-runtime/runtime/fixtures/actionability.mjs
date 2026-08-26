@@ -7,22 +7,62 @@ await page.setContent(`<!DOCTYPE html><html><body>
 <button id="go">Go</button>
 <button id="off" disabled>Off</button>
 <button id="hid" style="display:none">Hid</button>
+<button id="invis" style="visibility:hidden">Invis</button>
+<input id="ro" readonly value="no">
 </body></html>`);
 await page.locator("#go").click();
-let disabledFailed = false;
-const t0 = Date.now();
-try {
-  await page.locator("#off").click();
-} catch (error) {
-  disabledFailed = String(error.message).includes("timed out") || String(error.message).includes("actionable");
+if (await page.locator("#hid").isVisible()) throw new Error("display:none isVisible");
+if (await page.locator("#invis").isVisible()) throw new Error("visibility:hidden isVisible");
+
+async function expectTimeout(label, fn) {
+  const started = Date.now();
+  try {
+    await fn();
+  } catch (error) {
+    const message = String(error.message);
+    if (!(message.includes("timed out") || message.includes("actionable"))) throw error;
+    if (Date.now() - started > 5_000) throw new Error(label + " ignored page timeout");
+    return;
+  }
+  throw new Error(label + " succeeded");
 }
-if (!disabledFailed) throw new Error("disabled click must not be treated as actionable");
-if (Date.now() - t0 > 5_000) throw new Error("disabled click ignored page timeout");
-let hiddenFailed = false;
+
+await expectTimeout("disabled click", () => page.locator("#off").click());
+await expectTimeout("display:none click", () => page.locator("#hid").click());
+await expectTimeout("visibility:hidden click", () => page.locator("#invis").click());
+await expectTimeout("readonly fill", () => page.locator("#ro").fill("x"));
+
+await page.setContent(`<!DOCTYPE html><html><body style="margin:0">
+<button id="under">Covered</button>
+<div id="mask" style="position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.01)"></div>
+</body></html>`);
+await expectTimeout("overlay click", () => page.locator("#under").click());
+
+page.setDefaultTimeout(3_000);
+await page.setContent(`<!DOCTYPE html><html><body style="margin:0">
+<button id="later">Later</button>
+<div id="mask" style="position:fixed;left:0;top:0;right:0;bottom:0"></div>
+</body></html>`);
+await page.evaluate(() => {
+  window.__later = 0;
+  document.getElementById("later").addEventListener("click", () => {
+    window.__later += 1;
+  });
+  setTimeout(() => {
+    const mask = document.getElementById("mask");
+    if (mask) mask.remove();
+  }, 250);
+});
+await page.locator("#later").waitFor({ state: "visible" });
+await page.getByRole("button", { name: "Later" }).click();
+const later = await page.evaluate(() => window.__later);
+if (later < 1) throw new Error("auto-wait overlay click " + later);
+let hiddenState = false;
 try {
-  await page.locator("#hid").click();
+  await page.locator("#later").waitFor({ state: "hidden" });
 } catch (error) {
-  hiddenFailed = String(error.message).includes("timed out") || String(error.message).includes("actionable");
+  hiddenState = String(error.message).includes("unsupported_playwright_operation");
 }
-if (!hiddenFailed) throw new Error("hidden click must not be treated as actionable");
+if (!hiddenState) throw new Error("waitFor hidden must fail closed");
+
 await browser.close();
