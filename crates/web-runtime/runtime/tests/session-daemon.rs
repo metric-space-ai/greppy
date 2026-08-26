@@ -433,6 +433,10 @@ fn observe_read_search_research_screenshot_and_policy() {
         "retrieved_at {source}"
     );
     assert_eq!(source["classification"], "original");
+    assert!(
+        source.get("http_status").is_some(),
+        "http_status must be present when available: {source}"
+    );
     assert_eq!(
         source["untrusted_content_boundary"],
         "UNTRUSTED_PAGE_CONTENT"
@@ -1036,7 +1040,10 @@ fn run_script(script: &Path, dest: Option<&Path>) -> (i32, String, String) {
 
 fn assert_refused(script: &Path, dest: Option<&Path>, because: &str) {
     let (code, stdout, stderr) = run_script(script, dest);
-    assert_ne!(code, 0, "{because}: succeeded stdout={stdout} stderr={stderr}");
+    assert_ne!(
+        code, 0,
+        "{because}: succeeded stdout={stdout} stderr={stderr}"
+    );
     let combined = format!("{stdout}{stderr}");
     assert!(
         combined.contains("refusing")
@@ -1085,7 +1092,10 @@ fn package_and_uninstall_refuse_hostile_destinations() {
     let canary = canary_dir.join("DO_NOT_DELETE");
     std::fs::write(&canary, "keep-me").unwrap();
     let (code, stdout, stderr) = run_script(&package, Some(&canary_dir));
-    assert_ne!(code, 0, "package non-dist dir: stdout={stdout} stderr={stderr}");
+    assert_ne!(
+        code, 0,
+        "package non-dist dir: stdout={stdout} stderr={stderr}"
+    );
     assert!(canary.exists(), "package deleted canary in {canary_dir:?}");
     let (code, stdout, stderr) = run_script(&uninstall, Some(&canary_dir));
     assert_ne!(

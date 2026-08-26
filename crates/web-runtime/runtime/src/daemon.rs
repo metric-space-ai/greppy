@@ -884,6 +884,16 @@ impl Daemon {
         let recorded = self
             .engine_call("page.requests", json!({ "page": page }))
             .unwrap_or_else(|_| json!({ "requests": [] }));
+        let responses = self
+            .engine_call("page.responses", json!({ "page": page }))
+            .ok()
+            .and_then(|value| value.get("responses").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        let http_status = responses
+            .iter()
+            .rev()
+            .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
         let text = tree
             .get("text")
             .and_then(|v| v.as_str())
@@ -912,6 +922,7 @@ impl Daemon {
             "text": text,
             "digest": stored.digest.hex,
             "artifact_digest": stored.digest.hex,
+            "http_status": http_status,
             "classification": "original",
             "session_id": session_id,
             "operation_id": request.request_id,
