@@ -657,6 +657,11 @@ impl Daemon {
                 })
             })
             .collect();
+        let continuation = if omitted > 0 {
+            json!(format!("offset={}", admitted.len()))
+        } else {
+            serde_json::Value::Null
+        };
         Response::ok(
             request,
             json!({
@@ -667,7 +672,7 @@ impl Daemon {
                 "evidence": snippets,
                 "sources": admitted,
                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
-                "continuation_token": null,
+                "continuation_token": continuation,
             }),
         )
     }
