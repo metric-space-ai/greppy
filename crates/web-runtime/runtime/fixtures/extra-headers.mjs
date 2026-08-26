@@ -13,6 +13,10 @@ const url = await page.waitForURL("http");
 if (!String(url).includes("http")) throw new Error("waitForURL " + url);
 const request = await page.waitForRequest("http");
 if (!String(request.url()).includes("http")) throw new Error("waitForRequest");
+if (request.method() !== "GET") throw new Error("method " + request.method());
+if (request.resourceType() !== "document") {
+  throw new Error("resourceType " + request.resourceType());
+}
 const headers = request.headers();
 const headerBlob = JSON.stringify(headers).toLowerCase();
 if (!headerBlob.includes("x-greppy-test")) {

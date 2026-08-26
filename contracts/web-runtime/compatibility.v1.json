@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 184,
+    "implemented": 186,
     "unsupported": 270,
-    "unverified": 900
+    "unverified": 898
   },
   "entries": [
     {
@@ -9495,11 +9495,15 @@
       "symbol": "Request.frame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "always Page.mainFrame(); not the initiating iframe"
+      ]
     },
     {
       "symbol": "Request.headerValue",
@@ -9557,7 +9561,8 @@
         "network-and-box"
       ],
       "known_differences": [
-        "from Servo WebResourceRequest.method; default GET if missing"
+        "from Servo WebResourceRequest.method; default GET if missing",
+        "WebResourceRequest.method Display; extra-headers observes GET on main-frame goto"
       ]
     },
     {
@@ -9614,11 +9619,15 @@
       "symbol": "Request.resourceType",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "document if main_frame else other; not Chromium resourceType taxonomy"
+      ]
     },
     {
       "symbol": "Request.response",
