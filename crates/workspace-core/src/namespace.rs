@@ -95,6 +95,7 @@ impl WorkspaceCore {
         fs::create_dir_all(&root)?;
         let chunks = ChunkStore::open(&root)?;
         let connection = Connection::open(root.join("workspace.sqlite3"))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -1635,6 +1636,21 @@ fn validate_oid(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_waits_for_a_short_concurrent_metadata_writer() {
+        let root = tempfile::tempdir().unwrap();
+        drop(WorkspaceCore::open(root.path()).unwrap());
+        let connection = Connection::open(root.path().join("workspace.sqlite3")).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let concurrent_root = root.path().to_path_buf();
+        let opening = std::thread::spawn(move || WorkspaceCore::open(concurrent_root));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        connection.execute_batch("COMMIT").unwrap();
+
+        opening.join().unwrap().unwrap();
+    }
 
     fn git(path: &Path, args: &[&str]) {
         let output = Command::new("git")

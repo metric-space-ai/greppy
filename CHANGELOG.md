@@ -25,7 +25,8 @@ and `workspace gc` commands manage one persistent per-user provider mount.
 Linux uses FUSE3, macOS 15+ uses a bundled FSKit app extension with a minimal
 Swift system boundary, and Windows uses the official unchanged WinFsp 2.1
 runtime through Greppy's Rust provider. Adapter failure has no hidden native
-fallback.
+fallback. Concurrent provider and CLI opens wait for short SQLite-WAL writers
+instead of failing nondeterministically with `database is locked`.
 
 Dirty-based proposals record the pinned commit as parent but expose only the
 initial-snapshot-to-final patch. `greppy agent apply REF` verifies the exact

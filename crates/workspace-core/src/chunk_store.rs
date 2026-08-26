@@ -93,6 +93,7 @@ impl ChunkStore {
         // transaction is open; sharing one SQLite file would turn that valid
         // lock ordering into a cross-connection write lock.
         let connection = Connection::open(root.join("chunks.sqlite3"))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -601,6 +602,21 @@ fn new_segment_file(path: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_waits_for_a_short_concurrent_chunk_writer() {
+        let root = tempfile::tempdir().unwrap();
+        drop(ChunkStore::open(root.path()).unwrap());
+        let connection = Connection::open(root.path().join("chunks.sqlite3")).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let concurrent_root = root.path().to_path_buf();
+        let opening = std::thread::spawn(move || ChunkStore::open(concurrent_root));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        connection.execute_batch("COMMIT").unwrap();
+
+        opening.join().unwrap().unwrap();
+    }
 
     #[test]
     fn chunks_are_deduplicated_and_verified() {
