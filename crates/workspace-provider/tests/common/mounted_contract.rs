@@ -92,6 +92,10 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     {
         use std::os::unix::fs::MetadataExt as _;
         assert_eq!(fs::metadata(&link_source).unwrap().nlink(), 2);
+        assert_eq!(
+            fs::metadata(&link_source).unwrap().ino(),
+            fs::metadata(&hard_link).unwrap().ino()
+        );
     }
     fs::write(&hard_link, b"updated").unwrap();
     assert_eq!(fs::read(&link_source).unwrap(), b"updated");

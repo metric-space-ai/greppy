@@ -151,6 +151,6 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
     git(&root, &["config", "user.email", "test@example.test"]);
     git(&root, &["config", "user.name", "Test"]);
     git(&root, &["add", "-A"]);
-    assert_eq!(git(&root, &["status", "--porcelain"]).is_empty(), false);
+    assert!(!git(&root, &["status", "--porcelain"]).is_empty());
     assert!(!git(&root, &["write-tree"]).is_empty());
 }

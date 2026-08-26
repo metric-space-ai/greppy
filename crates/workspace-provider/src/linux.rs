@@ -43,6 +43,7 @@ struct PortableFuse {
     manifest: Arc<RwLock<ProviderManifest>>,
     nodes: Mutex<HashMap<u64, Node>>,
     reverse: Mutex<HashMap<Node, u64>>,
+    workspace_inodes: Mutex<HashMap<(String, u64), u64>>,
     next_inode: AtomicU64,
     uid: u32,
     gid: u32,
@@ -73,6 +74,7 @@ impl PortableFuse {
             manifest,
             nodes: Mutex::new(nodes),
             reverse: Mutex::new(reverse),
+            workspace_inodes: Mutex::new(HashMap::new()),
             next_inode: AtomicU64::new(16),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -86,12 +88,99 @@ impl PortableFuse {
 
     fn inode(&self, node: Node) -> u64 {
         if let Some(value) = self.reverse.lock().unwrap().get(&node).copied() {
+            self.bind_workspace_inode(&node, value);
+            return value;
+        }
+        if let Some((key, value)) = self.workspace_inode_key(&node).and_then(|key| {
+            self.workspace_inodes
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .map(|value| (key, value))
+        }) {
+            self.workspace_inodes.lock().unwrap().insert(key, value);
             return value;
         }
         let value = self.next_inode.fetch_add(1, Ordering::Relaxed);
         self.reverse.lock().unwrap().insert(node.clone(), value);
+        self.bind_workspace_inode(&node, value);
         self.nodes.lock().unwrap().insert(value, node);
         value
+    }
+
+    fn workspace_inode_key(&self, node: &Node) -> Option<(String, u64)> {
+        let Node::WorkspacePath { workspace, path } = node else {
+            return None;
+        };
+        let handle = self.core.open_workspace(workspace).ok()?;
+        let metadata = self.core.metadata(&handle, path).ok()??;
+        Some((workspace.clone(), metadata.inode))
+    }
+
+    fn bind_workspace_inode(&self, node: &Node, fuse_inode: u64) {
+        if let Some(key) = self.workspace_inode_key(node) {
+            self.workspace_inodes
+                .lock()
+                .unwrap()
+                .insert(key, fuse_inode);
+        }
+    }
+
+    fn rebind_after_unlink(
+        &self,
+        workspace: &str,
+        removed_path: &str,
+        logical_inode: u64,
+        handle: &WorkspaceHandle,
+    ) -> Result<(), Errno> {
+        let key = (workspace.to_string(), logical_inode);
+        let Some(fuse_inode) = self.workspace_inodes.lock().unwrap().get(&key).copied() else {
+            return Ok(());
+        };
+        let canonical_was_removed =
+            self.nodes
+                .lock()
+                .unwrap()
+                .get(&fuse_inode)
+                .is_some_and(|node| {
+                    matches!(
+                        node,
+                        Node::WorkspacePath {
+                            workspace: current_workspace,
+                            path
+                        } if current_workspace == workspace && path == removed_path
+                    )
+                });
+        if !canonical_was_removed {
+            return Ok(());
+        }
+        let replacement = self
+            .core
+            .path_for_inode(handle, logical_inode)
+            .map_err(core_errno)?;
+        let old = Node::WorkspacePath {
+            workspace: workspace.into(),
+            path: removed_path.into(),
+        };
+        let mut reverse = self.reverse.lock().unwrap();
+        let mut nodes = self.nodes.lock().unwrap();
+        reverse.remove(&old);
+        match replacement {
+            Some(path) => {
+                let new = Node::WorkspacePath {
+                    workspace: workspace.into(),
+                    path,
+                };
+                reverse.insert(new.clone(), fuse_inode);
+                nodes.insert(fuse_inode, new);
+            }
+            None => {
+                self.workspace_inodes.lock().unwrap().remove(&key);
+                nodes.remove(&fuse_inode);
+            }
+        }
+        Ok(())
     }
 
     fn remap_after_rename(&self, source: &Node, destination: &Node) {
@@ -715,8 +804,13 @@ impl Filesystem for PortableFuse {
                     return Err(Errno::EXDEV);
                 }
                 self.core
-                    .hard_link(&source_handle, source, &destination)
+                    .hard_link(&source_handle, &source, &destination)
                     .map_err(core_errno)?;
+                let source_node = Node::WorkspacePath {
+                    workspace: workspace.clone(),
+                    path: source,
+                };
+                self.bind_workspace_inode(&source_node, inode.0);
                 let node = Node::WorkspacePath {
                     workspace,
                     path: destination,
@@ -871,7 +965,13 @@ impl PortableFuse {
                     parent_node => {
                         let (workspace, path) = workspace_destination(&parent_node, name)?;
                         let handle = self.core.open_workspace(&workspace).map_err(core_errno)?;
-                        self.core.unlink(&handle, path).map_err(core_errno)
+                        let metadata = self
+                            .core
+                            .metadata(&handle, &path)
+                            .map_err(core_errno)?
+                            .ok_or(Errno::ENOENT)?;
+                        self.core.unlink(&handle, &path).map_err(core_errno)?;
+                        self.rebind_after_unlink(&workspace, &path, metadata.inode, &handle)
                     }
                 });
         match result {

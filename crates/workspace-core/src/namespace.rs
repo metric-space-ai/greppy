@@ -1007,6 +1007,32 @@ impl WorkspaceCore {
         Ok(())
     }
 
+    /// Return one currently linked path for a private inode.
+    ///
+    /// Mount adapters use this only to keep an OS inode bound to a surviving
+    /// hard-link alias after its previous canonical name was removed. Base
+    /// paths become private before a hard link can be created, so every
+    /// multi-name inode is represented in `cow_entries`.
+    pub fn path_for_inode(
+        &self,
+        workspace: &WorkspaceHandle,
+        inode: u64,
+    ) -> Result<Option<String>> {
+        let inode = i64::try_from(inode)
+            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
+        let connection = self.lock_metadata()?;
+        connection
+            .query_row(
+                "SELECT path FROM cow_entries
+                 WHERE workspace_id = ?1 AND inode_id = ?2 AND tombstone = 0
+                 ORDER BY path LIMIT 1",
+                params![workspace.id, inode],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn unlink(&self, workspace: &WorkspaceHandle, path: impl AsRef<Path>) -> Result<()> {
         let path = normalize_path(path.as_ref(), false)?;
         let metadata = self
@@ -2296,14 +2322,28 @@ mod tests {
             .unwrap();
         core.hard_link(&workspace, "private.bin", "private.link")
             .unwrap();
+        let inode = core
+            .metadata(&workspace, "private.bin")
+            .unwrap()
+            .unwrap()
+            .inode;
+        assert_eq!(
+            core.path_for_inode(&workspace, inode).unwrap().as_deref(),
+            Some("private.bin")
+        );
         let before = core.chunks().stats().unwrap().referenced_chunks;
         core.unlink(&workspace, "private.bin").unwrap();
+        assert_eq!(
+            core.path_for_inode(&workspace, inode).unwrap().as_deref(),
+            Some("private.link")
+        );
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before);
         assert_eq!(
             core.read(&workspace, "private.link", 0, 64).unwrap(),
             b"private unique bytes"
         );
         core.unlink(&workspace, "private.link").unwrap();
+        assert_eq!(core.path_for_inode(&workspace, inode).unwrap(), None);
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before - 1);
     }
 
