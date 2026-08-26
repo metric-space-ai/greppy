@@ -406,7 +406,7 @@ pub(crate) fn dispatch_index_agent_worktree(
     if !cli_json_output() {
         println!("agent worktree: {worktree}");
     }
-    let agent_data = crate::agent::agent_data_root(&worktree_path);
+    let agent_data = workspace.agent_data_root();
     std::fs::create_dir_all(&agent_data).map_err(|error| {
         Error::Invalid(format!(
             "no agent data root at {}: {error}",

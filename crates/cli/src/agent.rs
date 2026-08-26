@@ -315,7 +315,7 @@ fn run_agent(args: AgentArgs) -> u8 {
     // root (not the operator's global greppy data). Prewarm + tool children
     // share it via GREPPY_STORE_DIR; the sandbox grants only this tree, not
     // the platform-wide Application Support / XDG data path.
-    let agent_data = agent_data_root(workspace.worktree_path());
+    let agent_data = workspace.agent_data_root();
     if let Err(e) = std::fs::create_dir_all(&agent_data) {
         eprintln!("greppy -p: cannot create agent data root: {e}");
         keep_worktree_on_error(&workspace);
@@ -367,7 +367,7 @@ fn run_agent(args: AgentArgs) -> u8 {
 
     // Per-run scratch (TMPDIR for tool children). Outside the stable-worktree
     // parent and lock sibling so those stay non-writable to tools.
-    let scratch_dir = agent_scratch_dir(workspace.worktree_path(), &run_id);
+    let scratch_dir = workspace.agent_scratch_root();
     if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
         eprintln!("greppy -p: cannot create agent scratch dir: {e}");
         keep_worktree_on_error(&workspace);
@@ -868,36 +868,6 @@ fn writable_roots_for(
     roots
 }
 
-/// Isolated greppy data root for an agent worktree (`GREPPY_STORE_DIR`).
-///
-/// `<worktree>/../greppy-agent-data/<worktree-name>` — sibling of the worktree,
-/// outside the worktree content and outside the stable `.lock` sibling.
-pub(crate) fn agent_data_root(worktree_path: &Path) -> std::path::PathBuf {
-    let parent = worktree_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| worktree_path.to_path_buf());
-    let name = worktree_path
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("worktree"));
-    parent.join("greppy-agent-data").join(name)
-}
-
-/// Per-run scratch directory for tool children (`TMPDIR`).
-///
-/// Sibling of the worktree's placement namespace when possible:
-/// `<worktree>/../greppy-agent-scratch/<run_id>`. For a stable worktree under
-/// `…/agent-worktrees/<hash>` this lands at `…/greppy-agent-scratch/<run_id>`,
-/// which is outside the worktree and outside the lock sibling.
-fn agent_scratch_dir(worktree_path: &Path, run_id: &str) -> std::path::PathBuf {
-    let parent = worktree_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| worktree_path.to_path_buf());
-    parent.join("greppy-agent-scratch").join(run_id)
-}
-
 fn cargo_home_dir() -> std::path::PathBuf {
     if let Some(home) = std::env::var_os("CARGO_HOME") {
         return std::path::PathBuf::from(home);
@@ -1291,9 +1261,9 @@ mod tests {
         let wt = unique("roots-wt");
         fs::create_dir_all(&wt).unwrap();
         let run_id = "run-roots-test";
-        let scratch = agent_scratch_dir(&wt, run_id);
+        let scratch = unique("roots-scratch");
         fs::create_dir_all(&scratch).unwrap();
-        let agent_data = agent_data_root(&wt);
+        let agent_data = unique("roots-agent-data");
         fs::create_dir_all(&agent_data).unwrap();
         // Point data_root() at the isolated agent data for this test process
         // so any cache helpers agree with writable_roots_for.
@@ -1384,9 +1354,9 @@ mod tests {
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
         let run_id = wt.file_name().unwrap().to_string_lossy().into_owned();
-        let scratch = agent_scratch_dir(&wt, &run_id);
+        let scratch = unique("sb-off-scratch");
         fs::create_dir_all(&scratch).unwrap();
-        let agent_data = agent_data_root(&wt);
+        let agent_data = unique("sb-off-agent-data");
         fs::create_dir_all(&agent_data).unwrap();
         let mode = resolve_sandbox_mode(&a, &wt, &run_id, &scratch, &agent_data).expect("ok");
         assert!(matches!(mode, SandboxMode::Off));
@@ -1413,9 +1383,9 @@ mod tests {
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();
         let run_id = wt.file_name().unwrap().to_string_lossy().into_owned();
-        let scratch = agent_scratch_dir(&wt, &run_id);
+        let scratch = unique("sb-on-scratch");
         fs::create_dir_all(&scratch).unwrap();
-        let agent_data = agent_data_root(&wt);
+        let agent_data = unique("sb-on-agent-data");
         fs::create_dir_all(&agent_data).unwrap();
         let mode = resolve_sandbox_mode(&a, &wt, &run_id, &scratch, &agent_data).expect("ok");
         match mode {

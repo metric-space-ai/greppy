@@ -221,6 +221,19 @@ impl AgentWorkspace {
         &self.run_id
     }
 
+    /// Private Greppy Store for this workspace. This must live under the
+    /// provider's writable data root, never beside a mounted workspace: the
+    /// mount namespace intentionally exposes only WorkspaceCore-managed IDs.
+    pub fn agent_data_root(&self) -> PathBuf {
+        self.data_root.join("agent-data").join(&self.run_id)
+    }
+
+    /// Per-run tool scratch is provider-private for the same reason as the
+    /// Greppy Store: arbitrary siblings are not part of the mounted namespace.
+    pub fn agent_scratch_root(&self) -> PathBuf {
+        self.data_root.join("agent-scratch").join(&self.run_id)
+    }
+
     pub fn base_commit(&self) -> &str {
         &self.base_commit
     }
@@ -315,6 +328,13 @@ impl AgentWorkspace {
 
     pub fn cleanup(self) -> Result<(), WorkspaceError> {
         self.verify_identity()?;
+        for private_root in [self.agent_data_root(), self.agent_scratch_root()] {
+            match fs::remove_dir_all(&private_root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.core.remove_workspace(self.handle)?;
         Ok(())
     }
@@ -1048,6 +1068,16 @@ mod tests {
         let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
         std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
         let workspace = AgentWorkspace::create(&repo, "test-run").unwrap();
+        let agent_data = workspace.agent_data_root();
+        assert!(agent_data.starts_with(&data));
+        assert!(!agent_data.starts_with(&mount));
+        let agent_scratch = workspace.agent_scratch_root();
+        assert!(agent_scratch.starts_with(&data));
+        assert!(!agent_scratch.starts_with(&mount));
+        fs::create_dir_all(&agent_data).unwrap();
+        fs::write(agent_data.join("graph.db"), b"private store").unwrap();
+        fs::create_dir_all(&agent_scratch).unwrap();
+        fs::write(agent_scratch.join("tool.tmp"), b"scratch").unwrap();
         assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
         fs::write(workspace.worktree_path().join("tracked.txt"), "agent\n").unwrap();
         let outcome = workspace.finish("agent result").unwrap();
@@ -1069,6 +1099,8 @@ mod tests {
         let index_before = fs::read(&index).unwrap();
         let recovery_core = WorkspaceCore::open(data.join("core")).unwrap();
         workspace.cleanup().unwrap();
+        assert!(!agent_data.exists());
+        assert!(!agent_scratch.exists());
 
         let proposal = recovery_core.proposal(&ref_name).unwrap();
         let journal = ApplyJournal {
