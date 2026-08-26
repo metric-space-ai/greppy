@@ -2986,11 +2986,15 @@
       "symbol": "Frame.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "tap-touch"
+      ],
+      "known_differences": [
+        "main-frame locator.tap via Servo Touch Down/Up; child frames stay fail-closed"
+      ]
     },
     {
       "symbol": "Frame.textContent",
@@ -9830,11 +9834,15 @@
       "symbol": "Mouse.wheel",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-wheel"
+      ],
+      "known_differences": [
+        "Servo WheelEvent in device pixels at last mouse coordinates; no ctrlKey/pixel vs line mode options"
+      ]
     },
     {
       "symbol": "Mouse.button",

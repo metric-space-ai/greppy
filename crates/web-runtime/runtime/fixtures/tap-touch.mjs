@@ -18,29 +18,27 @@ await page.evaluate(() => {
     window.__seq.push("mousedown");
   });
 });
+
+async function expectTouch(label) {
+  const seq = await page.evaluate(() => window.__seq.slice());
+  if (!seq.some((item) => String(item).startsWith("touchstart"))) {
+    throw new Error(label + " produced no touchstart: " + JSON.stringify(seq));
+  }
+  if (!seq.includes("touchend")) {
+    throw new Error(label + " produced no touchend: " + JSON.stringify(seq));
+  }
+  await page.evaluate(() => {
+    window.__seq = [];
+  });
+}
+
 await page.locator("#t").tap();
-const afterLocator = await page.evaluate(() => window.__seq.slice());
-if (!afterLocator.some((item) => String(item).startsWith("touchstart"))) {
-  throw new Error("locator.tap produced no touchstart: " + JSON.stringify(afterLocator));
-}
-if (!afterLocator.includes("touchend")) {
-  throw new Error("locator.tap produced no touchend: " + JSON.stringify(afterLocator));
-}
-await page.evaluate(() => {
-  window.__seq = [];
-});
+await expectTouch("locator.tap");
+await page.mainFrame().tap("#t");
+await expectTouch("frame.tap");
 await page.tap("#t");
-const afterPage = await page.evaluate(() => window.__seq.slice());
-if (!afterPage.some((item) => String(item).startsWith("touchstart"))) {
-  throw new Error("page.tap produced no touchstart: " + JSON.stringify(afterPage));
-}
+await expectTouch("page.tap");
 const box = await page.locator("#t").boundingBox();
-await page.evaluate(() => {
-  window.__seq = [];
-});
 await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
-const afterScreen = await page.evaluate(() => window.__seq.slice());
-if (!afterScreen.some((item) => String(item).startsWith("touchstart"))) {
-  throw new Error("touchscreen.tap produced no touchstart: " + JSON.stringify(afterScreen));
-}
+await expectTouch("touchscreen.tap");
 await browser.close();

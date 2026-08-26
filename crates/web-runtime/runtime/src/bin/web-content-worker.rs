@@ -5,6 +5,7 @@ use servo::{
     InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType, UrlRequest,
+    WheelDelta, WheelEvent, WheelMode,
     WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use std::cell::RefCell;
@@ -1572,6 +1573,26 @@ impl ContentEngine {
                     MouseButton::Left,
                     point,
                 )));
+                Ok(json!({}))
+            }
+            "page.mouse.wheel" => {
+                let page_id = required_str(&params, "page")?;
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
+                webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                    WheelDelta {
+                        x: delta_x,
+                        y: delta_y,
+                        z: 0.0,
+                        mode: WheelMode::DeltaPixel,
+                    },
+                    point,
+                )));
+                self.servo.spin_event_loop();
                 Ok(json!({}))
             }
             "page.mouse.up" => {

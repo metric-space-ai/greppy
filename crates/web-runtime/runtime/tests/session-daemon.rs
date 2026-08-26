@@ -1918,6 +1918,11 @@ fn tap_dispatches_touch_events() {
 }
 
 #[test]
+fn mouse_wheel_dispatches_wheel_events() {
+    run_named_fixture("mouse-wheel.mjs", "run_wheel");
+}
+
+#[test]
 fn locator_filter_has_text_and_scroll() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-filter-{}.sock", std::process::id()));

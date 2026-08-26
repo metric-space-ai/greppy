@@ -733,6 +733,10 @@ class Frame {
     return this.locator(selector).click(options);
   }
 
+  tap(selector, options) {
+    return this.locator(selector).tap(options);
+  }
+
   fill(selector, value, options) {
     return this.locator(selector).fill(value, options);
   }
@@ -1005,6 +1009,15 @@ class Page {
           page: this._id,
           x: this._mouseX,
           y: this._mouseY,
+        });
+      },
+      wheel: async (deltaX, deltaY) => {
+        await engineCall("page.mouse.wheel", {
+          page: this._id,
+          x: this._mouseX,
+          y: this._mouseY,
+          deltaX: Number(deltaX) || 0,
+          deltaY: Number(deltaY) || 0,
         });
       },
       dblclick: async (x, y) => {
