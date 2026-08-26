@@ -272,14 +272,17 @@ fn ensure_supervisor(root: Option<&str>) -> std::result::Result<SupervisorCtx, E
     }
     #[cfg(unix)]
     {
-        let endpoint = crate::inference_daemon::Endpoint::for_identity("web-runtime", &run_id)
+        let identity = match root {
+            Some(root) => format!("{run_id}:{root}"),
+            None => run_id.clone(),
+        };
+        let endpoint = crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
             .ok_or_else(|| unavailable("cannot allocate web-runtime socket"))?;
         let socket = PathBuf::from(endpoint.address());
-        if socket.exists() {
+        if socket_is_live(&socket, &run_id) {
             return Ok(SupervisorCtx { socket, run_id });
         }
-        let identity = root.map(str::to_owned).unwrap_or_else(|| run_id.clone());
-        let _ = identity;
+        let _ = std::fs::remove_file(&socket);
         let spawned = crate::inference_daemon::spawn_once(&endpoint, || {
             let mut command = ProcessCommand::new(&supervisor);
             command
@@ -303,20 +306,37 @@ fn ensure_supervisor(root: Option<&str>) -> std::result::Result<SupervisorCtx, E
         match spawned {
             crate::inference_daemon::SpawnOutcome::Spawned
             | crate::inference_daemon::SpawnOutcome::Contended => {}
-            _ => {
+            crate::inference_daemon::SpawnOutcome::Cooldown => {
+                crate::inference_daemon::record_spawn_failure(&endpoint, spawned.attempted());
+                return Err(unavailable(
+                    "web-runtime-supervisor recently crashed; wait before retrying",
+                ));
+            }
+            crate::inference_daemon::SpawnOutcome::SpawnFailed => {
+                crate::inference_daemon::record_spawn_failure(&endpoint, true);
                 return Err(unavailable("failed to spawn web-runtime-supervisor"));
             }
         }
         for delay in crate::inference_daemon::retry_delays() {
-            if socket.exists() {
+            if socket_is_live(&socket, &run_id) {
                 return Ok(SupervisorCtx { socket, run_id });
             }
             std::thread::sleep(delay);
         }
+        crate::inference_daemon::record_spawn_failure(&endpoint, spawned.attempted());
         Err(unavailable(
             "web-runtime-supervisor did not create its socket",
         ))
     }
+}
+
+#[cfg(unix)]
+fn socket_is_live(socket: &std::path::Path, run_id: &str) -> bool {
+    if !socket.exists() {
+        return false;
+    }
+    let probe = Request::new(run_id, "web.status", serde_json::json!({}));
+    greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).is_ok()
 }
 
 fn emit_response(json_out: bool, response: Response) -> Result<i32> {
