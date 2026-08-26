@@ -1257,13 +1257,17 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             "count": 1,
             "innerHTML": "ok",
             "pageInnerHTML": "ok",
+            "textContent": "ok",
+            "pageTextContent": "ok",
         },
         "match": content_ref["includesOk"] == true
             && content_ref["includesOracle"] == true
             && content_ref["count"] == 1
             && content_ref["innerHTML"] == "ok"
-            && content_ref["pageInnerHTML"] == "ok",
-        "scope": "setContent Page.content markers, Locator.count(#x)==1, Locator.innerHTML, and Page.innerHTML; HTML serialization is not compared byte-for-byte",
+            && content_ref["pageInnerHTML"] == "ok"
+            && content_ref["textContent"] == "ok"
+            && content_ref["pageTextContent"] == "ok",
+        "scope": "setContent Page.content markers, Locator.count(#x)==1, innerHTML, and textContent of #x; HTML serialization is not compared byte-for-byte",
         "known_differences": [
             "Chromium and Servo serialize quotes/doctype differently; only substring markers, count, and innerHTML of #x are compared"
         ],

@@ -4,7 +4,9 @@
     "includesOracle": true,
     "count": 1,
     "innerHTML": "ok",
-    "pageInnerHTML": "ok"
+    "pageInnerHTML": "ok",
+    "textContent": "ok",
+    "pageTextContent": "ok"
   },
   "candidate": {
     "engine": "greppy-web-runtime+servo-0.5.0",
@@ -13,10 +15,12 @@
     "includesOracle": true,
     "count": 1,
     "innerHTML": "ok",
-    "pageInnerHTML": "ok"
+    "pageInnerHTML": "ok",
+    "textContent": "ok",
+    "pageTextContent": "ok"
   },
   "match": true,
-  "scope": "setContent Page.content markers, Locator.count(#x)==1, Locator.innerHTML, and Page.innerHTML; HTML serialization is not compared byte-for-byte",
+  "scope": "setContent Page.content markers, Locator.count(#x)==1, innerHTML, and textContent of #x; HTML serialization is not compared byte-for-byte",
   "known_differences": [
     "Chromium and Servo serialize quotes/doctype differently; only substring markers, count, and innerHTML of #x are compared"
   ]

@@ -24,4 +24,10 @@ if ((await page.locator("#x").innerHTML()).trim() !== "ok") {
 if ((await page.innerHTML("#x")).trim() !== "ok") {
   throw new Error("page.innerHTML");
 }
+if ((await page.locator("#x").textContent()).trim() !== "ok") {
+  throw new Error("locator.textContent");
+}
+if ((await page.textContent("#x")).trim() !== "ok") {
+  throw new Error("page.textContent");
+}
 await browser.close();

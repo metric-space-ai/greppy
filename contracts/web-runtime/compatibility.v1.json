@@ -1189,12 +1189,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-content"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle compares textContent of #x after setContent equals ok"
       ]
     },
     {
@@ -6532,11 +6534,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "phase1-spike"
+        "phase1-spike",
+        "oracle-content"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle compares textContent of #x after setContent equals ok"
+      ]
     },
     {
       "symbol": "Locator.toString",
@@ -15085,8 +15090,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1061,
+    "unverified": 1059,
     "unsupported": 281,
-    "passing": 12
+    "passing": 14
   }
 }

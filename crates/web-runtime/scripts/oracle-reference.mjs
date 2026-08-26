@@ -26,6 +26,8 @@ const content = await setPage.content();
 const count = await setPage.locator("#x").count();
 const innerHTML = (await setPage.locator("#x").innerHTML()).trim();
 const pageInnerHTML = (await setPage.innerHTML("#x")).trim();
+const textContent = (await setPage.locator("#x").textContent()).trim();
+const pageTextContent = (await setPage.textContent("#x")).trim();
 await setPage.close();
 
 const dialogPage = await browser.newPage();
@@ -79,6 +81,8 @@ const receipt = {
       count,
       innerHTML,
       pageInnerHTML,
+      textContent,
+      pageTextContent,
     },
     dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
     fill: { value: filled },
