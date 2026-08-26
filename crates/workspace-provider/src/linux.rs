@@ -10,13 +10,14 @@ use greppy_workspace_core::{
     PROVIDER_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +27,21 @@ const ROOT: u64 = 1;
 const WORKSPACES: u64 = 2;
 const DOCTOR: u64 = 3;
 const MARKER: u64 = 4;
+const INVALIDATION_QUEUE_CAPACITY: usize = 1_024;
+
+struct RenameInvalidation {
+    parent: INodeNo,
+    name: OsString,
+    new_parent: INodeNo,
+    new_name: OsString,
+}
+
+fn enqueue_rename_invalidation(
+    sender: &SyncSender<RenameInvalidation>,
+    invalidation: RenameInvalidation,
+) -> bool {
+    sender.try_send(invalidation).is_ok()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Node {
@@ -50,7 +66,7 @@ struct PortableFuse {
     next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
-    notifier: Arc<Mutex<Option<Notifier>>>,
+    invalidations: SyncSender<RenameInvalidation>,
 }
 
 impl PortableFuse {
@@ -58,8 +74,10 @@ impl PortableFuse {
         core: WorkspaceCore,
         doctor_root: PathBuf,
         manifest: Arc<RwLock<ProviderManifest>>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, Receiver<RenameInvalidation>)> {
         fs::create_dir_all(&doctor_root)?;
+        let (invalidations, pending_invalidations) =
+            mpsc::sync_channel(INVALIDATION_QUEUE_CAPACITY);
         let mut nodes = HashMap::new();
         let mut reverse = HashMap::new();
         for (inode, node) in [
@@ -71,20 +89,23 @@ impl PortableFuse {
             nodes.insert(inode, node.clone());
             reverse.insert(node, inode);
         }
-        Ok(Self {
-            core,
-            doctor_root,
-            manifest,
-            nodes: Mutex::new(nodes),
-            reverse: Mutex::new(reverse),
-            workspace_inodes: Mutex::new(HashMap::new()),
-            open_files: Mutex::new(HashMap::new()),
-            next_inode: AtomicU64::new(16),
-            next_file_handle: AtomicU64::new(1),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-            notifier: Arc::new(Mutex::new(None)),
-        })
+        Ok((
+            Self {
+                core,
+                doctor_root,
+                manifest,
+                nodes: Mutex::new(nodes),
+                reverse: Mutex::new(reverse),
+                workspace_inodes: Mutex::new(HashMap::new()),
+                open_files: Mutex::new(HashMap::new()),
+                next_inode: AtomicU64::new(16),
+                next_file_handle: AtomicU64::new(1),
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+                invalidations,
+            },
+            pending_invalidations,
+        ))
     }
 
     fn node(&self, inode: INodeNo) -> Option<Node> {
@@ -220,11 +241,20 @@ impl PortableFuse {
         new_parent: INodeNo,
         new_name: &OsStr,
     ) {
-        let notifier = self.notifier.lock().unwrap().clone();
-        if let Some(notifier) = notifier {
-            let _ = notifier.inval_entry(parent, name);
-            let _ = notifier.inval_entry(new_parent, new_name);
-        }
+        // Reverse notifications wait for a kernel acknowledgement. Running
+        // one synchronously in a FUSE callback can consume every session
+        // worker under concurrent renames and deadlock the mount. Queue the
+        // best-effort cache eviction for the dedicated notifier thread. A
+        // full queue safely falls back to the short entry TTL.
+        let _ = enqueue_rename_invalidation(
+            &self.invalidations,
+            RenameInvalidation {
+                parent,
+                name: name.to_os_string(),
+                new_parent,
+                new_name: new_name.to_os_string(),
+            },
+        );
     }
 
     fn child(&self, parent: &Node, name: &OsStr) -> Result<Node, Errno> {
@@ -1088,6 +1118,13 @@ impl PortableFuse {
     }
 }
 
+fn dispatch_invalidations(notifier: Notifier, invalidations: Receiver<RenameInvalidation>) {
+    while let Ok(invalidation) = invalidations.recv() {
+        let _ = notifier.inval_entry(invalidation.parent, &invalidation.name);
+        let _ = notifier.inval_entry(invalidation.new_parent, &invalidation.new_name);
+    }
+}
+
 pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     fs::create_dir_all(&data_root)?;
     fs::create_dir_all(&mount_root)?;
@@ -1117,8 +1154,8 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
         },
     }));
     let core = WorkspaceCore::open(data_root.join("core")).map_err(core_io)?;
-    let filesystem = PortableFuse::new(core, data_root.join("doctor"), manifest.clone())?;
-    let notifier = filesystem.notifier.clone();
+    let (filesystem, invalidations) =
+        PortableFuse::new(core, data_root.join("doctor"), manifest.clone())?;
     {
         let mut state = manifest.write().unwrap();
         state.state = ProviderState::Ready;
@@ -1151,7 +1188,10 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
     config.n_threads = Some(8);
     config.clone_fd = true;
     let session = Session::new(filesystem, mount_root, &config)?;
-    *notifier.lock().unwrap() = Some(session.notifier());
+    let notifier = session.notifier();
+    thread::Builder::new()
+        .name("greppy-fuse-invalidate".into())
+        .spawn(move || dispatch_invalidations(notifier, invalidations))?;
     let result = session.run();
     let mut state = manifest.write().unwrap();
     state.state = ProviderState::Broken;
@@ -1317,4 +1357,28 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invalidation(name: &str) -> RenameInvalidation {
+        RenameInvalidation {
+            parent: INodeNo(1),
+            name: OsString::from(name),
+            new_parent: INodeNo(2),
+            new_name: OsString::from(format!("new-{name}")),
+        }
+    }
+
+    #[test]
+    fn saturated_invalidation_queue_never_blocks_a_fuse_callback() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(enqueue_rename_invalidation(&sender, invalidation("first")));
+        assert!(!enqueue_rename_invalidation(
+            &sender,
+            invalidation("second")
+        ));
+    }
 }
