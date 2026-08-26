@@ -292,6 +292,49 @@ impl ChunkStore {
         Ok(())
     }
 
+    pub(crate) fn pin_many(&self, counts: &[(ChunkId, u64)]) -> Result<()> {
+        self.adjust_refs(counts, true)
+    }
+
+    pub(crate) fn unpin_many(&self, counts: &[(ChunkId, u64)]) -> Result<()> {
+        self.adjust_refs(counts, false)
+    }
+
+    fn adjust_refs(&self, counts: &[(ChunkId, u64)], increment: bool) -> Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        let transaction = connection.transaction()?;
+        for (id, count) in counts.iter().copied().filter(|(_, count)| *count > 0) {
+            let count = i64::try_from(count)
+                .map_err(|_| Error::Corrupt(format!("chunk reference count overflow for {id}")))?;
+            let changed = if increment {
+                transaction.execute(
+                    "UPDATE cow_chunks SET refs = refs + ?2 WHERE hash = ?1",
+                    params![&id.0[..], count],
+                )?
+            } else {
+                transaction.execute(
+                    "UPDATE cow_chunks SET refs = refs - ?2 WHERE hash = ?1 AND refs >= ?2",
+                    params![&id.0[..], count],
+                )?
+            };
+            if changed != 1 {
+                let detail = if increment {
+                    "unknown"
+                } else {
+                    "unknown or insufficiently referenced"
+                };
+                return Err(Error::Corrupt(format!(
+                    "cannot adjust {detail} chunk {id} by {count}"
+                )));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn unpin(&self, id: ChunkId) -> Result<()> {
         let connection = self
             .connection
@@ -777,6 +820,44 @@ mod tests {
         assert_eq!(stats.chunk_count, 1);
         assert_eq!(stats.referenced_chunks, 1);
         store.verify().unwrap();
+    }
+
+    #[test]
+    fn bulk_reference_updates_preserve_multiplicity_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(temp.path()).unwrap();
+        let first = store.put(b"first").unwrap();
+        let second = store.put(b"second").unwrap();
+
+        store.pin_many(&[(first, 300_000), (second, 3)]).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            let refs: i64 = connection
+                .query_row(
+                    "SELECT refs FROM cow_chunks WHERE hash = ?1",
+                    params![&first.0[..]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(refs, 300_000);
+        }
+
+        let missing = ChunkId([9; 32]);
+        assert!(store.unpin_many(&[(first, 1), (missing, 1)]).is_err());
+        {
+            let connection = store.connection.lock().unwrap();
+            let refs: i64 = connection
+                .query_row(
+                    "SELECT refs FROM cow_chunks WHERE hash = ?1",
+                    params![&first.0[..]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(refs, 300_000);
+        }
+
+        store.unpin_many(&[(first, 300_000), (second, 3)]).unwrap();
+        assert_eq!(store.stats().unwrap().referenced_chunks, 0);
     }
 
     #[test]

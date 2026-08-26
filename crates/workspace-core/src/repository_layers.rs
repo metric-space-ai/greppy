@@ -1,5 +1,6 @@
 use crate::{BaselineSnapshot, ChunkId, ChunkStore, EntryKind, Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -213,18 +214,14 @@ fn ensure_repository_base(
     );
     let mut entries = list_tree(&baseline.repository, &baseline.base_commit)?;
     hydrate_blobs(&baseline.repository, store, &mut entries)?;
-    let mut retained = Vec::new();
+    let mut retained = HashMap::<ChunkId, u64>::new();
     for entry in &entries {
         for chunk in entry_chunks(entry) {
-            if let Err(error) = store.pin(*chunk) {
-                for retained_chunk in retained {
-                    let _ = store.unpin(retained_chunk);
-                }
-                return Err(error);
-            }
-            retained.push(*chunk);
+            *retained.entry(*chunk).or_default() += 1;
         }
     }
+    let retained = retained.into_iter().collect::<Vec<_>>();
+    store.pin_many(&retained)?;
 
     let transaction = connection.transaction()?;
     let inserted = (|| -> Result<()> {
@@ -254,9 +251,7 @@ fn ensure_repository_base(
         Ok(())
     })();
     if let Err(error) = inserted {
-        for chunk in retained {
-            let _ = store.unpin(chunk);
-        }
+        let _ = store.unpin_many(&retained);
         return Err(error);
     }
     Ok(base_id)
@@ -604,7 +599,17 @@ fn list_tree(repository: &Path, commit: &str) -> Result<Vec<TreeEntry>> {
     Ok(entries)
 }
 
-fn hydrate_blobs(repository: &Path, store: &ChunkStore, entries: &mut [TreeEntry]) -> Result<()> {
+fn hydrate_blobs(
+    repository: &Path,
+    store: &ChunkStore,
+    entries: &mut [TreeEntry],
+) -> Result<usize> {
+    let mut by_oid = BTreeMap::<String, Vec<usize>>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(oid) = &entry.oid {
+            by_oid.entry(oid.clone()).or_default().push(index);
+        }
+    }
     let mut child = Command::new("git")
         .args(["cat-file", "--batch"])
         .current_dir(repository)
@@ -621,8 +626,7 @@ fn hydrate_blobs(repository: &Path, store: &ChunkStore, entries: &mut [TreeEntry
         detail: "stdout unavailable".into(),
     })?;
     let mut output = BufReader::new(output);
-    for entry in entries.iter_mut().filter(|entry| entry.oid.is_some()) {
-        let oid = entry.oid.as_deref().expect("filtered above");
+    for (oid, indexes) in &by_oid {
         writeln!(input, "{oid}")?;
         input.flush()?;
         let mut header = String::new();
@@ -638,10 +642,12 @@ fn hydrate_blobs(repository: &Path, store: &ChunkStore, entries: &mut [TreeEntry
             command: "git cat-file --batch".into(),
             detail: format!("invalid size {}", fields[2]),
         })?;
-        if size as u64 != entry.size {
-            return Err(Error::Corrupt(format!(
-                "Git blob {oid} changed size during Base import"
-            )));
+        for index in indexes {
+            if size as u64 != entries[*index].size {
+                return Err(Error::Corrupt(format!(
+                    "Git blob {oid} changed size during Base import"
+                )));
+            }
         }
         let mut bytes = vec![0_u8; size];
         output.read_exact(&mut bytes)?;
@@ -654,7 +660,9 @@ fn hydrate_blobs(repository: &Path, store: &ChunkStore, entries: &mut [TreeEntry
             });
         }
         let (chunks, _) = store.put_stream(bytes.as_slice())?;
-        entry.chunks = chunks;
+        for index in indexes {
+            entries[*index].chunks.clone_from(&chunks);
+        }
     }
     drop(input);
     let status = child.wait()?;
@@ -668,7 +676,7 @@ fn hydrate_blobs(repository: &Path, store: &ChunkStore, entries: &mut [TreeEntry
             detail: stderr.trim().into(),
         });
     }
-    Ok(())
+    Ok(by_oid.len())
 }
 
 fn entry_chunks(entry: &TreeEntry) -> &[ChunkId] {
@@ -676,24 +684,19 @@ fn entry_chunks(entry: &TreeEntry) -> &[ChunkId] {
 }
 
 fn retain_snapshot_chunks(store: &ChunkStore, baseline: &BaselineSnapshot) -> Result<()> {
-    let mut retained = Vec::new();
-    for chunk in snapshot_chunks(baseline) {
-        if let Err(error) = store.pin(chunk) {
-            for retained_chunk in retained {
-                let _ = store.unpin(retained_chunk);
-            }
-            return Err(error);
-        }
-        retained.push(chunk);
-    }
-    Ok(())
+    store.pin_many(&chunk_counts(snapshot_chunks(baseline)))
 }
 
 fn release_snapshot_chunks(store: &ChunkStore, baseline: &BaselineSnapshot) -> Result<()> {
-    for chunk in snapshot_chunks(baseline) {
-        store.unpin(chunk)?;
+    store.unpin_many(&chunk_counts(snapshot_chunks(baseline)))
+}
+
+fn chunk_counts(chunks: impl Iterator<Item = ChunkId>) -> Vec<(ChunkId, u64)> {
+    let mut counts = HashMap::<ChunkId, u64>::new();
+    for chunk in chunks {
+        *counts.entry(chunk).or_default() += 1;
     }
-    Ok(())
+    counts.into_iter().collect()
 }
 
 fn snapshot_chunks(snapshot: &BaselineSnapshot) -> impl Iterator<Item = ChunkId> + '_ {
@@ -750,5 +753,62 @@ fn git_error(command: &str, stderr: &[u8]) -> Error {
     Error::Git {
         command: command.into(),
         detail: String::from_utf8_lossy(stderr).trim().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn git(repository: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn repeated_tree_oids_are_hydrated_once() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "test@example.test"],
+        );
+        git(repository.path(), &["config", "user.name", "Test"]);
+        fs::write(repository.path().join("first.txt"), b"shared blob\n").unwrap();
+        fs::write(repository.path().join("second.txt"), b"shared blob\n").unwrap();
+        git(repository.path(), &["add", "."]);
+        git(repository.path(), &["commit", "-qm", "base"]);
+
+        let commit = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        let mut entries = list_tree(repository.path(), commit.trim()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(storage.path()).unwrap();
+
+        assert_eq!(
+            hydrate_blobs(repository.path(), &store, &mut entries).unwrap(),
+            1
+        );
+        let files = entries
+            .iter()
+            .filter(|entry| entry.oid.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].chunks, files[1].chunks);
+        assert_eq!(store.stats().unwrap().chunk_count, 1);
     }
 }

@@ -39,6 +39,8 @@ struct Args {
     expected_files: usize,
     #[arg(long, default_value_t = 500.0)]
     max_visible_p95_ms: f64,
+    #[arg(long, default_value_t = 120_000.0)]
+    max_cold_prime_ms: f64,
     #[arg(long, default_value_t = 1_048_576)]
     max_untouched_bytes: u64,
     #[arg(long, default_value_t = 1_310_720)]
@@ -107,6 +109,7 @@ fn main() {
 
     // Prime the complete production lifecycle: tracker activation and fence,
     // full Base/Dirty import, shared Git layer and mounted visibility.
+    let cold_prime_started = Instant::now();
     let prime = AgentWorkspace::create(&args.repository, "perf-prime").unwrap();
     let prime_root = prime.worktree_path();
     assert_eq!(
@@ -114,6 +117,15 @@ fn main() {
         probe_expected
     );
     prime.cleanup().unwrap();
+    let cold_prime_ms = cold_prime_started.elapsed().as_secs_f64() * 1_000.0;
+    write_checkpoint(
+        &args.output,
+        "cold-prime-measured",
+        serde_json::json!({
+            "cold_prime_ms": cold_prime_ms,
+            "cold_prime_gate_ms": args.max_cold_prime_ms,
+        }),
+    );
 
     let physical_before = allocated_tree_bytes(&args.data_root);
     let untouched = AgentWorkspace::create(&args.repository, "perf-untouched").unwrap();
@@ -292,6 +304,11 @@ fn main() {
         "fixture_commit": fixture_commit,
         "fixture_tracked_files": tracked_files,
         "iterations": args.iterations,
+        "cold_prime": {
+            "measurement": "first AgentWorkspace::create plus mounted read and cleanup on an empty provider Store",
+            "elapsed_ms": cold_prime_ms,
+            "gate_ms": args.max_cold_prime_ms,
+        },
         "workspace_creation": {
             "snapshot_p50_ms": null,
             "snapshot_p95_ms": null,
@@ -337,6 +354,11 @@ fn main() {
     if args.enforce {
         if source_tree_dirty() {
             fail("release evidence source worktree is tracked-dirty");
+        }
+        if cold_prime_ms > args.max_cold_prime_ms {
+            fail(&format!(
+                "cold workspace prime {cold_prime_ms:.3} ms exceeds gate"
+            ));
         }
         if end_to_end_p95_ms > args.max_visible_p95_ms {
             fail(&format!(
