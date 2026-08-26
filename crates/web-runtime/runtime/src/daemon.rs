@@ -735,14 +735,24 @@ impl Daemon {
         if !self.sessions.contains_key(&session_id) {
             return Err(missing_session(request, &session_id));
         }
-        if let Some(session) = self.sessions.get_mut(&session_id) {
+        let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             if let Err(message) = session.begin_operation(&request.request_id) {
-                return Err(engine_error(request, message, 38));
-            }
-            if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
+                Some(("engine", message))
+            } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
                 let _ = session.transition(SessionState::Failed);
+                Some(("limit", message))
+            } else {
+                None
+            }
+        });
+        match wall_time_error {
+            Some(("engine", message)) => return Err(engine_error(request, message, 38)),
+            Some(("limit", message)) => {
+                let _ = self.recover_content(&format!("wall time exceeded: {message}"));
                 return Err(limit_error(request, message));
             }
+            Some(_) => unreachable!(),
+            None => {}
         }
         let page = self
             .sessions

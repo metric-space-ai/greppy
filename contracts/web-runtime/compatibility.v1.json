@@ -38,9 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 36,
+    "implemented": 39,
     "unsupported": 243,
-    "unverified": 1075
+    "unverified": 1072
   },
   "entries": [
     {
@@ -5293,11 +5293,15 @@
       "symbol": "Locator.check",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "sets input.checked; no actionability beyond waitFor"
+      ]
     },
     {
       "symbol": "Locator.clear",
@@ -5829,11 +5833,15 @@
       "symbol": "Locator.selectOption",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "assigns select.value; no label/index matching"
+      ]
     },
     {
       "symbol": "Locator.selectText",
@@ -5901,11 +5909,13 @@
       "symbol": "Locator.uncheck",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "clears input.checked"
+      ]
     },
     {
       "symbol": "Locator.waitFor",

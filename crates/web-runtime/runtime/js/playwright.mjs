@@ -109,6 +109,28 @@ class Locator {
     });
   }
 
+  async check() {
+    await engineCall("locator.check", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
+  async uncheck() {
+    await engineCall("locator.uncheck", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
+  async selectOption(value) {
+    await engineCall("locator.selectOption", {
+      page: this._page._id,
+      selector: this._selector,
+      value: Array.isArray(value) ? value[0] : value,
+    });
+  }
+
   first() {
     return new Locator(this._page, { ...this._selector, nth: 0 });
   }

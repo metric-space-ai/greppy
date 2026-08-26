@@ -366,6 +366,37 @@ impl ContentEngine {
                 self.servo.spin_event_loop();
                 Ok(json!({}))
             }
+            "locator.check" | "locator.uncheck" => {
+                let _ = self.resolve_actionable(&params)?;
+                let page_id = required_str(&params, "page")?;
+                let checked = method == "locator.check";
+                let selector = params
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); nodes[0].checked = checked; return true; }})({selector}, {checked})"
+                );
+                self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
+            "locator.selectOption" => {
+                let _ = self.resolve_actionable(&params)?;
+                let page_id = required_str(&params, "page")?;
+                let value = required_str(&params, "value")?;
+                let selector = params
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(selector, value) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); nodes[0].value = value; return true; }})({selector}, {})",
+                    serde_json::to_string(&value).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
             "page.setContent" => {
                 let page_id = required_str(&params, "page")?;
                 let html = required_str(&params, "html")?;
