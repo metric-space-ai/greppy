@@ -2571,6 +2571,7 @@ class Browser {
     this._id = id;
     this._contexts = [];
     this._connected = true;
+    this._handlers = {};
     return withUnsupported(this, "Browser");
   }
 
@@ -2613,9 +2614,53 @@ class Browser {
   }
 
   async close() {
-    this._connected = false;
+    const contexts = this._contexts.slice();
     this._contexts = [];
+    for (const context of contexts) {
+      if (!context._closed) {
+        await context.close();
+      }
+    }
+    const wasConnected = this._connected;
+    this._connected = false;
+    if (wasConnected) {
+      this._emit("disconnected");
+    }
     await engineCall("browser.close", { browser: this._id });
+  }
+
+  _emit(event, payload) {
+    const list = (this._handlers && this._handlers[event]) || [];
+    for (const handler of list) {
+      const result = handler(payload);
+      if (result && typeof result.then === "function") {
+        result.catch(() => {});
+      }
+    }
+  }
+
+  on(event, handler) {
+    if (event === "disconnected") {
+      this._handlers[event] = this._handlers[event] || [];
+      this._handlers[event].push(handler);
+      return this;
+    }
+    throwUnsupported(`Browser.on.${event}`);
+  }
+
+  off(event, handler) {
+    const list = this._handlers[event];
+    if (!list) return this;
+    this._handlers[event] = list.filter((item) => item !== handler);
+    return this;
+  }
+
+  once(event, handler) {
+    const wrap = (...args) => {
+      this.off(event, wrap);
+      return handler(...args);
+    };
+    return this.on(event, wrap);
   }
 
   version() {

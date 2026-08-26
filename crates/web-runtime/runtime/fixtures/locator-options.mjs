@@ -65,6 +65,14 @@ let closed = 0;
 context.on("close", () => {
   closed += 1;
 });
+let disconnected = 0;
+browser.on("disconnected", () => {
+  disconnected += 1;
+});
+await expectUnsupported("browser.on close", () => browser.on("close", () => {}));
 await context.close();
 if (closed !== 1) throw new Error("BrowserContext close event " + closed);
+if (!browser.isConnected()) throw new Error("browser should stay connected after context.close");
 await browser.close();
+if (disconnected !== 1) throw new Error("Browser disconnected " + disconnected);
+if (browser.isConnected()) throw new Error("isConnected after Browser.close");

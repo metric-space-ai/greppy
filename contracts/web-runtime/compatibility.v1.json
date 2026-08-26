@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 310,
+    "implemented": 314,
     "unsupported": 337,
-    "unverified": 707
+    "unverified": 703
   },
   "entries": [
     {
@@ -4458,9 +4458,12 @@
       "tests": [
         "phase1-spike",
         "compat-core",
-        "launch-close"
+        "launch-close",
+        "locator-options"
       ],
-      "known_differences": []
+      "known_differences": [
+        "closes remaining contexts then emits disconnected; engine browser.close clears Servo pages"
+      ]
     },
     {
       "symbol": "Browser.contexts",
@@ -4484,7 +4487,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "mouse-init-viewport"
+        "mouse-init-viewport",
+        "locator-options"
       ],
       "known_differences": [
         "true after launch until Browser.close; not a live Chromium pipe check"
@@ -4536,31 +4540,43 @@
       "symbol": "Browser.off",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "removes a previously registered disconnected listener"
+      ]
     },
     {
       "symbol": "Browser.on",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "disconnected listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Browser.once",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "wraps on() and removes the listener after the first emit"
+      ]
     },
     {
       "symbol": "Browser.prependListener",
@@ -5284,11 +5300,15 @@
       "symbol": "Browser.event.disconnected",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "emitted from Browser.close after remaining contexts are closed; not a Chromium pipe drop"
+      ]
     },
     {
       "symbol": "Worker.addListener",
