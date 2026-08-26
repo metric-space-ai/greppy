@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -164,7 +164,7 @@ impl ChunkStore {
             return Ok(id);
         }
 
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (mut segment_id, mut committed_len): (i64, u64) = transaction.query_row(
             "SELECT id, committed_len FROM cow_segments ORDER BY id DESC LIMIT 1",
             [],
@@ -305,7 +305,7 @@ impl ChunkStore {
             .connection
             .lock()
             .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (id, count) in counts.iter().copied().filter(|(_, count)| *count > 0) {
             let count = i64::try_from(count)
                 .map_err(|_| Error::Corrupt(format!("chunk reference count overflow for {id}")))?;
@@ -362,7 +362,7 @@ impl ChunkStore {
             .connection
             .lock()
             .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("UPDATE cow_chunks SET refs = 0", [])?;
         for (id, refs) in expected {
             let changed = transaction.execute(
@@ -541,7 +541,7 @@ impl ChunkStore {
         segments.last_mut().unwrap().1 = segment_len;
         sync_directory(&self.root.join("segments"))?;
 
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (id, len) in &segments {
             transaction.execute(
                 "INSERT INTO cow_segments(id, committed_len) VALUES(?1, ?2)",

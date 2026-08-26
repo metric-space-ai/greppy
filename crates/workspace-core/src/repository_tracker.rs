@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -90,7 +90,7 @@ pub(crate) fn activate(
     heartbeat_unix_ms: u64,
 ) -> Result<RepositoryTrackerStatus> {
     let repository_text = path_text(repository)?;
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous: Option<(String, i64)> = transaction
         .query_row(
             "SELECT state, epoch FROM cow_repository_trackers WHERE repository = ?1",
@@ -135,7 +135,7 @@ pub(crate) fn record(
     heartbeat_unix_ms: u64,
 ) -> Result<()> {
     let repository = path_text(repository)?;
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (state, epoch, generation): (String, i64, i64) = transaction
         .query_row(
             "SELECT state, epoch, generation FROM cow_repository_trackers

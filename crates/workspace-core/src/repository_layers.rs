@@ -1,5 +1,5 @@
 use crate::{BaselineSnapshot, ChunkId, ChunkStore, EntryKind, Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -117,7 +117,7 @@ pub(crate) fn ensure_layers(
         retain_snapshot_chunks(store, baseline)?;
     }
     let baseline_json = serde_json::to_vec(baseline)?;
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = (|| -> Result<()> {
         transaction.execute(
             "INSERT INTO cow_dirty_layers(id, base_id, baseline_json) VALUES(?1, ?2, ?3)",
@@ -179,7 +179,7 @@ fn ensure_empty_base(connection: &mut Connection, baseline: &BaselineSnapshot) -
         "empty-base:{}",
         blake3::hash(format!("{repository}\0{}", baseline.base_commit).as_bytes()).to_hex()
     );
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
         "INSERT INTO cow_repository_bases(id, repository, base_commit, state)
          VALUES(?1, ?2, ?3, 'broken')",
@@ -245,7 +245,7 @@ fn ensure_repository_base(
     let retained = retained.into_iter().collect::<Vec<_>>();
     store.pin_many(&retained)?;
 
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = (|| -> Result<()> {
         transaction.execute(
             "INSERT INTO cow_repository_bases(id, repository, base_commit, state)
@@ -459,7 +459,7 @@ pub(crate) fn remove_unreferenced(connection: &mut Connection, store: &ChunkStor
         let baseline: BaselineSnapshot = serde_json::from_slice(&baseline)?;
         released.extend(snapshot_chunks(&baseline));
     }
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for id in &unreferenced_dirty {
         transaction.execute("DELETE FROM cow_dirty_layers WHERE id = ?1", params![id])?;
     }
@@ -483,7 +483,7 @@ pub(crate) fn remove_unreferenced(connection: &mut Connection, store: &ChunkStor
             released.extend(serde_json::from_slice::<Vec<ChunkId>>(&row?)?);
         }
     }
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for id in &unreferenced_bases {
         transaction.execute(
             "DELETE FROM cow_repository_bases WHERE id = ?1",

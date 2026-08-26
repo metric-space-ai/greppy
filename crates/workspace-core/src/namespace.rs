@@ -1,7 +1,7 @@
 use crate::repository_layers::{self, LayerKind};
 use crate::repository_tracker;
 use crate::{BaselineSnapshot, ChunkGcReport, ChunkId, ChunkStore, Error, Result, CHUNK_SIZE};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -324,7 +324,7 @@ impl WorkspaceCore {
             captured_snapshot_owns_chunks,
             empty_base,
         )?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if empty_base {
             repository_layers::retain_overlay_template(
                 &transaction,
@@ -432,7 +432,7 @@ impl WorkspaceCore {
     ) -> Result<()> {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in [&content.id, &git.id] {
             let ready: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE id = ?1 AND state = 'ready')",
@@ -466,7 +466,7 @@ impl WorkspaceCore {
     ) -> Result<()> {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE cow_workspaces SET state = 'kept'
              WHERE id IN (?1, ?2) AND state = 'ready'",
@@ -537,7 +537,7 @@ impl WorkspaceCore {
                 chunks.extend(workspace_chunks(&connection, id)?);
             }
         }
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "UPDATE cow_workspace_pairs SET state = 'removing'
              WHERE content_id = ?1 AND git_id = ?2",
@@ -1183,7 +1183,7 @@ impl WorkspaceCore {
         let _inode = self.materialize(workspace, &path)?;
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_tombstone(&transaction, &workspace.id, &path)?;
         transaction.commit()?;
         Ok(())
@@ -1216,7 +1216,8 @@ impl WorkspaceCore {
             let inode = self.materialize(workspace, &source)?;
             let _writer = self.lock_metadata_writer()?;
             let mut connection = self.lock_metadata()?;
-            let transaction = connection.transaction()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let replaced: Option<(i64, Vec<ChunkId>)> = transaction
                 .query_row(
                     "SELECT i.id, i.chunks_json
@@ -1271,7 +1272,7 @@ impl WorkspaceCore {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let translated = translate_redirect(&connection, &workspace.id, &source)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO cow_redirects(workspace_id, destination, source)
              VALUES(?1, ?2, ?3)",
@@ -1507,7 +1508,7 @@ impl WorkspaceCore {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let chunks = workspace_chunks(&connection, &workspace.id)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM cow_workspaces WHERE id = ?1",
             params![workspace.id],
@@ -1544,7 +1545,8 @@ impl WorkspaceCore {
                 .collect::<Result<Vec<_>>>()?;
             let _writer = self.lock_metadata_writer()?;
             let mut connection = self.lock_metadata()?;
-            let transaction = connection.transaction()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for (content_id, git_id, lease) in abandoned {
                 let Some(_lease) = lease else {
                     continue;
@@ -1641,7 +1643,7 @@ impl WorkspaceCore {
         };
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inode = insert_inode(
             &transaction,
             &workspace.id,
@@ -1695,7 +1697,7 @@ impl WorkspaceCore {
         }
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inode = insert_inode(
             &transaction,
             &workspace.id,
@@ -2281,6 +2283,26 @@ mod tests {
         connection.execute_batch("COMMIT").unwrap();
 
         opening.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn tracker_write_waits_before_reading_across_core_instances() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let setup = WorkspaceCore::open(root.path()).unwrap();
+        setup.request_repository_tracker(&repository).unwrap();
+        setup.activate_repository_tracker(&repository, 1).unwrap();
+        let writer = WorkspaceCore::open(root.path()).unwrap();
+
+        let connection = Connection::open(root.path().join("workspace.sqlite3")).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recording = std::thread::spawn(move || {
+            writer.record_repository_changes(&repository, &["src/lib.rs".into()], 2)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        connection.execute_batch("COMMIT").unwrap();
+
+        recording.join().unwrap().unwrap();
     }
 
     fn git(path: &Path, args: &[&str]) {
