@@ -4,8 +4,8 @@
 mod mounted_contract;
 
 use greppy_workspace_core::{capture_repository, ProviderInstallation, WorkspaceCore, CHUNK_SIZE};
-use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -56,9 +56,18 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
     git(&repo, &["config", "user.email", "test@example.test"]);
     git(&repo, &["config", "user.name", "Test"]);
     fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+    fs::write(repo.join("cache-visible.txt"), b"cached base\n").unwrap();
     fs::create_dir_all(repo.join("nested/deeper")).unwrap();
     fs::write(repo.join("nested/deeper/base.txt"), b"nested base\n").unwrap();
-    git(&repo, &["add", "tracked.txt", "nested/deeper/base.txt"]);
+    git(
+        &repo,
+        &[
+            "add",
+            "tracked.txt",
+            "cache-visible.txt",
+            "nested/deeper/base.txt",
+        ],
+    );
     git(&repo, &["commit", "-qm", "base"]);
     fs::write(repo.join("tracked.txt"), b"dirty\n").unwrap();
     fs::write(repo.join("untracked.txt"), b"user\n").unwrap();
@@ -106,6 +115,19 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
             .inode,
         immutable_inode,
         "a read-only FUSE open must not copy an immutable Base file into the private namespace"
+    );
+    let cache_visible = root.join("cache-visible.txt");
+    let mut cached_reader = File::open(&cache_visible).unwrap();
+    let mut cached_contents = Vec::new();
+    cached_reader.read_to_end(&mut cached_contents).unwrap();
+    assert_eq!(cached_contents, b"cached base\n");
+    fs::write(&cache_visible, b"promoted through writer\n").unwrap();
+    cached_reader.seek(SeekFrom::Start(0)).unwrap();
+    cached_contents.clear();
+    cached_reader.read_to_end(&mut cached_contents).unwrap();
+    assert_eq!(
+        cached_contents, b"promoted through writer\n",
+        "the retained read cache must stay coherent when another handle promotes the Base file"
     );
     mounted_contract::exercise_mounted_contract(&root, &core);
     assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"dirty\n");

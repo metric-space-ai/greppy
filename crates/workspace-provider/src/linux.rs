@@ -30,6 +30,9 @@ const ROOT: u64 = 1;
 const WORKSPACES: u64 = 2;
 const DOCTOR: u64 = 3;
 const MARKER: u64 = 4;
+type WorkspaceDirectorySnapshot = Arc<BTreeMap<String, NodeMetadata>>;
+type WorkspaceDirectoryCache = HashMap<(String, String), WorkspaceDirectorySnapshot>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Node {
     Root,
@@ -49,7 +52,7 @@ struct PortableFuse {
     reverse: Mutex<HashMap<Node, u64>>,
     workspace_inodes: Mutex<HashMap<(String, u64), u64>>,
     workspace_handles: Mutex<HashMap<String, WorkspaceHandle>>,
-    workspace_directories: Mutex<HashMap<(String, String), Arc<BTreeMap<String, NodeMetadata>>>>,
+    workspace_directories: Mutex<WorkspaceDirectoryCache>,
     open_files: Mutex<HashMap<u64, WorkspaceFileHandle>>,
     next_inode: AtomicU64,
     next_file_handle: AtomicU64,
@@ -576,30 +579,41 @@ impl Filesystem for PortableFuse {
 
     fn open(&self, _req: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result = match self.node(inode) {
-            Some(Node::WorkspacePath { workspace, path }) => self
-                .workspace_handle(&workspace)
-                .and_then(|workspace| {
-                    if flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
-                        self.core
-                            .open_file_read_only(&workspace, path)
-                            .map_err(core_errno)
-                    } else {
-                        self.core.open_file(&workspace, path).map_err(core_errno)
-                    }
-                })
-                .and_then(|handle| {
-                    let fh = self.next_file_handle.fetch_add(1, Ordering::Relaxed);
-                    self.open_files
-                        .lock()
-                        .map_err(|_| Errno::EIO)?
-                        .insert(fh, handle);
-                    Ok(FileHandle(fh))
-                }),
-            Some(_) => Ok(FileHandle(0)),
+            Some(Node::WorkspacePath { workspace, path }) => {
+                let read_only = flags.0 & libc::O_ACCMODE == libc::O_RDONLY;
+                self.workspace_handle(&workspace)
+                    .and_then(|workspace| {
+                        if read_only {
+                            self.core
+                                .open_file_read_only(&workspace, path)
+                                .map_err(core_errno)
+                        } else {
+                            self.core.open_file(&workspace, path).map_err(core_errno)
+                        }
+                    })
+                    .and_then(|handle| {
+                        let fh = self.next_file_handle.fetch_add(1, Ordering::Relaxed);
+                        self.open_files
+                            .lock()
+                            .map_err(|_| Errno::EIO)?
+                            .insert(fh, handle);
+                        let cache_flags = if read_only {
+                            // Reopening an immutable Base file must not evict the
+                            // kernel page cache. Writes still traverse this mount,
+                            // so the kernel keeps cached readers coherent while
+                            // WorkspaceCore promotes the shared origin privately.
+                            FopenFlags::FOPEN_KEEP_CACHE
+                        } else {
+                            FopenFlags::empty()
+                        };
+                        Ok((FileHandle(fh), cache_flags))
+                    })
+            }
+            Some(_) => Ok((FileHandle(0), FopenFlags::empty())),
             None => Err(Errno::ENOENT),
         };
         match result {
-            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Ok((fh, cache_flags)) => reply.opened(fh, cache_flags),
             Err(error) => reply.error(error),
         }
     }
