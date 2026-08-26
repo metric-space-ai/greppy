@@ -206,6 +206,7 @@ jobs:
             --data-root "$data" \
             --probe-path files/000/000000.txt \
             --output "$evidence" \
+            --phase-trace-dir "$RUNNER_TEMP/greppy-cow-perf-phases" \
             --source-commit "$GITHUB_SHA" \
             --provider-binary "$GITHUB_WORKSPACE/target/release/greppy-workspace-provider" \
             --native-baseline-root "$RUNNER_TEMP/greppy-native-worktree-baseline" \
@@ -231,6 +232,7 @@ jobs:
           path: |
             ${{ runner.temp }}/greppy-cow-perf-linux.json
             ${{ runner.temp }}/greppy-cow-provider.log
+            ${{ runner.temp }}/greppy-cow-perf-phases/*.jsonl
           if-no-files-found: error
 
   windows-winfsp:

@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct AgentWorkspace {
     repo_root: PathBuf,
@@ -170,20 +170,28 @@ impl From<greppy_workspace_core::Error> for WorkspaceError {
 impl AgentWorkspace {
     pub fn create(repo_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
         validate_run_id(run_id)?;
+        let started = Instant::now();
+        trace_workspace_phase(run_id, "start", started);
         let data_root = workspace_data_root()?;
         let provider = ProviderInstallation::require_healthy(&data_root)?;
+        trace_workspace_phase(run_id, "provider-healthy", started);
         provider.doctor_io(&format!("startup-{run_id}"))?;
+        trace_workspace_phase(run_id, "provider-io-verified", started);
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
+        trace_workspace_phase(run_id, "core-open", started);
         recover_apply_journals(&core)?;
+        trace_workspace_phase(run_id, "recovery-complete", started);
         let (baseline, captured_snapshot_owns_chunks) =
             capture_tracked_repository(repo_root, &core)?;
+        trace_workspace_phase(run_id, "snapshot-captured", started);
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
         let baseline_for_git = baseline.clone();
         let git_run_id = git_workspace_id(run_id);
         let pair_lease = core.begin_workspace_pair(run_id, &git_run_id)?;
+        trace_workspace_phase(run_id, "pair-started", started);
         let handle = if captured_snapshot_owns_chunks {
             core.create_workspace(run_id, baseline)
         } else {
@@ -196,6 +204,7 @@ impl AgentWorkspace {
                 return Err(error.into());
             }
         };
+        trace_workspace_phase(run_id, "content-namespace-created", started);
         let worktree = match provider.workspace_path(run_id) {
             Ok(path) => path,
             Err(error) => {
@@ -207,6 +216,7 @@ impl AgentWorkspace {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error);
         }
+        trace_workspace_phase(run_id, "content-visible", started);
         let (git_baseline, git_baseline_owns_chunks, baseline_tree) =
             match prepare_git_control_baseline(
                 &repo_root,
@@ -221,6 +231,7 @@ impl AgentWorkspace {
                     return Err(error);
                 }
             };
+        trace_workspace_phase(run_id, "git-baseline-prepared", started);
         let git_handle = if git_baseline_owns_chunks {
             core.create_overlay_workspace(&git_run_id, git_baseline)
         } else {
@@ -233,6 +244,7 @@ impl AgentWorkspace {
                 return Err(error.into());
             }
         };
+        trace_workspace_phase(run_id, "git-namespace-created", started);
         let private_git_dir = match provider.workspace_path(&git_run_id) {
             Ok(path) => path,
             Err(error) => {
@@ -244,6 +256,7 @@ impl AgentWorkspace {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error);
         }
+        trace_workspace_phase(run_id, "git-namespace-visible", started);
         let initialized = initialize_private_git(
             &worktree,
             &private_git_dir,
@@ -257,10 +270,12 @@ impl AgentWorkspace {
                 return Err(error);
             }
         };
+        trace_workspace_phase(run_id, "git-initialized", started);
         if let Err(error) = core.complete_workspace_pair(&handle, &git_handle) {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error.into());
         }
+        trace_workspace_phase(run_id, "pair-committed", started);
         Ok(Self {
             repo_root,
             worktree,
@@ -467,6 +482,32 @@ impl AgentWorkspace {
             });
         }
         Ok(())
+    }
+}
+
+fn trace_workspace_phase(run_id: &str, phase: &str, started: Instant) {
+    let Some(root) = std::env::var_os("GREPPY_WORKSPACE_PHASE_TRACE_DIR") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    if !root.is_absolute() || fs::create_dir_all(&root).is_err() {
+        return;
+    }
+    let event = serde_json::json!({
+        "run_id": run_id,
+        "phase": phase,
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1_000.0,
+    });
+    let Ok(mut encoded) = serde_json::to_vec(&event) else {
+        return;
+    };
+    encoded.push(b'\n');
+    if let Ok(mut output) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(format!("{run_id}.jsonl")))
+    {
+        let _ = output.write_all(&encoded);
     }
 }
 

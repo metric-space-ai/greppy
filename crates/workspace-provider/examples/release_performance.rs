@@ -47,6 +47,8 @@ struct Args {
     max_one_byte_write_bytes: u64,
     #[arg(long)]
     enforce: bool,
+    #[arg(long)]
+    phase_trace_dir: Option<PathBuf>,
     /// JSON: {"name":"rust|python|node","argv":["program","arg",...]}
     #[arg(long = "toolchain-case")]
     toolchain_cases: Vec<String>,
@@ -78,8 +80,14 @@ fn main() {
         || !args.output.is_absolute()
         || !args.provider_binary.is_absolute()
         || !args.native_baseline_root.is_absolute()
+        || args
+            .phase_trace_dir
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
     {
-        fail("repository, data-root, output and provider-binary must be absolute");
+        fail(
+            "repository, data-root, output, provider-binary, native-baseline-root and phase-trace-dir must be absolute",
+        );
     }
     if args.iterations < 5 || args.parallel == 0 {
         fail("at least five iterations and one parallel workspace are required");
@@ -110,7 +118,18 @@ fn main() {
     // Prime the complete production lifecycle: tracker activation and fence,
     // full Base/Dirty import, shared Git layer and mounted visibility.
     let cold_prime_started = Instant::now();
-    let prime = AgentWorkspace::create(&args.repository, "perf-prime").unwrap();
+    let previous_trace_dir = std::env::var_os("GREPPY_WORKSPACE_PHASE_TRACE_DIR");
+    if let Some(path) = &args.phase_trace_dir {
+        std::env::set_var("GREPPY_WORKSPACE_PHASE_TRACE_DIR", path);
+    }
+    let prime = AgentWorkspace::create(&args.repository, "perf-prime");
+    if args.phase_trace_dir.is_some() {
+        match previous_trace_dir {
+            Some(path) => std::env::set_var("GREPPY_WORKSPACE_PHASE_TRACE_DIR", path),
+            None => std::env::remove_var("GREPPY_WORKSPACE_PHASE_TRACE_DIR"),
+        }
+    }
+    let prime = prime.unwrap();
     let prime_root = prime.worktree_path();
     assert_eq!(
         fs::read(prime_root.join(&args.probe_path)).unwrap(),
