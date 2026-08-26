@@ -1698,6 +1698,7 @@ class BrowserContext {
     this._pages = [];
     this._browser = null;
     this._pendingRoutes = [];
+    this._extraHeaders = {};
     this.tracing = {
       start: async () => unsupported("BrowserContext.tracing.start")(),
       stop: async () => unsupported("BrowserContext.tracing.stop")(),
@@ -1718,6 +1719,9 @@ class BrowserContext {
     this._pages.push(page);
     for (const pending of this._pendingRoutes || []) {
       await page.route(pending.url, pending.handler);
+    }
+    if (this._extraHeaders && Object.keys(this._extraHeaders).length) {
+      await page.setExtraHTTPHeaders(this._extraHeaders);
     }
     return page;
   }
@@ -1768,6 +1772,13 @@ class BrowserContext {
 
   setDefaultNavigationTimeout(ms) {
     this.setDefaultTimeout(ms);
+  }
+
+  async setExtraHTTPHeaders(headers) {
+    this._extraHeaders = headers || {};
+    for (const page of this.pages()) {
+      await page.setExtraHTTPHeaders(this._extraHeaders);
+    }
   }
 
   async route(url, handler) {

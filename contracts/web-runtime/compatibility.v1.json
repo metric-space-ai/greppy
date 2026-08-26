@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 242,
+    "implemented": 243,
     "unsupported": 281,
-    "unverified": 831
+    "unverified": 830
   },
   "entries": [
     {
@@ -3749,11 +3749,16 @@
       "symbol": "BrowserContext.setExtraHTTPHeaders",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "applies Page.setExtraHTTPHeaders to current and later pages in the context",
+        "same limitation as Page.setExtraHTTPHeaders: main-frame goto via Servo UrlRequest, not subresources"
+      ]
     },
     {
       "symbol": "BrowserContext.setGeolocation",

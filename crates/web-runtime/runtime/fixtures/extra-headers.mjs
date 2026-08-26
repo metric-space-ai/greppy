@@ -47,6 +47,14 @@ const p2 = await ctx.newPage();
 await p2.goto(fixtureUrl + "ctx-route");
 if ((await p2.innerText("#cr")).trim() !== "ctx-ok") throw new Error("context.route");
 await ctx.close();
+const ctxHeaders = await browser.newContext();
+await ctxHeaders.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
+const p3 = await ctxHeaders.newPage();
+await p3.goto(fixtureUrl);
+if ((await p3.locator("body").innerText()).trim() !== "HEADER_OK") {
+  throw new Error("context extra headers");
+}
+await ctxHeaders.close();
 let paused = false;
 try {
   await page.pause();
