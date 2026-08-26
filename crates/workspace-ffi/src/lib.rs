@@ -62,6 +62,12 @@ fn status(result: greppy_workspace_core::Result<()>) -> i32 {
 }
 
 #[no_mangle]
+/// Opens a portable workspace core for an absolute data root.
+///
+/// # Safety
+/// `absolute_data_root` must point to a valid NUL-terminated string for the
+/// duration of this call. The returned pointer must eventually be passed
+/// exactly once to [`greppy_workspace_core_close`].
 pub unsafe extern "C" fn greppy_workspace_core_open(
     absolute_data_root: *const c_char,
 ) -> *mut GreppyWorkspaceCore {
@@ -82,6 +88,12 @@ pub unsafe extern "C" fn greppy_workspace_core_open(
 }
 
 #[no_mangle]
+/// Releases a workspace core returned by [`greppy_workspace_core_open`].
+///
+/// # Safety
+/// `core` must be null or an owned pointer returned by
+/// [`greppy_workspace_core_open`] that has not already been closed. No other
+/// thread may use the core while it is being closed.
 pub unsafe extern "C" fn greppy_workspace_core_close(core: *mut GreppyWorkspaceCore) {
     if !core.is_null() {
         drop(Box::from_raw(core));
@@ -89,6 +101,12 @@ pub unsafe extern "C" fn greppy_workspace_core_close(core: *mut GreppyWorkspaceC
 }
 
 #[no_mangle]
+/// Captures a repository and creates a new workspace namespace.
+///
+/// # Safety
+/// `value` must be a live core pointer. Both string pointers must be valid
+/// NUL-terminated strings for the duration of this call, and the core must not
+/// be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_create(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -113,6 +131,12 @@ pub unsafe extern "C" fn greppy_workspace_create(
 }
 
 #[no_mangle]
+/// Removes a workspace namespace.
+///
+/// # Safety
+/// `value` must be a live core pointer and `workspace_id` must point to a valid
+/// NUL-terminated string for the duration of this call. The core must not be
+/// closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_remove(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -145,6 +169,13 @@ fn metadata(value: NodeMetadata) -> GreppyWorkspaceMetadata {
 }
 
 #[no_mangle]
+/// Reads metadata for a path into caller-owned storage.
+///
+/// # Safety
+/// `value` must be a live core pointer; `workspace_id` and `path` must be valid
+/// NUL-terminated strings; and `out` must be valid and aligned for one
+/// [`GreppyWorkspaceMetadata`] write. All pointers must remain valid for the
+/// duration of this call.
 pub unsafe extern "C" fn greppy_workspace_metadata(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -176,6 +207,13 @@ pub unsafe extern "C" fn greppy_workspace_metadata(
 }
 
 #[no_mangle]
+/// Reads file bytes into a caller-provided buffer.
+///
+/// # Safety
+/// `value` must be a live core pointer; the string pointers must be valid
+/// NUL-terminated strings; and, when `capacity` is nonzero, `out` must be
+/// writable for `capacity` bytes. All pointers must remain valid and the core
+/// must not be closed for the duration of this call.
 pub unsafe extern "C" fn greppy_workspace_read(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -210,6 +248,13 @@ pub unsafe extern "C" fn greppy_workspace_read(
 }
 
 #[no_mangle]
+/// Reads a symbolic-link target into a caller-provided buffer.
+///
+/// # Safety
+/// `value` must be a live core pointer; the string pointers must be valid
+/// NUL-terminated strings; and, when `capacity` is nonzero, `out` must be
+/// writable for `capacity` bytes. All pointers must remain valid and the core
+/// must not be closed for the duration of this call.
 pub unsafe extern "C" fn greppy_workspace_read_symlink(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -245,6 +290,13 @@ pub unsafe extern "C" fn greppy_workspace_read_symlink(
 }
 
 #[no_mangle]
+/// Writes bytes into a workspace file at `offset`.
+///
+/// # Safety
+/// `value` must be a live core pointer; the string pointers must be valid
+/// NUL-terminated strings; and, when `length` is nonzero, `bytes` must be
+/// readable for `length` bytes. All pointers must remain valid and the core
+/// must not be closed for the duration of this call.
 pub unsafe extern "C" fn greppy_workspace_write(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -280,6 +332,12 @@ pub unsafe extern "C" fn greppy_workspace_write(
 macro_rules! path_operation {
     ($name:ident, $method:ident) => {
         #[no_mangle]
+        /// Applies a single-path namespace operation.
+        ///
+        /// # Safety
+        /// `value` must be a live core pointer and both string pointers must
+        /// reference valid NUL-terminated strings for the duration of this
+        /// call. The core must not be closed concurrently.
         pub unsafe extern "C" fn $name(
             value: *mut GreppyWorkspaceCore,
             workspace_id: *const c_char,
@@ -303,6 +361,12 @@ macro_rules! path_operation {
 path_operation!(greppy_workspace_unlink, unlink);
 
 #[no_mangle]
+/// Changes a workspace file's logical length.
+///
+/// # Safety
+/// `value` must be a live core pointer and both string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The core must
+/// not be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_truncate(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -323,6 +387,12 @@ pub unsafe extern "C" fn greppy_workspace_truncate(
 }
 
 #[no_mangle]
+/// Updates selected metadata fields for a workspace path.
+///
+/// # Safety
+/// `value` must be a live core pointer and both string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The core must
+/// not be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_set_metadata(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -376,6 +446,12 @@ unsafe fn create_node(
 }
 
 #[no_mangle]
+/// Creates a regular file in a workspace namespace.
+///
+/// # Safety
+/// `core` must be a live core pointer and both string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The core must
+/// not be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_create_file(
     core: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -386,6 +462,12 @@ pub unsafe extern "C" fn greppy_workspace_create_file(
 }
 
 #[no_mangle]
+/// Creates a directory in a workspace namespace.
+///
+/// # Safety
+/// `core` must be a live core pointer and both string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The core must
+/// not be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_mkdir(
     core: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -420,6 +502,12 @@ unsafe fn two_path_operation(
 }
 
 #[no_mangle]
+/// Atomically renames a workspace path.
+///
+/// # Safety
+/// `core` must be a live core pointer and all string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The core must
+/// not be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_rename(
     core: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -430,6 +518,12 @@ pub unsafe extern "C" fn greppy_workspace_rename(
 }
 
 #[no_mangle]
+/// Creates another directory entry for the source inode.
+///
+/// # Safety
+/// `core` must be a live core pointer and all string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The core must
+/// not be closed concurrently.
 pub unsafe extern "C" fn greppy_workspace_hard_link(
     core: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -440,6 +534,13 @@ pub unsafe extern "C" fn greppy_workspace_hard_link(
 }
 
 #[no_mangle]
+/// Creates a symbolic link containing arbitrary target bytes.
+///
+/// # Safety
+/// `value` must be a live core pointer; both string pointers must reference
+/// valid NUL-terminated strings; and, when `target_len` is nonzero, `target`
+/// must be readable for `target_len` bytes. All pointers must remain valid and
+/// the core must not be closed for the duration of this call.
 pub unsafe extern "C" fn greppy_workspace_symlink(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -469,6 +570,12 @@ pub unsafe extern "C" fn greppy_workspace_symlink(
 }
 
 #[no_mangle]
+/// Returns a newly allocated JSON directory listing.
+///
+/// # Safety
+/// `value` must be a live core pointer and both string pointers must reference
+/// valid NUL-terminated strings for the duration of this call. The returned
+/// string must be released exactly once with [`greppy_workspace_string_free`].
 pub unsafe extern "C" fn greppy_workspace_list_json(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
@@ -495,6 +602,12 @@ pub unsafe extern "C" fn greppy_workspace_list_json(
 }
 
 #[no_mangle]
+/// Returns a newly allocated JSON workspace listing.
+///
+/// # Safety
+/// `value` must be a live core pointer that is not closed during this call.
+/// The returned string must be released exactly once with
+/// [`greppy_workspace_string_free`].
 pub unsafe extern "C" fn greppy_workspace_list_workspaces_json(
     value: *mut GreppyWorkspaceCore,
 ) -> *mut c_char {
@@ -517,6 +630,12 @@ pub extern "C" fn greppy_workspace_last_error() -> *mut c_char {
 }
 
 #[no_mangle]
+/// Releases a string allocated by this FFI module.
+///
+/// # Safety
+/// `value` must be null or a pointer returned by a Greppy workspace FFI string
+/// function that has not already been freed. It must not be used after this
+/// call.
 pub unsafe extern "C" fn greppy_workspace_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(CString::from_raw(value));
