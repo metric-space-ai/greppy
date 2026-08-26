@@ -53,6 +53,115 @@ function decodeBase64(binary) {
   return Uint8Array.from(out);
 }
 
+function encodeBase64(bytes) {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let out = "";
+  for (let i = 0; i < arr.length; i += 3) {
+    const a = arr[i];
+    const b = i + 1 < arr.length ? arr[i + 1] : 0;
+    const c = i + 2 < arr.length ? arr[i + 2] : 0;
+    const n = (a << 16) | (b << 8) | c;
+    out += alphabet[(n >> 18) & 63];
+    out += alphabet[(n >> 12) & 63];
+    out += i + 1 < arr.length ? alphabet[(n >> 6) & 63] : "=";
+    out += i + 2 < arr.length ? alphabet[n & 63] : "=";
+  }
+  return out;
+}
+
+function encodeUtf8(str) {
+  const s = String(str);
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    let cp = s.charCodeAt(i);
+    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.length) {
+      const low = s.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+        i += 1;
+      }
+    }
+    if (cp < 0x80) {
+      out.push(cp);
+    } else if (cp < 0x800) {
+      out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+      out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else {
+      out.push(
+        0xf0 | (cp >> 18),
+        0x80 | ((cp >> 12) & 0x3f),
+        0x80 | ((cp >> 6) & 0x3f),
+        0x80 | (cp & 0x3f),
+      );
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+function decodeUtf8(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let out = "";
+  for (let i = 0; i < arr.length; ) {
+    const b0 = arr[i];
+    let cp;
+    let n = 1;
+    if (b0 < 0x80) {
+      cp = b0;
+    } else if ((b0 & 0xe0) === 0xc0 && i + 1 < arr.length) {
+      cp = ((b0 & 0x1f) << 6) | (arr[i + 1] & 0x3f);
+      n = 2;
+      if (cp < 0x80 || (arr[i + 1] & 0xc0) !== 0x80) cp = 0xfffd;
+    } else if ((b0 & 0xf0) === 0xe0 && i + 2 < arr.length) {
+      cp = ((b0 & 0x0f) << 12) | ((arr[i + 1] & 0x3f) << 6) | (arr[i + 2] & 0x3f);
+      n = 3;
+      if (cp < 0x800 || (arr[i + 1] & 0xc0) !== 0x80 || (arr[i + 2] & 0xc0) !== 0x80) cp = 0xfffd;
+    } else if ((b0 & 0xf8) === 0xf0 && i + 3 < arr.length) {
+      cp =
+        ((b0 & 0x07) << 18) |
+        ((arr[i + 1] & 0x3f) << 12) |
+        ((arr[i + 2] & 0x3f) << 6) |
+        (arr[i + 3] & 0x3f);
+      n = 4;
+      if (
+        cp < 0x10000 ||
+        cp > 0x10ffff ||
+        (arr[i + 1] & 0xc0) !== 0x80 ||
+        (arr[i + 2] & 0xc0) !== 0x80 ||
+        (arr[i + 3] & 0xc0) !== 0x80
+      ) {
+        cp = 0xfffd;
+      }
+    } else {
+      cp = 0xfffd;
+    }
+    out += String.fromCodePoint(cp);
+    i += n;
+  }
+  return out;
+}
+
+function bytesFromFulfillBody(body) {
+  if (body == null) {
+    return new Uint8Array();
+  }
+  if (typeof body === "string") {
+    return encodeUtf8(body);
+  }
+  if (body instanceof ArrayBuffer) {
+    return new Uint8Array(body.slice(0));
+  }
+  if (ArrayBuffer.isView(body)) {
+    return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  }
+  if (Array.isArray(body)) {
+    return Uint8Array.from(body);
+  }
+  return encodeUtf8(String(body));
+}
+
 function serializeEvaluate(pageFunction, arg) {
   if (typeof pageFunction === "function") {
     const source = pageFunction.toString();
@@ -854,13 +963,23 @@ class Page {
   }
 
   async waitForResponse(pattern) {
-    const request = await this.waitForRequest(pattern);
-    return {
-      url: () => request.url(),
-      status: () => 200,
-      ok: () => true,
-      request: () => request,
-    };
+    const needle = String(pattern);
+    const deadline = Date.now() + (this._timeout || 30_000);
+    while (Date.now() < deadline) {
+      const result = await engineCall("page.responses", { page: this._id });
+      const hit = (result.responses || []).find((rec) => String(rec.url).includes(needle));
+      if (hit) {
+        return this._responseFromRecord(hit);
+      }
+      const request = (await engineCall("page.requests", { page: this._id })).requests || [];
+      const reqHit = request.find((rec) => String(rec.url).includes(needle));
+      if (reqHit) {
+        // Non-intercepted loads have no recorded Servo response body/status.
+        break;
+      }
+      ops.op_sleep_ms(20);
+    }
+    return unsupported("Page.waitForResponse.unintercepted")();
   }
 
   async goto(url, options) {
@@ -891,19 +1010,60 @@ class Page {
     };
   }
 
+  _responseFromRecord(rec, request) {
+    const headers = rec.headers || {};
+    const status = Number(rec.status) || 200;
+    const bytes = () => decodeBase64(rec.bodyBase64 || "");
+    return {
+      url: () => rec.url,
+      status: () => status,
+      statusText: () => rec.statusText || (status < 400 ? "OK" : ""),
+      ok: () => (rec.ok == null ? status < 400 : !!rec.ok),
+      headers: () => headers,
+      headerValue: (name) => headers[String(name).toLowerCase()] || null,
+      body: async () => bytes(),
+      text: async () => decodeUtf8(bytes()),
+      request: () =>
+        request || this._requestFromRecord({ url: rec.url, method: "GET" }),
+    };
+  }
+
+  _downloadFromRecord(rec) {
+    const page = this;
+    return {
+      url: () => rec.url,
+      suggestedFilename: () => rec.suggestedFilename || "download",
+      page: () => page,
+      failure: async () => null,
+      path: async () => rec.path || null,
+      cancel: async () => unsupported("Download.cancel")(),
+      saveAs: async (path) => {
+        const result = await engineCall("page.saveDownload", {
+          page: page._id,
+          url: rec.url,
+          path: String(path),
+        });
+        if (Number(result.bytes) !== Number(rec.byteLength || 0)) {
+          throw new Error(
+            "saveAs wrote " + result.bytes + " bytes, expected " + rec.byteLength,
+          );
+        }
+        rec.path = String(path);
+      },
+    };
+  }
+
   async _dispatchNetwork() {
     const result = await engineCall("page.requests", { page: this._id });
+    const responses = ((await engineCall("page.responses", { page: this._id })).responses || []);
     const requests = result.requests || [];
     for (const rec of requests) {
       const request = this._requestFromRecord(rec);
       this._emit("request", request);
-      this._emit("response", {
-        url: () => rec.url,
-        status: () => 200,
-        ok: () => true,
-        request: () => request,
-        text: async () => "",
-      });
+      const hit = responses.find((row) => row.url === rec.url);
+      if (hit) {
+        this._emit("response", this._responseFromRecord(hit, request));
+      }
     }
   }
 
@@ -960,6 +1120,8 @@ class Page {
   }
 
   async _flushPopups() {
+    this._pendingPopups = this._pendingPopups || [];
+    this._popupWaiters = this._popupWaiters || [];
     const result = await engineCall("page.popups", { page: this._id });
     const recs = result.pages || [];
     for (const rec of recs) {
@@ -975,6 +1137,8 @@ class Page {
   }
 
   _waitForPopup() {
+    this._pendingPopups = this._pendingPopups || [];
+    this._popupWaiters = this._popupWaiters || [];
     if (this._pendingPopups.length) {
       return Promise.resolve(this._pendingPopups.shift());
     }
@@ -1027,6 +1191,7 @@ class Page {
   }
 
   waitForNavigation() {
+    this._navWaiters = this._navWaiters || [];
     return new Promise((resolve) => {
       this._navWaiters.push(resolve);
     });
@@ -1064,11 +1229,17 @@ class Page {
   }
 
   async goBack() {
-    return engineCall("page.goBack", { page: this._id });
+    const result = await engineCall("page.goBack", { page: this._id });
+    await this._flushNavigation();
+    await this._dispatchNetwork();
+    return result.ok ? result : null;
   }
 
   async goForward() {
-    return engineCall("page.goForward", { page: this._id });
+    const result = await engineCall("page.goForward", { page: this._id });
+    await this._flushNavigation();
+    await this._dispatchNetwork();
+    return result.ok ? result : null;
   }
 
   async close() {
@@ -1104,7 +1275,11 @@ class Page {
     }
     if (event === "download") {
       const result = await engineCall("page.downloads", { page: this._id });
-      return (result.downloads || [])[0] || null;
+      const rec = (result.downloads || [])[0];
+      if (!rec) {
+        return unsupported("Page.waitForEvent.download.empty")();
+      }
+      return this._downloadFromRecord(rec);
     }
     return unsupported(`Page.waitForEvent.${event}`)();
   }
@@ -1271,7 +1446,8 @@ class Page {
           page: this._id,
           pattern: String(url),
           action: "fulfill",
-          body: options.body || "",
+          bodyBase64: encodeBase64(bytesFromFulfillBody(options.body)),
+          byteLength: bytesFromFulfillBody(options.body).length,
           contentType: options.contentType || "text/html",
           status: options.status || 200,
         }),
@@ -1302,12 +1478,8 @@ class Page {
     await engineCall("page.addInitScript", { page: this._id, source });
   }
 
-  async setViewportSize(size) {
-    await engineCall("page.setViewportSize", {
-      page: this._id,
-      width: size.width,
-      height: size.height,
-    });
+  async setViewportSize() {
+    return unsupported("Page.setViewportSize")();
   }
 
   async viewportSize() {
@@ -1321,12 +1493,8 @@ class BrowserContext {
     this._id = id;
     this._pages = [];
     this.tracing = {
-      start: async () => {
-        this._tracing = true;
-      },
-      stop: async () => {
-        return engineCall("page.tracing", { page: this._lastPage || "page-1" });
-      },
+      start: async () => unsupported("BrowserContext.tracing.start")(),
+      stop: async () => unsupported("BrowserContext.tracing.stop")(),
     };
     return withUnsupported(this, "BrowserContext");
   }

@@ -13,7 +13,7 @@
     "The original parser attached some nested option fields to parent types (for example Page.trial, Page.waitUntil, Browser.viewport). Those rows are preserved as parser output and are not treated as proof that the parent object has those fields.",
     "EventEmitter overloads (on/once/off and related) are represented as events plus Page.addListener-style methods where the parser emitted them; types.d.ts recovery does not re-emit every overload.",
     "Type-level inventory is necessary but not sufficient for compatibility. Schema presence does not imply source or behavior compatibility.",
-    "Oracle receipts exist only for scoped cases (setContent title/evaluate/innerText, native alert type/message, locator.fill). behavior:passing is those cases, not the 1,354-row Playwright surface.",
+    "Oracle receipts exist only for scoped cases (setContent title/evaluate/innerText, native alert type/message, locator.fill, console.log text, Page.content markers + Locator.count). behavior:passing is those cases, not the 1,354-row Playwright surface.",
     "Silent no-ops and ignored options are not compatibility. schema implemented requires a binding that changes observable state or returns real engine state; otherwise the row is unsupported or unverified."
   ],
   "status_vocabulary": {
@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 196,
-    "unsupported": 277,
-    "unverified": 881
+    "implemented": 209,
+    "unsupported": 281,
+    "unverified": 864
   },
   "entries": [
     {
@@ -169,7 +169,6 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "clears Servo show_console_message records",
         "Greppy convenience; not counted as Playwright compatibility."
       ]
     },
@@ -234,12 +233,15 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "session-daemon",
-        "title-url"
+        "title-url",
+        "oracle-content"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle compares substring markers (ok / Oracle) after setContent, not byte-identical HTML serialization"
+      ]
     },
     {
       "symbol": "Page.context",
@@ -555,7 +557,8 @@
         "goback"
       ],
       "known_differences": [
-        "Servo WebView::go_back"
+        "Servo WebView::go_back",
+        "URL after go_back is asserted against the previous navigation"
       ]
     },
     {
@@ -563,11 +566,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "goback"
+      ],
       "known_differences": [
-        "Servo WebView::go_forward"
+        "Servo WebView::go_forward; URL after history traversal is asserted",
+        "return value is {ok,url} JSON, not a Playwright Response object"
       ]
     },
     {
@@ -816,11 +822,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "network-and-box"
+      ],
       "known_differences": [
-        "alias of on()"
+        "wraps on() and removes the listener after the first emit"
       ]
     },
     {
@@ -834,10 +842,10 @@
         "popup-opener"
       ],
       "known_differences": [
-        "always null; popup opener is not wired",
         "async; returns the Page that caused request_create_new (window.open / target=_blank)",
         "top-level pages return null",
-        "identity is the creating Page object when both live in the same BrowserContext"
+        "identity is the creating Page object when both live in the same BrowserContext",
+        "not compared against Playwright Chromium popup opener identity"
       ]
     },
     {
@@ -984,7 +992,6 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "returns recorded WebResourceRequest objects, not Playwright Request events",
         "Greppy convenience dump of recorded WebResourceRequests, not a Playwright Page.requests compatibility claim."
       ]
     },
@@ -1156,7 +1163,6 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "records size only; software renderer stays 800x600",
         "Recording a size without resizing the 800x600 software renderer is not compatibility. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
@@ -1238,11 +1244,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "route-fulfill"
+      ],
       "known_differences": [
-        "clears all RouteRule entries"
+        "clears all RouteRule entries for the page"
       ]
     },
     {
@@ -1363,11 +1371,17 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "route-fulfill",
+        "download-and-file"
+      ],
       "known_differences": [
-        "wraps waitForRequest with status 200"
+        "returns intercept records from route.fulfill (status/headers/base64 body)",
+        "unintercepted navigations throw unsupported_playwright_operation; they are not stubbed as status 200",
+        "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body.",
+        "not Chromium-oracle compared; not marked behavior passing"
       ]
     },
     {
@@ -2374,11 +2388,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "delegates to frame.locator which is main-frame CSS or the iframe element"
+        "main-frame delegates to Page.locator; child frames are not in-document locators"
       ]
     },
     {
@@ -2450,11 +2466,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "delegates to frame.locator"
+        "main-frame delegates to Page.locator"
       ]
     },
     {
@@ -2637,7 +2655,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "locator-type"
+        "locator-type",
+        "extra-selectors"
       ],
       "known_differences": [
         "delegates to locator.inputValue"
@@ -2726,11 +2745,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "returns a page locator for the iframe element, not in-frame locators"
+        "main-frame returns a page locator; iframe ids wrap the iframe element, not its contentDocument"
       ]
     },
     {
@@ -3647,11 +3668,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "cookies"
+      ],
       "known_differences": [
-        "cookies only; origins empty"
+        "cookies from document.cookie only; origins/localStorage are empty",
+        "HttpOnly / SiteDataManager cookies are not included"
       ]
     },
     {
@@ -4150,9 +4174,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "compat-core"
+      ],
       "known_differences": [
         "implemented as newContext()+newPage(); options are unsupported"
       ]
@@ -5829,13 +5855,16 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "compat-core",
         "session-daemon",
-        "locator-count"
+        "locator-count",
+        "oracle-content"
       ],
-      "known_differences": []
+      "known_differences": [
+        "oracle compares count of #x after setContent equals 1; full selector-engine parity is not claimed"
+      ]
     },
     {
       "symbol": "Locator.dblclick",
@@ -6045,9 +6074,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
         "descendant query under selector.scope; not Playwright layout-based piercing"
       ]
@@ -6057,9 +6088,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
         "descendant query under selector.scope; not Playwright layout-based piercing"
       ]
@@ -6097,9 +6130,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
         "descendant query under selector.scope; not Playwright layout-based piercing"
       ]
@@ -6123,9 +6158,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
         "descendant query under selector.scope; not Playwright layout-based piercing"
       ]
@@ -8876,11 +8913,13 @@
       "symbol": "Download.cancel",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation. No in-flight download cancellation."
+      ]
     },
     {
       "symbol": "Download.createReadStream",
@@ -8906,61 +8945,99 @@
       "symbol": "Download.failure",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "only route.fulfill with application/octet-stream (or content-type containing attachment)",
+        "HTML fulfill is not recorded as a download",
+        "path() is null until saveAs writes a caller-provided path; Playwright's auto temp path is not created",
+        "always null for a fulfilled intercept"
+      ]
     },
     {
       "symbol": "Download.page",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "only route.fulfill with application/octet-stream (or content-type containing attachment)",
+        "HTML fulfill is not recorded as a download",
+        "path() is null until saveAs writes a caller-provided path; Playwright's auto temp path is not created",
+        "the Page that registered the route"
+      ]
     },
     {
       "symbol": "Download.path",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "null until saveAs; then the path passed to saveAs",
+        "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body."
+      ]
     },
     {
       "symbol": "Download.saveAs",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body.",
+        "writes decoded intercept bytes to the caller path; Playwright auto temp path is not created",
+        "binary octet-stream fulfill only; not Chromium-oracle compared"
+      ]
     },
     {
       "symbol": "Download.suggestedFilename",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "only route.fulfill with application/octet-stream (or content-type containing attachment)",
+        "HTML fulfill is not recorded as a download",
+        "path() is null until saveAs writes a caller-provided path; Playwright's auto temp path is not created",
+        "taken from the intercept URL last path segment"
+      ]
     },
     {
       "symbol": "Download.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "only route.fulfill with application/octet-stream (or content-type containing attachment)",
+        "HTML fulfill is not recorded as a download",
+        "path() is null until saveAs writes a caller-provided path; Playwright's auto temp path is not created"
+      ]
     },
     {
       "symbol": "FileChooser.element",
@@ -9332,9 +9409,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "keyboard"
+      ],
       "known_differences": [
         "alias of keyboard.type DOM value append"
       ]
@@ -9344,11 +9423,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "keyboard"
+      ],
       "known_differences": [
-        "dispatches DOM KeyboardEvent; not OS-level key input"
+        "dispatches a DOM KeyboardEvent on the active element; not OS-level key input or form submit"
       ]
     },
     {
@@ -9756,11 +9837,19 @@
       "symbol": "Response.body",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill",
+        "download-and-file"
+      ],
+      "known_differences": [
+        "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body.",
+        "returns a Uint8Array of intercept bytes, not a Node Buffer",
+        "only route.fulfill intercepts; unintercepted navigations are unsupported",
+        "not Chromium-oracle compared; not marked behavior passing"
+      ]
     },
     {
       "symbol": "Response.finished",
@@ -9796,11 +9885,15 @@
       "symbol": "Response.headerValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "lookup on recorded fulfill headers, case-insensitive name"
+      ]
     },
     {
       "symbol": "Response.headerValues",
@@ -9816,11 +9909,15 @@
       "symbol": "Response.headers",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "fulfill content-type only; not the full Chromium header set"
+      ]
     },
     {
       "symbol": "Response.headersArray",
@@ -9856,24 +9953,29 @@
       "symbol": "Response.ok",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "route-fulfill"
+      ],
       "known_differences": [
-        "true when status stub is 200",
-        "Response objects currently stub status 200; not claimed as implemented until intercept status is tested."
+        "true when intercept status < 400"
       ]
     },
     {
       "symbol": "Response.request",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "reconstructed from the intercept URL as method GET; not the live Request event"
+      ]
     },
     {
       "symbol": "Response.securityDetails",
@@ -9899,34 +10001,45 @@
       "symbol": "Response.status",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "route-fulfill"
+      ],
       "known_differences": [
-        "200 stub except fulfilled intercepts are not reflected on the Response object yet",
-        "Response objects currently stub status 200; not claimed as implemented until intercept status is tested."
+        "status from route.fulfill; unintercepted responses are not claimed"
       ]
     },
     {
       "symbol": "Response.statusText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "http crate canonical reason for the fulfill status"
+      ]
     },
     {
       "symbol": "Response.text",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body.",
+        "TextDecoder utf-8 of stored bytes; invalid sequences become U+FFFD at text() time only",
+        "not Chromium-oracle compared"
+      ]
     },
     {
       "symbol": "Response.url",
@@ -9936,10 +10049,11 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "network-and-box"
+        "network-and-box",
+        "route-fulfill"
       ],
       "known_differences": [
-        "uses the request URL; status is 200 unless a route intercepts"
+        "uses the intercepted request URL"
       ]
     },
     {
@@ -10291,11 +10405,13 @@
       "symbol": "Tracing.start",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation. No Chromium trace."
+      ]
     },
     {
       "symbol": "Tracing.startChunk",
@@ -10321,11 +10437,13 @@
       "symbol": "Tracing.stop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation. No Chromium trace."
+      ]
     },
     {
       "symbol": "Tracing.stopChunk",
@@ -13909,12 +14027,12 @@
       "symbol": "BrowserContext.tracing",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "implemented",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "stop() dumps request/dialog/console logs; not Playwright trace.zip"
+        "No Playwright trace.zip. start/stop MUST fail with unsupported_playwright_operation. Returning request/download dumps is not tracing compatibility."
       ]
     },
     {
@@ -14105,11 +14223,13 @@
       "kind": "method",
       "origin": "types.d.ts recovery",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "keyboard"
+      ],
       "known_differences": [
-        "implemented via active-element value append; Servo evaluate of KeyboardEvent construction is incomplete"
+        "appends to the active element's value; not a full keydown/keyup sequence per character"
       ]
     },
     {
@@ -14947,8 +15067,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1069,
-    "unsupported": 277,
-    "passing": 8
+    "unverified": 1063,
+    "unsupported": 281,
+    "passing": 10
   }
 }

@@ -11,4 +11,11 @@ const text = (await page.locator("#x").innerText()).trim();
 if (title !== "Oracle" || value !== 2 || text !== "ok") {
   throw new Error(JSON.stringify({ title, value, text }));
 }
+const html = await page.content();
+if (!String(html).includes("ok") || !/oracle/i.test(String(html))) {
+  throw new Error("content missing markers: " + String(html).slice(0, 200));
+}
+if ((await page.locator("#x").count()) !== 1) {
+  throw new Error("count");
+}
 await browser.close();

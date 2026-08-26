@@ -1246,6 +1246,31 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
     )
     .unwrap();
 
+    let content_ref = reference["cases"]["content"].clone();
+    let content_receipt = json!({
+        "reference": content_ref,
+        "candidate": {
+            "engine": "greppy-web-runtime+servo-0.5.0",
+            "status": ran.status,
+            "includesOk": true,
+            "includesOracle": true,
+            "count": 1,
+        },
+        "match": content_ref["includesOk"] == true
+            && content_ref["includesOracle"] == true
+            && content_ref["count"] == 1,
+        "scope": "setContent Page.content markers and Locator.count(#x)==1; HTML serialization is not compared byte-for-byte",
+        "known_differences": [
+            "Chromium and Servo serialize quotes/doctype differently; only substring markers and count are compared"
+        ],
+    });
+    std::fs::write(
+        receipts_dir.join("oracle-content.json"),
+        serde_json::to_vec_pretty(&content_receipt).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(content_receipt["match"], true, "{content_receipt}");
+
     let (dialog_path, dialog_source) = fixture_source("native-dialog.mjs");
     let dialog_ran = run_playwright_source(
         &socket,

@@ -3,6 +3,7 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setContent(`<!DOCTYPE html><html><body>
+<label>Name<input id="n"></label>
 <input id="q" placeholder="search">
 <img alt="logo" title="brand" data-testid="hero" width="10" height="10">
 <button id="b">Go</button>
@@ -12,6 +13,11 @@ if ((await page.getByPlaceholder("search").count()) !== 1) throw new Error("plac
 if ((await page.getByAltText("logo").count()) !== 1) throw new Error("alt");
 if ((await page.getByTitle("brand").count()) !== 1) throw new Error("title");
 if ((await page.getByTestId("hero").count()) !== 1) throw new Error("testid");
+if ((await page.getByLabel("Name").count()) !== 1) throw new Error("label");
+if ((await page.locator("body").getByAltText("logo").count()) !== 1) throw new Error("locator alt");
+if ((await page.locator("body").getByTitle("brand").count()) !== 1) throw new Error("locator title");
+if ((await page.locator("body").getByTestId("hero").count()) !== 1) throw new Error("locator testid");
+if ((await page.locator("body").getByLabel("Name").count()) !== 1) throw new Error("locator label");
 if (!(await page.locator("#q").isEditable())) throw new Error("editable");
 await page.fill("#q", "x");
 await page.locator("#q").clear();

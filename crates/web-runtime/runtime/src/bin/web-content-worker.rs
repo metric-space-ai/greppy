@@ -39,6 +39,8 @@ struct RouteRule {
     pattern: String,
     action: String,
     body: Vec<u8>,
+    status: u16,
+    content_type: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +65,7 @@ struct Delegate {
     extra_headers: RefCell<Vec<(String, String)>>,
     last_console: RefCell<Vec<serde_json::Value>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
+    last_responses: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
@@ -83,6 +86,7 @@ impl Delegate {
             extra_headers: RefCell::new(Vec::new()),
             last_console: RefCell::new(Vec::new()),
             last_file_choosers: RefCell::new(Vec::new()),
+            last_responses: RefCell::new(Vec::new()),
             opener_id: RefCell::new(None),
             rendering_context,
         }
@@ -197,8 +201,15 @@ impl WebViewDelegate for Delegate {
             .borrow()
             .iter()
             .find(|rule| pattern_matches(&rule.pattern, &url))
-            .map(|rule| (rule.action.clone(), rule.body.clone()));
-        let Some((action, body)) = matched else {
+            .map(|rule| {
+                (
+                    rule.action.clone(),
+                    rule.body.clone(),
+                    rule.status,
+                    rule.content_type.clone(),
+                )
+            });
+        let Some((action, body, status, content_type)) = matched else {
             return;
         };
         let request_url = load.request.url.clone();
@@ -208,15 +219,52 @@ impl WebViewDelegate for Delegate {
                     .cancel();
             }
             "fulfill" => {
-                let mut intercepted = load.intercept(WebResourceResponse::new(request_url.clone()));
+                let status_code =
+                    http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
+                let mut header_map = http::HeaderMap::new();
+                if let Ok(value) = http::HeaderValue::from_str(&content_type) {
+                    header_map.insert(http::header::CONTENT_TYPE, value);
+                }
+                let mut intercepted = load.intercept(
+                    WebResourceResponse::new(request_url.clone())
+                        .status_code(status_code)
+                        .headers(header_map),
+                );
                 if !body.is_empty() {
                     intercepted.send_body_data(body.clone());
                 }
                 intercepted.finish();
-                self.downloads.borrow_mut().push(json!({
+                let status_text = status_code.canonical_reason().unwrap_or("").to_owned();
+                let body_b64 = base64_encode(&body);
+                self.last_responses.borrow_mut().push(json!({
                     "url": request_url.to_string(),
-                    "bytes": body.len(),
+                    "status": status,
+                    "statusText": status_text,
+                    "ok": status < 400,
+                    "bodyBase64": body_b64,
+                    "byteLength": body.len(),
+                    "headers": {
+                        "content-type": content_type,
+                    },
                 }));
+                let lower = content_type.to_ascii_lowercase();
+                let is_download =
+                    lower.contains("octet-stream") || lower.contains("attachment");
+                if is_download {
+                    let suggested = request_url
+                        .path_segments()
+                        .and_then(|segments| segments.last())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("download")
+                        .to_owned();
+                    self.downloads.borrow_mut().push(json!({
+                        "url": request_url.to_string(),
+                        "byteLength": body.len(),
+                        "bodyBase64": body_b64,
+                        "suggestedFilename": suggested,
+                        "contentType": content_type,
+                    }));
+                }
             }
             _ => {}
         }
@@ -1041,16 +1089,32 @@ impl ContentEngine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("continue")
                     .to_owned();
-                let body = params
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .as_bytes()
-                    .to_vec();
+                let body = if let Some(b64) = params
+                    .get("bodyBase64")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                {
+                    base64_decode(b64)?
+                } else {
+                    params
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .as_bytes()
+                        .to_vec()
+                };
+                let status = params.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+                let content_type = params
+                    .get("contentType")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("text/html")
+                    .to_owned();
                 self.page(&page_id)?.1.routes.borrow_mut().push(RouteRule {
                     pattern,
                     action,
                     body,
+                    status,
+                    content_type,
                 });
                 Ok(json!({}))
             }
@@ -1100,9 +1164,43 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 Ok(json!({ "requests": self.page(&page_id)?.1.requests.borrow().clone() }))
             }
+            "page.responses" => {
+                let page_id = required_str(&params, "page")?;
+                Ok(json!({ "responses": self.page(&page_id)?.1.last_responses.borrow().clone() }))
+            }
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
                 Ok(json!({ "downloads": self.page(&page_id)?.1.downloads.borrow().clone() }))
+            }
+            "page.saveDownload" => {
+                let page_id = required_str(&params, "page")?;
+                let url = required_str(&params, "url")?;
+                let path = required_str(&params, "path")?;
+                let body_b64 = {
+                    let downloads = self.page(&page_id)?.1.downloads.borrow();
+                    downloads
+                        .iter()
+                        .rev()
+                        .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url.as_str()))
+                        .and_then(|row| {
+                            row.get("bodyBase64")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                        })
+                        .ok_or_else(|| io::Error::other("no matching download body"))?
+                };
+                let bytes = base64_decode(&body_b64)?;
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&path, &bytes)?;
+                let written = std::fs::read(&path)?;
+                if written != bytes {
+                    return Err(io::Error::other("saveDownload readback mismatch"));
+                }
+                Ok(json!({ "ok": true, "bytes": written.len() }))
             }
             "page.popups" => {
                 let page_id = required_str(&params, "page")?;
@@ -1172,8 +1270,17 @@ impl ContentEngine {
                 let ok = webview.can_go_back();
                 if ok {
                     webview.go_back(1);
+                    let loading = webview.clone();
+                    let _ = self.spin_until(ACTION_TIMEOUT, move || {
+                        loading.load_status() == LoadStatus::Complete
+                    })?;
+                    webview.paint();
+                    self.servo.spin_event_loop();
                 }
-                Ok(json!({ "ok": ok }))
+                Ok(json!({
+                    "ok": ok,
+                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
+                }))
             }
             "page.goForward" => {
                 let page_id = required_str(&params, "page")?;
@@ -1181,8 +1288,17 @@ impl ContentEngine {
                 let ok = webview.can_go_forward();
                 if ok {
                     webview.go_forward(1);
+                    let loading = webview.clone();
+                    let _ = self.spin_until(ACTION_TIMEOUT, move || {
+                        loading.load_status() == LoadStatus::Complete
+                    })?;
+                    webview.paint();
+                    self.servo.spin_event_loop();
                 }
-                Ok(json!({ "ok": ok }))
+                Ok(json!({
+                    "ok": ok,
+                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
+                }))
             }
             "page.addCookies" => {
                 let page_id = required_str(&params, "page")?;
@@ -1445,7 +1561,8 @@ function greppyResolveIn(root, selector) {
       const el = document.getElementById(match.htmlFor);
       return el ? [el] : [];
     }
-    return [];
+    const nested = match.querySelector("input, textarea, select, button");
+    return nested ? [nested] : [];
   }
   const pool = greppyCandidates(root);
   if (selector.type === 'role') {
@@ -1706,6 +1823,49 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+fn base64_decode(input: &str) -> io::Result<Vec<u8>> {
+    fn sextet(byte: u8) -> io::Result<u32> {
+        match byte {
+            b'A'..=b'Z' => Ok(u32::from(byte - b'A')),
+            b'a'..=b'z' => Ok(u32::from(byte - b'a') + 26),
+            b'0'..=b'9' => Ok(u32::from(byte - b'0') + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid base64 body",
+            )),
+        }
+    }
+    let chars: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if chars.len() % 4 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid base64 length",
+        ));
+    }
+    let mut out = Vec::with_capacity(chars.len() / 4 * 3);
+    for chunk in chars.chunks(4) {
+        let pad = chunk.iter().filter(|byte| **byte == b'=').count();
+        let a = sextet(chunk[0])?;
+        let b = sextet(chunk[1])?;
+        let c = if chunk[2] == b'=' { 0 } else { sextet(chunk[2])? };
+        let d = if chunk[3] == b'=' { 0 } else { sextet(chunk[3])? };
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
 }
 
 fn is_parent_eof(error: &io::Error) -> bool {
