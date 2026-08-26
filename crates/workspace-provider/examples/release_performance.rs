@@ -86,6 +86,11 @@ fn main() {
     provider
         .doctor_io("release-performance")
         .unwrap_or_else(|error| fail(&format!("provider I/O doctor failed: {error}")));
+    write_checkpoint(
+        &args.output,
+        "provider-ready",
+        serde_json::json!({"source_commit": args.source_commit}),
+    );
     let tracked_files = tracked_file_count(&args.repository);
     if tracked_files != args.expected_files {
         fail(&format!(
@@ -122,6 +127,11 @@ fn main() {
     let physical_after = allocated_tree_bytes(&args.data_root);
     let untouched_physical_delta = physical_after.saturating_sub(physical_before);
     core.remove_workspace(untouched).unwrap();
+    write_checkpoint(
+        &args.output,
+        "untouched-space-measured",
+        serde_json::json!({"untouched_physical_delta_bytes": untouched_physical_delta}),
+    );
 
     let mut snapshot_ms = Vec::with_capacity(args.iterations);
     let mut visible_ms = Vec::with_capacity(args.iterations);
@@ -144,6 +154,11 @@ fn main() {
         end_to_end_ms.push(end_to_end_started.elapsed().as_secs_f64() * 1_000.0);
         core.remove_workspace(handle).unwrap();
     }
+    write_checkpoint(
+        &args.output,
+        "serial-workspaces-measured",
+        serde_json::json!({"snapshot_ms": &snapshot_ms, "visible_ms": &visible_ms, "end_to_end_ms": &end_to_end_ms}),
+    );
 
     let parallel_started = Instant::now();
     let parallel_baseline = capture_repository(&args.repository, core.chunks()).unwrap();
@@ -188,11 +203,24 @@ fn main() {
     for handle in handles {
         core.remove_workspace(handle).unwrap();
     }
+    write_checkpoint(
+        &args.output,
+        "parallel-workspaces-measured",
+        serde_json::json!({"workspaces": args.parallel, "wall_ms": parallel_ms}),
+    );
 
     let (native_worktree_ms, native_worktree_physical_bytes) = measure_native_worktrees(
         &args.repository,
         &args.native_baseline_root,
         args.native_baseline_iterations,
+    );
+    write_checkpoint(
+        &args.output,
+        "native-git-worktrees-measured",
+        serde_json::json!({
+            "elapsed_ms": &native_worktree_ms,
+            "physical_bytes": &native_worktree_physical_bytes,
+        }),
     );
 
     let large_path = args.repository.join(".greppy-perf-large.bin");
@@ -224,6 +252,14 @@ fn main() {
         .saturating_sub(chunks_before.chunk_count);
     core.remove_workspace(write_handle).unwrap();
     fs::remove_file(&large_path).unwrap();
+    write_checkpoint(
+        &args.output,
+        "one-byte-write-measured",
+        serde_json::json!({
+            "physical_delta_bytes": one_byte_physical_delta,
+            "new_chunks": one_byte_chunk_delta,
+        }),
+    );
 
     let toolchains = args
         .toolchain_cases
@@ -234,6 +270,11 @@ fn main() {
         })
         .map(|case| measure_toolchain(&core, &provider, &args.repository, case))
         .collect::<Vec<_>>();
+    write_checkpoint(
+        &args.output,
+        "toolchains-measured",
+        serde_json::to_value(&toolchains).unwrap(),
+    );
 
     let visible_p50_ms = percentile(&visible_ms, 50);
     let visible_p95_ms = percentile(&visible_ms, 95);
@@ -539,6 +580,22 @@ fn allocated_tree_bytes_if_exists(root: &Path) -> u64 {
     } else {
         0
     }
+}
+
+fn write_checkpoint(output: &Path, phase: &str, measurements: serde_json::Value) {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let checkpoint = serde_json::json!({
+        "schema": "greppy.portable-cow-performance.checkpoint.v1",
+        "complete": false,
+        "phase": phase,
+        "measurements": measurements,
+    });
+    let temporary = output.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(&checkpoint).unwrap()).unwrap();
+    fs::rename(temporary, output).unwrap();
+    eprintln!("portable workspace performance checkpoint: {phase}");
 }
 
 #[cfg(unix)]

@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "common/mounted_contract.rs"]
+mod mounted_contract;
+
 use greppy_workspace_core::{capture_repository, ProviderInstallation, WorkspaceCore, CHUNK_SIZE};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -87,6 +90,7 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
     provider.doctor_io("linux-mount").unwrap();
 
     let root = provider.workspace_path(workspace.id()).unwrap();
+    mounted_contract::exercise_mounted_contract(&root, &core);
     assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"dirty\n");
     assert_eq!(fs::read(root.join("untracked.txt")).unwrap(), b"user\n");
     assert_eq!(
