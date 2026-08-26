@@ -209,6 +209,11 @@ impl AgentWorkspace {
         &self.worktree
     }
 
+    /// Original repository captured into this immutable workspace view.
+    pub fn repository_path(&self) -> &Path {
+        &self.repo_root
+    }
+
     pub fn linked_git_dir(&self) -> &Path {
         &self.private_git_dir
     }

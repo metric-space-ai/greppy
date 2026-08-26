@@ -1385,11 +1385,14 @@ fn git_lookup(repository: &Path, commit: &str, path: &str) -> Result<Option<GitE
         .trim_end()
         .to_string();
     let oid = git_text(repository, &["rev-parse", &spec])?;
-    let mode = git_mode_for_path(repository, commit, path)?;
-    let kind = match object_type.as_str() {
-        "tree" => NodeKind::Directory,
-        "blob" if mode == 0o120000 => NodeKind::Symlink,
-        "blob" => NodeKind::File,
+    let git_mode = git_mode_for_path(repository, commit, path)?;
+    let (kind, mode) = match object_type.as_str() {
+        // Git tree modes contain only the object type. A mounted filesystem
+        // must expose traversable permissions or every committed directory is
+        // visible in its parent but inaccessible to recursive tools.
+        "tree" => (NodeKind::Directory, 0o040755),
+        "blob" if git_mode == 0o120000 => (NodeKind::Symlink, 0o120777),
+        "blob" => (NodeKind::File, git_mode),
         other => {
             return Err(Error::UnsupportedRepository(format!(
                 "unsupported Git object type {other} at {path}"
@@ -1708,6 +1711,9 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert_eq!(root, ["README.md", "src", "untracked.txt"]);
+        let source = core.metadata(&workspace, "src").unwrap().unwrap();
+        assert_eq!(source.kind, NodeKind::Directory);
+        assert_eq!(source.mode & 0o777, 0o755);
     }
 
     #[test]

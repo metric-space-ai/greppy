@@ -346,6 +346,7 @@ pub(crate) fn prepare_base_store(
     layout
         .quarantine_current()
         .map_err(|error| Error::io("quarantine invalid Base Store", error))?;
+    let expected_file_count = validate_workspace_inventory(workspace)?;
 
     std::fs::create_dir_all(shared_data_root)
         .map_err(|error| Error::io("create shared Base data root", error))?;
@@ -402,6 +403,7 @@ pub(crate) fn prepare_base_store(
             .map_err(|error| Error::Store(format!("checkpoint Base graph: {error}")))?;
     }
     validate_base_contents(workspace.worktree_path(), &staged_graph, &identity)?;
+    validate_base_file_count(&staged_graph, expected_file_count)?;
     #[cfg(debug_assertions)]
     if std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some() {
         return Err(Error::Invalid(
@@ -424,6 +426,69 @@ pub(crate) fn prepare_base_store(
         .map_err(|error| Error::io("publish immutable Base Store", error))?;
     drop(builder_lease);
     prepared_base_with_reader(&layout, manifest, false)
+}
+
+fn validate_workspace_inventory(
+    workspace: &greppy_agent::workspace::AgentWorkspace,
+) -> Result<usize> {
+    fn inventory(root: &Path) -> Result<Vec<(String, Option<u64>)>> {
+        greppy_discover::walk(root)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.rel_path, entry.size))
+                    .collect()
+            })
+            .map_err(|error| {
+                Error::Invalid(format!(
+                    "cannot inventory immutable Base candidate {}: {error}",
+                    root.display()
+                ))
+            })
+    }
+
+    let expected = inventory(workspace.repository_path())?;
+    let actual = inventory(workspace.worktree_path())?;
+    if expected == actual {
+        return Ok(expected.len());
+    }
+    let first_difference = expected
+        .iter()
+        .zip(actual.iter())
+        .find(|(left, right)| left != right)
+        .map(|(left, right)| format!("expected {left:?}, mounted {right:?}"))
+        .or_else(|| {
+            expected
+                .get(actual.len())
+                .map(|entry| format!("missing mounted entry {entry:?}"))
+        })
+        .or_else(|| {
+            actual
+                .get(expected.len())
+                .map(|entry| format!("unexpected mounted entry {entry:?}"))
+        })
+        .unwrap_or_else(|| "inventory content differs".into());
+    Err(Error::Invalid(format!(
+        "portable workspace inventory is incomplete: source has {} files, mount has {}; {first_difference}",
+        expected.len(),
+        actual.len()
+    )))
+}
+
+fn validate_base_file_count(graph_path: &Path, expected: usize) -> Result<()> {
+    let store = greppy_store::Store::open_with(graph_path, greppy_store::OpenOptions::read_only())?;
+    let actual = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM file_state", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .map_err(|error| Error::Store(format!("count Base file inventory: {error}")))?;
+    if actual != expected {
+        return Err(Error::Invalid(format!(
+            "Base file inventory is incomplete: expected {expected} file_state rows, found {actual}"
+        )));
+    }
+    Ok(())
 }
 
 fn append_embedding_cli_args(command: &mut Command, embedding_args: crate::EmbeddingCliArgs<'_>) {

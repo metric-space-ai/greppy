@@ -27,6 +27,11 @@ Swift system boundary, and Windows uses the official unchanged WinFsp 2.1
 runtime through Greppy's Rust provider. Adapter failure has no hidden native
 fallback. Concurrent provider and CLI opens wait for short SQLite-WAL writers
 instead of failing nondeterministically with `database is locked`.
+Committed Git trees are exposed with traversable virtual directory modes;
+their type-only Git mode is never mistaken for filesystem permissions. A Base
+builder compares source and mounted inventories before indexing and verifies
+the final `file_state` row count before publishing `COMPLETE`, preventing a
+root-files-only index from becoming a reusable false-success Base.
 
 Dirty-based proposals record the pinned commit as parent but expose only the
 initial-snapshot-to-final patch. `greppy agent apply REF` verifies the exact

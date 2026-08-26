@@ -53,7 +53,9 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
     git(&repo, &["config", "user.email", "test@example.test"]);
     git(&repo, &["config", "user.name", "Test"]);
     fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
-    git(&repo, &["add", "tracked.txt"]);
+    fs::create_dir_all(repo.join("nested/deeper")).unwrap();
+    fs::write(repo.join("nested/deeper/base.txt"), b"nested base\n").unwrap();
+    git(&repo, &["add", "tracked.txt", "nested/deeper/base.txt"]);
     git(&repo, &["commit", "-qm", "base"]);
     fs::write(repo.join("tracked.txt"), b"dirty\n").unwrap();
     fs::write(repo.join("untracked.txt"), b"user\n").unwrap();
@@ -87,6 +89,19 @@ fn mounted_provider_satisfies_workspace_and_private_git_contract() {
     let root = provider.workspace_path(workspace.id()).unwrap();
     assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"dirty\n");
     assert_eq!(fs::read(root.join("untracked.txt")).unwrap(), b"user\n");
+    assert_eq!(
+        fs::read(root.join("nested/deeper/base.txt")).unwrap(),
+        b"nested base\n"
+    );
+    assert_ne!(
+        fs::metadata(root.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "committed Git trees must be traversable through the provider"
+    );
     fs::write(root.join("unicode-ä.txt"), b"unicode").unwrap();
     fs::rename(root.join("unicode-ä.txt"), root.join("renamed.txt")).unwrap();
     fs::remove_file(root.join("renamed.txt")).unwrap();
