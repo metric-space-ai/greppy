@@ -145,6 +145,11 @@ pub(crate) fn record(
         )
         .optional()?
         .ok_or_else(|| Error::Corrupt(format!("unregistered repository tracker {repository}")))?;
+    if state == "requested" {
+        // The native watcher is installed before activation. Its successful
+        // pre-activation events are covered by the first full double-capture.
+        return Ok(());
+    }
     if state != "active" {
         return Err(Error::Corrupt(format!(
             "repository tracker is not active: {repository} ({state})"
@@ -179,27 +184,6 @@ pub(crate) fn mark_gap(
         "UPDATE cow_repository_trackers
          SET state = 'gap', detail = ?2, heartbeat_unix_ms = ?3
          WHERE repository = ?1 AND state != 'gap'",
-        params![path_text(repository)?, detail, heartbeat_unix_ms as i64],
-    )?;
-    if changed == 0 && status(connection, repository)?.is_none() {
-        return Err(Error::Corrupt(format!(
-            "cannot mark unknown repository tracker as gap: {}",
-            repository.display()
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn mark_active_gap(
-    connection: &Connection,
-    repository: &Path,
-    detail: &str,
-    heartbeat_unix_ms: u64,
-) -> Result<()> {
-    let changed = connection.execute(
-        "UPDATE cow_repository_trackers
-         SET state = 'gap', detail = ?2, heartbeat_unix_ms = ?3
-         WHERE repository = ?1 AND state = 'active'",
         params![path_text(repository)?, detail, heartbeat_unix_ms as i64],
     )?;
     if changed == 0 && status(connection, repository)?.is_none() {
@@ -307,6 +291,20 @@ mod tests {
         install_schema(&connection).unwrap();
         let repository = temp.path().join("repo");
         request(&connection, &repository).unwrap();
+        record(
+            &mut connection,
+            &repository,
+            &["before-active.txt".into()],
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            status(&connection, &repository)
+                .unwrap()
+                .unwrap()
+                .generation,
+            0
+        );
         assert_eq!(
             pending(&connection).unwrap().as_slice(),
             std::slice::from_ref(&repository)

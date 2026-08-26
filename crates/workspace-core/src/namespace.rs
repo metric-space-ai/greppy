@@ -684,17 +684,6 @@ impl WorkspaceCore {
         repository_tracker::mark_gap(&connection, repository, detail, heartbeat_unix_ms)
     }
 
-    pub fn mark_active_repository_tracker_gap(
-        &self,
-        repository: &Path,
-        detail: &str,
-        heartbeat_unix_ms: u64,
-    ) -> Result<()> {
-        let _writer = self.lock_metadata_writer()?;
-        let connection = self.lock_metadata()?;
-        repository_tracker::mark_active_gap(&connection, repository, detail, heartbeat_unix_ms)
-    }
-
     pub fn repository_tracker_status(
         &self,
         repository: &Path,

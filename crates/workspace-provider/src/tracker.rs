@@ -3,7 +3,10 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +41,7 @@ fn supervise(core: Arc<WorkspaceCore>) {
                 }
             };
             match build_watcher(core.clone(), &repository, &git_dir) {
-                Ok(mut watcher) => {
+                Ok((mut watcher, armed)) => {
                     if let Err(error) = watcher.watch(&repository, RecursiveMode::Recursive) {
                         let _ = core.mark_repository_tracker_gap(
                             &repository,
@@ -61,6 +64,7 @@ fn supervise(core: Arc<WorkspaceCore>) {
                         .activate_repository_tracker(&repository, now_ms())
                         .is_ok()
                     {
+                        armed.store(true, Ordering::Release);
                         watchers.insert(repository, watcher);
                     }
                 }
@@ -81,69 +85,63 @@ fn build_watcher(
     core: Arc<WorkspaceCore>,
     repository: &Path,
     git_dir: &Path,
-) -> notify::Result<RecommendedWatcher> {
+) -> notify::Result<(RecommendedWatcher, Arc<AtomicBool>)> {
     let repository = repository.to_path_buf();
     let git_dir = git_dir.to_path_buf();
-    notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
-        Ok(event) => {
-            let paths = event
-                .paths
-                .iter()
-                .map(|path| relative_utf8(&repository, &git_dir, path))
-                .collect::<Result<Vec<_>, _>>();
-            match paths {
-                Ok(paths) if !paths.is_empty() => {
-                    if let Err(error) =
-                        core.record_repository_changes(&repository, &paths, now_ms())
-                    {
+    let armed = Arc::new(AtomicBool::new(false));
+    let callback_armed = armed.clone();
+    let watcher =
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+            Ok(_) if !callback_armed.load(Ordering::Acquire) => {
+                // Successful events emitted while watch roots are being installed
+                // are covered by the first full double-capture after activation.
+            }
+            Ok(event) => {
+                let paths = event
+                    .paths
+                    .iter()
+                    .map(|path| relative_utf8(&repository, &git_dir, path))
+                    .collect::<Result<Vec<_>, _>>();
+                match paths {
+                    Ok(paths) if !paths.is_empty() => {
+                        if let Err(error) =
+                            core.record_repository_changes(&repository, &paths, now_ms())
+                        {
+                            mark_tracker_gap(
+                                &core,
+                                &repository,
+                                &format!("cannot record watcher event: {error}"),
+                            );
+                        }
+                    }
+                    Ok(_) => {
                         mark_tracker_gap(
                             &core,
                             &repository,
-                            &format!("cannot record watcher event: {error}"),
-                            true,
+                            "watcher emitted an event without paths",
                         );
                     }
-                }
-                Ok(_) => {
-                    mark_tracker_gap(
-                        &core,
-                        &repository,
-                        "watcher emitted an event without paths",
-                        true,
-                    );
-                }
-                Err(detail) => {
-                    mark_tracker_gap(&core, &repository, &detail, true);
+                    Err(detail) => {
+                        mark_tracker_gap(&core, &repository, &detail);
+                    }
                 }
             }
-        }
-        Err(error) => {
-            mark_tracker_gap(
-                &core,
-                &repository,
-                &format!("watcher backend error: {error}"),
-                false,
-            );
-        }
-    })
+            Err(error) => {
+                mark_tracker_gap(
+                    &core,
+                    &repository,
+                    &format!("watcher backend error: {error}"),
+                );
+            }
+        })?;
+    Ok((watcher, armed))
 }
 
-fn mark_tracker_gap(
-    core: &WorkspaceCore,
-    repository: &Path,
-    detail: &str,
-    ignore_while_requested: bool,
-) {
-    if ignore_while_requested {
-        // Successful watcher events emitted before activation are covered by
-        // the first full double-capture. The conditional update makes this
-        // decision atomically with respect to activation and restart.
-        let _ = core.mark_active_repository_tracker_gap(repository, detail, now_ms());
-    } else {
-        // Backend failure during installation must prevent activation. The
-        // tracker store preserves the first gap reason.
-        let _ = core.mark_repository_tracker_gap(repository, detail, now_ms());
-    }
+fn mark_tracker_gap(core: &WorkspaceCore, repository: &Path, detail: &str) {
+    // Backend failure during installation must prevent activation. Once
+    // armed, any unrepresentable event breaks continuity. The tracker store
+    // preserves the first gap reason.
+    let _ = core.mark_repository_tracker_gap(repository, detail, now_ms());
 }
 
 fn relative_utf8(repository: &Path, git_dir: &Path, path: &Path) -> Result<String, String> {
@@ -232,7 +230,7 @@ mod tests {
         let git_dir = std::fs::canonicalize(git_dir_path).unwrap();
         let core = Arc::new(WorkspaceCore::open(temp.path().join("core")).unwrap());
         core.request_repository_tracker(&repository).unwrap();
-        let mut watcher = build_watcher(core.clone(), &repository, &git_dir).unwrap();
+        let (mut watcher, armed) = build_watcher(core.clone(), &repository, &git_dir).unwrap();
         watcher
             .watch(&repository, RecursiveMode::Recursive)
             .unwrap();
@@ -252,6 +250,7 @@ mod tests {
         let active = core
             .activate_repository_tracker(&repository, now_ms())
             .unwrap();
+        armed.store(true, Ordering::Release);
         std::fs::write(repository.join("changed.txt"), b"changed").unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -283,7 +282,8 @@ mod tests {
         let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
         core.request_repository_tracker(&repository).unwrap();
 
-        mark_tracker_gap(&core, &repository, "root event without a child", true);
+        core.record_repository_changes(&repository, &["before-active.txt".into()], now_ms())
+            .unwrap();
         assert_eq!(
             core.repository_tracker_status(&repository)
                 .unwrap()
@@ -292,8 +292,8 @@ mod tests {
             RepositoryTrackerState::Requested
         );
 
-        mark_tracker_gap(&core, &repository, "watcher backend stopped", false);
-        mark_tracker_gap(&core, &repository, "later callback noise", false);
+        mark_tracker_gap(&core, &repository, "watcher backend stopped");
+        mark_tracker_gap(&core, &repository, "later callback noise");
         let status = core
             .repository_tracker_status(&repository)
             .unwrap()
