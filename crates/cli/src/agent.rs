@@ -404,7 +404,9 @@ fn run_agent(args: AgentArgs) -> u8 {
     std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env.with_sandbox(sandbox_mode),
+        Ok(env) => env
+            .with_git_index_file(workspace.git_index_path().to_path_buf())
+            .with_sandbox(sandbox_mode),
         Err(e) => {
             eprintln!("greppy -p: cannot build greppy env: {e}");
             keep_worktree_on_error(&workspace);

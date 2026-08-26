@@ -60,6 +60,7 @@ pub struct GreppyEnv {
     greppy_timeout: Duration,
     max_output_bytes: usize,
     sandbox: SandboxMode,
+    git_index_file: Option<PathBuf>,
 }
 
 impl GreppyEnv {
@@ -77,6 +78,7 @@ impl GreppyEnv {
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             sandbox: SandboxMode::Off,
+            git_index_file: None,
         })
     }
 
@@ -105,6 +107,14 @@ impl GreppyEnv {
     /// roots (worktree, temp, greppy data root, `~/.cargo`, platform cache).
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
+        self
+    }
+
+    /// Bind all Agent tool subprocesses to the workspace's private split
+    /// index. This keeps Git operations isolated while allowing every private
+    /// index to reference one immutable shared baseline index.
+    pub fn with_git_index_file(mut self, path: PathBuf) -> Self {
+        self.git_index_file = Some(path);
         self
     }
 
@@ -173,6 +183,9 @@ impl GreppyEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(index) = &self.git_index_file {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
         prepare_tool_env(&mut cmd);
 
         match run_capture(&mut cmd, Some(timeout)) {

@@ -16,12 +16,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct AgentWorkspace {
     repo_root: PathBuf,
     worktree: PathBuf,
     private_git_dir: PathBuf,
+    private_index: PathBuf,
     run_id: String,
     base_commit: String,
     baseline_hash: String,
@@ -39,6 +40,7 @@ impl fmt::Debug for AgentWorkspace {
             .field("repo_root", &self.repo_root)
             .field("worktree", &self.worktree)
             .field("private_git_dir", &self.private_git_dir)
+            .field("private_index", &self.private_index)
             .field("run_id", &self.run_id)
             .field("base_commit", &self.base_commit)
             .field("baseline_hash", &self.baseline_hash)
@@ -187,10 +189,11 @@ impl AgentWorkspace {
             &repo_root,
             &worktree,
             &private_git_dir,
+            &data_root,
             &baseline_for_git,
             core.chunks(),
         );
-        let (baseline_tree, baseline_view_commit) = match initialized {
+        let (baseline_tree, baseline_view_commit, private_index) = match initialized {
             Ok(result) => result,
             Err(error) => {
                 let _ = core.remove_workspace(handle);
@@ -202,6 +205,7 @@ impl AgentWorkspace {
             repo_root,
             worktree,
             private_git_dir,
+            private_index,
             run_id: run_id.into(),
             base_commit,
             baseline_hash,
@@ -225,6 +229,10 @@ impl AgentWorkspace {
 
     pub fn linked_git_dir(&self) -> &Path {
         &self.private_git_dir
+    }
+
+    pub fn git_index_path(&self) -> &Path {
+        &self.private_index
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -268,8 +276,17 @@ impl AgentWorkspace {
 
     pub fn finish(&self, message: &str) -> Result<RunOutcome, WorkspaceError> {
         self.verify_identity()?;
-        git_ok(&self.worktree, &["add", "-A"])?;
-        let final_tree = git_ok(&self.worktree, &["write-tree"])?;
+        let changed_paths = filter_ignored_paths(
+            &self.worktree,
+            &self.private_index,
+            self.core.changed_paths(&self.handle)?,
+        )?;
+        if !changed_paths.is_empty() {
+            let mut arguments = vec!["add", "-A", "--"];
+            arguments.extend(changed_paths.iter().map(String::as_str));
+            git_with_index(&self.worktree, &self.private_index, &arguments)?;
+        }
+        let final_tree = git_with_index(&self.worktree, &self.private_index, &["write-tree"])?;
         if final_tree == self.baseline_tree {
             return Ok(RunOutcome::Clean);
         }
@@ -350,6 +367,11 @@ impl AgentWorkspace {
             }
         }
         match fs::remove_dir_all(&self.private_git_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match fs::remove_file(&self.private_index) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -970,9 +992,10 @@ fn initialize_private_git(
     repo_root: &Path,
     worktree: &Path,
     private_git_dir: &Path,
+    data_root: &Path,
     baseline: &BaselineSnapshot,
     chunks: &ChunkStore,
-) -> Result<(String, String), WorkspaceError> {
+) -> Result<(String, String, PathBuf), WorkspaceError> {
     if private_git_dir.exists() {
         return Err(WorkspaceError::Tampered {
             path: private_git_dir.into(),
@@ -985,29 +1008,31 @@ fn initialize_private_git(
             .ok_or_else(|| io::Error::other("invalid private Git path"))?,
     )?;
     let object_format = git_ok(repo_root, &["rev-parse", "--show-object-format"])?;
-    let init = Command::new("git")
-        .args([
-            "init",
-            "--bare",
-            "--quiet",
-            "--template=",
-            &format!("--object-format={object_format}"),
-            path_text(private_git_dir)?,
-        ])
-        .output()?;
-    output_text("git init --bare private workspace repository", init)?;
     let common = git_ok(
         repo_root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let objects = PathBuf::from(common).join("objects");
+    let layer = ensure_shared_git_layer(
+        data_root,
+        worktree,
+        baseline,
+        chunks,
+        &object_format,
+        &objects,
+    )?;
+
+    init_bare(private_git_dir, &object_format)?;
     let alternates = private_git_dir.join("objects/info/alternates");
     fs::create_dir_all(
         alternates
             .parent()
             .ok_or_else(|| io::Error::other("invalid alternates path"))?,
     )?;
-    fs::write(&alternates, format!("{}\n", objects.display()))?;
+    fs::write(
+        &alternates,
+        format!("{}\n{}\n", layer.objects.display(), objects.display()),
+    )?;
     git_private(
         private_git_dir,
         worktree,
@@ -1037,43 +1062,27 @@ fn initialize_private_git(
         format!("gitdir: {}\n", private_git_dir.display()),
     )?;
 
-    let initial_index = private_git_dir.join("baseline.index");
-    git_private(
-        private_git_dir,
-        worktree,
-        Some(&initial_index),
-        &["read-tree", &baseline.base_commit],
-    )?;
-    for entry in &baseline.entries {
-        match entry.kind {
-            EntryKind::Tombstone => {
-                git_private(
-                    private_git_dir,
-                    worktree,
-                    Some(&initial_index),
-                    &["update-index", "--force-remove", "--", &entry.path],
-                )?;
-            }
-            EntryKind::File | EntryKind::Symlink => {
-                let bytes = baseline_bytes(chunks, entry)?;
-                let oid = hash_private_blob(private_git_dir, worktree, &bytes)?;
-                let cache_info = format!("{:o},{oid},{}", entry.mode, entry.path);
-                git_private(
-                    private_git_dir,
-                    worktree,
-                    Some(&initial_index),
-                    &["update-index", "--add", "--cacheinfo", &cache_info],
-                )?;
-            }
-        }
+    let private_index = layer
+        .index
+        .parent()
+        .ok_or_else(|| io::Error::other("shared Git index has no parent"))?
+        .join(format!(
+            "workspace-{}.index",
+            private_git_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| WorkspaceError::Unsupported(
+                    "private Git run id is not valid UTF-8".into()
+                ))?
+        ));
+    if private_index.exists() {
+        return Err(WorkspaceError::Tampered {
+            path: private_index,
+            detail: "private split index already exists".into(),
+        });
     }
-    let baseline_tree = git_private(
-        private_git_dir,
-        worktree,
-        Some(&initial_index),
-        &["write-tree"],
-    )?;
-    fs::rename(&initial_index, private_git_dir.join("index"))?;
+    fs::copy(&layer.index, &private_index)?;
+    let baseline_tree = layer.baseline_tree;
     let baseline_view_commit = commit_tree(
         worktree,
         &baseline_tree,
@@ -1092,7 +1101,205 @@ fn initialize_private_git(
         worktree,
         &["symbolic-ref", "HEAD", "refs/heads/greppy-baseline"],
     )?;
-    Ok((baseline_tree, baseline_view_commit))
+    Ok((baseline_tree, baseline_view_commit, private_index))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SharedGitLayerManifest {
+    schema: u32,
+    baseline_hash: String,
+    base_commit: String,
+    baseline_tree: String,
+    object_format: String,
+}
+
+struct SharedGitLayer {
+    objects: PathBuf,
+    index: PathBuf,
+    baseline_tree: String,
+}
+
+fn ensure_shared_git_layer(
+    data_root: &Path,
+    worktree: &Path,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+    object_format: &str,
+    source_objects: &Path,
+) -> Result<SharedGitLayer, WorkspaceError> {
+    let layers = data_root.join("git-layers");
+    fs::create_dir_all(&layers)?;
+    let final_root = layers.join(&baseline.baseline_hash);
+    if final_root.exists() {
+        return open_shared_git_layer(&final_root, baseline, object_format);
+    }
+
+    let temporary = layers.join(format!(
+        ".{}.tmp.{}.{}",
+        baseline.baseline_hash,
+        std::process::id(),
+        now_unix_ns()
+    ));
+    fs::create_dir(&temporary)?;
+    let build = (|| -> Result<SharedGitLayerManifest, WorkspaceError> {
+        let repository = temporary.join("repo");
+        init_bare(&repository, object_format)?;
+        let alternates = repository.join("objects/info/alternates");
+        fs::create_dir_all(
+            alternates
+                .parent()
+                .ok_or_else(|| io::Error::other("invalid shared alternates path"))?,
+        )?;
+        fs::write(&alternates, format!("{}\n", source_objects.display()))?;
+        let indexes = temporary.join("indexes");
+        fs::create_dir(&indexes)?;
+        let seed_index = indexes.join("seed.index");
+        git_private(
+            &repository,
+            worktree,
+            Some(&seed_index),
+            &["read-tree", &baseline.base_commit],
+        )?;
+        for entry in &baseline.entries {
+            match entry.kind {
+                EntryKind::Tombstone => {
+                    git_private(
+                        &repository,
+                        worktree,
+                        Some(&seed_index),
+                        &["update-index", "--force-remove", "--", &entry.path],
+                    )?;
+                }
+                EntryKind::File | EntryKind::Symlink => {
+                    let bytes = baseline_bytes(chunks, entry)?;
+                    let oid = hash_blob(&repository, worktree, &bytes)?;
+                    let cache_info = format!("{:o},{oid},{}", entry.mode, entry.path);
+                    git_private(
+                        &repository,
+                        worktree,
+                        Some(&seed_index),
+                        &["update-index", "--add", "--cacheinfo", &cache_info],
+                    )?;
+                }
+            }
+        }
+        let baseline_tree = git_private(&repository, worktree, Some(&seed_index), &["write-tree"])?;
+        git_private(
+            &repository,
+            worktree,
+            Some(&seed_index),
+            &["update-index", "--split-index"],
+        )?;
+        for entry in fs::read_dir(&repository)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("sharedindex.") {
+                fs::rename(entry.path(), indexes.join(name))?;
+            }
+        }
+        let seed_bytes = fs::metadata(&seed_index)?.len();
+        if seed_bytes > 512 * 1024 {
+            return Err(WorkspaceError::Unsupported(format!(
+                "private split-index seed is {seed_bytes} bytes; 0.3.4 requires at most 512 KiB"
+            )));
+        }
+        Ok(SharedGitLayerManifest {
+            schema: 1,
+            baseline_hash: baseline.baseline_hash.clone(),
+            base_commit: baseline.base_commit.clone(),
+            baseline_tree,
+            object_format: object_format.into(),
+        })
+    })();
+    let manifest = match build {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    };
+    fs::write(
+        temporary.join("layer.json"),
+        serde_json::to_vec(&manifest).map_err(|error| io::Error::other(error.to_string()))?,
+    )?;
+    fs::write(temporary.join("COMPLETE"), b"greppy.shared-git-layer.v1\n")?;
+    match fs::rename(&temporary, &final_root) {
+        Ok(()) => {}
+        Err(_error) if final_root.exists() => {
+            let _ = fs::remove_dir_all(&temporary);
+            open_shared_git_layer(&final_root, baseline, object_format)?;
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error.into());
+        }
+    }
+    open_shared_git_layer(&final_root, baseline, object_format)
+}
+
+fn open_shared_git_layer(
+    root: &Path,
+    baseline: &BaselineSnapshot,
+    object_format: &str,
+) -> Result<SharedGitLayer, WorkspaceError> {
+    if !root.join("COMPLETE").is_file() {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "shared Git layer is incomplete".into(),
+        });
+    }
+    let manifest: SharedGitLayerManifest =
+        serde_json::from_slice(&fs::read(root.join("layer.json"))?).map_err(|error| {
+            WorkspaceError::Tampered {
+                path: root.join("layer.json"),
+                detail: error.to_string(),
+            }
+        })?;
+    if manifest.schema != 1
+        || manifest.baseline_hash != baseline.baseline_hash
+        || manifest.base_commit != baseline.base_commit
+        || manifest.object_format != object_format
+    {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "shared Git layer identity does not match the captured baseline".into(),
+        });
+    }
+    let index = root.join("indexes/seed.index");
+    let objects = root.join("repo/objects");
+    if !index.is_file() || !objects.is_dir() {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "shared Git layer is missing index or objects".into(),
+        });
+    }
+    Ok(SharedGitLayer {
+        objects,
+        index,
+        baseline_tree: manifest.baseline_tree,
+    })
+}
+
+fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
+    let output = Command::new("git")
+        .args([
+            "init",
+            "--bare",
+            "--quiet",
+            "--template=",
+            &format!("--object-format={object_format}"),
+            path_text(path)?,
+        ])
+        .output()?;
+    output_text("git init --bare private workspace repository", output)?;
+    Ok(())
+}
+
+fn now_unix_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn baseline_bytes(chunks: &ChunkStore, entry: &BaselineEntry) -> Result<Vec<u8>, WorkspaceError> {
@@ -1104,7 +1311,7 @@ fn baseline_bytes(chunks: &ChunkStore, entry: &BaselineEntry) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-fn hash_private_blob(
+fn hash_blob(
     private_git_dir: &Path,
     worktree: &Path,
     bytes: &[u8],
@@ -1189,6 +1396,64 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
         &format!("git -C {} {}", cwd.display(), args.join(" ")),
         output,
     )
+}
+
+fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
+    let output = Command::new("git")
+        .args(["-C", path_text(cwd)?])
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .output()?;
+    output_text(
+        &format!(
+            "GIT_INDEX_FILE={} git -C {} {}",
+            index.display(),
+            cwd.display(),
+            args.join(" ")
+        ),
+        output,
+    )
+}
+
+fn filter_ignored_paths(
+    worktree: &Path,
+    index: &Path,
+    paths: Vec<String>,
+) -> Result<Vec<String>, WorkspaceError> {
+    if paths.is_empty() {
+        return Ok(paths);
+    }
+    let mut child = Command::new("git")
+        .args(["-C", path_text(worktree)?, "check-ignore", "-z", "--stdin"])
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("git check-ignore stdin unavailable"))?;
+        for path in &paths {
+            input.write_all(path.as_bytes())?;
+            input.write_all(&[0])?;
+        }
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(git_failed("git check-ignore -z --stdin", &output));
+    }
+    let ignored = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(paths
+        .into_iter()
+        .filter(|path| !ignored.contains(path))
+        .collect())
 }
 
 fn git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, WorkspaceError> {
@@ -1348,7 +1613,8 @@ mod tests {
         git(&repo, &["config", "user.email", "test@example.test"]);
         git(&repo, &["config", "user.name", "Test"]);
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
-        git(&repo, &["add", "tracked.txt"]);
+        fs::write(repo.join(".gitignore"), "cache/\n").unwrap();
+        git(&repo, &["add", "tracked.txt", ".gitignore"]);
         git(&repo, &["commit", "-qm", "base"]);
         // Exercise the Windows/Git-for-Windows checkout conversion explicitly
         // on every host. Recovery must restore the captured dirty bytes, not
@@ -1365,12 +1631,19 @@ mod tests {
         publish_provider(&data, &mount);
         let worktree = mount.join("workspaces/test-run");
         fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".gitignore"), "cache/\n").unwrap();
         fs::write(worktree.join("tracked.txt"), "dirty\n").unwrap();
         fs::write(worktree.join("untracked.txt"), "user\n").unwrap();
 
         let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
         std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
         let workspace = AgentWorkspace::create(&repo, "test-run").unwrap();
+        assert!(!workspace.linked_git_dir().join("index").exists());
+        assert!(fs::metadata(workspace.git_index_path()).unwrap().len() <= 512 * 1024);
+        assert!(fs::read_dir(workspace.git_index_path().parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("sharedindex.")));
         let agent_data = workspace.agent_data_root();
         assert!(agent_data.starts_with(&data));
         assert!(!agent_data.starts_with(&mount));
@@ -1381,8 +1654,36 @@ mod tests {
         fs::write(agent_data.join("graph.db"), b"private store").unwrap();
         fs::create_dir_all(&agent_scratch).unwrap();
         fs::write(agent_scratch.join("tool.tmp"), b"scratch").unwrap();
-        assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
+        assert!(git_with_index(
+            workspace.worktree_path(),
+            workspace.git_index_path(),
+            &["status", "--porcelain"]
+        )
+        .unwrap()
+        .is_empty());
         fs::write(workspace.worktree_path().join("tracked.txt"), "agent\n").unwrap();
+        workspace
+            .core
+            .write(&workspace.handle, "tracked.txt", 0, b"agent\n")
+            .unwrap();
+        fs::create_dir(workspace.worktree_path().join("cache")).unwrap();
+        fs::write(
+            workspace.worktree_path().join("cache/output.bin"),
+            b"ignored",
+        )
+        .unwrap();
+        workspace
+            .core
+            .mkdir(&workspace.handle, "cache", 0o755)
+            .unwrap();
+        workspace
+            .core
+            .create_file(&workspace.handle, "cache/output.bin", 0o100644)
+            .unwrap();
+        workspace
+            .core
+            .write(&workspace.handle, "cache/output.bin", 0, b"ignored")
+            .unwrap();
         let outcome = workspace.finish("agent result").unwrap();
         let (commit, ref_name, patch) = match outcome {
             RunOutcome::Proposal {
@@ -1397,6 +1698,7 @@ mod tests {
         assert!(patch.contains("-dirty"));
         assert!(patch.contains("+agent"));
         assert!(!patch.contains("-base"));
+        assert!(git(&repo, &["ls-tree", "-r", &commit, "--", "cache"]).is_empty());
 
         let index = git_path(&repo, "index").unwrap();
         let index_before = fs::read(&index).unwrap();

@@ -273,6 +273,43 @@ impl WorkspaceCore {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Paths whose visible namespace state differs from the immutable dirty
+    /// baseline. Provider-created `.git` routing metadata is deliberately not
+    /// part of an Agent proposal.
+    pub fn changed_paths(&self, workspace: &WorkspaceHandle) -> Result<Vec<String>> {
+        let connection = self.lock_metadata()?;
+        let mut paths = BTreeSet::new();
+        {
+            let mut statement = connection
+                .prepare("SELECT path FROM cow_entries WHERE workspace_id = ?1 ORDER BY path")?;
+            let rows = statement.query_map(params![workspace.id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let path = row?;
+                if path != ".git" && !path.starts_with(".git/") {
+                    paths.insert(path);
+                }
+            }
+        }
+        {
+            let mut statement = connection.prepare(
+                "SELECT source, destination FROM cow_redirects
+                 WHERE workspace_id = ?1 ORDER BY source, destination",
+            )?;
+            let rows = statement.query_map(params![workspace.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (source, destination) = row?;
+                for path in [source, destination] {
+                    if path != ".git" && !path.starts_with(".git/") {
+                        paths.insert(path);
+                    }
+                }
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     /// Drops cached repository/dirty layers that are not referenced by an
     /// active workspace or proposal, then compacts the chunk store.
     pub fn gc(&self) -> Result<ChunkGcReport> {
@@ -1680,13 +1717,19 @@ mod tests {
         {
             let connection = core.lock_metadata().unwrap();
             let bases: i64 = connection
-                .query_row("SELECT COUNT(*) FROM cow_repository_bases", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM cow_repository_bases", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             let dirty_layers: i64 = connection
-                .query_row("SELECT COUNT(*) FROM cow_dirty_layers", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM cow_dirty_layers", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             let workspace_layers: i64 = connection
-                .query_row("SELECT COUNT(*) FROM cow_workspace_layers", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM cow_workspace_layers", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!((bases, dirty_layers, workspace_layers), (1, 1, 1));
         }
