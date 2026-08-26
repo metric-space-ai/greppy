@@ -12,6 +12,12 @@ function unsupported(symbol) {
   };
 }
 
+function throwUnsupported(symbol) {
+  const error = new Error(`unsupported_playwright_operation: ${symbol}`);
+  error.code = "unsupported_playwright_operation";
+  throw error;
+}
+
 function withUnsupported(target, prefix) {
   return new Proxy(target, {
     get(obj, prop) {
@@ -629,25 +635,40 @@ class Frame {
     return this.evaluate(() => document.documentElement.outerHTML);
   }
 
+  _isMain() {
+    return this._id === "main";
+  }
+
+  _childFrameLocator() {
+    return this._page.frameLocator("iframe:nth-of-type(" + (Number(this._id) + 1) + ")");
+  }
+
   locator(selector) {
-    if (this._id === "main" || Number.isNaN(Number(this._id))) {
+    if (this._isMain()) {
       return this._page.locator(selector);
     }
-    return this._page.locator("iframe:nth-of-type(" + (Number(this._id) + 1) + ")");
+    return this._childFrameLocator().locator(selector);
   }
 
   getByRole(role, options) {
-    return this._id === "main"
-      ? this._page.getByRole(role, options)
-      : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByRole(role, options);
+    }
+    return this._childFrameLocator().getByRole(role, options);
   }
 
   getByText(text) {
-    return this._id === "main" ? this._page.getByText(text) : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByText(text);
+    }
+    return this._childFrameLocator().getByText(text);
   }
 
   getByLabel(name) {
-    return this._id === "main" ? this._page.getByLabel(name) : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByLabel(name);
+    }
+    throwUnsupported("Frame.getByLabel.child");
   }
 
   click(selector, options) {
@@ -734,25 +755,38 @@ class Frame {
   }
 
   isDetached() {
-    return false;
+    if (this._isMain()) {
+      return false;
+    }
+    throwUnsupported("Frame.isDetached.child");
   }
 
   getByPlaceholder(name) {
-    return this._id === "main"
-      ? this._page.getByPlaceholder(name)
-      : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByPlaceholder(name);
+    }
+    throwUnsupported("Frame.getByPlaceholder.child");
   }
 
   getByAltText(name) {
-    return this._id === "main" ? this._page.getByAltText(name) : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByAltText(name);
+    }
+    throwUnsupported("Frame.getByAltText.child");
   }
 
   getByTitle(name) {
-    return this._id === "main" ? this._page.getByTitle(name) : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByTitle(name);
+    }
+    throwUnsupported("Frame.getByTitle.child");
   }
 
   getByTestId(name) {
-    return this._id === "main" ? this._page.getByTestId(name) : this.locator("body").first();
+    if (this._isMain()) {
+      return this._page.getByTestId(name);
+    }
+    throwUnsupported("Frame.getByTestId.child");
   }
 
   getAttribute(selector, name) {
@@ -800,7 +834,10 @@ class Frame {
   }
 
   frameLocator(selector) {
-    return this._page.frameLocator(selector);
+    if (this._isMain()) {
+      return this._page.frameLocator(selector);
+    }
+    throwUnsupported("Frame.frameLocator.child");
   }
 }
 

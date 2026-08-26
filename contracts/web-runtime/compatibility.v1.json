@@ -2378,7 +2378,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page.locator().check; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2402,7 +2402,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page.locator; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2484,7 +2484,8 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page.locator"
+        "main-frame delegates to Page.locator",
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2512,11 +2513,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "frames"
+      ],
       "known_differences": [
-        "delegates to Page.frameLocator"
+        "main-frame delegates to Page.frameLocator",
+        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
       ]
     },
     {
@@ -2528,7 +2532,8 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.locator",
+        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
       ]
     },
     {
@@ -2539,10 +2544,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.getByAltText",
+        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
       ]
     },
     {
@@ -2553,10 +2560,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.getByLabel",
+        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
       ]
     },
     {
@@ -2567,10 +2576,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.getByPlaceholder",
+        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
       ]
     },
     {
@@ -2581,10 +2592,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "mouse-init-viewport"
+        "mouse-init-viewport",
+        "frames"
       ],
       "known_differences": [
-        "main frame only; child frames are still iframe-element locators"
+        "main-frame delegates to Page.getByRole",
+        "child CSS/text/role locators use same-origin FrameLocator contentDocument query; getByLabel/placeholder/alt/title/testid child calls throw"
       ]
     },
     {
@@ -2595,10 +2608,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.getByTestId",
+        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
       ]
     },
     {
@@ -2609,10 +2624,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "mouse-init-viewport"
+        "mouse-init-viewport",
+        "frames"
       ],
       "known_differences": [
-        "main frame only"
+        "main-frame delegates to Page.getByText",
+        "child CSS/text/role locators use same-origin FrameLocator contentDocument query; getByLabel/placeholder/alt/title/testid child calls throw"
       ]
     },
     {
@@ -2623,10 +2640,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.getByTitle",
+        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
       ]
     },
     {
@@ -2654,7 +2673,8 @@
         "filter-scroll"
       ],
       "known_differences": [
-        "delegates to frame.locator().hover"
+        "delegates to frame.locator().hover",
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2668,7 +2688,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2682,7 +2702,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2697,7 +2717,8 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "delegates to locator.inputValue"
+        "delegates to locator.inputValue",
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2711,7 +2732,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2722,10 +2743,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "always false for the live main frame; iframe detach is not tracked"
+        "main frame returns false while the Page is open",
+        "child frames throw unsupported_playwright_operation; detach tracking is not implemented"
       ]
     },
     {
@@ -2737,7 +2760,8 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.locator",
+        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
       ]
     },
     {
@@ -2751,7 +2775,8 @@
         "locator-type"
       ],
       "known_differences": [
-        "delegates to locator.isEditable"
+        "delegates to locator.isEditable",
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2763,7 +2788,8 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.locator",
+        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
       ]
     },
     {
@@ -2775,7 +2801,8 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.locator",
+        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
       ]
     },
     {
@@ -2789,7 +2816,8 @@
         "filter-scroll"
       ],
       "known_differences": [
-        "delegates to frame.locator().isVisible"
+        "delegates to frame.locator().isVisible",
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2801,10 +2829,12 @@
       "behavior": "unverified",
       "tests": [
         "extra-selectors",
-        "mouse-init-viewport"
+        "mouse-init-viewport",
+        "frames"
       ],
       "known_differences": [
-        "main-frame returns a page locator; iframe ids wrap the iframe element, not its contentDocument"
+        "main-frame returns a page locator",
+        "child CSS/text/role locators use same-origin FrameLocator contentDocument query; getByLabel/placeholder/alt/title/testid child calls throw"
       ]
     },
     {
@@ -2852,7 +2882,8 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.locator",
+        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
       ]
     },
     {
@@ -2864,7 +2895,8 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "main-frame delegates to Page.locator",
+        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
       ]
     },
     {
@@ -2878,7 +2910,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2927,7 +2959,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -2953,7 +2985,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
@@ -3010,10 +3042,11 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "nested-locator"
+        "nested-locator",
+        "frames"
       ],
       "known_differences": [
-        "locator.waitFor on the frame locator"
+        "locator.waitFor; child frames use same-origin FrameLocator CSS"
       ]
     },
     {
@@ -14128,7 +14161,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "main-frame delegates to Page; child frames are not in-document locators"
+        "child frames query same-origin iframe contentDocument via FrameLocator CSS; not Chromium actionability"
       ]
     },
     {
