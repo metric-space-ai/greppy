@@ -1513,3 +1513,57 @@ fn locator_evaluate_runs_against_matched_element() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn extra_selectors_dblclick_and_wait_for_function() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-extra-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_extra", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("extra-selectors.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_extra",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn research_profile_denies_cloud_metadata() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-meta-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_meta", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_meta",
+            "web.session.create",
+            json!({ "profile": "research" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let denied = unix_request(
+        &socket,
+        &Request::new(
+            "run_meta",
+            "web.read",
+            json!({
+                "session_id": session_id,
+                "url": "http://169.254.169.254/latest/meta-data/",
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("metadata");
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert_eq!(denied.error.as_ref().unwrap().code, "policy_denied");
+}

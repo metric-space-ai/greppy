@@ -291,6 +291,36 @@ class Locator {
     return result.value;
   }
 
+  async dblclick(options) {
+    if (options != null) {
+      return unsupported("Locator.dblclick.options")();
+    }
+    await engineCall("locator.dblclick", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
+  async dispatchEvent(type) {
+    await engineCall("locator.dispatchEvent", {
+      page: this._page._id,
+      selector: this._selector,
+      event: String(type),
+    });
+  }
+
+  async clear() {
+    await this.fill("");
+  }
+
+  async isEditable() {
+    const result = await engineCall("locator.isEditable", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return !!result.editable;
+  }
+
   first() {
     return new Locator(this._page, { ...this._selector, nth: 0 });
   }
@@ -364,6 +394,22 @@ class Page {
 
   getByText(text) {
     return new Locator(this, { type: "text", value: String(text) });
+  }
+
+  getByPlaceholder(name) {
+    return new Locator(this, { type: "placeholder", name: String(name) });
+  }
+
+  getByAltText(name) {
+    return new Locator(this, { type: "alt", name: String(name) });
+  }
+
+  getByTitle(name) {
+    return new Locator(this, { type: "title", name: String(name) });
+  }
+
+  getByTestId(name) {
+    return new Locator(this, { type: "testid", name: String(name), attr: "data-testid" });
   }
 
   locator(selector) {
@@ -446,6 +492,88 @@ class Page {
   async press(selector, key) {
     await this.focus(selector);
     await this.keyboard.press(key);
+  }
+
+  dblclick(selector, options) {
+    return this.locator(selector).dblclick(options);
+  }
+
+  dispatchEvent(selector, type) {
+    return this.locator(selector).dispatchEvent(type);
+  }
+
+  clear(selector) {
+    return this.locator(selector).clear();
+  }
+
+  isEditable(selector) {
+    return this.locator(selector).isEditable();
+  }
+
+  async bringToFront() {}
+
+  async addScriptTag(options = {}) {
+    await engineCall("page.addScriptTag", {
+      page: this._id,
+      content: options.content || "",
+      url: options.url || "",
+    });
+  }
+
+  async addStyleTag(options = {}) {
+    await engineCall("page.addStyleTag", {
+      page: this._id,
+      content: options.content || "",
+    });
+  }
+
+  async waitForFunction(pageFunction, arg) {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const value = await this.evaluate(pageFunction, arg);
+      if (value) {
+        return value;
+      }
+      ops.op_sleep_ms(20);
+    }
+    throw new Error("timeout: waitForFunction");
+  }
+
+  async waitForURL(pattern) {
+    const needle = String(pattern);
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const url = await this.url();
+      if (String(url).includes(needle)) {
+        return url;
+      }
+      ops.op_sleep_ms(20);
+    }
+    throw new Error("timeout: waitForURL " + needle);
+  }
+
+  async waitForRequest(pattern) {
+    const needle = String(pattern);
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const result = await engineCall("page.requests", { page: this._id });
+      const hit = (result.requests || []).find((rec) => String(rec.url).includes(needle));
+      if (hit) {
+        return { url: () => hit.url, method: () => "GET" };
+      }
+      ops.op_sleep_ms(20);
+    }
+    throw new Error("timeout: waitForRequest " + needle);
+  }
+
+  async waitForResponse(pattern) {
+    const request = await this.waitForRequest(pattern);
+    return {
+      url: () => request.url(),
+      status: () => 200,
+      ok: () => true,
+      request: () => request,
+    };
   }
 
   async goto(url, options) {

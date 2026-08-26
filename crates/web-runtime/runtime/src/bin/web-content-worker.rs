@@ -465,6 +465,32 @@ impl ContentEngine {
                 }
                 Ok(json!({}))
             }
+            "locator.dblclick" => {
+                let resolved = self.resolve_actionable(&params)?;
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                click_at(
+                    &webview,
+                    resolved.x,
+                    resolved.y,
+                    resolved.width,
+                    resolved.height,
+                );
+                self.servo.spin_event_loop();
+                click_at(
+                    &webview,
+                    resolved.x,
+                    resolved.y,
+                    resolved.width,
+                    resolved.height,
+                );
+                self.servo.spin_event_loop();
+                let _ = self.locator_eval(
+                    &params,
+                    "nodes[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true",
+                );
+                Ok(json!({}))
+            }
             "locator.fill" => {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
@@ -727,6 +753,57 @@ impl ContentEngine {
                     serde_json::to_string(&source).map_err(io::Error::other)?
                 );
                 Ok(json!({ "value": jsvalue_to_json(self.evaluate(webview, &script)?) }))
+            }
+            "locator.dispatchEvent" => {
+                let event = required_str(&params, "event")?;
+                let event_json = serde_json::to_string(&event).map_err(io::Error::other)?;
+                self.locator_eval(
+                    &params,
+                    &format!(
+                        "nodes[0].dispatchEvent(new Event({event_json}, {{ bubbles: true }})); return true"
+                    ),
+                )?;
+                Ok(json!({}))
+            }
+            "locator.isEditable" => match self.locator_eval(
+                &params,
+                "return !nodes[0].disabled && (nodes[0].isContentEditable || 'value' in nodes[0])",
+            )? {
+                JSValue::Boolean(value) => Ok(json!({ "editable": value })),
+                _ => Ok(json!({ "editable": false })),
+            },
+            "page.addScriptTag" => {
+                let page_id = required_str(&params, "page")?;
+                let content = params
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let src = params
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let (webview, _) = self.page(&page_id)?.clone();
+                let script = format!(
+                    "(function(content, src) {{ var el = document.createElement('script'); if (src) el.src = src; else el.text = content; (document.head || document.documentElement).appendChild(el); return true; }})({}, {})",
+                    serde_json::to_string(&content).map_err(io::Error::other)?,
+                    serde_json::to_string(&src).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &script)?;
+                Ok(json!({}))
+            }
+            "page.addStyleTag" => {
+                let page_id = required_str(&params, "page")?;
+                let content = params
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let (webview, _) = self.page(&page_id)?.clone();
+                let script = format!(
+                    "(function(css) {{ var el = document.createElement('style'); el.textContent = css; (document.head || document.documentElement).appendChild(el); return true; }})({})",
+                    serde_json::to_string(&content).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &script)?;
+                Ok(json!({}))
             }
             "page.setContent" => {
                 let page_id = required_str(&params, "page")?;
@@ -1143,6 +1220,23 @@ function greppyResolveNodes(selector) {
     nodes = Array.from(document.querySelectorAll('body *')).filter((el) => {
       const text = ((el.innerText || el.textContent || '') + '').trim();
       return text === wanted;
+    });
+  } else if (selector.type === 'placeholder') {
+    nodes = Array.from(document.querySelectorAll('[placeholder]')).filter((el) => {
+      return (el.getAttribute('placeholder') || '') === selector.name;
+    });
+  } else if (selector.type === 'alt') {
+    nodes = Array.from(document.querySelectorAll('[alt]')).filter((el) => {
+      return (el.getAttribute('alt') || '') === selector.name;
+    });
+  } else if (selector.type === 'title') {
+    nodes = Array.from(document.querySelectorAll('[title]')).filter((el) => {
+      return (el.getAttribute('title') || '') === selector.name;
+    });
+  } else if (selector.type === 'testid') {
+    const attr = selector.attr || 'data-testid';
+    nodes = Array.from(document.querySelectorAll('[' + attr + ']')).filter((el) => {
+      return (el.getAttribute(attr) || '') === selector.name;
     });
   }
   if (selector.nth != null) {

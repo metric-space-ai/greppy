@@ -39,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 102,
+    "implemented": 119,
     "unsupported": 243,
-    "unverified": 1009
+    "unverified": 992
   },
   "entries": [
     {
@@ -78,21 +78,29 @@
       "symbol": "Page.addScriptTag",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "appends a script element; content may not execute depending on Servo parser"
+      ]
     },
     {
       "symbol": "Page.addStyleTag",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "appends a style element with text content"
+      ]
     },
     {
       "symbol": "Page.ariaSnapshot",
@@ -108,11 +116,15 @@
       "symbol": "Page.bringToFront",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "no-op; software renderer has no window z-order"
+      ]
     },
     {
       "symbol": "Page.cancelPickLocator",
@@ -224,21 +236,29 @@
       "symbol": "Page.dblclick",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "delegates to locator.dblclick"
+      ]
     },
     {
       "symbol": "Page.dispatchEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "delegates to locator.dispatchEvent"
+      ]
     },
     {
       "symbol": "Page.dragAndDrop",
@@ -395,11 +415,15 @@
       "symbol": "Page.getByAltText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "exact alt attribute match"
+      ]
     },
     {
       "symbol": "Page.getByLabel",
@@ -417,11 +441,15 @@
       "symbol": "Page.getByPlaceholder",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "exact placeholder attribute match"
+      ]
     },
     {
       "symbol": "Page.getByRole",
@@ -439,11 +467,15 @@
       "symbol": "Page.getByTestId",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "data-testid only; Playwright testIdAttribute is not configurable"
+      ]
     },
     {
       "symbol": "Page.getByText",
@@ -463,11 +495,15 @@
       "symbol": "Page.getByTitle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "exact title attribute match"
+      ]
     },
     {
       "symbol": "Page.goBack",
@@ -1148,11 +1184,15 @@
       "symbol": "Page.waitForFunction",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "polls page.evaluate until truthy; 30s cap; no JSHandle"
+      ]
     },
     {
       "symbol": "Page.waitForLoadState",
@@ -1182,21 +1222,25 @@
       "symbol": "Page.waitForRequest",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "polls retained load_web_resource records; method always GET"
+      ]
     },
     {
       "symbol": "Page.waitForResponse",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "wraps waitForRequest with status 200"
+      ]
     },
     {
       "symbol": "Page.waitForSelector",
@@ -1228,11 +1272,13 @@
       "symbol": "Page.waitForURL",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "polls page.url for substring; not glob/RegExp"
+      ]
     },
     {
       "symbol": "Page.workers",
@@ -5507,11 +5553,15 @@
       "symbol": "Locator.clear",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "fill empty string"
+      ]
     },
     {
       "symbol": "Locator.click",
@@ -5556,11 +5606,15 @@
       "symbol": "Locator.dblclick",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "two click_at plus a bubbling dblclick event; not Chromium click count"
+      ]
     },
     {
       "symbol": "Locator.describe",
@@ -5586,11 +5640,15 @@
       "symbol": "Locator.dispatchEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "new Event(type, {bubbles:true}); no event init object"
+      ]
     },
     {
       "symbol": "Locator.dragTo",
@@ -5923,11 +5981,15 @@
       "symbol": "Locator.isEditable",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "not disabled and (value in el or isContentEditable)"
+      ]
     },
     {
       "symbol": "Locator.isEnabled",
