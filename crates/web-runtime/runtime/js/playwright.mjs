@@ -416,6 +416,14 @@ class Locator {
     });
   }
 
+  async screenshot() {
+    const result = await engineCall("locator.screenshot", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return decodeBase64(result.png_base64 || "").buffer;
+  }
+
   async allTextContents() {
     const result = await engineCall("locator.allTextContents", {
       page: this._page._id,
@@ -1896,6 +1904,35 @@ class BrowserContext {
     }
   }
 
+  async _restoreStorageState(state) {
+    const cookies = (state && state.cookies) || [];
+    const origins = (state && state.origins) || [];
+    if (origins.some((origin) => origin && origin.indexedDB && origin.indexedDB.length)) {
+      throwUnsupported("BrowserContext.storageState.indexedDB");
+    }
+    let page = this.pages()[0];
+    if (!page) {
+      page = await this.newPage();
+    }
+    for (const origin of origins) {
+      if (!origin || !origin.origin) continue;
+      const current = await page.url();
+      if (!String(current).startsWith(origin.origin)) {
+        await page.goto(origin.origin + "/");
+      }
+      await page.evaluate((items) => {
+        for (const item of items || []) {
+          if (item && item.name != null) {
+            localStorage.setItem(String(item.name), String(item.value == null ? "" : item.value));
+          }
+        }
+      }, origin.localStorage || []);
+    }
+    if (cookies.length) {
+      await this.addCookies(cookies);
+    }
+  }
+
   async storageState() {
     const cookies = await this.cookies();
     const origins = [];
@@ -2032,12 +2069,19 @@ class Browser {
   }
 
   async newContext(options) {
+    const storageState = options && options.storageState;
     if (options != null) {
-      return unsupported("Browser.newContext.options")();
+      const keys = Object.keys(options).filter((key) => options[key] !== undefined);
+      if (keys.some((key) => key !== "storageState")) {
+        return unsupported("Browser.newContext.options")();
+      }
     }
     const result = await engineCall("browser.newContext", { browser: this._id });
     const context = new BrowserContext(result.context);
     context._browser = this;
+    if (storageState) {
+      await context._restoreStorageState(storageState);
+    }
     return context;
   }
 

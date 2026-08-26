@@ -42,5 +42,17 @@ const after = await context.cookies();
 if (after.some((cookie) => cookie.name === "k")) {
   throw new Error("clearCookies left k: " + JSON.stringify(after));
 }
+const restoredCtx = await browser.newContext({ storageState: state });
+const restoredPage = restoredCtx.pages()[0] || (await restoredCtx.newPage());
+await restoredPage.goto(fixtureUrl);
+const restoredCookies = await restoredCtx.cookies();
+if (!restoredCookies.some((cookie) => cookie.name === "k" && cookie.value === "v")) {
+  throw new Error("restored cookies missing k=v: " + JSON.stringify(restoredCookies));
+}
+const restoredLs = await restoredPage.evaluate(() => localStorage.getItem("greppy"));
+if (restoredLs !== "origin-ok") {
+  throw new Error("restored localStorage missing greppy: " + JSON.stringify(restoredLs));
+}
+await restoredCtx.close();
 await context.close();
 await browser.close();

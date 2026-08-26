@@ -4366,10 +4366,11 @@
       "behavior": "unverified",
       "tests": [
         "phase1-spike",
-        "compat-core"
+        "compat-core",
+        "cookies"
       ],
       "known_differences": [
-        "options are unsupported"
+        "storageState is the only accepted option; other Browser.newContext options stay unsupported"
       ]
     },
     {
@@ -6658,11 +6659,15 @@
       "symbol": "Locator.screenshot",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "screenshot"
+      ],
+      "known_differences": [
+        "clips take_screenshot to the locator bounding box; no omitBackground/fullPage/animations options"
+      ]
     },
     {
       "symbol": "Locator.scrollIntoViewIfNeeded",
@@ -13935,11 +13940,15 @@
       "symbol": "BrowserContextOptions.storageState",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "cookies"
+      ],
+      "known_differences": [
+        "newContext({storageState}) restores document.cookie and origin localStorage; IndexedDB and HttpOnly cookies stay unsupported"
+      ]
     },
     {
       "symbol": "BrowserContextOptions.strictSelectors",

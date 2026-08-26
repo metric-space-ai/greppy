@@ -3,7 +3,7 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseMoveEvent, Preferences, RenderingContext, Servo, ServoBuilder, SimpleDialog,
+    MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, UrlRequest, WebResourceLoad, WebResourceResponse, WebView,
     WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
@@ -797,7 +797,7 @@ impl ContentEngine {
             "page.screenshot" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                let png = self.screenshot_png(&webview)?;
+                let png = self.screenshot_png(&webview, None)?;
                 Ok(json!({ "png_base64": base64_encode(&png) }))
             }
             "locator.count" => {
@@ -945,6 +945,19 @@ impl ContentEngine {
                     "width": resolved.width,
                     "height": resolved.height,
                 }))
+            }
+            "locator.screenshot" => {
+                let resolved = self.resolve_actionable(&params)?;
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let clip = Some((
+                    resolved.x.max(0.0) as u32,
+                    resolved.y.max(0.0) as u32,
+                    resolved.width.max(1.0) as u32,
+                    resolved.height.max(1.0) as u32,
+                ));
+                let png = self.screenshot_png(&webview, clip)?;
+                Ok(json!({ "png_base64": base64_encode(&png) }))
             }
             "locator.allTextContents" => {
                 let page_id = required_str(&params, "page")?;
@@ -1610,7 +1623,11 @@ impl ContentEngine {
         }
     }
 
-    fn screenshot_png(&self, webview: &WebView) -> io::Result<Vec<u8>> {
+    fn screenshot_png(
+        &self,
+        webview: &WebView,
+        clip: Option<(u32, u32, u32, u32)>,
+    ) -> io::Result<Vec<u8>> {
         let saved = Rc::new(RefCell::new(None));
         let callback = Rc::clone(&saved);
         webview.take_screenshot(None, move |result| {
@@ -1635,6 +1652,10 @@ impl ContentEngine {
             .take()
             .expect("screenshot completed")
             .map_err(|error| io::Error::other(format!("screenshot failed: {error:?}")))?;
+        let image = match clip {
+            Some((x, y, w, h)) => crop_rgba(&image, x, y, w, h),
+            None => image,
+        };
         let mut out = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut out, image.width(), image.height());
@@ -1649,6 +1670,24 @@ impl ContentEngine {
         }
         Ok(out)
     }
+}
+
+fn crop_rgba(image: &RgbaImage, x: u32, y: u32, width: u32, height: u32) -> RgbaImage {
+    let src_w = image.width();
+    let src_h = image.height();
+    let x = x.min(src_w.saturating_sub(1));
+    let y = y.min(src_h.saturating_sub(1));
+    let width = width.min(src_w.saturating_sub(x)).max(1);
+    let height = height.min(src_h.saturating_sub(y)).max(1);
+    let src = image.as_raw();
+    let mut out = vec![0_u8; (width * height * 4) as usize];
+    for row in 0..height {
+        let src_off = (((y + row) * src_w + x) * 4) as usize;
+        let dst_off = (row * width * 4) as usize;
+        let span = (width * 4) as usize;
+        out[dst_off..dst_off + span].copy_from_slice(&src[src_off..src_off + span]);
+    }
+    RgbaImage::from_raw(width, height, out).unwrap_or_else(|| image.clone())
 }
 
 struct ResolvedNode {
