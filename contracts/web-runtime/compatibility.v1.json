@@ -2408,10 +2408,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "main frame evaluate of documentElement.outerHTML; child frames use frameEvaluate"
+      ]
     },
     {
       "symbol": "Frame.dblclick",
@@ -2828,11 +2832,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "main frame only"
+        "main frame only",
+        "main frame only; child frames throw unsupported_playwright_operation"
       ]
     },
     {

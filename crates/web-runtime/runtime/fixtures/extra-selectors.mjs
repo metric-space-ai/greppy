@@ -51,4 +51,8 @@ if ((await main.locator("#q").count()) !== 1) throw new Error("frame locator");
 await main.click("#b");
 await main.check("#c");
 if (!(await page.isChecked("#c"))) throw new Error("frame check");
+await main.setContent("<!DOCTYPE html><html><body><p id=fsc>frame-set</p></body></html>");
+if ((await page.innerText("#fsc")).trim() !== "frame-set") throw new Error("frame setContent");
+const frameHtml = await main.content();
+if (!String(frameHtml).includes("frame-set")) throw new Error("frame content");
 await browser.close();
