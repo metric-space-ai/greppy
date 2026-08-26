@@ -305,6 +305,21 @@ jobs:
           key: windows-cpu-fast-assets-v1-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: windows-cpu-fast-assets-v1-
 
+      - name: Install pinned unchanged WinFsp 2.1 SDK
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
+          $actual = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
+          if ($actual -ne '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a') {
+            throw "WinFsp installer checksum mismatch: $actual"
+          }
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', 'INSTALLLEVEL=1000')
+          if ($install.ExitCode -ne 0) { throw "WinFsp installation failed: $($install.ExitCode)" }
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+            throw 'WinFsp Developer headers were not installed'
+          }
+
       # This job's name is its contract: Windows ships a CPU binary, so the
       # backend assertion is waived explicitly here and nowhere else.
       - name: Build Windows CPU test binary

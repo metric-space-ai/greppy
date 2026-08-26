@@ -27,6 +27,10 @@ Swift system boundary, and Windows uses the official unchanged WinFsp 2.1
 runtime through Greppy's Rust provider. Adapter failure has no hidden native
 fallback. Concurrent provider and CLI opens wait for short SQLite-WAL writers
 instead of failing nondeterministically with `database is locked`.
+Control and mounted provider manifests now bind the same immutable identity and
+capability set while validating their independently refreshed heartbeats
+separately; a healthy adapter is no longer rejected during the unavoidable
+cross-file heartbeat publication window.
 Committed Git trees are exposed with traversable virtual directory modes;
 their type-only Git mode is never mistaken for filesystem permissions. A Base
 builder compares source and mounted inventories before indexing and verifies

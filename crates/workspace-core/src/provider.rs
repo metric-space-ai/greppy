@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PROVIDER_PROTOCOL_VERSION: u32 = 1;
 const MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(15);
+const MAX_HEARTBEAT_FUTURE_SKEW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -103,7 +104,8 @@ impl ProviderInstallation {
             ))
         })?;
         let marker: ProviderManifest = serde_json::from_slice(&marker_bytes)?;
-        if marker != manifest {
+        validate_manifest(&marker, &data_root, now)?;
+        if !same_provider_identity(&marker, &manifest) {
             return Err(Error::AdapterUnhealthy(
                 "control manifest and mounted provider identity differ".into(),
             ));
@@ -182,6 +184,17 @@ impl ProviderInstallation {
     }
 }
 
+fn same_provider_identity(left: &ProviderManifest, right: &ProviderManifest) -> bool {
+    left.protocol_version == right.protocol_version
+        && left.adapter_version == right.adapter_version
+        && left.adapter_kind == right.adapter_kind
+        && left.state == right.state
+        && left.instance_id == right.instance_id
+        && left.data_root == right.data_root
+        && left.mount_root == right.mount_root
+        && left.capabilities == right.capabilities
+}
+
 fn validate_manifest(
     manifest: &ProviderManifest,
     expected_data_root: &Path,
@@ -220,9 +233,15 @@ fn validate_manifest(
     let heartbeat = UNIX_EPOCH
         .checked_add(Duration::from_millis(manifest.heartbeat_unix_ms))
         .ok_or_else(|| Error::AdapterUnhealthy("provider heartbeat overflowed".into()))?;
-    let age = now
-        .duration_since(heartbeat)
-        .map_err(|_| Error::AdapterUnhealthy("provider heartbeat is in the future".into()))?;
+    let age = match now.duration_since(heartbeat) {
+        Ok(age) => age,
+        Err(error) if error.duration() <= MAX_HEARTBEAT_FUTURE_SKEW => Duration::ZERO,
+        Err(_) => {
+            return Err(Error::AdapterUnhealthy(
+                "provider heartbeat is in the future".into(),
+            ));
+        }
+    };
     if age > MAX_HEARTBEAT_AGE {
         return Err(Error::AdapterUnhealthy(format!(
             "provider heartbeat is stale by {} seconds",
@@ -307,6 +326,49 @@ mod tests {
             serde_json::to_vec(&other).unwrap(),
         )
         .unwrap();
+        assert!(matches!(
+            ProviderInstallation::require_healthy_at(&data, now),
+            Err(Error::AdapterUnhealthy(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_independently_refreshed_live_heartbeats() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let control = manifest(&data, &mount, now - Duration::from_millis(500));
+        publish(&control);
+        let marker = manifest(&data, &mount, now);
+        fs::write(
+            mount.join(".greppy-provider.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+
+        ProviderInstallation::require_healthy_at(&data, now).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_stale_mount_heartbeat_even_when_control_is_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let control = manifest(&data, &mount, now);
+        publish(&control);
+        let marker = manifest(
+            &data,
+            &mount,
+            now - MAX_HEARTBEAT_AGE - Duration::from_millis(1),
+        );
+        fs::write(
+            mount.join(".greppy-provider.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+
         assert!(matches!(
             ProviderInstallation::require_healthy_at(&data, now),
             Err(Error::AdapterUnhealthy(_))

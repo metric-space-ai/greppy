@@ -16,6 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use greppy_agent::{run_startup_self_check, ExecutionEnv, GreppyEnv};
 use serde_json::json;
 
+#[path = "support/portable_provider.rs"]
+mod portable_provider;
+use portable_provider::spawn_fake_provider;
+
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn binary_path() -> PathBuf {
@@ -170,6 +174,8 @@ fn selfcheck_passes_on_healthy_fixture() {
     let repo = unique("healthy-repo");
     init_repo(&repo);
     let store = unique("healthy-store");
+    let provider_root = unique("healthy-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
 
     // Pre-build the index in the repo so the agent worktree clone has something
     // to warm from, and so prewarm is quick.
@@ -178,6 +184,7 @@ fn selfcheck_passes_on_healthy_fixture() {
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .output()
         .expect("index");
     // Index may warn about embeddings; structural must succeed for where-am-i.
@@ -193,6 +200,7 @@ fn selfcheck_passes_on_healthy_fixture() {
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
         .env_remove("GREPPY_SKIP_SELFCHECK")
@@ -206,6 +214,7 @@ fn selfcheck_passes_on_healthy_fixture() {
             "--max-turns",
             "2",
             "--no-sandbox",
+            "--private-store",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -234,8 +243,10 @@ fn selfcheck_passes_on_healthy_fixture() {
         "model loop must still run after self-check; stdout={stdout}\nstderr={stderr}"
     );
 
+    drop(provider);
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&provider_root);
 }
 
 /// `--skip-selfcheck` / GREPPY_SKIP_SELFCHECK=1 bypasses the probes entirely.
@@ -244,12 +255,15 @@ fn skip_selfcheck_bypasses_probes() {
     let repo = unique("skip-repo");
     init_repo(&repo);
     let store = unique("skip-store");
+    let provider_root = unique("skip-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
     let (endpoint, stop, handle) = spawn_stub_gateway();
 
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
         .args([
@@ -263,6 +277,7 @@ fn skip_selfcheck_bypasses_probes() {
             "2",
             "--skip-selfcheck",
             "--no-sandbox",
+            "--private-store",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -292,8 +307,10 @@ fn skip_selfcheck_bypasses_probes() {
         "model loop must run; stdout={stdout}\nstderr={stderr}"
     );
 
+    drop(provider);
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&provider_root);
 }
 
 /// Self-check failure aborts before the model loop (stub greppy that errors).
