@@ -2211,6 +2211,11 @@ fn getby_options_and_context_page_events_fail_closed() {
 }
 
 #[test]
+fn selectors_set_test_id_attribute_and_timeout_error() {
+    run_named_fixture("testid-timeout.mjs", "run_testid");
+}
+
+#[test]
 fn controller_module_policy_denies_host_filesystem() {
     run_named_fixture("controller-module-policy.mjs", "run_modpol");
 }

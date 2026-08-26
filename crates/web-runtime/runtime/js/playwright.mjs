@@ -1,7 +1,27 @@
 const ops = Deno.core.ops;
 
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
 function engineCall(method, params) {
-  return ops.op_engine_call(method, params ?? {});
+  const result = ops.op_engine_call(method, params ?? {});
+  if (result && typeof result.then === "function") {
+    return result.then(
+      (value) => value,
+      (error) => {
+        const message = String(error && error.message ? error.message : error);
+        if (message.includes("timed out") || message.includes("timeout")) {
+          throw new TimeoutError(message);
+        }
+        throw error;
+      },
+    );
+  }
+  return result;
 }
 
 function locatorParams(locator, extra) {
@@ -381,7 +401,7 @@ class Locator {
       }
       ops.op_sleep_ms(20);
     }
-    throw new Error("timeout: Locator.waitForFunction");
+    throw new TimeoutError("timeout: Locator.waitForFunction");
   }
 
   async check() {
@@ -618,7 +638,7 @@ class Locator {
     return new Locator(this._page, {
       type: "testid",
       name: String(name),
-      attr: "data-testid",
+      attr: testIdAttribute,
       scope: this._selector,
     });
   }
@@ -857,7 +877,7 @@ class FrameLocator {
     return new Locator(this._page, {
       type: "testid",
       name: String(name),
-      attr: "data-testid",
+      attr: testIdAttribute,
       scope: this._frameScope(),
     });
   }
@@ -1042,7 +1062,7 @@ class Frame {
         }
         ops.op_sleep_ms(20);
       }
-      throw new Error("timeout: Frame.waitForLoadState");
+      throw new TimeoutError("timeout: Frame.waitForLoadState");
     }
     return this._page.waitForLoadState(state);
   }
@@ -1214,7 +1234,7 @@ class Frame {
       }
       ops.op_sleep_ms(20);
     }
-    throw new Error("timeout: Frame.waitForFunction");
+    throw new TimeoutError("timeout: Frame.waitForFunction");
   }
 
   async waitForURL(pattern, options) {
@@ -1235,7 +1255,7 @@ class Frame {
       }
       ops.op_sleep_ms(20);
     }
-    throw new Error("timeout: Frame.waitForURL " + needle);
+    throw new TimeoutError("timeout: Frame.waitForURL " + needle);
   }
 
   waitForNavigation() {
@@ -1422,7 +1442,7 @@ class Page {
 
   getByTestId(name, options) {
     refuseLocatorOptions("Page.getByTestId", options, []);
-    return new Locator(this, { type: "testid", name: String(name), attr: "data-testid" });
+    return new Locator(this, { type: "testid", name: String(name), attr: testIdAttribute });
   }
 
   locator(selector) {
@@ -1566,7 +1586,7 @@ class Page {
       }
       ops.op_sleep_ms(20);
     }
-    throw new Error("timeout: waitForFunction");
+    throw new TimeoutError("timeout: waitForFunction");
   }
 
   async waitForURL(pattern) {
@@ -1579,7 +1599,7 @@ class Page {
       }
       ops.op_sleep_ms(20);
     }
-    throw new Error("timeout: waitForURL " + needle);
+    throw new TimeoutError("timeout: waitForURL " + needle);
   }
 
   async waitForRequest(pattern) {
@@ -1594,7 +1614,7 @@ class Page {
       }
       ops.op_sleep_ms(20);
     }
-    throw new Error("timeout: waitForRequest " + needle);
+    throw new TimeoutError("timeout: waitForRequest " + needle);
   }
 
   async waitForResponse(pattern) {
@@ -2714,9 +2734,21 @@ const webkit = withUnsupported(
   "BrowserType",
 );
 
-export { chromium, firefox, webkit };
+let testIdAttribute = "data-testid";
+const selectors = withUnsupported(
+  {
+    setTestIdAttribute(name) {
+      if (name == null || String(name) === "") {
+        throwUnsupported("Selectors.setTestIdAttribute.empty");
+      }
+      testIdAttribute = String(name);
+    },
+  },
+  "Selectors",
+);
+const errors = withUnsupported({ TimeoutError }, "errors");
+
+export { chromium, firefox, webkit, selectors, errors, TimeoutError };
 export const request = withUnsupported({}, "APIRequest");
-export const selectors = withUnsupported({}, "Selectors");
 export const devices = withUnsupported({}, "devices");
-export const errors = withUnsupported({}, "errors");
 export default { chromium, firefox, webkit, request, selectors, devices, errors };

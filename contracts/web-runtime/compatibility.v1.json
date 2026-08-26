@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 314,
+    "implemented": 317,
     "unsupported": 337,
-    "unverified": 703
+    "unverified": 700
   },
   "entries": [
     {
@@ -532,10 +532,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "testid-timeout"
       ],
       "known_differences": [
-        "data-testid only; Playwright testIdAttribute is not configurable"
+        "data-testid only; Playwright testIdAttribute is not configurable",
+        "uses selectors.setTestIdAttribute, default data-testid"
       ]
     },
     {
@@ -6558,10 +6560,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "testid-timeout"
       ],
       "known_differences": [
-        "descendant query under selector.scope; not Playwright layout-based piercing"
+        "descendant query under selector.scope; not Playwright layout-based piercing",
+        "uses selectors.setTestIdAttribute, default data-testid"
       ]
     },
     {
@@ -9783,10 +9787,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "frames"
+        "frames",
+        "testid-timeout"
       ],
       "known_differences": [
-        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed",
+        "uses selectors.setTestIdAttribute, default data-testid"
       ]
     },
     {
@@ -11027,11 +11033,15 @@
       "symbol": "Selectors.setTestIdAttribute",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "testid-timeout"
+      ],
+      "known_differences": [
+        "process-wide attribute name for getByTestId; default data-testid; empty name throws"
+      ]
     },
     {
       "symbol": "Selectors.content",
@@ -15332,11 +15342,15 @@
       "symbol": "errors.TimeoutError",
       "kind": "error_family",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "testid-timeout"
+      ],
+      "known_differences": [
+        "JS wait timeouts and engine timed-out messages are TimeoutError; not every Playwright timeout subclass"
+      ]
     },
     {
       "symbol": "chromium.connectOverCDP",
@@ -15608,11 +15622,15 @@
       "symbol": "errors",
       "kind": "namespace",
       "origin": "parser export / types.d.ts",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "testid-timeout"
+      ],
+      "known_differences": [
+        "exports TimeoutError; other error classes stay unsupported"
+      ]
     },
     {
       "symbol": "devices",
