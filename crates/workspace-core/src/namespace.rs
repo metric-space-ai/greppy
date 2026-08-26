@@ -1,10 +1,12 @@
-use crate::{BaselineSnapshot, ChunkId, ChunkStore, EntryKind, Error, Result, CHUNK_SIZE};
+use crate::repository_layers::{self, LayerKind};
+use crate::{BaselineSnapshot, ChunkGcReport, ChunkId, ChunkStore, Error, Result, CHUNK_SIZE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,14 +73,6 @@ struct InodeRecord {
     kind: NodeKind,
     size: u64,
     chunks: Vec<ChunkId>,
-}
-
-#[derive(Debug)]
-struct GitEntry {
-    kind: NodeKind,
-    mode: u32,
-    oid: String,
-    size: u64,
 }
 
 /// Adapter-neutral namespace and lifecycle engine. The platform mount layers
@@ -154,6 +148,7 @@ impl WorkspaceCore {
                  baseline_json BLOB NOT NULL
              );",
         )?;
+        repository_layers::install_schema(&connection)?;
         let core = Self {
             root,
             chunks,
@@ -190,6 +185,15 @@ impl WorkspaceCore {
         id: &str,
         baseline: BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
+        self.create_workspace_internal(id, baseline, true)
+    }
+
+    fn create_workspace_internal(
+        &self,
+        id: &str,
+        baseline: BaselineSnapshot,
+        captured_snapshot_owns_chunks: bool,
+    ) -> Result<WorkspaceHandle> {
         validate_workspace_id(id)?;
         let repository = baseline
             .repository
@@ -197,6 +201,12 @@ impl WorkspaceCore {
             .ok_or_else(|| Error::UnsupportedRepository("repository path is not UTF-8".into()))?;
         let baseline_json = serde_json::to_vec(&baseline)?;
         let mut connection = self.lock_metadata()?;
+        let (base_id, dirty_layer_id) = repository_layers::ensure_layers(
+            &mut connection,
+            &self.chunks,
+            &baseline,
+            captured_snapshot_owns_chunks,
+        )?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO cow_workspaces(
@@ -210,31 +220,7 @@ impl WorkspaceCore {
                 baseline_json
             ],
         )?;
-        for entry in &baseline.entries {
-            match entry.kind {
-                EntryKind::Tombstone => insert_tombstone(&transaction, id, &entry.path)?,
-                EntryKind::File | EntryKind::Symlink => {
-                    let kind = if entry.kind == EntryKind::File {
-                        NodeKind::File
-                    } else {
-                        NodeKind::Symlink
-                    };
-                    for chunk in &entry.chunks {
-                        self.chunks.pin(*chunk)?;
-                    }
-                    let inode = insert_inode(
-                        &transaction,
-                        id,
-                        kind,
-                        entry.mode,
-                        entry.size,
-                        entry.modified_unix_ns,
-                        &entry.chunks,
-                    )?;
-                    insert_entry(&transaction, id, &entry.path, inode)?;
-                }
-            }
-        }
+        repository_layers::link_workspace(&transaction, id, &base_id, &dirty_layer_id)?;
         transaction.commit()?;
         Ok(WorkspaceHandle { id: id.into() })
     }
@@ -248,26 +234,7 @@ impl WorkspaceCore {
         id: &str,
         baseline: &BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        let snapshot = snapshot_chunks(baseline);
-        let mut retained = Vec::with_capacity(snapshot.len());
-        for chunk in snapshot {
-            if let Err(error) = self.chunks.pin(chunk) {
-                for pinned in retained {
-                    let _ = self.chunks.unpin(pinned);
-                }
-                return Err(error);
-            }
-            retained.push(chunk);
-        }
-        match self.create_workspace(id, baseline.clone()) {
-            Ok(workspace) => Ok(workspace),
-            Err(error) => {
-                for chunk in retained {
-                    let _ = self.chunks.unpin(chunk);
-                }
-                Err(error)
-            }
-        }
+        self.create_workspace_internal(id, baseline.clone(), false)
     }
 
     pub fn status(&self, workspace: &WorkspaceHandle) -> Result<WorkspaceStatus> {
@@ -304,6 +271,15 @@ impl WorkspaceCore {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Drops cached repository/dirty layers that are not referenced by an
+    /// active workspace or proposal, then compacts the chunk store.
+    pub fn gc(&self) -> Result<ChunkGcReport> {
+        let mut connection = self.lock_metadata()?;
+        repository_layers::remove_unreferenced(&mut connection, &self.chunks)?;
+        drop(connection);
+        self.chunks.gc()
     }
 
     pub fn metadata(
@@ -343,23 +319,32 @@ impl WorkspaceCore {
                 changed_unix_ns: 0,
             }));
         }
-        let (repository, base_commit) = workspace_origin(&connection, &workspace.id)?;
         let translated = translate_redirect(&connection, &workspace.id, &path)?;
-        drop(connection);
-        Ok(
-            git_lookup(Path::new(&repository), &base_commit, &translated)?.map(|entry| {
-                NodeMetadata {
-                    kind: entry.kind,
-                    mode: entry.mode,
-                    size: entry.size,
-                    inode: stable_inode(&workspace.id, &path),
-                    nlink: 1,
-                    accessed_unix_ns: 0,
-                    modified_unix_ns: 0,
-                    changed_unix_ns: 0,
-                }
-            }),
-        )
+        if let Some(entry) = repository_layers::lookup(&connection, &workspace.id, &translated)? {
+            return Ok(Some(NodeMetadata {
+                kind: layer_node_kind(entry.kind)?,
+                mode: entry.mode,
+                size: entry.size,
+                inode: stable_inode(&workspace.id, &path),
+                nlink: 1,
+                accessed_unix_ns: entry.modified_unix_ns,
+                modified_unix_ns: entry.modified_unix_ns,
+                changed_unix_ns: entry.modified_unix_ns,
+            }));
+        }
+        if repository_layers::has_descendant(&connection, &workspace.id, &translated)? {
+            return Ok(Some(NodeMetadata {
+                kind: NodeKind::Directory,
+                mode: 0o040755,
+                size: 0,
+                inode: stable_inode(&workspace.id, &path),
+                nlink: 2,
+                accessed_unix_ns: 0,
+                modified_unix_ns: 0,
+                changed_unix_ns: 0,
+            }));
+        }
+        Ok(None)
     }
 
     pub fn read(
@@ -370,7 +355,7 @@ impl WorkspaceCore {
         length: usize,
     ) -> Result<Vec<u8>> {
         let path = normalize_path(path.as_ref(), false)?;
-        let inode = self.materialize(workspace, &path)?;
+        let inode = self.resolve_inode(workspace, &path)?;
         if inode.kind != NodeKind::File && inode.kind != NodeKind::Symlink {
             return Err(Error::IsDirectory(path));
         }
@@ -772,10 +757,9 @@ impl WorkspaceCore {
             return Err(Error::InvalidPath(format!("not a directory: {path}")));
         }
         let connection = self.lock_metadata()?;
-        let (repository, base_commit) = workspace_origin(&connection, &workspace.id)?;
         let translated = translate_redirect(&connection, &workspace.id, &path)?;
         let mut names = BTreeSet::new();
-        for name in git_list_directory(Path::new(&repository), &base_commit, &translated)? {
+        for name in repository_layers::list_names(&connection, &workspace.id, &translated)? {
             names.insert(name);
         }
         let prefix = if path.is_empty() {
@@ -854,10 +838,6 @@ impl WorkspaceCore {
                 .ok_or_else(|| Error::InvalidPath(format!("unknown workspace {}", workspace.id)))
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?
         };
-        let pinned = snapshot_chunks(&baseline);
-        for id in &pinned {
-            self.chunks.pin(*id)?;
-        }
         let repository = baseline.repository.clone();
         let baseline_json = serde_json::to_vec(&baseline)?;
         let insert = (|| -> Result<()> {
@@ -884,12 +864,7 @@ impl WorkspaceCore {
             )?;
             Ok(())
         })();
-        if let Err(error) = insert {
-            for id in pinned {
-                let _ = self.chunks.unpin(id);
-            }
-            return Err(error);
-        }
+        insert?;
         Ok(ProposalRecord {
             ref_name: ref_name.into(),
             repository,
@@ -950,7 +925,7 @@ impl WorkspaceCore {
     }
 
     pub fn remove_proposal(&self, ref_name: &str) -> Result<()> {
-        let proposal = self.proposal(ref_name)?;
+        self.proposal(ref_name)?;
         let connection = self.lock_metadata()?;
         let changed = connection.execute(
             "DELETE FROM cow_proposals WHERE ref_name = ?1",
@@ -960,24 +935,12 @@ impl WorkspaceCore {
             return Err(Error::InvalidPath(format!("unknown proposal {ref_name}")));
         }
         drop(connection);
-        for id in snapshot_chunks(&proposal.baseline) {
-            self.chunks.unpin(id)?;
-        }
         Ok(())
     }
 
     pub fn remove_workspace(&self, workspace: WorkspaceHandle) -> Result<()> {
         let mut connection = self.lock_metadata()?;
         let chunks = workspace_chunks(&connection, &workspace.id)?;
-        let baseline: BaselineSnapshot = connection
-            .query_row(
-                "SELECT baseline_json FROM cow_workspaces WHERE id = ?1",
-                params![workspace.id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .ok_or_else(|| Error::InvalidPath(format!("unknown workspace {}", workspace.id)))
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "DELETE FROM cow_workspaces WHERE id = ?1",
@@ -985,14 +948,6 @@ impl WorkspaceCore {
         )?;
         transaction.commit()?;
         for id in chunks {
-            self.chunks.unpin(id)?;
-        }
-        for entry in baseline.entries {
-            for id in entry.chunks {
-                self.chunks.unpin(id)?;
-            }
-        }
-        for id in baseline.index_chunks {
             self.chunks.unpin(id)?;
         }
         Ok(())
@@ -1011,24 +966,9 @@ impl WorkspaceCore {
                 }
             }
         }
-        {
-            let mut statement = connection.prepare("SELECT baseline_json FROM cow_workspaces")?;
-            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                let snapshot: BaselineSnapshot = serde_json::from_slice(&row?)?;
-                for id in snapshot_chunks(&snapshot) {
-                    *expected.entry(id).or_default() += 1;
-                }
-            }
-        }
-        {
-            let mut statement = connection.prepare("SELECT baseline_json FROM cow_proposals")?;
-            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                let snapshot: BaselineSnapshot = serde_json::from_slice(&row?)?;
-                for id in snapshot_chunks(&snapshot) {
-                    *expected.entry(id).or_default() += 1;
-                }
+        for chunks in repository_layers::count_references(&connection)? {
+            for id in chunks {
+                *expected.entry(id).or_default() += 1;
             }
         }
         drop(connection);
@@ -1106,6 +1046,25 @@ impl WorkspaceCore {
         Ok(())
     }
 
+    fn resolve_inode(&self, workspace: &WorkspaceHandle, path: &str) -> Result<InodeRecord> {
+        let connection = self.lock_metadata()?;
+        if let Some(inode) = load_inode_for_path(&connection, &workspace.id, path)? {
+            return Ok(inode);
+        }
+        if ancestor_tombstoned(&connection, &workspace.id, path)? {
+            return Err(Error::NotFound(path.into()));
+        }
+        let translated = translate_redirect(&connection, &workspace.id, path)?;
+        let entry = repository_layers::lookup(&connection, &workspace.id, &translated)?
+            .ok_or_else(|| Error::NotFound(path.into()))?;
+        Ok(InodeRecord {
+            id: 0,
+            kind: layer_node_kind(entry.kind)?,
+            size: entry.size,
+            chunks: entry.chunks,
+        })
+    }
+
     fn materialize(&self, workspace: &WorkspaceHandle, path: &str) -> Result<InodeRecord> {
         {
             let connection = self.lock_metadata()?;
@@ -1116,43 +1075,32 @@ impl WorkspaceCore {
                 return Err(Error::NotFound(path.into()));
             }
         }
-        let (repository, base_commit, translated) = {
-            let connection = self.lock_metadata()?;
-            let (repository, base_commit) = workspace_origin(&connection, &workspace.id)?;
-            let translated = translate_redirect(&connection, &workspace.id, path)?;
-            (repository, base_commit, translated)
-        };
-        let git = git_lookup(Path::new(&repository), &base_commit, &translated)?
-            .ok_or_else(|| Error::NotFound(path.into()))?;
-        let chunks = match git.kind {
-            NodeKind::Directory => Vec::new(),
-            NodeKind::File | NodeKind::Symlink => {
-                let bytes = git_blob(Path::new(&repository), &git.oid)?;
-                let (chunks, _) = self.chunks.put_stream(bytes.as_slice())?;
-                for id in &chunks {
-                    self.chunks.pin(*id)?;
-                }
-                chunks
-            }
-        };
+        let source = self.resolve_inode(workspace, path)?;
+        let mode = self
+            .metadata(workspace, path)?
+            .ok_or_else(|| Error::NotFound(path.into()))?
+            .mode;
+        for id in &source.chunks {
+            self.chunks.pin(*id)?;
+        }
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         let inode = insert_inode(
             &transaction,
             &workspace.id,
-            git.kind,
-            git.mode,
-            git.size,
+            source.kind,
+            mode,
+            source.size,
             0,
-            &chunks,
+            &source.chunks,
         )?;
         insert_entry(&transaction, &workspace.id, path, inode)?;
         transaction.commit()?;
         Ok(InodeRecord {
             id: inode,
-            kind: git.kind,
-            size: git.size,
-            chunks,
+            kind: source.kind,
+            size: source.size,
+            chunks: source.chunks,
         })
     }
 
@@ -1320,17 +1268,6 @@ fn load_inode_for_path(
         .transpose()
 }
 
-fn workspace_origin(connection: &Connection, workspace_id: &str) -> Result<(String, String)> {
-    connection
-        .query_row(
-            "SELECT repository, base_commit FROM cow_workspaces WHERE id = ?1 AND state != 'broken'",
-            params![workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| Error::InvalidPath(format!("unknown or broken workspace {workspace_id}")))
-}
-
 fn workspace_chunks(connection: &Connection, workspace_id: &str) -> Result<Vec<ChunkId>> {
     let mut statement = connection
         .prepare("SELECT chunks_json FROM cow_inodes WHERE workspace_id = ?1 ORDER BY id")?;
@@ -1396,135 +1333,6 @@ fn translate_redirect(connection: &Connection, workspace_id: &str, path: &str) -
         }
     }
     Ok(path.to_string())
-}
-
-fn git_lookup(repository: &Path, commit: &str, path: &str) -> Result<Option<GitEntry>> {
-    if path.is_empty() {
-        return Ok(Some(GitEntry {
-            kind: NodeKind::Directory,
-            mode: 0o040755,
-            oid: commit.to_string(),
-            size: 0,
-        }));
-    }
-    let spec = format!("{commit}:{path}");
-    let type_output = git(repository, &["cat-file", "-t", &spec], true)?;
-    if !type_output.status.success() {
-        return Ok(None);
-    }
-    let object_type = String::from_utf8_lossy(&type_output.stdout)
-        .trim_end()
-        .to_string();
-    let oid = git_text(repository, &["rev-parse", &spec])?;
-    let git_mode = git_mode_for_path(repository, commit, path)?;
-    let (kind, mode) = match object_type.as_str() {
-        // Git tree modes contain only the object type. A mounted filesystem
-        // must expose traversable permissions or every committed directory is
-        // visible in its parent but inaccessible to recursive tools.
-        "tree" => (NodeKind::Directory, 0o040755),
-        "blob" if git_mode == 0o120000 => (NodeKind::Symlink, 0o120777),
-        "blob" => (NodeKind::File, git_mode),
-        other => {
-            return Err(Error::UnsupportedRepository(format!(
-                "unsupported Git object type {other} at {path}"
-            )))
-        }
-    };
-    let size = if kind == NodeKind::Directory {
-        0
-    } else {
-        git_text(repository, &["cat-file", "-s", &oid])?
-            .parse::<u64>()
-            .map_err(|_| Error::Git {
-                command: format!("git cat-file -s {oid}"),
-                detail: "size is not an integer".into(),
-            })?
-    };
-    Ok(Some(GitEntry {
-        kind,
-        mode,
-        oid,
-        size,
-    }))
-}
-
-fn git_mode_for_path(repository: &Path, commit: &str, path: &str) -> Result<u32> {
-    let output = git_text(repository, &["ls-tree", commit, "--", path])?;
-    let mode = output.split_whitespace().next().ok_or_else(|| Error::Git {
-        command: format!("git ls-tree {commit} -- {path}"),
-        detail: "entry disappeared".into(),
-    })?;
-    u32::from_str_radix(mode, 8).map_err(|_| Error::Git {
-        command: format!("git ls-tree {commit} -- {path}"),
-        detail: format!("invalid mode {mode}"),
-    })
-}
-
-fn git_blob(repository: &Path, oid: &str) -> Result<Vec<u8>> {
-    let output = git(repository, &["cat-file", "blob", oid], false)?;
-    if !output.status.success() {
-        return Err(git_error(&format!("git cat-file blob {oid}"), &output));
-    }
-    Ok(output.stdout)
-}
-
-fn git_list_directory(repository: &Path, commit: &str, path: &str) -> Result<Vec<String>> {
-    let spec = if path.is_empty() {
-        commit.to_string()
-    } else {
-        format!("{commit}:{path}")
-    };
-    let output = git(repository, &["ls-tree", "-z", &spec], false)?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let mut names = Vec::new();
-    for record in output.stdout.split(|byte| *byte == 0) {
-        if record.is_empty() {
-            continue;
-        }
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or_else(|| Error::Git {
-                command: format!("git ls-tree -z {spec}"),
-                detail: "entry has no tab separator".into(),
-            })?;
-        names.push(
-            String::from_utf8(record[tab + 1..].to_vec()).map_err(|_| {
-                Error::UnsupportedRepository("non-UTF-8 Git path in directory".into())
-            })?,
-        );
-    }
-    Ok(names)
-}
-
-fn git(repository: &Path, args: &[&str], allow_failure: bool) -> Result<Output> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repository)
-        .output()?;
-    if !allow_failure && !output.status.success() {
-        return Err(git_error(&format!("git {}", args.join(" ")), &output));
-    }
-    Ok(output)
-}
-
-fn git_text(repository: &Path, args: &[&str]) -> Result<String> {
-    let output = git(repository, args, false)?;
-    String::from_utf8(output.stdout)
-        .map(|text| text.trim_end().to_string())
-        .map_err(|_| Error::Git {
-            command: format!("git {}", args.join(" ")),
-            detail: "stdout is not UTF-8".into(),
-        })
-}
-
-fn git_error(command: &str, output: &Output) -> Error {
-    Error::Git {
-        command: command.into(),
-        detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    }
 }
 
 fn read_chunks(
@@ -1624,6 +1432,17 @@ fn kind_name(kind: NodeKind) -> &'static str {
     }
 }
 
+fn layer_node_kind(kind: LayerKind) -> Result<NodeKind> {
+    match kind {
+        LayerKind::File => Ok(NodeKind::File),
+        LayerKind::Directory => Ok(NodeKind::Directory),
+        LayerKind::Symlink => Ok(NodeKind::Symlink),
+        LayerKind::Tombstone => Err(Error::Corrupt(
+            "tombstone escaped repository-layer resolution".into(),
+        )),
+    }
+}
+
 fn parse_kind(kind: &str) -> rusqlite::Result<NodeKind> {
     match kind {
         "file" => Ok(NodeKind::File),
@@ -1638,15 +1457,6 @@ fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
-}
-
-fn snapshot_chunks(snapshot: &BaselineSnapshot) -> Vec<ChunkId> {
-    snapshot
-        .entries
-        .iter()
-        .flat_map(|entry| entry.chunks.iter().copied())
-        .chain(snapshot.index_chunks.iter().copied())
-        .collect()
 }
 
 fn validate_proposal_ref(value: &str) -> Result<()> {
@@ -1748,6 +1558,35 @@ mod tests {
     }
 
     #[test]
+    fn provider_hot_path_does_not_access_git_or_the_source_repository() {
+        let (repo, _storage, core, workspace) = fixture();
+        fs::rename(repo.path().join(".git"), repo.path().join(".git.offline")).unwrap();
+        fs::remove_file(repo.path().join("src/lib.rs")).unwrap();
+        fs::remove_file(repo.path().join("README.md")).unwrap();
+
+        assert_eq!(
+            core.read(&workspace, "src/lib.rs", 0, 100).unwrap(),
+            b"pub fn base() {}\n"
+        );
+        assert_eq!(
+            core.read(&workspace, "README.md", 0, 100).unwrap(),
+            b"dirty\n"
+        );
+        assert_eq!(
+            core.read_dir(&workspace, "")
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            ["README.md", "src", "untracked.txt"]
+        );
+        core.write(&workspace, "src/lib.rs", 0, b"X").unwrap();
+        core.rename(&workspace, "src/lib.rs", "src/moved.rs")
+            .unwrap();
+        assert_eq!(core.read(&workspace, "src/moved.rs", 0, 1).unwrap(), b"X");
+    }
+
+    #[test]
     fn a_partial_write_replaces_only_one_logical_chunk() {
         let (_repo, _storage, core, workspace) = fixture();
         core.create_file(&workspace, "large.bin", 0o100644).unwrap();
@@ -1792,6 +1631,7 @@ mod tests {
             b"committed"
         );
         reopened.remove_workspace(workspace).unwrap();
+        reopened.gc().unwrap();
         assert_eq!(reopened.chunks().stats().unwrap().referenced_chunks, 0);
     }
 
@@ -1837,8 +1677,22 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
+        {
+            let connection = core.lock_metadata().unwrap();
+            let bases: i64 = connection
+                .query_row("SELECT COUNT(*) FROM cow_repository_bases", [], |row| row.get(0))
+                .unwrap();
+            let dirty_layers: i64 = connection
+                .query_row("SELECT COUNT(*) FROM cow_dirty_layers", [], |row| row.get(0))
+                .unwrap();
+            let workspace_layers: i64 = connection
+                .query_row("SELECT COUNT(*) FROM cow_workspace_layers", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!((bases, dirty_layers, workspace_layers), (1, 1, 1));
+        }
         core.remove_workspace(owner).unwrap();
         assert!(core.list_workspaces().unwrap().is_empty());
+        core.gc().unwrap();
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
     }
 
@@ -1964,6 +1818,8 @@ mod tests {
         assert!(core.chunks().stats().unwrap().referenced_chunks > 0);
         core.remove_workspace(workspace).unwrap();
         assert_eq!(core.list_workspaces().unwrap(), []);
+        assert!(core.chunks().stats().unwrap().referenced_chunks > 0);
+        core.gc().unwrap();
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
     }
 
@@ -1986,6 +1842,7 @@ mod tests {
         core.remove_workspace(workspace).unwrap();
         assert!(core.chunks().stats().unwrap().referenced_chunks > 0);
         core.remove_proposal(&record.ref_name).unwrap();
+        core.gc().unwrap();
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
     }
 }

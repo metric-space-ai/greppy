@@ -1631,7 +1631,6 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             let report = core
-                .chunks()
                 .gc()
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             println!(

@@ -5,8 +5,8 @@
 //! repository and before any model request can be made.
 
 use greppy_workspace_core::{
-    capture_repository, BaselineEntry, BaselineSnapshot, EntryKind, ProviderInstallation,
-    WorkspaceCore, WorkspaceHandle,
+    capture_repository, BaselineEntry, BaselineSnapshot, ChunkStore, EntryKind,
+    ProviderInstallation, WorkspaceCore, WorkspaceHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -175,18 +175,26 @@ impl AgentWorkspace {
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
+        let baseline_for_git = baseline.clone();
         let handle = core.create_workspace(run_id, baseline)?;
         let worktree = provider.workspace_path(run_id)?;
         if let Err(error) = wait_for_workspace(&worktree) {
             let _ = core.remove_workspace(handle);
             return Err(error);
         }
-        let private_git_dir = worktree.join(".git");
-        let initialized = initialize_private_git(&repo_root, &worktree, &base_commit);
+        let private_git_dir = data_root.join("private-git").join(run_id);
+        let initialized = initialize_private_git(
+            &repo_root,
+            &worktree,
+            &private_git_dir,
+            &baseline_for_git,
+            core.chunks(),
+        );
         let (baseline_tree, baseline_view_commit) = match initialized {
             Ok(result) => result,
             Err(error) => {
                 let _ = core.remove_workspace(handle);
+                let _ = fs::remove_dir_all(&private_git_dir);
                 return Err(error);
             }
         };
@@ -340,6 +348,11 @@ impl AgentWorkspace {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+        match fs::remove_dir_all(&self.private_git_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         self.core.remove_workspace(self.handle)?;
         Ok(())
@@ -956,29 +969,115 @@ fn home_dir() -> Result<PathBuf, WorkspaceError> {
 fn initialize_private_git(
     repo_root: &Path,
     worktree: &Path,
-    base_commit: &str,
+    private_git_dir: &Path,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
 ) -> Result<(String, String), WorkspaceError> {
-    git_ok(worktree, &["init", "--quiet"])?;
+    if private_git_dir.exists() {
+        return Err(WorkspaceError::Tampered {
+            path: private_git_dir.into(),
+            detail: "private Git state already exists for this run id".into(),
+        });
+    }
+    fs::create_dir_all(
+        private_git_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid private Git path"))?,
+    )?;
+    let object_format = git_ok(repo_root, &["rev-parse", "--show-object-format"])?;
+    let init = Command::new("git")
+        .args([
+            "init",
+            "--bare",
+            "--quiet",
+            "--template=",
+            &format!("--object-format={object_format}"),
+            path_text(private_git_dir)?,
+        ])
+        .output()?;
+    output_text("git init --bare private workspace repository", init)?;
     let common = git_ok(
         repo_root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let objects = PathBuf::from(common).join("objects");
-    let alternates = worktree.join(".git/objects/info/alternates");
+    let alternates = private_git_dir.join("objects/info/alternates");
     fs::create_dir_all(
         alternates
             .parent()
             .ok_or_else(|| io::Error::other("invalid alternates path"))?,
     )?;
     fs::write(&alternates, format!("{}\n", objects.display()))?;
-    git_ok(worktree, &["config", "core.autocrlf", "false"])?;
-    git_ok(worktree, &["config", "core.symlinks", "true"])?;
-    git_ok(worktree, &["add", "-A"])?;
-    let baseline_tree = git_ok(worktree, &["write-tree"])?;
+    git_private(
+        private_git_dir,
+        worktree,
+        None,
+        &["config", "core.bare", "false"],
+    )?;
+    git_private(
+        private_git_dir,
+        worktree,
+        None,
+        &["config", "core.worktree", path_text(worktree)?],
+    )?;
+    git_private(
+        private_git_dir,
+        worktree,
+        None,
+        &["config", "core.autocrlf", "false"],
+    )?;
+    git_private(
+        private_git_dir,
+        worktree,
+        None,
+        &["config", "core.symlinks", "true"],
+    )?;
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", private_git_dir.display()),
+    )?;
+
+    let initial_index = private_git_dir.join("baseline.index");
+    git_private(
+        private_git_dir,
+        worktree,
+        Some(&initial_index),
+        &["read-tree", &baseline.base_commit],
+    )?;
+    for entry in &baseline.entries {
+        match entry.kind {
+            EntryKind::Tombstone => {
+                git_private(
+                    private_git_dir,
+                    worktree,
+                    Some(&initial_index),
+                    &["update-index", "--force-remove", "--", &entry.path],
+                )?;
+            }
+            EntryKind::File | EntryKind::Symlink => {
+                let bytes = baseline_bytes(chunks, entry)?;
+                let oid = hash_private_blob(private_git_dir, worktree, &bytes)?;
+                let cache_info = format!("{:o},{oid},{}", entry.mode, entry.path);
+                git_private(
+                    private_git_dir,
+                    worktree,
+                    Some(&initial_index),
+                    &["update-index", "--add", "--cacheinfo", &cache_info],
+                )?;
+            }
+        }
+    }
+    let baseline_tree = git_private(
+        private_git_dir,
+        worktree,
+        Some(&initial_index),
+        &["write-tree"],
+    )?;
+    fs::rename(&initial_index, private_git_dir.join("index"))?;
     let baseline_view_commit = commit_tree(
         worktree,
         &baseline_tree,
-        base_commit,
+        &baseline.base_commit,
         "greppy private baseline view",
     )?;
     git_ok(
@@ -993,14 +1092,67 @@ fn initialize_private_git(
         worktree,
         &["symbolic-ref", "HEAD", "refs/heads/greppy-baseline"],
     )?;
-    let status = git_bytes(worktree, &["status", "--porcelain=v1", "-z"])?;
-    if !status.is_empty() {
-        return Err(WorkspaceError::Tampered {
-            path: worktree.into(),
-            detail: "private Git baseline view is not clean".into(),
-        });
-    }
     Ok((baseline_tree, baseline_view_commit))
+}
+
+fn baseline_bytes(chunks: &ChunkStore, entry: &BaselineEntry) -> Result<Vec<u8>, WorkspaceError> {
+    let mut bytes = Vec::with_capacity(entry.size as usize);
+    for chunk in &entry.chunks {
+        bytes.extend_from_slice(&chunks.read(*chunk)?);
+    }
+    bytes.truncate(entry.size as usize);
+    Ok(bytes)
+}
+
+fn hash_private_blob(
+    private_git_dir: &Path,
+    worktree: &Path,
+    bytes: &[u8],
+) -> Result<String, WorkspaceError> {
+    let mut child = Command::new("git")
+        .args([
+            "--git-dir",
+            path_text(private_git_dir)?,
+            "--work-tree",
+            path_text(worktree)?,
+            "hash-object",
+            "-w",
+            "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("git hash-object stdin unavailable"))?
+        .write_all(bytes)?;
+    output_text("git hash-object -w --stdin", child.wait_with_output()?)
+}
+
+fn git_private(
+    private_git_dir: &Path,
+    worktree: &Path,
+    index: Option<&Path>,
+    args: &[&str],
+) -> Result<String, WorkspaceError> {
+    let mut command = Command::new("git");
+    command
+        .args(["--git-dir", path_text(private_git_dir)?])
+        .args(["--work-tree", path_text(worktree)?]);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command.args(args).output()?;
+    output_text(
+        &format!(
+            "git --git-dir {} {}",
+            private_git_dir.display(),
+            args.join(" ")
+        ),
+        output,
+    )
 }
 
 fn commit_tree(

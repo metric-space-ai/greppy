@@ -10,6 +10,7 @@ mod error;
 mod namespace;
 mod path_policy;
 mod provider;
+mod repository_layers;
 mod snapshot;
 
 pub use chunk_store::{ChunkGcReport, ChunkId, ChunkStore, ChunkStoreStats, CHUNK_SIZE};
