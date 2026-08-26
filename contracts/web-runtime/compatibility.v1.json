@@ -858,11 +858,15 @@
       "symbol": "Page.pageErrors",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "console.error records as Error.message; not window.onerror / uncaught exceptions"
+      ]
     },
     {
       "symbol": "Page.pause",
@@ -8728,11 +8732,15 @@
       "symbol": "ConsoleMessage.page",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "returns the Page that received the console record"
+      ]
     },
     {
       "symbol": "ConsoleMessage.text",
@@ -9285,11 +9293,15 @@
       "symbol": "FileChooser.element",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "file-chooser-event"
+      ],
+      "known_differences": [
+        "returns a locator for the last clicked CSS file input; not a live ElementHandle"
+      ]
     },
     {
       "symbol": "FileChooser.isMultiple",

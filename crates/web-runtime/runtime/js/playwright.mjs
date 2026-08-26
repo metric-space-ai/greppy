@@ -206,6 +206,11 @@ class FileChooser {
     const selector = this._page._lastFileSelector || 'input[type="file"]';
     return this._page.setInputFiles(selector, files);
   }
+
+  element() {
+    const selector = this._page._lastFileSelector || 'input[type="file"]';
+    return this._page.locator(selector);
+  }
 }
 
 class Dialog {
@@ -255,6 +260,9 @@ class Locator {
   async click(options) {
     if (options != null) {
       return unsupported("Locator.click.options")();
+    }
+    if (this._selector && this._selector.type === "css" && this._selector.value) {
+      this._page._lastFileSelector = this._selector.value;
     }
     await engineCall("locator.click", {
       page: this._page._id,
@@ -1398,6 +1406,7 @@ class Page {
       const payload = {
         type: () => rec.type || "log",
         text: () => rec.text || "",
+        page: () => this,
       };
       const waiter = this._consoleWaiters.shift();
       if (waiter) {
@@ -1692,7 +1701,19 @@ class Page {
     return (result.messages || []).map((rec) => ({
       type: () => rec.type || "log",
       text: () => rec.text || "",
+      page: () => this,
     }));
+  }
+
+  async pageErrors() {
+    const messages = await this.consoleMessages();
+    return messages
+      .filter((msg) => msg.type() === "error")
+      .map((msg) => {
+        const error = new Error(msg.text());
+        error.name = "Error";
+        return error;
+      });
   }
 
   async clearConsoleMessages() {

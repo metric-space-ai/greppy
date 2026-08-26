@@ -10,11 +10,19 @@ page.on("console", handler);
 const waited = page.waitForEvent("console");
 await page.evaluate(() => {
   console.log("hello-console");
+  console.error("boom-err");
   return 1;
 });
 const waitedMsg = await waited;
 if (waitedMsg.text() !== "hello-console") {
   throw new Error("waitForEvent console " + waitedMsg.text());
+}
+if (typeof waitedMsg.page !== "function" || waitedMsg.page() !== page) {
+  throw new Error("ConsoleMessage.page");
+}
+const errors = await page.pageErrors();
+if (!errors.some((error) => String(error.message).includes("boom-err"))) {
+  throw new Error("pageErrors missing boom-err: " + JSON.stringify(errors.map((e) => e.message)));
 }
 const messages = await page.consoleMessages();
 const texts = messages.map((msg) => msg.text());

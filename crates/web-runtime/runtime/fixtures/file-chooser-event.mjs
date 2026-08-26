@@ -6,6 +6,10 @@ await page.setContent("<!DOCTYPE html><html><body><input id='f' type='file'></bo
 await page.locator("#f").click();
 const chooser = await page.waitForEvent("filechooser");
 if (chooser.isMultiple()) throw new Error("expected single file chooser");
+const chosen = chooser.element();
+if ((await chosen.getAttribute("id")) !== "f") {
+  throw new Error("FileChooser.element id " + (await chosen.getAttribute("id")));
+}
 await chooser.setFiles("FILE_PATH");
 const count = await page.evaluate(() => document.querySelector("#f").files.length);
 if (count !== 1) {
