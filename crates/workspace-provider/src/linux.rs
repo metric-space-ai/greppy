@@ -8,7 +8,7 @@ use greppy_workspace_core::{
     ProviderManifest, ProviderState, WorkspaceCore, WorkspaceFileHandle, WorkspaceHandle,
     PROVIDER_PROTOCOL_VERSION,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -25,6 +25,7 @@ const ATTR_TTL: Duration = Duration::from_millis(250);
 // reverse notifications from the active request can deadlock its worker pool.
 // Cache entries only for the same deliberately short period as attributes.
 const ENTRY_TTL: Duration = Duration::from_millis(250);
+const WORKSPACE_CACHE_LIMIT: usize = 1_024;
 const ROOT: u64 = 1;
 const WORKSPACES: u64 = 2;
 const DOCTOR: u64 = 3;
@@ -47,6 +48,8 @@ struct PortableFuse {
     nodes: Mutex<HashMap<u64, Node>>,
     reverse: Mutex<HashMap<Node, u64>>,
     workspace_inodes: Mutex<HashMap<(String, u64), u64>>,
+    workspace_handles: Mutex<HashMap<String, WorkspaceHandle>>,
+    workspace_directories: Mutex<HashMap<(String, String), BTreeMap<String, NodeMetadata>>>,
     open_files: Mutex<HashMap<u64, WorkspaceFileHandle>>,
     next_inode: AtomicU64,
     next_file_handle: AtomicU64,
@@ -79,6 +82,8 @@ impl PortableFuse {
             nodes: Mutex::new(nodes),
             reverse: Mutex::new(reverse),
             workspace_inodes: Mutex::new(HashMap::new()),
+            workspace_handles: Mutex::new(HashMap::new()),
+            workspace_directories: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
             next_inode: AtomicU64::new(16),
             next_file_handle: AtomicU64::new(1),
@@ -91,12 +96,92 @@ impl PortableFuse {
         self.nodes.lock().ok()?.get(&inode.0).cloned()
     }
 
+    fn workspace_handle(&self, workspace: &str) -> Result<WorkspaceHandle, Errno> {
+        if let Some(handle) = self
+            .workspace_handles
+            .lock()
+            .map_err(|_| Errno::EIO)?
+            .get(workspace)
+            .cloned()
+        {
+            return Ok(handle);
+        }
+        let handle = self.core.open_workspace(workspace).map_err(core_errno)?;
+        let mut handles = self.workspace_handles.lock().map_err(|_| Errno::EIO)?;
+        if handles.len() >= WORKSPACE_CACHE_LIMIT {
+            handles.clear();
+        }
+        handles.insert(workspace.to_string(), handle.clone());
+        Ok(handle)
+    }
+
+    fn workspace_directory(
+        &self,
+        workspace: &str,
+        path: &str,
+    ) -> Result<BTreeMap<String, NodeMetadata>, Errno> {
+        let key = (workspace.to_string(), path.to_string());
+        if let Some(entries) = self
+            .workspace_directories
+            .lock()
+            .map_err(|_| Errno::EIO)?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(entries);
+        }
+        let handle = self.workspace_handle(workspace)?;
+        let entries: BTreeMap<_, _> = self
+            .core
+            .read_dir(&handle, path)
+            .map_err(core_errno)?
+            .into_iter()
+            .map(|entry| (entry.name, entry.metadata))
+            .collect();
+        let mut directories = self.workspace_directories.lock().map_err(|_| Errno::EIO)?;
+        if directories.len() >= WORKSPACE_CACHE_LIMIT {
+            directories.clear();
+        }
+        directories.insert(key, entries.clone());
+        Ok(entries)
+    }
+
+    fn invalidate_workspace_directory(&self, workspace: &str, path: &str) {
+        let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        if let Ok(mut directories) = self.workspace_directories.lock() {
+            directories.remove(&(workspace.to_string(), parent.to_string()));
+            directories.remove(&(workspace.to_string(), path.to_string()));
+        }
+    }
+
+    fn invalidate_workspace_cache(&self, workspace: &str) {
+        if let Ok(mut directories) = self.workspace_directories.lock() {
+            directories.retain(|(workspace_id, _), _| workspace_id != workspace);
+        }
+    }
+
     fn inode(&self, node: Node) -> u64 {
+        let metadata = match &node {
+            Node::WorkspacePath { workspace, path } => self
+                .workspace_handle(workspace)
+                .ok()
+                .and_then(|handle| self.core.metadata(&handle, path).ok().flatten()),
+            _ => None,
+        };
+        self.inode_with_metadata(node, metadata.as_ref())
+    }
+
+    fn inode_with_metadata(&self, node: Node, metadata: Option<&NodeMetadata>) -> u64 {
         if let Some(value) = self.reverse.lock().unwrap().get(&node).copied() {
-            self.bind_workspace_inode(&node, value);
             return value;
         }
-        if let Some((key, value)) = self.workspace_inode_key(&node).and_then(|key| {
+        let workspace_key = match (&node, metadata) {
+            (Node::WorkspacePath { workspace, .. }, Some(metadata)) => {
+                Some((workspace.clone(), metadata.inode))
+            }
+            _ => None,
+        };
+        if let Some((_key, value)) = workspace_key.clone().and_then(|key| {
             self.workspace_inodes
                 .lock()
                 .unwrap()
@@ -104,12 +189,14 @@ impl PortableFuse {
                 .copied()
                 .map(|value| (key, value))
         }) {
-            self.workspace_inodes.lock().unwrap().insert(key, value);
+            self.reverse.lock().unwrap().insert(node, value);
             return value;
         }
         let value = self.next_inode.fetch_add(1, Ordering::Relaxed);
         self.reverse.lock().unwrap().insert(node.clone(), value);
-        self.bind_workspace_inode(&node, value);
+        if let Some(key) = workspace_key {
+            self.workspace_inodes.lock().unwrap().insert(key, value);
+        }
         self.nodes.lock().unwrap().insert(value, node);
         value
     }
@@ -118,7 +205,7 @@ impl PortableFuse {
         let Node::WorkspacePath { workspace, path } = node else {
             return None;
         };
-        let handle = self.core.open_workspace(workspace).ok()?;
+        let handle = self.workspace_handle(workspace).ok()?;
         let metadata = self.core.metadata(&handle, path).ok()??;
         Some((workspace.clone(), metadata.inode))
     }
@@ -213,47 +300,64 @@ impl PortableFuse {
         }
     }
 
-    fn child(&self, parent: &Node, name: &OsStr) -> Result<Node, Errno> {
+    fn child(&self, parent: &Node, name: &OsStr) -> Result<(Node, Option<NodeMetadata>), Errno> {
         match parent {
-            Node::Root if name == OsStr::new("workspaces") => Ok(Node::Workspaces),
-            Node::Root if name == OsStr::new("doctor") => Ok(Node::DoctorRoot),
-            Node::Root if name == OsStr::new(".greppy-provider.json") => Ok(Node::Marker),
+            Node::Root if name == OsStr::new("workspaces") => Ok((Node::Workspaces, None)),
+            Node::Root if name == OsStr::new("doctor") => Ok((Node::DoctorRoot, None)),
+            Node::Root if name == OsStr::new(".greppy-provider.json") => Ok((Node::Marker, None)),
             Node::Workspaces => {
                 let id = utf8_name(name)?;
                 self.core.open_workspace(id).map_err(core_errno)?;
-                Ok(Node::WorkspaceRoot(id.into()))
+                Ok((Node::WorkspaceRoot(id.into()), None))
             }
             Node::WorkspaceRoot(workspace) => self.workspace_child(workspace, "", name),
             Node::WorkspacePath { workspace, path } => self.workspace_child(workspace, path, name),
             Node::DoctorRoot => {
                 let child = PathBuf::from(name);
                 fs::symlink_metadata(self.doctor_path(&child)?).map_err(io_errno)?;
-                Ok(Node::Doctor(child))
+                Ok((Node::Doctor(child), None))
             }
             Node::Doctor(path) if self.doctor_root.join(path).is_dir() => {
                 let child = path.join(name);
                 fs::symlink_metadata(self.doctor_path(&child)?).map_err(io_errno)?;
-                Ok(Node::Doctor(child))
+                Ok((Node::Doctor(child), None))
             }
             _ => Err(Errno::ENOENT),
         }
     }
 
-    fn workspace_child(&self, workspace: &str, parent: &str, name: &OsStr) -> Result<Node, Errno> {
+    fn workspace_child(
+        &self,
+        workspace: &str,
+        parent: &str,
+        name: &OsStr,
+    ) -> Result<(Node, Option<NodeMetadata>), Errno> {
         let name = utf8_name(name)?;
         let path = join_virtual(parent, name);
-        let handle = self.core.open_workspace(workspace).map_err(core_errno)?;
-        self.core
-            .metadata(&handle, &path)
-            .map_err(core_errno)?
+        let metadata = self
+            .workspace_directory(workspace, parent)?
+            .get(name)
+            .cloned()
             .ok_or(Errno::ENOENT)?;
-        Ok(Node::WorkspacePath {
-            workspace: workspace.into(),
-            path,
-        })
+        Ok((
+            Node::WorkspacePath {
+                workspace: workspace.into(),
+                path,
+            },
+            Some(metadata),
+        ))
     }
 
     fn attr(&self, inode: u64, node: &Node) -> Result<FileAttr, Errno> {
+        self.attr_with_metadata(inode, node, None)
+    }
+
+    fn attr_with_metadata(
+        &self,
+        inode: u64,
+        node: &Node,
+        resolved_metadata: Option<&NodeMetadata>,
+    ) -> Result<FileAttr, Errno> {
         let now = SystemTime::now();
         let (kind, mode, size, nlink, uid, gid, atime, mtime, ctime) = match node {
             Node::Root | Node::Workspaces | Node::DoctorRoot | Node::WorkspaceRoot(_) => (
@@ -304,12 +408,16 @@ impl PortableFuse {
                 )
             }
             Node::WorkspacePath { workspace, path } => {
-                let handle = self.core.open_workspace(workspace).map_err(core_errno)?;
-                let metadata = self
-                    .core
-                    .metadata(&handle, path)
-                    .map_err(core_errno)?
-                    .ok_or(Errno::ENOENT)?;
+                let metadata = match resolved_metadata {
+                    Some(metadata) => metadata.clone(),
+                    None => {
+                        let handle = self.workspace_handle(workspace)?;
+                        self.core
+                            .metadata(&handle, path)
+                            .map_err(core_errno)?
+                            .ok_or(Errno::ENOENT)?
+                    }
+                };
                 workspace_attr(metadata, self.uid, self.gid)
             }
         };
@@ -338,10 +446,9 @@ impl PortableFuse {
 
     fn workspace_parts(&self, inode: INodeNo) -> Result<(WorkspaceHandle, String), Errno> {
         match self.node(inode).ok_or(Errno::ENOENT)? {
-            Node::WorkspacePath { workspace, path } => Ok((
-                self.core.open_workspace(&workspace).map_err(core_errno)?,
-                path,
-            )),
+            Node::WorkspacePath { workspace, path } => {
+                Ok((self.workspace_handle(&workspace)?, path))
+            }
             _ => Err(Errno::EINVAL),
         }
     }
@@ -365,9 +472,10 @@ impl Filesystem for PortableFuse {
             .node(parent)
             .ok_or(Errno::ENOENT)
             .and_then(|parent| self.child(&parent, name))
-            .and_then(|node| {
-                let inode = self.inode(node.clone());
-                self.attr(inode, &node).map(|attr| (attr, node))
+            .and_then(|(node, metadata)| {
+                let inode = self.inode_with_metadata(node.clone(), metadata.as_ref());
+                self.attr_with_metadata(inode, &node, metadata.as_ref())
+                    .map(|attr| (attr, node))
             });
         match result {
             Ok((attr, _)) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
@@ -446,6 +554,7 @@ impl Filesystem for PortableFuse {
                     mtime.map(time_or_now_ns),
                 )
                 .map_err(core_errno)?;
+            self.invalidate_workspace_cache(workspace.id());
             let node = self.node(inode).ok_or(Errno::ENOENT)?;
             self.attr(inode.0, &node)
         });
@@ -464,13 +573,19 @@ impl Filesystem for PortableFuse {
         }
     }
 
-    fn open(&self, _req: &Request, inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result = match self.node(inode) {
             Some(Node::WorkspacePath { workspace, path }) => self
-                .core
-                .open_workspace(&workspace)
-                .map_err(core_errno)
-                .and_then(|workspace| self.core.open_file(&workspace, path).map_err(core_errno))
+                .workspace_handle(&workspace)
+                .and_then(|workspace| {
+                    if flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
+                        self.core
+                            .open_file_read_only(&workspace, path)
+                            .map_err(core_errno)
+                    } else {
+                        self.core.open_file(&workspace, path).map_err(core_errno)
+                    }
+                })
                 .and_then(|handle| {
                     let fh = self.next_file_handle.fetch_add(1, Ordering::Relaxed);
                     self.open_files
@@ -519,15 +634,13 @@ impl Filesystem for PortableFuse {
                     .doctor_path(&relative)
                     .and_then(|path| fs::read(path).map_err(io_errno))
                     .map(|bytes| slice(bytes, offset, size)),
-                Some(Node::WorkspacePath { workspace, path }) => self
-                    .core
-                    .open_workspace(&workspace)
-                    .map_err(core_errno)
-                    .and_then(|handle| {
+                Some(Node::WorkspacePath { workspace, path }) => {
+                    self.workspace_handle(&workspace).and_then(|handle| {
                         self.core
                             .read(&handle, path, offset, size as usize)
                             .map_err(core_errno)
-                    }),
+                    })
+                }
                 _ => Err(Errno::EINVAL),
             }
         };
@@ -570,20 +683,23 @@ impl Filesystem for PortableFuse {
                     file.write_all_at(data, offset).map_err(io_errno)?;
                     Ok(data.len())
                 }),
-                Some(Node::WorkspacePath { workspace, path }) => self
-                    .core
-                    .open_workspace(&workspace)
-                    .map_err(core_errno)
-                    .and_then(|handle| {
+                Some(Node::WorkspacePath { workspace, path }) => {
+                    self.workspace_handle(&workspace).and_then(|handle| {
                         self.core
                             .write(&handle, path, offset, data)
                             .map_err(core_errno)
-                    }),
+                    })
+                }
                 _ => Err(Errno::EROFS),
             }
         };
         match result {
-            Ok(written) => reply.written(written as u32),
+            Ok(written) => {
+                if let Some(Node::WorkspacePath { workspace, path }) = self.node(inode) {
+                    self.invalidate_workspace_directory(&workspace, &path);
+                }
+                reply.written(written as u32)
+            }
             Err(error) => reply.error(error),
         }
     }
@@ -730,9 +846,7 @@ impl Filesystem for PortableFuse {
             Ok((inode, attr)) => {
                 let file_handle = match self.node(INodeNo(inode)) {
                     Some(Node::WorkspacePath { workspace, path }) => self
-                        .core
-                        .open_workspace(&workspace)
-                        .map_err(core_errno)
+                        .workspace_handle(&workspace)
                         .and_then(|workspace| {
                             self.core.open_file(&workspace, path).map_err(core_errno)
                         })
@@ -827,7 +941,7 @@ impl Filesystem for PortableFuse {
                 if workspace != destination_workspace {
                     return Err(Errno::EXDEV);
                 }
-                let handle = self.core.open_workspace(&workspace).map_err(core_errno)?;
+                let handle = self.workspace_handle(&workspace)?;
                 if no_replace
                     && self
                         .core
@@ -840,6 +954,7 @@ impl Filesystem for PortableFuse {
                 self.core
                     .rename(&handle, &source, &destination)
                     .map_err(core_errno)?;
+                self.invalidate_workspace_cache(&workspace);
                 self.remap_after_rename(
                     &Node::WorkspacePath {
                         workspace: workspace.clone(),
@@ -868,10 +983,11 @@ impl Filesystem for PortableFuse {
     ) {
         let result = self.node(parent).ok_or(Errno::ENOENT).and_then(|parent| {
             let (workspace, path) = workspace_destination(&parent, name)?;
-            let handle = self.core.open_workspace(&workspace).map_err(core_errno)?;
+            let handle = self.workspace_handle(&workspace)?;
             self.core
                 .symlink(&handle, &path, target.as_os_str().as_bytes())
                 .map_err(core_errno)?;
+            self.invalidate_workspace_cache(&workspace);
             let node = Node::WorkspacePath { workspace, path };
             let inode = self.inode(node.clone());
             self.attr(inode, &node)
@@ -901,6 +1017,7 @@ impl Filesystem for PortableFuse {
                 self.core
                     .hard_link(&source_handle, &source, &destination)
                     .map_err(core_errno)?;
+                self.invalidate_workspace_cache(&workspace);
                 let source_node = Node::WorkspacePath {
                     workspace: workspace.clone(),
                     path: source,
@@ -984,18 +1101,14 @@ impl PortableFuse {
         path: &str,
         children: &mut Vec<(u64, FileType, Vec<u8>)>,
     ) -> Result<(), Errno> {
-        let handle = self.core.open_workspace(workspace).map_err(core_errno)?;
-        for entry in self.core.read_dir(&handle, path).map_err(core_errno)? {
-            let child_path = join_virtual(path, &entry.name);
+        for (name, metadata) in self.workspace_directory(workspace, path)? {
+            let child_path = join_virtual(path, &name);
             let node = Node::WorkspacePath {
                 workspace: workspace.into(),
                 path: child_path,
             };
-            children.push((
-                self.inode(node),
-                file_type(entry.metadata.kind),
-                entry.name.into_bytes(),
-            ));
+            let inode = self.inode_with_metadata(node, Some(&metadata));
+            children.push((inode, file_type(metadata.kind), name.into_bytes()));
         }
         Ok(())
     }
@@ -1033,7 +1146,7 @@ impl PortableFuse {
             }
             parent_node => {
                 let (workspace, path) = workspace_destination(&parent_node, name)?;
-                let handle = self.core.open_workspace(&workspace).map_err(core_errno)?;
+                let handle = self.workspace_handle(&workspace)?;
                 if directory {
                     self.core.mkdir(&handle, &path, mode).map_err(core_errno)?;
                 } else {
@@ -1041,6 +1154,7 @@ impl PortableFuse {
                         .create_file(&handle, &path, mode)
                         .map_err(core_errno)?;
                 }
+                self.invalidate_workspace_cache(&workspace);
                 let node = Node::WorkspacePath { workspace, path };
                 let inode = self.inode(node.clone());
                 Ok((inode, self.attr(inode, &node)?))
@@ -1067,13 +1181,14 @@ impl PortableFuse {
                     }
                     parent_node => {
                         let (workspace, path) = workspace_destination(&parent_node, name)?;
-                        let handle = self.core.open_workspace(&workspace).map_err(core_errno)?;
+                        let handle = self.workspace_handle(&workspace)?;
                         let metadata = self
                             .core
                             .metadata(&handle, &path)
                             .map_err(core_errno)?
                             .ok_or(Errno::ENOENT)?;
                         self.core.unlink(&handle, &path).map_err(core_errno)?;
+                        self.invalidate_workspace_cache(&workspace);
                         self.rebind_after_unlink(&workspace, &path, metadata.inode, &handle)
                     }
                 });

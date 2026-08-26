@@ -143,45 +143,10 @@ jobs:
       - name: Materialize exact 300k-file fixture
         shell: bash
         run: |
-          python3 - <<'PY'
-          import os
-          import pathlib
-          import subprocess
-          import time
-
-          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "greppy-cow-perf-repo"
-          root.mkdir()
-          subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
-          subprocess.run(["git", "config", "user.email", "perf@greppy.invalid"], cwd=root, check=True)
-          subprocess.run(["git", "config", "user.name", "Greppy Performance Gate"], cwd=root, check=True)
-          process = subprocess.Popen(["git", "fast-import", "--quiet"], cwd=root, stdin=subprocess.PIPE)
-          stream = process.stdin
-          stream.write(b"blob\nmark :1\ndata 5\nbase\n")
-          stream.write(b"commit refs/heads/main\nmark :2\n")
-          stream.write(f"committer Greppy Gate <perf@greppy.invalid> {int(time.time())} +0000\n".encode())
-          stream.write(b"data 7\nfixture\n")
-          for index in range(299_997):
-              stream.write(f"M 100644 :1 files/{index // 1000:03}/{index:06}.txt\n".encode())
-          stream.write(b"\n")
-          stream.close()
-          if process.wait() != 0:
-              raise SystemExit("git fast-import failed")
-          subprocess.run(["git", "reset", "--hard", "-q", "main"], cwd=root, check=True)
-          projects = {
-              "rust/main.rs": "fn main() { assert_eq!(2 + 2, 4); }\n",
-              "python/test_sample.py": "assert sum([1, 2, 3]) == 6\n",
-              "node/test.js": "if ([1,2,3].reduce((a,b)=>a+b,0) !== 6) process.exit(1);\n",
-          }
-          for relative, content in projects.items():
-              path = root / relative
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(content)
-          subprocess.run(["git", "add", "rust", "python", "node"], cwd=root, check=True)
-          subprocess.run(["git", "commit", "-qm", "add toolchain fixtures"], cwd=root, check=True)
-          count = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).count(b"\0")
-          if count != 300_000:
-              raise SystemExit(f"fixture count is {count}, expected 300000")
-          PY
+          python3 tools/generate_portable_cow_fixture.py \
+            "$RUNNER_TEMP/greppy-cow-perf-repo" \
+            --files 300000 \
+            --modules 24
 
       - name: Mount provider and run hard gate
         id: performance

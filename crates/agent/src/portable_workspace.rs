@@ -218,7 +218,7 @@ impl AgentWorkspace {
             return Err(error);
         }
         trace_workspace_phase(run_id, "content-visible", started);
-        let (git_baseline, git_baseline_owns_chunks, baseline_tree) =
+        let (git_baseline, git_baseline_owns_chunks, baseline_tree, baseline_view_commit) =
             match prepare_git_control_baseline(
                 &repo_root,
                 &worktree,
@@ -261,8 +261,8 @@ impl AgentWorkspace {
         let initialized = initialize_private_git(
             &worktree,
             &private_git_dir,
-            &baseline_for_git,
             &baseline_tree,
+            &baseline_view_commit,
         );
         let (baseline_tree, baseline_view_commit, private_index) = match initialized {
             Ok(result) => result,
@@ -546,7 +546,7 @@ fn capture_tracked_repository(
     };
 
     trace_workspace_phase(run_id, "tracker-fence-start", started);
-    let fenced_generation = repository_tracker_fence(&repository, core, active.epoch)?;
+    repository_tracker_fence(&repository, core, active.epoch)?;
     trace_workspace_phase(run_id, "tracker-fence-complete", started);
     if let Some(mut cached) = core.cached_repository_snapshot(&repository, active.epoch)? {
         trace_workspace_phase(run_id, "cached-snapshot-found", started);
@@ -555,46 +555,40 @@ fn capture_tracked_repository(
         })?;
         let changes =
             core.repository_changes_since(&repository, active.epoch, cached_generation)?;
-        if changes.generation == fenced_generation
-            && changes
-                .paths
-                .iter()
-                .all(|path| path.starts_with(".git/greppy-tracker-fence-"))
-        {
-            cached.tracker_generation = Some(fenced_generation);
+        let changed_paths = changes
+            .paths
+            .iter()
+            .filter(|path| !is_repository_tracker_fence(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if changed_paths.is_empty() {
+            cached.tracker_generation = Some(changes.generation);
             return Ok((cached, false));
         }
-        if changes.generation == fenced_generation {
-            match capture_repository_incremental(
-                &repository,
-                core.chunks(),
-                &cached,
-                &changes.paths,
-                active.epoch,
-                fenced_generation,
-            ) {
-                Ok(Some(mut incremental)) => {
-                    let after_generation =
-                        repository_tracker_fence(&repository, core, active.epoch)?;
-                    let trailing = core.repository_changes_since(
-                        &repository,
-                        active.epoch,
-                        fenced_generation,
-                    )?;
-                    if trailing.generation == after_generation
-                        && trailing
-                            .paths
-                            .iter()
-                            .all(|path| path.starts_with(".git/greppy-tracker-fence-"))
-                    {
-                        incremental.tracker_generation = Some(after_generation);
-                        return Ok((incremental, true));
-                    }
-                    release_snapshot(core.chunks(), incremental);
+        match capture_repository_incremental(
+            &repository,
+            core.chunks(),
+            &cached,
+            &changed_paths,
+            active.epoch,
+            changes.generation,
+        ) {
+            Ok(Some(mut incremental)) => {
+                repository_tracker_fence(&repository, core, active.epoch)?;
+                let trailing =
+                    core.repository_changes_since(&repository, active.epoch, changes.generation)?;
+                if trailing
+                    .paths
+                    .iter()
+                    .all(|path| is_repository_tracker_fence(path))
+                {
+                    incremental.tracker_generation = Some(trailing.generation);
+                    return Ok((incremental, true));
                 }
-                Ok(None) | Err(greppy_workspace_core::Error::ConcurrentRepositoryMutation) => {}
-                Err(error) => return Err(error.into()),
+                release_snapshot(core.chunks(), incremental);
             }
+            Ok(None) | Err(greppy_workspace_core::Error::ConcurrentRepositoryMutation) => {}
+            Err(error) => return Err(error.into()),
         }
     }
 
@@ -620,19 +614,12 @@ fn capture_tracked_repository(
             trace_workspace_phase(run_id, phase, started)
         })?;
         trace_workspace_phase(run_id, "full-snapshot-captured", started);
+        repository_tracker_fence(&repository, core, active.epoch)?;
         let after = core
             .repository_tracker_status(&repository)?
             .ok_or_else(|| {
                 WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
             })?;
-        if after.state == RepositoryTrackerState::Active
-            && after.epoch == before.epoch
-            && after.generation == before.generation
-        {
-            baseline.tracker_epoch = Some(after.epoch);
-            baseline.tracker_generation = Some(after.generation);
-            return Ok((baseline, true));
-        }
         if after.state != RepositoryTrackerState::Active || after.epoch != before.epoch {
             trace_workspace_phase(run_id, "tracker-invalidated-after-full-snapshot", started);
             release_snapshot(core.chunks(), baseline);
@@ -645,6 +632,17 @@ fn capture_tracked_repository(
                 before.generation,
                 after.detail.as_deref().unwrap_or("none")
             )));
+        }
+        let changes =
+            core.repository_changes_since(&repository, before.epoch, before.generation)?;
+        if changes
+            .paths
+            .iter()
+            .all(|path| is_repository_tracker_fence(path))
+        {
+            baseline.tracker_epoch = Some(after.epoch);
+            baseline.tracker_generation = Some(changes.generation);
+            return Ok((baseline, true));
         }
         trace_workspace_phase(
             run_id,
@@ -659,6 +657,10 @@ fn capture_tracked_repository(
         }
     }
     unreachable!("two bounded snapshot attempts")
+}
+
+fn is_repository_tracker_fence(path: &str) -> bool {
+    path.starts_with(".git/greppy-tracker-fence-")
 }
 
 fn repository_tracker_fence(
@@ -1316,7 +1318,7 @@ fn prepare_git_control_baseline(
     data_root: &Path,
     baseline: &BaselineSnapshot,
     chunks: &ChunkStore,
-) -> Result<(BaselineSnapshot, bool, String), WorkspaceError> {
+) -> Result<(BaselineSnapshot, bool, String, String), WorkspaceError> {
     let object_format = git_ok(repo_root, &["rev-parse", "--show-object-format"])?;
     let common = git_ok(
         repo_root,
@@ -1332,7 +1334,7 @@ fn prepare_git_control_baseline(
         &objects,
     )?;
 
-    let (control, owns_chunks) = ensure_git_control_template(
+    let (control, owns_chunks, baseline_view_commit) = ensure_git_control_template(
         data_root,
         baseline,
         chunks,
@@ -1340,7 +1342,12 @@ fn prepare_git_control_baseline(
         &objects,
         &object_format,
     )?;
-    Ok((control, owns_chunks, layer.baseline_tree))
+    Ok((
+        control,
+        owns_chunks,
+        layer.baseline_tree,
+        baseline_view_commit,
+    ))
 }
 
 fn ensure_git_control_template(
@@ -1350,12 +1357,18 @@ fn ensure_git_control_template(
     layer: &SharedGitLayer,
     source_objects: &Path,
     object_format: &str,
-) -> Result<(BaselineSnapshot, bool), WorkspaceError> {
-    let templates = data_root.join("git-control-templates");
+) -> Result<(BaselineSnapshot, bool, String), WorkspaceError> {
+    let templates = data_root.join("git-control-templates").join("v2");
     fs::create_dir_all(&templates)?;
     let final_root = templates.join(&repository_baseline.baseline_hash);
     if final_root.exists() {
-        return Ok((load_git_control_template(&final_root)?, false));
+        let (snapshot, identity) = load_git_control_template(
+            &final_root,
+            repository_baseline,
+            &layer.baseline_tree,
+            object_format,
+        )?;
+        return Ok((snapshot, false, identity.baseline_view_commit));
     }
 
     let temporary = templates.join(format!(
@@ -1366,7 +1379,7 @@ fn ensure_git_control_template(
     ));
     let payload = temporary.join("payload");
     fs::create_dir(&temporary)?;
-    let build = (|| -> Result<BaselineSnapshot, WorkspaceError> {
+    let build = (|| -> Result<(BaselineSnapshot, GitControlTemplateIdentity), WorkspaceError> {
         init_bare(&payload, object_format)?;
         let alternates = payload.join("objects/info/alternates");
         fs::create_dir_all(
@@ -1388,11 +1401,34 @@ fn ensure_git_control_template(
             .file_name()
             .ok_or_else(|| io::Error::other("shared Git index has no file name"))?;
         fs::copy(&layer.shared_index, payload.join(shared_name))?;
-        capture_overlay_directory(final_root.join("namespace"), &payload, chunks)
-            .map_err(Into::into)
+        configure_git_control_template(&payload)?;
+        let baseline_view_commit = commit_tree_in_git_dir(
+            &payload,
+            &layer.baseline_tree,
+            &repository_baseline.base_commit,
+            "greppy private baseline view",
+        )?;
+        fs::create_dir_all(payload.join("refs/heads"))?;
+        fs::write(
+            payload.join("refs/heads/greppy-baseline"),
+            format!("{baseline_view_commit}\n"),
+        )?;
+        fs::write(payload.join("HEAD"), b"ref: refs/heads/greppy-baseline\n")?;
+        let snapshot = capture_overlay_directory(final_root.join("namespace"), &payload, chunks)?;
+        Ok((
+            snapshot,
+            GitControlTemplateIdentity {
+                schema: 2,
+                baseline_hash: repository_baseline.baseline_hash.clone(),
+                base_commit: repository_baseline.base_commit.clone(),
+                baseline_tree: layer.baseline_tree.clone(),
+                baseline_view_commit,
+                object_format: object_format.into(),
+            },
+        ))
     })();
-    let snapshot = match build {
-        Ok(snapshot) => snapshot,
+    let (snapshot, identity) = match build {
+        Ok(result) => result,
         Err(error) => {
             let _ = fs::remove_dir_all(&temporary);
             return Err(error);
@@ -1403,15 +1439,25 @@ fn ensure_git_control_template(
         serde_json::to_vec(&snapshot).map_err(|error| io::Error::other(error.to_string()))?,
     )?;
     fs::write(
+        temporary.join("identity.json"),
+        serde_json::to_vec(&identity).map_err(|error| io::Error::other(error.to_string()))?,
+    )?;
+    fs::write(
         temporary.join("COMPLETE"),
-        b"greppy.git-control-template.v1\n",
+        b"greppy.git-control-template.v2\n",
     )?;
     match fs::rename(&temporary, &final_root) {
-        Ok(()) => Ok((snapshot, true)),
+        Ok(()) => Ok((snapshot, true, identity.baseline_view_commit)),
         Err(_error) if final_root.exists() => {
             let _ = fs::remove_dir_all(&temporary);
             release_snapshot(chunks, snapshot);
-            Ok((load_git_control_template(&final_root)?, false))
+            let (snapshot, identity) = load_git_control_template(
+                &final_root,
+                repository_baseline,
+                &layer.baseline_tree,
+                object_format,
+            )?;
+            Ok((snapshot, false, identity.baseline_view_commit))
         }
         Err(error) => {
             let _ = fs::remove_dir_all(&temporary);
@@ -1421,8 +1467,15 @@ fn ensure_git_control_template(
     }
 }
 
-fn load_git_control_template(root: &Path) -> Result<BaselineSnapshot, WorkspaceError> {
-    if !root.join("COMPLETE").is_file() || !root.join("payload").is_dir() {
+fn load_git_control_template(
+    root: &Path,
+    repository_baseline: &BaselineSnapshot,
+    baseline_tree: &str,
+    object_format: &str,
+) -> Result<(BaselineSnapshot, GitControlTemplateIdentity), WorkspaceError> {
+    if fs::read(root.join("COMPLETE")).ok().as_deref() != Some(b"greppy.git-control-template.v2\n")
+        || !root.join("payload").is_dir()
+    {
         return Err(WorkspaceError::Tampered {
             path: root.into(),
             detail: "Git control template is incomplete".into(),
@@ -1433,15 +1486,28 @@ fn load_git_control_template(root: &Path) -> Result<BaselineSnapshot, WorkspaceE
             path: root.join("baseline.json"),
             detail: error.to_string(),
         })?;
+    let identity: GitControlTemplateIdentity =
+        serde_json::from_slice(&fs::read(root.join("identity.json"))?).map_err(|error| {
+            WorkspaceError::Tampered {
+                path: root.join("identity.json"),
+                detail: error.to_string(),
+            }
+        })?;
     if baseline.repository != root.join("namespace")
         || !baseline.base_commit.starts_with("virtual-empty:")
+        || identity.schema != 2
+        || identity.baseline_hash != repository_baseline.baseline_hash
+        || identity.base_commit != repository_baseline.base_commit
+        || identity.baseline_tree != baseline_tree
+        || identity.object_format != object_format
+        || !valid_object_id(&identity.baseline_view_commit, object_format)
     {
         return Err(WorkspaceError::Tampered {
             path: root.into(),
             detail: "Git control template identity is invalid".into(),
         });
     }
-    Ok(baseline)
+    Ok((baseline, identity))
 }
 
 fn git_workspace_id(run_id: &str) -> String {
@@ -1452,8 +1518,8 @@ fn git_workspace_id(run_id: &str) -> String {
 fn initialize_private_git(
     worktree: &Path,
     private_git_dir: &Path,
-    baseline: &BaselineSnapshot,
     baseline_tree: &str,
+    expected_baseline_view_commit: &str,
 ) -> Result<(String, String, PathBuf), WorkspaceError> {
     if !private_git_dir.is_dir() {
         return Err(WorkspaceError::Tampered {
@@ -1469,54 +1535,37 @@ fn initialize_private_git(
         });
     }
 
-    git_private(
-        private_git_dir,
-        worktree,
-        None,
-        &["config", "core.bare", "false"],
-    )?;
-    git_private(
-        private_git_dir,
-        worktree,
-        None,
-        &["config", "core.worktree", path_text(worktree)?],
-    )?;
-    git_private(
-        private_git_dir,
-        worktree,
-        None,
-        &["config", "core.autocrlf", "false"],
-    )?;
-    git_private(
-        private_git_dir,
-        worktree,
-        None,
-        &["config", "core.symlinks", "true"],
-    )?;
+    let baseline_view_commit =
+        fs::read_to_string(private_git_dir.join("refs/heads/greppy-baseline"))?;
+    let baseline_view_commit = baseline_view_commit.trim();
+    let head = fs::read(private_git_dir.join("HEAD"))?;
+    if baseline_view_commit != expected_baseline_view_commit
+        || head != b"ref: refs/heads/greppy-baseline\n"
+    {
+        return Err(WorkspaceError::Tampered {
+            path: private_git_dir.into(),
+            detail: "private Git namespace does not match its immutable template".into(),
+        });
+    }
     fs::write(
         worktree.join(".git"),
         format!("gitdir: {}\n", private_git_dir.display()),
     )?;
+    Ok((
+        baseline_tree.into(),
+        baseline_view_commit.into(),
+        private_index,
+    ))
+}
 
-    let baseline_view_commit = commit_tree(
-        worktree,
-        baseline_tree,
-        &baseline.base_commit,
-        "greppy private baseline view",
-    )?;
-    git_ok(
-        worktree,
-        &[
-            "update-ref",
-            "refs/heads/greppy-baseline",
-            &baseline_view_commit,
-        ],
-    )?;
-    git_ok(
-        worktree,
-        &["symbolic-ref", "HEAD", "refs/heads/greppy-baseline"],
-    )?;
-    Ok((baseline_tree.into(), baseline_view_commit, private_index))
+#[derive(Debug, Serialize, Deserialize)]
+struct GitControlTemplateIdentity {
+    schema: u32,
+    baseline_hash: String,
+    base_commit: String,
+    baseline_tree: String,
+    baseline_view_commit: String,
+    object_format: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1726,6 +1775,59 @@ fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
         .output()?;
     output_text("git init --bare private workspace repository", output)?;
     Ok(())
+}
+
+fn configure_git_control_template(git_dir: &Path) -> Result<(), WorkspaceError> {
+    for (key, value) in [
+        ("core.bare", "false"),
+        ("core.autocrlf", "false"),
+        ("core.symlinks", "true"),
+    ] {
+        let output = Command::new("git")
+            .args(["--git-dir", path_text(git_dir)?, "config", key, value])
+            .output()?;
+        output_text(&format!("git config {key}"), output)?;
+    }
+    Ok(())
+}
+
+fn commit_tree_in_git_dir(
+    git_dir: &Path,
+    tree: &str,
+    parent: &str,
+    message: &str,
+) -> Result<String, WorkspaceError> {
+    let output = Command::new("git")
+        .args([
+            "--git-dir",
+            path_text(git_dir)?,
+            "commit-tree",
+            tree,
+            "-p",
+            parent,
+            "-m",
+            message,
+        ])
+        .env("GIT_AUTHOR_NAME", "greppy agent")
+        .env("GIT_AUTHOR_EMAIL", "agent@greppy.local")
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_NAME", "greppy agent")
+        .env("GIT_COMMITTER_EMAIL", "agent@greppy.local")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+        .output()?;
+    output_text("git commit-tree private baseline template", output)
+}
+
+fn valid_object_id(value: &str, object_format: &str) -> bool {
+    let expected = match object_format {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return false,
+    };
+    value.len() == expected
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn now_unix_ns() -> u128 {
@@ -1997,6 +2099,15 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn tracker_fences_are_internal_but_other_git_paths_are_mutations() {
+        assert!(is_repository_tracker_fence(
+            ".git/greppy-tracker-fence-123-456"
+        ));
+        assert!(!is_repository_tracker_fence(".git/index"));
+        assert!(!is_repository_tracker_fence("src/lib.rs"));
+    }
+
     fn git(path: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .env_remove("GIT_DIR")
@@ -2104,6 +2215,7 @@ mod tests {
             let git_dir = repo_for_fence.join(".git");
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut observed = None::<String>;
+            let mut completed = 0;
             loop {
                 let current = fs::read_dir(&git_dir)
                     .unwrap()
@@ -2131,7 +2243,11 @@ mod tests {
                             3,
                         )
                         .unwrap();
-                    break;
+                    completed += 1;
+                    if completed == 2 {
+                        break;
+                    }
+                    observed = None;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -2152,7 +2268,7 @@ mod tests {
         let data_for_git = data.clone();
         let mount_for_git = mount.clone();
         let git_mount_emulator = std::thread::spawn(move || {
-            let templates = data_for_git.join("git-control-templates");
+            let templates = data_for_git.join("git-control-templates/v2");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(entries) = fs::read_dir(&templates) {

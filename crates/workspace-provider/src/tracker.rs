@@ -5,10 +5,14 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
     Arc,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const EVENT_QUEUE_CAPACITY: usize = 4_096;
+type TrackerEvent = notify::Result<notify::Event>;
 
 pub(crate) fn spawn(data_root: PathBuf) -> io::Result<thread::JoinHandle<()>> {
     let core = Arc::new(WorkspaceCore::open(data_root.join("core")).map_err(io::Error::other)?);
@@ -90,16 +94,67 @@ fn build_watcher(
     let git_dir = git_dir.to_path_buf();
     let armed = Arc::new(AtomicBool::new(false));
     let callback_armed = armed.clone();
-    let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        match event {
-            Ok(_) if !callback_armed.load(Ordering::Acquire) => {
-                // Successful events emitted while watch roots are being installed
-                // are covered by the first full double-capture after activation.
-            }
-            event => handle_armed_event(&core, &repository, &git_dir, event),
-        }
+    let (events, pending_events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let worker_overflowed = overflowed.clone();
+    let worker_core = core.clone();
+    let worker_repository = repository.clone();
+    let worker_git_dir = git_dir.clone();
+    thread::spawn(move || {
+        drain_watcher_events(
+            &worker_core,
+            &worker_repository,
+            &worker_git_dir,
+            pending_events,
+            &worker_overflowed,
+        )
+    });
+    let watcher = notify::recommended_watcher(move |event: TrackerEvent| {
+        enqueue_watcher_event(&events, &overflowed, &callback_armed, event)
     })?;
     Ok((watcher, armed))
+}
+
+fn enqueue_watcher_event(
+    events: &SyncSender<TrackerEvent>,
+    overflowed: &AtomicBool,
+    armed: &AtomicBool,
+    event: TrackerEvent,
+) {
+    if event.as_ref().is_ok_and(|event| event.kind.is_access()) {
+        return;
+    }
+    if event.is_ok() && !armed.load(Ordering::Acquire) {
+        // Successful events emitted while watch roots are being installed are
+        // covered by the first full double-capture after activation.
+        return;
+    }
+    if matches!(
+        events.try_send(event),
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+    ) {
+        overflowed.store(true, Ordering::Release);
+    }
+}
+
+fn drain_watcher_events(
+    core: &WorkspaceCore,
+    repository: &Path,
+    git_dir: &Path,
+    events: Receiver<TrackerEvent>,
+    overflowed: &AtomicBool,
+) {
+    loop {
+        if overflowed.swap(false, Ordering::AcqRel) {
+            mark_tracker_gap(core, repository, "watcher event queue overflowed");
+            return;
+        }
+        match events.recv_timeout(Duration::from_millis(50)) {
+            Ok(event) => handle_armed_event(core, repository, git_dir, event),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 fn handle_armed_event(
@@ -134,7 +189,15 @@ fn handle_armed_event(
                     }
                 }
                 Ok(_) => {
-                    mark_tracker_gap(core, repository, "watcher emitted an event without paths");
+                    mark_tracker_gap(
+                        core,
+                        repository,
+                        &format!(
+                            "watcher emitted an event without paths: kind={:?}, need_rescan={}",
+                            event.kind,
+                            event.need_rescan()
+                        ),
+                    );
                 }
                 Err(detail) => {
                     mark_tracker_gap(core, repository, &detail);
@@ -353,5 +416,36 @@ mod tests {
             after_mutation.detail.as_deref(),
             Some("watcher reported the repository root without a child path")
         );
+    }
+
+    #[test]
+    fn watcher_callback_filters_access_and_never_blocks_on_backpressure() {
+        use notify::event::{AccessKind, AccessMode, ModifyKind};
+        use notify::{Event, EventKind};
+
+        let (events, _pending) = mpsc::sync_channel(1);
+        let overflowed = AtomicBool::new(false);
+        let armed = AtomicBool::new(true);
+        enqueue_watcher_event(
+            &events,
+            &overflowed,
+            &armed,
+            Ok(Event::new(EventKind::Access(AccessKind::Close(
+                AccessMode::Read,
+            )))),
+        );
+        enqueue_watcher_event(
+            &events,
+            &overflowed,
+            &armed,
+            Ok(Event::new(EventKind::Modify(ModifyKind::Any))),
+        );
+        enqueue_watcher_event(
+            &events,
+            &overflowed,
+            &armed,
+            Ok(Event::new(EventKind::Modify(ModifyKind::Any))),
+        );
+        assert!(overflowed.load(Ordering::Acquire));
     }
 }

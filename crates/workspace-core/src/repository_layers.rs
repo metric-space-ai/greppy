@@ -340,25 +340,57 @@ pub(crate) fn lookup(
     )
 }
 
-pub(crate) fn list_names(
+pub(crate) fn list_entries(
     connection: &Connection,
     workspace_id: &str,
     parent: &str,
-) -> Result<Vec<String>> {
+) -> Result<BTreeMap<String, LayerEntry>> {
     let (base_id, dirty_id) = workspace_layers(connection, workspace_id)?;
-    let mut names = std::collections::BTreeSet::new();
+    let mut entries = BTreeMap::new();
     for (table, column, id) in [
         ("cow_repository_base_entries", "base_id", base_id.as_str()),
         ("cow_dirty_entries", "layer_id", dirty_id.as_str()),
     ] {
-        let sql = format!("SELECT name FROM {table} WHERE {column} = ?1 AND parent = ?2");
+        let sql = format!(
+            "SELECT name, kind, mode, size, chunks_json{} FROM {table}
+             WHERE {column} = ?1 AND parent = ?2 ORDER BY name",
+            if table == "cow_dirty_entries" {
+                ", modified_unix_ns"
+            } else {
+                ", 0"
+            }
+        );
         let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(params![id, parent], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map(params![id, parent], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
         for row in rows {
-            names.insert(row?);
+            let (name, kind, mode, size, chunks, modified_unix_ns) = row?;
+            let kind = parse_kind(&kind)?;
+            if kind == LayerKind::Tombstone {
+                entries.remove(&name);
+            } else {
+                entries.insert(
+                    name,
+                    LayerEntry {
+                        kind,
+                        mode: mode as u32,
+                        size: size as u64,
+                        modified_unix_ns,
+                        chunks: serde_json::from_slice(&chunks)?,
+                    },
+                );
+            }
         }
     }
-    Ok(names.into_iter().collect())
+    Ok(entries)
 }
 
 pub(crate) fn has_descendant(

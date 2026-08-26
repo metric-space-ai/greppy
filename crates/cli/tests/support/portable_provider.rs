@@ -162,7 +162,7 @@ fn publish_mount_manifest(mount: &Path, manifest: &ProviderManifest) {
 }
 
 fn git_control_payload(data: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(data.join("git-control-templates"))
+    std::fs::read_dir(data.join("git-control-templates").join("v2"))
         .ok()?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())

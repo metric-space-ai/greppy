@@ -70,6 +70,16 @@ struct ToolchainResult {
     overhead_percent: f64,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct FixtureManifest {
+    schema: String,
+    tracked_files: usize,
+    modules_per_toolchain: usize,
+    rust_sources: usize,
+    python_sources: usize,
+    node_sources: usize,
+}
+
 fn main() {
     let args = Args::parse();
     if cfg!(debug_assertions) {
@@ -109,6 +119,8 @@ fn main() {
             args.expected_files
         ));
     }
+    let fixture_profile =
+        load_fixture_manifest(&args.repository, args.expected_files, tracked_files);
     let probe_expected = fs::read(args.repository.join(&args.probe_path))
         .unwrap_or_else(|error| fail(&format!("cannot read native probe path: {error}")));
     let core = WorkspaceCore::open(args.data_root.join("core"))
@@ -309,13 +321,19 @@ fn main() {
         "toolchains-started",
         serde_json::json!({"cases": args.toolchain_cases.len()}),
     );
-    let toolchains = args
+    let toolchain_cases = args
         .toolchain_cases
         .iter()
         .map(|raw| {
             serde_json::from_str::<ToolchainCase>(raw)
                 .unwrap_or_else(|error| fail(&format!("invalid --toolchain-case JSON: {error}")))
         })
+        .collect::<Vec<_>>();
+    if args.enforce {
+        validate_toolchain_contract(&toolchain_cases);
+    }
+    let toolchains = toolchain_cases
+        .into_iter()
         .map(|case| measure_toolchain(&args.repository, case))
         .collect::<Vec<_>>();
     write_checkpoint(
@@ -357,6 +375,7 @@ fn main() {
         "fixture_repository": args.repository,
         "fixture_commit": fixture_commit,
         "fixture_tracked_files": tracked_files,
+        "fixture_profile": fixture_profile,
         "iterations": args.iterations,
         "cold_prime": {
             "measurement": "first AgentWorkspace::create plus mounted read and cleanup on an empty provider Store",
@@ -436,6 +455,68 @@ fn main() {
         if toolchains.iter().any(|case| case.overhead_percent > 20.0) {
             fail("toolchain overhead exceeds 20% gate");
         }
+    }
+}
+
+fn load_fixture_manifest(
+    repository: &Path,
+    expected_files: usize,
+    tracked_files: usize,
+) -> FixtureManifest {
+    let path = repository.join(".greppy-portable-cow-fixture.json");
+    let manifest = serde_json::from_slice::<FixtureManifest>(
+        &fs::read(&path)
+            .unwrap_or_else(|error| fail(&format!("cannot read fixture manifest: {error}"))),
+    )
+    .unwrap_or_else(|error| fail(&format!("invalid fixture manifest: {error}")));
+    if manifest.schema != "greppy.portable-cow-fixture.v2"
+        || manifest.tracked_files != expected_files
+        || manifest.tracked_files != tracked_files
+        || manifest.modules_per_toolchain < 16
+        || manifest.rust_sources != manifest.modules_per_toolchain + 1
+        || manifest.python_sources != manifest.modules_per_toolchain + 1
+        || manifest.node_sources != manifest.modules_per_toolchain + 1
+    {
+        fail("fixture manifest does not satisfy the representative v2 contract");
+    }
+    for (directory, expected) in [
+        ("rust", manifest.rust_sources),
+        ("python", manifest.python_sources),
+        ("node", manifest.node_sources),
+    ] {
+        let actual = tracked_file_count_under(repository, directory);
+        if actual != expected {
+            fail(&format!(
+                "fixture declares {expected} {directory} sources but Git tracks {actual}"
+            ));
+        }
+    }
+    manifest
+}
+
+fn validate_toolchain_contract(cases: &[ToolchainCase]) {
+    for required in ["rust", "python", "node"] {
+        if cases.iter().filter(|case| case.name == required).count() != 1 {
+            fail(&format!(
+                "release evidence requires exactly one {required} toolchain case"
+            ));
+        }
+    }
+    let rust = cases.iter().find(|case| case.name == "rust").unwrap();
+    if rust.cwd != Path::new("rust")
+        || rust.argv.first().map(String::as_str) != Some("rustc")
+        || rust.argv.get(1).map(String::as_str) != Some("main.rs")
+        || !rust.argv.iter().any(|argument| argument == "-o")
+    {
+        fail("Rust toolchain case does not compile the representative fixture");
+    }
+    let python = cases.iter().find(|case| case.name == "python").unwrap();
+    if python.cwd != Path::new("python") || python.argv != ["python3", "-B", "test_sample.py"] {
+        fail("Python toolchain case does not run the representative fixture");
+    }
+    let node = cases.iter().find(|case| case.name == "node").unwrap();
+    if node.cwd != Path::new("node") || node.argv != ["node", "test.js"] {
+        fail("Node toolchain case does not run the representative fixture");
     }
 }
 
@@ -559,6 +640,11 @@ fn timed_argv(cwd: &Path, argv: &[String]) -> Duration {
 
 fn tracked_file_count(repository: &Path) -> usize {
     let bytes = git_bytes(repository, &["ls-files", "-z"]);
+    bytes.iter().filter(|byte| **byte == 0).count()
+}
+
+fn tracked_file_count_under(repository: &Path, path: &str) -> usize {
+    let bytes = git_bytes(repository, &["ls-files", "-z", "--", path]);
     bytes.iter().filter(|byte| **byte == 0).count()
 }
 

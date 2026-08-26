@@ -3,9 +3,9 @@ use crate::repository_tracker;
 use crate::{BaselineSnapshot, ChunkGcReport, ChunkId, ChunkStore, Error, Result, CHUNK_SIZE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
@@ -79,7 +79,20 @@ pub struct WorkspacePairLease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileHandle {
     workspace_id: String,
-    inode: u64,
+    backing: WorkspaceFileBacking,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceFileBacking {
+    Private {
+        inode: u64,
+    },
+    Immutable {
+        visible_path: String,
+        origin_path: String,
+        metadata: NodeMetadata,
+        chunks: Vec<ChunkId>,
+    },
 }
 
 impl std::fmt::Debug for WorkspacePairLease {
@@ -118,6 +131,17 @@ pub struct WorkspaceCore {
     chunks: ChunkStore,
     metadata: ConnectionPool,
     metadata_writer: Mutex<()>,
+    promoted_origins: Mutex<HashMap<(String, String), u64>>,
+    _session_lease: File,
+}
+
+impl Drop for WorkspaceCore {
+    fn drop(&mut self) {
+        // Do not rely on field-drop ordering for the process-lifetime lease.
+        // In particular, recovery must be able to acquire exclusivity as soon
+        // as the last core instance has finished using metadata and chunks.
+        unlock_core_lease(&self._session_lease);
+    }
 }
 
 struct ConnectionPool {
@@ -182,6 +206,19 @@ impl WorkspaceCore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        let session_lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("workspace-core.lock"))?;
+        let recovering = lock_core_lease(&session_lease, true, true)?;
+        if recovering {
+            write_core_health(&session_lease, b"recovering-v1\n")?;
+        } else {
+            lock_core_lease(&session_lease, false, false)?;
+            require_healthy_core_marker(&session_lease)?;
+        }
         let chunks = ChunkStore::open(&root)?;
         let metadata_path = root.join("workspace.sqlite3");
         let connection = open_metadata_connection(&metadata_path)?;
@@ -224,6 +261,13 @@ impl WorkspaceCore {
              );
              CREATE INDEX IF NOT EXISTS cow_entries_inode
                  ON cow_entries(workspace_id, inode_id);
+             CREATE TABLE IF NOT EXISTS cow_inode_origins (
+                 workspace_id TEXT NOT NULL REFERENCES cow_workspaces(id) ON DELETE CASCADE,
+                 origin_path TEXT NOT NULL,
+                 inode_id INTEGER NOT NULL REFERENCES cow_inodes(id) ON DELETE CASCADE,
+                 PRIMARY KEY(workspace_id, origin_path),
+                 UNIQUE(workspace_id, inode_id)
+             );
              CREATE TABLE IF NOT EXISTS cow_redirects (
                  workspace_id TEXT NOT NULL REFERENCES cow_workspaces(id) ON DELETE CASCADE,
                  destination TEXT NOT NULL,
@@ -255,8 +299,14 @@ impl WorkspaceCore {
             chunks,
             metadata: ConnectionPool::new(metadata_path, connection),
             metadata_writer: Mutex::new(()),
+            promoted_origins: Mutex::new(HashMap::new()),
+            _session_lease: session_lease,
         };
-        core.recover()?;
+        if recovering {
+            core.recover()?;
+            write_core_health(&core._session_lease, b"healthy-v1\n")?;
+            downgrade_core_lease(&core._session_lease)?;
+        }
         Ok(core)
     }
 
@@ -730,6 +780,42 @@ impl WorkspaceCore {
             }));
         }
         let connection = self.lock_metadata()?;
+        let pristine_overlay: bool = connection.query_row(
+            "SELECT NOT EXISTS(
+                 SELECT 1 FROM cow_entries WHERE workspace_id = ?1 LIMIT 1
+             ) AND NOT EXISTS(
+                 SELECT 1 FROM cow_redirects WHERE workspace_id = ?1 LIMIT 1
+             )",
+            params![workspace.id],
+            |row| row.get(0),
+        )?;
+        if pristine_overlay {
+            if let Some(entry) = repository_layers::lookup(&connection, &workspace.id, &path)? {
+                return Ok(Some(NodeMetadata {
+                    kind: layer_node_kind(entry.kind)?,
+                    mode: entry.mode,
+                    size: entry.size,
+                    inode: stable_inode(&workspace.id, &path),
+                    nlink: 1,
+                    accessed_unix_ns: entry.modified_unix_ns,
+                    modified_unix_ns: entry.modified_unix_ns,
+                    changed_unix_ns: entry.modified_unix_ns,
+                }));
+            }
+            if repository_layers::has_descendant(&connection, &workspace.id, &path)? {
+                return Ok(Some(NodeMetadata {
+                    kind: NodeKind::Directory,
+                    mode: 0o040755,
+                    size: 0,
+                    inode: stable_inode(&workspace.id, &path),
+                    nlink: 2,
+                    accessed_unix_ns: 0,
+                    modified_unix_ns: 0,
+                    changed_unix_ns: 0,
+                }));
+            }
+            return Ok(None);
+        }
         if let Some(entry) = overlay_entry(&connection, &workspace.id, &path)? {
             return Ok(Some(entry));
         }
@@ -803,7 +889,70 @@ impl WorkspaceCore {
         }
         Ok(WorkspaceFileHandle {
             workspace_id: workspace.id.clone(),
-            inode: inode.id as u64,
+            backing: WorkspaceFileBacking::Private {
+                inode: inode.id as u64,
+            },
+        })
+    }
+
+    /// Open an immutable Base file without copying its inode into the private
+    /// namespace. If another handle later promotes the same Base object, reads
+    /// resolve through the persistent origin binding and observe that private
+    /// inode instead.
+    pub fn open_file_read_only(
+        &self,
+        workspace: &WorkspaceHandle,
+        path: impl AsRef<Path>,
+    ) -> Result<WorkspaceFileHandle> {
+        let path = normalize_path(path.as_ref(), false)?;
+        let connection = self.lock_metadata()?;
+        if let Some(inode) = load_inode_for_path(&connection, &workspace.id, &path)? {
+            if inode.kind != NodeKind::File {
+                return Err(Error::IsDirectory(path));
+            }
+            return Ok(WorkspaceFileHandle {
+                workspace_id: workspace.id.clone(),
+                backing: WorkspaceFileBacking::Private {
+                    inode: inode.id as u64,
+                },
+            });
+        }
+        if ancestor_tombstoned(&connection, &workspace.id, &path)? {
+            return Err(Error::NotFound(path));
+        }
+        let origin_path = translate_redirect(&connection, &workspace.id, &path)?;
+        let entry = repository_layers::lookup(&connection, &workspace.id, &origin_path)?
+            .ok_or_else(|| Error::NotFound(path.clone()))?;
+        let kind = layer_node_kind(entry.kind)?;
+        if kind != NodeKind::File {
+            return Err(Error::IsDirectory(path));
+        }
+        if let Some(inode) = load_inode_for_origin(&connection, &workspace.id, &origin_path)? {
+            return Ok(WorkspaceFileHandle {
+                workspace_id: workspace.id.clone(),
+                backing: WorkspaceFileBacking::Private {
+                    inode: inode.id as u64,
+                },
+            });
+        }
+        let metadata = NodeMetadata {
+            kind,
+            mode: entry.mode,
+            size: entry.size,
+            inode: stable_inode(&workspace.id, &path),
+            nlink: 1,
+            accessed_unix_ns: entry.modified_unix_ns,
+            modified_unix_ns: entry.modified_unix_ns,
+            changed_unix_ns: entry.modified_unix_ns,
+        };
+        Ok(WorkspaceFileHandle {
+            workspace_id: workspace.id.clone(),
+            backing: WorkspaceFileBacking::Immutable {
+                visible_path: path,
+                origin_path,
+                metadata,
+                chunks: entry.chunks,
+            },
         })
     }
 
@@ -815,9 +964,12 @@ impl WorkspaceCore {
     ) -> Result<WorkspaceFileHandle> {
         let handle = WorkspaceFileHandle {
             workspace_id: workspace.id.clone(),
-            inode,
+            backing: WorkspaceFileBacking::Private { inode },
         };
-        if self.load_open_inode(&handle)?.kind != NodeKind::File {
+        if self
+            .load_open_inode(&handle)?
+            .is_none_or(|inode| inode.kind != NodeKind::File)
+        {
             return Err(Error::IsDirectory(format!("inode {inode}")));
         }
         Ok(handle)
@@ -829,8 +981,16 @@ impl WorkspaceCore {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let inode = self.load_open_inode(handle)?;
-        read_chunks(&self.chunks, &inode.chunks, inode.size, offset, length)
+        if let Some(inode) = self.load_open_inode(handle)? {
+            return read_chunks(&self.chunks, &inode.chunks, inode.size, offset, length);
+        }
+        let WorkspaceFileBacking::Immutable {
+            metadata, chunks, ..
+        } = &handle.backing
+        else {
+            unreachable!("private handles always resolve an inode")
+        };
+        read_chunks(&self.chunks, chunks, metadata.size, offset, length)
     }
 
     pub fn write_open_file(
@@ -839,21 +999,25 @@ impl WorkspaceCore {
         offset: u64,
         bytes: &[u8],
     ) -> Result<usize> {
-        let inode = self.load_open_inode(handle)?;
+        let inode = self.promote_open_file(handle)?;
         self.write_inode(&handle.workspace_id, inode, offset, bytes)
     }
 
     pub fn truncate_open_file(&self, handle: &WorkspaceFileHandle, size: u64) -> Result<()> {
-        let inode = self.load_open_inode(handle)?;
+        let inode = self.promote_open_file(handle)?;
         self.truncate_inode(&handle.workspace_id, inode, size)
     }
 
     pub fn metadata_open_file(&self, handle: &WorkspaceFileHandle) -> Result<NodeMetadata> {
-        let inode = i64::try_from(handle.inode)
-            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
-        let connection = self.lock_metadata()?;
-        load_metadata_for_inode(&connection, &handle.workspace_id, inode)?
-            .ok_or_else(|| Error::NotFound(format!("open inode {}", handle.inode)))
+        if let Some(inode) = self.load_open_inode(handle)? {
+            let connection = self.lock_metadata()?;
+            return load_metadata_for_inode(&connection, &handle.workspace_id, inode.id)?
+                .ok_or_else(|| Error::NotFound(format!("open inode {}", inode.id)));
+        }
+        let WorkspaceFileBacking::Immutable { metadata, .. } = &handle.backing else {
+            unreachable!("private handles always resolve an inode")
+        };
+        Ok(metadata.clone())
     }
 
     pub fn set_metadata_open_file(
@@ -863,8 +1027,7 @@ impl WorkspaceCore {
         accessed_unix_ns: Option<i64>,
         modified_unix_ns: Option<i64>,
     ) -> Result<()> {
-        let inode = i64::try_from(handle.inode)
-            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
+        let inode = self.promote_open_file(handle)?.id;
         self.set_inode_metadata(
             &handle.workspace_id,
             inode,
@@ -1321,9 +1484,28 @@ impl WorkspaceCore {
         }
         let connection = self.lock_metadata()?;
         let translated = translate_redirect(&connection, &workspace.id, &path)?;
-        let mut names = BTreeSet::new();
-        for name in repository_layers::list_names(&connection, &workspace.id, &translated)? {
-            names.insert(name);
+        let mut entries = BTreeMap::new();
+        for (name, entry) in
+            repository_layers::list_entries(&connection, &workspace.id, &translated)?
+        {
+            let child = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            entries.insert(
+                name,
+                NodeMetadata {
+                    kind: layer_node_kind(entry.kind)?,
+                    mode: entry.mode,
+                    size: entry.size,
+                    inode: stable_inode(&workspace.id, &child),
+                    nlink: 1,
+                    accessed_unix_ns: entry.modified_unix_ns,
+                    modified_unix_ns: entry.modified_unix_ns,
+                    changed_unix_ns: entry.modified_unix_ns,
+                },
+            );
         }
         let prefix = if path.is_empty() {
             String::new()
@@ -1331,6 +1513,7 @@ impl WorkspaceCore {
             format!("{path}/")
         };
         let like = escape_like(&prefix) + "%";
+        let mut touched_names = BTreeSet::new();
         let overlay_paths: Vec<String> = {
             let mut statement = connection.prepare(
                 "SELECT path FROM cow_entries
@@ -1339,27 +1522,42 @@ impl WorkspaceCore {
             let rows = statement.query_map(params![workspace.id, like], |row| row.get(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        let redirect_destinations: Vec<String> = {
+            let mut statement = connection.prepare(
+                "SELECT destination FROM cow_redirects
+                 WHERE workspace_id = ?1 AND destination LIKE ?2 ESCAPE '\\'",
+            )?;
+            let rows = statement.query_map(params![workspace.id, like], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
         drop(connection);
-        for candidate in overlay_paths {
+        for candidate in overlay_paths.into_iter().chain(redirect_destinations) {
             let suffix = &candidate[prefix.len()..];
             if let Some(name) = suffix.split('/').next() {
                 if !name.is_empty() {
-                    names.insert(name.to_string());
+                    touched_names.insert(name.to_string());
                 }
             }
         }
-        let mut entries = Vec::new();
-        for name in names {
+        for name in touched_names {
             let child = if path.is_empty() {
                 name.clone()
             } else {
                 format!("{path}/{name}")
             };
-            if let Some(metadata) = self.metadata(workspace, &child)? {
-                entries.push(DirectoryEntry { name, metadata });
+            match self.metadata(workspace, &child)? {
+                Some(metadata) => {
+                    entries.insert(name, metadata);
+                }
+                None => {
+                    entries.remove(&name);
+                }
             }
         }
-        Ok(entries)
+        Ok(entries
+            .into_iter()
+            .map(|(name, metadata)| DirectoryEntry { name, metadata })
+            .collect())
     }
 
     pub fn keep(&self, workspace: &WorkspaceHandle) -> Result<()> {
@@ -1514,6 +1712,10 @@ impl WorkspaceCore {
             params![workspace.id],
         )?;
         transaction.commit()?;
+        self.promoted_origins
+            .lock()
+            .map_err(|_| Error::Corrupt("promotion cache lock poisoned".into()))?
+            .retain(|(workspace_id, _), _| workspace_id != &workspace.id);
         for id in chunks {
             self.chunks.unpin(id)?;
         }
@@ -1678,7 +1880,7 @@ impl WorkspaceCore {
     }
 
     fn materialize(&self, workspace: &WorkspaceHandle, path: &str) -> Result<InodeRecord> {
-        {
+        let origin_path = {
             let connection = self.lock_metadata()?;
             if let Some(inode) = load_inode_for_path(&connection, &workspace.id, path)? {
                 return Ok(inode);
@@ -1686,7 +1888,8 @@ impl WorkspaceCore {
             if ancestor_tombstoned(&connection, &workspace.id, path)? {
                 return Err(Error::NotFound(path.into()));
             }
-        }
+            translate_redirect(&connection, &workspace.id, path)?
+        };
         let source = self.resolve_inode(workspace, path)?;
         let mode = self
             .metadata(workspace, path)?
@@ -1698,6 +1901,22 @@ impl WorkspaceCore {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(inode) = load_inode_for_path(&transaction, &workspace.id, path)? {
+            transaction.commit()?;
+            for id in &source.chunks {
+                self.chunks.unpin(*id)?;
+            }
+            return Ok(inode);
+        }
+        if let Some(inode) = load_inode_for_origin(&transaction, &workspace.id, &origin_path)? {
+            insert_entry(&transaction, &workspace.id, path, inode.id)?;
+            transaction.commit()?;
+            for id in &source.chunks {
+                self.chunks.unpin(*id)?;
+            }
+            self.remember_promotion(&workspace.id, &origin_path, inode.id)?;
+            return Ok(inode);
+        }
         let inode = insert_inode(
             &transaction,
             &workspace.id,
@@ -1707,8 +1926,14 @@ impl WorkspaceCore {
             0,
             &source.chunks,
         )?;
+        transaction.execute(
+            "INSERT INTO cow_inode_origins(workspace_id, origin_path, inode_id)
+             VALUES(?1, ?2, ?3)",
+            params![workspace.id, origin_path, inode],
+        )?;
         insert_entry(&transaction, &workspace.id, path, inode)?;
         transaction.commit()?;
+        self.remember_promotion(&workspace.id, &origin_path, inode)?;
         Ok(InodeRecord {
             id: inode,
             kind: source.kind,
@@ -1745,12 +1970,56 @@ impl WorkspaceCore {
         Ok(())
     }
 
-    fn load_open_inode(&self, handle: &WorkspaceFileHandle) -> Result<InodeRecord> {
-        let inode = i64::try_from(handle.inode)
-            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
-        let connection = self.lock_metadata()?;
-        load_inode_for_id(&connection, &handle.workspace_id, inode)?
-            .ok_or_else(|| Error::NotFound(format!("open inode {}", handle.inode)))
+    fn load_open_inode(&self, handle: &WorkspaceFileHandle) -> Result<Option<InodeRecord>> {
+        match &handle.backing {
+            WorkspaceFileBacking::Private { inode } => {
+                let inode = i64::try_from(*inode)
+                    .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
+                let connection = self.lock_metadata()?;
+                load_inode_for_id(&connection, &handle.workspace_id, inode)?.map_or_else(
+                    || Err(Error::NotFound(format!("open inode {inode}"))),
+                    |inode| Ok(Some(inode)),
+                )
+            }
+            WorkspaceFileBacking::Immutable { origin_path, .. } => {
+                let promoted = self
+                    .promoted_origins
+                    .lock()
+                    .map_err(|_| Error::Corrupt("promotion cache lock poisoned".into()))?
+                    .get(&(handle.workspace_id.clone(), origin_path.clone()))
+                    .copied();
+                let Some(inode) = promoted else {
+                    return Ok(None);
+                };
+                let connection = self.lock_metadata()?;
+                load_inode_for_id(&connection, &handle.workspace_id, inode as i64)?.map_or_else(
+                    || Err(Error::NotFound(format!("promoted inode {inode}"))),
+                    |inode| Ok(Some(inode)),
+                )
+            }
+        }
+    }
+
+    fn remember_promotion(&self, workspace_id: &str, origin_path: &str, inode: i64) -> Result<()> {
+        self.promoted_origins
+            .lock()
+            .map_err(|_| Error::Corrupt("promotion cache lock poisoned".into()))?
+            .insert(
+                (workspace_id.to_string(), origin_path.to_string()),
+                inode as u64,
+            );
+        Ok(())
+    }
+
+    fn promote_open_file(&self, handle: &WorkspaceFileHandle) -> Result<InodeRecord> {
+        if let Some(inode) = self.load_open_inode(handle)? {
+            return Ok(inode);
+        }
+        let WorkspaceFileBacking::Immutable { visible_path, .. } = &handle.backing else {
+            unreachable!("private handles always resolve an inode")
+        };
+        let workspace = self.open_workspace(&handle.workspace_id)?;
+        self.materialize(&workspace, visible_path)
     }
 
     fn lock_metadata(&self) -> Result<PooledConnection<'_>> {
@@ -1766,14 +2035,19 @@ impl WorkspaceCore {
 
 #[cfg(unix)]
 fn lock_pair_lease(file: &File, nonblocking: bool) -> io::Result<bool> {
+    lock_core_lease(file, true, nonblocking)
+}
+
+#[cfg(unix)]
+fn lock_core_lease(file: &File, exclusive: bool, nonblocking: bool) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
+    const LOCK_SH: i32 = 1;
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
-    let operation = if nonblocking {
-        LOCK_EX | LOCK_NB
-    } else {
-        LOCK_EX
-    };
+    let mut operation = if exclusive { LOCK_EX } else { LOCK_SH };
+    if nonblocking {
+        operation |= LOCK_NB;
+    }
     // SAFETY: flock operates only on the valid descriptor owned by `file`.
     let result = unsafe { workspace_flock(file.as_raw_fd(), operation) };
     if result == 0 {
@@ -1788,11 +2062,21 @@ fn lock_pair_lease(file: &File, nonblocking: bool) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
+fn downgrade_core_lease(file: &File) -> io::Result<()> {
+    lock_core_lease(file, false, false).map(|_| ())
+}
+
+#[cfg(unix)]
 fn unlock_pair_lease(file: &File) {
     use std::os::fd::AsRawFd;
     const LOCK_UN: i32 = 8;
     // SAFETY: best-effort unlock of the valid descriptor owned by `file`.
     let _ = unsafe { workspace_flock(file.as_raw_fd(), LOCK_UN) };
+}
+
+#[cfg(unix)]
+fn unlock_core_lease(file: &File) {
+    unlock_pair_lease(file);
 }
 
 #[cfg(unix)]
@@ -1803,13 +2087,22 @@ extern "C" {
 
 #[cfg(windows)]
 fn lock_pair_lease(file: &File, nonblocking: bool) -> io::Result<bool> {
+    lock_core_lease(file, true, nonblocking)
+}
+
+#[cfg(windows)]
+fn lock_core_lease(file: &File, exclusive: bool, nonblocking: bool) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
-    let mut flags = LOCKFILE_EXCLUSIVE_LOCK;
+    let mut flags = if exclusive {
+        LOCKFILE_EXCLUSIVE_LOCK
+    } else {
+        0
+    };
     if nonblocking {
         flags |= LOCKFILE_FAIL_IMMEDIATELY;
     }
@@ -1836,6 +2129,12 @@ fn lock_pair_lease(file: &File, nonblocking: bool) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+fn downgrade_core_lease(file: &File) -> io::Result<()> {
+    unlock_pair_lease(file);
+    lock_core_lease(file, false, false).map(|_| ())
+}
+
+#[cfg(windows)]
 fn unlock_pair_lease(file: &File) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
@@ -1845,13 +2144,53 @@ fn unlock_pair_lease(file: &File) {
     let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
 }
 
+#[cfg(windows)]
+fn unlock_core_lease(file: &File) {
+    unlock_pair_lease(file);
+}
+
 #[cfg(not(any(unix, windows)))]
 fn lock_pair_lease(_file: &File, _nonblocking: bool) -> io::Result<bool> {
     Ok(true)
 }
 
 #[cfg(not(any(unix, windows)))]
+fn lock_core_lease(_file: &File, _exclusive: bool, _nonblocking: bool) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn downgrade_core_lease(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn unlock_pair_lease(_file: &File) {}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_core_lease(_file: &File) {}
+
+fn write_core_health(file: &File, value: &[u8]) -> io::Result<()> {
+    file.set_len(0)?;
+    let mut writer = file;
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(value)?;
+    writer.sync_all()
+}
+
+fn require_healthy_core_marker(file: &File) -> Result<()> {
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut value = Vec::new();
+    reader.read_to_end(&mut value)?;
+    if value == b"healthy-v1\n" {
+        Ok(())
+    } else {
+        Err(Error::AdapterUnavailable(
+            "workspace core recovery has not completed successfully".into(),
+        ))
+    }
+}
 
 fn open_metadata_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
@@ -2003,6 +2342,39 @@ fn load_inode_for_id(
             "SELECT id, kind, size, chunks_json FROM cow_inodes
              WHERE workspace_id = ?1 AND id = ?2",
             params![workspace_id, inode],
+            |row| {
+                let chunks: Vec<u8> = row.get(3)?;
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    chunks,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(id, kind, size, chunks)| {
+            Ok(InodeRecord {
+                id,
+                kind: parse_kind(&kind)?,
+                size: size as u64,
+                chunks: serde_json::from_slice(&chunks)?,
+            })
+        })
+        .transpose()
+}
+
+fn load_inode_for_origin(
+    connection: &Connection,
+    workspace_id: &str,
+    origin_path: &str,
+) -> Result<Option<InodeRecord>> {
+    connection
+        .query_row(
+            "SELECT i.id, i.kind, i.size, i.chunks_json
+             FROM cow_inode_origins o JOIN cow_inodes i ON i.id = o.inode_id
+             WHERE o.workspace_id = ?1 AND o.origin_path = ?2",
+            params![workspace_id, origin_path],
             |row| {
                 let chunks: Vec<u8> = row.get(3)?;
                 Ok((
@@ -2305,6 +2677,23 @@ mod tests {
         recording.join().unwrap().unwrap();
     }
 
+    #[test]
+    fn concurrent_open_does_not_reconcile_live_chunk_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let core = WorkspaceCore::open(root.path()).unwrap();
+        let transient = core.chunks().put(b"live cross-database update").unwrap();
+        core.chunks().pin(transient).unwrap();
+
+        let concurrent = WorkspaceCore::open(root.path()).unwrap();
+        core.chunks().unpin(transient).unwrap();
+
+        drop(concurrent);
+        drop(core);
+        let recovered = WorkspaceCore::open(root.path()).unwrap();
+        recovered.gc().unwrap();
+        assert_eq!(recovered.chunks().stats().unwrap().chunk_count, 0);
+    }
+
     fn git(path: &Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -2598,6 +2987,43 @@ mod tests {
             b"PRIVATE stable bytes"
         );
         assert_eq!(core.metadata_open_file(&handle).unwrap().nlink, 0);
+    }
+
+    #[test]
+    fn read_only_handle_does_not_copy_up_and_observes_later_promotion() {
+        let (_repo, _storage, core, workspace) = fixture();
+        let before_inodes: i64 = core
+            .lock_metadata()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM cow_inodes WHERE workspace_id = ?1",
+                params![workspace.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before_chunks = core.chunks().stats().unwrap().referenced_chunks;
+
+        let handle = core.open_file_read_only(&workspace, "README.md").unwrap();
+        assert_eq!(core.read_open_file(&handle, 0, 64).unwrap(), b"dirty\n");
+        assert_eq!(core.metadata_open_file(&handle).unwrap().size, 6);
+        let after_open_inodes: i64 = core
+            .lock_metadata()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM cow_inodes WHERE workspace_id = ?1",
+                params![workspace.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_open_inodes, before_inodes);
+        assert_eq!(
+            core.chunks().stats().unwrap().referenced_chunks,
+            before_chunks
+        );
+
+        core.write(&workspace, "README.md", 0, b"DIRTY").unwrap();
+        assert_eq!(core.read_open_file(&handle, 0, 64).unwrap(), b"DIRTY\n");
+        assert_eq!(core.metadata_open_file(&handle).unwrap().size, 6);
     }
 
     #[test]
