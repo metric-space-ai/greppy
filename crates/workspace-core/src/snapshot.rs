@@ -349,7 +349,7 @@ fn preflight_repository(repository: &Path) -> Result<()> {
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty())
         .collect();
-    if fields.len() % 3 != 0 {
+    if !fields.chunks_exact(3).remainder().is_empty() {
         return Err(Error::Git {
             command: "git check-attr filter".into(),
             detail: "unexpected -z output shape".into(),

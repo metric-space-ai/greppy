@@ -481,6 +481,7 @@ fn workspace_doctor_json_is_machine_readable_when_provider_is_missing() {
 /// immutable index Base. The temporary namespace is removed afterwards and is
 /// never registered as a native Git worktree.
 #[test]
+#[cfg(not(feature = "ci-test-assets"))]
 fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
     let dir = unique_temp("index-agent-worktree");
     let repo = dir.join("repo");
@@ -545,6 +546,94 @@ fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
         "portable namespace must not be registered as a native Git worktree"
     );
 
+    let base_root = store.join("agent-base-stores");
+    let complete = find_file_named(&base_root, "COMPLETE");
+    let base_dir = complete
+        .parent()
+        .unwrap_or_else(|| panic!("COMPLETE must have a Base directory parent"));
+    assert!(base_dir.join("graph.db").is_file(), "Base graph is missing");
+    assert!(
+        base_dir.join("summary_cache.db").is_file(),
+        "Base summary cache is missing"
+    );
+    assert!(
+        base_dir.join("manifest.json").is_file(),
+        "Base manifest is missing"
+    );
+
     drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn index_agent_worktree_fails_closed_when_base_summary_generation_fails() {
+    let dir = unique_temp("index-agent-worktree-summary-failure");
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    init_repo(&repo);
+    std::fs::write(repo.join("src/lib.rs"), b"pub fn value() -> usize { 7 }\n").unwrap();
+    git(&repo, &["add", "src/lib.rs"]);
+    git(&repo, &["commit", "-m", "code"]);
+
+    let store = dir.join("store");
+    let provider = spawn_fake_provider(&dir, &repo);
+    let out = std::process::Command::new(binary_path())
+        .args(["index", "--agent-worktree"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BASE_SUMMARY_FAIL", "1")
+        .output()
+        .expect("spawn greppy");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "failed Base publication must not report success; stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("agent Base prewarm failed closed"),
+        "failure must name the fail-closed Base boundary; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("injected immutable Base summary generation failure"),
+        "test must reach the post-graph summary publication boundary; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("warming a full private Store"),
+        "Base failure must not fall back to a private Store; stderr={stderr}"
+    );
+    assert!(
+        try_find_file_named(&store, "COMPLETE").is_none(),
+        "failed Base publication must not leave a COMPLETE marker"
+    );
+
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(feature = "ci-test-assets"))]
+fn find_file_named(root: &std::path::Path, name: &str) -> PathBuf {
+    try_find_file_named(root, name)
+        .unwrap_or_else(|| panic!("{name} not found under {}", root.display()))
+}
+
+fn try_find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let entries =
+        std::fs::read_dir(root).unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
+    for entry in entries {
+        let path = entry.expect("read directory entry").path();
+        if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = try_find_file_named(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }

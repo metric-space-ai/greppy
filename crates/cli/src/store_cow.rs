@@ -15,6 +15,8 @@ pub(crate) const ENV_FALLBACK_REASON: &str = "GREPPY_AGENT_STORE_FALLBACK_REASON
 pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
+#[cfg(debug_assertions)]
+const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverlaySpec {
@@ -397,6 +399,12 @@ pub(crate) fn prepare_base_store(
             .map_err(|error| Error::Store(format!("checkpoint Base graph: {error}")))?;
     }
     validate_base_contents(workspace.worktree_path(), &staged_graph, &identity)?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some() {
+        return Err(Error::Invalid(
+            "injected immutable Base summary generation failure".into(),
+        ));
+    }
     let staged_summary_cache = build_base_summary_cache(
         workspace.worktree_path(),
         &staged_graph,
@@ -457,7 +465,11 @@ fn validate_base_contents(
         )
         .ok();
     let expected_completion = format!("{generation}|{}", identity.embedding_model);
-    if completion.as_deref() != Some(expected_completion.as_str()) {
+    #[cfg(debug_assertions)]
+    let injected_summary_failure = std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some();
+    #[cfg(not(debug_assertions))]
+    let injected_summary_failure = false;
+    if !injected_summary_failure && completion.as_deref() != Some(expected_completion.as_str()) {
         return Err(Error::Invalid(format!(
             "Base embedding generation is incomplete: expected `{expected_completion}`, got {}",
             completion.as_deref().unwrap_or("missing")

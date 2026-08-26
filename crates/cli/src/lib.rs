@@ -159,6 +159,10 @@ const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
+/// Bound the source sent to the summary daemon. Cache keys continue to use the
+/// complete source span, so this only bounds inference cost and request
+/// latency; it does not weaken cache invalidation or Base completeness.
+const SUMMARY_INFERENCE_SOURCE_MAX_BYTES: usize = 8 * 1024;
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 #[cfg(debug_assertions)]
@@ -4377,8 +4381,10 @@ fn summarize_source_cached(
             return Some(bullets);
         }
     }
-    let bullets = summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, source)
-        .filter(|bullets| !bullets.is_empty())?;
+    let inference_source = cap_summary_inference_source(source);
+    let bullets =
+        summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, &inference_source)
+            .filter(|bullets| !bullets.is_empty())?;
     if let Some(cache) = cache {
         let _ = if unbounded {
             cache.put_unbounded(&cache_key, &hash, &bullets)
@@ -4387,6 +4393,27 @@ fn summarize_source_cached(
         };
     }
     Some(bullets)
+}
+
+/// Preserve a representative head and tail for very large single-line data
+/// and generated-code spans. Truncating only the tail made long JSON records
+/// lose their closing structure, while sending the full span could exceed the
+/// summary daemon's bounded response time on GPU prewarm.
+fn cap_summary_inference_source(source: &str) -> String {
+    if source.len() <= SUMMARY_INFERENCE_SOURCE_MAX_BYTES {
+        return source.to_string();
+    }
+
+    const SEPARATOR: &str = "\n/* greppy: summary source middle omitted */\n";
+    let content_budget = SUMMARY_INFERENCE_SOURCE_MAX_BYTES - SEPARATOR.len();
+    let head_budget = content_budget * 3 / 4;
+    let tail_budget = content_budget - head_budget;
+    let head = truncate_utf8_bytes(source, head_budget);
+    let mut tail_start = source.len().saturating_sub(tail_budget);
+    while tail_start < source.len() && !source.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{head}{SEPARATOR}{}", &source[tail_start..])
 }
 
 /// Async nudge for the Qwen daemon, called ONLY from the dispatches that

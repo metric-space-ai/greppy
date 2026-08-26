@@ -442,12 +442,24 @@ pub(crate) fn dispatch_index_agent_worktree(
             Some(prepared)
         }
         Err(error) => {
-            crate::store_cow::configure_private_environment(&error.to_string());
-            eprintln!(
-                "greppy index --agent-worktree: shared Base unavailable ({error}) — \
-                 warming a full private Store"
-            );
-            None
+            match restore_project {
+                Some(previous) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, previous),
+                None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
+            }
+            for (name, value) in cow_env {
+                match value {
+                    Some(previous) => std::env::set_var(name, previous),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let cleanup = workspace.cleanup();
+            let cleanup_detail = cleanup
+                .err()
+                .map(|cleanup_error| format!("; workspace cleanup also failed: {cleanup_error}"))
+                .unwrap_or_default();
+            return Err(Error::Invalid(format!(
+                "agent Base prewarm failed closed: {error}{cleanup_detail}"
+            )));
         }
     };
     // The agent does not read the operator's data root: `greppy -p` runs with

@@ -174,10 +174,7 @@ impl AgentWorkspace {
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
-        let handle = match core.create_workspace(run_id, baseline) {
-            Ok(handle) => handle,
-            Err(error) => return Err(error.into()),
-        };
+        let handle = core.create_workspace(run_id, baseline)?;
         let worktree = provider.workspace_path(run_id)?;
         if let Err(error) = wait_for_workspace(&worktree) {
             let _ = core.remove_workspace(handle);
@@ -766,15 +763,13 @@ pub fn workspace_data_root() -> Result<PathBuf, WorkspaceError> {
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(
-            home_dir()?.join("Library/Group Containers/group.ai.metricspace.greppy/workspace")
-        );
+        Ok(home_dir()?.join("Library/Group Containers/group.ai.metricspace.greppy/workspace"))
     }
     #[cfg(target_os = "windows")]
     {
         let root = std::env::var_os("LOCALAPPDATA")
             .ok_or_else(|| WorkspaceError::AdapterUnavailable("LOCALAPPDATA is not set".into()))?;
-        return Ok(PathBuf::from(root).join("greppy/workspace"));
+        Ok(PathBuf::from(root).join("greppy/workspace"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

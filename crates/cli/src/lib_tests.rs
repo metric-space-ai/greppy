@@ -1107,6 +1107,27 @@ fn semantic_purpose_span_cap_limits_lines_and_bytes() {
     assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
 }
 
+#[test]
+fn summary_inference_cap_bounds_large_single_line_json_without_changing_utf8() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = include_bytes!("../tests/fixtures/eodag-onda-search-69d24e8.json");
+    let source = std::str::from_utf8(fixture).expect("EODAG fixture must be UTF-8");
+    assert_eq!(fixture.len(), 30_716);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(fixture)),
+        "6fdcba0e3814ba02671a12a4ba0d8d429ff98a52ccd5372efd7808fb6e0d354e"
+    );
+
+    let capped = cap_summary_inference_source(source);
+
+    assert_eq!(capped.len(), SUMMARY_INFERENCE_SOURCE_MAX_BYTES);
+    assert!(capped.starts_with("{\n  \"@odata.context\""));
+    assert!(capped.contains("summary source middle omitted"));
+    assert!(capped.ends_with("\n  ]\n}\n"));
+    assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn ten_agents_reuse_published_summary_without_private_duplicates() {

@@ -341,11 +341,17 @@ fn run_agent(args: AgentArgs) -> u8 {
                 Some(prepared)
             }
             Err(error) => {
-                crate::store_cow::configure_private_environment(&error.to_string());
                 eprintln!(
-                    "greppy -p: shared Base unavailable ({error}) — falling back to a full private Store"
+                    "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
                 );
-                None
+                if args.keep_worktree {
+                    keep_worktree_on_error(&workspace);
+                } else if let Err(cleanup_error) = workspace.cleanup() {
+                    eprintln!(
+                        "greppy -p: failed to clean the aborted portable workspace: {cleanup_error}"
+                    );
+                }
+                return EXIT_AGENT;
             }
         }
     };

@@ -170,6 +170,7 @@ impl ChunkStore {
         let path = self.segment_path(segment_id);
         let mut segment = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -530,6 +531,7 @@ impl ChunkStore {
             let path = self.segment_path(id);
             let file = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(path)?;
