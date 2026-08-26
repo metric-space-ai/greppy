@@ -230,12 +230,14 @@ fn ensure_repository_base(
              VALUES(?1, ?2, ?3, 'ready')",
             params![base_id, repository, baseline.base_commit],
         )?;
-        for entry in &entries {
-            transaction.execute(
+        {
+            let mut insert_entry = transaction.prepare_cached(
                 "INSERT INTO cow_repository_base_entries(
                      base_id, path, parent, name, kind, mode, size, chunks_json
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
+            )?;
+            for entry in &entries {
+                insert_entry.execute(params![
                     base_id,
                     entry.path,
                     entry.parent,
@@ -244,8 +246,8 @@ fn ensure_repository_base(
                     entry.mode as i64,
                     entry.size as i64,
                     serde_json::to_vec(entry_chunks(entry))?
-                ],
-            )?;
+                ])?;
+            }
         }
         transaction.commit()?;
         Ok(())
