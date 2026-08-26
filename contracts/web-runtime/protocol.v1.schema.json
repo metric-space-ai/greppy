@@ -382,7 +382,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["session_id", "script_source"],
-      "description": "Controller script MUST be carried in the length-delimited payload, never in process arguments. --script-stdin consumes stdin without exposing the script in argv. Inline script flags MUST NOT be added.",
+      "description": "Controller script MUST be carried in the length-delimited payload, never in process arguments. --script-stdin consumes stdin without exposing the script in argv and MUST send that source as script_text. Inline script flags MUST NOT be added.",
       "properties": {
         "session_id": { "$ref": "#/$defs/session_id" },
         "script_source": {
@@ -394,8 +394,23 @@
           "minLength": 1,
           "description": "Workspace-relative path when script_source is file. MUST NOT be used to place script text in process arguments."
         },
+        "script_text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Controller source when script_source is stdin. MUST be carried in this length-delimited payload and MUST NOT appear in process arguments."
+        },
         "timeout_seconds": { "type": "integer", "minimum": 1 }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "script_source": { "const": "file" } }, "required": ["script_source"] },
+          "then": { "required": ["script_file"], "not": { "required": ["script_text"] } }
+        },
+        {
+          "if": { "properties": { "script_source": { "const": "stdin" } }, "required": ["script_source"] },
+          "then": { "required": ["script_text"], "not": { "required": ["script_file"] } }
+        }
+      ]
     },
     "payload_web_observe": {
       "type": "object",
@@ -553,6 +568,7 @@
       "required": [
         "schema",
         "request_id",
+        "operation",
         "status",
         "result",
         "artifacts",
@@ -561,6 +577,7 @@
       "properties": {
         "schema": { "$ref": "#/$defs/schema_id" },
         "request_id": { "$ref": "#/$defs/request_id" },
+        "operation": { "$ref": "#/$defs/operation" },
         "status": { "type": "string", "enum": ["ok", "error", "cancelled"] },
         "result": { "type": ["object", "null"] },
         "artifacts": {
@@ -579,6 +596,14 @@
         {
           "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
           "then": { "not": { "required": ["error"] } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "handshake" } }, "required": ["operation"] },
+          "then": {
+            "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+            "then": { "required": ["handshake"] }
+          },
+          "else": { "not": { "required": ["handshake"] } }
         }
       ]
     }

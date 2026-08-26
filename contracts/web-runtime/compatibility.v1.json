@@ -34,8 +34,8 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "unverified": 1113,
-    "unsupported": 241
+    "unverified": 1111,
+    "unsupported": 243
   },
   "entries": [
     {
@@ -2962,11 +2962,13 @@
       "symbol": "BrowserContext.newCDPSession",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
+      ]
     },
     {
       "symbol": "BrowserContext.newPage",
@@ -3632,11 +3634,13 @@
       "symbol": "Browser.newBrowserCDPSession",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
+      ]
     },
     {
       "symbol": "Browser.newContext",
@@ -6217,7 +6221,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6229,7 +6233,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6241,7 +6245,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6253,7 +6257,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6265,7 +6269,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6277,7 +6281,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6289,7 +6293,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6301,7 +6305,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6313,7 +6317,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6325,7 +6329,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6337,7 +6341,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6349,7 +6353,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6361,7 +6365,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6373,7 +6377,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -6385,7 +6389,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12031,7 +12035,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12043,7 +12047,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12055,7 +12059,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12067,7 +12071,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12079,7 +12083,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12091,7 +12095,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -12103,7 +12107,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -13195,7 +13199,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "Chromium DevTools Protocol compatibility is a separate track. connectOverCDP and CDPSession MUST NOT be claimed by the first javascript-library/chromium release. Calls MUST fail explicitly."
       ]
     },
     {
@@ -14055,7 +14059,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "firefox and webkit MUST exist for schema tracking, but their launch path is unsupported. Launch, launchPersistentContext, launchServer, and connect MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
       ]
     },
     {
@@ -14067,7 +14071,7 @@
       "behavior": "unsupported",
       "tests": [],
       "known_differences": [
-        "Electron, Android, and their option/type surfaces are a separate compatibility track and MUST NOT be implied by the first javascript-library/chromium release. Calls MUST fail explicitly."
+        "firefox and webkit MUST exist for schema tracking, but their launch path is unsupported. Launch, launchPersistentContext, launchServer, and connect MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
       ]
     },
     {
