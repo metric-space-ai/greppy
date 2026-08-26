@@ -18,4 +18,7 @@ if (!String(html).includes("ok") || !/oracle/i.test(String(html))) {
 if ((await page.locator("#x").count()) !== 1) {
   throw new Error("count");
 }
+if ((await page.locator("#x").innerHTML()).trim() !== "ok") {
+  throw new Error("innerHTML");
+}
 await browser.close();

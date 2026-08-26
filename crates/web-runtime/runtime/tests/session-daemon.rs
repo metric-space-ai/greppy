@@ -1255,13 +1255,15 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             "includesOk": true,
             "includesOracle": true,
             "count": 1,
+            "innerHTML": "ok",
         },
         "match": content_ref["includesOk"] == true
             && content_ref["includesOracle"] == true
-            && content_ref["count"] == 1,
-        "scope": "setContent Page.content markers and Locator.count(#x)==1; HTML serialization is not compared byte-for-byte",
+            && content_ref["count"] == 1
+            && content_ref["innerHTML"] == "ok",
+        "scope": "setContent Page.content markers, Locator.count(#x)==1, and Locator.innerHTML; HTML serialization is not compared byte-for-byte",
         "known_differences": [
-            "Chromium and Servo serialize quotes/doctype differently; only substring markers and count are compared"
+            "Chromium and Servo serialize quotes/doctype differently; only substring markers, count, and innerHTML of #x are compared"
         ],
     });
     std::fs::write(

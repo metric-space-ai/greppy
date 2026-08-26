@@ -2,18 +2,20 @@
   "reference": {
     "includesOk": true,
     "includesOracle": true,
-    "count": 1
+    "count": 1,
+    "innerHTML": "ok"
   },
   "candidate": {
     "engine": "greppy-web-runtime+servo-0.5.0",
     "status": "ok",
     "includesOk": true,
     "includesOracle": true,
-    "count": 1
+    "count": 1,
+    "innerHTML": "ok"
   },
   "match": true,
-  "scope": "setContent Page.content markers and Locator.count(#x)==1; HTML serialization is not compared byte-for-byte",
+  "scope": "setContent Page.content markers, Locator.count(#x)==1, and Locator.innerHTML; HTML serialization is not compared byte-for-byte",
   "known_differences": [
-    "Chromium and Servo serialize quotes/doctype differently; only substring markers and count are compared"
+    "Chromium and Servo serialize quotes/doctype differently; only substring markers, count, and innerHTML of #x are compared"
   ]
 }

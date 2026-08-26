@@ -24,6 +24,7 @@ const value = await setPage.evaluate(() => 1 + 1);
 const text = (await setPage.locator("#x").innerText()).trim();
 const content = await setPage.content();
 const count = await setPage.locator("#x").count();
+const innerHTML = (await setPage.locator("#x").innerHTML()).trim();
 await setPage.close();
 
 const dialogPage = await browser.newPage();
@@ -75,6 +76,7 @@ const receipt = {
       includesOk: String(content).includes("ok"),
       includesOracle: /oracle/i.test(String(content)),
       count,
+      innerHTML,
     },
     dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
     fill: { value: filled },

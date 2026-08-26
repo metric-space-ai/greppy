@@ -6213,12 +6213,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "locator-state"
+        "locator-state",
+        "oracle-content"
       ],
       "known_differences": [
-        "innerHTML string; not Chromium serialization"
+        "innerHTML string; not Chromium serialization",
+        "oracle compares innerHTML of #x after setContent equals ok"
       ]
     },
     {
@@ -9716,7 +9718,9 @@
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo WebResourceRequest has no request body; not implemented as empty/null stub"
+      ]
     },
     {
       "symbol": "Request.postDataBuffer",
@@ -9726,7 +9730,9 @@
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo WebResourceRequest has no request body; not implemented as empty/null stub"
+      ]
     },
     {
       "symbol": "Request.postDataJSON",
@@ -9736,7 +9742,9 @@
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo WebResourceRequest has no request body; not implemented as empty/null stub"
+      ]
     },
     {
       "symbol": "Request.redirectedFrom",
@@ -15075,8 +15083,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1063,
+    "unverified": 1062,
     "unsupported": 281,
-    "passing": 10
+    "passing": 11
   }
 }
