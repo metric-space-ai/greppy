@@ -714,6 +714,20 @@ impl ContentEngine {
                 );
                 Ok(json!({ "values": jsvalue_to_json(self.evaluate(webview, &source)?) }))
             }
+            "locator.evaluate" => {
+                let source = required_str(&params, "source")?;
+                let page_id = required_str(&params, "page")?;
+                let selector = params
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let script = format!(
+                    "(function(selector, source) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); return (0, eval)('(' + source + ')')(nodes[0]); }})({selector}, {})",
+                    serde_json::to_string(&source).map_err(io::Error::other)?
+                );
+                Ok(json!({ "value": jsvalue_to_json(self.evaluate(webview, &script)?) }))
+            }
             "page.setContent" => {
                 let page_id = required_str(&params, "page")?;
                 let html = required_str(&params, "html")?;

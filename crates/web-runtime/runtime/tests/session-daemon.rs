@@ -1495,3 +1495,21 @@ fn locator_box_and_request_events_after_goto() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn locator_evaluate_runs_against_matched_element() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-loceval-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_loceval", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("locator-evaluate.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_loceval",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

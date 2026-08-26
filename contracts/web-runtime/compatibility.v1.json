@@ -39,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 101,
+    "implemented": 102,
     "unsupported": 243,
-    "unverified": 1010
+    "unverified": 1009
   },
   "entries": [
     {
@@ -5636,11 +5636,15 @@
       "symbol": "Locator.evaluate",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-evaluate"
+      ],
+      "known_differences": [
+        "eval(pageFunction)(element) in page JS; not Playwright JSHandle/world isolation"
+      ]
     },
     {
       "symbol": "Locator.evaluateAll",

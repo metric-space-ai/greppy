@@ -276,6 +276,21 @@ class Locator {
     return this.allTextContents();
   }
 
+  async evaluate(pageFunction, arg) {
+    const fn =
+      typeof pageFunction === "function" ? pageFunction.toString() : String(pageFunction);
+    const source =
+      arg === undefined
+        ? fn
+        : "function(el) { return (" + fn + ")(el, " + JSON.stringify(arg) + "); }";
+    const result = await engineCall("locator.evaluate", {
+      page: this._page._id,
+      selector: this._selector,
+      source,
+    });
+    return result.value;
+  }
+
   first() {
     return new Locator(this._page, { ...this._selector, nth: 0 });
   }
