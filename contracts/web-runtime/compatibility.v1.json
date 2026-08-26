@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 186,
-    "unsupported": 270,
-    "unverified": 898
+    "implemented": 188,
+    "unsupported": 275,
+    "unverified": 891
   },
   "entries": [
     {
@@ -113,11 +113,13 @@
       "symbol": "Page.ariaSnapshot",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Inspector/codegen UI is not part of this runtime. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.bringToFront",
@@ -136,11 +138,13 @@
       "symbol": "Page.cancelPickLocator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Inspector/codegen UI is not part of this runtime. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.check",
@@ -582,11 +586,13 @@
       "symbol": "Page.hideHighlight",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Inspector/codegen UI is not part of this runtime. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.hover",
@@ -863,21 +869,25 @@
       "symbol": "Page.pickLocator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Inspector/codegen UI is not part of this runtime. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.prependListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "unshifts onto the in-memory handler list"
+      ]
     },
     {
       "symbol": "Page.press",
@@ -911,11 +921,13 @@
       "symbol": "Page.removeAllListeners",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "clears in-memory handler lists; not Node EventEmitter"
+      ]
     },
     {
       "symbol": "Page.removeListener",
@@ -6087,11 +6099,13 @@
       "symbol": "Locator.highlight",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Inspector/codegen UI is not part of this runtime. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.hover",
@@ -14888,8 +14902,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1076,
-    "unsupported": 270,
+    "unverified": 1071,
+    "unsupported": 275,
     "passing": 8
   }
 }

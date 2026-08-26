@@ -17,4 +17,5 @@ if (!texts.some((text) => String(text).includes("hello-console")) && !seen.some(
   throw new Error("console log not captured: " + JSON.stringify({ texts, seen }));
 }
 page.off("console", handler);
+page.removeAllListeners("console");
 await browser.close();

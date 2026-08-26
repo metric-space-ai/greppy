@@ -1080,6 +1080,21 @@ class Page {
     return this.off(event, handler);
   }
 
+  removeAllListeners(event) {
+    if (event == null) {
+      this._handlers = {};
+    } else {
+      this._handlers[event] = [];
+    }
+    return this;
+  }
+
+  prependListener(event, handler) {
+    this._handlers[event] = this._handlers[event] || [];
+    this._handlers[event].unshift(handler);
+    return this;
+  }
+
   async consoleMessages() {
     const result = await engineCall("page.consoleMessages", { page: this._id });
     return (result.messages || []).map((rec) => ({
