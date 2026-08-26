@@ -1381,19 +1381,35 @@ mod tests {
         src
     }
 
+    static TEMP_DIR_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn tempdir_via_env() -> std::path::PathBuf {
         let base = std::env::temp_dir();
         let unique = format!(
             "greppy-indexer-embedding-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            TEMP_DIR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let p = base.join(unique);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn embedding_test_tempdirs_are_unique_under_parallel_calls() {
+        let paths = (0..128)
+            .map(|_| std::thread::spawn(tempdir_via_env))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            paths.len()
+        );
+        for path in paths {
+            std::fs::remove_dir_all(path).unwrap();
+        }
     }
 
     fn store_with_project(root: &Path) -> Store {
