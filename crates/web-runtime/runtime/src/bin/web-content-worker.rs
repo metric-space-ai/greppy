@@ -5,8 +5,8 @@ use servo::{
     InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType, UrlRequest,
-    WheelDelta, WheelEvent, WheelMode,
     WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -75,10 +75,7 @@ struct Delegate {
 }
 
 impl Delegate {
-    fn new(
-        rendering_context: Rc<dyn RenderingContext>,
-        profile: SharedProfile,
-    ) -> Self {
+    fn new(rendering_context: Rc<dyn RenderingContext>, profile: SharedProfile) -> Self {
         Self {
             new_frame_ready: RefCell::new(false),
             routes: RefCell::new(Vec::new()),
@@ -214,9 +211,11 @@ impl WebViewDelegate for Delegate {
                 })
             })
             .collect();
-        let abort_match = self.routes.borrow().iter().any(|rule| {
-            rule.action == "abort" && pattern_matches(&rule.pattern, &url)
-        });
+        let abort_match = self
+            .routes
+            .borrow()
+            .iter()
+            .any(|rule| rule.action == "abort" && pattern_matches(&rule.pattern, &url));
         let policy = decide_url(self.profile.get(), &url);
         let failure = match &policy {
             UrlDecision::Deny { reason } => Some(format!("policy_denied: {reason}")),
@@ -236,7 +235,8 @@ impl WebViewDelegate for Delegate {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
             }
             let denied_url = load.request.url.clone();
-            load.intercept(WebResourceResponse::new(denied_url)).cancel();
+            load.intercept(WebResourceResponse::new(denied_url))
+                .cancel();
             return;
         }
         let matched = self
@@ -295,8 +295,7 @@ impl WebViewDelegate for Delegate {
                     },
                 }));
                 let lower = content_type.to_ascii_lowercase();
-                let is_download =
-                    lower.contains("octet-stream") || lower.contains("attachment");
+                let is_download = lower.contains("octet-stream") || lower.contains("attachment");
                 if is_download {
                     let suggested = request_url
                         .path_segments()
@@ -579,7 +578,10 @@ impl ContentEngine {
             "session.setProfile" => {
                 let name = required_str(&params, "profile")?;
                 let parsed = NetworkProfile::parse(&name).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "profile must be research or project")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "profile must be research or project",
+                    )
                 })?;
                 self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
@@ -825,10 +827,26 @@ impl ContentEngine {
                     if !value.is_object() {
                         return None;
                     }
-                    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as u32;
-                    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as u32;
-                    let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
-                    let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
+                    let x = value
+                        .get("x")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0)
+                        .max(0.0) as u32;
+                    let y = value
+                        .get("y")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0)
+                        .max(0.0) as u32;
+                    let width = value
+                        .get("width")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0)
+                        .max(1.0) as u32;
+                    let height = value
+                        .get("height")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0)
+                        .max(1.0) as u32;
                     Some((x, y, width, height))
                 });
                 let png = self.screenshot_png(&webview, clip)?;
@@ -1253,9 +1271,13 @@ impl ContentEngine {
             }
             "page.clearPageErrors" => {
                 let page_id = required_str(&params, "page")?;
-                self.page(&page_id)?.1.last_console.borrow_mut().retain(|row| {
-                    row.get("type").and_then(|value| value.as_str()) != Some("error")
-                });
+                self.page(&page_id)?
+                    .1
+                    .last_console
+                    .borrow_mut()
+                    .retain(|row| {
+                        row.get("type").and_then(|value| value.as_str()) != Some("error")
+                    });
                 Ok(json!({}))
             }
             "page.fileChoosers" => {
@@ -1375,7 +1397,9 @@ impl ContentEngine {
                     downloads
                         .iter()
                         .rev()
-                        .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url.as_str()))
+                        .find(|row| {
+                            row.get("url").and_then(|value| value.as_str()) == Some(url.as_str())
+                        })
                         .and_then(|row| {
                             row.get("bodyBase64")
                                 .and_then(|value| value.as_str())
@@ -2194,8 +2218,16 @@ fn base64_decode(input: &str) -> io::Result<Vec<u8>> {
         let pad = chunk.iter().filter(|byte| **byte == b'=').count();
         let a = sextet(chunk[0])?;
         let b = sextet(chunk[1])?;
-        let c = if chunk[2] == b'=' { 0 } else { sextet(chunk[2])? };
-        let d = if chunk[3] == b'=' { 0 } else { sextet(chunk[3])? };
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            sextet(chunk[2])?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            sextet(chunk[3])?
+        };
         let n = (a << 18) | (b << 12) | (c << 6) | d;
         out.push((n >> 16) as u8);
         if pad < 2 {

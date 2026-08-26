@@ -446,10 +446,9 @@ impl Daemon {
             .get(&session_id)
             .map(|session| session.profile)
             .unwrap_or(NetworkProfile::Research);
-        if let Err(error) = self.engine_call(
-            "session.setProfile",
-            json!({ "profile": profile.as_str() }),
-        ) {
+        if let Err(error) =
+            self.engine_call("session.setProfile", json!({ "profile": profile.as_str() }))
+        {
             self.finish_session(&session_id);
             return engine_error(request, error, 34);
         }
@@ -724,7 +723,7 @@ impl Daemon {
                 "omitted": omitted,
                 "omitted_reasons": omitted_reasons,
                 "evidence": snippets,
-                "sources": admitted,
+                "sources": admitted.into_iter().map(model_facing_source).collect::<Vec<_>>(),
                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
                 "continuation_token": continuation,
             }),
@@ -798,37 +797,45 @@ impl Daemon {
             .and_then(|session| session.page_id.clone());
         let page = match page {
             Some(page) => page,
-            None => match self.engine_call("session.ensurePage", json!({})) {
-                Ok(result) => {
-                    let page = result
-                        .get("page")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned);
-                    let Some(page) = page else {
-                        self.finish_session(&session_id);
-                        return Err(engine_error(request, "session has no page", 34));
-                    };
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.page_id = Some(page.clone());
-                        session.pages = 1;
+            None => {
+                if let Some(session) = self.sessions.get(&session_id) {
+                    if let Err(message) =
+                        session.limits.check_pages(session.pages.saturating_add(1))
+                    {
+                        return Err(limit_error(request, message));
                     }
-                    page
                 }
-                Err(error) => {
-                    self.finish_session(&session_id);
-                    return Err(engine_error(request, error, 34));
+                match self.engine_call("session.ensurePage", json!({})) {
+                    Ok(result) => {
+                        let page = result
+                            .get("page")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned);
+                        let Some(page) = page else {
+                            self.finish_session(&session_id);
+                            return Err(engine_error(request, "session has no page", 34));
+                        };
+                        if let Some(session) = self.sessions.get_mut(&session_id) {
+                            session.page_id = Some(page.clone());
+                            session.pages = 1;
+                        }
+                        page
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        return Err(engine_error(request, error, 34));
+                    }
                 }
-            },
+            }
         };
         let profile = self
             .sessions
             .get(&session_id)
             .map(|session| session.profile)
             .unwrap_or(NetworkProfile::Research);
-        if let Err(error) = self.engine_call(
-            "session.setProfile",
-            json!({ "profile": profile.as_str() }),
-        ) {
+        if let Err(error) =
+            self.engine_call("session.setProfile", json!({ "profile": profile.as_str() }))
+        {
             self.finish_session(&session_id);
             return Err(engine_error(request, error, 34));
         }
@@ -851,7 +858,7 @@ impl Daemon {
             return Err({
                 let mut error = ErrorObject::new(
                     "policy_denied",
-                    reason,
+                    format!("{reason}: {}", redact_secrets(url)),
                     request.request_id.clone(),
                     36,
                     "use the project profile for loopback fixtures",
@@ -895,7 +902,7 @@ impl Daemon {
             &request.operation,
             false,
         )?;
-        Ok(json!({
+        Ok(model_facing_source(json!({
             "requested_url": url,
             "final_url": tree.get("url"),
             "redirect_chain": redirect_chain(url, tree.get("url"), recorded.get("requests")),
@@ -904,11 +911,12 @@ impl Daemon {
             "media_type": "text/html",
             "text": text,
             "digest": stored.digest.hex,
+            "artifact_digest": stored.digest.hex,
             "classification": "original",
             "session_id": session_id,
             "operation_id": request.request_id,
             "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
-        }))
+        })))
     }
 
     fn store_bytes(
@@ -1052,14 +1060,14 @@ impl Daemon {
                 return Err(error.to_string());
             }
         };
-        let mut content = match WorkerProcess::spawn(&self.content_worker, WorkerKind::Content, token)
-        {
-            Ok(content) => content,
-            Err(error) => {
-                self.record_crash("content", reason, false);
-                return Err(error.to_string());
-            }
-        };
+        let mut content =
+            match WorkerProcess::spawn(&self.content_worker, WorkerKind::Content, token) {
+                Ok(content) => content,
+                Err(error) => {
+                    self.record_crash("content", reason, false);
+                    return Err(error.to_string());
+                }
+            };
         if let Err(error) = content.handshake() {
             self.record_crash("content", reason, false);
             return Err(error.to_string());
@@ -1217,7 +1225,7 @@ fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -
         request,
         ErrorObject::new(
             "engine_error",
-            message,
+            redact_secrets(&message.into()),
             request.request_id.clone(),
             exit_code,
             "retry the operation or inspect web.doctor",
@@ -1230,12 +1238,62 @@ fn limit_error(request: &Request, message: impl Into<String>) -> Response {
         request,
         ErrorObject::new(
             "resource_limit",
-            message,
+            redact_secrets(&message.into()),
             request.request_id.clone(),
             37,
             "close the session or raise the documented limit",
         ),
     )
+}
+
+const MODEL_TEXT_CHARS: usize = 4096;
+
+fn model_facing_source(mut source: serde_json::Value) -> serde_json::Value {
+    if let Some(text) = source
+        .get("text")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+    {
+        let truncated = text.chars().count() > MODEL_TEXT_CHARS;
+        let snippet: String = text.chars().take(MODEL_TEXT_CHARS).collect();
+        if let Some(object) = source.as_object_mut() {
+            object.insert("text".into(), json!(snippet));
+            object.insert("text_truncated".into(), json!(truncated));
+            if truncated {
+                object.insert("full_text".into(), json!("artifact"));
+            }
+        }
+    }
+    source
+}
+
+fn redact_secrets(input: &str) -> String {
+    let mut out = input.to_owned();
+    if let Some(scheme) = out.find("://") {
+        let rest_at = scheme + 3;
+        if let Some(at_rel) = out[rest_at..].find('@') {
+            let creds = &out[rest_at..rest_at + at_rel];
+            if let Some(colon) = creds.find(':') {
+                let user = creds[..colon].to_owned();
+                out.replace_range(rest_at..rest_at + at_rel, &format!("{user}:****"));
+            }
+        }
+    }
+    for key in ["password", "token", "secret", "authorization"] {
+        let needle = format!("{key}=");
+        let mut search_from = 0;
+        let lower = out.to_ascii_lowercase();
+        while let Some(rel) = lower[search_from..].find(&needle) {
+            let start = search_from + rel + needle.len();
+            let end = out[start..]
+                .find(|ch: char| matches!(ch, '&' | ' ' | '"' | '\'' | '\n' | '\r'))
+                .map(|idx| start + idx)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "****");
+            search_from = start + 4;
+        }
+    }
+    out
 }
 
 fn redirect_chain(
@@ -1336,5 +1394,29 @@ mod redirect_chain_tests {
                 "http://example.test/end".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn redact_secrets_masks_userinfo_and_password_query() {
+        assert_eq!(
+            super::redact_secrets("https://alice:s3cret@example.test/x"),
+            "https://alice:****@example.test/x"
+        );
+        let masked = super::redact_secrets("http://example.test/?password=s3cret&q=1");
+        assert!(!masked.contains("s3cret"), "{masked}");
+        assert!(masked.contains("password=****"), "{masked}");
+    }
+
+    #[test]
+    fn model_facing_source_truncates_long_text() {
+        let long = "x".repeat(5000);
+        let compact = super::model_facing_source(json!({
+            "text": long,
+            "digest": "abc"
+        }));
+        assert_eq!(compact["text_truncated"], true);
+        assert_eq!(compact["text"].as_str().unwrap().chars().count(), 4096);
+        assert_eq!(compact["full_text"], "artifact");
+        assert_eq!(compact["digest"], "abc");
     }
 }

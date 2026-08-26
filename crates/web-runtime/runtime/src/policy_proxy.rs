@@ -73,7 +73,9 @@ fn handle_connect(mut client: TcpStream, profile: SharedProfile, target: &str) -
             splice(client, server)
         }
         Err(_) => {
-            client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            client.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
             Ok(())
         }
     }
@@ -89,14 +91,18 @@ fn handle_forward(
     let (host, port, path) = match parse_http_target(target, head) {
         Some(parsed) => parsed,
         None => {
-            client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            client.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
             return Ok(());
         }
     };
     let addr = match pin_connect_addr(profile.get(), &host, port) {
         Ok(addr) => addr,
         Err(_) => {
-            client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            client.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
             return Ok(());
         }
     };
@@ -148,7 +154,9 @@ fn parse_http_target(target: &str, head: &str) -> Option<(String, u16, String)> 
         return Some((host, port, path));
     }
     if target.starts_with('/') {
-        let host_line = head.lines().find(|line| line.to_ascii_lowercase().starts_with("host:"))?;
+        let host_line = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("host:"))?;
         let hostport = host_line.split_once(':')?.1.trim();
         let (host, port) = split_host_port(hostport, 80);
         return Some((host, port, target.to_owned()));
@@ -254,7 +262,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else { return };
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let mut buf = [0_u8; 2048];
             let _ = stream.read(&mut buf);
             let header = format!(
@@ -269,9 +279,7 @@ mod tests {
 
     fn proxy_get(proxy: &PolicyProxy, url: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(proxy.addr()).unwrap();
-        let req = format!(
-            "GET {url} HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n"
-        );
+        let req = format!("GET {url} HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).unwrap();
@@ -304,11 +312,7 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let (status, extra, body) = if req.contains("GET /start") {
-                    (
-                        "302 Found",
-                        format!("Location: http://{addr}/end\r\n"),
-                        "",
-                    )
+                    ("302 Found", format!("Location: http://{addr}/end\r\n"), "")
                 } else {
                     ("200 OK", String::new(), "at-end")
                 };

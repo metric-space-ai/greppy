@@ -418,6 +418,25 @@ fn observe_read_search_research_screenshot_and_policy() {
         read.result.as_ref().unwrap()["untrusted_content_boundary"],
         "UNTRUSTED_PAGE_CONTENT"
     );
+    let source = &read.result.as_ref().unwrap()["source"];
+    assert!(
+        source["requested_url"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&origin),
+        "requested_url {source}"
+    );
+    let digest = source["digest"].as_str().unwrap_or("");
+    assert_eq!(digest.len(), 64, "digest {source}");
+    assert!(
+        source["retrieved_at"].as_str().unwrap_or("").len() > 4,
+        "retrieved_at {source}"
+    );
+    assert_eq!(source["classification"], "original");
+    assert_eq!(
+        source["untrusted_content_boundary"],
+        "UNTRUSTED_PAGE_CONTENT"
+    );
 
     let observed = unix_request(
         &socket,
@@ -905,6 +924,37 @@ fn local_package_contains_three_images() {
     assert!(dest.join("SHA256SUMS").exists());
     assert!(dest.join("sbom.json").exists());
     assert!(dest.join("UNSIGNED").exists());
+    assert!(dest.join("provenance.json").exists());
+    assert!(!dest.join("bin").join("phase1-probe").exists());
+    let mut hashes = Vec::new();
+    for name in [
+        "web-runtime-supervisor",
+        "web-controller-worker",
+        "web-content-worker",
+    ] {
+        let bytes = std::fs::read(dest.join("bin").join(name)).expect(name);
+        hashes.push(web_runtime::artifacts::hex_sha256(&bytes));
+    }
+    assert_eq!(hashes.len(), 3);
+    assert_ne!(
+        hashes[0], hashes[1],
+        "supervisor and controller must be distinct images"
+    );
+    assert_ne!(
+        hashes[0], hashes[2],
+        "supervisor and content must be distinct images"
+    );
+    assert_ne!(
+        hashes[1], hashes[2],
+        "controller and content must be distinct images"
+    );
+    let sums = std::fs::read_to_string(dest.join("SHA256SUMS")).expect("SHA256SUMS");
+    for digest in &hashes {
+        assert!(sums.contains(digest), "SHA256SUMS missing {digest}");
+    }
+    let sbom: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dest.join("sbom.json")).unwrap()).unwrap();
+    assert_eq!(sbom["components"].as_array().unwrap().len(), 3);
     let sign = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("scripts")
@@ -927,7 +977,17 @@ fn local_package_contains_three_images() {
     assert!(signed.join("UNSIGNED").exists());
     assert!(signed.join("NOTARIZATION_SKIPPED").exists());
     assert!(signed.join("provenance.json").exists());
-    let _ = std::fs::remove_dir_all(&dest);
+    let uninstall = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("uninstall-web-runtime.sh");
+    let status = Command::new("sh")
+        .arg(&uninstall)
+        .arg(&dest)
+        .status()
+        .expect("uninstall");
+    assert!(status.success(), "uninstall failed: {status}");
+    assert!(!dest.exists(), "uninstall left {dest:?}");
     let _ = std::fs::remove_dir_all(&signed);
 }
 
@@ -1700,11 +1760,9 @@ fn research_profile_denies_cloud_metadata() {
     assert_eq!(denied.error.as_ref().unwrap().code, "policy_denied");
 }
 
-
 #[test]
 fn wrong_run_id_is_session_not_owned() {
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-owned-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-owned-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_owner", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
@@ -1769,8 +1827,7 @@ fn read_redirect_chain_uses_recorded_navigation() {
         }
     });
     let origin = format!("http://{address}");
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-redir-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-redir-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_redir", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
@@ -1809,12 +1866,16 @@ fn read_redirect_chain_uses_recorded_navigation() {
         .unwrap_or_default();
     let final_url = source["final_url"].as_str().unwrap_or("");
     assert!(
-        chain.iter().any(|value| value.as_str() == Some(&format!("{origin}/start"))),
+        chain
+            .iter()
+            .any(|value| value.as_str() == Some(&format!("{origin}/start"))),
         "chain missing start: {chain:?}"
     );
     assert!(
         final_url.contains("/end")
-            || chain.iter().any(|value| value.as_str().is_some_and(|url| url.contains("/end"))),
+            || chain
+                .iter()
+                .any(|value| value.as_str().is_some_and(|url| url.contains("/end"))),
         "redirect evidence missing /end: final={final_url} chain={chain:?}"
     );
 }
@@ -1842,8 +1903,7 @@ fn goto_redirect_to_metadata_is_denied() {
         }
     });
     let origin = format!("http://{address}/jump");
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-jump-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-jump-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let script = r#"
 import { chromium } from "playwright";
@@ -1872,13 +1932,7 @@ await browser.close();
         command.arg("--fixture-url").arg(&origin);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
-    let ran = run_playwright_source(
-        &socket,
-        "run_jump",
-        script,
-        None,
-        Duration::from_secs(60),
-    );
+    let ran = run_playwright_source(&socket, "run_jump", script, None, Duration::from_secs(60));
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
 #[test]
@@ -1901,8 +1955,7 @@ fn nested_locators_tap_and_empty_workers() {
 
 #[test]
 fn route_abort_sets_request_failure() {
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-abort-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-abort-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let fixture = serve_fixture("<!DOCTYPE html><html><body>abort-host</body></html>");
     let _guard = Supervisor::spawn(&socket, "run_abort", |command| {
@@ -1954,6 +2007,288 @@ fn frames_content_frame_and_describe() {
 #[test]
 fn fail_closed_clock_coverage_request_and_handles() {
     run_named_fixture("fail-closed-surface.mjs", "run_failcl");
+}
+
+#[test]
+fn locator_strict_mode_rejects_ambiguous_click() {
+    run_named_fixture("strict-mode.mjs", "run_strict");
+}
+
+#[test]
+fn controller_module_policy_denies_host_filesystem() {
+    run_named_fixture("controller-module-policy.mjs", "run_modpol");
+}
+
+#[test]
+fn web_run_deadline_is_enforced_externally() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-deadline-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_deadln", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_deadln",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_deadln",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.waitForTimeout(30_000);\nawait browser.close();\n"
+        }),
+    );
+    run.deadline_ms = 1500;
+    let ran = unix_request(&socket, &run, Duration::from_secs(10)).expect("run");
+    assert_eq!(ran.status, "error", "{ran:?}");
+    let message = ran
+        .error
+        .as_ref()
+        .map(|e| e.message.clone())
+        .unwrap_or_default();
+    assert!(
+        message.contains("timed out")
+            || ran.error.as_ref().map(|e| e.code.as_str()) == Some("timeout"),
+        "expected deadline timeout, got {ran:?}"
+    );
+}
+
+#[test]
+fn idle_supervisor_workers_are_not_cpu_hot() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-idlecpu-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let supervisor = Supervisor::spawn(&socket, "run_idlecpu", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    thread::sleep(Duration::from_millis(1500));
+    let parent = supervisor.child.id();
+    let workers = child_pids(parent);
+    assert!(workers.len() >= 2, "workers {workers:?}");
+    for pid in workers {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "%cpu="])
+            .output()
+            .expect("ps cpu");
+        let cpu: f64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(100.0);
+        assert!(
+            cpu < 25.0,
+            "worker {pid} cpu {cpu} after idle; expected a quiet event loop"
+        );
+    }
+}
+
+#[test]
+fn max_pages_limit_is_enforced_by_supervisor() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-maxpg-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxpg", |command| {
+        command.env("GREPPY_WEB_MAX_PAGES", "0");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxpg",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>limit</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxpg",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+}
+
+#[test]
+fn idle_sessions_are_reaped() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-reap-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_reap", |command| {
+        command.env("GREPPY_WEB_IDLE_TTL_MS", "80");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_reap",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok");
+    thread::sleep(Duration::from_millis(250));
+    let listed = unix_request(
+        &socket,
+        &Request::new("run_reap", "web.session.list", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("list");
+    let sessions = listed.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        sessions.is_empty(),
+        "idle session should have been reaped: {sessions:?}"
+    );
+}
+
+#[test]
+fn policy_errors_redact_url_credentials() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-redact-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_redact", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_redact",
+            "web.session.create",
+            json!({ "profile": "research" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_redact",
+            "web.read",
+            json!({
+                "session_id": session_id,
+                "url": "http://alice:s3cret@127.0.0.1/"
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    let dumped = format!("{read:?}");
+    assert!(
+        !dumped.contains("s3cret"),
+        "secret leaked in policy error: {dumped}"
+    );
+    assert_eq!(read.error.as_ref().unwrap().code, "policy_denied");
+}
+
+#[test]
+fn large_read_is_truncated_and_artifact_backed() {
+    let body = format!(
+        "<!DOCTYPE html><html><body><p>{}</p></body></html>",
+        "playwright-compat ".repeat(400)
+    );
+    let origin = serve_fixture(Box::leak(body.into_boxed_str()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-bigread-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let store = std::env::temp_dir().join(format!("greppy-store-big-{}", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_bigread", |command| {
+        command.env("GREPPY_STORE_DIR", &store);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_bigread",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_bigread",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(60),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    let source = &read.result.as_ref().unwrap()["source"];
+    let text = source["text"].as_str().unwrap_or("");
+    assert!(text.len() <= 4096 + 32, "model text {}", text.len());
+    assert_eq!(source["text_truncated"], true);
+    assert_eq!(source["digest"].as_str().unwrap().len(), 64);
+    let artifacts = unix_request(
+        &socket,
+        &Request::new(
+            "run_bigread",
+            "web.artifacts",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("artifacts");
+    assert!(
+        artifacts.result.as_ref().unwrap()["artifacts"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 1,
+        "{artifacts:?}"
+    );
+}
+
+#[test]
+fn web_doctor_reports_process_health() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-doctor-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_doctor", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let doctor = unix_request(
+        &socket,
+        &Request::new("run_doctor", "web.doctor", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("doctor");
+    assert_eq!(doctor.status, "ok", "{doctor:?}");
+    assert_eq!(
+        doctor.result.as_ref().unwrap()["process_health"]["healthy"],
+        true
+    );
 }
 
 #[test]
@@ -2058,7 +2393,6 @@ fn run_named_fixture(name: &str, run_id: &str) {
 fn console_messages_are_captured_from_page_evaluate() {
     run_named_fixture("console-messages.mjs", "run_console");
 }
-
 
 #[test]
 fn hydrated_spa_wait_for_function_sees_async_dom_update() {

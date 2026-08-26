@@ -28,6 +28,16 @@ impl SessionLimits {
             limits.max_artifact_bytes = 4 * 1024 * 1024;
             limits.idle_ttl = Duration::from_secs(2 * 60);
         }
+        if let Ok(ms) = std::env::var("GREPPY_WEB_IDLE_TTL_MS") {
+            if let Ok(value) = ms.parse::<u64>() {
+                limits.idle_ttl = Duration::from_millis(value.clamp(20, 3_600_000));
+            }
+        }
+        if let Ok(pages) = std::env::var("GREPPY_WEB_MAX_PAGES") {
+            if let Ok(value) = pages.parse::<u32>() {
+                limits.max_pages = value;
+            }
+        }
         limits
     }
 

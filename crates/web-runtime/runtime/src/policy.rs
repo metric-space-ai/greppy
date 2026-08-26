@@ -343,7 +343,10 @@ mod tests {
                 "project should deny LAN {url}"
             );
             assert!(
-                matches!(decide_url(NetworkProfile::Research, url), UrlDecision::Deny { .. }),
+                matches!(
+                    decide_url(NetworkProfile::Research, url),
+                    UrlDecision::Deny { .. }
+                ),
                 "research should deny LAN {url}"
             );
         }
@@ -448,12 +451,7 @@ mod tests {
 
     #[test]
     fn pin_connect_addr_denies_metadata_and_lan_literals() {
-        assert!(pin_connect_addr(
-            NetworkProfile::Project,
-            "169.254.169.254",
-            80
-        )
-        .is_err());
+        assert!(pin_connect_addr(NetworkProfile::Project, "169.254.169.254", 80).is_err());
         assert!(pin_connect_addr(NetworkProfile::Project, "10.1.2.3", 80).is_err());
         assert!(pin_connect_addr(NetworkProfile::Research, "127.0.0.1", 9).is_err());
         assert!(pin_connect_addr(NetworkProfile::Project, "127.0.0.1", 9).is_ok());
@@ -464,20 +462,16 @@ mod tests {
         let public = "8.8.8.8:80".parse().unwrap();
         let lan = "10.0.0.1:80".parse().unwrap();
         let meta = "169.254.169.254:80".parse().unwrap();
-        let pinned = pin_connect_addr_with(
-            NetworkProfile::Research,
-            "mixed.test",
-            80,
-            |_, _| Ok(vec![lan, public]),
-        )
+        let pinned = pin_connect_addr_with(NetworkProfile::Research, "mixed.test", 80, |_, _| {
+            Ok(vec![lan, public])
+        })
         .expect("public A record remains usable");
         assert_eq!(pinned, public);
-        assert!(pin_connect_addr_with(
-            NetworkProfile::Research,
-            "rebind.test",
-            80,
-            |_, _| Ok(vec![public, meta]),
-        )
-        .is_err());
+        assert!(
+            pin_connect_addr_with(NetworkProfile::Research, "rebind.test", 80, |_, _| Ok(
+                vec![public, meta]
+            ),)
+            .is_err()
+        );
     }
 }
