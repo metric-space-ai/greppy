@@ -93,25 +93,31 @@ Rust crate licenses are declared by their packages and resolved in
 packaged source and attach it to the release. A tag is not publishable when the
 SBOM, model notices, checksums, signatures, or build provenance are missing.
 
+## Native filesystem adapters
+
+### WinFsp 2.1 (Windows filesystem transport)
+
+- Purpose: signed Windows kernel and user-mode transport for Greppy's Rust
+  portable workspace provider. WinFsp contains no Greppy namespace, Chunk-CoW,
+  Git, proposal, or policy logic.
+- Upstream: [`winfsp/winfsp`](https://github.com/winfsp/winfsp), release `v2.1`,
+  source commit `fde790d8ea41283606d1c56b557608a17e455f59`.
+- Distributed artifact: the unchanged official
+  `winfsp-2.1.25156.msi`, SHA-256
+  `073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`.
+- License: GPL-3.0 with WinFsp's FLOSS exception. Greppy is Apache-2.0 FLOSS;
+  the exception permits linking to the platform DLL and redistribution of the
+  unmodified official installer. Greppy does not use or redistribute the
+  separately GPL-3.0-licensed `winfsp-rs` crates.
+
+Required notice: WinFsp - Windows File System Proxy, Copyright (C) Bill
+Zissimopoulos. Source and complete license terms:
+<https://github.com/winfsp/winfsp>.
+
+The Windows provider's small C ABI bridge is original Greppy Apache-2.0 source;
+all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
+
 ## Ported third-party code
-
-### greppy-rift-core (filesystem snapshot mechanics)
-
-- Purpose: exact Filesystem-CoW workspaces for the integrated agent.
-- Upstream: [`anomalyco/rift`](https://github.com/anomalyco/rift), pinned at
-  `757a22cb247f9b24a849c9d6bd56f49c0ec494f8`.
-- Greppy hard fork: [`mkh-welsch/rift`](https://github.com/mkh-welsch/rift),
-  package `greppy-rift-core`, pinned by `Cargo.lock` and `Cargo.toml` at
-  `151100550fca311563ee8323d045a12182dead7c`.
-- License: MIT; see `licenses/RIFT-MIT.txt`.
-- Retained scope: empty snapshot-source preparation, Btrfs read-only source
-  sealing, APFS `clonefile`, Btrfs subvolume snapshot/removal, Linux `FICLONE`,
-  capability probing, and exact snapshot receipts.
-
-The fork deliberately removed Rift's CLI, JavaScript/Bun/Node FFI, workspace
-manager, SQLite registry, hooks, markers, Git policy, filtered-copy behavior,
-and source-conversion logic. Greppy owns Git isolation, lifecycle, fallback,
-and proposal publication; no compatibility with Rift's public API is claimed.
 
 ### pi (agent loop semantics)
 

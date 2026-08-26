@@ -58,7 +58,6 @@ enum VirtualPath {
 
 struct WindowsProvider {
     core: WorkspaceCore,
-    data_root: PathBuf,
     doctor_root: PathBuf,
     manifest: Arc<RwLock<ProviderManifest>>,
 }
@@ -92,7 +91,6 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
 
     let mut provider = Box::new(WindowsProvider {
         core,
-        data_root,
         doctor_root,
         manifest,
     });

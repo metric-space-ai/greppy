@@ -59,6 +59,7 @@ fn mounted_winfsp_provider_satisfies_workspace_and_private_git_contract() {
     let child = Command::new(env!("CARGO_BIN_EXE_greppy-workspace-provider"))
         .args(["--data-root", data.to_str().unwrap()])
         .args(["--mount-root", mount.to_str().unwrap()])
+        .env("GREPPY_WINFSP_DEBUG", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -67,10 +68,15 @@ fn mounted_winfsp_provider_satisfies_workspace_and_private_git_contract() {
     let _guard = MountGuard(child);
     let started = Instant::now();
     let provider = loop {
-        if let Ok(provider) = ProviderInstallation::require_healthy(&data) {
-            break provider;
+        match ProviderInstallation::require_healthy(&data) {
+            Ok(provider) => break provider,
+            Err(error) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "WinFsp provider did not become healthy: {error}"
+                );
+            }
         }
-        assert!(started.elapsed() < Duration::from_secs(20));
         thread::sleep(Duration::from_millis(100));
     };
     provider.doctor_io("windows-mount").unwrap();
