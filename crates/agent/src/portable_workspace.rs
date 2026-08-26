@@ -2084,12 +2084,12 @@ mod tests {
                         .map(|entry| entry.path())
                         .find(|path| path.join("COMPLETE").is_file())
                     {
-                        copy_test_tree(
-                            &template.join("payload"),
-                            &mount_for_git
-                                .join("workspaces")
-                                .join(git_workspace_id("test-run")),
-                        );
+                        let workspaces = mount_for_git.join("workspaces");
+                        let git_id = git_workspace_id("test-run");
+                        let staging = workspaces.join(format!(".{git_id}.publishing"));
+                        let destination = workspaces.join(git_id);
+                        copy_test_tree(&template.join("payload"), &staging);
+                        fs::rename(staging, destination).unwrap();
                         break;
                     }
                 }
