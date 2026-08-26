@@ -646,6 +646,10 @@ class Locator {
     return this;
   }
 
+  description() {
+    return this._description || null;
+  }
+
   toString() {
     return this._description || JSON.stringify(this._selector);
   }
@@ -840,14 +844,32 @@ class Frame {
 
   async goto(url, options) {
     if (this._id !== "main") {
-      return unsupported("Frame.goto.child")();
+      if (options != null) {
+        return unsupported("Frame.goto.options")();
+      }
+      const result = await engineCall("page.frameGoto", {
+        page: this._page._id,
+        index: Number(this._id),
+        url: String(url),
+      });
+      this._url = result.url || String(url);
+      return result;
     }
     return this._page.goto(url, options);
   }
 
-  async setContent(html) {
+  async setContent(html, options) {
+    if (options != null) {
+      return unsupported("Frame.setContent.options")();
+    }
     if (this._id !== "main") {
-      return unsupported("Frame.setContent.child")();
+      await this.evaluate((markup) => {
+        document.open();
+        document.write(String(markup));
+        document.close();
+        return true;
+      }, html);
+      return;
     }
     return this._page.setContent(html);
   }
@@ -857,24 +879,54 @@ class Frame {
   }
 
   async waitForLoadState(state) {
+    if (state != null && state !== "load" && state !== "domcontentloaded") {
+      return unsupported("Frame.waitForLoadState.state")();
+    }
     if (this._id !== "main") {
-      return unsupported("Frame.waitForLoadState.child")();
+      const wantComplete = state == null || state === "load";
+      const deadline = Date.now() + (this._page._timeout || 30_000);
+      while (Date.now() < deadline) {
+        const ready = await this.evaluate(() => document.readyState);
+        if (ready === "complete" || (!wantComplete && ready === "interactive")) {
+          return;
+        }
+        ops.op_sleep_ms(20);
+      }
+      throw new Error("timeout: Frame.waitForLoadState");
     }
     return this._page.waitForLoadState(state);
   }
 
   async addScriptTag(options) {
-    if (this._id !== "main") {
-      return unsupported("Frame.addScriptTag.child")();
+    if (options && (options.url || options.path || options.type)) {
+      return unsupported("Frame.addScriptTag.url")();
     }
-    return this._page.addScriptTag(options);
+    if (this._id !== "main") {
+      await this.evaluate((source) => {
+        const script = document.createElement("script");
+        script.textContent = String(source || "");
+        document.documentElement.appendChild(script);
+        return true;
+      }, (options && options.content) || "");
+      return;
+    }
+    return this._page.addScriptTag(options || {});
   }
 
   async addStyleTag(options) {
-    if (this._id !== "main") {
-      return unsupported("Frame.addStyleTag.child")();
+    if (options && (options.url || options.path)) {
+      return unsupported("Frame.addStyleTag.url")();
     }
-    return this._page.addStyleTag(options);
+    if (this._id !== "main") {
+      await this.evaluate((css) => {
+        const style = document.createElement("style");
+        style.textContent = String(css || "");
+        document.documentElement.appendChild(style);
+        return true;
+      }, (options && options.content) || "");
+      return;
+    }
+    return this._page.addStyleTag(options || {});
   }
 
   hover(selector) {
@@ -997,24 +1049,43 @@ class Frame {
   }
 
   waitForTimeout(ms) {
-    if (!this._isMain()) {
-      throwUnsupported("Frame.waitForTimeout.child");
-    }
     return this._page.waitForTimeout(ms);
   }
 
-  waitForFunction(pageFunction, arg) {
-    if (!this._isMain()) {
-      throwUnsupported("Frame.waitForFunction.child");
+  async waitForFunction(pageFunction, arg, options) {
+    if (options != null) {
+      return unsupported("Frame.waitForFunction.options")();
     }
-    return this._page.waitForFunction(pageFunction, arg);
+    const deadline = Date.now() + (this._page._timeout || 30_000);
+    while (Date.now() < deadline) {
+      const value = await this.evaluate(pageFunction, arg);
+      if (value) {
+        return value;
+      }
+      ops.op_sleep_ms(20);
+    }
+    throw new Error("timeout: Frame.waitForFunction");
   }
 
-  waitForURL(pattern) {
-    if (!this._isMain()) {
-      throwUnsupported("Frame.waitForURL.child");
+  async waitForURL(pattern, options) {
+    if (options != null) {
+      return unsupported("Frame.waitForURL.options")();
     }
-    return this._page.waitForURL(pattern);
+    if (pattern instanceof RegExp || typeof pattern === "function") {
+      return unsupported("Frame.waitForURL.pattern")();
+    }
+    const needle = String(pattern);
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const url = this._isMain()
+        ? await this._page.url()
+        : await this.evaluate(() => String(location.href));
+      if (String(url).includes(needle)) {
+        return url;
+      }
+      ops.op_sleep_ms(20);
+    }
+    throw new Error("timeout: Frame.waitForURL " + needle);
   }
 
   waitForNavigation() {
@@ -1042,7 +1113,8 @@ class Frame {
     if (!this._isMain()) {
       throwUnsupported("Frame.childFrames.nested");
     }
-    return this._page.frames();
+    const frames = await this._page.frames();
+    return frames.filter((frame) => !frame._isMain());
   }
 }
 
@@ -1533,6 +1605,10 @@ class Page {
         this._pendingConsole.push(payload);
       }
       this._emit("console", payload);
+      if ((rec.type || "log") === "error") {
+        const error = new Error(rec.text || "");
+        this._emit("pageerror", error);
+      }
     }
     this._consoleSeen = messages.length;
   }
@@ -1668,7 +1744,12 @@ class Page {
 
   async frames() {
     const result = await engineCall("page.frames", { page: this._id });
-    return (result.frames || []).map((info) => new Frame(this, info));
+    const children = (result.frames || []).map((info) => new Frame(this, info));
+    const main = this.mainFrame();
+    try {
+      main._url = await this.url();
+    } catch (_error) {}
+    return [main, ...children];
   }
 
   async frame(options = {}) {
@@ -1788,7 +1869,8 @@ class Page {
       event === "response" ||
       event === "download" ||
       event === "popup" ||
-      event === "console"
+      event === "console" ||
+      event === "pageerror"
     ) {
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);

@@ -1453,6 +1453,67 @@ impl ContentEngine {
                 };
                 Ok(json!({ "frames": frames }))
             }
+            "page.frameIsDetached" => {
+                let page_id = required_str(&params, "page")?;
+                let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(index) {{ return !document.querySelectorAll('iframe')[index]; }})({index})"
+                );
+                let detached = match self.evaluate(webview, &source)? {
+                    JSValue::Boolean(value) => value,
+                    other => matches!(other, JSValue::String(text) if text == "true"),
+                };
+                Ok(json!({ "detached": detached }))
+            }
+            "page.frameGoto" => {
+                let page_id = required_str(&params, "page")?;
+                let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let url = required_str(&params, "url")?;
+                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("policy_denied: {reason}"),
+                    ));
+                }
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(index, url) {{ var frame = document.querySelectorAll('iframe')[index]; if (!frame) throw new Error('no frame'); try {{ frame.contentWindow.location.replace(url); }} catch (e) {{ frame.src = url; }} return String(url); }})({index}, {})",
+                    serde_json::to_string(&url).map_err(io::Error::other)?
+                );
+                let assigned = match self.evaluate(webview.clone(), &source)? {
+                    JSValue::String(text) => text,
+                    _ => url.clone(),
+                };
+                let ready_script = format!(
+                    "(function(index, want) {{ var frame = document.querySelectorAll('iframe')[index]; if (!frame) return false; try {{ var loc = String(frame.contentWindow.location.href || ''); var doc = frame.contentDocument; return loc.indexOf(want) !== -1 && doc && (doc.readyState === 'complete' || doc.readyState === 'interactive'); }} catch (e) {{ return false; }} }})({index}, {})",
+                    serde_json::to_string(&url).map_err(io::Error::other)?
+                );
+                let deadline = Instant::now() + ACTION_TIMEOUT;
+                loop {
+                    if self.parent_dead() {
+                        return Err(Self::parent_gone());
+                    }
+                    let ready = match self.evaluate(webview.clone(), &ready_script) {
+                        Ok(JSValue::Boolean(value)) => value,
+                        Ok(JSValue::String(text)) => text == "true",
+                        Ok(_) => false,
+                        Err(_) => false,
+                    };
+                    if ready {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out waiting for frame navigation",
+                        ));
+                    }
+                    self.servo.spin_event_loop();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(json!({ "url": assigned }))
+            }
             "page.frameEvaluate" => {
                 let page_id = required_str(&params, "page")?;
                 let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);

@@ -7,6 +7,10 @@ const handler = (msg) => {
   seen.push(msg.text());
 };
 page.on("console", handler);
+const pageErrorsSeen = [];
+page.on("pageerror", (error) => {
+  pageErrorsSeen.push(String(error && error.message));
+});
 const waited = page.waitForEvent("console");
 await page.evaluate(() => {
   console.log("hello-console");
@@ -27,6 +31,9 @@ if (!errors.some((error) => String(error.message).includes("boom-err"))) {
 const waitedError = await page.waitForEvent("pageerror");
 if (!String(waitedError.message).includes("boom-err")) {
   throw new Error("waitForEvent pageerror " + waitedError.message);
+}
+if (!pageErrorsSeen.some((message) => message.includes("boom-err"))) {
+  throw new Error("page.on pageerror " + JSON.stringify(pageErrorsSeen));
 }
 await page.clearPageErrors();
 const afterErrors = await page.pageErrors();

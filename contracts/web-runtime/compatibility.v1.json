@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 263,
-    "unsupported": 290,
-    "unverified": 801
+    "implemented": 292,
+    "unsupported": 289,
+    "unverified": 773
   },
   "entries": [
     {
@@ -442,7 +442,7 @@
         "frames"
       ],
       "known_differences": [
-        "same-origin iframes via querySelectorAll"
+        "returns main frame plus same-origin iframes from querySelectorAll; nested frames stay fail-closed"
       ]
     },
     {
@@ -2173,11 +2173,15 @@
       "symbol": "Page.event.console",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "page.on(console) emits ConsoleMessage {text,type,page} from Servo show_console_message records after evaluate; not Chromium ConsoleMessage.args/location"
+      ]
     },
     {
       "symbol": "Page.event.crash",
@@ -2280,7 +2284,8 @@
         "console-messages"
       ],
       "known_differences": [
-        "waitForEvent(pageerror) returns console.error Errors; not window.onerror"
+        "waitForEvent(pageerror) returns console.error Errors; not window.onerror",
+        "page.on(pageerror) is emitted from console.error records during _dispatchConsole"
       ]
     },
     {
@@ -2365,10 +2370,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main frame only; child frames throw unsupported_playwright_operation"
+        "content injection only; url/path/type throw unsupported_playwright_operation",
+        "child same-origin iframe appends a script element via frameEvaluate; return value is not an ElementHandle"
       ]
     },
     {
@@ -2379,10 +2386,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main frame only; child frames throw unsupported_playwright_operation"
+        "content injection only; url/path throw unsupported_playwright_operation",
+        "child same-origin iframe appends a style element via frameEvaluate; return value is not an ElementHandle"
       ]
     },
     {
@@ -2410,8 +2419,7 @@
         "frames"
       ],
       "known_differences": [
-        "main returns top-level iframe Frame objects from page.frames()",
-        "nested iframe childFrames throw unsupported_playwright_operation; empty-array would be fabricated success"
+        "main frame returns the page iframe list excluding main; nested childFrames throw unsupported_playwright_operation"
       ]
     },
     {
@@ -2692,10 +2700,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-headers"
+        "extra-headers",
+        "frames"
       ],
       "known_differences": [
-        "main frame only; child frames throw unsupported_playwright_operation"
+        "main frame delegates to Page.goto; options throw",
+        "child same-origin iframe assigns iframe.src after decide_url, waits for contentDocument.readyState; options throw; returns {url} not a Playwright Response"
       ]
     },
     {
@@ -2783,8 +2793,8 @@
         "frames"
       ],
       "known_differences": [
-        "main frame returns false while the Page is open",
-        "child frames throw unsupported_playwright_operation; detach tracking is not implemented"
+        "synchronous; main frame returns false while the Page is open",
+        "child frames throw unsupported_playwright_operation; live detach tracking is not implemented"
       ]
     },
     {
@@ -2966,11 +2976,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main frame only",
-        "main frame only; child frames throw unsupported_playwright_operation"
+        "main frame uses page.setContent",
+        "child same-origin iframe uses document.open/write/close via frameEvaluate; options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -3059,10 +3070,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main-frame only; child frames throw unsupported_playwright_operation"
+        "polls Frame.evaluate until truthy; returns the value not a JSHandle",
+        "child frames use frameEvaluate; polling/timeout options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -3073,10 +3086,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "frames"
       ],
       "known_differences": [
-        "main frame only; child frames throw unsupported_playwright_operation"
+        "main frame waits for Servo LoadStatus::Complete",
+        "child same-origin iframe polls document.readyState; networkidle and other states throw unsupported_playwright_operation"
       ]
     },
     {
@@ -3114,10 +3129,11 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "frames"
       ],
       "known_differences": [
-        "main-frame only; child frames throw unsupported_playwright_operation"
+        "sleeps via page.waitForTimeout regardless of frame; not a frame-scoped clock"
       ]
     },
     {
@@ -3128,10 +3144,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-headers"
+        "extra-headers",
+        "frames"
       ],
       "known_differences": [
-        "main-frame only; child frames throw unsupported_playwright_operation"
+        "substring match on location.href; regex/function/options throw unsupported_playwright_operation",
+        "child frames poll frameEvaluate location.href"
       ]
     },
     {
@@ -6130,11 +6148,15 @@
       "symbol": "Locator.description",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "returns the string last passed to Locator.describe, or null; not a live Playwright description object"
+      ]
     },
     {
       "symbol": "Locator.dispatchEvent",
@@ -15477,8 +15499,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1047,
-    "unsupported": 290,
+    "unverified": 1048,
+    "unsupported": 289,
     "passing": 17
   }
 }

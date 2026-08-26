@@ -6,8 +6,11 @@ await page.setContent(
   `<!DOCTYPE html><html><body><iframe name="child" srcdoc="<p id='in'>frame-ok</p><button>Go</button><label>Name<input placeholder='search'></label>"></iframe></body></html>`,
 );
 const frames = await page.frames();
-if (frames.length < 1) {
-  throw new Error("expected iframe, got " + frames.length);
+if (frames.length < 2) {
+  throw new Error("expected main+iframe, got " + frames.length);
+}
+if (frames[0].parentFrame() !== null) {
+  throw new Error("frames()[0] should be the main frame");
 }
 const child = await page.frame({ name: "child" });
 if (!child) {
@@ -31,6 +34,9 @@ if (child.parentFrame() !== main && child.parentFrame()._id !== "main") {
   throw new Error("child parentFrame");
 }
 const kids = await main.childFrames();
+if (kids.some((frame) => frame._isMain())) {
+  throw new Error("childFrames included main");
+}
 if (!kids.some((frame) => frame.name() === "child")) {
   throw new Error("main childFrames missing child");
 }
@@ -46,6 +52,9 @@ const described = page.locator("iframe").describe("child-iframe");
 if (!String(described.toString()).includes("child-iframe")) {
   throw new Error("locator.describe/toString " + described.toString());
 }
+if (described.description() !== "child-iframe") {
+  throw new Error("locator.description " + described.description());
+}
 const viaContent = await page.locator("iframe").contentFrame().locator("#in").innerText();
 if (viaContent.trim() !== "frame-ok") throw new Error("contentFrame " + viaContent);
 const viaNested = await page.locator("body").frameLocator("iframe").locator("#in").innerText();
@@ -58,6 +67,28 @@ if ((await page.frameLocator("iframe").getByPlaceholder("search").count()) !== 1
 }
 const mainNested = await main.frameLocator("iframe").locator("#in").innerText();
 if (mainNested.trim() !== "frame-ok") throw new Error("main frameLocator " + mainNested);
+
+await child.setContent(
+  "<!DOCTYPE html><html><body><p id='in'>rewritten</p></body></html>",
+);
+if ((await child.locator("#in").innerText()).trim() !== "rewritten") {
+  throw new Error("child setContent " + (await child.locator("#in").innerText()));
+}
+await child.addStyleTag({ content: "p { font-weight: 700; }" });
+await child.addScriptTag({ content: "window.__child_tag = 7;" });
+if ((await child.evaluate(() => window.__child_tag)) !== 7) {
+  throw new Error("child addScriptTag");
+}
+await child.waitForLoadState();
+await child.waitForTimeout(10);
+if (!(await child.waitForFunction(() => document.getElementById("in")))) {
+  throw new Error("child waitForFunction");
+}
+await child.goto("about:blank");
+const blank = await child.waitForURL("about:blank");
+if (!String(blank).includes("about:blank")) {
+  throw new Error("child goto/waitForURL " + blank);
+}
 
 function expectUnsupported(label, fn) {
   let failed = false;
