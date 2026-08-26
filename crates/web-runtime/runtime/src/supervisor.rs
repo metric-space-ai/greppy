@@ -16,7 +16,7 @@ const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct Config {
     pub controller_worker: PathBuf,
     pub content_worker: PathBuf,
-    pub script: Option<PathBuf>,
+    pub scripts: Vec<PathBuf>,
     pub fixture_url: Option<String>,
 }
 
@@ -24,7 +24,7 @@ impl Config {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut controller_worker = None;
         let mut content_worker = None;
-        let mut script = None;
+        let mut scripts = Vec::new();
         let mut fixture_url = None;
         let mut args = args.into_iter();
 
@@ -37,7 +37,9 @@ impl Config {
                     set_path(&mut content_worker, "--content-worker", args.next())?;
                 }
                 Some("--script") => {
+                    let mut script = None;
                     set_path(&mut script, "--script", args.next())?;
+                    scripts.push(script.expect("script path"));
                 }
                 Some("--fixture-url") => {
                     let value = args
@@ -62,7 +64,7 @@ impl Config {
                 .ok_or_else(|| "missing --controller-worker PATH".to_owned())?,
             content_worker: content_worker
                 .ok_or_else(|| "missing --content-worker PATH".to_owned())?,
-            script,
+            scripts,
             fixture_url,
         })
     }
@@ -101,7 +103,7 @@ pub fn run(config: Config) -> io::Result<()> {
     content.handshake()?;
     println!("web_runtime.content=ready");
 
-    if let Some(script) = &config.script {
+    for script in &config.scripts {
         let fixture_url = config.fixture_url.clone().unwrap_or_default();
         run_script(&mut controller, &mut content, script, fixture_url)?;
         println!("web_runtime.script=ok");
@@ -425,7 +427,7 @@ mod tests {
 
         assert_eq!(config.controller_worker, PathBuf::from("controller"));
         assert_eq!(config.content_worker, PathBuf::from("content"));
-        assert_eq!(config.script, None);
+        assert_eq!(config.scripts, Vec::<PathBuf>::new());
     }
 
     #[test]

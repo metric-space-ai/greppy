@@ -20,8 +20,9 @@ use web_runtime::worker::require_capability;
 const PLAYWRIGHT_JS: &str = include_str!("../../js/playwright.mjs");
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Clone)]
 struct EngineBridge {
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     stdout: Arc<Mutex<io::Stdout>>,
     pending: Arc<
         Mutex<
@@ -127,15 +128,12 @@ fn run(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     let _capability = require_capability(std::env::args_os().skip(1))?;
     let stdout = Arc::new(Mutex::new(io::stdout()));
     let pending = Arc::new(Mutex::new(HashMap::new()));
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(Rc::new(PlaywrightLoader)),
-        extensions: vec![greppy_playwright::init(EngineBridge {
-            next_id: AtomicU64::new(1),
-            stdout: Arc::clone(&stdout),
-            pending: Arc::clone(&pending),
-        })],
-        ..Default::default()
-    });
+    let bridge = EngineBridge {
+        next_id: Arc::new(AtomicU64::new(1)),
+        stdout: Arc::clone(&stdout),
+        pending: Arc::clone(&pending),
+    };
+    let mut runtime = new_js_runtime(bridge.clone());
     runtime
         .execute_script("<web-controller-worker>", "1 + 1")
         .map_err(|error| io::Error::other(format!("JavaScript startup probe failed: {error}")))?;
@@ -205,26 +203,28 @@ fn run(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
             )
         })?;
 
-    match recv_control(&control_rx)? {
-        Message::Shutdown { .. } => {
-            drop(runtime);
-            let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
-            return write_message(&mut *stdout, &Message::shutdown_ack(WorkerKind::Controller));
-        }
-        Message::RunScript {
-            specifier,
-            source,
-            fixture_url,
-            ..
-        } => {
-            let result = run_script(
-                &tokio_runtime,
-                &mut runtime,
-                &specifier,
+    loop {
+        match recv_control(&control_rx)? {
+            Message::Shutdown { .. } => {
+                drop(runtime);
+                let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
+                return write_message(&mut *stdout, &Message::shutdown_ack(WorkerKind::Controller));
+            }
+            Message::RunScript {
+                specifier,
                 source,
                 fixture_url,
-            );
-            {
+                ..
+            } => {
+                drop(runtime);
+                runtime = new_js_runtime(bridge.clone());
+                let result = run_script(
+                    &tokio_runtime,
+                    &mut runtime,
+                    &specifier,
+                    source,
+                    fixture_url,
+                );
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
                     Ok(()) => write_message(
@@ -237,28 +237,24 @@ fn run(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     )?,
                 }
             }
-        }
-        unexpected => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "controller worker expected RunScript or Shutdown, received {unexpected:?}"
-                ),
-            ));
+            unexpected => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "controller worker expected RunScript or Shutdown, received {unexpected:?}"
+                    ),
+                ));
+            }
         }
     }
+}
 
-    match recv_control(&control_rx)? {
-        Message::Shutdown { .. } => {
-            drop(runtime);
-            let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
-            write_message(&mut *stdout, &Message::shutdown_ack(WorkerKind::Controller))
-        }
-        unexpected => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("controller worker expected Shutdown, received {unexpected:?}"),
-        )),
-    }
+fn new_js_runtime(bridge: EngineBridge) -> JsRuntime {
+    JsRuntime::new(RuntimeOptions {
+        module_loader: Some(Rc::new(PlaywrightLoader)),
+        extensions: vec![greppy_playwright::init(bridge)],
+        ..Default::default()
+    })
 }
 
 fn recv_control(control_rx: &mpsc::Receiver<io::Result<Message>>) -> io::Result<Message> {

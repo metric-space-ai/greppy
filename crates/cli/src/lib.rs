@@ -77,6 +77,7 @@ use edit::*;
 mod search;
 use search::*;
 mod read;
+mod web;
 use read::*;
 mod plus;
 use plus::*;
@@ -1799,6 +1800,7 @@ fn dispatch_subcommand(
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
+        Command::Web { command } => web::dispatch(command),
         Command::WhoCalls {
             symbols,
             path_opts,
@@ -8199,6 +8201,10 @@ fn command_requests_json(command: Option<&Command>) -> bool {
         | Some(Command::Plus { json, .. })
         | Some(Command::Search { json, .. })
         | Some(Command::Context { json, .. }) => *json,
+        Some(Command::Web {
+            command:
+                WebCommand::Status { json } | WebCommand::Doctor { json } | WebCommand::Run { json, .. },
+        }) => *json,
         _ => false,
     }
 }

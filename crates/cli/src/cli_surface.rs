@@ -718,6 +718,11 @@ pub enum Command {
         #[arg(long)]
         prewarm: bool,
     },
+    /// Experimental web runtime. Not a production Playwright compatibility claim.
+    Web {
+        #[command(subcommand)]
+        command: WebCommand,
+    },
     /// Internal: warm Qwen3.5 summarization daemon for `brief`.
     #[cfg(any(unix, windows))]
     #[command(hide = true, name = "summarize-daemon")]
@@ -733,5 +738,28 @@ pub enum Command {
         /// Load the model immediately at startup instead of on first request.
         #[arg(long)]
         prewarm: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebCommand {
+    /// Report experimental web-runtime availability. Does not link engines.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check supervisor and worker images without constructing engines.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one unchanged Playwright script through the isolated supervisor.
+    Run {
+        #[arg(long)]
+        script_file: Option<String>,
+        #[arg(long)]
+        script_stdin: bool,
+        #[arg(long)]
+        json: bool,
     },
 }

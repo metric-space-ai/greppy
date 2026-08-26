@@ -57,3 +57,32 @@ fn unchanged_playwright_script_controls_servo_across_process_boundary() {
     );
     assert!(stdout.contains("web_runtime.supervisor=stopped"));
 }
+
+#[test]
+fn supervisor_reuses_workers_for_two_scripts() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/spike.mjs");
+    let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
+    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime-supervisor"))
+        .arg("--controller-worker")
+        .arg(env!("CARGO_BIN_EXE_web-controller-worker"))
+        .arg("--content-worker")
+        .arg(env!("CARGO_BIN_EXE_web-content-worker"))
+        .arg("--script")
+        .arg(&script)
+        .arg("--script")
+        .arg(&script)
+        .arg("--fixture-url")
+        .arg(&fixture)
+        .output()
+        .expect("supervisor must launch two scripts");
+
+    assert!(
+        output.status.success(),
+        "two-script session failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert_eq!(stdout.matches("web_runtime.script=ok").count(), 2);
+}
