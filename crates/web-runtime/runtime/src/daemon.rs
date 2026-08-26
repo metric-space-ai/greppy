@@ -161,6 +161,9 @@ impl Daemon {
                 "web.search".into(),
                 "web.research".into(),
                 "web.artifacts".into(),
+                "page.route".into(),
+                "page.frames".into(),
+                "page.setInputFiles".into(),
             ],
             compatibility_coverage_level: "unverified".to_owned(),
             max_message_bytes: greppy_web_client::MAX_FRAME_BYTES as u64,
@@ -197,6 +200,10 @@ impl Daemon {
                 "content_alive": self.content.is_running(),
                 "last_crash": self.last_crash.clone(),
                 "engines_linked_into_greppy_parent": false,
+                "signed_distributable": false,
+                "oracle_receipt": "contracts/web-runtime/receipts/oracle-skip.json",
+                "inventory_entries": 1354,
+                "compatibility_coverage_level_note": "schema implemented is not Chromium oracle behavior",
             }),
         )
     }
