@@ -1682,6 +1682,148 @@ fn mouse_init_script_viewport_and_locator_all() {
 }
 
 #[test]
+fn read_redirect_chain_uses_recorded_navigation() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let n = stream.read(&mut buffer).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buffer[..n]);
+            let (status, extra, body) = if req.contains("GET /start") {
+                (
+                    "302 Found",
+                    format!("Location: http://{address}/end\r\n"),
+                    "",
+                )
+            } else {
+                ("200 OK", String::new(), "redirect-end")
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    let origin = format!("http://{address}");
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-redir-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_redir", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_redir",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_redir",
+            "web.read",
+            json!({
+                "session_id": session_id,
+                "url": format!("{origin}/start"),
+            }),
+        ),
+        Duration::from_secs(60),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    let source = read.result.as_ref().unwrap()["source"].clone();
+    let chain = source["redirect_chain"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let final_url = source["final_url"].as_str().unwrap_or("");
+    assert!(
+        chain.iter().any(|value| value.as_str() == Some(&format!("{origin}/start"))),
+        "chain missing start: {chain:?}"
+    );
+    assert!(
+        final_url.contains("/end")
+            || chain.iter().any(|value| value.as_str().is_some_and(|url| url.contains("/end"))),
+        "redirect evidence missing /end: final={final_url} chain={chain:?}"
+    );
+}
+
+#[test]
+fn goto_redirect_to_metadata_is_denied() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind jump");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = b"";
+            let header = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://169.254.169.254/latest/meta-data/\r\n",
+                "Content-Length: 0\r\n",
+                "Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    let origin = format!("http://{address}/jump");
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-jump-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+let failed = false;
+try {
+  await page.goto(fixtureUrl);
+} catch (error) {
+  failed = true;
+}
+const url = await page.url();
+if (String(url).includes("169.254.169.254")) {
+  throw new Error("landed on metadata " + url);
+}
+const text = await page.evaluate(() => (document.body && document.body.innerText) || "");
+if (String(text).toLowerCase().includes("ami-id")) {
+  throw new Error("metadata body leaked through redirect");
+}
+if (!failed && String(url).includes("169.254")) {
+  throw new Error("redirect to metadata succeeded");
+}
+await browser.close();
+"#;
+    let _guard = Supervisor::spawn(&socket, "run_jump", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_jump",
+        script,
+        None,
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+#[test]
 fn nested_locators_tap_and_empty_workers() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-nested-{}.sock", std::process::id()));

@@ -792,6 +792,18 @@ impl Daemon {
                 }
             },
         };
+        let profile = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.profile)
+            .unwrap_or(NetworkProfile::Research);
+        if let Err(error) = self.engine_call(
+            "session.setProfile",
+            json!({ "profile": profile.as_str() }),
+        ) {
+            self.finish_session(&session_id);
+            return Err(engine_error(request, error, 34));
+        }
         Ok((session_id, page))
     }
 
@@ -834,6 +846,9 @@ impl Daemon {
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
+        let recorded = self
+            .engine_call("page.requests", json!({ "page": page }))
+            .unwrap_or_else(|_| json!({ "requests": [] }));
         let text = tree
             .get("text")
             .and_then(|v| v.as_str())
@@ -855,7 +870,7 @@ impl Daemon {
         Ok(json!({
             "requested_url": url,
             "final_url": tree.get("url"),
-            "redirect_chain": [url],
+            "redirect_chain": redirect_chain(url, tree.get("url"), recorded.get("requests")),
             "retrieved_at": stored.timestamp,
             "title": title,
             "media_type": "text/html",
@@ -1151,6 +1166,37 @@ fn limit_error(request: &Request, message: impl Into<String>) -> Response {
     )
 }
 
+fn redirect_chain(
+    requested: &str,
+    final_url: Option<&serde_json::Value>,
+    requests: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let mut chain = vec![requested.to_owned()];
+    if let Some(serde_json::Value::Array(rows)) = requests {
+        for row in rows {
+            let Some(url) = row.get("url").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let main = row
+                .get("main_frame")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !main {
+                continue;
+            }
+            if chain.last().map(String::as_str) != Some(url) {
+                chain.push(url.to_owned());
+            }
+        }
+    }
+    if let Some(final_url) = final_url.and_then(|value| value.as_str()) {
+        if chain.last().map(String::as_str) != Some(final_url) {
+            chain.push(final_url.to_owned());
+        }
+    }
+    chain
+}
+
 fn run_script_on_workers(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
@@ -1176,4 +1222,47 @@ fn random_token() -> io::Result<String> {
 
 pub fn socket_exists(path: &Path) -> bool {
     path.exists()
+}
+
+#[cfg(test)]
+mod redirect_chain_tests {
+    use super::redirect_chain;
+    use serde_json::json;
+
+    #[test]
+    fn recorded_main_frame_hops_are_kept() {
+        let requests = json!([
+            {"url": "http://example.test/start", "main_frame": true},
+            {"url": "http://example.test/asset.css", "main_frame": false},
+            {"url": "http://example.test/end", "main_frame": true, "redirect": true}
+        ]);
+        let chain = redirect_chain(
+            "http://example.test/start",
+            Some(&json!("http://example.test/end")),
+            Some(&requests),
+        );
+        assert_eq!(
+            chain,
+            vec![
+                "http://example.test/start".to_owned(),
+                "http://example.test/end".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn final_url_is_appended_when_requests_are_missing() {
+        let chain = redirect_chain(
+            "http://example.test/start",
+            Some(&json!("http://example.test/end")),
+            None,
+        );
+        assert_eq!(
+            chain,
+            vec![
+                "http://example.test/start".to_owned(),
+                "http://example.test/end".to_owned()
+            ]
+        );
+    }
 }

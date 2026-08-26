@@ -7,7 +7,7 @@ use servo::{
     SoftwareRenderingContext, UrlRequest, WebResourceLoad, WebResourceResponse, WebView,
     WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
@@ -65,13 +65,18 @@ struct Delegate {
     viewport: RefCell<(u32, u32)>,
     extra_headers: RefCell<Vec<(String, String)>>,
     last_console: RefCell<Vec<serde_json::Value>>,
+    profile: Rc<Cell<NetworkProfile>>,
+    denied_navigation: RefCell<Option<String>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
 impl Delegate {
-    fn new(rendering_context: Rc<dyn RenderingContext>) -> Self {
+    fn new(
+        rendering_context: Rc<dyn RenderingContext>,
+        profile: Rc<Cell<NetworkProfile>>,
+    ) -> Self {
         Self {
             new_frame_ready: RefCell::new(false),
             routes: RefCell::new(Vec::new()),
@@ -86,6 +91,8 @@ impl Delegate {
             viewport: RefCell::new((800, 600)),
             extra_headers: RefCell::new(Vec::new()),
             last_console: RefCell::new(Vec::new()),
+            profile,
+            denied_navigation: RefCell::new(None),
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
             opener_id: RefCell::new(None),
@@ -119,7 +126,10 @@ impl WebViewDelegate for Delegate {
     fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
         let child = request
             .builder(Rc::clone(&self.rendering_context))
-            .delegate(Rc::new(Delegate::new(Rc::clone(&self.rendering_context))))
+            .delegate(Rc::new(Delegate::new(
+                Rc::clone(&self.rendering_context),
+                Rc::clone(&self.profile),
+            )))
             .build();
         child.show();
         self.popups.borrow_mut().push((child, parent));
@@ -197,10 +207,10 @@ impl WebViewDelegate for Delegate {
             "redirect": load.request.is_redirect,
             "headers": headers,
         }));
-        if let UrlDecision::Deny {
-            reason: "cloud metadata endpoint denied",
-        } = decide_url(NetworkProfile::Project, &url)
-        {
+        if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+            if load.request.is_for_main_frame {
+                *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
+            }
             let denied_url = load.request.url.clone();
             load.intercept(WebResourceResponse::new(denied_url)).cancel();
             return;
@@ -300,7 +310,7 @@ struct ContentEngine {
     next_id: u64,
     parent_alive: Arc<AtomicBool>,
     wake: Arc<AtomicBool>,
-    profile: NetworkProfile,
+    profile: Rc<Cell<NetworkProfile>>,
 }
 
 impl ContentEngine {
@@ -331,7 +341,7 @@ impl ContentEngine {
             next_id: 1,
             parent_alive,
             wake,
-            profile: NetworkProfile::Research,
+            profile: Rc::new(Cell::new(NetworkProfile::Research)),
         })
     }
 
@@ -514,7 +524,10 @@ impl ContentEngine {
             }
             "context.newPage" => {
                 let page = self.alloc_id("page");
-                let delegate = Rc::new(Delegate::new(Rc::clone(&self.rendering_context)));
+                let delegate = Rc::new(Delegate::new(
+                    Rc::clone(&self.rendering_context),
+                    Rc::clone(&self.profile),
+                ));
                 let webview = WebViewBuilder::new(&self.servo, Rc::clone(&self.rendering_context))
                     .delegate(delegate.clone())
                     .build();
@@ -532,15 +545,16 @@ impl ContentEngine {
             }
             "session.setProfile" => {
                 let name = required_str(&params, "profile")?;
-                self.profile = NetworkProfile::parse(&name).ok_or_else(|| {
+                let parsed = NetworkProfile::parse(&name).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "profile must be research or project")
                 })?;
-                Ok(json!({ "profile": self.profile.as_str() }))
+                self.profile.set(parsed);
+                Ok(json!({ "profile": self.profile.get().as_str() }))
             }
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile, &url) {
+                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
@@ -548,8 +562,10 @@ impl ContentEngine {
                 }
                 let url = Url::parse(&url)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-                let (webview, _) = self.page(&page_id)?.clone();
-                let extra = self.page(&page_id)?.1.extra_headers.borrow().clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                delegate.denied_navigation.replace(None);
+                let previous = webview.url();
+                let extra = delegate.extra_headers.borrow().clone();
                 if extra.is_empty() {
                     webview.load(url.clone());
                 } else {
@@ -567,11 +583,14 @@ impl ContentEngine {
                 }
                 let loading = webview.clone();
                 let expected = url.clone();
+                let denied = Rc::clone(&delegate);
                 if !self.spin_until(ACTION_TIMEOUT, move || {
-                    loading.load_status() == LoadStatus::Complete
-                        && loading
-                            .url()
-                            .is_some_and(|current| urls_match(&current, &expected))
+                    denied.denied_navigation.borrow().is_some()
+                        || (loading.load_status() == LoadStatus::Complete
+                            && loading.url().is_some_and(|current| {
+                                previous.as_ref().map(|old| current != *old).unwrap_or(true)
+                                    || urls_match(&current, &expected)
+                            }))
                 })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -581,6 +600,22 @@ impl ContentEngine {
                             webview.url()
                         ),
                     ));
+                }
+                if let Some(reason) = delegate.denied_navigation.borrow().clone() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("policy_denied: {reason}"),
+                    ));
+                }
+                if let Some(final_url) = webview.url() {
+                    if let UrlDecision::Deny { reason } =
+                        decide_url(self.profile.get(), final_url.as_str())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("policy_denied: {reason}"),
+                        ));
+                    }
                 }
                 webview.paint();
                 self.servo.spin_event_loop();
@@ -1266,7 +1301,10 @@ impl ContentEngine {
                         })
                         .unwrap_or_else(|| page_id.clone());
                     let id = self.alloc_id("page");
-                    let delegate = Rc::new(Delegate::new(Rc::clone(&self.rendering_context)));
+                    let delegate = Rc::new(Delegate::new(
+                        Rc::clone(&self.rendering_context),
+                        Rc::clone(&self.profile),
+                    ));
                     delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(id.clone(), (webview, delegate));
                     pages.push(json!({ "page": id, "opener": opener }));
