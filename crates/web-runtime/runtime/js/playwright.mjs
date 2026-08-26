@@ -801,7 +801,7 @@ class Page {
       const result = await engineCall("page.requests", { page: this._id });
       const hit = (result.requests || []).find((rec) => String(rec.url).includes(needle));
       if (hit) {
-        return { url: () => hit.url, method: () => "GET" };
+        return this._requestFromRecord(hit);
       }
       ops.op_sleep_ms(20);
     }
@@ -827,24 +827,28 @@ class Page {
     return result;
   }
 
+  _requestFromRecord(rec) {
+    const headerList = rec.headers || [];
+    return {
+      url: () => rec.url,
+      method: () => rec.method || "GET",
+      headers: () => {
+        const out = {};
+        headerList.forEach((h) => {
+          out[String(h.name).toLowerCase()] = h.value;
+        });
+        return out;
+      },
+      resourceType: () => (rec.main_frame ? "document" : "other"),
+      frame: () => this.mainFrame(),
+    };
+  }
+
   async _dispatchNetwork() {
     const result = await engineCall("page.requests", { page: this._id });
     const requests = result.requests || [];
     for (const rec of requests) {
-      const headerList = rec.headers || [];
-      const request = {
-        url: () => rec.url,
-        method: () => rec.method || "GET",
-        headers: () => {
-          const out = {};
-          headerList.forEach((h) => {
-            out[h.name] = h.value;
-          });
-          return out;
-        },
-        resourceType: () => (rec.main_frame ? "document" : "other"),
-        frame: () => this.mainFrame(),
-      };
+      const request = this._requestFromRecord(rec);
       this._emit("request", request);
       this._emit("response", {
         url: () => rec.url,
