@@ -244,7 +244,7 @@ int greppy_winfsp_mount(void *context, const char *mountpoint)
     char foreground[] = "-f";
     char debug[] = "-d";
     char option[] = "-o";
-    char filesystem_name[] = "FileSystemName=greppy-cow,volname=Greppy Workspaces";
+    char filesystem_name[] = "FileSystemName=greppy-cow,volname=Greppy Workspaces,uid=-1,gid=-1";
     char *regular_arguments[] = {program, foreground, option, filesystem_name, (char *)mountpoint, 0};
     char *debug_arguments[] = {program, foreground, debug, option, filesystem_name, (char *)mountpoint, 0};
     if (0 != getenv("GREPPY_WINFSP_DEBUG"))

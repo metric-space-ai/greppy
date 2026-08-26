@@ -349,6 +349,9 @@ unsafe extern "C" fn greppy_windows_create(
 ) -> c_int {
     ffi_result(context, path, |provider, raw| {
         match provider.parse(raw)? {
+            VirtualPath::Doctor(relative) if relative.is_empty() && directory != 0 => {
+                return Err(-EEXIST);
+            }
             VirtualPath::Doctor(relative) if !relative.is_empty() => {
                 let path = provider.doctor_path(&relative)?;
                 if directory != 0 {
