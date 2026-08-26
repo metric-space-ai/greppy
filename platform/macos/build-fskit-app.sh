@@ -7,7 +7,7 @@ identity=${CODE_SIGN_IDENTITY:--}
 target=arm64-apple-macos15.4
 app="$output_root/GreppyWorkspaceFS.app"
 extension="$app/Contents/Extensions/GreppyWorkspaceFS.appex"
-cargo_target="$output_root/cargo-target-aarch64-macos15.4"
+cargo_target="$repository_root/target/fskit-aarch64-macos15.4"
 ffi_archive="$cargo_target/aarch64-apple-darwin/release/libgreppy_workspace_ffi.a"
 
 rm -rf "$app"
