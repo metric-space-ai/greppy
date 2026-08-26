@@ -14,6 +14,10 @@ if ((await page.getByPlaceholder("search").count()) !== 1) throw new Error("plac
 if ((await page.getByAltText("logo").count()) !== 1) throw new Error("alt");
 if ((await page.getByTitle("brand").count()) !== 1) throw new Error("title");
 if ((await page.getByTestId("hero").count()) !== 1) throw new Error("testid");
+const snap = await page.locator("#b").ariaSnapshot();
+if (!String(snap).includes("button") || !String(snap).includes("Go")) {
+  throw new Error("ariaSnapshot " + snap);
+}
 if ((await page.getByLabel("Name").count()) !== 1) throw new Error("label");
 if ((await page.locator("body").getByAltText("logo").count()) !== 1) throw new Error("locator alt");
 if ((await page.locator("body").getByTitle("brand").count()) !== 1) throw new Error("locator title");

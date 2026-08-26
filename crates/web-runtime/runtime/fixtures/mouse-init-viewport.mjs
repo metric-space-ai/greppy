@@ -12,6 +12,13 @@ try {
 }
 if (!devicesClosed) throw new Error("devices must fail closed");
 const context = await browser.newContext();
+if (!browser.isConnected()) throw new Error("isConnected");
+if (browser.browserType().name() !== "chromium") {
+  throw new Error("browserType " + browser.browserType().name());
+}
+if (!browser.contexts().some((item) => item === context)) {
+  throw new Error("contexts missing current context");
+}
 context.setDefaultTimeout(5_000);
 await context.addInitScript(() => {
   window.__ctxinit = 1;

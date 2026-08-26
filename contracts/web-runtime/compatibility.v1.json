@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 297,
+    "implemented": 301,
     "unsupported": 290,
-    "unverified": 767
+    "unverified": 763
   },
   "entries": [
     {
@@ -4343,11 +4343,15 @@
       "symbol": "Browser.browserType",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "returns the chromium BrowserType export used to launch this Browser"
+      ]
     },
     {
       "symbol": "Browser.close",
@@ -4367,21 +4371,29 @@
       "symbol": "Browser.contexts",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "in-memory list of contexts created through this Browser; not Chromium target discovery"
+      ]
     },
     {
       "symbol": "Browser.isConnected",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "mouse-init-viewport"
+      ],
+      "known_differences": [
+        "true after launch until Browser.close; not a live Chromium pipe check"
+      ]
     },
     {
       "symbol": "Browser.newBrowserCDPSession",
@@ -6007,11 +6019,15 @@
       "symbol": "Locator.ariaSnapshot",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-selectors"
+      ],
+      "known_differences": [
+        "simplified role/name YAML from the locator subtree; not Playwright full aria snapshot (checked/expanded/level/yaml options)"
+      ]
     },
     {
       "symbol": "Locator.blur",

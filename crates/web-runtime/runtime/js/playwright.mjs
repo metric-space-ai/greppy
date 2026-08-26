@@ -650,6 +650,48 @@ class Locator {
     return this._description || null;
   }
 
+  async ariaSnapshot(options) {
+    if (options != null) {
+      return unsupported("Locator.ariaSnapshot.options")();
+    }
+    return this.evaluate((el) => {
+      function roleOf(node) {
+        const explicit = node.getAttribute && node.getAttribute("role");
+        if (explicit) return explicit;
+        const tag = (node.tagName || "").toLowerCase();
+        if (tag === "button") return "button";
+        if (tag === "a" && node.hasAttribute("href")) return "link";
+        if (tag === "input" || tag === "textarea") return "textbox";
+        if (tag === "img") return "img";
+        if (tag === "h1" || tag === "h2" || tag === "h3" || tag === "h4" || tag === "h5" || tag === "h6") {
+          return "heading";
+        }
+        return tag || "generic";
+      }
+      function nameOf(node) {
+        const labelled = node.getAttribute && node.getAttribute("aria-label");
+        if (labelled) return labelled.trim();
+        if (node.getAttribute && node.getAttribute("alt")) return node.getAttribute("alt").trim();
+        return ((node.innerText || node.textContent || node.value || "") + "").trim().split("\n")[0];
+      }
+      function walk(node, indent) {
+        if (!node || node.nodeType !== 1) return "";
+        const role = roleOf(node);
+        const name = nameOf(node);
+        let line = indent + "- " + role;
+        if (name) line += ' "' + name.replace(/"/g, '\\"') + '"';
+        const kids = [];
+        const children = node.children || [];
+        for (let i = 0; i < children.length; i++) {
+          const child = walk(children[i], indent + "  ");
+          if (child) kids.push(child);
+        }
+        return [line].concat(kids).join("\n");
+      }
+      return walk(el, "");
+    });
+  }
+
   toString() {
     return this._description || JSON.stringify(this._selector);
   }
@@ -2253,6 +2295,9 @@ class BrowserContext {
     }
     this._pages = [];
     this._closed = true;
+    if (this._browser && Array.isArray(this._browser._contexts)) {
+      this._browser._contexts = this._browser._contexts.filter((context) => context !== this);
+    }
     await engineCall("context.close", { context: this._id });
   }
 
@@ -2347,6 +2392,8 @@ class BrowserContext {
 class Browser {
   constructor(id) {
     this._id = id;
+    this._contexts = [];
+    this._connected = true;
     return withUnsupported(this, "Browser");
   }
 
@@ -2361,10 +2408,23 @@ class Browser {
     const result = await engineCall("browser.newContext", { browser: this._id });
     const context = new BrowserContext(result.context);
     context._browser = this;
+    this._contexts.push(context);
     if (storageState) {
       await context._restoreStorageState(storageState);
     }
     return context;
+  }
+
+  contexts() {
+    return this._contexts.slice();
+  }
+
+  isConnected() {
+    return !!this._connected;
+  }
+
+  browserType() {
+    return chromium;
   }
 
   async newPage(options) {
@@ -2376,6 +2436,8 @@ class Browser {
   }
 
   async close() {
+    this._connected = false;
+    this._contexts = [];
     await engineCall("browser.close", { browser: this._id });
   }
 
