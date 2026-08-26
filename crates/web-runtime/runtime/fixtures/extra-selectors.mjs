@@ -44,6 +44,9 @@ await page.evaluate(() => {
 });
 const injected = await page.waitForFunction(() => window.__greppy === 1);
 if (!injected) throw new Error("waitForFunction");
+if (!(await page.mainFrame().waitForFunction(() => window.__greppy === 1))) {
+  throw new Error("frame waitForFunction");
+}
 const main = page.mainFrame();
 await main.fill("#q", "frame-fill");
 if ((await main.inputValue("#q")) !== "frame-fill") throw new Error("frame fill");

@@ -13,6 +13,8 @@ if (text !== "HEADER_OK") {
 }
 const url = await page.waitForURL("http");
 if (!String(url).includes("http")) throw new Error("waitForURL " + url);
+const frameUrl = await page.mainFrame().waitForURL("http");
+if (!String(frameUrl).includes("http")) throw new Error("frame waitForURL " + frameUrl);
 const request = await page.waitForRequest("http");
 if (!String(request.url()).includes("http")) throw new Error("waitForRequest");
 if (request.method() !== "GET") throw new Error("method " + request.method());
