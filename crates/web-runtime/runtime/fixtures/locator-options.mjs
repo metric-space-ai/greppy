@@ -21,7 +21,6 @@ const pages = [];
 context.on("page", (page) => {
   pages.push(page);
 });
-await expectUnsupported("context.on request", () => context.on("request", () => {}));
 const page = await context.newPage();
 if (pages.length !== 1 || pages[0] !== page) {
   throw new Error("BrowserContext page event " + pages.length);

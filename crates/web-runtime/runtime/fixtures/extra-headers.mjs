@@ -23,6 +23,14 @@ async function expectUnsupported(label, fn) {
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
+const finished = [];
+const ctxRequests = [];
+page.on("requestfinished", (req) => {
+  finished.push(String(req.url()));
+});
+page.context().on("request", (req) => {
+  ctxRequests.push(String(req.url()));
+});
 let loaded = 0;
 let dcl = 0;
 page.on("load", () => {
@@ -38,6 +46,12 @@ await nav;
 await loadWait;
 if (loaded < 1) throw new Error("Page load event " + loaded);
 if (dcl < 1) throw new Error("Page domcontentloaded event " + dcl);
+if (!finished.some((url) => String(url).includes("http"))) {
+  throw new Error("requestfinished " + JSON.stringify(finished));
+}
+if (!ctxRequests.some((url) => String(url).includes("http"))) {
+  throw new Error("context request " + JSON.stringify(ctxRequests));
+}
 const frameNav = page.mainFrame().waitForNavigation();
 await page.mainFrame().goto(fixtureUrl);
 await frameNav;

@@ -7,6 +7,10 @@ const handler = (msg) => {
   seen.push(msg.text());
 };
 page.on("console", handler);
+const ctxConsole = [];
+page.context().on("console", (msg) => {
+  ctxConsole.push(msg.text());
+});
 const pageErrorsSeen = [];
 page.on("pageerror", (error) => {
   pageErrorsSeen.push(String(error && error.message));
@@ -44,6 +48,9 @@ const messages = await page.consoleMessages();
 const texts = messages.map((msg) => msg.text());
 if (!texts.some((text) => String(text).includes("hello-console")) && !seen.some((text) => String(text).includes("hello-console"))) {
   throw new Error("console log not captured: " + JSON.stringify({ texts, seen }));
+}
+if (!ctxConsole.some((text) => String(text).includes("hello-console"))) {
+  throw new Error("context console " + JSON.stringify(ctxConsole));
 }
 page.off("console", handler);
 page.removeAllListeners("console");

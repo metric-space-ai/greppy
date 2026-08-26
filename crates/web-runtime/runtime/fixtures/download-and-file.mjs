@@ -33,9 +33,16 @@ const afterText = await response.body();
 if (toHex(afterText) !== expectedHex) {
   throw new Error("Response.body changed after text(): " + toHex(afterText) + " text=" + JSON.stringify(asText));
 }
+const ctxDownloads = [];
+page.context().on("download", (item) => {
+  ctxDownloads.push(item);
+});
 const download = await page.waitForEvent("download");
 if (!download || !String(download.url()).includes("data.bin")) {
   throw new Error("download url " + (download && download.url()));
+}
+if (!ctxDownloads.some((item) => String(item.url()).includes("data.bin"))) {
+  throw new Error("context download missing");
 }
 if (download.suggestedFilename() !== "data.bin") {
   throw new Error("filename " + download.suggestedFilename());

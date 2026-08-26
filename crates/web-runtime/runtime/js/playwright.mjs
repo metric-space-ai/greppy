@@ -1023,6 +1023,7 @@ class Frame {
         url: String(url),
       });
       this._url = result.url || String(url);
+      await this._page._dispatchFrames();
       return result;
     }
     return this._page.goto(url, options);
@@ -1039,6 +1040,7 @@ class Frame {
         document.close();
         return true;
       }, html);
+      await this._page._dispatchFrames();
       return;
     }
     return this._page.setContent(html);
@@ -1295,6 +1297,8 @@ class Page {
     this._timeout = 30_000;
     this._context = null;
     this._handlers = {};
+    this._seenFrames = {};
+    this._emittedNetwork = new Set();
     this._consoleSeen = 0;
     this._popupWaiters = [];
     this._pendingPopups = [];
@@ -1641,12 +1645,18 @@ class Page {
     if (options != null) {
       return unsupported("Page.goto.options")();
     }
-    const result = await engineCall("page.goto", { page: this._id, url });
-    await this._flushPopups();
-    await this._flushNavigation();
-    await this._dispatchNetwork();
-    this._emitLoad();
-    return result;
+    try {
+      const result = await engineCall("page.goto", { page: this._id, url });
+      await this._flushPopups();
+      await this._flushNavigation();
+      await this._dispatchNetworkUntilSettled();
+      await this._dispatchFrames();
+      this._emitLoad();
+      return result;
+    } catch (error) {
+      await this._dispatchNetworkUntilSettled();
+      throw error;
+    }
   }
 
   _requestFromRecord(rec, all) {
@@ -1755,18 +1765,76 @@ class Page {
     }, "Download");
   }
 
-  async _dispatchNetwork() {
+  async _dispatchNetwork(settle) {
     const result = await engineCall("page.requests", { page: this._id });
     const responses = ((await engineCall("page.responses", { page: this._id })).responses || []);
     const requests = result.requests || [];
-    for (const rec of requests) {
-      const request = this._requestFromRecord(rec);
-      this._emit("request", request);
+    this._emittedNetwork = this._emittedNetwork || new Set();
+    for (let index = 0; index < requests.length; index++) {
+      const rec = requests[index];
+      const key = String(rec.method || "GET") + " " + String(rec.url) + " " + index;
+      const request = this._requestFromRecord(rec, requests);
       const hit = responses.find((row) => row.url === rec.url);
+      if (!this._emittedNetwork.has(key + " req")) {
+        this._emittedNetwork.add(key + " req");
+        this._emit("request", request);
+      }
       if (hit) {
-        this._emit("response", this._responseFromRecord(hit, request));
+        if (!this._emittedNetwork.has(key + " fin")) {
+          this._emittedNetwork.add(key + " fin");
+          this._emit("response", this._responseFromRecord(hit, request));
+          this._emit("requestfinished", request);
+        }
+      } else if (request.failure()) {
+        if (!this._emittedNetwork.has(key + " fail")) {
+          this._emittedNetwork.add(key + " fail");
+          this._emit("requestfailed", request);
+        }
+      } else if (settle) {
+        if (!this._emittedNetwork.has(key + " fin")) {
+          this._emittedNetwork.add(key + " fin");
+          this._emit("requestfinished", request);
+        }
       }
     }
+    return requests.length;
+  }
+
+  async _dispatchNetworkUntilSettled() {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      const count = await this._dispatchNetwork(false);
+      if (count > 0) {
+        await this._dispatchNetwork(true);
+        return;
+      }
+      ops.op_sleep_ms(20);
+    }
+    await this._dispatchNetwork(true);
+  }
+
+  async _dispatchFrames() {
+    const frames = await this.frames();
+    this._seenFrames = this._seenFrames || {};
+    const current = {};
+    for (const frame of frames) {
+      const id = String(frame._id);
+      const url = String(frame.url() || "");
+      const prev = this._seenFrames[id];
+      current[id] = { name: frame.name(), url, frame };
+      if (!prev) {
+        this._emit("frameattached", frame);
+        this._emit("framenavigated", frame);
+      } else if (prev.url !== url) {
+        this._emit("framenavigated", frame);
+      }
+    }
+    for (const id of Object.keys(this._seenFrames)) {
+      if (id !== "main" && !current[id]) {
+        this._emit("framedetached", this._seenFrames[id].frame);
+      }
+    }
+    this._seenFrames = current;
   }
 
   _emit(event, payload) {
@@ -1777,6 +1845,21 @@ class Page {
         result.catch(() => {});
       }
     }
+    if (
+      this._context &&
+      (event === "console" ||
+        event === "dialog" ||
+        event === "download" ||
+        event === "request" ||
+        event === "response" ||
+        event === "requestfailed" ||
+        event === "requestfinished" ||
+        event === "frameattached" ||
+        event === "framedetached" ||
+        event === "framenavigated")
+    ) {
+      this._context._emit(event, payload);
+    }
   }
 
   async evaluate(pageFunction, arg) {
@@ -1786,6 +1869,7 @@ class Page {
     });
     await this._flushPopups();
     await this._dispatchConsole();
+    await this._dispatchFrames();
     return result.value;
   }
 
@@ -1910,12 +1994,14 @@ class Page {
 
   async setContent(html) {
     await engineCall("page.setContent", { page: this._id, html: String(html) });
+    await this._dispatchFrames();
     this._emitLoad();
   }
 
   async reload() {
     await engineCall("page.reload", { page: this._id });
     await this._flushNavigation();
+    await this._dispatchFrames();
     this._emitLoad();
   }
 
@@ -2033,7 +2119,9 @@ class Page {
       if (!rec) {
         return unsupported("Page.waitForEvent.download.empty")();
       }
-      return this._downloadFromRecord(rec);
+      const download = this._downloadFromRecord(rec);
+      this._emit("download", download);
+      return download;
     }
     if (event === "request") {
       return this.waitForRequest("");
@@ -2061,6 +2149,17 @@ class Page {
     if (event === "load" || event === "domcontentloaded") {
       return new Promise((resolve) => {
         this.once(event, () => resolve(this));
+      });
+    }
+    if (
+      event === "frameattached" ||
+      event === "framedetached" ||
+      event === "framenavigated" ||
+      event === "requestfailed" ||
+      event === "requestfinished"
+    ) {
+      return new Promise((resolve) => {
+        this.once(event, (payload) => resolve(payload));
       });
     }
     return unsupported(`Page.waitForEvent.${event}`)();
@@ -2096,7 +2195,12 @@ class Page {
       event === "pageerror" ||
       event === "close" ||
       event === "load" ||
-      event === "domcontentloaded"
+      event === "domcontentloaded" ||
+      event === "frameattached" ||
+      event === "framedetached" ||
+      event === "framenavigated" ||
+      event === "requestfailed" ||
+      event === "requestfinished"
     ) {
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);
@@ -2366,7 +2470,20 @@ class BrowserContext {
   }
 
   on(event, handler) {
-    if (event === "page" || event === "close") {
+    if (
+      event === "page" ||
+      event === "close" ||
+      event === "console" ||
+      event === "dialog" ||
+      event === "download" ||
+      event === "request" ||
+      event === "response" ||
+      event === "requestfailed" ||
+      event === "requestfinished" ||
+      event === "frameattached" ||
+      event === "framedetached" ||
+      event === "framenavigated"
+    ) {
       this._handlers = this._handlers || {};
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);
@@ -2409,13 +2526,13 @@ class BrowserContext {
   }
 
   prependListener(event, handler) {
-    if (event === "page" || event === "close") {
-      this._handlers = this._handlers || {};
-      this._handlers[event] = this._handlers[event] || [];
-      this._handlers[event].unshift(handler);
-      return this;
+    this.on(event, handler);
+    const list = this._handlers && this._handlers[event];
+    if (list && list.length > 1) {
+      const last = list.pop();
+      list.unshift(last);
     }
-    throwUnsupported(`BrowserContext.on.${event}`);
+    return this;
   }
 
   async routeWebSocket() {

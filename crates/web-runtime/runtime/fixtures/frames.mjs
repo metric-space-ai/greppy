@@ -124,6 +124,36 @@ function expectUnsupported(label, fn) {
   if (!failed) throw new Error(label + " did not throw");
 }
 
+const attached = [];
+const detached = [];
+const navigated = [];
+const ctxAttached = [];
+page.on("frameattached", (frame) => attached.push(frame.name()));
+page.on("framedetached", (frame) => detached.push(frame.name()));
+page.on("framenavigated", (frame) => navigated.push(frame.name() || frame.url()));
+page.context().on("frameattached", (frame) => ctxAttached.push(frame.name()));
+const waited = page.waitForEvent("frameattached");
+await page.evaluate(() => {
+  const iframe = document.createElement("iframe");
+  iframe.name = "dyn";
+  iframe.srcdoc = "<p id='d'>dyn-ok</p>";
+  document.body.appendChild(iframe);
+  return true;
+});
+const waitedFrame = await waited;
+if (!attached.includes("dyn")) throw new Error("frameattached " + JSON.stringify(attached));
+if (!ctxAttached.includes("dyn")) throw new Error("context frameattached " + JSON.stringify(ctxAttached));
+if (!navigated.includes("dyn")) throw new Error("framenavigated " + JSON.stringify(navigated));
+if (!waitedFrame || waitedFrame.name() !== "dyn") {
+  throw new Error("waitForEvent frameattached " + (waitedFrame && waitedFrame.name()));
+}
+await page.evaluate(() => {
+  const iframe = document.querySelector("iframe[name=dyn]");
+  if (iframe) iframe.remove();
+  return true;
+});
+if (!detached.includes("dyn")) throw new Error("framedetached " + JSON.stringify(detached));
+
 expectUnsupported("child isDetached", () => child.isDetached());
 expectUnsupported("child getByPlaceholder", () => child.getByPlaceholder("search"));
 expectUnsupported("child getByAltText", () => child.getByAltText("logo"));

@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 332,
-    "unsupported": 458,
-    "unverified": 564
+    "implemented": 346,
+    "unsupported": 466,
+    "unverified": 542
   },
   "entries": [
     {
@@ -2294,31 +2294,43 @@
       "symbol": "Page.event.frameattached",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "emitted when page.frames() sees a new iframe after setContent/evaluate; identity is iframe index, not Chromium frame id"
+      ]
     },
     {
       "symbol": "Page.event.framedetached",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "emitted when a previously seen iframe index disappears"
+      ]
     },
     {
       "symbol": "Page.event.framenavigated",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "emitted on attach and when iframe src/url changes; srcdoc url is the src attribute"
+      ]
     },
     {
       "symbol": "Page.event.load",
@@ -2384,21 +2396,30 @@
       "symbol": "Page.event.requestfailed",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "abort-failure"
+      ],
+      "known_differences": [
+        "emitted from recorded requests that have Request.failure after abort"
+      ]
     },
     {
       "symbol": "Page.event.requestfinished",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "emitted after a recorded response is paired with a request",
+        "requestfinished fires after recorded requests settle; Response objects exist for intercept fulfill, not every Servo navigation"
+      ]
     },
     {
       "symbol": "Page.event.response",
@@ -2426,7 +2447,8 @@
         "fail-closed-surface"
       ],
       "known_differences": [
-        "page.on('websocket') throws unsupported_playwright_operation; WebSocket objects are not created."
+        "page.on('websocket') throws unsupported_playwright_operation; WebSocket objects are not created.",
+        "page.on('websocket') throws unsupported_playwright_operation."
       ]
     },
     {
@@ -2440,7 +2462,8 @@
         "fail-closed-surface"
       ],
       "known_differences": [
-        "page.on('worker') throws unsupported_playwright_operation; Worker objects are not created."
+        "page.on('worker') throws unsupported_playwright_operation; Worker objects are not created.",
+        "page.on('worker') throws unsupported_playwright_operation."
       ]
     },
     {
@@ -4307,11 +4330,15 @@
       "symbol": "BrowserContext.event.backgroundpage",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserContext.on('backgroundpage') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.event.close",
@@ -4331,11 +4358,15 @@
       "symbol": "BrowserContext.event.console",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "forwarded from Page console"
+      ]
     },
     {
       "symbol": "BrowserContext.event.dialog",
@@ -4351,41 +4382,57 @@
       "symbol": "BrowserContext.event.download",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "download-and-file"
+      ],
+      "known_differences": [
+        "forwarded from Page download"
+      ]
     },
     {
       "symbol": "BrowserContext.event.frameattached",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "forwarded from Page frameattached"
+      ]
     },
     {
       "symbol": "BrowserContext.event.framedetached",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "forwarded from Page framedetached"
+      ]
     },
     {
       "symbol": "BrowserContext.event.framenavigated",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "forwarded from Page framenavigated"
+      ]
     },
     {
       "symbol": "BrowserContext.event.page",
@@ -4405,81 +4452,114 @@
       "symbol": "BrowserContext.event.pageclose",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserContext.on('pageclose') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.event.pageload",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserContext.on('pageload') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.event.request",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "forwarded from Page request"
+      ]
     },
     {
       "symbol": "BrowserContext.event.requestfailed",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "abort-failure"
+      ],
+      "known_differences": [
+        "forwarded from Page requestfailed"
+      ]
     },
     {
       "symbol": "BrowserContext.event.requestfinished",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "forwarded from Page requestfinished",
+        "requestfinished fires after recorded requests settle; Response objects exist for intercept fulfill, not every Servo navigation"
+      ]
     },
     {
       "symbol": "BrowserContext.event.response",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "forwarded from Page response"
+      ]
     },
     {
       "symbol": "BrowserContext.event.serviceworker",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserContext.on('serviceworker') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.event.weberror",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserContext.on('weberror') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Browser.addListener",
@@ -5381,11 +5461,15 @@
       "symbol": "Browser.event.context",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Browser.on('context') throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Browser.event.disconnected",
@@ -9279,11 +9363,15 @@
       "symbol": "BrowserServer.event.close",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws; BrowserServer events are not emitted."
+      ]
     },
     {
       "symbol": "Clock.fastForward",
@@ -9793,11 +9881,15 @@
       "symbol": "Debugger.event.pausedstatechanged",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No CDP debugger. Debugger events are not emitted."
+      ]
     },
     {
       "symbol": "Dialog.accept",
@@ -16372,8 +16464,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 879,
-    "unsupported": 458,
+    "unverified": 871,
+    "unsupported": 466,
     "passing": 17
   }
 }
