@@ -1,0 +1,17 @@
+{
+  "reference": {
+    "type": "log",
+    "text": "hello-console"
+  },
+  "candidate": {
+    "engine": "greppy-web-runtime+servo-0.5.0",
+    "status": "ok",
+    "type": "log",
+    "text": "hello-console"
+  },
+  "match": true,
+  "scope": "console.log text from page.evaluate; args/location are not compared",
+  "known_differences": [
+    "Chromium delivers ConsoleMessage during the log; candidate records Servo show_console_message and flushes after evaluate"
+  ]
+}

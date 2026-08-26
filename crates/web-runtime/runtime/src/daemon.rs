@@ -205,7 +205,8 @@ impl Daemon {
                 "oracle_receipts": [
                     "contracts/web-runtime/receipts/oracle-setcontent.json",
                     "contracts/web-runtime/receipts/oracle-dialog.json",
-                    "contracts/web-runtime/receipts/oracle-fill.json"
+                    "contracts/web-runtime/receipts/oracle-fill.json",
+                    "contracts/web-runtime/receipts/oracle-console.json"
                 ],
                 "inventory_entries": 1354,
                 "compatibility_coverage_level_note": "schema implemented is not Chromium oracle behavior; oracle receipts are scoped cases only",

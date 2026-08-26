@@ -14,6 +14,9 @@ Receipts in this directory:
   records Servo SimpleDialogs and exposes them via `waitForEvent('dialog')`
   after evaluate. Confirm/prompt are candidate-only in the same fixture.
 - `oracle-fill.json` — `locator.fill` of a text input value.
+- `oracle-console.json` — `console.log('hello-console')` text and type `log`.
+  Chromium delivers ConsoleMessage during the log; the candidate records
+  Servo `show_console_message` and flushes after evaluate.
 - `oracle-skip.json` — recorded skip used when the reference stack is absent.
 
 Inventory `behavior` stays `unverified` except for the exact symbols covered

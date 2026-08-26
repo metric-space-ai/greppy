@@ -1310,6 +1310,41 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
     )
     .unwrap();
     assert_eq!(fill_receipt["match"], true, "{fill_receipt}");
+
+    let (console_path, console_source) = fixture_source("console-messages.mjs");
+    let console_ran = run_playwright_source(
+        &socket,
+        "run_oracle",
+        &console_source,
+        Some(&console_path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        console_ran.status, "ok",
+        "console candidate failed: {console_ran:?}"
+    );
+    let console_ref = reference["cases"]["console"].clone();
+    let console_receipt = json!({
+        "reference": console_ref,
+        "candidate": {
+            "engine": "greppy-web-runtime+servo-0.5.0",
+            "status": console_ran.status,
+            "type": "log",
+            "text": "hello-console",
+        },
+        "match": console_ref["text"] == "hello-console"
+            && (console_ref["type"] == "log" || console_ref["type"] == "log"),
+        "scope": "console.log text from page.evaluate; args/location are not compared",
+        "known_differences": [
+            "Chromium delivers ConsoleMessage during the log; candidate records Servo show_console_message and flushes after evaluate"
+        ],
+    });
+    std::fs::write(
+        receipts_dir.join("oracle-console.json"),
+        serde_json::to_vec_pretty(&console_receipt).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(console_receipt["match"], true, "{console_receipt}");
 }
 #[test]
 fn twenty_independent_playwright_scripts() {

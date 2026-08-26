@@ -46,6 +46,20 @@ await fillPage.locator("#q").fill("ok");
 const filled = await fillPage.evaluate(() => document.querySelector("#q").value);
 await fillPage.close();
 
+const consolePage = await browser.newPage();
+let consoleText = null;
+let consoleType = null;
+consolePage.on("console", (msg) => {
+  if (consoleText == null) {
+    consoleType = msg.type();
+    consoleText = msg.text();
+  }
+});
+await consolePage.evaluate(() => {
+  console.log("hello-console");
+});
+await consolePage.close();
+
 await browser.close();
 const receipt = {
   engine: "playwright@1.62.1+chromium-1234",
@@ -57,6 +71,7 @@ const receipt = {
     setContent: { title, value, text },
     dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
     fill: { value: filled },
+    console: { type: consoleType, text: consoleText },
   },
 };
 writeFileSync(out, JSON.stringify(receipt, null, 2) + "\n");

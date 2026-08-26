@@ -211,12 +211,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "console-messages"
+        "console-messages",
+        "oracle-console"
       ],
       "known_differences": [
-        "Servo show_console_message records; not Chromium ConsoleMessage.args"
+        "Servo show_console_message records; not Chromium ConsoleMessage.args",
+        "oracle-console.json covers console.log text/type only; not args, location, or other console methods"
       ]
     },
     {
@@ -8387,12 +8389,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "console-messages"
+        "console-messages",
+        "oracle-console"
       ],
       "known_differences": [
-        "text from Servo console message string"
+        "text from Servo console message string",
+        "oracle-console.json covers console.log text/type only; not args, location, or other console methods"
       ]
     },
     {
@@ -13974,12 +13978,14 @@
       "origin": "types.d.ts recovery",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "console-messages"
+        "console-messages",
+        "oracle-console"
       ],
       "known_differences": [
-        "mapped from ConsoleLogLevel; warn becomes warning"
+        "mapped from ConsoleLogLevel; warn becomes warning",
+        "oracle-console.json covers console.log text/type only; not args, location, or other console methods"
       ]
     },
     {
@@ -14853,8 +14859,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1084,
+    "unverified": 1081,
     "unsupported": 265,
-    "passing": 5
+    "passing": 8
   }
 }
