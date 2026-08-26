@@ -1645,6 +1645,7 @@ class Page {
     await this._flushPopups();
     await this._flushNavigation();
     await this._dispatchNetwork();
+    this._emitLoad();
     return result;
   }
 
@@ -1909,10 +1910,18 @@ class Page {
 
   async setContent(html) {
     await engineCall("page.setContent", { page: this._id, html: String(html) });
+    this._emitLoad();
   }
 
   async reload() {
     await engineCall("page.reload", { page: this._id });
+    await this._flushNavigation();
+    this._emitLoad();
+  }
+
+  _emitLoad() {
+    this._emit("domcontentloaded", this);
+    this._emit("load", this);
   }
 
   async waitForTimeout(ms) {
@@ -2049,6 +2058,11 @@ class Page {
         this.once("close", () => resolve(this));
       });
     }
+    if (event === "load" || event === "domcontentloaded") {
+      return new Promise((resolve) => {
+        this.once(event, () => resolve(this));
+      });
+    }
     return unsupported(`Page.waitForEvent.${event}`)();
   }
 
@@ -2080,7 +2094,9 @@ class Page {
       event === "popup" ||
       event === "console" ||
       event === "pageerror" ||
-      event === "close"
+      event === "close" ||
+      event === "load" ||
+      event === "domcontentloaded"
     ) {
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);

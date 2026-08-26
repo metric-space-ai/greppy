@@ -23,9 +23,21 @@ async function expectUnsupported(label, fn) {
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
+let loaded = 0;
+let dcl = 0;
+page.on("load", () => {
+  loaded += 1;
+});
+page.on("domcontentloaded", () => {
+  dcl += 1;
+});
+const loadWait = page.waitForEvent("load");
 const nav = page.waitForNavigation();
 await page.goto(fixtureUrl);
 await nav;
+await loadWait;
+if (loaded < 1) throw new Error("Page load event " + loaded);
+if (dcl < 1) throw new Error("Page domcontentloaded event " + dcl);
 const frameNav = page.mainFrame().waitForNavigation();
 await page.mainFrame().goto(fixtureUrl);
 await frameNav;

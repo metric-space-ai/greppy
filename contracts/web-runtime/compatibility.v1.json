@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 330,
+    "implemented": 332,
     "unsupported": 458,
-    "unverified": 566
+    "unverified": 564
   },
   "entries": [
     {
@@ -2252,11 +2252,15 @@
       "symbol": "Page.event.domcontentloaded",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "emitted after goto/setContent/reload returns; not Chromium document lifecycle timing"
+      ]
     },
     {
       "symbol": "Page.event.download",
@@ -2320,11 +2324,15 @@
       "symbol": "Page.event.load",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "emitted after goto/setContent/reload returns; not Chromium document lifecycle timing"
+      ]
     },
     {
       "symbol": "Page.event.pageerror",
