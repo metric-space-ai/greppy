@@ -68,6 +68,8 @@ struct ToolchainResult {
     native_ms: f64,
     workspace_ms: f64,
     overhead_percent: f64,
+    native_samples_ms: Vec<f64>,
+    workspace_samples_ms: Vec<f64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -391,6 +393,8 @@ fn main() {
             "end_to_end_p50_ms": end_to_end_p50_ms,
             "end_to_end_p95_ms": end_to_end_p95_ms,
             "end_to_end_p95_gate_ms": args.max_visible_p95_ms,
+            "visible_samples_ms": visible_ms,
+            "end_to_end_samples_ms": end_to_end_ms,
         },
         "native_git_worktree_baseline": {
             "description": "warm git worktree add --detach checkout on the identical repository and host",
@@ -555,6 +559,8 @@ fn measure_toolchain(repository: &Path, case: ToolchainCase) -> ToolchainResult 
         native_ms,
         workspace_ms,
         overhead_percent: overhead,
+        native_samples_ms: native_samples,
+        workspace_samples_ms: workspace_samples,
     }
 }
 

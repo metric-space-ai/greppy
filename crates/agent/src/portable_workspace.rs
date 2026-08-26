@@ -692,7 +692,13 @@ fn repository_tracker_fence(
     let remove = fs::remove_file(&path);
     let created = created?;
     remove?;
-    wait_for_tracker_path(repository, core, epoch, created, &virtual_path)
+    // The observed create event is the ordering barrier: every repository
+    // event that happened before the fence write has reached the journal.
+    // Removal is synchronous and fence paths are excluded from every snapshot
+    // delta, so waiting for a second watcher round-trip adds latency without
+    // strengthening the captured baseline. A delayed removal event remains a
+    // harmless ignored journal entry for the next fence.
+    Ok(created)
 }
 
 fn wait_for_tracker_path(
