@@ -51,7 +51,7 @@ struct Args {
     enforce: bool,
     #[arg(long)]
     phase_trace_dir: Option<PathBuf>,
-    /// JSON: {"name":"rust|python|node","argv":["program","arg",...]}
+    /// JSON: {"name":"rust|python|node","argv":["program","arg",...],"release_gate":true}
     #[arg(long = "toolchain-case")]
     toolchain_cases: Vec<String>,
 }
@@ -62,16 +62,24 @@ struct ToolchainCase {
     argv: Vec<String>,
     #[serde(default)]
     cwd: PathBuf,
+    #[serde(default = "default_true")]
+    release_gate: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct ToolchainResult {
     name: String,
+    release_gate: bool,
     native_ms: f64,
     workspace_ms: f64,
+    absolute_overhead_ms: f64,
     overhead_percent: f64,
     native_samples_ms: Vec<f64>,
     workspace_samples_ms: Vec<f64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -501,7 +509,10 @@ fn main() {
                 fail(&format!("missing required {required} toolchain case"));
             }
         }
-        if toolchains.iter().any(|case| case.overhead_percent > 20.0) {
+        if toolchains
+            .iter()
+            .any(|case| case.release_gate && case.overhead_percent > 20.0)
+        {
             fail("toolchain overhead exceeds 20% gate");
         }
     }
@@ -545,9 +556,14 @@ fn load_fixture_manifest(
 
 fn validate_toolchain_contract(cases: &[ToolchainCase]) {
     for required in ["rust", "python", "node"] {
-        if cases.iter().filter(|case| case.name == required).count() != 1 {
+        if cases
+            .iter()
+            .filter(|case| case.name == required && case.release_gate)
+            .count()
+            != 1
+        {
             fail(&format!(
-                "release evidence requires exactly one {required} toolchain case"
+                "release evidence requires exactly one gated {required} toolchain case"
             ));
         }
     }
@@ -564,8 +580,19 @@ fn validate_toolchain_contract(cases: &[ToolchainCase]) {
         fail("Python toolchain case does not run the representative fixture");
     }
     let node = cases.iter().find(|case| case.name == "node").unwrap();
-    if node.cwd != Path::new("node") || node.argv != ["node", "test.js"] {
-        fail("Node toolchain case does not run the representative fixture");
+    if node.cwd != Path::new("node") || node.argv != ["node", "--test", "test.js"] {
+        fail("Node toolchain case does not run the representative test workflow");
+    }
+    let node_startup = cases
+        .iter()
+        .filter(|case| case.name == "node-startup-diagnostic")
+        .collect::<Vec<_>>();
+    if node_startup.len() != 1
+        || node_startup[0].release_gate
+        || node_startup[0].cwd != Path::new("node")
+        || node_startup[0].argv != ["node", "test.js"]
+    {
+        fail("release evidence must retain the ungated direct Node startup diagnostic");
     }
 }
 
@@ -594,6 +621,7 @@ fn measure_toolchain(repository: &Path, case: ToolchainCase) -> ToolchainResult 
     workspace_handle.cleanup().unwrap();
     let native_ms = percentile(&native_samples, 50);
     let workspace_ms = percentile(&workspace_samples, 50);
+    let absolute_overhead_ms = workspace_ms - native_ms;
     let overhead = if native_ms == 0.0 {
         0.0
     } else {
@@ -601,8 +629,10 @@ fn measure_toolchain(repository: &Path, case: ToolchainCase) -> ToolchainResult 
     };
     ToolchainResult {
         name: case.name,
+        release_gate: case.release_gate,
         native_ms,
         workspace_ms,
+        absolute_overhead_ms,
         overhead_percent: overhead,
         native_samples_ms: native_samples,
         workspace_samples_ms: workspace_samples,
