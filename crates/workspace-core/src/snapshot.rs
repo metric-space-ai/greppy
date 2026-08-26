@@ -33,12 +33,20 @@ pub struct BaselineEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineDirectory {
+    pub path: String,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineSnapshot {
     pub repository: PathBuf,
     pub base_commit: String,
     pub baseline_hash: String,
     pub index_hash: String,
     pub index_chunks: Vec<ChunkId>,
+    #[serde(default)]
+    pub directories: Vec<BaselineDirectory>,
     pub entries: Vec<BaselineEntry>,
     #[serde(default)]
     pub tracker_epoch: Option<u64>,
@@ -120,11 +128,11 @@ pub fn capture_overlay_directory(
         )));
     }
     for attempt in 0..2 {
-        let first_paths = overlay_paths(&directory)?;
+        let first = overlay_inventory(&directory)?;
         let mut pinned = Vec::new();
         let captured = (|| -> Result<BaselineSnapshot> {
-            let mut entries = Vec::with_capacity(first_paths.len());
-            for path in &first_paths {
+            let mut entries = Vec::with_capacity(first.paths.len());
+            for path in &first.paths {
                 let entry = capture_entry(&directory, path, store)?;
                 for chunk in &entry.chunks {
                     store.pin(*chunk)?;
@@ -132,7 +140,7 @@ pub fn capture_overlay_directory(
                 }
                 entries.push(entry);
             }
-            if overlay_paths(&directory)? != first_paths {
+            if overlay_inventory(&directory)? != first {
                 return Err(Error::ConcurrentRepositoryMutation);
             }
             for expected in &entries {
@@ -149,6 +157,7 @@ pub fn capture_overlay_directory(
             let canonical = serde_json::to_vec(&(
                 "greppy.overlay-directory.v1",
                 identity_text.as_ref(),
+                &first.directories,
                 &entries,
             ))?;
             let baseline_hash = blake3::hash(&canonical).to_hex().to_string();
@@ -158,6 +167,7 @@ pub fn capture_overlay_directory(
                 baseline_hash,
                 index_hash: blake3::hash(&[]).to_hex().to_string(),
                 index_chunks: Vec::new(),
+                directories: first.directories.clone(),
                 entries,
                 tracker_epoch: None,
                 tracker_generation: None,
@@ -181,8 +191,19 @@ pub fn capture_overlay_directory(
     Err(Error::ConcurrentRepositoryMutation)
 }
 
-fn overlay_paths(root: &Path) -> Result<Vec<String>> {
-    fn visit(root: &Path, relative: &Path, paths: &mut Vec<String>) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayInventory {
+    directories: Vec<BaselineDirectory>,
+    paths: Vec<String>,
+}
+
+fn overlay_inventory(root: &Path) -> Result<OverlayInventory> {
+    fn visit(
+        root: &Path,
+        relative: &Path,
+        directories: &mut Vec<BaselineDirectory>,
+        paths: &mut Vec<String>,
+    ) -> Result<()> {
         let mut entries =
             fs::read_dir(root.join(relative))?.collect::<std::result::Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
@@ -190,7 +211,18 @@ fn overlay_paths(root: &Path) -> Result<Vec<String>> {
             let child = relative.join(entry.file_name());
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                visit(root, &child, paths)?;
+                let path = child.to_str().ok_or_else(|| {
+                    Error::UnsupportedRepository(format!(
+                        "overlay directory is not UTF-8: {}",
+                        child.display()
+                    ))
+                })?;
+                validate_relative_path(path)?;
+                directories.push(BaselineDirectory {
+                    path: path.replace('\\', "/"),
+                    mode: directory_mode(&metadata),
+                });
+                visit(root, &child, directories, paths)?;
                 continue;
             }
             let path = child.to_str().ok_or_else(|| {
@@ -205,10 +237,12 @@ fn overlay_paths(root: &Path) -> Result<Vec<String>> {
         Ok(())
     }
 
+    let mut directories = Vec::new();
     let mut paths = Vec::new();
-    visit(root, Path::new(""), &mut paths)?;
+    visit(root, Path::new(""), &mut directories, &mut paths)?;
+    directories.sort_by(|left, right| left.path.cmp(&right.path));
     paths.sort();
-    Ok(paths)
+    Ok(OverlayInventory { directories, paths })
 }
 
 fn capture_once(
@@ -273,6 +307,7 @@ fn capture_once(
         baseline_hash,
         index_hash: first.index_hash.clone(),
         index_chunks,
+        directories: Vec::new(),
         entries,
         tracker_epoch: None,
         tracker_generation: None,
@@ -422,6 +457,7 @@ fn capture_repository_incremental_once(
             baseline_hash: blake3::hash(&canonical).to_hex().to_string(),
             index_hash,
             index_chunks,
+            directories: cached.directories.clone(),
             entries,
             tracker_epoch: Some(tracker_epoch),
             tracker_generation: Some(tracker_generation),
@@ -994,6 +1030,16 @@ fn git_mode(metadata: &Metadata) -> u32 {
 #[cfg(not(unix))]
 fn git_mode(_metadata: &Metadata) -> u32 {
     0o100644
+}
+
+#[cfg(unix)]
+fn directory_mode(metadata: &Metadata) -> u32 {
+    0o040000 | (metadata.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn directory_mode(_metadata: &Metadata) -> u32 {
+    0o040755
 }
 
 #[cfg(unix)]

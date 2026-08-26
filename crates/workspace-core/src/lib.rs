@@ -29,5 +29,6 @@ pub use repository_tracker::{
 };
 pub use snapshot::{
     capture_overlay_directory, capture_repository, capture_repository_incremental,
-    capture_repository_with_observer, BaselineEntry, BaselineSnapshot, EntryKind,
+    capture_repository_with_observer, BaselineDirectory, BaselineEntry, BaselineSnapshot,
+    EntryKind,
 };

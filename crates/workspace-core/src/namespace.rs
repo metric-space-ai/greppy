@@ -2617,6 +2617,7 @@ mod tests {
     fn private_git_control_templates_are_shared_chunk_cow_namespaces() {
         let storage = tempfile::tempdir().unwrap();
         let template = tempfile::tempdir().unwrap();
+        fs::create_dir_all(template.path().join("refs/heads")).unwrap();
         fs::write(template.path().join("HEAD"), b"ref: refs/heads/base\n").unwrap();
         fs::write(template.path().join("index"), vec![3_u8; CHUNK_SIZE * 2]).unwrap();
         fs::write(
@@ -2646,6 +2647,14 @@ mod tests {
         assert_eq!(
             core.read(&first, "HEAD", 0, 128).unwrap(),
             b"ref: refs/heads/base\n"
+        );
+        assert_eq!(
+            core.metadata(&first, "refs").unwrap().unwrap().kind,
+            NodeKind::Directory
+        );
+        assert_eq!(
+            core.metadata(&first, "refs/heads").unwrap().unwrap().kind,
+            NodeKind::Directory
         );
         assert_eq!(
             core.read(&second, "index", CHUNK_SIZE as u64, 1).unwrap(),

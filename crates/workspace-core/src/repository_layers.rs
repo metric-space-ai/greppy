@@ -179,11 +179,33 @@ fn ensure_empty_base(connection: &mut Connection, baseline: &BaselineSnapshot) -
         "empty-base:{}",
         blake3::hash(format!("{repository}\0{}", baseline.base_commit).as_bytes()).to_hex()
     );
-    connection.execute(
+    let transaction = connection.transaction()?;
+    transaction.execute(
         "INSERT INTO cow_repository_bases(id, repository, base_commit, state)
-         VALUES(?1, ?2, ?3, 'ready')",
+         VALUES(?1, ?2, ?3, 'broken')",
         params![base_id, repository, baseline.base_commit],
     )?;
+    for directory in &baseline.directories {
+        let (parent, name) = split_parent(&directory.path);
+        transaction.execute(
+            "INSERT INTO cow_repository_base_entries(
+                 base_id, path, parent, name, kind, mode, size, chunks_json
+             ) VALUES(?1, ?2, ?3, ?4, 'directory', ?5, 0, ?6)",
+            params![
+                base_id,
+                directory.path,
+                parent,
+                name,
+                directory.mode as i64,
+                serde_json::to_vec(&Vec::<ChunkId>::new())?
+            ],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE cow_repository_bases SET state = 'ready' WHERE id = ?1",
+        params![base_id],
+    )?;
+    transaction.commit()?;
     Ok(base_id)
 }
 
