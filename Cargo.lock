@@ -798,6 +798,7 @@ dependencies = [
 name = "greppy-agent"
 version = "0.3.3"
 dependencies = [
+ "blake3",
  "filetime",
  "greppy-workspace-core",
  "landlock",

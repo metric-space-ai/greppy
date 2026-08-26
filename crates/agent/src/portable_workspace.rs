@@ -5,7 +5,8 @@
 //! repository and before any model request can be made.
 
 use greppy_workspace_core::{
-    capture_repository, BaselineSnapshot, ProviderInstallation, WorkspaceCore, WorkspaceHandle,
+    capture_repository, BaselineEntry, BaselineSnapshot, EntryKind, ProviderInstallation,
+    WorkspaceCore, WorkspaceHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -424,15 +425,6 @@ fn apply_from_core(
 
     let index_path = git_path(&canonical_target, "index")?;
     let index_before = hash_optional_file(&index_path)?;
-    let patch = git_bytes(
-        &canonical_target,
-        &[
-            "diff",
-            "--binary",
-            &proposal.baseline_tree,
-            &proposal.final_tree,
-        ],
-    )?;
     let affected_paths = changed_paths(
         &canonical_target,
         &proposal.baseline_tree,
@@ -454,30 +446,11 @@ fn apply_from_core(
             .collect(),
     };
     let journal_path = publish_apply_journal(core, &journal)?;
-    let mut child = Command::new("git")
-        .args([
-            "-C",
-            path_text(&canonical_target)?,
-            "apply",
-            "--binary",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("git apply stdin is unavailable"))?
-        .write_all(&patch)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    if let Err(error) = journal.affected_paths.iter().try_for_each(|path| {
+        materialize_git_tree_entry(&canonical_target, &proposal.final_tree, path)
+    }) {
         restore_apply_journal(core, &journal_path, &journal)?;
-        return Err(WorkspaceError::Conflict {
-            ref_name: ref_name.into(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().into(),
-        });
+        return Err(error);
     }
     let index_after = hash_optional_file(&index_path)?;
     if index_before != index_after {
@@ -660,6 +633,15 @@ fn restore_apply_journal(
     journal: &ApplyJournal,
 ) -> Result<(), WorkspaceError> {
     let repository = journal.repository.canonicalize()?;
+    let proposal = core.proposal(&journal.ref_name)?;
+    if proposal.baseline_hash != journal.baseline_hash
+        || proposal.baseline_tree != journal.baseline_tree
+    {
+        return Err(WorkspaceError::Tampered {
+            path: journal_path.to_path_buf(),
+            detail: "apply recovery journal does not match its pinned proposal".into(),
+        });
+    }
     for path in &journal.affected_paths {
         validate_apply_path(path)?;
     }
@@ -717,6 +699,16 @@ fn restore_apply_journal(
             return Err(git_failed("git checkout-index for apply recovery", &output));
         }
     }
+    // checkout-index is correct for paths that were clean in the original
+    // checkout, including the checkout conversion configured by Git. Dirty
+    // and untracked paths are different: their exact visible bytes are pinned
+    // in the baseline CAS and must not pass through autocrlf or a filter during
+    // recovery.
+    for entry in &proposal.baseline.entries {
+        if journal.affected_paths.contains(&entry.path) {
+            restore_pinned_baseline_entry(core, &repository, entry)?;
+        }
+    }
     for (path, modified_unix_ns) in &journal.modified_times {
         validate_apply_path(path)?;
         let target = repository.join(path);
@@ -746,6 +738,156 @@ fn restore_apply_journal(
         });
     }
     remove_apply_journal(journal_path)
+}
+
+fn restore_pinned_baseline_entry(
+    core: &WorkspaceCore,
+    repository: &Path,
+    entry: &BaselineEntry,
+) -> Result<(), WorkspaceError> {
+    validate_apply_path(&entry.path)?;
+    let target = repository.join(&entry.path);
+    remove_visible_path(&target)?;
+    if entry.kind == EntryKind::Tombstone {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut bytes = Vec::with_capacity(entry.size.try_into().unwrap_or(0));
+    for id in &entry.chunks {
+        bytes.extend_from_slice(&core.chunks().read(*id)?);
+    }
+    bytes.truncate(
+        entry
+            .size
+            .try_into()
+            .map_err(|_| WorkspaceError::Tampered {
+                path: target.clone(),
+                detail: "captured baseline entry is too large for this platform".into(),
+            })?,
+    );
+    if blake3::hash(&bytes).to_hex().as_str() != entry.content_hash {
+        return Err(WorkspaceError::Tampered {
+            path: target,
+            detail: "captured baseline chunks do not match their content hash".into(),
+        });
+    }
+    match entry.kind {
+        EntryKind::File => {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&target)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            set_restored_mode(&target, entry.mode)?;
+        }
+        EntryKind::Symlink => create_restored_symlink(&bytes, &target)?,
+        EntryKind::Tombstone => unreachable!(),
+    }
+    Ok(())
+}
+
+fn materialize_git_tree_entry(
+    repository: &Path,
+    tree: &str,
+    relative: &str,
+) -> Result<(), WorkspaceError> {
+    validate_apply_path(relative)?;
+    let target = repository.join(relative);
+    remove_visible_path(&target)?;
+    let listing = git_bytes(repository, &["ls-tree", "-z", tree, "--", relative])?;
+    if listing.is_empty() {
+        return Ok(());
+    }
+    let record = listing
+        .strip_suffix(&[0])
+        .ok_or_else(|| WorkspaceError::Tampered {
+            path: target.clone(),
+            detail: "Git tree entry is not NUL terminated".into(),
+        })?;
+    let tab = record
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| WorkspaceError::Tampered {
+            path: target.clone(),
+            detail: "Git tree entry has no path separator".into(),
+        })?;
+    let header = std::str::from_utf8(&record[..tab]).map_err(|_| WorkspaceError::Tampered {
+        path: target.clone(),
+        detail: "Git tree entry header is not UTF-8".into(),
+    })?;
+    let listed_path =
+        std::str::from_utf8(&record[tab + 1..]).map_err(|_| WorkspaceError::Tampered {
+            path: target.clone(),
+            detail: "Git tree entry path is not UTF-8".into(),
+        })?;
+    if listed_path != relative {
+        return Err(WorkspaceError::Tampered {
+            path: target,
+            detail: "Git tree returned a different path than requested".into(),
+        });
+    }
+    let mut fields = header.split_ascii_whitespace();
+    let mode = fields.next().unwrap_or_default();
+    let kind = fields.next().unwrap_or_default();
+    let oid = fields.next().unwrap_or_default();
+    if fields.next().is_some() || kind != "blob" || oid.len() != 40 && oid.len() != 64 {
+        return Err(WorkspaceError::Tampered {
+            path: target,
+            detail: format!("unsupported Git tree entry {header:?}"),
+        });
+    }
+    let bytes = git_bytes(repository, &["cat-file", "blob", oid])?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match mode {
+        "100644" | "100755" => {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&target)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let restored_mode = if mode == "100755" { 0o755 } else { 0o644 };
+            set_restored_mode(&target, restored_mode)?;
+        }
+        "120000" => create_restored_symlink(&bytes, &target)?,
+        _ => {
+            return Err(WorkspaceError::Tampered {
+                path: target,
+                detail: format!("unsupported Git tree mode {mode}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_restored_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+}
+
+#[cfg(windows)]
+fn set_restored_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_restored_symlink(target: &[u8], path: &Path) -> io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    std::os::unix::fs::symlink(OsStr::from_bytes(target), path)
+}
+
+#[cfg(windows)]
+fn create_restored_symlink(target: &[u8], path: &Path) -> io::Result<()> {
+    let target = String::from_utf8(target.to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 symlink target"))?;
+    std::os::windows::fs::symlink_file(target, path)
 }
 
 fn remove_visible_path(path: &Path) -> Result<(), WorkspaceError> {
@@ -1056,6 +1198,10 @@ mod tests {
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
         git(&repo, &["add", "tracked.txt"]);
         git(&repo, &["commit", "-qm", "base"]);
+        // Exercise the Windows/Git-for-Windows checkout conversion explicitly
+        // on every host. Recovery must restore the captured dirty bytes, not
+        // bytes rewritten by checkout-index through core.autocrlf.
+        git(&repo, &["config", "core.autocrlf", "true"]);
         let base = git(&repo, &["rev-parse", "HEAD"]);
         fs::write(repo.join("tracked.txt"), "staged\n").unwrap();
         git(&repo, &["add", "tracked.txt"]);

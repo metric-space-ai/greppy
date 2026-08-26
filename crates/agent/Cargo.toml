@@ -11,6 +11,7 @@ description = "greppy agent wire layer: provider-neutral protocol types and Anth
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+blake3 = { workspace = true }
 greppy-workspace-core = { path = "../workspace-core" }
 filetime = { workspace = true }
 # Plain HTTP only (localhost gateway). No TLS stack.

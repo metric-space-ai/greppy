@@ -386,8 +386,11 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // semantic candidate set and forbids paraphrased semantic retry loops.
     // 24.08.2026: the 0.3.2 coding gate approved one precise Greppy edit with
     // verification and no redundant reread after a successful edit.
+    // 26.08.2026: the owner approved the 0.3.4 bash-smart execution contract:
+    // leading environment assignments are supported, shell expressions use
+    // pipefail on Unix, and unsafe Windows pipeline semantics are rejected.
     const APPROVED_SHA256: &str =
-        "752cecd93ba0ba54785f8ee4281ae1cd253b9e8cbb5b1040e18670e2bfcf909b";
+        "9f95e74e9180185db92764353bd72e0553fca876deac03aad055c7faa448a3da";
 
     let text = prompt();
     let digest = {
