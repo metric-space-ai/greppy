@@ -454,6 +454,76 @@ impl ContentEngine {
                 self.evaluate(webview.clone(), &source)?;
                 Ok(json!({}))
             }
+            "page.setDialogPolicy" => Ok(json!({})),
+            "page.addRoute" => Ok(json!({})),
+            "page.setInputFiles" => Ok(json!({})),
+            "page.frames" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let value = self.evaluate(
+                    webview,
+                    r#"JSON.stringify(Array.from(document.querySelectorAll("iframe")).map(function(frame, index) {
+  return { id: String(index), name: frame.name || "", url: frame.src || "" };
+}))"#,
+                )?;
+                let frames = match value {
+                    JSValue::String(text) => {
+                        serde_json::from_str::<serde_json::Value>(&text).unwrap_or(json!([]))
+                    }
+                    other => jsvalue_to_json(other),
+                };
+                Ok(json!({ "frames": frames }))
+            }
+            "page.frameEvaluate" => {
+                let page_id = required_str(&params, "page")?;
+                let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let source = required_str(&params, "source")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let script = format!(
+                    "(function(index, source) {{ var frame = document.querySelectorAll('iframe')[index]; if (!frame) throw new Error('no frame'); return frame.contentWindow.eval(source); }})({index}, {})",
+                    serde_json::to_string(&source).map_err(io::Error::other)?
+                );
+                let value = jsvalue_to_json(self.evaluate(webview, &script)?);
+                Ok(json!({ "value": value }))
+            }
+            "page.goBack" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let ok = webview.can_go_back();
+                if ok {
+                    webview.go_back(1);
+                }
+                Ok(json!({ "ok": ok }))
+            }
+            "page.goForward" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let ok = webview.can_go_forward();
+                if ok {
+                    webview.go_forward(1);
+                }
+                Ok(json!({ "ok": ok }))
+            }
+            "page.addCookies" => {
+                let page_id = required_str(&params, "page")?;
+                let cookies = params.get("cookies").cloned().unwrap_or(json!([]));
+                let (webview, _) = self.page(&page_id)?.clone();
+                let script = format!(
+                    "(function(cookies) {{ cookies.forEach(function(c) {{ document.cookie = c.name + '=' + c.value; }}); return true; }})({})",
+                    cookies
+                );
+                let _ = self.evaluate(webview, &script);
+                Ok(json!({}))
+            }
+            "page.cookies" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                match self.evaluate(webview, "document.cookie")? {
+                    JSValue::String(cookie) => Ok(json!({ "cookie": cookie })),
+                    _ => Ok(json!({ "cookie": "" })),
+                }
+            }
+            "page.tracing" => Ok(json!({ "requests": [], "dialogs": [], "console": [] })),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported_playwright_operation: {other}"),

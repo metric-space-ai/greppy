@@ -234,27 +234,6 @@ impl Daemon {
                 ),
             );
         }
-        match self.engine_call("session.ensurePage", json!({})) {
-            Ok(result) => {
-                session.page_id = result
-                    .get("page")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned);
-                session.pages = 1;
-            }
-            Err(error) => {
-                return Response::error(
-                    request,
-                    ErrorObject::new(
-                        "engine_error",
-                        error,
-                        request.request_id.clone(),
-                        34,
-                        "retry web.session.create",
-                    ),
-                );
-            }
-        }
         self.sessions.insert(id.clone(), session);
         self.journal(&id, "session.ready", json!({ "profile": profile }));
         Response::ok(
@@ -758,9 +737,29 @@ impl Daemon {
             .sessions
             .get(&session_id)
             .and_then(|session| session.page_id.clone());
-        let Some(page) = page else {
-            self.finish_session(&session_id);
-            return Err(engine_error(request, "session has no page", 34));
+        let page = match page {
+            Some(page) => page,
+            None => match self.engine_call("session.ensurePage", json!({})) {
+                Ok(result) => {
+                    let page = result
+                        .get("page")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned);
+                    let Some(page) = page else {
+                        self.finish_session(&session_id);
+                        return Err(engine_error(request, "session has no page", 34));
+                    };
+                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                        session.page_id = Some(page.clone());
+                        session.pages = 1;
+                    }
+                    page
+                }
+                Err(error) => {
+                    self.finish_session(&session_id);
+                    return Err(engine_error(request, error, 34));
+                }
+            },
         };
         Ok((session_id, page))
     }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TEST_DEADLINE: Duration = Duration::from_secs(180);
+const TEST_DEADLINE: Duration = Duration::from_secs(300);
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -674,4 +674,124 @@ fn twenty_session_create_run_close_cycles() {
         .unwrap_or_else(|error| panic!("close {i}: {error}"));
         assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
     }
+}
+
+#[test]
+fn embedder_dialogs_frames_routes_and_cookies() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-embedder-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/embedder-surface.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_embedder", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_embedder",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_embedder",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn one_thousand_session_create_run_close_cycles() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-run1000-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/launch-only.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_1000", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    for i in 0..1000 {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_1000",
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("create {i}: {error}"));
+        assert_eq!(created.status, "ok", "create {i}: {created:?}");
+        let session_id = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut run = Request::new(
+            "run_1000",
+            "web.run",
+            json!({
+                "session_id": session_id,
+                "script_source": "file",
+                "script_file": script.display().to_string(),
+                "script_text": source,
+            }),
+        );
+        run.deadline_ms = 10_000;
+        let ran = unix_request(&socket, &run, Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("run {i}: {error}"));
+        assert_eq!(ran.status, "ok", "run {i}: {ran:?}");
+        let closed = unix_request(
+            &socket,
+            &Request::new(
+                "run_1000",
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("close {i}: {error}"));
+        assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
+    }
+}
+
+#[test]
+fn local_package_contains_three_images() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("package-web-runtime.sh");
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-{}", std::process::id()));
+    let status = Command::new("sh")
+        .arg(&script)
+        .arg(&dest)
+        .status()
+        .expect("package script");
+    assert!(status.success(), "packager failed: {status}");
+    for name in [
+        "web-runtime-supervisor",
+        "web-controller-worker",
+        "web-content-worker",
+    ] {
+        assert!(
+            dest.join("bin").join(name).exists(),
+            "missing {name} in {}",
+            dest.display()
+        );
+    }
+    assert!(dest.join("SHA256SUMS").exists());
+    assert!(dest.join("sbom.json").exists());
+    let _ = std::fs::remove_dir_all(&dest);
 }

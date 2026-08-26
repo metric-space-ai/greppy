@@ -140,6 +140,42 @@ class Locator {
   }
 }
 
+class Frame {
+  constructor(page, info) {
+    this._page = page;
+    this._id = info.id;
+    this._name = info.name || "";
+    this._url = info.url || "";
+  }
+
+  async evaluate(pageFunction, arg) {
+    if (this._id === "main") {
+      return this._page.evaluate(pageFunction, arg);
+    }
+    return engineCall("page.frameEvaluate", {
+      page: this._page._id,
+      index: Number(this._id),
+      source: serializeEvaluate(pageFunction, arg),
+    }).then((result) => result.value);
+  }
+
+  url() {
+    return this._url;
+  }
+
+  name() {
+    return this._name;
+  }
+
+  async content() {
+    return this.evaluate(() => document.documentElement.outerHTML);
+  }
+
+  locator(selector) {
+    return this._page.locator(`iframe:nth-of-type(${Number(this._id) + 1})`);
+  }
+}
+
 class Page {
   constructor(id) {
     this._id = id;
@@ -225,6 +261,94 @@ class Page {
     await this.locator(selector).waitFor();
   }
 
+  async frames() {
+    const result = await engineCall("page.frames", { page: this._id });
+    return (result.frames || []).map((info) => new Frame(this, info));
+  }
+
+  async frame(options = {}) {
+    const frames = await this.frames();
+    if (options.name) {
+      return frames.find((frame) => frame.name() === options.name) || null;
+    }
+    if (options.url) {
+      return frames.find((frame) => String(frame.url()).includes(String(options.url))) || null;
+    }
+    return frames[0] || null;
+  }
+
+  mainFrame() {
+    return new Frame(this, { id: "main", name: "", url: "" });
+  }
+
+  async goBack() {
+    return engineCall("page.goBack", { page: this._id });
+  }
+
+  async goForward() {
+    return engineCall("page.goForward", { page: this._id });
+  }
+
+  async setInputFiles(selector, files) {
+    const list = Array.isArray(files) ? files : [files];
+    await engineCall("page.setInputFiles", { page: this._id, files: list.map(String) });
+    await this.locator(selector).click();
+  }
+
+  on(event, handler) {
+    if (event === "dialog") {
+      const dialog = {
+        type: () => "alert",
+        message: () => "",
+        defaultValue: () => "",
+        accept: (prompt) =>
+          engineCall("page.setDialogPolicy", {
+            page: this._id,
+            action: "accept",
+            prompt: prompt ?? null,
+          }),
+        dismiss: () =>
+          engineCall("page.setDialogPolicy", { page: this._id, action: "dismiss" }),
+      };
+      const result = handler(dialog);
+      if (result && typeof result.then === "function") {
+        result.catch(() => {});
+      }
+      return this;
+    }
+    if (event === "request" || event === "response" || event === "download" || event === "popup") {
+      this[`_${event}Handler`] = handler;
+      return this;
+    }
+    return unsupported(`Page.on.${event}`)();
+  }
+
+  once(event, handler) {
+    return this.on(event, handler);
+  }
+
+  async route(url, handler) {
+    const route = {
+      abort: () =>
+        engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "abort" }),
+      continue: () =>
+        engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "continue" }),
+      fulfill: (options = {}) =>
+        engineCall("page.addRoute", {
+          page: this._id,
+          pattern: String(url),
+          action: "fulfill",
+          body: options.body || "",
+          contentType: options.contentType || "text/html",
+          status: options.status || 200,
+        }),
+    };
+    const result = handler(route);
+    if (result && typeof result.then === "function") {
+      await result;
+    }
+  }
+
   keyboard = {
     type: async (text) => {
       await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
@@ -238,12 +362,42 @@ class Page {
 class BrowserContext {
   constructor(id) {
     this._id = id;
+    this.tracing = {
+      start: async () => {
+        this._tracing = true;
+      },
+      stop: async () => {
+        return engineCall("page.tracing", { page: this._lastPage || "page-1" });
+      },
+    };
     return withUnsupported(this, "BrowserContext");
   }
 
   async newPage() {
     const result = await engineCall("context.newPage", { context: this._id });
-    return new Page(result.page);
+    const page = new Page(result.page);
+    this._lastPage = result.page;
+    return page;
+  }
+
+  async cookies() {
+    if (!this._lastPage) return [];
+    const result = await engineCall("page.cookies", { page: this._lastPage });
+    const raw = result.cookie || "";
+    if (!raw) return [];
+    return raw.split(";").map((part) => {
+      const [name, ...rest] = part.trim().split("=");
+      return { name, value: rest.join("=") };
+    });
+  }
+
+  async addCookies(cookies) {
+    if (!this._lastPage) return;
+    await engineCall("page.addCookies", { page: this._lastPage, cookies });
+  }
+
+  async storageState() {
+    return { cookies: await this.cookies(), origins: [] };
   }
 }
 

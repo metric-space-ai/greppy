@@ -38,9 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 40,
+    "implemented": 58,
     "unsupported": 243,
-    "unverified": 1071
+    "unverified": 1053
   },
   "entries": [
     {
@@ -312,11 +312,15 @@
       "symbol": "Page.frame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "selects by name or url substring"
+      ]
     },
     {
       "symbol": "Page.frameLocator",
@@ -332,11 +336,15 @@
       "symbol": "Page.frames",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "same-origin iframes via querySelectorAll"
+      ]
     },
     {
       "symbol": "Page.getAttribute",
@@ -430,21 +438,25 @@
       "symbol": "Page.goBack",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo WebView::go_back"
+      ]
     },
     {
       "symbol": "Page.goForward",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Servo WebView::go_forward"
+      ]
     },
     {
       "symbol": "Page.goto",
@@ -598,10 +610,12 @@
       "symbol": "Page.mainFrame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "embedder-surface"
+      ],
       "known_differences": []
     },
     {
@@ -618,21 +632,27 @@
       "symbol": "Page.on",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "dialog handler is a policy probe; request/download/popup listeners are stored but not dispatched as Playwright events"
+      ]
     },
     {
       "symbol": "Page.once",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "alias of on()"
+      ]
     },
     {
       "symbol": "Page.opener",
@@ -770,11 +790,15 @@
       "symbol": "Page.route",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "handler is invoked with a stub Route that registers abort/fulfill/continue patterns"
+      ]
     },
     {
       "symbol": "Page.routeFromHAR",
@@ -876,11 +900,13 @@
       "symbol": "Page.setInputFiles",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "feeds FilePicker paths then clicks the locator"
+      ]
     },
     {
       "symbol": "Page.setViewportSize",
@@ -2038,7 +2064,7 @@
       "symbol": "Frame.content",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
@@ -2078,11 +2104,15 @@
       "symbol": "Frame.evaluate",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "contentWindow.eval; same-origin only"
+      ]
     },
     {
       "symbol": "Frame.evaluateHandle",
@@ -2338,20 +2368,24 @@
       "symbol": "Frame.locator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "returns a page locator for the iframe element, not in-frame locators"
+      ]
     },
     {
       "symbol": "Frame.name",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "embedder-surface"
+      ],
       "known_differences": []
     },
     {
@@ -2468,10 +2502,12 @@
       "symbol": "Frame.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "embedder-surface"
+      ],
       "known_differences": []
     },
     {
@@ -2878,11 +2914,15 @@
       "symbol": "BrowserContext.addCookies",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "assigns document.cookie"
+      ]
     },
     {
       "symbol": "BrowserContext.addInitScript",
@@ -2958,11 +2998,15 @@
       "symbol": "BrowserContext.cookies",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "document.cookie on last page"
+      ]
     },
     {
       "symbol": "BrowserContext.exposeBinding",
@@ -3213,11 +3257,13 @@
       "symbol": "BrowserContext.storageState",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "cookies only; origins empty"
+      ]
     },
     {
       "symbol": "BrowserContext.unroute",
@@ -13189,11 +13235,13 @@
       "symbol": "BrowserContext.tracing",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "stop() dumps request/dialog/console logs; not Playwright trace.zip"
+      ]
     },
     {
       "symbol": "ElementHandle.type",

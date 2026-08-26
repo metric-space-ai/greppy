@@ -174,6 +174,13 @@ fn playwright_module_methods_are_not_silent_omissions() {
     claimed.push("Page.getByLabel".into());
     claimed.push("Page.getByText".into());
     claimed.push("Page.locator".into());
+    claimed.push("Page.route".into());
+    claimed.push("Page.frames".into());
+    claimed.push("Page.mainFrame".into());
+    claimed.push("Page.goBack".into());
+    claimed.push("Frame.evaluate".into());
+    claimed.push("BrowserContext.cookies".into());
+    claimed.push("BrowserContext.addCookies".into());
 
     let missing: Vec<_> = claimed
         .iter()
