@@ -64,6 +64,26 @@ function serializeEvaluate(pageFunction, arg) {
   return String(pageFunction);
 }
 
+class FileChooser {
+  constructor(page, record) {
+    this._page = page;
+    this._multiple = !!(record && record.multiple);
+  }
+
+  isMultiple() {
+    return this._multiple;
+  }
+
+  page() {
+    return this._page;
+  }
+
+  async setFiles(files) {
+    const selector = this._page._lastFileSelector || 'input[type="file"]';
+    return this._page.setInputFiles(selector, files);
+  }
+}
+
 class Dialog {
   constructor(page, record) {
     this._page = page;
@@ -957,6 +977,14 @@ class Page {
         return unsupported("Page.waitForEvent.dialog.empty")();
       }
       return new Dialog(this, rec);
+    }
+    if (event === "filechooser") {
+      const result = await engineCall("page.fileChoosers", { page: this._id, consume: true });
+      const rec = (result.choosers || [])[0];
+      if (!rec) {
+        return unsupported("Page.waitForEvent.filechooser.empty")();
+      }
+      return new FileChooser(this, rec);
     }
     if (event === "popup" || event === "page") {
       const result = await engineCall("page.popups", { page: this._id });

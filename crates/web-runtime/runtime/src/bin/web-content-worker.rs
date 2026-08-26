@@ -61,6 +61,7 @@ struct Delegate {
     viewport: RefCell<(u32, u32)>,
     extra_headers: RefCell<Vec<(String, String)>>,
     last_console: RefCell<Vec<serde_json::Value>>,
+    last_file_choosers: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
@@ -80,6 +81,7 @@ impl Delegate {
             viewport: RefCell::new((800, 600)),
             extra_headers: RefCell::new(Vec::new()),
             last_console: RefCell::new(Vec::new()),
+            last_file_choosers: RefCell::new(Vec::new()),
             rendering_context,
         }
     }
@@ -119,6 +121,9 @@ impl WebViewDelegate for Delegate {
     fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
         match embedder_control {
             EmbedderControl::FilePicker(mut picker) => {
+                self.last_file_choosers.borrow_mut().push(json!({
+                    "multiple": picker.allow_select_multiple(),
+                }));
                 let paths = self.file_paths.borrow().clone();
                 if paths.is_empty() {
                     picker.dismiss();
@@ -1001,6 +1006,24 @@ impl ContentEngine {
                 Ok(json!({
                     "messages": self.page(&page_id)?.1.last_console.borrow().clone()
                 }))
+            }
+            "page.fileChoosers" => {
+                let page_id = required_str(&params, "page")?;
+                let consume = params
+                    .get("consume")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let choosers = if consume {
+                    self.page(&page_id)?
+                        .1
+                        .last_file_choosers
+                        .borrow_mut()
+                        .drain(..)
+                        .collect::<Vec<_>>()
+                } else {
+                    self.page(&page_id)?.1.last_file_choosers.borrow().clone()
+                };
+                Ok(json!({ "choosers": choosers }))
             }
             "context.close" => Ok(json!({})),
             "page.addRoute" => {

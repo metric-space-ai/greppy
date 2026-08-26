@@ -1695,3 +1695,27 @@ fn frame_locator_queries_same_origin_iframe_document() {
 fn locator_type_and_page_is_editable() {
     run_named_fixture("locator-type.mjs", "run_loctype");
 }
+
+#[test]
+fn file_chooser_wait_for_event_sets_dom_files() {
+    let dir = std::env::temp_dir().join(format!("greppy-web-fcevent-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("sample.txt");
+    std::fs::write(&file, b"chooser-bytes").unwrap();
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-fcevent-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let (path, template) = fixture_source("file-chooser-event.mjs");
+    let source = template.replace("FILE_PATH", &file.display().to_string());
+    let _guard = Supervisor::spawn(&socket, "run_fcevent", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_fcevent",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 179,
+    "implemented": 182,
     "unsupported": 251,
-    "unverified": 924
+    "unverified": 921
   },
   "entries": [
     {
@@ -1239,11 +1239,13 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "native-dialog"
+        "native-dialog",
+        "file-chooser-event"
       ],
       "known_differences": [
         "popup drains auxiliary WebViews; download returns last intercept record",
-        "dialog waitForEvent consumes retained SimpleDialog records after evaluate; Chromium requires waiting before the alert"
+        "dialog waitForEvent consumes retained SimpleDialog records after evaluate; Chromium requires waiting before the alert",
+        "filechooser consumes retained FilePicker records after click; Chromium emits during the picker"
       ]
     },
     {
@@ -8863,31 +8865,43 @@
       "symbol": "FileChooser.isMultiple",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "file-chooser-event"
+      ],
+      "known_differences": [
+        "from Servo FilePicker.allow_select_multiple"
+      ]
     },
     {
       "symbol": "FileChooser.page",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "file-chooser-event"
+      ],
+      "known_differences": [
+        "returns the Page that opened the picker"
+      ]
     },
     {
       "symbol": "FileChooser.setFiles",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "file-chooser-event"
+      ],
+      "known_differences": [
+        "calls page.setInputFiles on the last clicked CSS input; FileList via page JS File+DataTransfer"
+      ]
     },
     {
       "symbol": "FileChooser.noWaitAfter",
