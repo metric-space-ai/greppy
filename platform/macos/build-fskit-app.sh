@@ -56,11 +56,23 @@ verify_minos "$app/Contents/MacOS/GreppyWorkspaceFS"
 cp platform/macos/GreppyWorkspaceFS/Info.plist "$extension/Contents/Info.plist"
 cp platform/macos/GreppyWorkspaceApp/Info.plist "$app/Contents/Info.plist"
 
-codesign --force --timestamp=none --options runtime \
-    --entitlements platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements \
-    --sign "$identity" "$extension"
-codesign --force --timestamp=none --options runtime \
-    --entitlements platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.entitlements \
-    --sign "$identity" "$app"
+sign_bundle() {
+    entitlements=$1
+    bundle=$2
+    if [ "$identity" = "-" ]; then
+        codesign --force --timestamp=none --options runtime \
+            --entitlements "$entitlements" --sign "$identity" "$bundle"
+    else
+        codesign --force --timestamp --options runtime \
+            --entitlements "$entitlements" --sign "$identity" "$bundle"
+    fi
+}
+
+sign_bundle \
+    platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements \
+    "$extension"
+sign_bundle \
+    platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.entitlements \
+    "$app"
 
 codesign --verify --deep --strict "$app"
