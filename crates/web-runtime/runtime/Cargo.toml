@@ -1,0 +1,35 @@
+[package]
+name = "web-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+controller-runtime = ["dep:deno_core"]
+content-runtime = ["dep:servo"]
+
+[dependencies]
+deno_core = { version = "=0.410.0", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+servo = { version = "=0.5.0", optional = true }
+
+[[bin]]
+name = "web-runtime-supervisor"
+path = "src/bin/web-runtime-supervisor.rs"
+
+[[bin]]
+name = "web-controller-worker"
+path = "src/bin/web-controller-worker.rs"
+required-features = ["controller-runtime"]
+
+[[bin]]
+name = "web-content-worker"
+path = "src/bin/web-content-worker.rs"
+required-features = ["content-runtime"]
+
+[[test]]
+name = "process-boundary"
+path = "tests/process-boundary.rs"
+required-features = ["controller-runtime", "content-runtime"]

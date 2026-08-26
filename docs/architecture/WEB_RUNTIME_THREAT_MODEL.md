@@ -1,8 +1,8 @@
 # Greppy Web Runtime Threat Model
 
 Contract revision: 2026-08-26
-Phase: 0 (specified, not implemented)
-Status: every mitigation in this document is a contract requirement. None of it is implemented. Phase 0 records the threats so later phases cannot treat missing controls as optional.
+Phase: 0 plus experimental lifecycle checkpoint
+Status: every mitigation in this document is a contract requirement. Only the three-image process boundary and bounded worker lifecycle have an experimental implementation; capabilities, OS sandboxing, parent integration, policy, artifacts, and the remaining controls are not implemented. Phase 0 records the threats so later phases cannot treat missing controls as optional.
 
 This threat model is binding for the Playwright interactive web runtime described in `docs/PLAYWRIGHT_INTERACTIVE_WEB_RUNTIME_GUIDE.md` sections 5, 10.2, 14.2, 16, 17, and 26. It does not authorize a production claim, a Playwright-compatible label, or a security-review pass.
 
@@ -67,11 +67,11 @@ Four authority levels, in decreasing trust:
 3. Controller worker: Playwright automation JavaScript. Untrusted.
 4. Content worker and the network: page origin. Untrusted.
 
-Controller V8 and page content MUST NOT run in the Greppy parent process. A random process MUST NOT attach to an existing session by guessing a socket path or session ID. Role flags (`web-runtime-daemon`, `web-controller-worker`, `web-content-worker`) MUST be hidden from ordinary CLI help and MUST require an unguessable, short-lived capability issued by the parent.
+Controller V8 and page content MUST NOT run in the Greppy parent process. A random process MUST NOT attach to an existing session by guessing a socket path or session ID. The supervisor, controller, and content roles MUST be three separately linked images (`web-runtime-supervisor`, `web-controller-worker`, and `web-content-worker`), hidden from ordinary CLI help and protected by unguessable, short-lived parent-issued capabilities. A single distributable MAY contain all three images, but no linked image may contain both engines or re-execute itself to select among these roles.
 
 ## 5. STRIDE analysis
 
-Each subsection states the threat, the specified mitigation, and the Phase 0 implementation state. Specified is not implemented.
+Each subsection states the threat, the specified mitigation, and the Phase 0 implementation state. Specified is not implemented unless the experimental lifecycle checkpoint is named explicitly.
 
 ### 5.1 Controller capability policy (guide §16.1, §10.2)
 
@@ -124,7 +124,7 @@ Information disclosure. Profiles, downloads, traces, or cookies persist outside 
 
 Controller and page MUST NOT run in the Greppy parent. If they do, a V8 or Servo memory-safety defect, or a simple infinite loop, takes down the agent and inherits parent credentials.
 
-Specified mitigation: at least three authority levels; shipped artifact MAY re-exec the same binary with hidden role flags; each role requires a parent-issued capability; parent survives worker crashes and forced termination; timeout termination kills the entire worker process tree and returns a typed partial-artifact result. Phase 0: unimplemented. Open critical risk (`Controller or page escapes sandbox`).
+Specified mitigation: three separately linked runtime images: an engine-free supervisor, a V8-only controller worker, and a Servo/mozjs-only content worker. A single distributable MAY package those images, but a same-binary re-exec design is forbidden because it recreates the proven same-Mach-O engine collision. Each process requires a parent-issued capability; the parent survives worker crashes and forced termination; timeout termination kills the entire worker process tree and returns a typed partial-artifact result. `phase1-probe` remains only the negative collision regression. The positive three-image lifecycle boundary is implemented and smoke-tested as an experimental checkpoint, but parent-issued capabilities, OS sandboxing, process-tree enforcement, typed partial artifacts, and Greppy-parent integration remain unimplemented. Open critical risk (`Controller or page escapes sandbox`).
 
 ### 5.6 Prompt-injection fencing for research outputs (guide §14.2)
 
@@ -154,12 +154,12 @@ Specified mitigation: parent-owned capability, heartbeat, idle TTL when no live 
 
 ## 6. Mitigations specified versus unimplemented
 
-The following are specified now and unimplemented in Phase 0. Later phases MUST implement them rather than re-derive policy.
+The following are specified now. Only the row explicitly marked as an experimental lifecycle checkpoint has an implementation; later phases MUST implement the remaining controls rather than re-derive policy.
 
 | Mitigation | Specified in | Implemented in Phase 0 |
 |---|---|---|
 | Parent-issued unguessable capabilities | §6.2, this document | No |
-| Controller and content out of parent process | §5, §6.2 | No |
+| Three separately linked runtime images; neither engine in parent or supervisor; no same-binary re-exec | §5, §6.2 | Experimental lifecycle checkpoint only; not packaged, signed, sandboxed, or parent-integrated |
 | Module allow-list, no npm, no FFI, no child_process | §10.2, §16.1 | No |
 | Env allow-list | §10.2, §16.1 | No |
 | Virtualized fs roots | §10.2, §16.1 | No |
@@ -176,15 +176,17 @@ No critical or high finding is waived.
 
 ## 7. Residual risks from the guide §26 register
 
-These remain open Phase-0 tracked risks. Severity is taken from the register. They are not residual-after-mitigation; the mitigations are not yet built.
+These remain open Phase-0 tracked risks. Severity is taken from the register. They are not residual-after-mitigation; apart from the explicitly identified lifecycle checkpoint, the mitigations are not yet built.
 
 | Risk | Severity | Phase 0 tracking |
 |---|---|---|
 | Servo lacks required automation hooks | Critical | Open. `docs/architecture/SERVO_EMBEDDING_GAPS.md` inventories required hooks as unverified against crate 0.5.0 source because the crate was not present locally. Stop if fork size becomes unbounded. |
 | Playwright behavior is larger than its schema | Critical | Open. Coverage inventory exists with schema/source/behavior set to unverified or unsupported. No schema-only claim is permitted. |
 | Node compatibility expands without bound | High | Open. Safe builtin allow-list is specified, not implemented. No arbitrary npm claim. |
-| V8 and Servo inflate build/install size | High | Open. Benchmarks registered, not measured. |
-| Controller or page escapes sandbox | Critical | Open. Process model specified, not implemented. Hostile tests not run. |
+| V8 and Servo inflate build/install size | High | Open. One optional distributable containing three separately linked images is specified; aggregate and per-image benchmarks are registered, not measured. |
+| V8 and Servo collide in one linked image | Critical | Proven negative. `phase1-probe` demonstrates the same-Mach-O collision. The three-image lifecycle checkpoint is implemented and smoke-tested; production packaging, signing, and sandboxing remain open. |
+| Controller or page escapes sandbox | Critical | Open. Three separately linked runtime images and an engine-free supervisor exist as an experimental checkpoint, but capabilities, OS sandboxing, parent integration, and hostile tests are not implemented. |
+| Runtime packaging or signing is incomplete | High | Open. No release-CI receipt proves the one-distributable/three-image layout, per-image and package signatures, SBOM, provenance, installation, upgrade, rollback, or uninstall. |
 | Playwright releases drift rapidly | High | Open. Baseline pinned at 1.62.1 in the dependency lock. |
 | Event ordering creates flaky automation | High | Open. Causal journal specified, not implemented. |
 | Auto-waiting busy-polls | Medium | Open. Idle CPU gate registered, not measured. |
@@ -197,12 +199,15 @@ These remain open Phase-0 tracked risks. Severity is taken from the register. Th
 
 The following remain unresolved critical or high findings. They MAY NOT be converted to a pass by prose, a demo script, or type coverage:
 
-1. No process isolation implementation (controller/page in parent would be a ship blocker).
+1. The experimental process boundary lacks production capabilities, OS sandboxing, parent-owned lifecycle, and hostile isolation tests.
 2. No SSRF/rebinding enforcement.
 3. No credential redaction path.
 4. No evidence that Servo 0.5.0 exposes the required embedding hooks (crate source not inspected; see the gaps document).
 5. No conformance corpus execution; compatibility entries are unverified or unsupported.
 6. No proof the runtime cannot outlive the agent run.
 7. No prompt-injection fencing tests.
+8. No release-CI proof that the three required linked images are packaged,
+   signed, verified, installed, upgraded, rolled back, and removed as one
+   distributable.
 
-Phase 1 may proceed only as an `experimental web-runtime spike` and only if it does not silently replace this architecture with official Playwright, CDP, an external browser, or the CTOX web stack.
+Phase 1 may proceed only as an `experimental web-runtime spike`, through the three separately linked images required above, and only if it does not silently replace this architecture with official Playwright, CDP, an external browser, or the CTOX web stack. The negative `phase1-probe` is not Phase 1 completion. Even a successful positive spike leaves packaging and signing as unproven Phase 7 release gates.

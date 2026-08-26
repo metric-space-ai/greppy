@@ -239,25 +239,74 @@ JavaScript replacement during the first implementation track.
 
 ### 6.2 Process model
 
-The release MUST use at least three authority levels:
+The web runtime MUST run as **three separate processes**, which are **three
+separately linked images** (three Mach-O or ELF binaries). Do not collapse
+these roles into one linked image that re-executes itself with role flags.
 
-1. Greppy parent: owns the model loop and user-visible completion.
-2. Web supervisor: owns sessions, policy, resource limits, and evidence.
-3. Workers: controller and content processes with narrower capabilities.
+1. `web-runtime-supervisor`: owns sessions, policy, resource limits, and
+   evidence. It uses **neither** JavaScript engine (no `deno_core` / V8, no
+   Servo / mozjs / SpiderMonkey).
+2. `web-controller-worker`: `deno_core` / V8 only. Executes controller-realm
+   Playwright automation JavaScript.
+3. `web-content-worker`: Servo / mozjs / SpiderMonkey only. Hosts the page
+   realm, DOM, layout, network, and input.
 
-The shipped artifact MAY be one binary that re-executes itself with hidden
-role flags:
+Authority levels (the Greppy parent is not a fourth web-runtime binary):
+
+1. Greppy parent: owns the model loop and user-visible completion. It MUST NOT
+   link either web engine.
+2. `web-runtime-supervisor`: as above.
+3. Workers: `web-controller-worker` and `web-content-worker`, each a narrower,
+   separately linked image.
+
+**Distributable artifact versus linked image.** A *distributable* is a product
+or package; it MAY contain multiple binaries. A *linked image* is a single
+Mach-O or ELF that is linked together. The collision below is about one linked
+image, not about one distributable. One optional install package that contains
+the three binaries is allowed. One Mach-O / ELF that contains both engines is
+not.
+
+**Same-Mach-O collision (proven negative).** Linking V8 (`deno_core`) and
+SpiderMonkey/mozjs (Servo) into one linked image has been proven to collide.
+Keep `crates/web-runtime/phase1-probe` as the documented **negative
+regression** of that collision: it can compile and link both engines into one
+macOS executable, then SIGSEGV because ld64 coalesces overlapping
+`v8::internal` symbols (SpiderMonkey irregexp is a V8 fork). `phase1-probe` is
+not a working in-process runtime, not Phase 1 completion, and not Playwright
+compatibility.
+
+A single-binary "re-exec with hidden role flags" design would put both engines
+in one linked image and recreates that collision. It is not the process model.
+
+The lifecycle checkpoint currently invokes the separate binaries with explicit
+worker paths and communicates over framed stdin/stdout pipes:
 
 ```text
-greppy web-runtime-daemon --socket <path> --run-id <id>
-greppy web-controller-worker --capability <token>
-greppy web-content-worker --capability <token>
+web-runtime-supervisor \
+  --controller-worker <path> \
+  --content-worker <path>
 ```
 
-Role flags MUST be hidden from ordinary CLI help. Every role invocation MUST
-require an unguessable, short-lived capability issued by its parent. A random
-process MUST NOT be able to attach to an existing session by guessing a socket
-path or session ID.
+The following hidden invocations and capability tokens are the **production
+contract and are not implemented by the lifecycle checkpoint**:
+
+```text
+web-runtime-supervisor --socket <path> --run-id <id>
+web-controller-worker --capability <token>
+web-content-worker --capability <token>
+```
+
+Those names MUST be hidden from ordinary CLI help. Every supervisor or worker
+invocation MUST require an unguessable, short-lived capability issued by its
+parent. A random process MUST NOT be able to attach to an existing session by
+guessing a socket path or session ID.
+
+**Packaging.** The isolated workspace at `crates/web-runtime` contains the
+`runtime` package, which produces the three role binaries so integration tests
+can use Cargo-provided `CARGO_BIN_EXE_<name>` paths. The sibling
+`phase1-probe` package is the negative same-image regression and MUST remain
+separate from the isolated runtime package. `phase1-probe` is not a shipped
+role.
 
 ### 6.3 Lifecycle
 
@@ -285,14 +334,13 @@ deadline, cancellation token, worker identity, and last heartbeat.
 The recommended source layout is:
 
 ```text
-crates/web-runtime/
-  src/client.rs
-  src/protocol.rs
-  src/supervisor.rs
-  src/session.rs
-  src/policy.rs
-  src/artifacts.rs
-  src/errors.rs
+crates/web-runtime/            # isolated Cargo workspace
+  runtime/                     # one package; three separately linked role binaries
+    src/protocol.rs
+    src/supervisor.rs
+    src/worker.rs
+    src/bin/
+  phase1-probe/                # separate negative same-image regression package
 
 crates/web-engine-servo/
   src/engine.rs
@@ -356,12 +404,20 @@ Crate boundaries MUST remain acyclic. `web-engine-servo` MUST NOT depend on
 Greppy CLI or agent crates. `playwright-compat` depends on engine traits, not
 Servo concrete types. The supervisor selects the concrete engine adapter.
 
-Servo and V8 MUST be build-isolated from Greppy's normal fast edit/test cycle
-where Cargo permits it. A separate `greppy-web-runtime` binary is acceptable
-and preferred if linking both stacks into the ordinary Greppy CLI materially
-slows every build or enlarges installs for users who do not enable web tools.
-The normal `greppy` binary then contains only the versioned IPC client and
+Servo (`mozjs` / SpiderMonkey) and V8 (`deno_core`) MUST be build-isolated from
+Greppy's normal fast edit/test cycle where Cargo permits it, and MUST NOT be
+linked into the same Mach-O or ELF (see §6.2). The ordinary `greppy` CLI MUST
+NOT link either engine; it contains only the versioned IPC client and
 lifecycle manager.
+
+A single optional *distributable* MAY package the three separately linked
+images (`web-runtime-supervisor`, `web-controller-worker`,
+`web-content-worker`). That is one product/package, not one linked image. Those
+three binaries SHOULD be produced by the single Cargo package
+`crates/web-runtime/runtime` so integration tests can use Cargo-provided
+`CARGO_BIN_EXE_<name>` paths. Keep `crates/web-runtime/phase1-probe` as a
+separate sibling package and negative same-Mach-O collision regression; it is
+not a shipped role, not Phase 1 completion, and not a Playwright deliverable.
 
 ## 8. CLI contract
 
@@ -1049,16 +1105,30 @@ const value = await page.evaluate(() => document.title);
 await browser.close();
 ```
 
+The positive spike MUST use the production process boundary from §6.2:
+`web-runtime-supervisor`, `web-controller-worker`, and `web-content-worker`
+are three separately linked images. The supervisor links neither engine, the
+controller image links V8 only, and the content image links Servo/mozjs only.
+The existing `phase1-probe` proves the negative same-Mach-O collision and MUST
+remain a negative regression; compiling or crashing that probe is not this
+Phase 1 deliverable and cannot satisfy the gate.
+
 Gate:
 
 - no source rewriting;
 - no prohibited runtime dependency;
+- the unchanged script completes through all three separately linked runtime
+  images, with no same-image engine co-linking or same-binary re-exec design;
 - deterministic pass on macOS and Linux target CI;
 - process isolation and cleanup pass;
 - measured size/RSS rationale passes;
 - React or equivalent hydration fixture passes.
 
 Stop if this gate fails.
+
+Passing Phase 1 does not prove that those images can be packaged, signed, or
+installed as one distributable. Packaging and signing remain Phase 7 release
+gates until receipts exist for every claimed platform.
 
 ### Phase 2: runtime foundation
 
@@ -1134,8 +1204,9 @@ without exceeding Greppy output budgets.
 
 Deliver:
 
-- installers or optional runtime package;
-- signed artifacts and SBOM;
+- installers or one optional runtime distributable containing the three
+  separately linked runtime images;
+- per-image and distributable signatures, SBOM, and provenance;
 - upgrade and rollback path;
 - compatibility receipt;
 - operator documentation;
@@ -1145,6 +1216,10 @@ Deliver:
 
 Gate: all Definition of Done items pass. No manual waiver may convert an
 unknown compatibility result into a pass.
+
+The existence of three build outputs does not prove this phase. Packaging,
+installation, signing, signature verification, and rollback MUST execute in
+release CI and produce receipts; until then the release gate is unproven.
 
 ## 22. CI and verification
 
@@ -1190,6 +1265,12 @@ Nightly or scheduled lanes SHOULD run:
 
 ## 23. Release and supply chain
 
+The release MAY be one optional distributable artifact, but that artifact
+MUST contain three separately linked runtime images. It MUST NOT replace them
+with one linked image that selects or re-executes roles. The distributable is
+the installation and versioning boundary; each contained Mach-O or ELF remains
+an independently linked security and engine-isolation boundary.
+
 Release artifacts MUST include:
 
 - exact Greppy and web-runtime versions;
@@ -1200,17 +1281,23 @@ Release artifacts MUST include:
 - compatibility coverage manifest;
 - conformance receipt with corpus hashes;
 - benchmark receipt;
-- artifact SHA-256 and signature;
+- SHA-256 and signature for each linked image and for the containing
+  distributable;
 - build provenance.
 
 If V8 prebuilt archives are used, mirror and verify them by digest. Release CI
 SHOULD periodically build V8 from source to prove reproducibility and detect
 archive drift. Servo source and any local patches MUST be pinned and auditable.
 
-Runtime upgrade MUST be atomic. The old runtime remains available until the
-new binary passes self-check and protocol handshake. Active sessions are not
-migrated across incompatible runtime versions; they are closed or allowed to
-drain under the owning build.
+Runtime upgrade MUST be atomic. The old runtime set remains available until
+the candidate distributable is verified, all three contained images pass
+self-checks, and the supervisor completes protocol handshakes with both worker
+images. Active sessions are not migrated across incompatible runtime versions;
+they are closed or allowed to drain under the owning build.
+
+Packaging and signing are currently specified but not proven. A source build,
+the negative `phase1-probe`, or prose declaring the expected file layout MUST
+NOT advance this gate; only release-CI receipts for every claimed platform do.
 
 ## 24. Failure behavior
 
@@ -1286,8 +1373,10 @@ tests, generated manifests, receipts, or inspected runtime state.
 | Servo lacks required automation hooks | Critical | Phase-0 gap inventory; upstream narrow APIs; stop if fork size becomes unbounded. |
 | Playwright behavior is larger than its schema | Critical | Differential behavioral corpus; port applicable upstream tests; no schema-only claims. |
 | Node compatibility expands without bound | High | Versioned safe builtin allow-list; separate `@playwright/test` track; no arbitrary npm claim. |
-| V8 and Servo inflate build/install size | High | Separate optional runtime artifact; registered size/RSS gate; isolated build lanes. |
-| Controller or page escapes sandbox | Critical | Separate workers, OS sandbox, capability IPC, hostile tests, security review. |
+| V8 and Servo inflate build/install size | High | One optional distributable containing three separately linked runtime images; registered aggregate and per-image size/RSS gates; isolated build lanes. |
+| V8 and Servo collide in one linked image | Critical | Never co-link the engines or use a same-binary re-exec design; retain `phase1-probe` as the negative regression; execute the positive path through three separately linked images. |
+| Controller or page escapes sandbox | Critical | Separate linked worker images, an engine-free supervisor, OS sandbox, capability IPC, hostile tests, and security review. |
+| Runtime packaging or signing is incomplete | High | Verify the one-distributable/three-image layout, per-image and package signatures, SBOM, provenance, install, upgrade, rollback, and uninstall in release CI. |
 | Playwright releases drift rapidly | High | Pin one version; automated schema diff; explicit compatibility upgrade releases. |
 | Event ordering creates flaky automation | High | Single causal event journal; deterministic fixtures; race and replay tests. |
 | Auto-waiting busy-polls | Medium | Event-driven waiting; idle CPU gate; polling only as bounded fallback. |
@@ -1303,9 +1392,17 @@ below is true:
 
 ### Architecture
 
-- [ ] Controller and page JavaScript run in separate worker processes.
+- [ ] Supervisor, controller, and content roles run as three separately linked
+  images; no linked image contains both V8 and Servo/mozjs.
+- [ ] The supervisor links neither JavaScript engine; controller JavaScript
+  runs only in the V8 worker image and page JavaScript only in the
+  Servo/mozjs worker image.
 - [ ] Greppy parent survives worker crashes and forced termination.
-- [ ] Runtime is one optional, versioned installation boundary.
+- [ ] Runtime is one optional, versioned distributable and installation
+  boundary containing those three images, not one linked or re-executed
+  binary.
+- [ ] `phase1-probe` remains a passing negative collision regression and is
+  neither shipped nor counted as positive runtime completion.
 - [ ] No prohibited production runtime dependency is present.
 - [ ] Crate boundaries match the approved dependency direction.
 
@@ -1355,10 +1452,18 @@ below is true:
 
 - [ ] Supported platform matrix passes.
 - [ ] Reproducible build and dependency verification pass.
-- [ ] SBOM, licenses, signatures, and provenance exist.
+- [ ] Release packaging tests verify that the distributable installs exactly
+  the three separately linked runtime images and no same-binary role re-exec
+  path.
+- [ ] SBOM, licenses, per-image and distributable signatures, and provenance
+  exist and verify on every claimed platform.
 - [ ] Conformance and benchmark receipts are attached.
 - [ ] Upgrade, rollback, doctor, and uninstall are tested.
 - [ ] Documentation names limitations without euphemism.
+
+Packaging and signing stay unchecked until release CI produces and verifies
+the corresponding receipts. Documentation, local binaries, or a successful
+Phase 1 spike are not substitutes.
 
 ## 28. Final product contract
 
