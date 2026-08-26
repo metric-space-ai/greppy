@@ -41,8 +41,8 @@
   "entry_count": 1354,
   "status_counts": {
     "implemented": 301,
-    "unsupported": 330,
-    "unverified": 723
+    "unsupported": 337,
+    "unverified": 716
   },
   "entries": [
     {
@@ -2496,11 +2496,15 @@
       "symbol": "Frame.dragAndDrop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Child/main Frame.dragAndDrop is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Frame.evaluate",
@@ -2563,11 +2567,15 @@
       "symbol": "Frame.frameElement",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No ElementHandle for the iframe element. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Frame.frameLocator",
@@ -3006,11 +3014,15 @@
       "symbol": "Frame.setInputFiles",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Frame.setInputFiles is not implemented; use Page/Locator.setInputFiles. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Frame.tap",
@@ -3800,11 +3812,15 @@
       "symbol": "BrowserContext.routeFromHAR",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "HAR replay is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.routeWebSocket",
@@ -3973,11 +3989,15 @@
       "symbol": "BrowserContext.waitForEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserContext event wait is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.accuracy",
@@ -6236,11 +6256,15 @@
       "symbol": "Locator.drop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "HTML5 drop is not implemented (dragTo is mouse path only). Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.elementHandle",
@@ -6497,11 +6521,15 @@
       "symbol": "Locator.hideHighlight",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No highlighter overlay. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.highlight",
@@ -15689,8 +15717,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1007,
-    "unsupported": 330,
+    "unverified": 1000,
+    "unsupported": 337,
     "passing": 17
   }
 }

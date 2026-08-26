@@ -46,6 +46,13 @@ await expectUnsupported("BrowserContext.serviceWorkers", () => context.serviceWo
 await expectUnsupported("Locator.elementHandle", () => page.locator("#b").elementHandle());
 await expectUnsupported("Locator.evaluateHandle", () => page.locator("#b").evaluateHandle(() => 1));
 await expectUnsupported("Frame.evaluateHandle", () => page.mainFrame().evaluateHandle(() => 1));
+await expectUnsupported("Frame.frameElement", () => page.mainFrame().frameElement());
+await expectUnsupported("Frame.dragAndDrop", () => page.mainFrame().dragAndDrop("#b", "#b"));
+await expectUnsupported("Frame.setInputFiles", () => page.mainFrame().setInputFiles("#b", "x"));
+await expectUnsupported("Locator.drop", () => page.locator("#b").drop(page.locator("#b")));
+await expectUnsupported("Locator.hideHighlight", () => page.locator("#b").hideHighlight());
+await expectUnsupported("BrowserContext.routeFromHAR", () => context.routeFromHAR("x.har"));
+await expectUnsupported("BrowserContext.waitForEvent", () => context.waitForEvent("page"));
 const messages = await page.consoleMessages();
 if (!messages.length) throw new Error("expected console message");
 await expectUnsupported("ConsoleMessage.args", () => messages[0].args());

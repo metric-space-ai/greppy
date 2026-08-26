@@ -225,7 +225,7 @@ impl Daemon {
                 },
                 "last_crash": self.last_crash.clone(),
                 "crash_receipts": self.crash_receipts.clone(),
-                "unsupported_capability_count": 330,
+                "unsupported_capability_count": 337,
                 "conformance_receipt_id": "contracts/web-runtime/receipts/oracle-setcontent.json",
                 "engines_linked_into_greppy_parent": false,
                 "signed_distributable": false,
