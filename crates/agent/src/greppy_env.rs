@@ -295,9 +295,21 @@ fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured,
         cmd.process_group(0);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn greppy binary: {e}"))?;
+    let start = Instant::now();
+    let mut executable_busy_attempts = 0;
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if executable_busy(&error)
+                    && executable_busy_attempts < EXECUTABLE_BUSY_RETRIES =>
+            {
+                executable_busy_attempts += 1;
+                thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(format!("failed to spawn greppy binary: {error}")),
+        }
+    };
 
     let stdout_pipe = child
         .stdout
@@ -321,7 +333,6 @@ fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured,
         buf
     });
 
-    let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -356,6 +367,13 @@ fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured,
         timed_out,
         timeout,
     })
+}
+
+const EXECUTABLE_BUSY_RETRIES: usize = 10;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+fn executable_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ExecutableFileBusy
 }
 
 /// Kill the spawned tool process and, on Unix, its process group so shell
@@ -1001,6 +1019,29 @@ exit 2
             elapsed < Duration::from_secs(4),
             "elapsed too long: {elapsed:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_busy_spawn_retries_until_atomic_publisher_releases_writer() {
+        let bin = write_stub("exit 0");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&bin)
+            .expect("hold executable open for writing");
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(35));
+            drop(writer);
+        });
+        let mut command = Command::new(&bin);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let captured = run_capture(&mut command, Some(Duration::from_secs(1)))
+            .expect("ETXTBSY must be retried after the writer closes");
+
+        releaser.join().expect("writer releaser");
+        assert!(captured.success);
+        assert!(!captured.timed_out);
     }
 
     #[test]
