@@ -821,7 +821,17 @@ impl ContentEngine {
             "page.screenshot" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                let png = self.screenshot_png(&webview, None)?;
+                let clip = params.get("clip").and_then(|value| {
+                    if !value.is_object() {
+                        return None;
+                    }
+                    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as u32;
+                    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as u32;
+                    let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
+                    let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
+                    Some((x, y, width, height))
+                });
+                let png = self.screenshot_png(&webview, clip)?;
                 Ok(json!({ "png_base64": base64_encode(&png) }))
             }
             "locator.count" => {
@@ -1864,6 +1874,12 @@ function greppyResolveNodes(selector) {
     if (selector.hasText) {
       const wanted = String(selector.hasText);
       nodes = nodes.filter((el) => ((el.innerText || el.textContent || '') + '').indexOf(wanted) !== -1);
+    }
+    if (selector.has) {
+      nodes = nodes.filter((el) => greppyResolveIn(el, selector.has).length > 0);
+    }
+    if (selector.hasNot) {
+      nodes = nodes.filter((el) => greppyResolveIn(el, selector.hasNot).length === 0);
     }
     if (selector.nth != null) {
       const idx = selector.nth < 0 ? nodes.length + selector.nth : selector.nth;

@@ -3,7 +3,7 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setContent(
-  `<!DOCTYPE html><html><body><iframe name="child" srcdoc="<p id='in'>frame-ok</p><button>Go</button>"></iframe></body></html>`,
+  `<!DOCTYPE html><html><body><iframe name="child" srcdoc="<p id='in'>frame-ok</p><button>Go</button><label>Name<input placeholder='search'></label>"></iframe></body></html>`,
 );
 const frames = await page.frames();
 if (frames.length < 1) {
@@ -50,6 +50,12 @@ const viaContent = await page.locator("iframe").contentFrame().locator("#in").in
 if (viaContent.trim() !== "frame-ok") throw new Error("contentFrame " + viaContent);
 const viaNested = await page.locator("body").frameLocator("iframe").locator("#in").innerText();
 if (viaNested.trim() !== "frame-ok") throw new Error("locator.frameLocator " + viaNested);
+if ((await page.frameLocator("iframe").getByLabel("Name").count()) !== 1) {
+  throw new Error("FrameLocator.getByLabel");
+}
+if ((await page.frameLocator("iframe").getByPlaceholder("search").count()) !== 1) {
+  throw new Error("FrameLocator.getByPlaceholder");
+}
 const mainNested = await main.frameLocator("iframe").locator("#in").innerText();
 if (mainNested.trim() !== "frame-ok") throw new Error("main frameLocator " + mainNested);
 

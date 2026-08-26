@@ -1064,7 +1064,7 @@
         "screenshot"
       ],
       "known_differences": [
-        "options are unsupported; returns PNG bytes"
+        "clip is the only accepted option; PNG bytes cropped from the full-page screenshot"
       ]
     },
     {
@@ -6260,7 +6260,7 @@
         "filter-scroll"
       ],
       "known_differences": [
-        "hasText substring only; has/hasNot locators are not implemented"
+        "hasText substring plus has/hasNot locator intersection; no regex hasText"
       ]
     },
     {
@@ -9439,71 +9439,99 @@
       "symbol": "FrameLocator.getByAltText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.getByLabel",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.getByPlaceholder",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.getByRole",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.getByTestId",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.getByText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.getByTitle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe FrameLocator using existing selector types; nested child Frame methods stay fail-closed"
+      ]
     },
     {
       "symbol": "FrameLocator.last",

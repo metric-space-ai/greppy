@@ -35,4 +35,13 @@ if (redSize.width >= full.width && redSize.height >= full.height) {
 if (red.byteLength === blue.byteLength && new Uint8Array(red).every((b, i) => b === new Uint8Array(blue)[i])) {
   throw new Error("red and blue locator screenshots were identical");
 }
+const clipBuf = await page.screenshot({
+  clip: { x: redSize.width ? 0 : 0, y: 0, width: Math.max(20, redSize.width), height: Math.max(10, redSize.height) },
+});
+const clipBytes = new Uint8Array(clipBuf);
+if (clipBytes[0] !== 0x89 || clipBytes[1] !== 0x50) throw new Error("clip screenshot not png");
+const clipSize = pngSize(clipBuf);
+if (clipSize.width >= full.width && clipSize.height >= full.height) {
+  throw new Error("page.screenshot clip not smaller: " + JSON.stringify({ clipSize, full }));
+}
 await browser.close();

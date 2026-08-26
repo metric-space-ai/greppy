@@ -255,6 +255,8 @@ class Locator {
   constructor(page, selector) {
     this._page = page;
     this._selector = selector;
+    this._description = undefined;
+    return withUnsupported(this, "Locator");
   }
 
   async click(options) {
@@ -570,9 +572,19 @@ class Locator {
   }
 
   filter(options = {}) {
+    const has = options.has && options.has._selector ? options.has._selector : null;
+    const hasNot = options.hasNot && options.hasNot._selector ? options.hasNot._selector : null;
+    if (options.has && !has) {
+      throwUnsupported("Locator.filter.has");
+    }
+    if (options.hasNot && !hasNot) {
+      throwUnsupported("Locator.filter.hasNot");
+    }
     return new Locator(this._page, {
       type: "filter",
       hasText: options.hasText != null ? String(options.hasText) : null,
+      has,
+      hasNot,
       scope: this._selector,
     });
   }
@@ -669,6 +681,48 @@ class FrameLocator {
   constructor(page, frameSelector) {
     this._page = page;
     this._frame = frameSelector;
+    return withUnsupported(this, "FrameLocator");
+  }
+
+  getByLabel(name) {
+    return new Locator(this._page, {
+      type: "label",
+      name,
+      scope: { type: "framecss", frame: this._frame, value: "html" },
+    });
+  }
+
+  getByPlaceholder(name) {
+    return new Locator(this._page, {
+      type: "placeholder",
+      name: String(name),
+      scope: { type: "framecss", frame: this._frame, value: "html" },
+    });
+  }
+
+  getByAltText(name) {
+    return new Locator(this._page, {
+      type: "alt",
+      name: String(name),
+      scope: { type: "framecss", frame: this._frame, value: "html" },
+    });
+  }
+
+  getByTitle(name) {
+    return new Locator(this._page, {
+      type: "title",
+      name: String(name),
+      scope: { type: "framecss", frame: this._frame, value: "html" },
+    });
+  }
+
+  getByTestId(name) {
+    return new Locator(this._page, {
+      type: "testid",
+      name: String(name),
+      attr: "data-testid",
+      scope: { type: "framecss", frame: this._frame, value: "html" },
+    });
   }
 
   locator(selector) {
@@ -1557,10 +1611,20 @@ class Page {
   }
 
   async screenshot(options) {
+    let clip = null;
     if (options != null) {
-      return unsupported("Page.screenshot.options")();
+      const keys = Object.keys(options).filter((key) => options[key] !== undefined);
+      if (keys.some((key) => key !== "clip") || !options.clip) {
+        return unsupported("Page.screenshot.options")();
+      }
+      clip = {
+        x: Number(options.clip.x) || 0,
+        y: Number(options.clip.y) || 0,
+        width: Number(options.clip.width) || 1,
+        height: Number(options.clip.height) || 1,
+      };
     }
-    const result = await engineCall("page.screenshot", { page: this._id });
+    const result = await engineCall("page.screenshot", { page: this._id, clip });
     const binary = result.png_base64 || "";
     return decodeBase64(binary).buffer;
   }
