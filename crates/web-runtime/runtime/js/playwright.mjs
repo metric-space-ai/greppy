@@ -67,6 +67,13 @@ class Locator {
     });
   }
 
+  async hover() {
+    await engineCall("locator.hover", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
   async innerText() {
     const result = await engineCall("locator.innerText", {
       page: this._page._id,
@@ -86,6 +93,29 @@ class Locator {
     });
     return result.count;
   }
+
+  async isVisible() {
+    const result = await engineCall("locator.isVisible", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return !!result.visible;
+  }
+
+  async waitFor() {
+    await engineCall("locator.waitFor", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
+  first() {
+    return new Locator(this._page, { ...this._selector, nth: 0 });
+  }
+
+  nth(index) {
+    return new Locator(this._page, { ...this._selector, nth: index });
+  }
 }
 
 class Page {
@@ -104,6 +134,10 @@ class Page {
 
   getByLabel(name) {
     return new Locator(this, { type: "label", name });
+  }
+
+  getByText(text) {
+    return new Locator(this, { type: "text", value: String(text) });
   }
 
   locator(selector) {
@@ -148,6 +182,31 @@ class Page {
     const bytes = Uint8Array.from(atob(binary), (c) => c.charCodeAt(0));
     return bytes.buffer;
   }
+
+  async setContent(html) {
+    await engineCall("page.setContent", { page: this._id, html: String(html) });
+  }
+
+  async reload() {
+    await engineCall("page.reload", { page: this._id });
+  }
+
+  async waitForTimeout(ms) {
+    ops.op_sleep_ms(Math.max(0, Number(ms) || 0));
+  }
+
+  async waitForLoadState() {
+    await engineCall("page.waitForLoadState", { page: this._id });
+  }
+
+  keyboard = {
+    type: async (text) => {
+      await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
+    },
+    press: async (key) => {
+      await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
+    },
+  };
 }
 
 class BrowserContext {

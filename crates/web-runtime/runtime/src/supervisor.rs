@@ -406,6 +406,17 @@ impl WorkerProcess {
         }
     }
 
+    pub(crate) fn is_running(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                self.reaped = true;
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn send(&mut self, message: &Message) -> io::Result<()> {
         let input = self.input.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin is already closed")

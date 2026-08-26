@@ -72,6 +72,11 @@ impl ModuleLoader for PlaywrightLoader {
     }
 }
 
+#[op2(fast)]
+fn op_sleep_ms(ms: u32) {
+    thread::sleep(Duration::from_millis(u64::from(ms.min(60_000))));
+}
+
 #[op2(async(deferred))]
 #[serde]
 async fn op_engine_call(
@@ -108,7 +113,7 @@ async fn op_engine_call(
 
 extension!(
     greppy_playwright,
-    ops = [op_engine_call],
+    ops = [op_engine_call, op_sleep_ms],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);

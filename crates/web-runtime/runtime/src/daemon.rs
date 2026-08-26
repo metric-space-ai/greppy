@@ -44,10 +44,14 @@ struct Daemon {
     fixture_url: String,
     search_endpoint: Option<String>,
     store: ArtifactStore,
+    controller_worker: PathBuf,
+    content_worker: PathBuf,
     controller: WorkerProcess,
     content: WorkerProcess,
     sessions: HashMap<String, Session>,
     next_engine_id: AtomicU64,
+    last_crash: Option<String>,
+    last_request: Instant,
 }
 
 impl Daemon {
@@ -68,14 +72,21 @@ impl Daemon {
             fixture_url: config.fixture_url.unwrap_or_default(),
             search_endpoint: std::env::var("GREPPY_WEB_SEARCH_ENDPOINT").ok(),
             store: ArtifactStore::new(data_root)?,
+            controller_worker: config.controller_worker,
+            content_worker: config.content_worker,
             controller,
             content,
             sessions: HashMap::new(),
             next_engine_id: AtomicU64::new(1),
+            last_crash: None,
+            last_request: Instant::now(),
         })
     }
 
     fn handle(&mut self, request: Request) -> Response {
+        self.last_request = Instant::now();
+        self.reap_idle_sessions();
+        self.ensure_workers();
         if request.schema != SCHEMA {
             return Response::error(
                 &request,
@@ -158,7 +169,7 @@ impl Daemon {
         response
     }
 
-    fn status(&self, request: &Request) -> Response {
+    fn status(&mut self, request: &Request) -> Response {
         Response::ok(
             request,
             serde_json::json!({
@@ -166,7 +177,25 @@ impl Daemon {
                 "playwright_compatibility_version": "1.62.1",
                 "compatibility_coverage_level": "unverified",
                 "sessions": self.sessions.len(),
+                "ready": self
+                    .sessions
+                    .values()
+                    .filter(|session| session.state == SessionState::Ready)
+                    .count(),
+                "busy": self
+                    .sessions
+                    .values()
+                    .filter(|session| session.state == SessionState::Busy)
+                    .count(),
+                "failed": self
+                    .sessions
+                    .values()
+                    .filter(|session| session.state == SessionState::Failed)
+                    .count(),
                 "workers": 2,
+                "controller_alive": self.controller.is_running(),
+                "content_alive": self.content.is_running(),
+                "last_crash": self.last_crash.clone(),
                 "engines_linked_into_greppy_parent": false,
             }),
         )
@@ -383,6 +412,12 @@ impl Daemon {
                 );
             }
         };
+        if !self.controller.is_running() {
+            if let Err(error) = self.recover_controller("controller worker exited") {
+                self.finish_session(&session_id);
+                return engine_error(request, error, 33);
+            }
+        }
         let started = Instant::now();
         let outcome = run_script_on_workers(
             &mut self.controller,
@@ -838,10 +873,20 @@ impl Daemon {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        if !self.content.is_running() {
+            self.recover_content("content worker exited")?;
+            return Err(
+                "content worker crashed and was restarted; session pages were reset".into(),
+            );
+        }
         let request_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
-        self.content
-            .send(&Message::engine_call(request_id, method.to_owned(), params))
-            .map_err(|error| error.to_string())?;
+        if let Err(error) =
+            self.content
+                .send(&Message::engine_call(request_id, method.to_owned(), params))
+        {
+            let _ = self.recover_content(&format!("content send failed: {error}"));
+            return Err(error.to_string());
+        }
         match self.content.recv(Duration::from_secs(60)) {
             Ok(Message::EngineResult {
                 request_id: got,
@@ -857,7 +902,71 @@ impl Daemon {
                 }
             }
             Ok(other) => Err(format!("unexpected content message {other:?}")),
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self.recover_content(&format!("content worker: {message}"));
+                Err(message)
+            }
+        }
+    }
+
+    fn ensure_workers(&mut self) {
+        if !self.content.is_running() {
+            let _ = self.recover_content("content worker exited");
+        }
+        if !self.controller.is_running() {
+            let _ = self.recover_controller("controller worker exited");
+        }
+    }
+
+    fn recover_controller(&mut self, reason: &str) -> Result<(), String> {
+        self.last_crash = Some(reason.to_owned());
+        let token = random_token().map_err(|error| error.to_string())?;
+        let mut controller =
+            WorkerProcess::spawn(&self.controller_worker, WorkerKind::Controller, token)
+                .map_err(|error| error.to_string())?;
+        controller.handshake().map_err(|error| error.to_string())?;
+        self.controller = controller;
+        Ok(())
+    }
+
+    fn recover_content(&mut self, reason: &str) -> Result<(), String> {
+        self.last_crash = Some(reason.to_owned());
+        let token = random_token().map_err(|error| error.to_string())?;
+        let mut content = WorkerProcess::spawn(&self.content_worker, WorkerKind::Content, token)
+            .map_err(|error| error.to_string())?;
+        content.handshake().map_err(|error| error.to_string())?;
+        self.content = content;
+        for session in self.sessions.values_mut() {
+            session.page_id = None;
+            session.pages = 0;
+            if session.state != SessionState::Failed
+                && session.state != SessionState::Closing
+                && session.state != SessionState::Closed
+            {
+                let _ = session.transition(SessionState::Failed);
+            }
+        }
+        Ok(())
+    }
+
+    fn reap_idle_sessions(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.state != SessionState::Busy
+                    && now.duration_since(session.last_heartbeat) > session.limits.idle_ttl
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for session_id in stale {
+            if let Some(mut session) = self.sessions.remove(&session_id) {
+                if let Some(page) = session.page_id.take() {
+                    let _ = self.engine_call("page.close", json!({ "page": page }));
+                }
+            }
         }
     }
 }

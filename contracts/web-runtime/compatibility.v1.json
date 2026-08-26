@@ -5,7 +5,7 @@
   "playwright_version": "1.62.1",
   "surface": "javascript-library/chromium",
   "coverage_level": "unverified",
-  "implementation_status": "not-implemented",
+  "implementation_status": "partial",
   "inventory_limitations": [
     "The original parser emitted no BrowserType.* member entries. BrowserType appears as an export interface, but its methods and properties are missing from entries.",
     "Recovered from types.d.ts (comment-stripped declaration parse): connectOverCDP, connect, executablePath, launch, launchPersistentContext, launchServer, name. Overloads were collapsed to one inventory row per member name.",
@@ -21,7 +21,11 @@
       "passing",
       "implemented",
       "unknown"
-    ]
+    ],
+    "implemented": "A Greppy web-runtime binding exists for this symbol. This is not a Playwright-compatibility claim.",
+    "passing": "A named Greppy test executed the symbol. It is not an oracle comparison against playwright@1.62.1 + Chromium.",
+    "partial": "Some inventoried symbols have bindings and tests; the rest remain unverified or unsupported. Oracle behavior is unverified until Phase 20 receipts exist.",
+    "phase_0_note": "Phase 0 forbade implemented/passing/unknown because no runtime existed. Later phases may set implemented/passing in-place; unknown remains forbidden. Entries must not be deleted."
   },
   "separate_tracks": [
     "@playwright/test runner compatibility",
@@ -34,8 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "unverified": 1111,
-    "unsupported": 243
+    "implemented": 35,
+    "unsupported": 243,
+    "unverified": 1076
   },
   "entries": [
     {
@@ -182,10 +187,12 @@
       "symbol": "Page.content",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "session-daemon"
+      ],
       "known_differences": []
     },
     {
@@ -242,10 +249,13 @@
       "symbol": "Page.evaluate",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -352,10 +362,12 @@
       "symbol": "Page.getByLabel",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike"
+      ],
       "known_differences": []
     },
     {
@@ -372,10 +384,12 @@
       "symbol": "Page.getByRole",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike"
+      ],
       "known_differences": []
     },
     {
@@ -392,11 +406,15 @@
       "symbol": "Page.getByText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "exact trimmed innerText/textContent match only"
+      ]
     },
     {
       "symbol": "Page.getByTitle",
@@ -432,11 +450,16 @@
       "symbol": "Page.goto",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "phase1-spike",
+        "session-daemon"
+      ],
+      "known_differences": [
+        "options are unsupported; URL match ignores trailing slash"
+      ]
     },
     {
       "symbol": "Page.hideHighlight",
@@ -562,10 +585,13 @@
       "symbol": "Page.locator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -682,11 +708,13 @@
       "symbol": "Page.reload",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "reload re-navigates the current URL; options are unsupported"
+      ]
     },
     {
       "symbol": "Page.removeAllListeners",
@@ -772,11 +800,15 @@
       "symbol": "Page.screenshot",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "session-daemon"
+      ],
+      "known_differences": [
+        "options are unsupported; returns PNG bytes"
+      ]
     },
     {
       "symbol": "Page.selectOption",
@@ -802,10 +834,12 @@
       "symbol": "Page.setContent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -882,10 +916,12 @@
       "symbol": "Page.title",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "session-daemon"
+      ],
       "known_differences": []
     },
     {
@@ -922,10 +958,12 @@
       "symbol": "Page.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "session-daemon"
+      ],
       "known_differences": []
     },
     {
@@ -972,11 +1010,15 @@
       "symbol": "Page.waitForLoadState",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "state argument ignored; waits for Servo LoadStatus::Complete"
+      ]
     },
     {
       "symbol": "Page.waitForNavigation",
@@ -1022,10 +1064,12 @@
       "symbol": "Page.waitForTimeout",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -2974,10 +3018,13 @@
       "symbol": "BrowserContext.newPage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -3604,10 +3651,13 @@
       "symbol": "Browser.close",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -3646,11 +3696,16 @@
       "symbol": "Browser.newContext",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
+      "known_differences": [
+        "options are unsupported"
+      ]
     },
     {
       "symbol": "Browser.newPage",
@@ -5256,11 +5311,15 @@
       "symbol": "Locator.click",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "phase1-spike"
+      ],
+      "known_differences": [
+        "options are unsupported"
+      ]
     },
     {
       "symbol": "Locator.contentFrame",
@@ -5276,10 +5335,13 @@
       "symbol": "Locator.count",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "compat-core",
+        "session-daemon"
+      ],
       "known_differences": []
     },
     {
@@ -5396,11 +5458,16 @@
       "symbol": "Locator.fill",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
+      "known_differences": [
+        "options are unsupported"
+      ]
     },
     {
       "symbol": "Locator.filter",
@@ -5416,10 +5483,12 @@
       "symbol": "Locator.first",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "compat-core"
+      ],
       "known_differences": []
     },
     {
@@ -5546,11 +5615,15 @@
       "symbol": "Locator.hover",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "mousemove to box center; no pointer-event guarantees"
+      ]
     },
     {
       "symbol": "Locator.innerHTML",
@@ -5566,10 +5639,12 @@
       "symbol": "Locator.innerText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike"
+      ],
       "known_differences": []
     },
     {
@@ -5636,11 +5711,15 @@
       "symbol": "Locator.isVisible",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "no wait; visible iff exactly one node with non-zero box"
+      ]
     },
     {
       "symbol": "Locator.last",
@@ -5676,11 +5755,13 @@
       "symbol": "Locator.nth",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "nth is applied in the selector runtime; first() uses nth=0"
+      ]
     },
     {
       "symbol": "Locator.or",
@@ -5796,10 +5877,12 @@
       "symbol": "Locator.textContent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike"
+      ],
       "known_differences": []
     },
     {
@@ -5826,11 +5909,15 @@
       "symbol": "Locator.waitFor",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "waits until the locator is actionable"
+      ]
     },
     {
       "symbol": "Locator.waitForFunction",
@@ -8604,11 +8691,13 @@
       "symbol": "Keyboard.press",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "dispatches DOM KeyboardEvent; not OS-level key input"
+      ]
     },
     {
       "symbol": "Keyboard.up",
@@ -12974,11 +13063,13 @@
       "symbol": "Page.keyboard",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "keyboard object exists; type/press are DOM-level, not OS input"
+      ]
     },
     {
       "symbol": "Page.localStorage",
@@ -13148,12 +13239,15 @@
       "symbol": "BrowserType.launch",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "options are unsupported; chromium is the only launch path that starts Servo"
       ]
     },
     {
@@ -13184,11 +13278,15 @@
       "symbol": "BrowserType.name",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "chromium.name() returns chromium"
+      ]
     },
     {
       "symbol": "ConnectOverCDPTransport.open",
@@ -13256,11 +13354,13 @@
       "symbol": "Keyboard.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "implemented via active-element value append; Servo evaluate of KeyboardEvent construction is incomplete"
+      ]
     },
     {
       "symbol": "AndroidDevice.input",
@@ -13686,12 +13786,16 @@
       "symbol": "chromium.launch",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core",
+        "session-daemon"
+      ],
       "known_differences": [
-        "The chromium BrowserType launch path is the first-release target and is inventoried but not implemented in Phase 0. firefox.launch and webkit.launch MUST fail with browser_engine_not_available and MUST NOT silently launch Servo."
+        "options are unsupported; launches the Servo-backed content worker, not Chromium"
       ]
     },
     {
@@ -13722,11 +13826,15 @@
       "symbol": "chromium.name",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "compat-core"
+      ],
+      "known_differences": [
+        "returns the string chromium"
+      ]
     },
     {
       "symbol": "firefox.connectOverCDP",
@@ -13980,10 +14088,13 @@
       "symbol": "chromium",
       "kind": "const",
       "origin": "parser export / types.d.ts",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "phase1-spike",
+        "compat-core"
+      ],
       "known_differences": []
     },
     {

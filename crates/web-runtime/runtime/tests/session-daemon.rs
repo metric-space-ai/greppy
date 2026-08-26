@@ -123,6 +123,14 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn worker_comm(pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 fn serve_fixture(html: &'static str) -> String {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -508,4 +516,109 @@ fn content_worker_exits_after_supervisor_is_killed() {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn content_worker_crash_is_recovered_without_hanging() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-crash-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let supervisor = Supervisor::spawn(&socket, "run_crash", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let parent = supervisor.child.id();
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_crash",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+
+    let content = child_pids(parent)
+        .into_iter()
+        .find(|pid| worker_comm(*pid).contains("web-content"))
+        .expect("content worker pid");
+    assert!(Command::new("kill")
+        .args(["-KILL", &content.to_string()])
+        .status()
+        .unwrap()
+        .success());
+
+    let observed = unix_request(
+        &socket,
+        &Request::new(
+            "run_crash",
+            "web.observe",
+            json!({ "session_id": created.result.as_ref().unwrap()["session_id"] }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("observe after crash");
+    assert_eq!(observed.status, "error", "{observed:?}");
+
+    let status = unix_request(
+        &socket,
+        &Request::new("run_crash", "web.status", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("status");
+    assert_eq!(status.status, "ok", "{status:?}");
+    let crash = status.result.as_ref().and_then(|v| v.get("last_crash"));
+    assert!(
+        crash.is_some() && !crash.unwrap().is_null(),
+        "expected last_crash after worker kill: {status:?}"
+    );
+
+    let created_again = unix_request(
+        &socket,
+        &Request::new(
+            "run_crash",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("create after recover");
+    assert_eq!(created_again.status, "ok", "{created_again:?}");
+}
+
+#[test]
+fn playwright_core_methods_run_without_network() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-compat-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/compat-core.mjs");
+    let _guard = Supervisor::spawn(&socket, "run_compat", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_compat",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = std::fs::read_to_string(&script).unwrap();
+    let mut run = Request::new(
+        "run_compat",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
 }

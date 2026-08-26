@@ -16,6 +16,7 @@ pub struct SessionLimits {
     pub max_download_bytes: u64,
     pub max_artifact_bytes: u64,
     pub max_console_bytes: u64,
+    pub idle_ttl: Duration,
 }
 
 impl SessionLimits {
@@ -25,6 +26,7 @@ impl SessionLimits {
             limits.max_pages = 8;
             limits.max_network_bytes = 8 * 1024 * 1024;
             limits.max_artifact_bytes = 4 * 1024 * 1024;
+            limits.idle_ttl = Duration::from_secs(2 * 60);
         }
         limits
     }
@@ -91,6 +93,7 @@ impl Default for SessionLimits {
             max_download_bytes: 16 * 1024 * 1024,
             max_artifact_bytes: 16 * 1024 * 1024,
             max_console_bytes: 256 * 1024,
+            idle_ttl: Duration::from_secs(5 * 60),
         }
     }
 }

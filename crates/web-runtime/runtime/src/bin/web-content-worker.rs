@@ -331,6 +331,98 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("count returned {other:?}"))),
                 }
             }
+            "locator.isVisible" => {
+                let page_id = required_str(&params, "page")?;
+                let selector = params
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let (webview, _) = self.page(&page_id)?.clone();
+                match self.evaluate(webview, &resolve_script(&selector))? {
+                    JSValue::Object(values) => {
+                        let count = number_field(&values, "count").unwrap_or(0.0);
+                        let width = number_field(&values, "width").unwrap_or(0.0);
+                        let height = number_field(&values, "height").unwrap_or(0.0);
+                        Ok(json!({ "visible": count == 1.0 && width > 0.0 && height > 0.0 }))
+                    }
+                    _ => Ok(json!({ "visible": false })),
+                }
+            }
+            "locator.waitFor" => {
+                let _ = self.resolve_actionable(&params)?;
+                Ok(json!({}))
+            }
+            "locator.hover" => {
+                let resolved = self.resolve_actionable(&params)?;
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                hover_at(
+                    &webview,
+                    resolved.x,
+                    resolved.y,
+                    resolved.width,
+                    resolved.height,
+                );
+                self.servo.spin_event_loop();
+                Ok(json!({}))
+            }
+            "page.setContent" => {
+                let page_id = required_str(&params, "page")?;
+                let html = required_str(&params, "html")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(html) {{ document.open(); document.write(html); document.close(); return document.documentElement.outerHTML.length; }})({})",
+                    serde_json::to_string(&html).map_err(io::Error::other)?
+                );
+                self.evaluate(webview.clone(), &source)?;
+                webview.paint();
+                self.servo.spin_event_loop();
+                Ok(json!({}))
+            }
+            "page.reload" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let url = webview
+                    .url()
+                    .ok_or_else(|| io::Error::other("page has no url to reload"))?;
+                self.handle("page.goto", json!({ "page": page_id, "url": url.as_str() }))
+            }
+            "page.waitForLoadState" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let loading = webview.clone();
+                if !self.spin_until(ACTION_TIMEOUT, move || {
+                    loading.load_status() == LoadStatus::Complete
+                })? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for load state",
+                    ));
+                }
+                Ok(json!({}))
+            }
+            "page.keyboard.type" => {
+                let page_id = required_str(&params, "page")?;
+                let text = required_str(&params, "text")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(text) {{ var el = document.activeElement || document.body; if (el && el.value !== undefined) {{ el.value = (el.value || ) + text; }} return true; }})({})",
+                    serde_json::to_string(&text).map_err(io::Error::other)?
+                );
+                self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
+            "page.keyboard.press" => {
+                let page_id = required_str(&params, "page")?;
+                let key = required_str(&params, "key")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let source = format!(
+                    "(function(key) {{ const el = document.activeElement || document.body; el.dispatchEvent(new KeyboardEvent(keydown, {{ key, bubbles: true }})); el.dispatchEvent(new KeyboardEvent(keyup, {{ key, bubbles: true }})); return true; }})({})",
+                    serde_json::to_string(&key).map_err(io::Error::other)?
+                );
+                self.evaluate(webview.clone(), &source)?;
+                Ok(json!({}))
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported_playwright_operation: {other}"),
@@ -466,28 +558,37 @@ function greppyRoleOf(el) {
   return tag;
 }
 function greppyResolveNodes(selector) {
+  let nodes = [];
   if (selector.type === 'css') {
-    return Array.from(document.querySelectorAll(selector.value));
-  }
-  if (selector.type === 'label') {
+    nodes = Array.from(document.querySelectorAll(selector.value));
+  } else if (selector.type === 'label') {
     const labels = Array.from(document.querySelectorAll('label'));
     const match = labels.find((label) => (label.textContent || '').trim() === selector.name);
-    if (!match) return [];
-    if (match.control) return [match.control];
-    if (match.htmlFor) {
-      const el = document.getElementById(match.htmlFor);
-      return el ? [el] : [];
+    if (match) {
+      if (match.control) nodes = [match.control];
+      else if (match.htmlFor) {
+        const el = document.getElementById(match.htmlFor);
+        nodes = el ? [el] : [];
+      }
     }
-    return [];
-  }
-  if (selector.type === 'role') {
-    return Array.from(document.querySelectorAll('body *')).filter((el) => {
+  } else if (selector.type === 'role') {
+    nodes = Array.from(document.querySelectorAll('body *')).filter((el) => {
       if (greppyRoleOf(el) !== selector.role) return false;
       if (selector.name == null) return true;
       return greppyAccessibleName(el) === selector.name;
     });
+  } else if (selector.type === 'text') {
+    const wanted = selector.value;
+    nodes = Array.from(document.querySelectorAll('body *')).filter((el) => {
+      const text = ((el.innerText || el.textContent || '') + '').trim();
+      return text === wanted;
+    });
   }
-  return [];
+  if (selector.nth != null) {
+    const el = nodes[selector.nth];
+    return el ? [el] : [];
+  }
+  return nodes;
 }
 "#;
 
@@ -539,12 +640,20 @@ fn fill_script(selector: &serde_json::Value, value: &str) -> String {
     )
 }
 
-fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
+fn hover_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
     let point = WebViewPoint::Device(DevicePoint::new(
         (x + width / 2.0) as f32,
         (y + height / 2.0) as f32,
     ));
     webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+}
+
+fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
+    hover_at(webview, x, y, width, height);
+    let point = WebViewPoint::Device(DevicePoint::new(
+        (x + width / 2.0) as f32,
+        (y + height / 2.0) as f32,
+    ));
     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
         MouseButtonAction::Down,
         MouseButton::Left,
