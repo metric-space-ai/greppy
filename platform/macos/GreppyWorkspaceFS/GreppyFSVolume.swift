@@ -3,6 +3,11 @@ import Foundation
 import FSKit
 
 final class GreppyFSVolume: FSVolume {
+    private struct DirectoryChild {
+        let item: GreppyFSItem
+        let metadata: RustWorkspaceMetadata?
+    }
+
     private static let volumeID = UUID(uuidString: "70B5BBC5-38F6-4F2A-8F8C-1A3FC950A392")!
     private let resource: FSResource
     private let core: RustWorkspaceCore
@@ -79,8 +84,20 @@ final class GreppyFSVolume: FSVolume {
         guard let (workspaceID, relative) = item.workspaceAndPath, !relative.isEmpty else {
             throw posix(EINVAL)
         }
-        if let inode = item.boundPrivateInode() { return (workspaceID, inode) }
+        if let inode = item.boundPrivateInode() {
+            try core.promoteFileInode(workspace: workspaceID, inode: inode)
+            return (workspaceID, inode)
+        }
         let inode = try core.openFileInode(workspace: workspaceID, path: relative)
+        return (workspaceID, item.bindPrivateInode(inode))
+    }
+
+    private func readableInode(for item: GreppyFSItem) throws -> (String, UInt64) {
+        guard let (workspaceID, relative) = item.workspaceAndPath, !relative.isEmpty else {
+            throw posix(EINVAL)
+        }
+        if let inode = item.boundPrivateInode() { return (workspaceID, inode) }
+        let inode = try core.openFileReadOnlyInode(workspace: workspaceID, path: relative)
         return (workspaceID, item.bindPrivateInode(inode))
     }
 
@@ -419,48 +436,67 @@ extension GreppyFSVolume: FSVolume.Operations {
         guard start <= children.count else { throw posix(EINVAL) }
         for index in start..<children.count {
             let child = children[index]
-            let complete = try await attributes(FSItem.GetAttributesRequest(), of: child)
+            let complete = if let metadata = child.metadata {
+                attributes(metadata: metadata, item: child.item, parent: directory.identifier)
+            } else {
+                try await attributes(FSItem.GetAttributesRequest(), of: child.item)
+            }
             let attrs = requested == nil ? nil : complete
             let type = complete.type
             let packed = packer.packEntry(
-                name: child.name,
+                name: child.item.name,
                 itemType: type,
-                itemID: child.identifier,
+                itemID: child.item.identifier,
                 nextCookie: FSDirectoryCookie(UInt64(index + 1)),
                 attributes: attrs
             )
             if !packed { break }
         }
-        return FSDirectoryVerifier(directoryGeneration(children))
+        return FSDirectoryVerifier(directoryGeneration(children.map(\.item)))
     }
 
-    private func directoryChildren(_ directory: GreppyFSItem) throws -> [GreppyFSItem] {
+    private func directoryChildren(_ directory: GreppyFSItem) throws -> [DirectoryChild] {
         switch directory.location {
         case .root:
-            return [markerItem(), doctorItem(), workspacesItem()]
+            return [markerItem(), doctorItem(), workspacesItem()].map {
+                DirectoryChild(item: $0, metadata: nil)
+            }
         case .workspaces:
             return try core.workspaces().sorted().map {
-                item(location: .workspace($0), name: FSFileName(string: $0))
+                DirectoryChild(
+                    item: item(location: .workspace($0), name: FSFileName(string: $0)),
+                    metadata: nil
+                )
             }
         case .workspace(let workspaceID):
             return try core.directory(workspace: workspaceID, path: "").map {
-                item(
-                    location: .path(workspace: workspaceID, relative: $0.name),
-                    name: FSFileName(string: $0.name)
+                DirectoryChild(
+                    item: item(
+                        location: .path(workspace: workspaceID, relative: $0.name),
+                        name: FSFileName(string: $0.name)
+                    ),
+                    metadata: $0.metadata.workspaceMetadata
                 )
             }
         case .path(let workspaceID, let relative):
             return try core.directory(workspace: workspaceID, path: relative).map {
                 let child = relative.isEmpty ? $0.name : "\(relative)/\($0.name)"
-                return item(
-                    location: .path(workspace: workspaceID, relative: child),
-                    name: FSFileName(string: $0.name)
+                return DirectoryChild(
+                    item: item(
+                        location: .path(workspace: workspaceID, relative: child),
+                        name: FSFileName(string: $0.name)
+                    ),
+                    metadata: $0.metadata.workspaceMetadata
                 )
             }
         case .doctor:
-            return try doctorChildren(relative: "")
+            return try doctorChildren(relative: "").map {
+                DirectoryChild(item: $0, metadata: nil)
+            }
         case .doctorPath(let relative):
-            return try doctorChildren(relative: relative)
+            return try doctorChildren(relative: relative).map {
+                DirectoryChild(item: $0, metadata: nil)
+            }
         case .marker:
             throw posix(ENOTDIR)
         }
@@ -721,7 +757,7 @@ extension GreppyFSVolume: FSVolume.ReadWriteOperations {
                 return data.count
             }
         }
-        let (workspaceID, inode) = try privateInode(for: item)
+        let (workspaceID, inode) = try readableInode(for: item)
         let data = try core.read(
             workspace: workspaceID,
             inode: inode,

@@ -1,10 +1,13 @@
 use greppy_workspace_core::{
-    capture_repository, NodeKind, NodeMetadata, WorkspaceCore, WorkspaceHandle,
+    capture_repository, NodeKind, NodeMetadata, WorkspaceCore, WorkspaceFileHandle, WorkspaceHandle,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
@@ -13,6 +16,8 @@ thread_local! {
 #[repr(C)]
 pub struct GreppyWorkspaceCore {
     core: WorkspaceCore,
+    open_files: Mutex<HashMap<(String, u64), WorkspaceFileHandle>>,
+    next_open_file: AtomicU64,
 }
 
 #[repr(C)]
@@ -44,14 +49,38 @@ unsafe fn required_str<'a>(value: *const c_char, name: &str) -> Result<&'a str, 
 }
 
 unsafe fn core<'a>(value: *mut GreppyWorkspaceCore) -> Result<&'a WorkspaceCore, i32> {
+    ffi_core(value).map(|value| &value.core)
+}
+
+unsafe fn ffi_core<'a>(value: *mut GreppyWorkspaceCore) -> Result<&'a GreppyWorkspaceCore, i32> {
     value
         .as_ref()
-        .map(|value| &value.core)
         .ok_or_else(|| remember("workspace core is null"))
 }
 
 fn workspace(core: &WorkspaceCore, id: &str) -> Result<WorkspaceHandle, i32> {
     core.open_workspace(id).map_err(remember)
+}
+
+fn open_inode_handle(
+    value: &GreppyWorkspaceCore,
+    workspace_id: &str,
+    inode: u64,
+) -> Result<WorkspaceFileHandle, i32> {
+    if let Some(handle) = value
+        .open_files
+        .lock()
+        .map_err(|_| remember("workspace open-file registry is poisoned"))?
+        .get(&(workspace_id.to_owned(), inode))
+        .cloned()
+    {
+        return Ok(handle);
+    }
+    let workspace = workspace(&value.core, workspace_id)?;
+    value
+        .core
+        .open_file_inode(&workspace, inode)
+        .map_err(remember)
 }
 
 fn status(result: greppy_workspace_core::Result<()>) -> i32 {
@@ -79,7 +108,11 @@ pub unsafe extern "C" fn greppy_workspace_core_open(
         return ptr::null_mut();
     }
     match WorkspaceCore::open(root) {
-        Ok(core) => Box::into_raw(Box::new(GreppyWorkspaceCore { core })),
+        Ok(core) => Box::into_raw(Box::new(GreppyWorkspaceCore {
+            core,
+            open_files: Mutex::new(HashMap::new()),
+            next_open_file: AtomicU64::new(1_u64 << 62),
+        })),
         Err(error) => {
             remember(error);
             ptr::null_mut()
@@ -141,12 +174,23 @@ pub unsafe extern "C" fn greppy_workspace_remove(
     value: *mut GreppyWorkspaceCore,
     workspace_id: *const c_char,
 ) -> i32 {
-    let Ok(core) = core(value) else { return -1 };
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
     let Ok(id) = required_str(workspace_id, "workspace_id") else {
         return -1;
     };
-    match workspace(core, id) {
-        Ok(workspace) => status(core.remove_workspace(workspace)),
+    match workspace(&value.core, id) {
+        Ok(workspace) => match value.core.remove_workspace(workspace) {
+            Ok(()) => {
+                match value.open_files.lock() {
+                    Ok(mut files) => files.retain(|(workspace, _), _| workspace != id),
+                    Err(_) => return remember("workspace open-file registry is poisoned"),
+                }
+                0
+            }
+            Err(error) => remember(error),
+        },
         Err(code) => code,
     }
 }
@@ -233,6 +277,77 @@ pub unsafe extern "C" fn greppy_workspace_open_file_inode(
 }
 
 #[no_mangle]
+/// Opens a regular file without copying immutable Base chunks into the private
+/// namespace and returns a stable positive token accepted by the inode-based
+/// FFI operations.
+///
+/// The handle is retained by this core so inode-based reads remain valid. A
+/// later write or explicit promotion materializes only the chunks changed by
+/// that mutable operation.
+///
+/// # Safety
+/// Pointer requirements match [`greppy_workspace_open_file_inode`].
+pub unsafe extern "C" fn greppy_workspace_open_file_read_only_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    path: *const c_char,
+) -> i64 {
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    let Ok(path) = required_str(path, "path") else {
+        return -1;
+    };
+    let result = workspace(&value.core, id)
+        .and_then(|workspace| {
+            value
+                .core
+                .open_file_read_only(&workspace, path)
+                .map_err(remember)
+        })
+        .and_then(|handle| {
+            let token = value.next_open_file.fetch_add(1, Ordering::Relaxed);
+            if token > i64::MAX as u64 {
+                return Err(remember("workspace open-file token space exhausted"));
+            }
+            value
+                .open_files
+                .lock()
+                .map_err(|_| remember("workspace open-file registry is poisoned"))?
+                .insert((id.to_owned(), token), handle);
+            Ok(token)
+        })
+        .and_then(|token| i64::try_from(token).map_err(|_| remember("handle token exceeds i64")));
+    result.unwrap_or_else(i64::from)
+}
+
+#[no_mangle]
+/// Materializes an inode previously opened read-only without changing bytes.
+///
+/// # Safety
+/// `value` must be live and `workspace_id` must be a valid NUL-terminated
+/// string for the duration of this call.
+pub unsafe extern "C" fn greppy_workspace_promote_inode(
+    value: *mut GreppyWorkspaceCore,
+    workspace_id: *const c_char,
+    inode: u64,
+) -> i32 {
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
+    let Ok(id) = required_str(workspace_id, "workspace_id") else {
+        return -1;
+    };
+    match open_inode_handle(value, id, inode) {
+        Ok(handle) => status(value.core.materialize_open_file(&handle).map(|_| ())),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
 /// Reads metadata through a stable private inode.
 ///
 /// # Safety
@@ -244,16 +359,17 @@ pub unsafe extern "C" fn greppy_workspace_metadata_inode(
     inode: u64,
     out: *mut GreppyWorkspaceMetadata,
 ) -> i32 {
-    let Ok(core) = core(value) else { return -1 };
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
     let Ok(id) = required_str(workspace_id, "workspace_id") else {
         return -1;
     };
     if out.is_null() {
         return remember("metadata output is null");
     }
-    let result = workspace(core, id)
-        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
-        .and_then(|handle| core.metadata_open_file(&handle).map_err(remember));
+    let result = open_inode_handle(value, id, inode)
+        .and_then(|handle| value.core.metadata_open_file(&handle).map_err(remember));
     match result {
         Ok(value) => {
             out.write(metadata(value));
@@ -276,19 +392,21 @@ pub unsafe extern "C" fn greppy_workspace_read_inode(
     out: *mut u8,
     capacity: usize,
 ) -> i64 {
-    let Ok(core) = core(value) else { return -1 };
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
     let Ok(id) = required_str(workspace_id, "workspace_id") else {
         return -1;
     };
     if capacity != 0 && out.is_null() {
         return remember("read output is null") as i64;
     }
-    let result = workspace(core, id)
-        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
-        .and_then(|handle| {
-            core.read_open_file(&handle, offset, capacity)
-                .map_err(remember)
-        });
+    let result = open_inode_handle(value, id, inode).and_then(|handle| {
+        value
+            .core
+            .read_open_file(&handle, offset, capacity)
+            .map_err(remember)
+    });
     match result {
         Ok(bytes) => {
             if !bytes.is_empty() {
@@ -313,7 +431,9 @@ pub unsafe extern "C" fn greppy_workspace_write_inode(
     bytes: *const u8,
     length: usize,
 ) -> i64 {
-    let Ok(core) = core(value) else { return -1 };
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
     let Ok(id) = required_str(workspace_id, "workspace_id") else {
         return -1;
     };
@@ -325,10 +445,11 @@ pub unsafe extern "C" fn greppy_workspace_write_inode(
     } else {
         std::slice::from_raw_parts(bytes, length)
     };
-    workspace(core, id)
-        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
+    open_inode_handle(value, id, inode)
         .and_then(|handle| {
-            core.write_open_file(&handle, offset, bytes)
+            value
+                .core
+                .write_open_file(&handle, offset, bytes)
                 .map_err(remember)
         })
         .map(|written| written as i64)
@@ -527,14 +648,14 @@ pub unsafe extern "C" fn greppy_workspace_truncate_inode(
     inode: u64,
     size: u64,
 ) -> i32 {
-    let Ok(core) = core(value) else { return -1 };
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
     let Ok(id) = required_str(workspace_id, "workspace_id") else {
         return -1;
     };
-    match workspace(core, id)
-        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
-    {
-        Ok(handle) => status(core.truncate_open_file(&handle, size)),
+    match open_inode_handle(value, id, inode) {
+        Ok(handle) => status(value.core.truncate_open_file(&handle, size)),
         Err(code) => code,
     }
 }
@@ -592,14 +713,14 @@ pub unsafe extern "C" fn greppy_workspace_set_metadata_inode(
     accessed_unix_ns: i64,
     modified_unix_ns: i64,
 ) -> i32 {
-    let Ok(core) = core(value) else { return -1 };
+    let Ok(value) = ffi_core(value) else {
+        return -1;
+    };
     let Ok(id) = required_str(workspace_id, "workspace_id") else {
         return -1;
     };
-    match workspace(core, id)
-        .and_then(|workspace| core.open_file_inode(&workspace, inode).map_err(remember))
-    {
-        Ok(handle) => status(core.set_metadata_open_file(
+    match open_inode_handle(value, id, inode) {
+        Ok(handle) => status(value.core.set_metadata_open_file(
             &handle,
             (valid & 1 != 0).then_some(mode),
             (valid & 2 != 0).then_some(accessed_unix_ns),
@@ -876,6 +997,70 @@ mod tests {
                 ),
                 0
             );
+            let base_inode = greppy_workspace_open_file_read_only_inode(
+                core,
+                c("ffi-test").as_ptr(),
+                c("base.txt").as_ptr(),
+            );
+            assert!(base_inode > 0);
+            let mut base_output = [0_u8; 32];
+            assert_eq!(
+                greppy_workspace_read_inode(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    base_inode as u64,
+                    0,
+                    base_output.as_mut_ptr(),
+                    base_output.len(),
+                ),
+                4
+            );
+            assert_eq!(&base_output[..4], b"base");
+            assert_eq!(
+                greppy_workspace_promote_inode(core, c("ffi-test").as_ptr(), base_inode as u64,),
+                0
+            );
+            assert_eq!(
+                greppy_workspace_rename(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("base.txt").as_ptr(),
+                    c("base-renamed.txt").as_ptr(),
+                ),
+                0
+            );
+            assert_eq!(
+                greppy_workspace_unlink(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("base-renamed.txt").as_ptr(),
+                ),
+                0
+            );
+            assert_eq!(
+                greppy_workspace_write_inode(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    base_inode as u64,
+                    4,
+                    b" stable".as_ptr(),
+                    b" stable".len(),
+                ),
+                b" stable".len() as i64
+            );
+            base_output.fill(0);
+            assert_eq!(
+                greppy_workspace_read_inode(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    base_inode as u64,
+                    0,
+                    base_output.as_mut_ptr(),
+                    base_output.len(),
+                ),
+                b"base stable".len() as i64
+            );
+            assert_eq!(&base_output[..b"base stable".len()], b"base stable");
             assert_eq!(
                 greppy_workspace_create_file(
                     core,

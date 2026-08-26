@@ -1003,6 +1003,14 @@ impl WorkspaceCore {
         self.write_inode(&handle.workspace_id, inode, offset, bytes)
     }
 
+    /// Promotes an immutable open handle into the private namespace without
+    /// changing its contents. Mutable adapter operations use this boundary
+    /// before rename or unlink so an already-open handle remains valid.
+    pub fn materialize_open_file(&self, handle: &WorkspaceFileHandle) -> Result<NodeMetadata> {
+        self.promote_open_file(handle)?;
+        self.metadata_open_file(handle)
+    }
+
     pub fn truncate_open_file(&self, handle: &WorkspaceFileHandle, size: u64) -> Result<()> {
         let inode = self.promote_open_file(handle)?;
         self.truncate_inode(&handle.workspace_id, inode, size)

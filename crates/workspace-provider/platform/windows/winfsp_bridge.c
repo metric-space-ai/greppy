@@ -1,6 +1,7 @@
 #define FUSE_USE_VERSION 31
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,7 @@ typedef int (*GreppyDirectoryEmitter)(void *, const char *, const GreppyWindowsS
 
 extern int greppy_windows_getattr(void *, const char *, GreppyWindowsStat *);
 extern int greppy_windows_getattr_handle(void *, uint64_t, GreppyWindowsStat *);
-extern int greppy_windows_open(void *, const char *, uint64_t *);
+extern int greppy_windows_open(void *, const char *, int, uint64_t *);
 extern int greppy_windows_release(void *, uint64_t);
 extern int greppy_windows_readdir(void *, const char *, uint64_t, void *, GreppyDirectoryEmitter);
 extern int greppy_windows_create(void *, const char *, uint32_t, int);
@@ -108,12 +109,14 @@ static int greppy_create(const char *path, fuse_mode_t mode, struct fuse_file_in
     int result = greppy_windows_create(greppy_context(), path, mode, 0);
     if (0 != result)
         return result;
-    return greppy_windows_open(greppy_context(), path, &file->fh);
+    return greppy_windows_open(greppy_context(), path,
+        (file->flags & O_ACCMODE) == O_RDONLY, &file->fh);
 }
 
 static int greppy_open(const char *path, struct fuse_file_info *file)
 {
-    return greppy_windows_open(greppy_context(), path, &file->fh);
+    return greppy_windows_open(greppy_context(), path,
+        (file->flags & O_ACCMODE) == O_RDONLY, &file->fh);
 }
 
 static int greppy_unlink(const char *path)

@@ -30,6 +30,11 @@ int32_t greppy_workspace_metadata(GreppyWorkspaceCore *core, const char *workspa
                                   const char *path, GreppyWorkspaceMetadata *out);
 int64_t greppy_workspace_open_file_inode(GreppyWorkspaceCore *core, const char *workspace_id,
                                          const char *path);
+int64_t greppy_workspace_open_file_read_only_inode(GreppyWorkspaceCore *core,
+                                                   const char *workspace_id,
+                                                   const char *path);
+int32_t greppy_workspace_promote_inode(GreppyWorkspaceCore *core,
+                                       const char *workspace_id, uint64_t inode);
 int32_t greppy_workspace_metadata_inode(GreppyWorkspaceCore *core, const char *workspace_id,
                                         uint64_t inode, GreppyWorkspaceMetadata *out);
 int64_t greppy_workspace_read(GreppyWorkspaceCore *core, const char *workspace_id,

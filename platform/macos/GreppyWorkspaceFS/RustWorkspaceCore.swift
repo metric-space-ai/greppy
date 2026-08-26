@@ -59,6 +59,24 @@ struct RustWorkspaceDirectoryMetadata: Decodable {
         case modifiedUnixNanoseconds = "modified_unix_ns"
         case changedUnixNanoseconds = "changed_unix_ns"
     }
+
+    var workspaceMetadata: RustWorkspaceMetadata {
+        let convertedKind: RustWorkspaceMetadata.Kind = switch kind {
+        case .file: .file
+        case .directory: .directory
+        case .symbolicLink: .symbolicLink
+        }
+        return RustWorkspaceMetadata(
+            kind: convertedKind,
+            mode: mode,
+            size: size,
+            inode: inode,
+            linkCount: nlink,
+            accessedNanoseconds: accessedUnixNanoseconds,
+            modifiedNanoseconds: modifiedUnixNanoseconds,
+            changedNanoseconds: changedUnixNanoseconds
+        )
+    }
 }
 
 final class RustWorkspaceCore {
@@ -107,6 +125,23 @@ final class RustWorkspaceCore {
         }
         guard result > 0 else { throw Self.lastError() }
         return UInt64(result)
+    }
+
+    func openFileReadOnlyInode(workspace: String, path: String) throws -> UInt64 {
+        let result = workspace.withCString { workspacePointer in
+            path.withCString { pathPointer in
+                greppy_workspace_open_file_read_only_inode(raw, workspacePointer, pathPointer)
+            }
+        }
+        guard result > 0 else { throw Self.lastError() }
+        return UInt64(result)
+    }
+
+    func promoteFileInode(workspace: String, inode: UInt64) throws {
+        let result = workspace.withCString { workspacePointer in
+            greppy_workspace_promote_inode(raw, workspacePointer, inode)
+        }
+        guard result == 0 else { throw Self.lastError() }
     }
 
     func metadata(workspace: String, inode: UInt64) throws -> RustWorkspaceMetadata {

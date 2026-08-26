@@ -177,13 +177,18 @@ unsafe extern "C" {
 }
 
 impl WindowsProvider {
-    fn open_file(&self, raw: &str) -> Result<u64, c_int> {
+    fn open_file(&self, raw: &str, read_only: bool) -> Result<u64, c_int> {
         let VirtualPath::WorkspacePath { workspace, path } = self.parse(raw)? else {
             self.metadata(raw)?;
             return Ok(0);
         };
         let workspace = self.workspace(&workspace)?;
-        let file = self.core.open_file(&workspace, path).map_err(core_errno)?;
+        let file = if read_only {
+            self.core.open_file_read_only(&workspace, path)
+        } else {
+            self.core.open_file(&workspace, path)
+        }
+        .map_err(core_errno)?;
         let id = self.next_open_file.fetch_add(1, Ordering::Relaxed);
         self.open_files.lock().map_err(|_| -EIO)?.insert(id, file);
         Ok(id)
@@ -333,13 +338,14 @@ impl WindowsProvider {
 unsafe extern "C" fn greppy_windows_open(
     context: *mut c_void,
     path: *const c_char,
+    read_only: c_int,
     output: *mut u64,
 ) -> c_int {
     ffi_result(context, path, |provider, raw| {
         if output.is_null() {
             return Err(-EINVAL);
         }
-        let handle = provider.open_file(raw)?;
+        let handle = provider.open_file(raw, read_only != 0)?;
         unsafe { ptr::write(output, handle) };
         Ok(0)
     })
