@@ -39,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 144,
+    "implemented": 160,
     "unsupported": 243,
-    "unverified": 967
+    "unverified": 951
   },
   "entries": [
     {
@@ -62,11 +62,13 @@
       "symbol": "Page.addListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "alias of Page.on"
+      ]
     },
     {
       "symbol": "Page.addLocatorHandler",
@@ -282,11 +284,15 @@
       "symbol": "Page.emulateMedia",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "no-op; does not change prefers-color-scheme"
+      ]
     },
     {
       "symbol": "Page.evaluate",
@@ -1083,11 +1089,15 @@
       "symbol": "Page.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "alias of locator.click; no touch input path"
+      ]
     },
     {
       "symbol": "Page.textContent",
@@ -1308,11 +1318,15 @@
       "symbol": "Page.workers",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "always empty; Servo embedder has no Web Workers inventory"
+      ]
     },
     {
       "symbol": "Page.behavior",
@@ -2460,11 +2474,13 @@
       "symbol": "Frame.goto",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main frame only; child frames throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Frame.hover",
@@ -2656,11 +2672,13 @@
       "symbol": "Frame.setContent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main frame only"
+      ]
     },
     {
       "symbol": "Frame.setInputFiles",
@@ -2758,11 +2776,15 @@
       "symbol": "Frame.waitForSelector",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "locator.waitFor on the frame locator"
+      ]
     },
     {
       "symbol": "Frame.waitForTimeout",
@@ -3375,11 +3397,13 @@
       "symbol": "BrowserContext.route",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to the first page in context.pages()"
+      ]
     },
     {
       "symbol": "BrowserContext.routeFromHAR",
@@ -5861,71 +5885,91 @@
       "symbol": "Locator.getByAltText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.getByLabel",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.getByPlaceholder",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.getByRole",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.getByTestId",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.getByText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.getByTitle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.hideHighlight",
@@ -6107,11 +6151,15 @@
       "symbol": "Locator.locator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "descendant query under selector.scope; not Playwright layout-based piercing"
+      ]
     },
     {
       "symbol": "Locator.normalize",

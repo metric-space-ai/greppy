@@ -1278,49 +1278,63 @@ function greppyRoleOf(el) {
   if (tag === 'input' || tag === 'textarea') return 'textbox';
   return tag;
 }
-function greppyResolveNodes(selector) {
-  let nodes = [];
+function greppyQueryAll(root, sel) {
+  try { return Array.from(root.querySelectorAll(sel)); } catch (error) { return []; }
+}
+function greppyCandidates(root) {
+  return greppyQueryAll(root === document ? document : root, '*');
+}
+function greppyResolveIn(root, selector) {
   if (selector.type === 'css') {
-    nodes = Array.from(document.querySelectorAll(selector.value));
-  } else if (selector.type === 'label') {
-    const labels = Array.from(document.querySelectorAll('label'));
+    return greppyQueryAll(root === document ? document : root, selector.value);
+  }
+  if (selector.type === 'label') {
+    const labels = greppyQueryAll(root === document ? document : root, 'label');
     const match = labels.find((label) => (label.textContent || '').trim() === selector.name);
-    if (match) {
-      if (match.control) nodes = [match.control];
-      else if (match.htmlFor) {
-        const el = document.getElementById(match.htmlFor);
-        nodes = el ? [el] : [];
-      }
+    if (!match) return [];
+    if (match.control) return [match.control];
+    if (match.htmlFor) {
+      const el = document.getElementById(match.htmlFor);
+      return el ? [el] : [];
     }
-  } else if (selector.type === 'role') {
-    nodes = Array.from(document.querySelectorAll('body *')).filter((el) => {
+    return [];
+  }
+  const pool = greppyCandidates(root);
+  if (selector.type === 'role') {
+    return pool.filter((el) => {
       if (greppyRoleOf(el) !== selector.role) return false;
       if (selector.name == null) return true;
       return greppyAccessibleName(el) === selector.name;
     });
-  } else if (selector.type === 'text') {
+  }
+  if (selector.type === 'text') {
     const wanted = selector.value;
-    nodes = Array.from(document.querySelectorAll('body *')).filter((el) => {
-      const text = ((el.innerText || el.textContent || '') + '').trim();
-      return text === wanted;
-    });
-  } else if (selector.type === 'placeholder') {
-    nodes = Array.from(document.querySelectorAll('[placeholder]')).filter((el) => {
-      return (el.getAttribute('placeholder') || '') === selector.name;
-    });
-  } else if (selector.type === 'alt') {
-    nodes = Array.from(document.querySelectorAll('[alt]')).filter((el) => {
-      return (el.getAttribute('alt') || '') === selector.name;
-    });
-  } else if (selector.type === 'title') {
-    nodes = Array.from(document.querySelectorAll('[title]')).filter((el) => {
-      return (el.getAttribute('title') || '') === selector.name;
-    });
-  } else if (selector.type === 'testid') {
+    return pool.filter((el) => ((el.innerText || el.textContent || '') + '').trim() === wanted);
+  }
+  if (selector.type === 'placeholder') {
+    return pool.filter((el) => (el.getAttribute('placeholder') || '') === selector.name);
+  }
+  if (selector.type === 'alt') {
+    return pool.filter((el) => (el.getAttribute('alt') || '') === selector.name);
+  }
+  if (selector.type === 'title') {
+    return pool.filter((el) => (el.getAttribute('title') || '') === selector.name);
+  }
+  if (selector.type === 'testid') {
     const attr = selector.attr || 'data-testid';
-    nodes = Array.from(document.querySelectorAll('[' + attr + ']')).filter((el) => {
-      return (el.getAttribute(attr) || '') === selector.name;
-    });
+    return pool.filter((el) => (el.getAttribute(attr) || '') === selector.name);
+  }
+  return [];
+}
+function greppyResolveNodes(selector) {
+  let roots = [document];
+  if (selector.scope) {
+    roots = greppyResolveNodes(selector.scope);
+    if (!roots.length) return [];
+  }
+  let nodes = [];
+  for (let i = 0; i < roots.length; i++) {
+    nodes = nodes.concat(greppyResolveIn(roots[i], selector));
   }
   if (selector.nth != null) {
     const idx = selector.nth < 0 ? nodes.length + selector.nth : selector.nth;

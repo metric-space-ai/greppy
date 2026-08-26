@@ -1584,3 +1584,21 @@ fn mouse_init_script_viewport_and_locator_all() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn nested_locators_tap_and_empty_workers() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-nested-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_nested", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("nested-locator.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_nested",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

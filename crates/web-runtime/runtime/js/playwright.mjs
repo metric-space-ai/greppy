@@ -333,6 +333,48 @@ class Locator {
     return new Locator(this._page, { ...this._selector, nth: -1 });
   }
 
+  locator(selector) {
+    return new Locator(this._page, { type: "css", value: selector, scope: this._selector });
+  }
+
+  getByRole(role, options = {}) {
+    return new Locator(this._page, {
+      type: "role",
+      role,
+      name: options.name ?? null,
+      scope: this._selector,
+    });
+  }
+
+  getByText(text) {
+    return new Locator(this._page, { type: "text", value: String(text), scope: this._selector });
+  }
+
+  getByLabel(name) {
+    return new Locator(this._page, { type: "label", name, scope: this._selector });
+  }
+
+  getByPlaceholder(name) {
+    return new Locator(this._page, { type: "placeholder", name: String(name), scope: this._selector });
+  }
+
+  getByAltText(name) {
+    return new Locator(this._page, { type: "alt", name: String(name), scope: this._selector });
+  }
+
+  getByTitle(name) {
+    return new Locator(this._page, { type: "title", name: String(name), scope: this._selector });
+  }
+
+  getByTestId(name) {
+    return new Locator(this._page, {
+      type: "testid",
+      name: String(name),
+      attr: "data-testid",
+      scope: this._selector,
+    });
+  }
+
   async all() {
     const n = await this.count();
     const locators = [];
@@ -412,6 +454,24 @@ class Frame {
 
   async innerText(selector) {
     return this.locator(selector).innerText();
+  }
+
+  async goto(url, options) {
+    if (this._id !== "main") {
+      return unsupported("Frame.goto.child")();
+    }
+    return this._page.goto(url, options);
+  }
+
+  async setContent(html) {
+    if (this._id !== "main") {
+      return unsupported("Frame.setContent.child")();
+    }
+    return this._page.setContent(html);
+  }
+
+  async waitForSelector(selector) {
+    await this.locator(selector).waitFor();
   }
 }
 
@@ -562,6 +622,10 @@ class Page {
   async press(selector, key) {
     await this.focus(selector);
     await this.keyboard.press(key);
+  }
+
+  tap(selector, options) {
+    return this.locator(selector).click(options);
   }
 
   dblclick(selector, options) {
@@ -821,6 +885,16 @@ class Page {
     return this.on(event, handler);
   }
 
+  addListener(event, handler) {
+    return this.on(event, handler);
+  }
+
+  async emulateMedia() {}
+
+  async workers() {
+    return [];
+  }
+
   async route(url, handler) {
     const route = {
       abort: () =>
@@ -941,6 +1015,13 @@ class BrowserContext {
 
   setDefaultTimeout(ms) {
     this._timeout = Math.max(0, Number(ms) || 0);
+  }
+
+  async route(url, handler) {
+    const pages = this.pages();
+    if (pages[0]) {
+      return pages[0].route(url, handler);
+    }
   }
 }
 
