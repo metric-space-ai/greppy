@@ -7,7 +7,7 @@ use servo::{
     SoftwareRenderingContext, UrlRequest, WebResourceLoad, WebResourceResponse, WebView,
     WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
-use web_runtime::policy::{decide_url, NetworkProfile, UrlDecision};
+use web_runtime::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
+use web_runtime::policy_proxy::PolicyProxy;
 use web_runtime::protocol::{read_message, write_message, Message, WorkerKind};
 use web_runtime::worker::require_capability;
 
@@ -65,7 +66,7 @@ struct Delegate {
     viewport: RefCell<(u32, u32)>,
     extra_headers: RefCell<Vec<(String, String)>>,
     last_console: RefCell<Vec<serde_json::Value>>,
-    profile: Rc<Cell<NetworkProfile>>,
+    profile: SharedProfile,
     denied_navigation: RefCell<Option<String>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
@@ -75,7 +76,7 @@ struct Delegate {
 impl Delegate {
     fn new(
         rendering_context: Rc<dyn RenderingContext>,
-        profile: Rc<Cell<NetworkProfile>>,
+        profile: SharedProfile,
     ) -> Self {
         Self {
             new_frame_ready: RefCell::new(false),
@@ -140,7 +141,7 @@ impl WebViewDelegate for Delegate {
             .builder(Rc::clone(&self.rendering_context))
             .delegate(Rc::new(Delegate::new(
                 Rc::clone(&self.rendering_context),
-                Rc::clone(&self.profile),
+                self.profile.clone(),
             )))
             .build();
         child.show();
@@ -336,7 +337,8 @@ struct ContentEngine {
     next_id: u64,
     parent_alive: Arc<AtomicBool>,
     wake: Arc<AtomicBool>,
-    profile: Rc<Cell<NetworkProfile>>,
+    profile: SharedProfile,
+    _proxy: PolicyProxy,
 }
 
 impl ContentEngine {
@@ -352,9 +354,12 @@ impl ContentEngine {
             io::Error::other(format!("renderer make_current failed: {error:?}"))
         })?;
 
+        let profile = SharedProfile::new(NetworkProfile::Research);
+        let proxy = PolicyProxy::spawn(profile.clone())?;
         let mut preferences = Preferences::default();
-        preferences.network_http_proxy_uri = String::new();
-        preferences.network_https_proxy_uri = String::new();
+        preferences.network_http_proxy_uri = proxy.uri();
+        preferences.network_https_proxy_uri = proxy.uri();
+        preferences.network_http_no_proxy = String::new();
         let wake = Arc::new(AtomicBool::new(true));
         let servo = ServoBuilder::default()
             .preferences(preferences)
@@ -367,7 +372,8 @@ impl ContentEngine {
             next_id: 1,
             parent_alive,
             wake,
-            profile: Rc::new(Cell::new(NetworkProfile::Research)),
+            profile,
+            _proxy: proxy,
         })
     }
 
@@ -552,7 +558,7 @@ impl ContentEngine {
                 let page = self.alloc_id("page");
                 let delegate = Rc::new(Delegate::new(
                     Rc::clone(&self.rendering_context),
-                    Rc::clone(&self.profile),
+                    self.profile.clone(),
                 ));
                 let webview = WebViewBuilder::new(&self.servo, Rc::clone(&self.rendering_context))
                     .delegate(delegate.clone())
@@ -1329,7 +1335,7 @@ impl ContentEngine {
                     let id = self.alloc_id("page");
                     let delegate = Rc::new(Delegate::new(
                         Rc::clone(&self.rendering_context),
-                        Rc::clone(&self.profile),
+                        self.profile.clone(),
                     ));
                     delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(id.clone(), (webview, delegate));

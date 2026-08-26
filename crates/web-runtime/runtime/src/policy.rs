@@ -1,6 +1,8 @@
 //! Page network policy (guide §16.2).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkProfile {
@@ -22,6 +24,38 @@ impl NetworkProfile {
             Self::Research => "research",
             Self::Project => "project",
         }
+    }
+
+    fn as_code(self) -> u8 {
+        match self {
+            Self::Research => 0,
+            Self::Project => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Project,
+            _ => Self::Research,
+        }
+    }
+}
+
+/// Process-wide network profile shared with the connect-time policy proxy.
+#[derive(Clone)]
+pub struct SharedProfile(Arc<AtomicU8>);
+
+impl SharedProfile {
+    pub fn new(profile: NetworkProfile) -> Self {
+        Self(Arc::new(AtomicU8::new(profile.as_code())))
+    }
+
+    pub fn get(&self) -> NetworkProfile {
+        NetworkProfile::from_code(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, profile: NetworkProfile) {
+        self.0.store(profile.as_code(), Ordering::Relaxed);
     }
 }
 
@@ -106,15 +140,64 @@ fn decide_host_literal(profile: NetworkProfile, host: &str) -> UrlDecision {
 }
 
 fn decide_resolved_hostname(profile: NetworkProfile, host: &str) -> UrlDecision {
-    let Ok(addrs) = (host, 80).to_socket_addrs() else {
-        return UrlDecision::Allow;
-    };
+    match pin_connect_addr(profile, host, 80) {
+        Ok(_) => UrlDecision::Allow,
+        Err(reason) => UrlDecision::Deny { reason },
+    }
+}
+
+/// Resolve `host` and pick a SocketAddr that is allowed *and* is the address
+/// the caller must dial. Metadata in the answer denies the whole name.
+pub fn pin_connect_addr(
+    profile: NetworkProfile,
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr, &'static str> {
+    pin_connect_addr_with(profile, host, port, default_resolve)
+}
+
+fn default_resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
+    (host, port)
+        .to_socket_addrs()
+        .map(|iter| iter.collect())
+        .map_err(|_| "DNS resolution failed")
+}
+
+pub fn pin_connect_addr_with(
+    profile: NetworkProfile,
+    host: &str,
+    port: u16,
+    resolve: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, &'static str>,
+) -> Result<SocketAddr, &'static str> {
+    let host = host.trim_matches(|ch| ch == '[' || ch == ']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match decide_ip(profile, ip) {
+            UrlDecision::Allow => Ok(SocketAddr::new(ip, port)),
+            UrlDecision::Deny { reason } => Err(reason),
+        };
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return pin_connect_addr_with(profile, "127.0.0.1", port, resolve);
+    }
+    let addrs = resolve(host, port)?;
+    if addrs.is_empty() {
+        return Err("DNS resolution failed");
+    }
+    let mut first_allowed = None;
     for addr in addrs {
-        if let UrlDecision::Deny { reason } = decide_ip(profile, addr.ip()) {
-            return UrlDecision::Deny { reason };
+        match decide_ip(profile, addr.ip()) {
+            UrlDecision::Deny {
+                reason: "cloud metadata endpoint denied",
+            } => return Err("cloud metadata endpoint denied"),
+            UrlDecision::Deny { .. } => {}
+            UrlDecision::Allow => {
+                if first_allowed.is_none() {
+                    first_allowed = Some(addr);
+                }
+            }
         }
     }
-    UrlDecision::Allow
+    first_allowed.ok_or("LAN and non-public endpoints denied")
 }
 
 fn is_metadata_host(host: &str) -> bool {
@@ -361,5 +444,40 @@ mod tests {
             decide_url(NetworkProfile::Research, "https://example.com/path"),
             UrlDecision::Allow
         );
+    }
+
+    #[test]
+    fn pin_connect_addr_denies_metadata_and_lan_literals() {
+        assert!(pin_connect_addr(
+            NetworkProfile::Project,
+            "169.254.169.254",
+            80
+        )
+        .is_err());
+        assert!(pin_connect_addr(NetworkProfile::Project, "10.1.2.3", 80).is_err());
+        assert!(pin_connect_addr(NetworkProfile::Research, "127.0.0.1", 9).is_err());
+        assert!(pin_connect_addr(NetworkProfile::Project, "127.0.0.1", 9).is_ok());
+    }
+
+    #[test]
+    fn pin_connect_addr_skips_lan_but_denies_metadata_in_the_answer() {
+        let public = "8.8.8.8:80".parse().unwrap();
+        let lan = "10.0.0.1:80".parse().unwrap();
+        let meta = "169.254.169.254:80".parse().unwrap();
+        let pinned = pin_connect_addr_with(
+            NetworkProfile::Research,
+            "mixed.test",
+            80,
+            |_, _| Ok(vec![lan, public]),
+        )
+        .expect("public A record remains usable");
+        assert_eq!(pinned, public);
+        assert!(pin_connect_addr_with(
+            NetworkProfile::Research,
+            "rebind.test",
+            80,
+            |_, _| Ok(vec![public, meta]),
+        )
+        .is_err());
     }
 }
