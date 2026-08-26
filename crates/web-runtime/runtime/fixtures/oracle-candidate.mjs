@@ -21,4 +21,7 @@ if ((await page.locator("#x").count()) !== 1) {
 if ((await page.locator("#x").innerHTML()).trim() !== "ok") {
   throw new Error("innerHTML");
 }
+if ((await page.innerHTML("#x")).trim() !== "ok") {
+  throw new Error("page.innerHTML");
+}
 await browser.close();

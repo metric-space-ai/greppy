@@ -623,12 +623,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-content"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle compares page.innerHTML('#x') after setContent equals ok"
       ]
     },
     {
@@ -15083,8 +15085,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1062,
+    "unverified": 1061,
     "unsupported": 281,
-    "passing": 11
+    "passing": 12
   }
 }

@@ -25,6 +25,7 @@ const text = (await setPage.locator("#x").innerText()).trim();
 const content = await setPage.content();
 const count = await setPage.locator("#x").count();
 const innerHTML = (await setPage.locator("#x").innerHTML()).trim();
+const pageInnerHTML = (await setPage.innerHTML("#x")).trim();
 await setPage.close();
 
 const dialogPage = await browser.newPage();
@@ -77,6 +78,7 @@ const receipt = {
       includesOracle: /oracle/i.test(String(content)),
       count,
       innerHTML,
+      pageInnerHTML,
     },
     dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
     fill: { value: filled },
