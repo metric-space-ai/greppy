@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 182,
-    "unsupported": 251,
-    "unverified": 921
+    "implemented": 181,
+    "unsupported": 265,
+    "unverified": 908
   },
   "entries": [
     {
@@ -323,31 +323,37 @@
       "symbol": "Page.evaluateHandle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle/ElementHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.exposeBinding",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Same process-isolation limit as exposeFunction. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.exposeFunction",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Page JS runs in Servo and controller JS in V8; there is no RPC to bind a controller function into the page. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.fill",
@@ -843,11 +849,13 @@
       "symbol": "Page.pdf",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No PDF renderer in the software-renderer Servo embedder. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.pickLocator",
@@ -1210,11 +1218,13 @@
       "symbol": "Page.video",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No video recorder. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.viewportSize",
@@ -4956,71 +4966,85 @@
       "symbol": "JSHandle.asElement",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "JSHandle.dispose",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "JSHandle.evaluate",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "JSHandle.evaluateHandle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "JSHandle.getProperties",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "JSHandle.getProperty",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "JSHandle.jsonValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JSHandle world. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ElementHandle.boundingBox",
@@ -5046,11 +5070,13 @@
       "symbol": "ElementHandle.click",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "ElementHandle is not implemented; use Locator. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ElementHandle.contentFrame",
@@ -6267,11 +6293,13 @@
       "symbol": "Locator.press",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "focus then keyboard.press DOM KeyboardEvent; not OS input"
+      ]
     },
     {
       "symbol": "Locator.pressSequentially",
@@ -9736,14 +9764,13 @@
       "symbol": "Response.ok",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
+      "schema": "unverified",
+      "source": "unverified",
       "behavior": "unverified",
-      "tests": [
-        "network-and-box"
-      ],
+      "tests": [],
       "known_differences": [
-        "true when status stub is 200"
+        "true when status stub is 200",
+        "Response objects currently stub status 200; not claimed as implemented until intercept status is tested."
       ]
     },
     {
@@ -9780,14 +9807,13 @@
       "symbol": "Response.status",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
+      "schema": "unverified",
+      "source": "unverified",
       "behavior": "unverified",
-      "tests": [
-        "network-and-box"
-      ],
+      "tests": [],
       "known_differences": [
-        "200 stub except fulfilled intercepts are not reflected on the Response object yet"
+        "200 stub except fulfilled intercepts are not reflected on the Response object yet",
+        "Response objects currently stub status 200; not claimed as implemented until intercept status is tested."
       ]
     },
     {
@@ -13647,11 +13673,13 @@
       "symbol": "Page.clock",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Clock injection is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.coverage",
@@ -14823,8 +14851,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1098,
-    "unsupported": 251,
+    "unverified": 1084,
+    "unsupported": 265,
     "passing": 5
   }
 }

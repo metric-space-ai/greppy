@@ -437,6 +437,11 @@ class Locator {
     await this.focus();
     await this._page.keyboard.type(text);
   }
+
+  async press(key) {
+    await this.focus();
+    await this._page.keyboard.press(key);
+  }
 }
 
 class FrameLocator {
