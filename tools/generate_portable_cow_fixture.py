@@ -10,7 +10,7 @@ import pathlib
 import subprocess
 
 
-SCHEMA = "greppy.portable-cow-fixture.v2"
+SCHEMA = "greppy.portable-cow-fixture.v3"
 FIXED_GIT_DATE = "2000-01-01T00:00:00Z"
 
 
@@ -93,6 +93,16 @@ def node_sources(modules: int) -> dict[str, str]:
         "}\n"
         "if (!Number.isInteger(value) || value < 0) process.exit(1);\n"
     )
+    sources["node/package.json"] = json.dumps(
+        {
+            "name": "greppy-portable-cow-performance-fixture",
+            "private": True,
+            "scripts": {"test": "node test.js"},
+            "version": "1.0.0",
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
     return sources
 
 
@@ -151,7 +161,7 @@ def main() -> None:
         "modules_per_toolchain": args.modules,
         "rust_sources": args.modules + 1,
         "python_sources": args.modules + 1,
-        "node_sources": args.modules + 1,
+        "node_sources": args.modules + 2,
     }
     (args.root / manifest_path).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"

@@ -178,7 +178,7 @@ jobs:
             --hardware "$hardware" \
             --toolchain-case '{"name":"rust","cwd":"rust","argv":["rustc","main.rs","-o","/tmp/greppy-perf-rust"]}' \
             --toolchain-case '{"name":"python","cwd":"python","argv":["python3","-B","test_sample.py"]}' \
-            --toolchain-case '{"name":"node","cwd":"node","argv":["node","--test","test.js"]}' \
+            --toolchain-case '{"name":"node","cwd":"node","argv":["npm","test","--silent"]}' \
             --toolchain-case '{"name":"node-startup-diagnostic","cwd":"node","argv":["node","test.js"],"release_gate":false}' \
             --enforce
 

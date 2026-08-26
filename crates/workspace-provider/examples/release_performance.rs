@@ -529,13 +529,13 @@ fn load_fixture_manifest(
             .unwrap_or_else(|error| fail(&format!("cannot read fixture manifest: {error}"))),
     )
     .unwrap_or_else(|error| fail(&format!("invalid fixture manifest: {error}")));
-    if manifest.schema != "greppy.portable-cow-fixture.v2"
+    if manifest.schema != "greppy.portable-cow-fixture.v3"
         || manifest.tracked_files != expected_files
         || manifest.tracked_files != tracked_files
         || manifest.modules_per_toolchain < 16
         || manifest.rust_sources != manifest.modules_per_toolchain + 1
         || manifest.python_sources != manifest.modules_per_toolchain + 1
-        || manifest.node_sources != manifest.modules_per_toolchain + 1
+        || manifest.node_sources != manifest.modules_per_toolchain + 2
     {
         fail("fixture manifest does not satisfy the representative v2 contract");
     }
@@ -580,7 +580,7 @@ fn validate_toolchain_contract(cases: &[ToolchainCase]) {
         fail("Python toolchain case does not run the representative fixture");
     }
     let node = cases.iter().find(|case| case.name == "node").unwrap();
-    if node.cwd != Path::new("node") || node.argv != ["node", "--test", "test.js"] {
+    if node.cwd != Path::new("node") || node.argv != ["npm", "test", "--silent"] {
         fail("Node toolchain case does not run the representative test workflow");
     }
     let node_startup = cases
