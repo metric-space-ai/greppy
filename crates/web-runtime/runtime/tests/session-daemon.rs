@@ -2155,6 +2155,11 @@ fn locator_click_waits_for_actionable_target() {
 }
 
 #[test]
+fn getby_options_and_context_page_events_fail_closed() {
+    run_named_fixture("locator-options.mjs", "run_locopt");
+}
+
+#[test]
 fn controller_module_policy_denies_host_filesystem() {
     run_named_fixture("controller-module-policy.mjs", "run_modpol");
 }

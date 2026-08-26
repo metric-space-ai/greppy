@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 301,
+    "implemented": 310,
     "unsupported": 337,
-    "unverified": 716
+    "unverified": 707
   },
   "entries": [
     {
@@ -485,9 +485,13 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "phase1-spike"
+        "phase1-spike",
+        "extra-selectors",
+        "locator-options"
       ],
-      "known_differences": []
+      "known_differences": [
+        "label text equality; unsupported keys throw; exact:true is accepted because matching is already exact equality; exact:false throws"
+      ]
     },
     {
       "symbol": "Page.getByPlaceholder",
@@ -512,9 +516,13 @@
       "behavior": "unverified",
       "tests": [
         "phase1-spike",
-        "actionability"
+        "actionability",
+        "locator-options"
       ],
-      "known_differences": []
+      "known_differences": [
+        "name option only plus exact:true; checked/pressed/expanded/includeHidden throw unsupported_playwright_operation",
+        "unsupported keys throw; exact:true is accepted because matching is already exact equality; exact:false throws"
+      ]
     },
     {
       "symbol": "Page.getByTestId",
@@ -538,10 +546,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "locator-options"
       ],
       "known_differences": [
-        "exact trimmed innerText/textContent match only"
+        "trimmed innerText/textContent equality, not Playwright default substring",
+        "unsupported keys throw; exact:true is accepted because matching is already exact equality; exact:false throws"
       ]
     },
     {
@@ -3557,11 +3567,15 @@
       "symbol": "BrowserContext.addListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "alias of BrowserContext.on"
+      ]
     },
     {
       "symbol": "BrowserContext.backgroundPages",
@@ -3625,7 +3639,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "cookies"
+        "cookies",
+        "locator-options"
       ],
       "known_differences": [
         "engine no-op besides acknowledging close; pages are not torn down independently of Browser.close",
@@ -3726,31 +3741,43 @@
       "symbol": "BrowserContext.off",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "removes a previously registered page/close listener from the in-memory list"
+      ]
     },
     {
       "symbol": "BrowserContext.on",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "page and close listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "BrowserContext.once",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "wraps on() and removes the listener after the first emit"
+      ]
     },
     {
       "symbol": "BrowserContext.pages",
@@ -3780,21 +3807,29 @@
       "symbol": "BrowserContext.removeAllListeners",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "clears in-memory handler lists"
+      ]
     },
     {
       "symbol": "BrowserContext.removeListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "alias of BrowserContext.off"
+      ]
     },
     {
       "symbol": "BrowserContext.route",
@@ -4215,11 +4250,15 @@
       "symbol": "BrowserContext.event.close",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "emitted from BrowserContext.close after tracked pages are closed"
+      ]
     },
     {
       "symbol": "BrowserContext.event.console",
@@ -4285,11 +4324,15 @@
       "symbol": "BrowserContext.event.page",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "emitted from context.newPage with the created Page; not Chromium target events"
+      ]
     },
     {
       "symbol": "BrowserContext.event.pageclose",
@@ -6475,10 +6518,11 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "nested-locator"
+        "nested-locator",
+        "locator-options"
       ],
       "known_differences": [
-        "descendant query under selector.scope; not Playwright layout-based piercing"
+        "scoped getByRole; extra role options besides name/exact:true throw"
       ]
     },
     {
@@ -6503,10 +6547,11 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "nested-locator"
+        "nested-locator",
+        "locator-options"
       ],
       "known_differences": [
-        "descendant query under selector.scope; not Playwright layout-based piercing"
+        "descendant exact text; exact:false throws"
       ]
     },
     {
@@ -6968,11 +7013,15 @@
       "symbol": "Locator.waitForFunction",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "polls locator.evaluate until truthy; returns the value not a JSHandle; options throw"
+      ]
     },
     {
       "symbol": "Locator.boxes",

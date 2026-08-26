@@ -32,6 +32,18 @@ function throwUnsupported(symbol) {
   throw error;
 }
 
+function refuseLocatorOptions(prefix, options, allowed) {
+  if (options == null) {
+    return;
+  }
+  const keys = Object.keys(options).filter((key) => options[key] !== undefined);
+  for (const key of keys) {
+    if (allowed.indexOf(key) === -1) {
+      throwUnsupported(`${prefix}.${key}`);
+    }
+  }
+}
+
 function withUnsupported(target, prefix) {
   return new Proxy(target, {
     get(obj, prop) {
@@ -357,6 +369,21 @@ class Locator {
     }));
   }
 
+  async waitForFunction(pageFunction, arg, options) {
+    if (options != null) {
+      return unsupported("Locator.waitForFunction.options")();
+    }
+    const deadline = Date.now() + (this._page._timeout || 30_000);
+    while (Date.now() < deadline) {
+      const value = await this.evaluate(pageFunction, arg);
+      if (value) {
+        return value;
+      }
+      ops.op_sleep_ms(20);
+    }
+    throw new Error("timeout: Locator.waitForFunction");
+  }
+
   async check() {
     await engineCall("locator.check", {
       ...locatorParams(this),
@@ -534,6 +561,10 @@ class Locator {
   }
 
   getByRole(role, options = {}) {
+    refuseLocatorOptions("Locator.getByRole", options, ["name", "exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Locator.getByRole.exact");
+    }
     return new Locator(this._page, {
       type: "role",
       role,
@@ -542,27 +573,48 @@ class Locator {
     });
   }
 
-  getByText(text) {
+  getByText(text, options) {
+    refuseLocatorOptions("Locator.getByText", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Locator.getByText.exact");
+    }
     return new Locator(this._page, { type: "text", value: String(text), scope: this._selector });
   }
 
-  getByLabel(name) {
+  getByLabel(name, options) {
+    refuseLocatorOptions("Locator.getByLabel", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Locator.getByLabel.exact");
+    }
     return new Locator(this._page, { type: "label", name, scope: this._selector });
   }
 
-  getByPlaceholder(name) {
+  getByPlaceholder(name, options) {
+    refuseLocatorOptions("Locator.getByPlaceholder", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Locator.getByPlaceholder.exact");
+    }
     return new Locator(this._page, { type: "placeholder", name: String(name), scope: this._selector });
   }
 
-  getByAltText(name) {
+  getByAltText(name, options) {
+    refuseLocatorOptions("Locator.getByAltText", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Locator.getByAltText.exact");
+    }
     return new Locator(this._page, { type: "alt", name: String(name), scope: this._selector });
   }
 
-  getByTitle(name) {
+  getByTitle(name, options) {
+    refuseLocatorOptions("Locator.getByTitle", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Locator.getByTitle.exact");
+    }
     return new Locator(this._page, { type: "title", name: String(name), scope: this._selector });
   }
 
-  getByTestId(name) {
+  getByTestId(name, options) {
+    refuseLocatorOptions("Locator.getByTestId", options, []);
     return new Locator(this._page, {
       type: "testid",
       name: String(name),
@@ -749,7 +801,11 @@ class FrameLocator {
     });
   }
 
-  getByLabel(name) {
+  getByLabel(name, options) {
+    refuseLocatorOptions("FrameLocator.getByLabel", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("FrameLocator.getByLabel.exact");
+    }
     return new Locator(this._page, {
       type: "label",
       name,
@@ -757,7 +813,11 @@ class FrameLocator {
     });
   }
 
-  getByPlaceholder(name) {
+  getByPlaceholder(name, options) {
+    refuseLocatorOptions("FrameLocator.getByPlaceholder", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("FrameLocator.getByPlaceholder.exact");
+    }
     return new Locator(this._page, {
       type: "placeholder",
       name: String(name),
@@ -765,7 +825,11 @@ class FrameLocator {
     });
   }
 
-  getByAltText(name) {
+  getByAltText(name, options) {
+    refuseLocatorOptions("FrameLocator.getByAltText", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("FrameLocator.getByAltText.exact");
+    }
     return new Locator(this._page, {
       type: "alt",
       name: String(name),
@@ -773,7 +837,11 @@ class FrameLocator {
     });
   }
 
-  getByTitle(name) {
+  getByTitle(name, options) {
+    refuseLocatorOptions("FrameLocator.getByTitle", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("FrameLocator.getByTitle.exact");
+    }
     return new Locator(this._page, {
       type: "title",
       name: String(name),
@@ -794,11 +862,19 @@ class FrameLocator {
     return this._inner("framecss", { value: selector });
   }
 
-  getByText(text) {
+  getByText(text, options) {
+    refuseLocatorOptions("FrameLocator.getByText", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("FrameLocator.getByText.exact");
+    }
     return this._inner("frametext", { value: String(text) });
   }
 
   getByRole(role, options = {}) {
+    refuseLocatorOptions("FrameLocator.getByRole", options, ["name", "exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("FrameLocator.getByRole.exact");
+    }
     return this._inner("framerole", { role, name: options.name ?? null });
   }
 
@@ -1289,6 +1365,10 @@ class Page {
   }
 
   getByRole(role, options = {}) {
+    refuseLocatorOptions("Page.getByRole", options, ["name", "exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Page.getByRole.exact");
+    }
     return new Locator(this, {
       type: "role",
       role,
@@ -1296,27 +1376,48 @@ class Page {
     });
   }
 
-  getByLabel(name) {
+  getByLabel(name, options) {
+    refuseLocatorOptions("Page.getByLabel", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Page.getByLabel.exact");
+    }
     return new Locator(this, { type: "label", name });
   }
 
-  getByText(text) {
+  getByText(text, options) {
+    refuseLocatorOptions("Page.getByText", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Page.getByText.exact");
+    }
     return new Locator(this, { type: "text", value: String(text) });
   }
 
-  getByPlaceholder(name) {
+  getByPlaceholder(name, options) {
+    refuseLocatorOptions("Page.getByPlaceholder", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Page.getByPlaceholder.exact");
+    }
     return new Locator(this, { type: "placeholder", name: String(name) });
   }
 
-  getByAltText(name) {
+  getByAltText(name, options) {
+    refuseLocatorOptions("Page.getByAltText", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Page.getByAltText.exact");
+    }
     return new Locator(this, { type: "alt", name: String(name) });
   }
 
-  getByTitle(name) {
+  getByTitle(name, options) {
+    refuseLocatorOptions("Page.getByTitle", options, ["exact"]);
+    if (options && options.exact === false) {
+      throwUnsupported("Page.getByTitle.exact");
+    }
     return new Locator(this, { type: "title", name: String(name) });
   }
 
-  getByTestId(name) {
+  getByTestId(name, options) {
+    refuseLocatorOptions("Page.getByTestId", options, []);
     return new Locator(this, { type: "testid", name: String(name), attr: "data-testid" });
   }
 
@@ -2155,6 +2256,7 @@ class BrowserContext {
     this._extraHeaders = {};
     this._initScripts = [];
     this._closed = false;
+    this._handlers = {};
     this.tracing = {
       start: async () => unsupported("BrowserContext.tracing.start")(),
       stop: async () => unsupported("BrowserContext.tracing.stop")(),
@@ -2192,7 +2294,61 @@ class BrowserContext {
     for (const source of this._initScripts || []) {
       await engineCall("page.addInitScript", { page: page._id, source });
     }
+    this._emit("page", page);
     return page;
+  }
+
+  _emit(event, payload) {
+    const list = (this._handlers && this._handlers[event]) || [];
+    for (const handler of list) {
+      const result = handler(payload);
+      if (result && typeof result.then === "function") {
+        result.catch(() => {});
+      }
+    }
+  }
+
+  on(event, handler) {
+    if (event === "page" || event === "close") {
+      this._handlers = this._handlers || {};
+      this._handlers[event] = this._handlers[event] || [];
+      this._handlers[event].push(handler);
+      return this;
+    }
+    throwUnsupported(`BrowserContext.on.${event}`);
+  }
+
+  off(event, handler) {
+    const list = this._handlers && this._handlers[event];
+    if (!list) return this;
+    this._handlers[event] = list.filter((item) => item !== handler);
+    return this;
+  }
+
+  once(event, handler) {
+    const wrap = (...args) => {
+      this.off(event, wrap);
+      return handler(...args);
+    };
+    return this.on(event, wrap);
+  }
+
+  addListener(event, handler) {
+    return this.on(event, handler);
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler);
+  }
+
+  removeAllListeners(event) {
+    if (!this._handlers) return this;
+    if (event == null) {
+      this._handlers = {};
+    } else {
+      this._handlers[event] = [];
+    }
+    return this;
   }
 
   async cookies() {
@@ -2314,6 +2470,7 @@ class BrowserContext {
     if (this._browser && Array.isArray(this._browser._contexts)) {
       this._browser._contexts = this._browser._contexts.filter((context) => context !== this);
     }
+    this._emit("close", this);
     await engineCall("context.close", { context: this._id });
   }
 
