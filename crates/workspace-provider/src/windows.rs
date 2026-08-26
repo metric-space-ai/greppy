@@ -205,7 +205,7 @@ impl WindowsProvider {
             VirtualPath::Marker => {
                 let size = self.manifest_bytes()?.len() as u64;
                 Ok(GreppyWindowsStat {
-                    mode: S_IFREG | 0o400,
+                    mode: S_IFREG | 0o444,
                     size,
                     inode: hash_path(raw),
                     nlink: 1,
