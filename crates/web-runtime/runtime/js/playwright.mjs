@@ -271,6 +271,10 @@ class Locator {
     await this._page._flushPopups();
   }
 
+  async tap(options) {
+    return this.click(options);
+  }
+
   async fill(value, options) {
     if (options != null) {
       return unsupported("Locator.fill.options")();
@@ -1620,6 +1624,17 @@ class Page {
     if (event === "response") {
       return this.waitForResponse("");
     }
+    if (event === "pageerror") {
+      const errors = await this.pageErrors();
+      if (errors.length) return errors[0];
+      const deadline = Date.now() + (this._timeout || 30_000);
+      while (Date.now() < deadline) {
+        const next = await this.pageErrors();
+        if (next.length) return next[0];
+        ops.op_sleep_ms(20);
+      }
+      return unsupported("Page.waitForEvent.pageerror.empty")();
+    }
     return unsupported(`Page.waitForEvent.${event}`)();
   }
 
@@ -1714,6 +1729,10 @@ class Page {
         error.name = "Error";
         return error;
       });
+  }
+
+  async clearPageErrors() {
+    await engineCall("page.clearPageErrors", { page: this._id });
   }
 
   async clearConsoleMessages() {
@@ -1923,6 +1942,13 @@ class BrowserContext {
     for (const page of this.pages()) {
       await engineCall("page.clearCookies", { page: page._id });
     }
+  }
+
+  async setStorageState(state) {
+    if (typeof state === "string") {
+      throwUnsupported("BrowserContext.setStorageState.filePath");
+    }
+    return this._restoreStorageState(state);
   }
 
   async _restoreStorageState(state) {

@@ -54,5 +54,13 @@ if (restoredLs !== "origin-ok") {
   throw new Error("restored localStorage missing greppy: " + JSON.stringify(restoredLs));
 }
 await restoredCtx.close();
+const viaSet = await browser.newContext();
+await viaSet.setStorageState(state);
+const viaPage = viaSet.pages()[0] || (await viaSet.newPage());
+await viaPage.goto(fixtureUrl);
+if ((await viaPage.evaluate(() => localStorage.getItem("greppy"))) !== "origin-ok") {
+  throw new Error("setStorageState did not restore localStorage");
+}
+await viaSet.close();
 await context.close();
 await browser.close();

@@ -1206,6 +1206,13 @@ impl ContentEngine {
                 self.page(&page_id)?.1.last_console.borrow_mut().clear();
                 Ok(json!({}))
             }
+            "page.clearPageErrors" => {
+                let page_id = required_str(&params, "page")?;
+                self.page(&page_id)?.1.last_console.borrow_mut().retain(|row| {
+                    row.get("type").and_then(|value| value.as_str()) != Some("error")
+                });
+                Ok(json!({}))
+            }
             "page.fileChoosers" => {
                 let page_id = required_str(&params, "page")?;
                 let consume = params

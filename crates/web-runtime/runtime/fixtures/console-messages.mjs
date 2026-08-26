@@ -24,6 +24,15 @@ const errors = await page.pageErrors();
 if (!errors.some((error) => String(error.message).includes("boom-err"))) {
   throw new Error("pageErrors missing boom-err: " + JSON.stringify(errors.map((e) => e.message)));
 }
+const waitedError = await page.waitForEvent("pageerror");
+if (!String(waitedError.message).includes("boom-err")) {
+  throw new Error("waitForEvent pageerror " + waitedError.message);
+}
+await page.clearPageErrors();
+const afterErrors = await page.pageErrors();
+if (afterErrors.some((error) => String(error.message).includes("boom-err"))) {
+  throw new Error("clearPageErrors left boom-err");
+}
 const messages = await page.consoleMessages();
 const texts = messages.map((msg) => msg.text());
 if (!texts.some((text) => String(text).includes("hello-console")) && !seen.some((text) => String(text).includes("hello-console"))) {

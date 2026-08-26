@@ -178,11 +178,15 @@
       "symbol": "Page.clearPageErrors",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "drops console.error records; not uncaught exception state"
+      ]
     },
     {
       "symbol": "Page.click",
@@ -2269,11 +2273,15 @@
       "symbol": "Page.event.pageerror",
       "kind": "event",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "waitForEvent(pageerror) returns console.error Errors; not window.onerror"
+      ]
     },
     {
       "symbol": "Page.event.popup",
@@ -3856,11 +3864,15 @@
       "symbol": "BrowserContext.setStorageState",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "cookies"
+      ],
+      "known_differences": [
+        "object form only; file path and IndexedDB stay unsupported"
+      ]
     },
     {
       "symbol": "BrowserContext.storageState",
@@ -6751,11 +6763,15 @@
       "symbol": "Locator.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "nested-locator"
+      ],
+      "known_differences": [
+        "alias of Locator.click; not a Touchscreen path"
+      ]
     },
     {
       "symbol": "Locator.textContent",

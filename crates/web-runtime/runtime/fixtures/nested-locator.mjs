@@ -16,6 +16,7 @@ if ((await box.getByText("Hello").count()) !== 1) throw new Error("scoped text")
 if ((await box.locator("input").count()) !== 1) throw new Error("scoped css");
 if ((await box.getByPlaceholder("inside").count()) !== 1) throw new Error("scoped placeholder");
 await page.tap("#box button");
+await page.locator("#box button").tap();
 let workersUnsupported = false;
 try {
   await page.workers();
