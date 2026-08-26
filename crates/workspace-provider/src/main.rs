@@ -23,7 +23,12 @@ fn main() {
         eprintln!("greppy workspace provider failed: {error}");
         std::process::exit(1);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    if let Err(error) = windows::serve(args.data_root, args.mount_root) {
+        eprintln!("greppy workspace provider failed: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(target_os = "macos")]
     {
         let _ = args;
         eprintln!(
@@ -35,3 +40,6 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux;
+
+#[cfg(target_os = "windows")]
+mod windows;

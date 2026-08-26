@@ -1072,12 +1072,15 @@ dependencies = [
 name = "greppy-workspace-provider"
 version = "0.3.3"
 dependencies = [
+ "cc",
  "clap",
+ "filetime",
  "fuser",
  "greppy-workspace-core",
  "libc",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

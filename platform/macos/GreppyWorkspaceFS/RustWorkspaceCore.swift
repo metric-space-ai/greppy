@@ -33,6 +33,10 @@ struct RustWorkspaceDirectoryEntry: Decodable {
     let metadata: RustWorkspaceDirectoryMetadata
 }
 
+private struct RustWorkspaceStatus: Decodable {
+    let id: String
+}
+
 struct RustWorkspaceDirectoryMetadata: Decodable {
     enum Kind: String, Decodable {
         case file = "File"
@@ -261,7 +265,7 @@ final class RustWorkspaceCore {
     }
 
     func workspaces() throws -> [String] {
-        try JSONDecoder().decode([String].self, from: workspacesJSON())
+        try JSONDecoder().decode([RustWorkspaceStatus].self, from: workspacesJSON()).map(\.id)
     }
 
     private func check(

@@ -20,5 +20,12 @@ serde_json = { workspace = true }
 fuser = { version = "0.18", default-features = false }
 libc = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+filetime = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[build-dependencies]
+cc = "1.2"
