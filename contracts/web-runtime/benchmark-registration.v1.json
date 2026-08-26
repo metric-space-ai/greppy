@@ -1,0 +1,185 @@
+{
+  "contract": "greppy.web-runtime.benchmark-registration.v1",
+  "contract_revision": "2026-08-26",
+  "phase": 0,
+  "implementation_status": "registered-not-measured",
+  "registration_rule": "Baselines MUST be registered before optimization. This document registers metrics only. No measurement numbers are recorded because Phase 0 has no runtime to measure.",
+  "comparison_method": {
+    "id": "same-machine-playwright-1.62.1-chromium",
+    "description": "Measure the candidate and the reference on the same machine, fixtures, network conditions, and workload.",
+    "candidate": "Greppy web runtime plus Servo, once implemented",
+    "reference": "official Playwright 1.62.1 plus its pinned Chromium/Chrome-for-Testing build",
+    "reference_browser_from_playwright_core_browsers_json": {
+      "inspection_path": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/browsers.json",
+      "name": "chromium",
+      "playwright_browser_revision": "1234",
+      "browser_version": "151.0.7922.34",
+      "title": "Chrome for Testing",
+      "role": "test-oracle-only"
+    },
+    "reference_role": "test-oracle-only",
+    "production_runtime": "Playwright and Chromium MUST NOT be linked, bundled, invoked, downloaded, or required by the production runtime."
+  },
+  "spike_pass_criteria": {
+    "id": "phase-1-size-or-operations-rationale",
+    "description": "The spike passes the size/operations rationale only if at least one of the following is true.",
+    "any_of": [
+      "installed runtime size is at least 30% smaller than the reference Playwright-plus-Chromium installation",
+      "steady memory on the registered research workload is at least 30% lower than the reference",
+      "operational dependency count is materially lower and the release owner accepts the measured size difference"
+    ],
+    "current_result": "unverified",
+    "measurement_status": "not-yet-measured"
+  },
+  "absolute_gates": [
+    {
+      "id": "idle-cpu-converges-to-effectively-zero",
+      "name": "Idle CPU converges to effectively zero",
+      "description": "Idle CPU with no page activity MUST converge to effectively zero.",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "no-busy-polling-in-idle-session",
+      "name": "No busy polling in an idle session",
+      "description": "No busy polling loop may remain active in an idle session. Auto-waiting MUST react to DOM/layout/navigation events; polling MAY be used only as a bounded recovery backstop.",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "no-session-or-worker-survives-verified-run-cleanup",
+      "name": "Cleanup leaves no session or worker",
+      "description": "No session or worker may survive verified Greppy run cleanup.",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "output-budgets-and-artifact-limits-enforced",
+      "name": "Output budgets and artifact limits remain enforced",
+      "description": "Output budgets and artifact limits MUST remain enforced regardless of comparison results.",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    }
+  ],
+  "benchmarks": [
+    {
+      "id": "installed-bytes",
+      "name": "Installed bytes",
+      "unit": "bytes",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "cold-start-to-first-page",
+      "name": "Cold start to first page",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "warm-session-creation",
+      "name": "Warm session creation",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "peak-rss",
+      "name": "Peak RSS",
+      "unit": "bytes",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "steady-rss",
+      "name": "Steady RSS",
+      "unit": "bytes",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "simple-navigation-latency",
+      "name": "Simple navigation latency",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "hydrated-app-readiness-latency",
+      "name": "Hydrated-app readiness latency",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "locator-action-latency",
+      "name": "Locator action latency",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "text-extraction-latency",
+      "name": "Text extraction latency",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "controller-script-throughput",
+      "name": "Controller script throughput",
+      "unit": "scripts_per_second",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "idle-cpu",
+      "name": "Idle CPU",
+      "unit": "cpu_percent",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "absolute_gate": "idle-cpu-converges-to-effectively-zero",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "cleanup-latency",
+      "name": "Cleanup latency",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "absolute_gate": "no-session-or-worker-survives-verified-run-cleanup",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    },
+    {
+      "id": "crash-recovery-latency",
+      "name": "Crash recovery latency",
+      "unit": "milliseconds",
+      "comparison_method": "same-machine-playwright-1.62.1-chromium",
+      "spike_pass_criteria": "phase-1-size-or-operations-rationale",
+      "current_result": "unverified",
+      "measurement_status": "not-yet-measured"
+    }
+  ]
+}
