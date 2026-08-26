@@ -3,11 +3,11 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setContent(
-  `<!DOCTYPE html><html><body><iframe name="child" srcdoc="<p id='in'>frame-ok</p><button>Go</button><label>Name<input placeholder='search'></label>"></iframe></body></html>`,
+  `<!DOCTYPE html><html><body><iframe name="child" srcdoc="<p id='in'>frame-ok</p><button>Go</button><label>Name<input placeholder='search'></label>"></iframe><iframe name="second" srcdoc="<p id='in'>second-ok</p>"></iframe></body></html>`,
 );
 const frames = await page.frames();
-if (frames.length < 2) {
-  throw new Error("expected main+iframe, got " + frames.length);
+if (frames.length < 3) {
+  throw new Error("expected main+two iframes, got " + frames.length);
 }
 if (frames[0].parentFrame() !== null) {
   throw new Error("frames()[0] should be the main frame");
@@ -55,9 +55,9 @@ if (!String(described.toString()).includes("child-iframe")) {
 if (described.description() !== "child-iframe") {
   throw new Error("locator.description " + described.description());
 }
-const viaContent = await page.locator("iframe").contentFrame().locator("#in").innerText();
+const viaContent = await page.locator("iframe").first().contentFrame().locator("#in").innerText();
 if (viaContent.trim() !== "frame-ok") throw new Error("contentFrame " + viaContent);
-const viaNested = await page.locator("body").frameLocator("iframe").locator("#in").innerText();
+const viaNested = await page.locator("body").frameLocator("iframe").first().locator("#in").innerText();
 if (viaNested.trim() !== "frame-ok") throw new Error("locator.frameLocator " + viaNested);
 if ((await page.frameLocator("iframe").getByLabel("Name").count()) !== 1) {
   throw new Error("FrameLocator.getByLabel");
@@ -65,7 +65,20 @@ if ((await page.frameLocator("iframe").getByLabel("Name").count()) !== 1) {
 if ((await page.frameLocator("iframe").getByPlaceholder("search").count()) !== 1) {
   throw new Error("FrameLocator.getByPlaceholder");
 }
-const mainNested = await main.frameLocator("iframe").locator("#in").innerText();
+if ((await page.frameLocator("iframe").first().locator("#in").innerText()).trim() !== "frame-ok") {
+  throw new Error("FrameLocator.first");
+}
+if ((await page.frameLocator("iframe").nth(1).locator("#in").innerText()).trim() !== "second-ok") {
+  throw new Error("FrameLocator.nth");
+}
+if ((await page.frameLocator("iframe").last().locator("#in").innerText()).trim() !== "second-ok") {
+  throw new Error("FrameLocator.last");
+}
+const ownerName = await page.frameLocator("iframe").nth(1).owner().getAttribute("name");
+if (ownerName !== "second") {
+  throw new Error("FrameLocator.owner " + ownerName);
+}
+const mainNested = await main.frameLocator("iframe").first().locator("#in").innerText();
 if (mainNested.trim() !== "frame-ok") throw new Error("main frameLocator " + mainNested);
 
 await child.setContent(
@@ -118,4 +131,5 @@ expectUnsupported("child getByTitle", () => child.getByTitle("brand"));
 expectUnsupported("child getByTestId", () => child.getByTestId("hero"));
 expectUnsupported("child getByLabel", () => child.getByLabel("Name"));
 expectUnsupported("child frameLocator", () => child.frameLocator("iframe"));
+expectUnsupported("nested FrameLocator.frameLocator", () => page.frameLocator("iframe").frameLocator("iframe"));
 await browser.close();

@@ -1901,7 +1901,13 @@ function greppyResolveIn(root, selector) {
     return pool;
   }
   if (selector.type === 'framecss' || selector.type === 'frametext' || selector.type === 'framerole') {
-    const frames = greppyQueryAll(root === document ? document : root, selector.frame || 'iframe');
+    const framesAll = greppyQueryAll(root === document ? document : root, selector.frame || 'iframe');
+    let frames = framesAll;
+    if (selector.frameIndex != null) {
+      const idx = selector.frameIndex < 0 ? framesAll.length + selector.frameIndex : selector.frameIndex;
+      const frame = framesAll[idx];
+      frames = frame ? [frame] : [];
+    }
     let nodes = [];
     for (let i = 0; i < frames.length; i++) {
       try {

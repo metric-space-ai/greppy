@@ -658,6 +658,45 @@ fn content_worker_crash_is_recovered_without_hanging() {
 }
 
 #[test]
+fn web_status_reports_observability_fields() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-statobs-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_statobs", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let status = unix_request(
+        &socket,
+        &Request::new("run_statobs", "web.status", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("status");
+    assert_eq!(status.status, "ok", "{status:?}");
+    let result = status.result.as_ref().expect("status result");
+    for key in [
+        "runtime_version",
+        "runtime_build_id",
+        "playwright_compatibility_version",
+        "process_health",
+        "session_counts",
+        "workers",
+        "resource_totals",
+        "last_crash",
+        "unsupported_capability_count",
+        "conformance_receipt_id",
+    ] {
+        assert!(
+            result.get(key).is_some(),
+            "missing web.status field {key}: {status:?}"
+        );
+    }
+    assert_eq!(result["playwright_compatibility_version"], "1.62.1");
+    assert_eq!(result["inventory_entries"], 1354);
+    assert!(result["unsupported_capability_count"].as_u64().unwrap() > 0);
+    assert_eq!(result["process_health"]["healthy"], true);
+    assert_eq!(result["session_counts"]["total"], 0);
+}
+
+#[test]
 fn playwright_core_methods_run_without_network() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-compat-{}.sock", std::process::id()));

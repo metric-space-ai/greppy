@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 292,
-    "unsupported": 289,
-    "unverified": 773
+    "implemented": 297,
+    "unsupported": 290,
+    "unverified": 767
   },
   "entries": [
     {
@@ -9441,21 +9441,29 @@
       "symbol": "FrameLocator.first",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "nth(0) among matching iframes"
+      ]
     },
     {
       "symbol": "FrameLocator.frameLocator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "Nested FrameLocator is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "FrameLocator.getByAltText",
@@ -9559,41 +9567,57 @@
       "symbol": "FrameLocator.last",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "nth(-1) among matching iframes"
+      ]
     },
     {
       "symbol": "FrameLocator.locator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "same-origin iframe document querySelector; unindexed FrameLocator concatenates matching iframes"
+      ]
     },
     {
       "symbol": "FrameLocator.nth",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "selects the 0-based iframe among querySelectorAll matches via frameIndex; not Playwright strict FrameLocator by default"
+      ]
     },
     {
       "symbol": "FrameLocator.owner",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "returns a CSS Locator for the iframe element, honoring nth/first/last"
+      ]
     },
     {
       "symbol": "FrameLocator.checked",
@@ -15499,8 +15523,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1048,
-    "unsupported": 289,
+    "unverified": 1047,
+    "unsupported": 290,
     "passing": 17
   }
 }

@@ -658,14 +658,16 @@ class Locator {
     if (!this._selector || this._selector.type !== "css" || !this._selector.value) {
       throwUnsupported("Locator.contentFrame.nonCss");
     }
-    return new FrameLocator(this._page, this._selector.value);
+    const index = this._selector.nth == null ? null : this._selector.nth;
+    return new FrameLocator(this._page, this._selector.value, index);
   }
 
   frameLocator(selector) {
     if (!this._selector || this._selector.type !== "css" || !this._selector.value) {
       throwUnsupported("Locator.frameLocator.nonCss");
     }
-    return new FrameLocator(this._page, this._selector.value + " " + selector);
+    const index = this._selector.nth == null ? null : this._selector.nth;
+    return new FrameLocator(this._page, this._selector.value + " " + selector, index);
   }
 
   async dragTo(target) {
@@ -682,17 +684,36 @@ class Locator {
 }
 
 class FrameLocator {
-  constructor(page, frameSelector) {
+  constructor(page, frameSelector, index = null) {
     this._page = page;
     this._frame = frameSelector;
+    this._index = index;
     return withUnsupported(this, "FrameLocator");
+  }
+
+  _frameScope() {
+    return {
+      type: "framecss",
+      frame: this._frame,
+      value: "html",
+      frameIndex: this._index,
+    };
+  }
+
+  _inner(type, extra) {
+    return new Locator(this._page, {
+      type,
+      frame: this._frame,
+      frameIndex: this._index,
+      ...extra,
+    });
   }
 
   getByLabel(name) {
     return new Locator(this._page, {
       type: "label",
       name,
-      scope: { type: "framecss", frame: this._frame, value: "html" },
+      scope: this._frameScope(),
     });
   }
 
@@ -700,7 +721,7 @@ class FrameLocator {
     return new Locator(this._page, {
       type: "placeholder",
       name: String(name),
-      scope: { type: "framecss", frame: this._frame, value: "html" },
+      scope: this._frameScope(),
     });
   }
 
@@ -708,7 +729,7 @@ class FrameLocator {
     return new Locator(this._page, {
       type: "alt",
       name: String(name),
-      scope: { type: "framecss", frame: this._frame, value: "html" },
+      scope: this._frameScope(),
     });
   }
 
@@ -716,7 +737,7 @@ class FrameLocator {
     return new Locator(this._page, {
       type: "title",
       name: String(name),
-      scope: { type: "framecss", frame: this._frame, value: "html" },
+      scope: this._frameScope(),
     });
   }
 
@@ -725,33 +746,41 @@ class FrameLocator {
       type: "testid",
       name: String(name),
       attr: "data-testid",
-      scope: { type: "framecss", frame: this._frame, value: "html" },
+      scope: this._frameScope(),
     });
   }
 
   locator(selector) {
-    return new Locator(this._page, {
-      type: "framecss",
-      frame: this._frame,
-      value: selector,
-    });
+    return this._inner("framecss", { value: selector });
   }
 
   getByText(text) {
-    return new Locator(this._page, {
-      type: "frametext",
-      frame: this._frame,
-      value: String(text),
-    });
+    return this._inner("frametext", { value: String(text) });
   }
 
   getByRole(role, options = {}) {
-    return new Locator(this._page, {
-      type: "framerole",
-      frame: this._frame,
-      role,
-      name: options.name ?? null,
-    });
+    return this._inner("framerole", { role, name: options.name ?? null });
+  }
+
+  nth(index) {
+    return new FrameLocator(this._page, this._frame, index);
+  }
+
+  first() {
+    return this.nth(0);
+  }
+
+  last() {
+    return this.nth(-1);
+  }
+
+  owner() {
+    const loc = new Locator(this._page, { type: "css", value: this._frame });
+    return this._index == null ? loc : loc.nth(this._index);
+  }
+
+  frameLocator() {
+    throwUnsupported("FrameLocator.frameLocator.nested");
   }
 }
 

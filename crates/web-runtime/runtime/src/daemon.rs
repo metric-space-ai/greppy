@@ -175,33 +175,58 @@ impl Daemon {
     }
 
     fn status(&mut self, request: &Request) -> Response {
+        let idle = self
+            .sessions
+            .values()
+            .filter(|session| session.state == SessionState::Ready)
+            .count();
+        let busy = self
+            .sessions
+            .values()
+            .filter(|session| session.state == SessionState::Busy)
+            .count();
+        let failed = self
+            .sessions
+            .values()
+            .filter(|session| session.state == SessionState::Failed)
+            .count();
+        let controller_alive = self.controller.is_running();
+        let content_alive = self.content.is_running();
         Response::ok(
             request,
             serde_json::json!({
                 "label": "experimental web-runtime spike",
+                "runtime_version": "0.1.0",
+                "runtime_build_id": "web-runtime-0.1.0",
                 "playwright_compatibility_version": "1.62.1",
                 "compatibility_coverage_level": "unverified",
+                "process_health": {
+                    "controller_alive": controller_alive,
+                    "content_alive": content_alive,
+                    "healthy": controller_alive && content_alive,
+                },
                 "sessions": self.sessions.len(),
-                "ready": self
-                    .sessions
-                    .values()
-                    .filter(|session| session.state == SessionState::Ready)
-                    .count(),
-                "busy": self
-                    .sessions
-                    .values()
-                    .filter(|session| session.state == SessionState::Busy)
-                    .count(),
-                "failed": self
-                    .sessions
-                    .values()
-                    .filter(|session| session.state == SessionState::Failed)
-                    .count(),
+                "session_counts": {
+                    "total": self.sessions.len(),
+                    "idle": idle,
+                    "active": busy,
+                    "failed": failed,
+                },
+                "ready": idle,
+                "busy": busy,
+                "failed": failed,
                 "workers": 2,
-                "controller_alive": self.controller.is_running(),
-                "content_alive": self.content.is_running(),
+                "controller_alive": controller_alive,
+                "content_alive": content_alive,
+                "resource_totals": {
+                    "sessions": self.sessions.len(),
+                    "workers": 2,
+                    "crash_receipts": self.crash_receipts.len(),
+                },
                 "last_crash": self.last_crash.clone(),
                 "crash_receipts": self.crash_receipts.clone(),
+                "unsupported_capability_count": 290,
+                "conformance_receipt_id": "contracts/web-runtime/receipts/oracle-setcontent.json",
                 "engines_linked_into_greppy_parent": false,
                 "signed_distributable": false,
                 "oracle_receipt": "contracts/web-runtime/receipts/oracle-setcontent.json",
