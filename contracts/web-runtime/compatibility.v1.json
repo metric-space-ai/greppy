@@ -38,9 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 59,
+    "implemented": 60,
     "unsupported": 243,
-    "unverified": 1052
+    "unverified": 1051
   },
   "entries": [
     {
@@ -906,11 +906,13 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "file-chooser"
+        "file-chooser-dom"
       ],
       "known_differences": [
-        "feeds FilePicker paths then clicks the locator",
-        "stores sandbox paths for FilePicker; DOM FileList may stay empty without a picker dialog"
+        "DOM FileList is assigned via page JS File+DataTransfer, not Chromium CDP DOM.setFileInputFiles",
+        "input and change events are dispatched after assignment",
+        "Servo FilePicker.submit does not populate HTMLInputElement.files in this software-renderer embedder; that path is not used for compatibility evidence",
+        "internal file_paths storage is component plumbing only, not Playwright FileList semantics"
       ]
     },
     {
@@ -5922,11 +5924,18 @@
       "symbol": "Locator.setInputFiles",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "file-chooser-dom"
+      ],
+      "known_differences": [
+        "DOM FileList is assigned via page JS File+DataTransfer, not Chromium CDP DOM.setFileInputFiles",
+        "input and change events are dispatched after assignment",
+        "Servo FilePicker.submit does not populate HTMLInputElement.files in this software-renderer embedder; that path is not used for compatibility evidence",
+        "internal file_paths storage is component plumbing only, not Playwright FileList semantics"
+      ]
     },
     {
       "symbol": "Locator.tap",

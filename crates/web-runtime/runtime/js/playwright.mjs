@@ -138,6 +138,13 @@ class Locator {
   nth(index) {
     return new Locator(this._page, { ...this._selector, nth: index });
   }
+
+  async setInputFiles(files) {
+    if (this._selector.type !== "css") {
+      return unsupported("Locator.setInputFiles.nonCss")();
+    }
+    return this._page.setInputFiles(this._selector.value, files);
+  }
 }
 
 class Frame {
@@ -307,8 +314,11 @@ class Page {
 
   async setInputFiles(selector, files) {
     const list = Array.isArray(files) ? files : [files];
-    await engineCall("page.setInputFiles", { page: this._id, files: list.map(String) });
-    await this.locator(selector).click();
+    return engineCall("page.setInputFiles", {
+      page: this._id,
+      selector: String(selector),
+      files: list.map(String),
+    });
   }
 
   on(event, handler) {

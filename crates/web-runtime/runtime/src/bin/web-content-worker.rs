@@ -568,6 +568,11 @@ impl ContentEngine {
             }
             "page.setInputFiles" => {
                 let page_id = required_str(&params, "page")?;
+                let selector = params
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#file")
+                    .to_owned();
                 let files = params
                     .get("files")
                     .and_then(|v| v.as_array())
@@ -577,8 +582,79 @@ impl ContentEngine {
                     .iter()
                     .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
                     .collect();
+                let mut payloads = Vec::new();
+                for path in &paths {
+                    let bytes = std::fs::read(path).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("setInputFiles cannot read {}: {error}", path.display()),
+                        )
+                    })?;
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("upload.bin")
+                        .to_owned();
+                    payloads.push(json!({
+                        "name": name,
+                        "type": "application/octet-stream",
+                        "b64": base64_encode(&bytes),
+                    }));
+                }
                 self.page(&page_id)?.1.file_paths.replace(paths);
-                Ok(json!({}))
+                let (webview, _) = self.page(&page_id)?.clone();
+                let selector_json = serde_json::to_string(&selector).map_err(io::Error::other)?;
+                let files_json = serde_json::to_string(&payloads).map_err(io::Error::other)?;
+                let script = format!(
+                    r#"(function(selector, files) {{
+  var input = document.querySelector(selector);
+  if (!input) return {{ dom_files: 0, changed: 0, error: "no input" }};
+  try {{
+    if (typeof DataTransfer === "undefined" || typeof File === "undefined") {{
+      return {{
+        dom_files: 0,
+        changed: 0,
+        error: "Servo 0.5.0 page JS has no DataTransfer/File constructors; HTMLInputElement.files cannot be assigned without FilePicker"
+      }};
+    }}
+    var dt = new DataTransfer();
+    files.forEach(function(file) {{
+      var raw = atob(file.b64);
+      var buf = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream" }}));
+    }});
+    input.files = dt.files;
+    var changed = 0;
+    var onChange = function() {{ changed += 1; }};
+    input.addEventListener("input", onChange);
+    input.addEventListener("change", onChange);
+    input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    input.removeEventListener("input", onChange);
+    input.removeEventListener("change", onChange);
+    return {{
+      dom_files: input.files ? input.files.length : 0,
+      changed: changed,
+      name: input.files && input.files[0] ? input.files[0].name : ""
+    }};
+  }} catch (error) {{
+    return {{
+      dom_files: 0,
+      changed: 0,
+      error: String(error)
+    }};
+  }}
+}})({selector_json}, {files_json})"#
+                );
+                match self.evaluate(webview, &script) {
+                    Ok(value) => Ok(jsvalue_to_json(value)),
+                    Err(error) => Ok(json!({
+                        "dom_files": 0,
+                        "changed": 0,
+                        "error": error.to_string(),
+                    })),
+                }
             }
             "page.requests" => {
                 let page_id = required_str(&params, "page")?;
