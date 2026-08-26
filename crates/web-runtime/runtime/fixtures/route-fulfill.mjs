@@ -49,6 +49,10 @@ const associated = response.request();
 if (!associated || !String(associated.url()).includes("intercepted")) {
   throw new Error("response.request");
 }
+const viaRequest = await associated.response();
+if (!viaRequest || viaRequest.status() !== 200) {
+  throw new Error("request.response");
+}
 const text = await page.locator("#x").innerText();
 if (text.trim() !== "intercepted-ok") {
   throw new Error("expected intercepted-ok, got " + JSON.stringify(text));

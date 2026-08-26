@@ -26,6 +26,22 @@ if ((await child.getByRole("button").count()) < 1) {
 await child.waitForSelector("#in");
 const main = page.mainFrame();
 if (main.isDetached()) throw new Error("main isDetached");
+if (main.parentFrame() !== null) throw new Error("main parentFrame");
+if (child.parentFrame() !== main && child.parentFrame()._id !== "main") {
+  throw new Error("child parentFrame");
+}
+const kids = await main.childFrames();
+if (!kids.some((frame) => frame.name() === "child")) {
+  throw new Error("main childFrames missing child");
+}
+let nested = false;
+try {
+  await child.childFrames();
+  nested = true;
+} catch (error) {
+  if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
+}
+if (nested) throw new Error("nested childFrames must fail closed");
 const mainNested = await main.frameLocator("iframe").locator("#in").innerText();
 if (mainNested.trim() !== "frame-ok") throw new Error("main frameLocator " + mainNested);
 

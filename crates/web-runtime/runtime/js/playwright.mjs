@@ -427,6 +427,21 @@ class Locator {
     return result.value;
   }
 
+  async evaluateAll(pageFunction, arg) {
+    const fn =
+      typeof pageFunction === "function" ? pageFunction.toString() : String(pageFunction);
+    const source =
+      arg === undefined
+        ? fn
+        : "function(els) { return (" + fn + ")(els, " + JSON.stringify(arg) + "); }";
+    const result = await engineCall("locator.evaluateAll", {
+      page: this._page._id,
+      selector: this._selector,
+      source,
+    });
+    return result.value;
+  }
+
   async dblclick(options) {
     if (options != null) {
       return unsupported("Locator.dblclick.options")();
@@ -839,6 +854,20 @@ class Frame {
     }
     throwUnsupported("Frame.frameLocator.child");
   }
+
+  parentFrame() {
+    if (this._isMain()) {
+      return null;
+    }
+    return this._page.mainFrame();
+  }
+
+  async childFrames() {
+    if (!this._isMain()) {
+      throwUnsupported("Frame.childFrames.nested");
+    }
+    return this._page.frames();
+  }
 }
 
 class Page {
@@ -1137,6 +1166,12 @@ class Page {
       resourceType: () => (rec.main_frame ? "document" : "other"),
       isNavigationRequest: () => !!rec.main_frame,
       frame: () => this.mainFrame(),
+      response: async () => {
+        const result = await engineCall("page.responses", { page: this._id });
+        const hit = (result.responses || []).find((row) => row.url === rec.url);
+        if (!hit) return null;
+        return this._responseFromRecord(hit);
+      },
     };
   }
 

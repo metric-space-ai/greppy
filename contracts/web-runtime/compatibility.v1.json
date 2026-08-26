@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 238,
+    "implemented": 242,
     "unsupported": 281,
-    "unverified": 835
+    "unverified": 831
   },
   "entries": [
     {
@@ -2385,11 +2385,16 @@
       "symbol": "Frame.childFrames",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "main returns top-level iframe Frame objects from page.frames()",
+        "nested iframe childFrames throw unsupported_playwright_operation; empty-array would be fabricated success"
+      ]
     },
     {
       "symbol": "Frame.click",
@@ -2867,11 +2872,15 @@
       "symbol": "Frame.parentFrame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frames"
+      ],
+      "known_differences": [
+        "main returns null; iframe frames return Page.mainFrame(); deeper nesting is not represented"
+      ]
     },
     {
       "symbol": "Frame.press",
@@ -6093,11 +6102,15 @@
       "symbol": "Locator.evaluateAll",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-evaluate"
+      ],
+      "known_differences": [
+        "calls the function with the array of matched elements, not each element; same-origin CSS engine"
+      ]
     },
     {
       "symbol": "Locator.evaluateHandle",
@@ -9933,11 +9946,16 @@
       "symbol": "Request.response",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "returns the intercept Response when route.fulfill recorded last_responses for the same URL",
+        "unintercepted requests return null; not a live Chromium response"
+      ]
     },
     {
       "symbol": "Request.serviceWorker",
