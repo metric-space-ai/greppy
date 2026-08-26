@@ -8,4 +8,13 @@ await page.locator("#q").type("ab");
 if ((await page.inputValue("#q")) !== "ab") {
   throw new Error("locator.type expected ab, got " + JSON.stringify(await page.inputValue("#q")));
 }
+await page.locator("#q").evaluate((el) => {
+  el.addEventListener("keydown", () => {
+    window.__pressed = 1;
+  });
+});
+await page.locator("#q").press("Enter");
+if ((await page.evaluate(() => window.__pressed)) !== 1) {
+  throw new Error("locator.press did not dispatch keydown");
+}
 await browser.close();
