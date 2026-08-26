@@ -213,7 +213,7 @@ impl AgentWorkspace {
                 return Err(error.into());
             }
         };
-        if let Err(error) = wait_for_workspace(&worktree) {
+        if let Err(error) = wait_for_workspace_snapshot(&worktree, &baseline_for_git.entries) {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error);
         }
@@ -2073,6 +2073,48 @@ fn wait_for_workspace(path: &Path) -> Result<(), WorkspaceError> {
     )))
 }
 
+fn wait_for_workspace_snapshot(
+    path: &Path,
+    entries: &[BaselineEntry],
+) -> Result<(), WorkspaceError> {
+    let witness = entries
+        .iter()
+        .find(|entry| !matches!(entry.kind, EntryKind::Tombstone));
+    for _ in 0..100 {
+        if workspace_snapshot_visible(path, entries) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let witness = witness.map_or_else(
+        || "workspace root".to_string(),
+        |entry| format!("baseline witness {}", entry.path),
+    );
+    Err(WorkspaceError::AdapterUnavailable(format!(
+        "provider did not expose {witness} under {} within two seconds",
+        path.display()
+    )))
+}
+
+fn workspace_snapshot_visible(path: &Path, entries: &[BaselineEntry]) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    entries
+        .iter()
+        .find(|entry| !matches!(entry.kind, EntryKind::Tombstone))
+        .is_none_or(|entry| {
+            let Ok(metadata) = fs::symlink_metadata(path.join(&entry.path)) else {
+                return false;
+            };
+            match entry.kind {
+                EntryKind::File => metadata.is_file() && metadata.len() == entry.size,
+                EntryKind::Symlink => metadata.file_type().is_symlink(),
+                EntryKind::Tombstone => true,
+            }
+        })
+}
+
 fn validate_run_id(value: &str) -> Result<(), WorkspaceError> {
     if value.is_empty()
         || value.len() > 128
@@ -2112,6 +2154,24 @@ mod tests {
         ));
         assert!(!is_repository_tracker_fence(".git/index"));
         assert!(!is_repository_tracker_fence("src/lib.rs"));
+    }
+
+    #[test]
+    fn workspace_snapshot_visibility_requires_a_real_baseline_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let entries = vec![BaselineEntry {
+            path: "src/lib.rs".into(),
+            kind: EntryKind::File,
+            mode: 0o644,
+            size: 4,
+            modified_unix_ns: 0,
+            content_hash: String::new(),
+            chunks: Vec::new(),
+        }];
+        assert!(!workspace_snapshot_visible(root.path(), &entries));
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), b"rust").unwrap();
+        assert!(workspace_snapshot_visible(root.path(), &entries));
     }
 
     fn git(path: &Path, args: &[&str]) -> String {

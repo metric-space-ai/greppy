@@ -969,8 +969,16 @@ fn validate_identifier(value: &str) -> Result<(), c_int> {
 }
 
 fn portable_metadata(value: NodeMetadata) -> GreppyWindowsStat {
+    let kind = match value.kind {
+        NodeKind::File => S_IFREG,
+        NodeKind::Directory => S_IFDIR,
+        NodeKind::Symlink => S_IFLNK,
+    };
     GreppyWindowsStat {
-        mode: value.mode,
+        // WorkspaceCore stores permission bits and node kind separately.
+        // WinFsp's FUSE ABI expects both in st_mode; omitting the kind makes
+        // freshly-created directories look like regular files to Windows.
+        mode: kind | (value.mode & 0o7777),
         size: value.size,
         inode: value.inode,
         nlink: value.nlink,
