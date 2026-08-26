@@ -221,6 +221,10 @@ class Page {
     await engineCall("page.waitForLoadState", { page: this._id });
   }
 
+  async waitForSelector(selector) {
+    await this.locator(selector).waitFor();
+  }
+
   keyboard = {
     type: async (text) => {
       await engineCall("page.keyboard.type", { page: this._id, text: String(text) });

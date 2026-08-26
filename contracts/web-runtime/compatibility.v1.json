@@ -38,9 +38,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 39,
+    "implemented": 40,
     "unsupported": 243,
-    "unverified": 1072
+    "unverified": 1071
   },
   "entries": [
     {
@@ -1054,11 +1054,13 @@
       "symbol": "Page.waitForSelector",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "implemented as locator(selector).waitFor(); no state/timeout options"
+      ]
     },
     {
       "symbol": "Page.waitForTimeout",
