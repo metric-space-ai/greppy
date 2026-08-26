@@ -62,17 +62,38 @@ if (!(await page.locator("body").waitForFunction(() => window.__n === 1))) {
   throw new Error("Locator.waitForFunction");
 }
 let closed = 0;
+let prependClosed = 0;
+context.prependListener("close", () => {
+  prependClosed += 1;
+});
 context.on("close", () => {
   closed += 1;
 });
 let disconnected = 0;
+let added = 0;
+let prepended = 0;
 browser.on("disconnected", () => {
   disconnected += 1;
 });
+browser.addListener("disconnected", () => {
+  added += 1;
+});
+browser.prependListener("disconnected", () => {
+  prepended += 1;
+});
+const leak = () => {
+  throw new Error("removed browser listener fired");
+};
+browser.addListener("disconnected", leak);
+browser.removeListener("disconnected", leak);
 await expectUnsupported("browser.on close", () => browser.on("close", () => {}));
 await context.close();
 if (closed !== 1) throw new Error("BrowserContext close event " + closed);
+if (prependClosed !== 1) throw new Error("BrowserContext prependListener close " + prependClosed);
 if (!browser.isConnected()) throw new Error("browser should stay connected after context.close");
 await browser.close();
 if (disconnected !== 1) throw new Error("Browser disconnected " + disconnected);
+if (added !== 1) throw new Error("Browser.addListener disconnected " + added);
+if (prepended !== 1) throw new Error("Browser.prependListener disconnected " + prepended);
 if (browser.isConnected()) throw new Error("isConnected after Browser.close");
+browser.removeAllListeners();

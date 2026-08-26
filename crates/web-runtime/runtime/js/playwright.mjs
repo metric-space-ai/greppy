@@ -1659,7 +1659,7 @@ class Page {
       });
       return out;
     };
-    return {
+    return withUnsupported({
       url: () => rec.url,
       method: () => rec.method || "GET",
       headers: headerMap,
@@ -1696,14 +1696,14 @@ class Page {
         if (!hit) return null;
         return this._responseFromRecord(hit);
       },
-    };
+    }, "Request");
   }
 
   _responseFromRecord(rec, request) {
     const headers = rec.headers || {};
     const status = Number(rec.status) || 200;
     const bytes = () => decodeBase64(rec.bodyBase64 || "");
-    return {
+    return withUnsupported({
       url: () => rec.url,
       status: () => status,
       statusText: () => rec.statusText || (status < 400 ? "OK" : ""),
@@ -1722,12 +1722,12 @@ class Page {
       json: async () => JSON.parse(decodeUtf8(bytes())),
       request: () =>
         request || this._requestFromRecord({ url: rec.url, method: "GET" }),
-    };
+    }, "Response");
   }
 
   _downloadFromRecord(rec) {
     const page = this;
-    return {
+    return withUnsupported({
       url: () => rec.url,
       suggestedFilename: () => rec.suggestedFilename || "download",
       page: () => page,
@@ -1751,7 +1751,7 @@ class Page {
         }
         rec.path = String(path);
       },
-    };
+    }, "Download");
   }
 
   async _dispatchNetwork() {
@@ -2215,22 +2215,25 @@ class Page {
   }
 
   async route(url, handler) {
-    const route = {
-      abort: () =>
-        engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "abort" }),
-      continue: () =>
-        engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "continue" }),
-      fulfill: (options = {}) =>
-        engineCall("page.addRoute", {
-          page: this._id,
-          pattern: String(url),
-          action: "fulfill",
-          bodyBase64: encodeBase64(bytesFromFulfillBody(options.body)),
-          byteLength: bytesFromFulfillBody(options.body).length,
-          contentType: options.contentType || "text/html",
-          status: options.status || 200,
-        }),
-    };
+    const route = withUnsupported(
+      {
+        abort: () =>
+          engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "abort" }),
+        continue: () =>
+          engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "continue" }),
+        fulfill: (options = {}) =>
+          engineCall("page.addRoute", {
+            page: this._id,
+            pattern: String(url),
+            action: "fulfill",
+            bodyBase64: encodeBase64(bytesFromFulfillBody(options.body)),
+            byteLength: bytesFromFulfillBody(options.body).length,
+            contentType: options.contentType || "text/html",
+            status: options.status || 200,
+          }),
+      },
+      "Route",
+    );
     const result = handler(route);
     if (result && typeof result.then === "function") {
       await result;
@@ -2281,19 +2284,25 @@ class BrowserContext {
     this._initScripts = [];
     this._closed = false;
     this._handlers = {};
-    this.tracing = {
-      start: async () => unsupported("BrowserContext.tracing.start")(),
-      stop: async () => unsupported("BrowserContext.tracing.stop")(),
-    };
-    this.clock = {
-      install: unsupported("Clock.install"),
-      fastForward: unsupported("Clock.fastForward"),
-      pauseAt: unsupported("Clock.pauseAt"),
-      resume: unsupported("Clock.resume"),
-      runFor: unsupported("Clock.runFor"),
-      setFixedTime: unsupported("Clock.setFixedTime"),
-      setSystemTime: unsupported("Clock.setSystemTime"),
-    };
+    this.tracing = withUnsupported(
+      {
+        start: async () => unsupported("BrowserContext.tracing.start")(),
+        stop: async () => unsupported("BrowserContext.tracing.stop")(),
+      },
+      "Tracing",
+    );
+    this.clock = withUnsupported(
+      {
+        install: unsupported("Clock.install"),
+        fastForward: unsupported("Clock.fastForward"),
+        pauseAt: unsupported("Clock.pauseAt"),
+        resume: unsupported("Clock.resume"),
+        runFor: unsupported("Clock.runFor"),
+        setFixedTime: unsupported("Clock.setFixedTime"),
+        setSystemTime: unsupported("Clock.setSystemTime"),
+      },
+      "Clock",
+    );
     this.request = withUnsupported({}, "APIRequestContext");
     return withUnsupported(this, "BrowserContext");
   }
@@ -2373,6 +2382,20 @@ class BrowserContext {
       this._handlers[event] = [];
     }
     return this;
+  }
+
+  prependListener(event, handler) {
+    if (event === "page" || event === "close") {
+      this._handlers = this._handlers || {};
+      this._handlers[event] = this._handlers[event] || [];
+      this._handlers[event].unshift(handler);
+      return this;
+    }
+    throwUnsupported(`BrowserContext.on.${event}`);
+  }
+
+  async routeWebSocket() {
+    return unsupported("BrowserContext.routeWebSocket")();
   }
 
   async cookies() {
@@ -2681,6 +2704,32 @@ class Browser {
       return handler(...args);
     };
     return this.on(event, wrap);
+  }
+
+  addListener(event, handler) {
+    return this.on(event, handler);
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler);
+  }
+
+  removeAllListeners(event) {
+    if (event == null) {
+      this._handlers = {};
+    } else {
+      this._handlers[event] = [];
+    }
+    return this;
+  }
+
+  prependListener(event, handler) {
+    if (event !== "disconnected") {
+      throwUnsupported(`Browser.on.${event}`);
+    }
+    this._handlers[event] = this._handlers[event] || [];
+    this._handlers[event].unshift(handler);
+    return this;
   }
 
   version() {

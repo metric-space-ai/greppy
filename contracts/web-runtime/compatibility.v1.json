@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 317,
-    "unsupported": 337,
-    "unverified": 700
+    "implemented": 324,
+    "unsupported": 438,
+    "unverified": 592
   },
   "entries": [
     {
@@ -170,10 +170,12 @@
       "symbol": "Page.clearConsoleMessages",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "console-messages"
+      ],
       "known_differences": [
         "Greppy convenience; not counted as Playwright compatibility."
       ]
@@ -1029,10 +1031,12 @@
       "symbol": "Page.requests",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
         "Greppy convenience dump of recorded WebResourceRequests, not a Playwright Page.requests compatibility claim."
       ]
@@ -3799,11 +3803,15 @@
       "symbol": "BrowserContext.prependListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "page and close listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "BrowserContext.removeAllListeners",
@@ -3865,11 +3873,15 @@
       "symbol": "BrowserContext.routeWebSocket",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "WebSocket routing is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.serviceWorkers",
@@ -4420,21 +4432,29 @@
       "symbol": "Browser.addListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "disconnected listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Browser.bind",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Browser EventEmitter bind/unbind are not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Browser.browserType",
@@ -4584,31 +4604,43 @@
       "symbol": "Browser.prependListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "disconnected listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Browser.removeAllListeners",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "disconnected listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Browser.removeListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-options"
+      ],
+      "known_differences": [
+        "disconnected listeners only; other events throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Browser.startTracing",
@@ -4638,11 +4670,15 @@
       "symbol": "Browser.unbind",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Browser EventEmitter bind/unbind are not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Browser.version",
@@ -5316,101 +5352,141 @@
       "symbol": "Worker.addListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.evaluate",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.evaluateHandle",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.off",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.on",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.once",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.prependListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.removeListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.waitForEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.workers throws unsupported_playwright_operation; Worker objects are not created."
+      ]
     },
     {
       "symbol": "Worker.event.close",
@@ -5520,21 +5596,29 @@
       "symbol": "ElementHandle.boundingBox",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.check",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.click",
@@ -5552,291 +5636,407 @@
       "symbol": "ElementHandle.contentFrame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.dblclick",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.dispatchEvent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.fill",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.focus",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.getAttribute",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.hover",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.innerHTML",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.innerText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.inputValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.isChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.isDisabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.isEditable",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.isEnabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.isHidden",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.isVisible",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.ownerFrame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.press",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.screenshot",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.scrollIntoViewIfNeeded",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.selectOption",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.selectText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.setChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.setInputFiles",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.textContent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.uncheck",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.waitForElementState",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.waitForSelector",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "ElementHandle.animations",
@@ -6356,11 +6556,15 @@
       "symbol": "Locator.elementHandles",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No ElementHandle lifetime. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.evaluate",
@@ -6803,11 +7007,15 @@
       "symbol": "Locator.normalize",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Locator.normalize is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.nth",
@@ -7606,71 +7814,99 @@
       "symbol": "WebSocketRoute.close",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.connectToServer",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.onClose",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.onMessage",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.protocols",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.send",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.routeWebSocket / BrowserContext.routeWebSocket throw; WebSocketRoute objects are not created."
+      ]
     },
     {
       "symbol": "WebSocketRoute.code",
@@ -8610,131 +8846,183 @@
       "symbol": "APIResponse.body",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.dispose",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.headers",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.headersArray",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.json",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.ok",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.securityDetails",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.serverAddr",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.status",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.statusText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.text",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.timing",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "APIRequestContext methods throw unsupported_playwright_operation; APIResponse objects are not created."
+      ]
     },
     {
       "symbol": "APIResponse.issuer",
@@ -8790,101 +9078,141 @@
       "symbol": "BrowserServer.addListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.close",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.kill",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.off",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.on",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.once",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.prependListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.process",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.removeListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.wsEndpoint",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "BrowserType.launchServer throws unsupported_playwright_operation; BrowserServer objects are not created."
+      ]
     },
     {
       "symbol": "BrowserServer.event.close",
@@ -8998,11 +9326,15 @@
       "symbol": "Clock.time",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No clock emulation. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ConsoleMessage.args",
@@ -9066,21 +9398,29 @@
       "symbol": "ConsoleMessage.timestamp",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ConsoleMessage.timestamp is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ConsoleMessage.worker",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ConsoleMessage.worker is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.startCSSCoverage",
@@ -10257,11 +10597,15 @@
       "symbol": "Request.existingResponse",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Request.existingResponse is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Request.failure",
@@ -10384,9 +10728,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
         "GET/HEAD return null; other methods throw unsupported_playwright_operation"
       ]
@@ -10396,9 +10742,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
         "GET/HEAD return null; other methods throw unsupported_playwright_operation"
       ]
@@ -10462,11 +10810,15 @@
       "symbol": "Request.serviceWorker",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Request.serviceWorker is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Request.sizes",
@@ -10543,31 +10895,43 @@
       "symbol": "Response.finished",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Response.finished is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Response.frame",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Response.frame is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Response.fromServiceWorker",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Response.fromServiceWorker is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Response.headerValue",
@@ -10629,11 +10993,15 @@
       "symbol": "Response.httpVersion",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Response.httpVersion is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Response.json",
@@ -10682,21 +11050,29 @@
       "symbol": "Response.securityDetails",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Response.securityDetails is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Response.serverAddr",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "Response.serverAddr is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Response.status",
@@ -10839,21 +11215,29 @@
       "symbol": "Route.fallback",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Route.fallback is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Route.fetch",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Route.fetch is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Route.fulfill",
@@ -10873,11 +11257,15 @@
       "symbol": "Route.request",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Route.request is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Route.body",
@@ -11023,11 +11411,15 @@
       "symbol": "Selectors.register",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Custom selector engines are not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Selectors.setTestIdAttribute",
@@ -11091,21 +11483,29 @@
       "symbol": "Tracing.group",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No Chromium tracing groups. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Tracing.groupEnd",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No Chromium tracing groups. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Tracing.start",
@@ -11123,21 +11523,29 @@
       "symbol": "Tracing.startChunk",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No Chromium tracing chunks. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Tracing.startHar",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "HAR tracing is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Tracing.stop",
@@ -11155,21 +11563,29 @@
       "symbol": "Tracing.stopChunk",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "No Chromium tracing chunks. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Tracing.stopHar",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "HAR tracing is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Tracing.column",
@@ -11315,31 +11731,43 @@
       "symbol": "Video.delete",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.video throws unsupported_playwright_operation; Video objects are not created."
+      ]
     },
     {
       "symbol": "Video.path",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.video throws unsupported_playwright_operation; Video objects are not created."
+      ]
     },
     {
       "symbol": "Video.saveAs",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.video throws unsupported_playwright_operation; Video objects are not created."
+      ]
     },
     {
       "symbol": "WebError.error",
@@ -14755,11 +15183,15 @@
       "symbol": "ElementHandle.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "ElementHandle is not implemented. Locator.elementHandle throws unsupported_playwright_operation, so these methods cannot be invoked."
+      ]
     },
     {
       "symbol": "Locator.type",
@@ -15819,8 +16251,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1000,
-    "unsupported": 337,
+    "unverified": 899,
+    "unsupported": 438,
     "passing": 17
   }
 }

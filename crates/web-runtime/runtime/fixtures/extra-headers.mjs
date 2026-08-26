@@ -1,5 +1,25 @@
 import { chromium } from "playwright";
 
+async function expectUnsupported(label, fn) {
+  let failed = false;
+  try {
+    const result = fn();
+    if (result && typeof result.then === "function") {
+      try {
+        await result;
+      } catch (error) {
+        if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
+        return;
+      }
+      throw new Error(label + " resolved instead of throwing");
+    }
+  } catch (error) {
+    if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
+    failed = true;
+  }
+  if (!failed) throw new Error(label + " did not throw");
+}
+
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
@@ -17,6 +37,10 @@ const frameUrl = await page.mainFrame().waitForURL("http");
 if (!String(frameUrl).includes("http")) throw new Error("frame waitForURL " + frameUrl);
 const request = await page.waitForRequest("http");
 if (!String(request.url()).includes("http")) throw new Error("waitForRequest");
+const dumped = await page.requests();
+if (!dumped.some((item) => String(item.url()).includes("http"))) {
+  throw new Error("Page.requests missing navigation: " + JSON.stringify(dumped.map((item) => item.url())));
+}
 if (request.method() !== "GET") throw new Error("method " + request.method());
 if (request.resourceType() !== "document") {
   throw new Error("resourceType " + request.resourceType());
@@ -40,6 +64,19 @@ if (!headerArray.some((h) => String(h.name).toLowerCase() === "x-greppy-test" &&
 if (!request.isNavigationRequest()) throw new Error("isNavigationRequest");
 if (request.failure() !== null) throw new Error("request.failure");
 if (request.postData() !== null) throw new Error("GET postData");
+if (request.postDataJSON() !== null) throw new Error("GET postDataJSON");
+if (request.postDataBuffer() !== null) throw new Error("GET postDataBuffer");
+await expectUnsupported("Request.existingResponse", () => request.existingResponse());
+await expectUnsupported("Request.serviceWorker", () => request.serviceWorker());
+const response = await request.response();
+if (response) {
+  await expectUnsupported("Response.finished", () => response.finished());
+  await expectUnsupported("Response.frame", () => response.frame());
+  await expectUnsupported("Response.fromServiceWorker", () => response.fromServiceWorker());
+  await expectUnsupported("Response.httpVersion", () => response.httpVersion());
+  await expectUnsupported("Response.securityDetails", () => response.securityDetails());
+  await expectUnsupported("Response.serverAddr", () => response.serverAddr());
+}
 const ctx = await browser.newContext();
 if (ctx.browser() !== browser && ctx.browser()._id !== browser._id) {
   throw new Error("context.browser");

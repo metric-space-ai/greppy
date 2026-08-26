@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { chromium, selectors } from "playwright";
 
 async function expectUnsupported(label, fn) {
   let failed = false;
@@ -26,6 +26,19 @@ const page = await context.newPage();
 await page.setContent("<!DOCTYPE html><html><body><button id='b'>Go</button></body></html>");
 await page.evaluate(() => console.log("closed-log"));
 
+await expectUnsupported("Selectors.register", () => selectors.register("foo"));
+await expectUnsupported("Page.workers", () => page.workers());
+await expectUnsupported("Tracing.group", () => context.tracing.group("g"));
+await expectUnsupported("Tracing.startChunk", () => context.tracing.startChunk());
+await expectUnsupported("Tracing.groupEnd", () => context.tracing.groupEnd());
+await expectUnsupported("BrowserContext.routeWebSocket", () => context.routeWebSocket("**"));
+await expectUnsupported("Locator.elementHandles", () => page.locator("#b").elementHandles());
+await expectUnsupported("Locator.normalize", () => page.locator("#b").normalize());
+await page.route("https://example.invalid/fail-closed", async (route) => {
+  await expectUnsupported("Route.fallback", () => route.fallback());
+  await expectUnsupported("Route.fetch", () => route.fetch());
+  await expectUnsupported("Route.request", () => route.request());
+});
 await expectUnsupported("chromium.connect", () => chromium.connect());
 await expectUnsupported("chromium.launchPersistentContext", () => chromium.launchPersistentContext());
 await expectUnsupported("chromium.launchServer", () => chromium.launchServer());
@@ -38,6 +51,9 @@ await expectUnsupported("Coverage.startJSCoverage", () => page.coverage.startJSC
 await expectUnsupported("Coverage.startCSSCoverage", () => page.coverage.startCSSCoverage());
 await expectUnsupported("Clock.install", () => context.clock.install());
 await expectUnsupported("Clock.fastForward", () => context.clock.fastForward());
+await expectUnsupported("Clock.time", () => context.clock.time());
+await expectUnsupported("Browser.bind", () => browser.bind());
+await expectUnsupported("Browser.unbind", () => browser.unbind());
 await expectUnsupported("APIRequestContext.get context", () => context.request.get("https://example.com"));
 await expectUnsupported("APIRequestContext.get page", () => page.request.get("https://example.com"));
 await expectUnsupported("BrowserContext.setHTTPCredentials", () => context.setHTTPCredentials({ username: "a", password: "b" }));
@@ -57,4 +73,6 @@ const messages = await page.consoleMessages();
 if (!messages.length) throw new Error("expected console message");
 await expectUnsupported("ConsoleMessage.args", () => messages[0].args());
 await expectUnsupported("ConsoleMessage.location", () => messages[0].location());
+await expectUnsupported("ConsoleMessage.timestamp", () => messages[0].timestamp());
+await expectUnsupported("ConsoleMessage.worker", () => messages[0].worker());
 await browser.close();
