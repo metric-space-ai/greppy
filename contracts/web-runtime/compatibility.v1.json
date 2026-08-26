@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 254,
-    "unsupported": 281,
-    "unverified": 819
+    "implemented": 260,
+    "unsupported": 287,
+    "unverified": 807
   },
   "entries": [
     {
@@ -2435,11 +2435,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "page-actions"
+      ],
       "known_differences": [
-        "delegates to locator.dblclick; no dedicated Frame.dblclick fixture"
+        "delegates to locator.dblclick"
       ]
     },
     {
@@ -2778,12 +2780,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "page-actions"
+      ],
       "known_differences": [
-        "main-frame delegates to Page.locator",
-        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
+        "main-frame locator.isDisabled"
       ]
     },
     {
@@ -2906,12 +2909,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "page-actions"
+      ],
       "known_differences": [
-        "main-frame delegates to Page.locator",
-        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
+        "main-frame locator.press dispatches KeyboardEvent; not OS-level input"
       ]
     },
     {
@@ -2919,12 +2923,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "page-actions"
+      ],
       "known_differences": [
-        "main-frame delegates to Page.locator",
-        "child frames use same-origin FrameLocator CSS; no dedicated fixture yet"
+        "main-frame locator.selectOption"
       ]
     },
     {
@@ -2995,11 +3000,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "page-actions"
+      ],
       "known_differences": [
-        "main frame delegates to Page.title"
+        "main delegates to Page.title; child uses frameEvaluate document.title"
       ]
     },
     {
@@ -3032,11 +3039,13 @@
       "symbol": "Frame.waitForFunction",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame only; child frames throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Frame.waitForLoadState",
@@ -3056,11 +3065,13 @@
       "symbol": "Frame.waitForNavigation",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame only; child frames throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Frame.waitForSelector",
@@ -3081,21 +3092,27 @@
       "symbol": "Frame.waitForTimeout",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "main-frame only; child frames throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Frame.waitForURL",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "main-frame only; child frames throw unsupported_playwright_operation"
+      ]
     },
     {
       "symbol": "Frame.button",
@@ -3518,11 +3535,13 @@
       "symbol": "BrowserContext.clearPermissions",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.close",
@@ -3558,41 +3577,51 @@
       "symbol": "BrowserContext.exposeBinding",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.exposeFunction",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.grantPermissions",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.isClosed",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "true after BrowserContext.close in this process"
+      ]
     },
     {
       "symbol": "BrowserContext.newCDPSession",
@@ -3785,11 +3814,13 @@
       "symbol": "BrowserContext.setGeolocation",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.setHTTPCredentials",
@@ -3805,11 +3836,13 @@
       "symbol": "BrowserContext.setOffline",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "BrowserContext.setStorageState",
@@ -3841,11 +3874,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
-        "filters pending context routes and Page.unroute on open pages; no dedicated fixture"
+        "removes matching pending context routes and Page.unroute"
       ]
     },
     {
@@ -6233,12 +6268,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "locator-state"
+        "locator-state",
+        "oracle-content"
       ],
       "known_differences": [
-        "Element.getAttribute; no attribute waiting"
+        "Element.getAttribute; no attribute waiting",
+        "oracle compares getAttribute('id') of #x after setContent equals x"
       ]
     },
     {
@@ -9829,11 +9866,15 @@
       "symbol": "Request.failure",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "null for recorded requests; failed/aborted requests are not observed"
+      ]
     },
     {
       "symbol": "Request.frame",
@@ -15314,8 +15355,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1057,
-    "unsupported": 281,
-    "passing": 16
+    "unverified": 1050,
+    "unsupported": 287,
+    "passing": 17
   }
 }

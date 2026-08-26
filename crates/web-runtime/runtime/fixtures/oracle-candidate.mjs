@@ -32,4 +32,5 @@ if ((await page.textContent("#x")).trim() !== "ok") {
 }
 if (!(await page.locator("#x").isVisible())) throw new Error("locator.isVisible");
 if (!(await page.isVisible("#x"))) throw new Error("page.isVisible");
+if ((await page.locator("#x").getAttribute("id")) !== "x") throw new Error("getAttribute");
 await browser.close();

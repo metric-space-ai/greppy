@@ -8,7 +8,8 @@
     "textContent": "ok",
     "pageTextContent": "ok",
     "visible": true,
-    "pageVisible": true
+    "pageVisible": true,
+    "attr": "x"
   },
   "candidate": {
     "engine": "greppy-web-runtime+servo-0.5.0",
@@ -21,7 +22,8 @@
     "textContent": "ok",
     "pageTextContent": "ok",
     "visible": true,
-    "pageVisible": true
+    "pageVisible": true,
+    "attr": "x"
   },
   "match": true,
   "scope": "setContent Page.content markers, Locator.count(#x)==1, innerHTML, and textContent of #x; HTML serialization is not compared byte-for-byte",

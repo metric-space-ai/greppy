@@ -876,6 +876,34 @@ class Frame {
     return this.locator(selector).focus();
   }
 
+  waitForTimeout(ms) {
+    if (!this._isMain()) {
+      throwUnsupported("Frame.waitForTimeout.child");
+    }
+    return this._page.waitForTimeout(ms);
+  }
+
+  waitForFunction(pageFunction, arg) {
+    if (!this._isMain()) {
+      throwUnsupported("Frame.waitForFunction.child");
+    }
+    return this._page.waitForFunction(pageFunction, arg);
+  }
+
+  waitForURL(pattern) {
+    if (!this._isMain()) {
+      throwUnsupported("Frame.waitForURL.child");
+    }
+    return this._page.waitForURL(pattern);
+  }
+
+  waitForNavigation() {
+    if (!this._isMain()) {
+      throwUnsupported("Frame.waitForNavigation.child");
+    }
+    return this._page.waitForNavigation();
+  }
+
   frameLocator(selector) {
     if (this._isMain()) {
       return this._page.frameLocator(selector);
@@ -1198,6 +1226,7 @@ class Page {
       allHeaders: async () => headerMap(),
       resourceType: () => (rec.main_frame ? "document" : "other"),
       isNavigationRequest: () => !!rec.main_frame,
+      failure: () => null,
       frame: () => this.mainFrame(),
       response: async () => {
         const result = await engineCall("page.responses", { page: this._id });
@@ -1729,6 +1758,7 @@ class BrowserContext {
     this._pendingRoutes = [];
     this._extraHeaders = {};
     this._initScripts = [];
+    this._closed = false;
     this.tracing = {
       start: async () => unsupported("BrowserContext.tracing.start")(),
       stop: async () => unsupported("BrowserContext.tracing.stop")(),
@@ -1789,7 +1819,12 @@ class BrowserContext {
       await page.close();
     }
     this._pages = [];
+    this._closed = true;
     await engineCall("context.close", { context: this._id });
+  }
+
+  isClosed() {
+    return !!this._closed;
   }
 
   pages() {
@@ -1837,6 +1872,30 @@ class BrowserContext {
     for (const page of this.pages()) {
       await page.unrouteAll();
     }
+  }
+
+  async setOffline() {
+    return unsupported("BrowserContext.setOffline")();
+  }
+
+  async grantPermissions() {
+    return unsupported("BrowserContext.grantPermissions")();
+  }
+
+  async clearPermissions() {
+    return unsupported("BrowserContext.clearPermissions")();
+  }
+
+  async setGeolocation() {
+    return unsupported("BrowserContext.setGeolocation")();
+  }
+
+  async exposeFunction() {
+    return unsupported("BrowserContext.exposeFunction")();
+  }
+
+  async exposeBinding() {
+    return unsupported("BrowserContext.exposeBinding")();
   }
 
   async route(url, handler) {

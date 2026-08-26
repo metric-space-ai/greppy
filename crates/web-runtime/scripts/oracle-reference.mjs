@@ -30,6 +30,7 @@ const textContent = (await setPage.locator("#x").textContent()).trim();
 const pageTextContent = (await setPage.textContent("#x")).trim();
 const visible = await setPage.locator("#x").isVisible();
 const pageVisible = await setPage.isVisible("#x");
+const attr = await setPage.locator("#x").getAttribute("id");
 await setPage.close();
 
 const dialogPage = await browser.newPage();
@@ -87,6 +88,7 @@ const receipt = {
       pageTextContent,
       visible,
       pageVisible,
+      attr,
     },
     dialog: { value: dialogValue, type: dialogType, message: dialogMessage },
     fill: { value: filled },

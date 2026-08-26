@@ -36,6 +36,7 @@ if (!headerArray.some((h) => String(h.name).toLowerCase() === "x-greppy-test" &&
   throw new Error("headersArray " + JSON.stringify(headerArray));
 }
 if (!request.isNavigationRequest()) throw new Error("isNavigationRequest");
+if (request.failure() !== null) throw new Error("request.failure");
 const ctx = await browser.newContext();
 if (ctx.browser() !== browser && ctx.browser()._id !== browser._id) {
   throw new Error("context.browser");
@@ -59,7 +60,21 @@ try {
   stillRouted = false;
 }
 if (stillRouted) throw new Error("context.unrouteAll");
+await ctx.route("**/ctx-one", (route) =>
+  route.fulfill({ body: "<p id=one>one</p>", contentType: "text/html" }),
+);
+await ctx.unroute("**/ctx-one");
+await p2.goto(fixtureUrl + "ctx-one");
+let one = false;
+try {
+  one = (await p2.locator("#one").innerText()).trim() === "one";
+} catch (error) {
+  one = false;
+}
+if (one) throw new Error("context.unroute");
+if (ctx.isClosed()) throw new Error("context still open");
 await ctx.close();
+if (!ctx.isClosed()) throw new Error("context.isClosed");
 const ctxHeaders = await browser.newContext();
 await ctxHeaders.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
 const p3 = await ctxHeaders.newPage();
