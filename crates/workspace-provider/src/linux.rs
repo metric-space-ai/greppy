@@ -602,7 +602,8 @@ impl Filesystem for PortableFuse {
                             // kernel page cache. Writes still traverse this mount,
                             // so the kernel keeps cached readers coherent while
                             // WorkspaceCore promotes the shared origin privately.
-                            FopenFlags::FOPEN_KEEP_CACHE
+                            // A read-only handle also has nothing to flush on close.
+                            FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_NOFLUSH
                         } else {
                             FopenFlags::empty()
                         };
