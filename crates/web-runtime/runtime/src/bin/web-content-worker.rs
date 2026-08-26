@@ -99,6 +99,18 @@ impl Delegate {
             rendering_context,
         }
     }
+
+    fn mark_request_failure(&self, url: &str, error_text: &str) {
+        if let Some(row) = self
+            .requests
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url))
+        {
+            row["failure"] = json!({ "errorText": error_text });
+        }
+    }
 }
 
 impl WebViewDelegate for Delegate {
@@ -200,14 +212,24 @@ impl WebViewDelegate for Delegate {
                 })
             })
             .collect();
+        let abort_match = self.routes.borrow().iter().any(|rule| {
+            rule.action == "abort" && pattern_matches(&rule.pattern, &url)
+        });
+        let policy = decide_url(self.profile.get(), &url);
+        let failure = match &policy {
+            UrlDecision::Deny { reason } => Some(format!("policy_denied: {reason}")),
+            UrlDecision::Allow if abort_match => Some("net::ERR_FAILED".to_owned()),
+            UrlDecision::Allow => None,
+        };
         self.requests.borrow_mut().push(json!({
             "url": url,
             "method": load.request.method.to_string(),
             "main_frame": load.request.is_for_main_frame,
             "redirect": load.request.is_redirect,
             "headers": headers,
+            "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
-        if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+        if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
             }
@@ -234,6 +256,10 @@ impl WebViewDelegate for Delegate {
         let request_url = load.request.url.clone();
         match action.as_str() {
             "abort" => {
+                self.mark_request_failure(&url, "net::ERR_FAILED");
+                if load.request.is_for_main_frame {
+                    *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
+                }
                 load.intercept(WebResourceResponse::new(request_url))
                     .cancel();
             }
@@ -1387,7 +1413,7 @@ impl ContentEngine {
                 let cookies = params.get("cookies").cloned().unwrap_or(json!([]));
                 let (webview, _) = self.page(&page_id)?.clone();
                 let script = format!(
-                    "(function(cookies) {{ cookies.forEach(function(c) {{ document.cookie = c.name + '=' + c.value; }}); return true; }})({})",
+                    "(function(cookies) {{ cookies.forEach(function(c) {{ var parts = [c.name + '=' + c.value]; if (c.path) parts.push('path=' + c.path); if (c.domain) parts.push('domain=' + c.domain); if (c.secure) parts.push('Secure'); if (c.sameSite) parts.push('SameSite=' + c.sameSite); document.cookie = parts.join(';'); }}); return true; }})({})",
                     cookies
                 );
                 let _ = self.evaluate(webview, &script);

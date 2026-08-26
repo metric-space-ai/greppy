@@ -1226,7 +1226,7 @@ class Page {
       allHeaders: async () => headerMap(),
       resourceType: () => (rec.main_frame ? "document" : "other"),
       isNavigationRequest: () => !!rec.main_frame,
-      failure: () => null,
+      failure: () => rec.failure || null,
       postData: () => {
         const method = rec.method || "GET";
         if (method === "GET" || method === "HEAD") return null;
@@ -1807,24 +1807,45 @@ class BrowserContext {
   }
 
   async cookies() {
-    if (!this._lastPage) return [];
-    const result = await engineCall("page.cookies", { page: this._lastPage });
-    const raw = result.cookie || "";
-    if (!raw) return [];
-    return raw.split(";").map((part) => {
-      const [name, ...rest] = part.trim().split("=");
-      return { name, value: rest.join("=") };
-    });
+    const pages = this.pages();
+    const out = [];
+    const seen = new Set();
+    for (const page of pages) {
+      const result = await engineCall("page.cookies", { page: page._id });
+      const raw = result.cookie || "";
+      if (!raw) continue;
+      for (const part of raw.split(";")) {
+        const [name, ...rest] = part.trim().split("=");
+        if (!name) continue;
+        const value = rest.join("=");
+        const key = name + "=" + value;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ name, value });
+      }
+    }
+    return out;
   }
 
   async addCookies(cookies) {
-    if (!this._lastPage) return;
-    await engineCall("page.addCookies", { page: this._lastPage, cookies });
+    const pages = this.pages();
+    if (!pages.length) {
+      throwUnsupported("BrowserContext.addCookies.noPage");
+    }
+    for (const cookie of cookies || []) {
+      if (cookie && cookie.httpOnly) {
+        throwUnsupported("BrowserContext.addCookies.httpOnly");
+      }
+    }
+    for (const page of pages) {
+      await engineCall("page.addCookies", { page: page._id, cookies });
+    }
   }
 
   async clearCookies() {
-    if (!this._lastPage) return;
-    await engineCall("page.clearCookies", { page: this._lastPage });
+    for (const page of this.pages()) {
+      await engineCall("page.clearCookies", { page: page._id });
+    }
   }
 
   async storageState() {

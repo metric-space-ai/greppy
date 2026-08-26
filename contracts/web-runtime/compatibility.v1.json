@@ -3574,7 +3574,7 @@
         "cookies"
       ],
       "known_differences": [
-        "document.cookie on last page"
+        "document.cookie name/value from all open pages; HttpOnly cookies are not visible"
       ]
     },
     {
@@ -9874,10 +9874,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-headers"
+        "extra-headers",
+        "abort-failure"
       ],
       "known_differences": [
-        "null for recorded requests; failed/aborted requests are not observed"
+        "null for successful recorded requests; route.abort records { errorText: net::ERR_FAILED }",
+        "policy-denied loads record policy_denied errorText; Chromium net error codes are not mapped 1:1"
       ]
     },
     {

@@ -4,7 +4,16 @@ const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
 await page.goto(fixtureUrl);
-await context.addCookies([{ name: "k", value: "v" }]);
+let httpOnlyFailed = false;
+try {
+  await context.addCookies([{ name: "h", value: "secret", httpOnly: true }]);
+} catch (error) {
+  httpOnlyFailed = String(error).includes(
+    "unsupported_playwright_operation: BrowserContext.addCookies.httpOnly"
+  );
+}
+if (!httpOnlyFailed) throw new Error("httpOnly cookies must fail closed");
+await context.addCookies([{ name: "k", value: "v", path: "/" }]);
 const cookies = await context.cookies();
 if (!cookies.some((cookie) => cookie.name === "k" && cookie.value === "v")) {
   throw new Error("expected cookie k=v, got " + JSON.stringify(cookies));
