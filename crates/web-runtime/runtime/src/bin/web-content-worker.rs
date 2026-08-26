@@ -371,6 +371,19 @@ impl ContentEngine {
         }
     }
 
+    fn locator_eval(&self, params: &serde_json::Value, expr: &str) -> io::Result<JSValue> {
+        let page_id = required_str(params, "page")?;
+        let selector = params
+            .get("selector")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let (webview, _) = self.page(&page_id)?.clone();
+        let source = format!(
+            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
+        );
+        self.evaluate(webview, &source)
+    }
+
     fn handle(&mut self, method: &str, params: serde_json::Value) -> io::Result<serde_json::Value> {
         match method {
             "chromium.launch" => {
@@ -503,6 +516,10 @@ impl ContentEngine {
                 self.pages.remove(&page_id);
                 Ok(json!({}))
             }
+            "page.isClosed" => {
+                let page_id = required_str(&params, "page")?;
+                Ok(json!({ "closed": !self.pages.contains_key(&page_id) }))
+            }
             "session.ensurePage" => self.handle("context.newPage", params),
             "page.url" => {
                 let page_id = required_str(&params, "page")?;
@@ -622,6 +639,58 @@ impl ContentEngine {
                     serde_json::to_string(&value).map_err(io::Error::other)?
                 );
                 self.evaluate(webview, &source)?;
+                Ok(json!({}))
+            }
+            "locator.inputValue" => {
+                match self.locator_eval(&params, "return String(nodes[0].value || '')")? {
+                    JSValue::String(value) => Ok(json!({ "value": value })),
+                    other => Ok(json!({ "value": format!("{other:?}") })),
+                }
+            }
+            "locator.getAttribute" => {
+                let name = required_str(&params, "name")?;
+                let name_json = serde_json::to_string(&name).map_err(io::Error::other)?;
+                match self.locator_eval(
+                    &params,
+                    &format!("return nodes[0].getAttribute({name_json})"),
+                )? {
+                    JSValue::String(value) => Ok(json!({ "value": value })),
+                    JSValue::Null => Ok(json!({ "value": serde_json::Value::Null })),
+                    other => Ok(json!({ "value": format!("{other:?}") })),
+                }
+            }
+            "locator.isChecked" => match self.locator_eval(&params, "return !!nodes[0].checked")? {
+                JSValue::Boolean(value) => Ok(json!({ "checked": value })),
+                _ => Ok(json!({ "checked": false })),
+            },
+            "locator.isEnabled" => match self.locator_eval(
+                &params,
+                "return !(nodes[0].disabled || nodes[0].getAttribute('aria-disabled') === 'true')",
+            )? {
+                JSValue::Boolean(value) => Ok(json!({ "enabled": value })),
+                _ => Ok(json!({ "enabled": false })),
+            },
+            "locator.isDisabled" => match self.locator_eval(
+                &params,
+                "return !!(nodes[0].disabled || nodes[0].getAttribute('aria-disabled') === 'true')",
+            )? {
+                JSValue::Boolean(value) => Ok(json!({ "disabled": value })),
+                _ => Ok(json!({ "disabled": false })),
+            },
+            "locator.isHidden" => {
+                let visible = self.handle("locator.isVisible", params)?;
+                Ok(
+                    json!({ "hidden": !visible.get("visible").and_then(|v| v.as_bool()).unwrap_or(false) }),
+                )
+            }
+            "locator.innerHTML" => {
+                match self.locator_eval(&params, "return String(nodes[0].innerHTML || '')")? {
+                    JSValue::String(html) => Ok(json!({ "html": html })),
+                    other => Ok(json!({ "html": format!("{other:?}") })),
+                }
+            }
+            "locator.focus" => {
+                self.locator_eval(&params, "nodes[0].focus(); return true")?;
                 Ok(json!({}))
             }
             "page.setContent" => {
@@ -856,6 +925,15 @@ impl ContentEngine {
                     JSValue::String(cookie) => Ok(json!({ "cookie": cookie })),
                     _ => Ok(json!({ "cookie": "" })),
                 }
+            }
+            "page.clearCookies" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let _ = self.evaluate(
+                    webview,
+                    r#"(function() { document.cookie.split(';').forEach(function(part) { var name = part.split('=')[0].trim(); if (name) document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/'; }); return document.cookie; })()"#,
+                );
+                Ok(json!({}))
             }
             "page.tracing" => {
                 let page_id = required_str(&params, "page")?;

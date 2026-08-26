@@ -39,9 +39,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 67,
+    "implemented": 96,
     "unsupported": 243,
-    "unverified": 1044
+    "unverified": 1015
   },
   "entries": [
     {
@@ -128,11 +128,15 @@
       "symbol": "Page.check",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.clearConsoleMessages",
@@ -158,11 +162,15 @@
       "symbol": "Page.click",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.close",
@@ -172,7 +180,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "keyboard"
+        "keyboard",
+        "locator-state"
       ],
       "known_differences": [
         "drops the Servo WebView from the content worker; not Chromium target close"
@@ -304,21 +313,29 @@
       "symbol": "Page.fill",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.focus",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.frame",
@@ -364,11 +381,15 @@
       "symbol": "Page.getAttribute",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.getByAltText",
@@ -503,71 +524,99 @@
       "symbol": "Page.hover",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.innerHTML",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.innerText",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.inputValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.isChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.isClosed",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "true after page.close removes the Servo WebView"
+      ]
     },
     {
       "symbol": "Page.isDisabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.isEditable",
@@ -583,31 +632,43 @@
       "symbol": "Page.isEnabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.isHidden",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.isVisible",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.locator",
@@ -739,11 +800,15 @@
       "symbol": "Page.press",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "focus(selector) then keyboard.type/press; not OS-level key events"
+      ]
     },
     {
       "symbol": "Page.reload",
@@ -864,11 +929,15 @@
       "symbol": "Page.selectOption",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.setChecked",
@@ -966,11 +1035,15 @@
       "symbol": "Page.textContent",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.title",
@@ -992,11 +1065,15 @@
       "symbol": "Page.uncheck",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+      ]
     },
     {
       "symbol": "Page.unroute",
@@ -3014,11 +3091,15 @@
       "symbol": "BrowserContext.clearCookies",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "cookies"
+      ],
+      "known_differences": [
+        "expires document.cookie entries; not HttpOnly SiteDataManager cookies"
+      ]
     },
     {
       "symbol": "BrowserContext.clearPermissions",
@@ -5606,11 +5687,15 @@
       "symbol": "Locator.focus",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "HTMLElement.focus(); no actionability"
+      ]
     },
     {
       "symbol": "Locator.frameLocator",
@@ -5626,11 +5711,15 @@
       "symbol": "Locator.getAttribute",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "Element.getAttribute; no attribute waiting"
+      ]
     },
     {
       "symbol": "Locator.getByAltText",
@@ -5741,11 +5830,15 @@
       "symbol": "Locator.innerHTML",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "innerHTML string; not Chromium serialization"
+      ]
     },
     {
       "symbol": "Locator.innerText",
@@ -5766,31 +5859,43 @@
       "symbol": "Locator.inputValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "reads input.value; no fill waiting"
+      ]
     },
     {
       "symbol": "Locator.isChecked",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "reads input.checked; no actionability wait"
+      ]
     },
     {
       "symbol": "Locator.isDisabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "disabled or aria-disabled"
+      ]
     },
     {
       "symbol": "Locator.isEditable",
@@ -5806,21 +5911,29 @@
       "symbol": "Locator.isEnabled",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "disabled or aria-disabled"
+      ]
     },
     {
       "symbol": "Locator.isHidden",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-state"
+      ],
+      "known_differences": [
+        "negation of isVisible"
+      ]
     },
     {
       "symbol": "Locator.isVisible",
@@ -13182,11 +13295,15 @@
       "symbol": "Page.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "page-actions"
+      ],
+      "known_differences": [
+        "focus(selector) then keyboard.type/press; not OS-level key events"
+      ]
     },
     {
       "symbol": "Page.clock",

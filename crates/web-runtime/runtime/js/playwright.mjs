@@ -21,6 +21,9 @@ function withUnsupported(target, prefix) {
       if (prop === "then" || prop === "catch" || prop === "finally") {
         return undefined;
       }
+      if (String(prop).startsWith("_")) {
+        return obj[prop];
+      }
       if (prop in obj) {
         return obj[prop];
       }
@@ -190,6 +193,70 @@ class Locator {
     });
   }
 
+  async inputValue() {
+    const result = await engineCall("locator.inputValue", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return result.value;
+  }
+
+  async getAttribute(name) {
+    const result = await engineCall("locator.getAttribute", {
+      page: this._page._id,
+      selector: this._selector,
+      name: String(name),
+    });
+    return result.value;
+  }
+
+  async isChecked() {
+    const result = await engineCall("locator.isChecked", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return !!result.checked;
+  }
+
+  async isEnabled() {
+    const result = await engineCall("locator.isEnabled", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return !!result.enabled;
+  }
+
+  async isDisabled() {
+    const result = await engineCall("locator.isDisabled", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return !!result.disabled;
+  }
+
+  async isHidden() {
+    const result = await engineCall("locator.isHidden", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return !!result.hidden;
+  }
+
+  async innerHTML() {
+    const result = await engineCall("locator.innerHTML", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return result.html;
+  }
+
+  async focus() {
+    await engineCall("locator.focus", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+  }
+
   first() {
     return new Locator(this._page, { ...this._selector, nth: 0 });
   }
@@ -245,6 +312,7 @@ class Frame {
 class Page {
   constructor(id) {
     this._id = id;
+    this._closed = false;
     return withUnsupported(this, "Page");
   }
 
@@ -266,6 +334,84 @@ class Page {
 
   locator(selector) {
     return new Locator(this, { type: "css", value: selector });
+  }
+
+  click(selector, options) {
+    return this.locator(selector).click(options);
+  }
+
+  fill(selector, value, options) {
+    return this.locator(selector).fill(value, options);
+  }
+
+  hover(selector) {
+    return this.locator(selector).hover();
+  }
+
+  check(selector) {
+    return this.locator(selector).check();
+  }
+
+  uncheck(selector) {
+    return this.locator(selector).uncheck();
+  }
+
+  selectOption(selector, value) {
+    return this.locator(selector).selectOption(value);
+  }
+
+  innerText(selector) {
+    return this.locator(selector).innerText();
+  }
+
+  innerHTML(selector) {
+    return this.locator(selector).innerHTML();
+  }
+
+  textContent(selector) {
+    return this.locator(selector).textContent();
+  }
+
+  inputValue(selector) {
+    return this.locator(selector).inputValue();
+  }
+
+  getAttribute(selector, name) {
+    return this.locator(selector).getAttribute(name);
+  }
+
+  isVisible(selector) {
+    return this.locator(selector).isVisible();
+  }
+
+  isHidden(selector) {
+    return this.locator(selector).isHidden();
+  }
+
+  isChecked(selector) {
+    return this.locator(selector).isChecked();
+  }
+
+  isEnabled(selector) {
+    return this.locator(selector).isEnabled();
+  }
+
+  isDisabled(selector) {
+    return this.locator(selector).isDisabled();
+  }
+
+  focus(selector) {
+    return this.locator(selector).focus();
+  }
+
+  async type(selector, text) {
+    await this.focus(selector);
+    await this.keyboard.type(text);
+  }
+
+  async press(selector, key) {
+    await this.focus(selector);
+    await this.keyboard.press(key);
   }
 
   async goto(url, options) {
@@ -356,6 +502,13 @@ class Page {
 
   async close() {
     await engineCall("page.close", { page: this._id });
+    this._closed = true;
+  }
+
+  async isClosed() {
+    if (this._closed) return true;
+    const result = await engineCall("page.isClosed", { page: this._id });
+    return !!result.closed;
   }
 
   async waitForEvent(event) {
@@ -479,6 +632,11 @@ class BrowserContext {
   async addCookies(cookies) {
     if (!this._lastPage) return;
     await engineCall("page.addCookies", { page: this._lastPage, cookies });
+  }
+
+  async clearCookies() {
+    if (!this._lastPage) return;
+    await engineCall("page.clearCookies", { page: this._lastPage });
   }
 
   async storageState() {

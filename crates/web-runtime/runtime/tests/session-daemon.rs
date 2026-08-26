@@ -1438,3 +1438,39 @@ fn fifty_local_research_pages() {
         );
     }
 }
+
+#[test]
+fn locator_state_queries_and_page_is_closed() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-locstate-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_locstate", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("locator-state.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_locstate",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn page_selector_actions_delegate_to_locators() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-pageact-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_pageact", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("page-actions.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_pageact",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
