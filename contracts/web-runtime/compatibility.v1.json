@@ -1270,9 +1270,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
         "polls retained load_web_resource records; method always GET"
       ]
@@ -1320,9 +1322,11 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-headers"
+      ],
       "known_differences": [
         "polls page.url for substring; not glob/RegExp"
       ]

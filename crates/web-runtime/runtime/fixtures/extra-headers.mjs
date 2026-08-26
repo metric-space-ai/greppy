@@ -8,4 +8,16 @@ const text = (await page.locator("body").innerText()).trim();
 if (text !== "HEADER_OK") {
   throw new Error("expected HEADER_OK from extra headers, got " + JSON.stringify(text));
 }
+const url = await page.waitForURL("http");
+if (!String(url).includes("http")) throw new Error("waitForURL " + url);
+const request = await page.waitForRequest("http");
+if (!String(request.url()).includes("http")) throw new Error("waitForRequest");
+let paused = false;
+try {
+  await page.pause();
+  paused = true;
+} catch (error) {
+  if (!String(error.message).includes("unsupported_playwright_operation")) throw error;
+}
+if (paused) throw new Error("pause must not succeed as a no-op");
 await browser.close();
