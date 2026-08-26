@@ -132,3 +132,79 @@ fn session_create_run_close_over_unix_socket() {
     .expect("session close");
     assert_eq!(closed.status, "ok");
 }
+
+#[test]
+fn one_thousand_session_create_close_cycles() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-cycles-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let child = Command::new(env!("CARGO_BIN_EXE_web-runtime-supervisor"))
+        .arg("--controller-worker")
+        .arg(env!("CARGO_BIN_EXE_web-controller-worker"))
+        .arg("--content-worker")
+        .arg(env!("CARGO_BIN_EXE_web-content-worker"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--run-id")
+        .arg("run_cycles")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn supervisor daemon");
+    let _guard = Supervisor(child);
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    for i in 0..1000 {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_cycles",
+                "web.session.create",
+                json!({ "profile": "research" }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("create {i}: {error}"));
+        assert_eq!(created.status, "ok", "create {i}: {created:?}");
+        let session_id = created
+            .result
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+            .and_then(|value| value.as_str())
+            .expect("session_id")
+            .to_owned();
+        let closed = unix_request(
+            &socket,
+            &Request::new(
+                "run_cycles",
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("close {i}: {error}"));
+        assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
+    }
+
+    let listed = unix_request(
+        &socket,
+        &Request::new("run_cycles", "web.session.list", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("list");
+    assert_eq!(listed.status, "ok");
+    let sessions = listed
+        .result
+        .as_ref()
+        .and_then(|value| value.get("sessions"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        sessions.is_empty(),
+        "sessions leaked after 1000 close cycles: {sessions:?}"
+    );
+}

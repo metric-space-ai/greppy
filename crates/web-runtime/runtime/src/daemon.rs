@@ -25,8 +25,8 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let _ = std::fs::remove_file(&config.socket);
-    let listener = UnixListener::bind(&config.socket)?;
     let mut daemon = Daemon::start(config)?;
+    let listener = UnixListener::bind(&daemon.socket)?;
     for connection in listener.incoming() {
         let stream = connection?;
         serve_connection(stream, |request| daemon.handle(request)).map_err(io::Error::other)?;
@@ -35,6 +35,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
 }
 
 struct Daemon {
+    socket: PathBuf,
     run_id: String,
     fixture_url: String,
     controller: WorkerProcess,
@@ -54,6 +55,7 @@ impl Daemon {
             WorkerProcess::spawn(&config.content_worker, WorkerKind::Content, random_token()?)?;
         content.handshake()?;
         Ok(Self {
+            socket: config.socket,
             run_id: config.run_id,
             fixture_url: config.fixture_url.unwrap_or_default(),
             controller,
