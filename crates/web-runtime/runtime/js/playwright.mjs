@@ -563,6 +563,27 @@ class Frame {
     await this.locator(selector).waitFor();
   }
 
+  async waitForLoadState(state) {
+    if (this._id !== "main") {
+      return unsupported("Frame.waitForLoadState.child")();
+    }
+    return this._page.waitForLoadState(state);
+  }
+
+  async addScriptTag(options) {
+    if (this._id !== "main") {
+      return unsupported("Frame.addScriptTag.child")();
+    }
+    return this._page.addScriptTag(options);
+  }
+
+  async addStyleTag(options) {
+    if (this._id !== "main") {
+      return unsupported("Frame.addStyleTag.child")();
+    }
+    return this._page.addStyleTag(options);
+  }
+
   hover(selector) {
     return this.locator(selector).hover();
   }

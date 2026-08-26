@@ -24,8 +24,9 @@ await page.locator("#b").evaluate((el) => {
 await page.dblclick("#b");
 if ((await page.innerText("#t")).trim() !== "dbl") throw new Error("dblclick");
 await page.dispatchEvent("#t", "click");
-await page.addStyleTag({ content: "#t { font-weight: 700; }" });
-await page.addScriptTag({ content: "window.__greppy_tag = 1;" });
+await page.mainFrame().addStyleTag({ content: "#t { font-weight: 700; }" });
+await page.mainFrame().addScriptTag({ content: "window.__greppy_tag = 1;" });
+await page.mainFrame().waitForLoadState();
 const tags = await page.evaluate(() => ({
   styles: document.querySelectorAll("style").length,
   scripts: document.querySelectorAll("script").length,
