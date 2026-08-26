@@ -113,6 +113,125 @@ jobs:
         run: |
           ! git grep -n -E 'rift-workspace|RiftWorkspace|btrfs subvolume|clonefile' -- Cargo.toml Cargo.lock crates/agent/Cargo.toml crates/agent/src/portable_workspace.rs crates/workspace-core crates/workspace-provider
 
+  linux-release-performance:
+    name: Linux portable CoW hard performance gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Install FUSE3 runtime and representative toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 nodejs
+          test -c /dev/fuse
+          rustc --version
+          python3 --version
+          node --version
+
+      - name: Build release provider and measurement harness
+        run: |
+          cargo build -p greppy-workspace-provider --release --locked
+          cargo build -p greppy-workspace-provider --example release_performance --release --locked
+
+      - name: Materialize exact 300k-file fixture
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import time
+
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "greppy-cow-perf-repo"
+          root.mkdir()
+          subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+          subprocess.run(["git", "config", "user.email", "perf@greppy.invalid"], cwd=root, check=True)
+          subprocess.run(["git", "config", "user.name", "Greppy Performance Gate"], cwd=root, check=True)
+          process = subprocess.Popen(["git", "fast-import", "--quiet"], cwd=root, stdin=subprocess.PIPE)
+          stream = process.stdin
+          stream.write(b"blob\nmark :1\ndata 5\nbase\n")
+          stream.write(b"commit refs/heads/main\nmark :2\n")
+          stream.write(f"committer Greppy Gate <perf@greppy.invalid> {int(time.time())} +0000\n".encode())
+          stream.write(b"data 7\nfixture\n")
+          for index in range(299_997):
+              stream.write(f"M 100644 :1 files/{index // 1000:03}/{index:06}.txt\n".encode())
+          stream.write(b"\n")
+          stream.close()
+          if process.wait() != 0:
+              raise SystemExit("git fast-import failed")
+          subprocess.run(["git", "reset", "--hard", "-q", "main"], cwd=root, check=True)
+          projects = {
+              "rust/main.rs": "fn main() { assert_eq!(2 + 2, 4); }\n",
+              "python/test_sample.py": "assert sum([1, 2, 3]) == 6\n",
+              "node/test.js": "if ([1,2,3].reduce((a,b)=>a+b,0) !== 6) process.exit(1);\n",
+          }
+          for relative, content in projects.items():
+              path = root / relative
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(content)
+          subprocess.run(["git", "add", "rust", "python", "node"], cwd=root, check=True)
+          subprocess.run(["git", "commit", "-qm", "add toolchain fixtures"], cwd=root, check=True)
+          count = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).count(b"\0")
+          if count != 300_000:
+              raise SystemExit(f"fixture count is {count}, expected 300000")
+          PY
+
+      - name: Mount provider and run hard gate
+        id: performance
+        shell: bash
+        run: |
+          data="$RUNNER_TEMP/greppy-cow-perf-data"
+          mount="$RUNNER_TEMP/greppy-cow-perf-mount"
+          evidence="$RUNNER_TEMP/greppy-cow-perf-linux.json"
+          mkdir -p "$data" "$mount"
+          target/release/greppy-workspace-provider \
+            --data-root "$data" --mount-root "$mount" \
+            >"$RUNNER_TEMP/greppy-cow-provider.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/greppy-cow-provider.pid"
+          for _ in $(seq 1 200); do
+            test -f "$data/provider.json" && mountpoint -q "$mount" && break
+            sleep 0.1
+          done
+          mountpoint -q "$mount"
+          hardware="$(lscpu | tr '\n' ';')"
+          target/release/examples/release_performance \
+            --repository "$RUNNER_TEMP/greppy-cow-perf-repo" \
+            --data-root "$data" \
+            --probe-path files/000/000000.txt \
+            --output "$evidence" \
+            --source-commit "$GITHUB_SHA" \
+            --provider-binary "$GITHUB_WORKSPACE/target/release/greppy-workspace-provider" \
+            --hardware "$hardware" \
+            --toolchain-case '{"name":"rust","cwd":"rust","argv":["rustc","main.rs","-o","/tmp/greppy-perf-rust"]}' \
+            --toolchain-case '{"name":"python","cwd":"python","argv":["python3","-B","test_sample.py"]}' \
+            --toolchain-case '{"name":"node","cwd":"node","argv":["node","test.js"]}' \
+            --enforce
+
+      - name: Unmount provider
+        if: always()
+        shell: bash
+        run: |
+          mount="$RUNNER_TEMP/greppy-cow-perf-mount"
+          mountpoint -q "$mount" && fusermount3 -u "$mount" || true
+          test -f "$RUNNER_TEMP/greppy-cow-provider.pid" && kill "$(cat "$RUNNER_TEMP/greppy-cow-provider.pid")" || true
+
+      - name: Upload raw performance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: portable-cow-performance-linux-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/greppy-cow-perf-linux.json
+            ${{ runner.temp }}/greppy-cow-provider.log
+          if-no-files-found: error
+
   windows-winfsp:
     name: Windows WinFsp provider
     runs-on: windows-latest
