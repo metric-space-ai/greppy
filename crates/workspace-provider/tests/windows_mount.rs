@@ -85,6 +85,20 @@ fn mounted_winfsp_provider_satisfies_workspace_and_private_git_contract() {
     provider.doctor_io("windows-mount").unwrap();
 
     let root = provider.workspace_path(workspace.id()).unwrap();
+    let immutable_inode = core
+        .metadata(&workspace, "tracked.txt")
+        .unwrap()
+        .unwrap()
+        .inode;
+    assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"dirty\n");
+    assert_eq!(
+        core.metadata(&workspace, "tracked.txt")
+            .unwrap()
+            .unwrap()
+            .inode,
+        immutable_inode,
+        "a read-only WinFsp open must not copy an immutable Base file into the private namespace"
+    );
     mounted_contract::exercise_mounted_contract(&root, &core);
     assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"dirty\n");
     assert_eq!(fs::read(root.join("untracked.txt")).unwrap(), b"user\n");
