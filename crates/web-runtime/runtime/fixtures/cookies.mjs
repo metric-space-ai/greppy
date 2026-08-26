@@ -9,12 +9,20 @@ const cookies = await context.cookies();
 if (!cookies.some((cookie) => cookie.name === "k" && cookie.value === "v")) {
   throw new Error("expected cookie k=v, got " + JSON.stringify(cookies));
 }
+await page.evaluate(() => localStorage.setItem("greppy", "origin-ok"));
 const state = await context.storageState();
 if (!state.cookies.some((cookie) => cookie.name === "k" && cookie.value === "v")) {
   throw new Error("storageState missing k=v: " + JSON.stringify(state));
 }
-if (!Array.isArray(state.origins)) {
-  throw new Error("storageState origins");
+if (
+  !Array.isArray(state.origins) ||
+  !state.origins.some(
+    (origin) =>
+      origin.localStorage &&
+      origin.localStorage.some((item) => item.name === "greppy" && item.value === "origin-ok")
+  )
+) {
+  throw new Error("storageState missing localStorage origin: " + JSON.stringify(state));
 }
 await context.clearCookies();
 const after = await context.cookies();

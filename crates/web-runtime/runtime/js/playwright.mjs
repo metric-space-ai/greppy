@@ -1696,7 +1696,7 @@ class Page {
   }
 
   async workers() {
-    return [];
+    return unsupported("Page.workers")();
   }
 
   async pause() {
@@ -1828,7 +1828,35 @@ class BrowserContext {
   }
 
   async storageState() {
-    return { cookies: await this.cookies(), origins: [] };
+    const cookies = await this.cookies();
+    const origins = [];
+    const seen = new Set();
+    for (const page of this.pages()) {
+      const snapshot = await page.evaluate(() => {
+        const origin = location.origin;
+        if (!origin || origin === "null" || origin === "about:blank") {
+          return null;
+        }
+        const localStorageItems = [];
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const name = localStorage.key(i);
+            localStorageItems.push({
+              name,
+              value: localStorage.getItem(name),
+            });
+          }
+        } catch (_error) {
+          return { origin, localStorage: [] };
+        }
+        return { origin, localStorage: localStorageItems };
+      });
+      if (snapshot && snapshot.origin && !seen.has(snapshot.origin)) {
+        seen.add(snapshot.origin);
+        origins.push(snapshot);
+      }
+    }
+    return { cookies, origins };
   }
 
   async close() {

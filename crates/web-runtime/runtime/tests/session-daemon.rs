@@ -1842,6 +1842,27 @@ fn nested_locators_tap_and_empty_workers() {
 }
 
 #[test]
+fn cookies_storage_state_includes_local_storage_origin() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-cookst-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let fixture = serve_fixture("<!DOCTYPE html><html><body>cookies</body></html>");
+    let _guard = Supervisor::spawn(&socket, "run_cookst", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("cookies.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_cookst",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
 fn locator_filter_has_text_and_scroll() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-filter-{}.sock", std::process::id()));

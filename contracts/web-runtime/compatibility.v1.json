@@ -3869,8 +3869,8 @@
         "cookies"
       ],
       "known_differences": [
-        "cookies from document.cookie only; origins/localStorage are empty",
-        "HttpOnly / SiteDataManager cookies are not included"
+        "cookies from document.cookie only (name/value); HttpOnly cookies are not included",
+        "origins capture localStorage from currently open pages only; IndexedDB is not included"
       ]
     },
     {

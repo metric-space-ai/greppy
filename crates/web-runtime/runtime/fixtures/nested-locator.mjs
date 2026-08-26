@@ -16,7 +16,12 @@ if ((await box.getByText("Hello").count()) !== 1) throw new Error("scoped text")
 if ((await box.locator("input").count()) !== 1) throw new Error("scoped css");
 if ((await box.getByPlaceholder("inside").count()) !== 1) throw new Error("scoped placeholder");
 await page.tap("#box button");
-const workers = await page.workers();
-if (!Array.isArray(workers) || workers.length !== 0) throw new Error("workers");
+let workersUnsupported = false;
+try {
+  await page.workers();
+} catch (error) {
+  workersUnsupported = String(error).includes("unsupported_playwright_operation: Page.workers");
+}
+if (!workersUnsupported) throw new Error("page.workers must fail closed");
 await page.mainFrame().waitForSelector("#box");
 await browser.close();
