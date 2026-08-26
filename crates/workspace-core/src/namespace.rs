@@ -437,6 +437,15 @@ impl WorkspaceCore {
         repository_tracker::changes_since(&connection, repository, epoch, generation)
     }
 
+    pub fn cached_repository_snapshot(
+        &self,
+        repository: &Path,
+        tracker_epoch: u64,
+    ) -> Result<Option<BaselineSnapshot>> {
+        let connection = self.lock_metadata()?;
+        repository_layers::cached_snapshot(&connection, repository, tracker_epoch)
+    }
+
     pub fn metadata(
         &self,
         workspace: &WorkspaceHandle,

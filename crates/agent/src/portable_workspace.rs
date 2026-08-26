@@ -173,12 +173,17 @@ impl AgentWorkspace {
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
         recover_apply_journals(&core)?;
-        let baseline = capture_tracked_repository(repo_root, &core)?;
+        let (baseline, captured_snapshot_owns_chunks) =
+            capture_tracked_repository(repo_root, &core)?;
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
         let baseline_for_git = baseline.clone();
-        let handle = core.create_workspace(run_id, baseline)?;
+        let handle = if captured_snapshot_owns_chunks {
+            core.create_workspace(run_id, baseline)?
+        } else {
+            core.create_workspace_from_shared_baseline(run_id, &baseline)?
+        };
         let worktree = provider.workspace_path(run_id)?;
         if let Err(error) = wait_for_workspace(&worktree) {
             let _ = core.remove_workspace(handle);
@@ -409,7 +414,7 @@ impl AgentWorkspace {
 fn capture_tracked_repository(
     repository: &Path,
     core: &WorkspaceCore,
-) -> Result<BaselineSnapshot, WorkspaceError> {
+) -> Result<(BaselineSnapshot, bool), WorkspaceError> {
     let repository = fs::canonicalize(repository)?;
     core.request_repository_tracker(&repository)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -435,6 +440,24 @@ fn capture_tracked_repository(
         thread::sleep(Duration::from_millis(20));
     };
 
+    let fenced_generation = repository_tracker_fence(&repository, core, active.epoch)?;
+    if let Some(mut cached) = core.cached_repository_snapshot(&repository, active.epoch)? {
+        let cached_generation = cached.tracker_generation.ok_or_else(|| {
+            WorkspaceError::AdapterUnavailable("cached baseline has no tracker generation".into())
+        })?;
+        let changes =
+            core.repository_changes_since(&repository, active.epoch, cached_generation)?;
+        if changes.generation == fenced_generation
+            && changes
+                .paths
+                .iter()
+                .all(|path| path.starts_with(".git/greppy-tracker-fence-"))
+        {
+            cached.tracker_generation = Some(fenced_generation);
+            return Ok((cached, false));
+        }
+    }
+
     for attempt in 0..2 {
         let before = core
             .repository_tracker_status(&repository)?
@@ -458,7 +481,7 @@ fn capture_tracked_repository(
         {
             baseline.tracker_epoch = Some(after.epoch);
             baseline.tracker_generation = Some(after.generation);
-            return Ok(baseline);
+            return Ok((baseline, true));
         }
         release_snapshot(core.chunks(), baseline);
         if attempt == 1 {
@@ -468,6 +491,73 @@ fn capture_tracked_repository(
         }
     }
     unreachable!("two bounded snapshot attempts")
+}
+
+fn repository_tracker_fence(
+    repository: &Path,
+    core: &WorkspaceCore,
+    epoch: u64,
+) -> Result<u64, WorkspaceError> {
+    let git_dir = PathBuf::from(git_ok(
+        repository,
+        &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+    )?);
+    let name = format!(
+        "greppy-tracker-fence-{}-{}",
+        std::process::id(),
+        now_unix_ns()
+    );
+    let path = git_dir.join(&name);
+    let virtual_path = format!(".git/{name}");
+    let before = core.repository_tracker_status(repository)?.ok_or_else(|| {
+        WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+    })?;
+    if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
+        return Err(WorkspaceError::AdapterUnavailable(
+            "repository tracker changed before fence".into(),
+        ));
+    }
+    fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
+    let created = wait_for_tracker_path(repository, core, epoch, before.generation, &virtual_path);
+    let remove = fs::remove_file(&path);
+    let created = created?;
+    remove?;
+    wait_for_tracker_path(repository, core, epoch, created, &virtual_path)
+}
+
+fn wait_for_tracker_path(
+    repository: &Path,
+    core: &WorkspaceCore,
+    epoch: u64,
+    after_generation: u64,
+    expected_path: &str,
+) -> Result<u64, WorkspaceError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = core.repository_tracker_status(repository)?.ok_or_else(|| {
+            WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+        })?;
+        if status.state != RepositoryTrackerState::Active || status.epoch != epoch {
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker lost continuity during fence: {}",
+                status
+                    .detail
+                    .unwrap_or_else(|| "epoch/state changed".into())
+            )));
+        }
+        if status.generation > after_generation {
+            let changes = core.repository_changes_since(repository, epoch, after_generation)?;
+            if changes.paths.iter().any(|path| path == expected_path) {
+                return Ok(status.generation);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker fence timed out for {expected_path}"
+            )));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Apply a persisted proposal after its agent workspace has been cleaned up.
@@ -1619,7 +1709,7 @@ mod tests {
         AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
         PROVIDER_PROTOCOL_VERSION,
     };
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1693,7 +1783,7 @@ mod tests {
         let data = temp.path().join("provider-data");
         let mount = temp.path().join("provider-mount");
         publish_provider(&data, &mount);
-        let tracker_core = WorkspaceCore::open(data.join("core")).unwrap();
+        let tracker_core = Arc::new(WorkspaceCore::open(data.join("core")).unwrap());
         let tracked_repo = fs::canonicalize(&repo).unwrap();
         tracker_core
             .request_repository_tracker(&tracked_repo)
@@ -1701,6 +1791,48 @@ mod tests {
         tracker_core
             .activate_repository_tracker(&tracked_repo, 1)
             .unwrap();
+        let tracker_for_fence = tracker_core.clone();
+        let repo_for_fence = tracked_repo.clone();
+        let fence_emulator = std::thread::spawn(move || {
+            let git_dir = repo_for_fence.join(".git");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut observed = None::<String>;
+            loop {
+                let current = fs::read_dir(&git_dir)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .find(|name| name.starts_with("greppy-tracker-fence-"));
+                if observed.is_none() {
+                    if let Some(name) = current {
+                        let path = format!(".git/{name}");
+                        tracker_for_fence
+                            .record_repository_changes(
+                                &repo_for_fence,
+                                std::slice::from_ref(&path),
+                                2,
+                            )
+                            .unwrap();
+                        observed = Some(path);
+                    }
+                } else if let Some(observed_path) = observed.as_ref().filter(|_| current.is_none())
+                {
+                    tracker_for_fence
+                        .record_repository_changes(
+                            &repo_for_fence,
+                            std::slice::from_ref(observed_path),
+                            3,
+                        )
+                        .unwrap();
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fence emulator timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
         let worktree = mount.join("workspaces/test-run");
         fs::create_dir_all(&worktree).unwrap();
         fs::write(worktree.join(".gitignore"), "cache/\n").unwrap();
@@ -1710,6 +1842,7 @@ mod tests {
         let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
         std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
         let workspace = AgentWorkspace::create(&repo, "test-run").unwrap();
+        fence_emulator.join().unwrap();
         assert!(!workspace.linked_git_dir().join("index").exists());
         assert!(fs::metadata(workspace.git_index_path()).unwrap().len() <= 512 * 1024);
         assert!(fs::read_dir(workspace.git_index_path().parent().unwrap())

@@ -324,6 +324,31 @@ pub(crate) fn count_references(connection: &Connection) -> Result<Vec<Vec<ChunkI
     Ok(all)
 }
 
+pub(crate) fn cached_snapshot(
+    connection: &Connection,
+    repository: &Path,
+    tracker_epoch: u64,
+) -> Result<Option<BaselineSnapshot>> {
+    let repository = repository
+        .to_str()
+        .ok_or_else(|| Error::UnsupportedRepository("repository path is not valid UTF-8".into()))?;
+    let mut statement = connection.prepare(
+        "SELECT d.baseline_json
+         FROM cow_dirty_layers d
+         JOIN cow_repository_bases b ON b.id = d.base_id
+         WHERE b.repository = ?1
+         ORDER BY d.rowid DESC",
+    )?;
+    let rows = statement.query_map(params![repository], |row| row.get::<_, Vec<u8>>(0))?;
+    for row in rows {
+        let snapshot: BaselineSnapshot = serde_json::from_slice(&row?)?;
+        if snapshot.tracker_epoch == Some(tracker_epoch) && snapshot.tracker_generation.is_some() {
+            return Ok(Some(snapshot));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn remove_unreferenced(connection: &mut Connection, store: &ChunkStore) -> Result<()> {
     let unreferenced_dirty: Vec<String> = {
         let mut statement = connection.prepare(

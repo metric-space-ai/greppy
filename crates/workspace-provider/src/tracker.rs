@@ -26,7 +26,18 @@ fn supervise(core: Arc<WorkspaceCore>) {
         };
         for repository in requests {
             watchers.remove(&repository);
-            match build_watcher(core.clone(), &repository) {
+            let git_dir = match repository_git_dir(&repository) {
+                Ok(git_dir) => git_dir,
+                Err(error) => {
+                    let _ = core.mark_repository_tracker_gap(
+                        &repository,
+                        &format!("cannot resolve Git directory: {error}"),
+                        now_ms(),
+                    );
+                    continue;
+                }
+            };
+            match build_watcher(core.clone(), &repository, &git_dir) {
                 Ok(mut watcher) => {
                     if let Err(error) = watcher.watch(&repository, RecursiveMode::Recursive) {
                         let _ = core.mark_repository_tracker_gap(
@@ -35,6 +46,16 @@ fn supervise(core: Arc<WorkspaceCore>) {
                             now_ms(),
                         );
                         continue;
+                    }
+                    if !git_dir.starts_with(&repository) {
+                        if let Err(error) = watcher.watch(&git_dir, RecursiveMode::Recursive) {
+                            let _ = core.mark_repository_tracker_gap(
+                                &repository,
+                                &format!("cannot watch linked Git directory: {error}"),
+                                now_ms(),
+                            );
+                            continue;
+                        }
                     }
                     if core
                         .activate_repository_tracker(&repository, now_ms())
@@ -59,14 +80,16 @@ fn supervise(core: Arc<WorkspaceCore>) {
 fn build_watcher(
     core: Arc<WorkspaceCore>,
     repository: &Path,
+    git_dir: &Path,
 ) -> notify::Result<RecommendedWatcher> {
     let repository = repository.to_path_buf();
+    let git_dir = git_dir.to_path_buf();
     notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
         Ok(event) => {
             let paths = event
                 .paths
                 .iter()
-                .map(|path| relative_utf8(&repository, path))
+                .map(|path| relative_utf8(&repository, &git_dir, path))
                 .collect::<Result<Vec<_>, _>>();
             match paths {
                 Ok(paths) if !paths.is_empty() => {
@@ -102,14 +125,17 @@ fn build_watcher(
     })
 }
 
-fn relative_utf8(repository: &Path, path: &Path) -> Result<String, String> {
-    let relative = path.strip_prefix(repository).map_err(|_| {
-        format!(
-            "watcher path escaped repository: {} not under {}",
-            path.display(),
-            repository.display()
-        )
-    })?;
+fn relative_utf8(repository: &Path, git_dir: &Path, path: &Path) -> Result<String, String> {
+    let (prefix, relative) = if let Ok(relative) = path.strip_prefix(repository) {
+        ("", relative)
+    } else if let Ok(relative) = path.strip_prefix(git_dir) {
+        (".git/", relative)
+    } else {
+        return Err(format!(
+            "watcher path escaped repository roots: {}",
+            path.display()
+        ));
+    };
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
@@ -128,7 +154,26 @@ fn relative_utf8(repository: &Path, path: &Path) -> Result<String, String> {
     if parts.is_empty() {
         return Err("watcher reported the repository root without a child path".into());
     }
-    Ok(parts.join("/"))
+    Ok(format!("{prefix}{}", parts.join("/")))
+}
+
+fn repository_git_dir(repository: &Path) -> io::Result<PathBuf> {
+    let dot_git = repository.join(".git");
+    if dot_git.is_dir() {
+        return std::fs::canonicalize(dot_git);
+    }
+    let marker = std::fs::read_to_string(&dot_git)?;
+    let value = marker
+        .trim()
+        .strip_prefix("gitdir:")
+        .ok_or_else(|| io::Error::other(".git file has no gitdir marker"))?
+        .trim();
+    let path = PathBuf::from(value);
+    std::fs::canonicalize(if path.is_absolute() {
+        path
+    } else {
+        repository.join(path)
+    })
 }
 
 fn now_ms() -> u64 {
@@ -145,12 +190,13 @@ mod tests {
     #[test]
     fn path_normalization_is_relative_and_rejects_escape() {
         let root = Path::new("/tmp/repository");
+        let git_dir = Path::new("/tmp/repository/.git");
         assert_eq!(
-            relative_utf8(root, Path::new("/tmp/repository/src/lib.rs")).unwrap(),
+            relative_utf8(root, git_dir, Path::new("/tmp/repository/src/lib.rs")).unwrap(),
             "src/lib.rs"
         );
-        assert!(relative_utf8(root, Path::new("/tmp/other/file")).is_err());
-        assert!(relative_utf8(root, root).is_err());
+        assert!(relative_utf8(root, git_dir, Path::new("/tmp/other/file")).is_err());
+        assert!(relative_utf8(root, git_dir, root).is_err());
     }
 
     #[test]
@@ -159,9 +205,12 @@ mod tests {
         let repository_path = temp.path().join("repo");
         std::fs::create_dir(&repository_path).unwrap();
         let repository = std::fs::canonicalize(repository_path).unwrap();
+        let git_dir_path = repository.join(".git");
+        std::fs::create_dir(&git_dir_path).unwrap();
+        let git_dir = std::fs::canonicalize(git_dir_path).unwrap();
         let core = Arc::new(WorkspaceCore::open(temp.path().join("core")).unwrap());
         core.request_repository_tracker(&repository).unwrap();
-        let mut watcher = build_watcher(core.clone(), &repository).unwrap();
+        let mut watcher = build_watcher(core.clone(), &repository, &git_dir).unwrap();
         watcher
             .watch(&repository, RecursiveMode::Recursive)
             .unwrap();
