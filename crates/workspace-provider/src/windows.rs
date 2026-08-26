@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
+use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
 
 const EPERM: c_int = 1;
 const ENOENT: c_int = 2;
@@ -63,6 +64,7 @@ struct WindowsProvider {
 }
 
 pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
+    configure_winfsp_runtime()?;
     fs::create_dir_all(&data_root)?;
     fs::create_dir_all(&mount_root)?;
     let doctor_root = data_root.join("provider-doctor");
@@ -109,6 +111,26 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
             "WinFsp dispatcher exited with {result}"
         )))
     }
+}
+
+fn configure_winfsp_runtime() -> io::Result<()> {
+    let program_files = std::env::var_os("ProgramFiles(x86)")
+        .or_else(|| std::env::var_os("ProgramFiles"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Program Files is unavailable"))?;
+    let runtime = PathBuf::from(program_files).join("WinFsp").join("bin");
+    let library = runtime.join("winfsp-x64.dll");
+    if !library.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("WinFsp 2.1 runtime is unavailable at {}", library.display()),
+        ));
+    }
+    let mut wide: Vec<u16> = runtime.as_os_str().encode_wide().collect();
+    wide.push(0);
+    if unsafe { SetDllDirectoryW(wide.as_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 unsafe extern "C" {

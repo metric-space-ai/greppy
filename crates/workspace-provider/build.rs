@@ -24,4 +24,6 @@ fn main() {
         .compile("greppy_winfsp_bridge");
     println!("cargo:rustc-link-search=native={}", library.display());
     println!("cargo:rustc-link-lib=dylib=winfsp-x64");
+    println!("cargo:rustc-link-lib=delayimp");
+    println!("cargo:rustc-link-arg-bin=greppy-workspace-provider=/DELAYLOAD:winfsp-x64.dll");
 }
