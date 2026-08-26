@@ -675,6 +675,12 @@ impl ContentEngine {
                 Ok(json!({
                     "requests": delegate.requests.borrow().clone(),
                     "downloads": delegate.downloads.borrow().clone(),
+                    "file_paths": delegate
+                        .file_paths
+                        .borrow()
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
                 }))
             }
             other => Err(io::Error::new(

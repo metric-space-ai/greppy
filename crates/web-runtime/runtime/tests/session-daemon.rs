@@ -947,3 +947,47 @@ fn download_is_recorded_from_fulfilled_binary() {
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn file_chooser_accepts_set_input_files() {
+    let dir = std::env::temp_dir().join(format!("greppy-web-upload-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("sample.txt");
+    std::fs::write(&file, b"upload-bytes").unwrap();
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-file-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/file-chooser.mjs");
+    let source = std::fs::read_to_string(&script_path)
+        .unwrap()
+        .replace("FILE_PATH", &file.display().to_string());
+    let _guard = Supervisor::spawn(&socket, "run_file", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_file",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_file",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "inline",
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}

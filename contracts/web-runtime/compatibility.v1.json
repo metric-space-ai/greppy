@@ -903,11 +903,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "file-chooser"
+      ],
       "known_differences": [
-        "feeds FilePicker paths then clicks the locator"
+        "feeds FilePicker paths then clicks the locator",
+        "stores sandbox paths for FilePicker; DOM FileList may stay empty without a picker dialog"
       ]
     },
     {
