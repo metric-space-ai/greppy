@@ -191,7 +191,7 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     let stdout_times = spool_dir.join(format!("{token}.stdout.times"));
     let stderr_times = spool_dir.join(format!("{token}.stderr.times"));
 
-    let mut command = command_for_argv(argv);
+    let mut command = command_for_argv(argv)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -985,25 +985,68 @@ fn push_line_lift(lifts: &mut Vec<LiftedLine>, lines: &[RawLine<'_>], line: Opti
     });
 }
 
-fn command_for_argv(argv: &[String]) -> std::process::Command {
+fn command_for_argv(argv: &[String]) -> Result<std::process::Command> {
     if argv.len() == 1 {
         #[cfg(windows)]
         {
+            if argv[0].contains('|') {
+                return Err(Error::Invalid(
+                    "bash-smart refuses pipeline scripts on Windows because cmd.exe has no pipefail contract; pass an argv command without a pipeline"
+                        .into(),
+                ));
+            }
             let mut command = std::process::Command::new("cmd");
             command.arg("/C").arg(&argv[0]);
-            command
+            return Ok(command);
         }
         #[cfg(not(windows))]
         {
-            let mut command = std::process::Command::new("sh");
-            command.arg("-c").arg(&argv[0]);
-            command
+            let mut command = std::process::Command::new("bash");
+            command.args(["-o", "pipefail", "-c"]).arg(&argv[0]);
+            return Ok(command);
         }
-    } else {
-        let mut command = std::process::Command::new(&argv[0]);
-        command.args(&argv[1..]);
-        command
     }
+
+    let assignment_count = argv
+        .iter()
+        .take_while(|arg| env_assignment(arg).is_some())
+        .count();
+    let command_argv = &argv[assignment_count..];
+    if command_argv.is_empty() {
+        return Err(Error::Invalid(
+            "bash-smart requires a command after environment assignments".into(),
+        ));
+    }
+    if command_argv[0] == "cd" || command_argv.iter().any(|arg| is_shell_operator(arg)) {
+        return Err(Error::Invalid(
+            "bash-smart received unquoted shell syntax; pass the complete shell expression as one quoted argument, for example `greppy bash-smart -- \"cd DIR && COMMAND\"`"
+                .into(),
+        ));
+    }
+
+    let mut command = std::process::Command::new(&command_argv[0]);
+    command.args(&command_argv[1..]);
+    for assignment in &argv[..assignment_count] {
+        let (name, value) = env_assignment(assignment).expect("counted assignment");
+        command.env(name, value);
+    }
+    Ok(command)
+}
+
+fn env_assignment(arg: &str) -> Option<(&str, &str)> {
+    let (name, value) = arg.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some((name, value))
+}
+
+fn is_shell_operator(arg: &str) -> bool {
+    matches!(arg, "&&" | "||" | "|" | ";" | "<" | ">" | ">>") || arg.starts_with("2>")
 }
 
 #[cfg(unix)]

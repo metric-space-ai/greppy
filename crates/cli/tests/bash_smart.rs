@@ -114,6 +114,62 @@ fn child_flags_after_delimiter_pass_through_unchanged() {
 }
 
 #[test]
+fn leading_environment_assignments_are_applied_to_the_child() {
+    let workspace = fresh_workspace("leading-assignment");
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "GREPPY_BASH_SMART_ASSIGNMENT=works",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"$GREPPY_BASH_SMART_ASSIGNMENT\"",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"ok \xe2\x80\x94 exit 0\nworks\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn unquoted_shell_syntax_is_rejected_with_actionable_guidance() {
+    let workspace = fresh_workspace("unquoted-shell");
+    let output = run(
+        &workspace,
+        &["bash-smart", "--", "cd", "repo", "&&", "printf", "ok"],
+    );
+    let stderr = text(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(
+        stderr.contains("received unquoted shell syntax"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("complete shell expression"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn quoted_pipeline_uses_pipefail_exit_status() {
+    let workspace = fresh_workspace("pipeline-pipefail");
+    let output = run(
+        &workspace,
+        &["bash-smart", "--", "sh -c 'exit 9' | tail -n 1"],
+    );
+
+    assert_eq!(output.status.code(), Some(9));
+    assert!(
+        output.stdout.starts_with(b"FAILED \xe2\x80\x94 exit 9"),
+        "stdout={}",
+        text(&output.stdout)
+    );
+}
+
+#[test]
 fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
     let workspace = fresh_workspace("long");
     let output = run(

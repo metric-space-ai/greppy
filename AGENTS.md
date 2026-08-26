@@ -133,12 +133,16 @@ EDIT:
                              reports the diagnostics against symbols and spans
 
 RUN:
-  bash-smart [-e REGEX] -- CMD …   runs CMD unchanged, same exit code. Line 1 is
-                             the verdict: `ok — exit 0` or `ok — exit 0,
-                             3 warnings` or `FAILED — exit 101: 2 errors,
-                             1 warning`. Then each error and warning block and
-                             every REGEX match as `LINE  content`; the rest
-                             compacted, any part of the original printable.
+  bash-smart [-e REGEX] -- CMD …   runs argv directly with the same exit code;
+                             leading `VAR=value` tokens become child environment
+                             assignments. Pass shell builtins/operators as one
+                             quoted expression. Unix expressions use Bash with
+                             pipefail; Windows refuses pipelines because cmd.exe
+                             cannot provide that status contract. Line 1 is the
+                             verdict: `ok — exit 0` or `ok — exit 0, 3 warnings`
+                             or `FAILED — exit 101: 2 errors, 1 warning`. Then
+                             each error/warning block and every REGEX match is
+                             shown; the rest is compacted and expandable.
 
 INDEX:
   index [PATH]                      rebuilds the graph and meaning index for PATH; run it when

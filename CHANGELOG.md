@@ -39,7 +39,21 @@ manifest, or publication failure aborts `index --agent-worktree` and `greppy
 Store and returning success. Summary inference deterministically bounds very
 large individual source spans while retaining the complete span for cache
 identity and Base-completeness checks. The regression fixture is the exact
-30,716-byte EODAG JSON input that exposed the CUDA prewarm failure.
+30,716-byte EODAG JSON input that exposed the CUDA prewarm failure. Explicit
+`--device` and `--no-gpu` selections are preserved by the internal immutable
+Base build instead of being silently replaced by automatic device selection.
+
+`bash-smart` now applies leading `VAR=value` tokens to direct argv commands,
+rejects unquoted shell syntax with an actionable quoted-command example, and
+uses Bash pipefail for quoted Unix pipelines so a failed producer cannot be
+masked by a successful `tail` or `grep`. Windows pipeline scripts are rejected
+until an equivalent fail-closed status contract exists.
+
+The Windows conformance gate remains fail-closed: official unchanged WinFsp
+2.1 does not implement hard links, while the 0.3.4 workspace contract requires
+them. No Windows release is eligible until the provider substrate satisfies
+the same hard-link semantics as Linux and macOS; the test is neither skipped
+nor emulated with a full file copy.
 
 ## [0.3.3] — 2026-08-25
 
