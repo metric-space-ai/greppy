@@ -1023,6 +1023,7 @@ class Page {
       headerValue: (name) => headers[String(name).toLowerCase()] || null,
       body: async () => bytes(),
       text: async () => decodeUtf8(bytes()),
+      json: async () => JSON.parse(decodeUtf8(bytes())),
       request: () =>
         request || this._requestFromRecord({ url: rec.url, method: "GET" }),
     };

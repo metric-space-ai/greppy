@@ -49,6 +49,17 @@ const text = await page.locator("#x").innerText();
 if (text.trim() !== "intercepted-ok") {
   throw new Error("expected intercepted-ok, got " + JSON.stringify(text));
 }
+await page.route("**/data.json", (route) =>
+  route.fulfill({
+    body: "{\"k\":1}",
+    contentType: "application/json",
+    status: 200,
+  }),
+);
+await page.goto(fixtureUrl + "data.json");
+const jsonResp = await page.waitForResponse("data.json");
+const data = await jsonResp.json();
+if (!data || data.k !== 1) throw new Error("json " + JSON.stringify(data));
 const recorded = await page.requests();
 if (!recorded.length) throw new Error("page.requests empty");
 await page.unroute("**/intercepted");

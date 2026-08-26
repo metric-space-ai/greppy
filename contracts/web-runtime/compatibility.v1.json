@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 209,
+    "implemented": 210,
     "unsupported": 281,
-    "unverified": 864
+    "unverified": 863
   },
   "entries": [
     {
@@ -2366,11 +2366,13 @@
       "kind": "method",
       "origin": "parser",
       "schema": "implemented",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
+      "tests": [
+        "extra-selectors"
+      ],
       "known_differences": [
-        "delegates to frame.locator().check"
+        "main-frame delegates to Page.locator().check; child frames are not in-document locators"
       ]
     },
     {
@@ -2748,7 +2750,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "mouse-init-viewport"
       ],
       "known_differences": [
         "main-frame returns a page locator; iframe ids wrap the iframe element, not its contentDocument"
@@ -9943,11 +9946,16 @@
       "symbol": "Response.json",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "JSON.parse of intercept body bytes after UTF-8 decode; only route.fulfill",
+        "not Chromium-oracle compared; not marked behavior passing"
+      ]
     },
     {
       "symbol": "Response.ok",

@@ -7,6 +7,7 @@ await page.setContent(`<!DOCTYPE html><html><body>
 <input id="q" placeholder="search">
 <img alt="logo" title="brand" data-testid="hero" width="10" height="10">
 <button id="b">Go</button>
+<input type="checkbox" id="c">
 <p id="t">idle</p>
 </body></html>`);
 if ((await page.getByPlaceholder("search").count()) !== 1) throw new Error("placeholder");
@@ -43,4 +44,11 @@ await page.evaluate(() => {
 });
 const injected = await page.waitForFunction(() => window.__greppy === 1);
 if (!injected) throw new Error("waitForFunction");
+const main = page.mainFrame();
+await main.fill("#q", "frame-fill");
+if ((await main.inputValue("#q")) !== "frame-fill") throw new Error("frame fill");
+if ((await main.locator("#q").count()) !== 1) throw new Error("frame locator");
+await main.click("#b");
+await main.check("#c");
+if (!(await page.isChecked("#c"))) throw new Error("frame check");
 await browser.close();
