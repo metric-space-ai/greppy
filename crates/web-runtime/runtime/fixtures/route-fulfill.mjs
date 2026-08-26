@@ -24,5 +24,5 @@ try {
   still = false;
 }
 if (still) throw new Error("unroute did not stop fulfill");
-if (page.opener() !== null) throw new Error("opener");
+if ((await page.opener()) !== null) throw new Error("opener");
 await browser.close();

@@ -1754,3 +1754,8 @@ fn file_chooser_wait_for_event_sets_dom_files() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+#[test]
+fn popup_opener_returns_creating_page() {
+    run_named_fixture("popup-opener.mjs", "run_opener");
+}

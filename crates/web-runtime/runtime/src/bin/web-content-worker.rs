@@ -53,7 +53,8 @@ struct Delegate {
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
     downloads: RefCell<Vec<serde_json::Value>>,
-    popups: RefCell<Vec<WebView>>,
+    popups: RefCell<Vec<(WebView, WebView)>>,
+    opener_id: RefCell<Option<String>>,
     last_dialogs: RefCell<Vec<serde_json::Value>>,
     dialog_action: RefCell<DialogAction>,
     prompt_text: RefCell<Option<String>>,
@@ -82,6 +83,7 @@ impl Delegate {
             extra_headers: RefCell::new(Vec::new()),
             last_console: RefCell::new(Vec::new()),
             last_file_choosers: RefCell::new(Vec::new()),
+            opener_id: RefCell::new(None),
             rendering_context,
         }
     }
@@ -109,13 +111,13 @@ impl WebViewDelegate for Delegate {
         }));
     }
 
-    fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
+    fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
         let child = request
             .builder(Rc::clone(&self.rendering_context))
             .delegate(Rc::new(Delegate::new(Rc::clone(&self.rendering_context))))
             .build();
         child.show();
-        self.popups.borrow_mut().push(child);
+        self.popups.borrow_mut().push((child, parent));
     }
 
     fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
@@ -1104,18 +1106,36 @@ impl ContentEngine {
             }
             "page.popups" => {
                 let page_id = required_str(&params, "page")?;
-                let taken: Vec<WebView> = {
+                let taken: Vec<(WebView, WebView)> = {
                     let delegate = &self.page(&page_id)?.1;
                     delegate.popups.borrow_mut().drain(..).collect()
                 };
-                let mut ids = Vec::new();
-                for webview in taken {
+                let mut pages = Vec::new();
+                for (webview, parent) in taken {
+                    let opener = self
+                        .pages
+                        .iter()
+                        .find_map(|(id, (existing, _))| {
+                            if existing == &parent {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| page_id.clone());
                     let id = self.alloc_id("page");
                     let delegate = Rc::new(Delegate::new(Rc::clone(&self.rendering_context)));
+                    delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(id.clone(), (webview, delegate));
-                    ids.push(id);
+                    pages.push(json!({ "page": id, "opener": opener }));
                 }
-                Ok(json!({ "pages": ids }))
+                Ok(json!({ "pages": pages }))
+            }
+            "page.opener" => {
+                let page_id = required_str(&params, "page")?;
+                Ok(json!({
+                    "page": self.page(&page_id)?.1.opener_id.borrow().clone()
+                }))
             }
             "page.frames" => {
                 let page_id = required_str(&params, "page")?;

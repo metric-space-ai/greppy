@@ -136,6 +136,7 @@ class Locator {
       page: this._page._id,
       selector: this._selector,
     });
+    await this._page._flushPopups();
   }
 
   async fill(value, options) {
@@ -595,6 +596,9 @@ class Page {
     this._context = null;
     this._handlers = {};
     this._consoleSeen = 0;
+    this._popupWaiters = [];
+    this._pendingPopups = [];
+    this._openerId = null;
     this.mouse = {
       click: async (x, y) => {
         await engineCall("page.mouse.click", { page: this._id, x, y });
@@ -842,6 +846,7 @@ class Page {
       return unsupported("Page.goto.options")();
     }
     const result = await engineCall("page.goto", { page: this._id, url });
+    await this._flushPopups();
     await this._dispatchNetwork();
     return result;
   }
@@ -894,6 +899,7 @@ class Page {
       page: this._id,
       source: serializeEvaluate(pageFunction, arg),
     });
+    await this._flushPopups();
     await this._dispatchConsole();
     return result.value;
   }
@@ -909,6 +915,49 @@ class Page {
       });
     }
     this._consoleSeen = messages.length;
+  }
+
+  _adoptPopup(rec) {
+    const id = typeof rec === "string" ? rec : rec.page;
+    const openerId = typeof rec === "string" ? this._id : rec.opener || this._id;
+    let page = null;
+    if (this._context && this._context._pages) {
+      page = this._context._pages.find((item) => item._id === id) || null;
+    }
+    if (!page) {
+      page = new Page(id);
+      page._context = this._context;
+      if (this._context) {
+        this._context._pages = this._context._pages || [];
+        this._context._pages.push(page);
+      }
+    }
+    page._openerId = openerId;
+    return page;
+  }
+
+  async _flushPopups() {
+    const result = await engineCall("page.popups", { page: this._id });
+    const recs = result.pages || [];
+    for (const rec of recs) {
+      const popup = this._adoptPopup(rec);
+      const waiter = this._popupWaiters.shift();
+      if (waiter) {
+        waiter(popup);
+      } else {
+        this._pendingPopups.push(popup);
+      }
+      this._emit("popup", popup);
+    }
+  }
+
+  _waitForPopup() {
+    if (this._pendingPopups.length) {
+      return Promise.resolve(this._pendingPopups.shift());
+    }
+    return new Promise((resolve) => {
+      this._popupWaiters.push(resolve);
+    });
   }
 
   async url() {
@@ -1015,12 +1064,7 @@ class Page {
       return new FileChooser(this, rec);
     }
     if (event === "popup" || event === "page") {
-      const result = await engineCall("page.popups", { page: this._id });
-      const id = (result.pages || [])[0];
-      if (!id) {
-        return null;
-      }
-      return new Page(id);
+      return this._waitForPopup();
     }
     if (event === "download") {
       const result = await engineCall("page.downloads", { page: this._id });
@@ -1120,8 +1164,25 @@ class Page {
     return (result.requests || []).map((rec) => this._requestFromRecord(rec));
   }
 
-  opener() {
-    return null;
+  async opener() {
+    if (this._openerId) {
+      if (this._context && this._context._pages) {
+        const found = this._context._pages.find((page) => page._id === this._openerId);
+        if (found) return found;
+      }
+      const page = new Page(this._openerId);
+      page._context = this._context;
+      return page;
+    }
+    const result = await engineCall("page.opener", { page: this._id });
+    if (!result.page) return null;
+    if (this._context && this._context._pages) {
+      const found = this._context._pages.find((page) => page._id === result.page);
+      if (found) return found;
+    }
+    const page = new Page(result.page);
+    page._context = this._context;
+    return page;
   }
 
   async unroute(url) {

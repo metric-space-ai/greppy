@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 194,
+    "implemented": 192,
     "unsupported": 277,
-    "unverified": 883
+    "unverified": 885
   },
   "entries": [
     {
@@ -164,14 +164,13 @@
       "symbol": "Page.clearConsoleMessages",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
+      "schema": "unverified",
+      "source": "unverified",
       "behavior": "unverified",
-      "tests": [
-        "console-messages"
-      ],
+      "tests": [],
       "known_differences": [
-        "clears Servo show_console_message records"
+        "clears Servo show_console_message records",
+        "Greppy convenience; not counted as Playwright compatibility."
       ]
     },
     {
@@ -832,10 +831,13 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "route-fulfill"
+        "popup-opener"
       ],
       "known_differences": [
-        "always null; popup opener is not wired"
+        "always null; popup opener is not wired",
+        "async; returns the Page that caused request_create_new (window.open / target=_blank)",
+        "top-level pages return null",
+        "identity is the creating Page object when both live in the same BrowserContext"
       ]
     },
     {
@@ -977,14 +979,13 @@
       "symbol": "Page.requests",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "passing",
+      "schema": "unverified",
+      "source": "unverified",
       "behavior": "unverified",
-      "tests": [
-        "route-fulfill"
-      ],
+      "tests": [],
       "known_differences": [
-        "returns recorded WebResourceRequest objects, not Playwright Request events"
+        "returns recorded WebResourceRequest objects, not Playwright Request events",
+        "Greppy convenience dump of recorded WebResourceRequests, not a Playwright Page.requests compatibility claim."
       ]
     },
     {
