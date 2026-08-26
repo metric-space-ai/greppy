@@ -74,6 +74,18 @@ class Locator {
     });
     return result.text;
   }
+
+  async textContent() {
+    return this.innerText();
+  }
+
+  async count() {
+    const result = await engineCall("locator.count", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    return result.count;
+  }
 }
 
 class Page {
@@ -110,6 +122,31 @@ class Page {
       page: this._id,
       source: serializeEvaluate(pageFunction, arg),
     }).then((result) => result.value);
+  }
+
+  async url() {
+    const result = await engineCall("page.url", { page: this._id });
+    return result.url;
+  }
+
+  async title() {
+    const result = await engineCall("page.title", { page: this._id });
+    return result.title;
+  }
+
+  async content() {
+    const result = await engineCall("page.content", { page: this._id });
+    return result.html;
+  }
+
+  async screenshot(options) {
+    if (options != null) {
+      return unsupported("Page.screenshot.options")();
+    }
+    const result = await engineCall("page.screenshot", { page: this._id });
+    const binary = result.png_base64 || "";
+    const bytes = Uint8Array.from(atob(binary), (c) => c.charCodeAt(0));
+    return bytes.buffer;
   }
 }
 

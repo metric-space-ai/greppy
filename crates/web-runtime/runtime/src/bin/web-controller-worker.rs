@@ -204,7 +204,19 @@ fn run(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
         })?;
 
     loop {
-        match recv_control(&control_rx)? {
+        let message = match recv_control(&control_rx) {
+            Ok(message) => message,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        match message {
             Message::Shutdown { .. } => {
                 drop(runtime);
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());

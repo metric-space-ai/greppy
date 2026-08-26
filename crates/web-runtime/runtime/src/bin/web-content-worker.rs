@@ -57,10 +57,12 @@ struct ContentEngine {
     rendering_context: Rc<dyn RenderingContext>,
     pages: HashMap<String, (WebView, Rc<Delegate>)>,
     next_id: u64,
+    parent_alive: Arc<AtomicBool>,
+    wake: Arc<AtomicBool>,
 }
 
 impl ContentEngine {
-    fn new() -> io::Result<Self> {
+    fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
                 width: 800,
@@ -75,16 +77,30 @@ impl ContentEngine {
         let mut preferences = Preferences::default();
         preferences.network_http_proxy_uri = String::new();
         preferences.network_https_proxy_uri = String::new();
+        let wake = Arc::new(AtomicBool::new(true));
         let servo = ServoBuilder::default()
             .preferences(preferences)
-            .event_loop_waker(Box::new(WakeFlag(Arc::new(AtomicBool::new(false)))))
+            .event_loop_waker(Box::new(WakeFlag(Arc::clone(&wake))))
             .build();
         Ok(Self {
             servo,
             rendering_context,
             pages: HashMap::new(),
             next_id: 1,
+            parent_alive,
+            wake,
         })
+    }
+
+    fn parent_dead(&self) -> bool {
+        !self.parent_alive.load(Ordering::Relaxed)
+    }
+
+    fn parent_gone() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "supervisor closed content worker stdin",
+        )
     }
 
     fn alloc_id(&mut self, prefix: &str) -> String {
@@ -93,16 +109,23 @@ impl ContentEngine {
         id
     }
 
-    fn spin_until(&self, timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    fn spin_until(
+        &self,
+        timeout: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            if self.parent_dead() {
+                return Err(Self::parent_gone());
+            }
             if predicate() {
-                return true;
+                return Ok(true);
             }
             self.servo.spin_event_loop();
             thread::sleep(Duration::from_millis(1));
         }
-        predicate()
+        Ok(predicate())
     }
 
     fn page(&self, page_id: &str) -> io::Result<&(WebView, Rc<Delegate>)> {
@@ -118,7 +141,7 @@ impl ContentEngine {
             *callback_slot.borrow_mut() = Some(result);
         });
         let ready = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some()) {
+        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some())? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out evaluating page JavaScript",
@@ -147,7 +170,12 @@ impl ContentEngine {
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                self.spin_until(ACTION_TIMEOUT, move || created.url().is_some());
+                if !self.spin_until(ACTION_TIMEOUT, move || created.url().is_some())? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out creating page",
+                    ));
+                }
                 self.pages.insert(page.clone(), (webview, delegate));
                 Ok(json!({ "page": page }))
             }
@@ -164,8 +192,8 @@ impl ContentEngine {
                     loading.load_status() == LoadStatus::Complete
                         && loading
                             .url()
-                            .is_some_and(|current| current.as_str() == expected.as_str())
-                }) {
+                            .is_some_and(|current| urls_match(&current, &expected))
+                })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -177,7 +205,11 @@ impl ContentEngine {
                 }
                 webview.paint();
                 self.servo.spin_event_loop();
-                Ok(json!({ "url": url.as_str() }))
+                thread::sleep(Duration::from_millis(20));
+                self.servo.spin_event_loop();
+                Ok(
+                    json!({ "url": webview.url().map(|u| u.to_string()).unwrap_or_else(|| url.to_string()) }),
+                )
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -239,6 +271,66 @@ impl ContentEngine {
                 self.pages.clear();
                 Ok(json!({}))
             }
+            "page.close" => {
+                let page_id = required_str(&params, "page")?;
+                self.pages.remove(&page_id);
+                Ok(json!({}))
+            }
+            "session.ensurePage" => self.handle("context.newPage", params),
+            "page.url" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                Ok(json!({
+                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
+                }))
+            }
+            "page.title" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                match self.evaluate(webview, "document.title")? {
+                    JSValue::String(title) => Ok(json!({ "title": title })),
+                    other => Ok(json!({ "title": format!("{other:?}") })),
+                }
+            }
+            "page.content" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                match self.evaluate(webview, "document.documentElement.outerHTML")? {
+                    JSValue::String(html) => Ok(json!({ "html": html })),
+                    other => Err(io::Error::other(format!("content returned {other:?}"))),
+                }
+            }
+            "page.observe" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                match self.evaluate(webview, OBSERVE_JS)? {
+                    JSValue::String(text) => serde_json::from_str(&text)
+                        .map_err(|error| io::Error::other(format!("observe json: {error}"))),
+                    JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
+                    other => Err(io::Error::other(format!("observe returned {other:?}"))),
+                }
+            }
+            "page.screenshot" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let png = self.screenshot_png(&webview)?;
+                Ok(json!({ "png_base64": base64_encode(&png) }))
+            }
+            "locator.count" => {
+                let page_id = required_str(&params, "page")?;
+                let selector = params
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let (webview, _) = self.page(&page_id)?.clone();
+                let script = format!(
+                    "(function(selector) {{ {SELECTOR_RUNTIME} return greppyResolveNodes(selector).length; }})({selector})"
+                );
+                match self.evaluate(webview, &script)? {
+                    JSValue::Number(count) => Ok(json!({ "count": count as u64 })),
+                    other => Err(io::Error::other(format!("count returned {other:?}"))),
+                }
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported_playwright_operation: {other}"),
@@ -257,6 +349,9 @@ impl ContentEngine {
         let deadline = Instant::now() + ACTION_TIMEOUT;
         let mut last;
         loop {
+            if self.parent_dead() {
+                return Err(Self::parent_gone());
+            }
             match self.evaluate(webview.clone(), &script)? {
                 JSValue::Object(values) => {
                     let count = number_field(&values, "count")? as usize;
@@ -300,6 +395,46 @@ impl ContentEngine {
             self.servo.spin_event_loop();
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn screenshot_png(&self, webview: &WebView) -> io::Result<Vec<u8>> {
+        let saved = Rc::new(RefCell::new(None));
+        let callback = Rc::clone(&saved);
+        webview.take_screenshot(None, move |result| {
+            *callback.borrow_mut() = Some(result);
+        });
+        let deadline = Instant::now() + ACTION_TIMEOUT;
+        while saved.borrow().is_none() {
+            if self.parent_dead() {
+                return Err(Self::parent_gone());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out capturing screenshot",
+                ));
+            }
+            self.servo.spin_event_loop();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let image = saved
+            .borrow_mut()
+            .take()
+            .expect("screenshot completed")
+            .map_err(|error| io::Error::other(format!("screenshot failed: {error:?}")))?;
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, image.width(), image.height());
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|error| io::Error::other(format!("png header: {error}")))?;
+            writer
+                .write_image_data(image.as_raw())
+                .map_err(|error| io::Error::other(format!("png data: {error}")))?;
+        }
+        Ok(out)
     }
 }
 
@@ -422,6 +557,13 @@ fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
     )));
 }
 
+fn urls_match(current: &Url, expected: &Url) -> bool {
+    current.scheme() == expected.scheme()
+        && current.host() == expected.host()
+        && current.port_or_known_default() == expected.port_or_known_default()
+        && current.path().trim_end_matches('/') == expected.path().trim_end_matches('/')
+}
+
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {
     params
         .get(key)
@@ -477,9 +619,53 @@ fn jsvalue_to_json(value: JSValue) -> serde_json::Value {
     }
 }
 
+const OBSERVE_JS: &str = r#"JSON.stringify({
+  url: location.href,
+  title: document.title,
+  text: ((document.body && document.body.innerText) || '').slice(0, 8000),
+  headings: Array.from(document.querySelectorAll('h1,h2,h3,h4')).map(function(h) {
+    return (h.innerText || '').trim();
+  }).filter(Boolean).slice(0, 20),
+  links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(function(a) {
+    return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
+  })
+})"#;
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = chunk.get(1).copied().unwrap_or(0) as u32;
+        let c = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (a << 16) | (b << 8) | c;
+        out.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn is_parent_eof(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+    )
+}
+
 fn main() -> io::Result<()> {
     let _capability = require_capability(std::env::args_os().skip(1))?;
-    let mut engine = ContentEngine::new()?;
+    let parent_alive = Arc::new(AtomicBool::new(true));
+    let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     match read_message(&mut stdin)? {
@@ -498,6 +684,7 @@ fn main() -> io::Result<()> {
     write_message(&mut io::stdout(), &Message::ready(WorkerKind::Content))?;
 
     let (tx, rx) = mpsc::channel();
+    let parent_for_reader = Arc::clone(&parent_alive);
     thread::Builder::new()
         .name("web-content-protocol-reader".to_owned())
         .spawn(move || {
@@ -510,6 +697,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                     Err(error) => {
+                        parent_for_reader.store(false, Ordering::Relaxed);
                         let _ = tx.send(Err(error));
                         return;
                     }
@@ -524,8 +712,21 @@ fn main() -> io::Result<()> {
         })?;
 
     loop {
-        engine.servo.spin_event_loop();
-        match rx.recv_timeout(Duration::from_millis(5)) {
+        if engine.parent_dead() {
+            return Ok(());
+        }
+        // Servo asked to be pumped, or a live document needs a modest idle
+        // tick. Never spin the compositor while the protocol is idle and no
+        // pages exist — that kept CPU at 100% after the supervisor died.
+        if engine.wake.swap(false, Ordering::Relaxed) {
+            engine.servo.spin_event_loop();
+        }
+        let wait = if engine.pages.is_empty() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_millis(10)
+        };
+        match rx.recv_timeout(wait) {
             Ok(Ok(Message::EngineCall {
                 request_id,
                 method,
@@ -541,6 +742,7 @@ fn main() -> io::Result<()> {
                         Some(error.to_string()),
                     ),
                 };
+                engine.wake.store(true, Ordering::Relaxed);
                 write_message(&mut io::stdout(), &reply)?;
             }
             Ok(Ok(Message::Shutdown { .. })) => {
@@ -557,14 +759,14 @@ fn main() -> io::Result<()> {
                     format!("content worker received {unexpected:?}"),
                 ));
             }
+            Ok(Err(error)) if is_parent_eof(&error) => return Ok(()),
             Ok(Err(error)) => return Err(error),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "content protocol reader stopped",
-                ));
+            Err(RecvTimeoutError::Timeout) => {
+                if !engine.pages.is_empty() {
+                    engine.servo.spin_event_loop();
+                }
             }
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 }

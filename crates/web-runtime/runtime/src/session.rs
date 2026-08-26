@@ -1,5 +1,7 @@
 //! Run-owned session state machine (guide §6.3).
 
+use crate::limits::SessionLimits;
+use crate::policy::NetworkProfile;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,16 +21,30 @@ pub struct Session {
     pub state: SessionState,
     pub operation_id: Option<String>,
     pub last_heartbeat: Instant,
+    pub profile: NetworkProfile,
+    pub limits: SessionLimits,
+    pub page_id: Option<String>,
+    pub pages: u32,
+    pub network_bytes: u64,
+    pub artifact_bytes: u64,
+    pub started: Instant,
 }
 
 impl Session {
-    pub fn new(id: impl Into<String>, run_id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>, run_id: impl Into<String>, profile: NetworkProfile) -> Self {
         Self {
             id: id.into(),
             run_id: run_id.into(),
             state: SessionState::Creating,
             operation_id: None,
             last_heartbeat: Instant::now(),
+            profile,
+            limits: SessionLimits::for_profile(profile.as_str()),
+            page_id: None,
+            pages: 0,
+            network_bytes: 0,
+            artifact_bytes: 0,
+            started: Instant::now(),
         }
     }
 
@@ -73,7 +89,7 @@ mod tests {
 
     #[test]
     fn ready_busy_ready_close() {
-        let mut session = Session::new("wrs_1", "run");
+        let mut session = Session::new("wrs_1", "run", crate::policy::NetworkProfile::Project);
         session.transition(SessionState::Ready).unwrap();
         session.begin_operation("wrq_1").unwrap();
         assert_eq!(session.operation_id.as_deref(), Some("wrq_1"));
@@ -85,7 +101,7 @@ mod tests {
 
     #[test]
     fn rejects_closed_to_ready() {
-        let mut session = Session::new("wrs_1", "run");
+        let mut session = Session::new("wrs_1", "run", crate::policy::NetworkProfile::Project);
         session.transition(SessionState::Ready).unwrap();
         session.transition(SessionState::Closing).unwrap();
         session.transition(SessionState::Closed).unwrap();

@@ -389,6 +389,23 @@ impl WorkerProcess {
         Ok(())
     }
 
+    pub(crate) fn recv(&mut self, timeout: Duration) -> io::Result<Message> {
+        match self.messages.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {timeout:?} waiting for {:?} worker message",
+                    self.worker
+                ),
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("{:?} worker protocol reader stopped", self.worker),
+            )),
+        }
+    }
+
     pub(crate) fn send(&mut self, message: &Message) -> io::Result<()> {
         let input = self.input.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin is already closed")

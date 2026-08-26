@@ -1,15 +1,19 @@
 //! Unix-socket client/supervisor daemon (guide §6.3, §9).
 
+use crate::artifacts::ArtifactStore;
+use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
 use crate::session::{Session, SessionState};
 use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
     new_session_id, serve_connection, ErrorObject, Handshake, Request, Response, SCHEMA,
 };
+use serde_json::json;
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct DaemonConfig {
@@ -38,9 +42,12 @@ struct Daemon {
     socket: PathBuf,
     run_id: String,
     fixture_url: String,
+    search_endpoint: Option<String>,
+    store: ArtifactStore,
     controller: WorkerProcess,
     content: WorkerProcess,
     sessions: HashMap<String, Session>,
+    next_engine_id: AtomicU64,
 }
 
 impl Daemon {
@@ -54,13 +61,17 @@ impl Daemon {
         let mut content =
             WorkerProcess::spawn(&config.content_worker, WorkerKind::Content, random_token()?)?;
         content.handshake()?;
+        let data_root = data_root(&config.run_id);
         Ok(Self {
             socket: config.socket,
-            run_id: config.run_id,
+            run_id: config.run_id.clone(),
             fixture_url: config.fixture_url.unwrap_or_default(),
+            search_endpoint: std::env::var("GREPPY_WEB_SEARCH_ENDPOINT").ok(),
+            store: ArtifactStore::new(data_root)?,
             controller,
             content,
             sessions: HashMap::new(),
+            next_engine_id: AtomicU64::new(1),
         })
     }
 
@@ -95,6 +106,12 @@ impl Daemon {
             "web.session.list" => self.session_list(&request),
             "web.session.close" => self.session_close(&request),
             "web.run" => self.web_run(&request),
+            "web.observe" => self.web_observe(&request),
+            "web.screenshot" => self.web_screenshot(&request),
+            "web.read" => self.web_read(&request),
+            "web.search" => self.web_search(&request),
+            "web.research" => self.web_research(&request),
+            "web.artifacts" => self.web_artifacts(&request),
             other => Response::error(
                 &request,
                 ErrorObject::new(
@@ -127,6 +144,12 @@ impl Daemon {
                 "chromium.launch".into(),
                 "session".into(),
                 "web.run".into(),
+                "web.observe".into(),
+                "web.screenshot".into(),
+                "web.read".into(),
+                "web.search".into(),
+                "web.research".into(),
+                "web.artifacts".into(),
             ],
             compatibility_coverage_level: "unverified".to_owned(),
             max_message_bytes: greppy_web_client::MAX_FRAME_BYTES as u64,
@@ -167,8 +190,9 @@ impl Daemon {
                 ),
             );
         }
+        let parsed = NetworkProfile::parse(profile).expect("validated");
         let id = new_session_id();
-        let mut session = Session::new(&id, &self.run_id);
+        let mut session = Session::new(&id, &self.run_id, parsed);
         if session.transition(SessionState::Ready).is_err() {
             return Response::error(
                 request,
@@ -181,10 +205,31 @@ impl Daemon {
                 ),
             );
         }
+        match self.engine_call("session.ensurePage", json!({})) {
+            Ok(result) => {
+                session.page_id = result
+                    .get("page")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+                session.pages = 1;
+            }
+            Err(error) => {
+                return Response::error(
+                    request,
+                    ErrorObject::new(
+                        "engine_error",
+                        error,
+                        request.request_id.clone(),
+                        34,
+                        "retry web.session.create",
+                    ),
+                );
+            }
+        }
         self.sessions.insert(id.clone(), session);
         Response::ok(
             request,
-            serde_json::json!({
+            json!({
                 "session_id": id,
                 "profile": profile,
                 "state": "ready",
@@ -229,6 +274,9 @@ impl Daemon {
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
                 let _ = session.transition(SessionState::Closing);
+                if let Some(page) = session.page_id.take() {
+                    let _ = self.engine_call("page.close", json!({ "page": page }));
+                }
                 let _ = session.transition(SessionState::Closed);
                 Response::ok(
                     request,
@@ -373,6 +421,551 @@ impl Daemon {
             let _ = session.transition(SessionState::Ready);
         }
     }
+
+    fn web_observe(&mut self, request: &Request) -> Response {
+        match self.with_session_page(request, "web.observe") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.engine_call("page.observe", json!({ "page": page })) {
+                    Ok(mut tree) => {
+                        self.finish_session(&session_id);
+                        if let Some(object) = tree.as_object_mut() {
+                            object.insert(
+                                "untrusted_content_boundary".into(),
+                                json!("UNTRUSTED_PAGE_CONTENT"),
+                            );
+                        }
+                        Response::ok(request, tree)
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        engine_error(request, error, 34)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_screenshot(&mut self, request: &Request) -> Response {
+        match self.with_session_page(request, "web.screenshot") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.engine_call("page.screenshot", json!({ "page": page })) {
+                    Ok(result) => {
+                        let Some(b64) = result.get("png_base64").and_then(|v| v.as_str()) else {
+                            self.finish_session(&session_id);
+                            return engine_error(request, "screenshot missing png", 34);
+                        };
+                        let bytes = match decode_base64(b64) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                self.finish_session(&session_id);
+                                return engine_error(request, error, 34);
+                            }
+                        };
+                        let stored = self.store_bytes(
+                            request,
+                            &session_id,
+                            &bytes,
+                            "image/png",
+                            "web.screenshot",
+                            true,
+                        );
+                        self.finish_session(&session_id);
+                        match stored {
+                            Ok(manifest) => {
+                                let mut response = Response::ok(
+                                    request,
+                                    json!({
+                                        "session_id": session_id,
+                                        "digest": manifest.digest.hex,
+                                        "byte_count": manifest.byte_count,
+                                        "object_path": manifest.object_path,
+                                    }),
+                                );
+                                response
+                                    .artifacts
+                                    .push(serde_json::to_value(manifest).unwrap_or(json!({})));
+                                response
+                            }
+                            Err(response) => response,
+                        }
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        engine_error(request, error, 34)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_read(&mut self, request: &Request) -> Response {
+        let Some(url) = request.payload.get("url").and_then(|v| v.as_str()) else {
+            return protocol_error(request, "web.read requires url");
+        };
+        match self.with_session_page(request, "web.read") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.navigate_and_extract(&session_id, &page, url, request) {
+                    Ok(source) => {
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "source": source,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(response) => {
+                        self.finish_session(&session_id);
+                        response
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_search(&mut self, request: &Request) -> Response {
+        let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
+            return protocol_error(request, "web.search requires query");
+        };
+        let limit = request
+            .payload
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .max(1) as usize;
+        match self.with_session_page(request, "web.search") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let search_url = self.search_url(query);
+                match self.navigate_and_extract(&session_id, &page, &search_url, request) {
+                    Ok(mut source) => {
+                        let links = self
+                            .engine_call("page.observe", json!({ "page": page }))
+                            .ok()
+                            .and_then(|tree| tree.get("links").cloned())
+                            .and_then(|value| value.as_array().cloned())
+                            .unwrap_or_default();
+                        let results: Vec<_> = links.into_iter().take(limit).collect();
+                        source["classification"] = json!("aggregator");
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "query": query,
+                                "results": results,
+                                "source": source,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(response) => {
+                        self.finish_session(&session_id);
+                        response
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_research(&mut self, request: &Request) -> Response {
+        let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
+            return protocol_error(request, "web.research requires query");
+        };
+        let max_sources = request
+            .payload
+            .get("max_sources")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3)
+            .clamp(1, 8) as usize;
+        let search = self.web_search(request);
+        if search.status != "ok" {
+            return search;
+        }
+        let results = search
+            .result
+            .as_ref()
+            .and_then(|value| value.get("results"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut admitted = Vec::new();
+        let mut omitted = 0u32;
+        let mut omitted_reasons = Vec::new();
+        for result in results.into_iter().take(max_sources) {
+            let Some(href) = result.get("href").and_then(|v| v.as_str()) else {
+                omitted += 1;
+                omitted_reasons.push(json!({"reason": "missing href"}));
+                continue;
+            };
+            let mut read_req = request.clone();
+            read_req.payload =
+                json!({ "url": href, "session_id": request.payload.get("session_id") });
+            match self.web_read(&read_req) {
+                response if response.status == "ok" => {
+                    if let Some(source) = response
+                        .result
+                        .and_then(|value| value.get("source").cloned())
+                    {
+                        admitted.push(source);
+                    } else {
+                        omitted += 1;
+                        omitted_reasons.push(json!({
+                            "url": href,
+                            "reason": "read returned no source",
+                        }));
+                    }
+                }
+                response => {
+                    omitted += 1;
+                    omitted_reasons.push(json!({
+                        "url": href,
+                        "status": response.status,
+                        "error": response.error,
+                    }));
+                }
+            }
+        }
+        let snippets: Vec<_> = admitted
+            .iter()
+            .map(|source| {
+                json!({
+                    "url": source.get("final_url"),
+                    "title": source.get("title"),
+                    "snippet": source.get("text").and_then(|v| v.as_str()).unwrap_or("").chars().take(280).collect::<String>(),
+                    "digest": source.get("digest"),
+                })
+            })
+            .collect();
+        Response::ok(
+            request,
+            json!({
+                "query_summary": query,
+                "admitted_sources": admitted.len(),
+                "omitted": omitted,
+                "omitted_reasons": omitted_reasons,
+                "evidence": snippets,
+                "sources": admitted,
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                "continuation_token": null,
+            }),
+        )
+    }
+
+    fn web_artifacts(&mut self, request: &Request) -> Response {
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone());
+        let Some(session_id) = session_id else {
+            return protocol_error(request, "web.artifacts requires session_id");
+        };
+        if !self.sessions.contains_key(&session_id) {
+            return missing_session(request, &session_id);
+        }
+        match self.store.list_session(&session_id) {
+            Ok(list) => Response::ok(
+                request,
+                json!({ "session_id": session_id, "artifacts": list }),
+            ),
+            Err(error) => engine_error(request, error.to_string(), 39),
+        }
+    }
+
+    fn with_session_page(
+        &mut self,
+        request: &Request,
+        operation: &str,
+    ) -> Result<(String, String), Response> {
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone());
+        let Some(session_id) = session_id else {
+            return Err(protocol_error(
+                request,
+                &format!("{operation} requires session_id"),
+            ));
+        };
+        if !self.sessions.contains_key(&session_id) {
+            return Err(missing_session(request, &session_id));
+        }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            if let Err(message) = session.begin_operation(&request.request_id) {
+                return Err(engine_error(request, message, 38));
+            }
+            if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
+                let _ = session.transition(SessionState::Failed);
+                return Err(limit_error(request, message));
+            }
+        }
+        let page = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.page_id.clone());
+        let Some(page) = page else {
+            self.finish_session(&session_id);
+            return Err(engine_error(request, "session has no page", 34));
+        };
+        Ok((session_id, page))
+    }
+
+    fn navigate_and_extract(
+        &mut self,
+        session_id: &str,
+        page: &str,
+        url: &str,
+        request: &Request,
+    ) -> Result<serde_json::Value, Response> {
+        let profile = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.profile)
+            .unwrap_or(NetworkProfile::Research);
+        if let UrlDecision::Deny { reason } = decide_url(profile, url) {
+            return Err({
+                let mut error = ErrorObject::new(
+                    "policy_denied",
+                    reason,
+                    request.request_id.clone(),
+                    36,
+                    "use the project profile for loopback fixtures",
+                );
+                error.session_id = Some(session_id.to_owned());
+                Response::error(request, error)
+            });
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if let Err(message) = session
+                .limits
+                .check_network_bytes(session.network_bytes, 4096)
+            {
+                return Err(limit_error(request, message));
+            }
+            session.network_bytes = session.network_bytes.saturating_add(4096);
+        }
+        self.engine_call("page.goto", json!({ "page": page, "url": url }))
+            .map_err(|error| engine_error(request, error, 34))?;
+        let tree = self
+            .engine_call("page.observe", json!({ "page": page }))
+            .map_err(|error| engine_error(request, error, 34))?;
+        let text = tree
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let title = tree
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let stored = self.store_bytes(
+            request,
+            session_id,
+            text.as_bytes(),
+            "text/plain",
+            &request.operation,
+            false,
+        )?;
+        Ok(json!({
+            "requested_url": url,
+            "final_url": tree.get("url"),
+            "redirect_chain": [url],
+            "retrieved_at": stored.timestamp,
+            "title": title,
+            "media_type": "text/html",
+            "text": text,
+            "digest": stored.digest.hex,
+            "classification": "original",
+            "session_id": session_id,
+            "operation_id": request.request_id,
+            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+        }))
+    }
+
+    fn store_bytes(
+        &mut self,
+        request: &Request,
+        session_id: &str,
+        bytes: &[u8],
+        media_type: &str,
+        operation: &str,
+        sensitive: bool,
+    ) -> Result<crate::artifacts::ArtifactManifest, Response> {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if let Err(message) = session
+                .limits
+                .check_artifact_bytes(session.artifact_bytes, bytes.len() as u64)
+            {
+                return Err(limit_error(request, message));
+            }
+            session.artifact_bytes = session.artifact_bytes.saturating_add(bytes.len() as u64);
+        }
+        self.store
+            .put(
+                bytes,
+                media_type,
+                session_id,
+                &self.run_id,
+                &format!("{operation}:{}", request.request_id),
+                sensitive,
+            )
+            .map_err(|error| engine_error(request, error.to_string(), 39))
+    }
+
+    fn search_url(&self, query: &str) -> String {
+        if let Some(endpoint) = &self.search_endpoint {
+            if endpoint.contains('?') {
+                format!("{endpoint}&q={}", urlencoding(query))
+            } else {
+                format!("{endpoint}?q={}", urlencoding(query))
+            }
+        } else {
+            format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query))
+        }
+    }
+
+    fn engine_call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
+        self.content
+            .send(&Message::engine_call(request_id, method.to_owned(), params))
+            .map_err(|error| error.to_string())?;
+        match self.content.recv(Duration::from_secs(60)) {
+            Ok(Message::EngineResult {
+                request_id: got,
+                ok,
+                result,
+                error,
+                ..
+            }) if got == request_id => {
+                if ok {
+                    Ok(result)
+                } else {
+                    Err(error.unwrap_or_else(|| "engine call failed".to_owned()))
+                }
+            }
+            Ok(other) => Err(format!("unexpected content message {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+fn data_root(run_id: &str) -> PathBuf {
+    let base = std::env::var("GREPPY_STORE_DIR")
+        .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"));
+    base.join("web-runtime").join(run_id)
+}
+
+fn urlencoding(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Result<u8, String> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err("invalid base64".into()),
+        }
+    }
+    let filtered: Vec<u8> = input
+        .bytes()
+        .filter(|c| *c != b'=' && !c.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::new();
+    for chunk in filtered.chunks(4) {
+        let a = val(chunk[0])?;
+        let b = val(*chunk.get(1).unwrap_or(&b'A'))?;
+        let c = val(*chunk.get(2).unwrap_or(&b'A'))?;
+        let d = val(*chunk.get(3).unwrap_or(&b'A'))?;
+        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
+        out.push(((triple >> 16) & 255) as u8);
+        if chunk.len() > 2 {
+            out.push(((triple >> 8) & 255) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push((triple & 255) as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn protocol_error(request: &Request, message: &str) -> Response {
+    Response::error(
+        request,
+        ErrorObject::new(
+            "protocol_violation",
+            message,
+            request.request_id.clone(),
+            30,
+            "see greppy web --help",
+        ),
+    )
+}
+
+fn missing_session(request: &Request, session_id: &str) -> Response {
+    let mut error = ErrorObject::new(
+        "session_not_found",
+        format!("session {session_id} was not found"),
+        request.request_id.clone(),
+        32,
+        "create a session first",
+    );
+    error.session_id = Some(session_id.to_owned());
+    Response::error(request, error)
+}
+
+fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -> Response {
+    Response::error(
+        request,
+        ErrorObject::new(
+            "engine_error",
+            message,
+            request.request_id.clone(),
+            exit_code,
+            "retry the operation or inspect web.doctor",
+        ),
+    )
+}
+
+fn limit_error(request: &Request, message: impl Into<String>) -> Response {
+    Response::error(
+        request,
+        ErrorObject::new(
+            "resource_limit",
+            message,
+            request.request_id.clone(),
+            37,
+            "close the session or raise the documented limit",
+        ),
+    )
 }
 
 fn run_script_on_workers(
