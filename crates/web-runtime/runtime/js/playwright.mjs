@@ -624,6 +624,10 @@ class Locator {
   }
 
   filter(options = {}) {
+    refuseLocatorOptions("Locator.filter", options, ["has", "hasNot", "hasText"]);
+    if (options.hasText != null && typeof options.hasText !== "string") {
+      throwUnsupported("Locator.filter.hasText");
+    }
     const has = options.has && options.has._selector ? options.has._selector : null;
     const hasNot = options.hasNot && options.hasNot._selector ? options.hasNot._selector : null;
     if (options.has && !has) {

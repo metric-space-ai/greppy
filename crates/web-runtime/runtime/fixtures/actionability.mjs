@@ -65,4 +65,20 @@ try {
 }
 if (!hiddenState) throw new Error("waitFor hidden must fail closed");
 
+page.setDefaultTimeout(3_000);
+await page.setContent(`<!DOCTYPE html><html><body>
+<div style="height:2500px"></div>
+<button id="low">Low</button>
+</body></html>`);
+await page.evaluate(() => {
+  window.__low = 0;
+  document.getElementById("low").addEventListener("click", () => {
+    window.__low = 1;
+  });
+});
+await page.locator("#low").click();
+if ((await page.evaluate(() => window.__low)) !== 1) {
+  throw new Error("off-screen click did not land");
+}
+
 await browser.close();

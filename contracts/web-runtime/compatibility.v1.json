@@ -6191,11 +6191,13 @@
       "tests": [
         "phase1-spike",
         "hover",
-        "actionability"
+        "actionability",
+        "locator-options"
       ],
       "known_differences": [
         "options are unsupported",
-        "visible = non-empty box plus computed display/visibility; hit-target is elementFromPoint at box center (element or descendant); overlay and visibility:hidden time out; not Chromium animation-stability or force"
+        "visible = non-empty box plus computed display/visibility; hit-target is elementFromPoint at box center (element or descendant); overlay and visibility:hidden time out; not Chromium animation-stability or force",
+        "force/trial/position/timeout-as-options throw; page default timeout is used instead. Off-screen targets may scrollIntoView nearest then hit-test; not Chromium scroll padding or sticky-header handling"
       ]
     },
     {
@@ -6321,10 +6323,11 @@
       "source": "unsupported",
       "behavior": "unsupported",
       "tests": [
-        "fail-closed-surface"
+        "fail-closed-surface",
+        "locator-options"
       ],
       "known_differences": [
-        "No ElementHandle lifetime/object identity. Calls MUST fail with unsupported_playwright_operation."
+        "No ElementHandle lifetime. Calls MUST fail with unsupported_playwright_operation."
       ]
     },
     {
@@ -6406,10 +6409,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "filter-scroll"
+        "filter-scroll",
+        "locator-options"
       ],
       "known_differences": [
-        "hasText substring plus has/hasNot locator intersection; no regex hasText"
+        "hasText substring plus has/hasNot locator intersection; no regex hasText",
+        "hasText must be a string; regex/exact/visible filter options throw unsupported_playwright_operation"
       ]
     },
     {
