@@ -8,6 +8,8 @@ await page.locator("#q").type("ab");
 if ((await page.inputValue("#q")) !== "ab") {
   throw new Error("locator.type expected ab, got " + JSON.stringify(await page.inputValue("#q")));
 }
+if ((await page.mainFrame().inputValue("#q")) !== "ab") throw new Error("frame inputValue");
+if (!(await page.mainFrame().isEditable("#q"))) throw new Error("frame isEditable");
 await page.locator("#q").evaluate((el) => {
   el.addEventListener("keydown", () => {
     window.__pressed = 1;

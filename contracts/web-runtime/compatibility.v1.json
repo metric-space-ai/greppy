@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 181,
-    "unsupported": 265,
-    "unverified": 908
+    "implemented": 184,
+    "unsupported": 270,
+    "unverified": 900
   },
   "entries": [
     {
@@ -2556,11 +2556,13 @@
       "symbol": "Frame.innerHTML",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to locator.innerHTML"
+      ]
     },
     {
       "symbol": "Frame.innerText",
@@ -2578,11 +2580,15 @@
       "symbol": "Frame.inputValue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-type"
+      ],
+      "known_differences": [
+        "delegates to locator.inputValue"
+      ]
     },
     {
       "symbol": "Frame.isChecked",
@@ -2618,11 +2624,15 @@
       "symbol": "Frame.isEditable",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-type"
+      ],
+      "known_differences": [
+        "delegates to locator.isEditable"
+      ]
     },
     {
       "symbol": "Frame.isEnabled",
@@ -4154,21 +4164,25 @@
       "symbol": "Browser.startTracing",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Not Playwright trace.zip / Chromium tracing. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Browser.stopTracing",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Not Playwright trace.zip / Chromium tracing. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Browser.unbind",
@@ -5656,11 +5670,13 @@
       "symbol": "Locator.and",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Locator intersection is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.ariaSnapshot",
@@ -6275,11 +6291,13 @@
       "symbol": "Locator.or",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "Locator union is not implemented. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Locator.page",
@@ -13691,11 +13709,13 @@
       "symbol": "Page.coverage",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "No JS/CSS coverage profiler. Calls MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.keyboard",
@@ -14859,8 +14879,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 1081,
-    "unsupported": 265,
+    "unverified": 1076,
+    "unsupported": 270,
     "passing": 8
   }
 }

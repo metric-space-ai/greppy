@@ -573,6 +573,18 @@ class Frame {
   isVisible(selector) {
     return this.locator(selector).isVisible();
   }
+
+  innerHTML(selector) {
+    return this.locator(selector).innerHTML();
+  }
+
+  inputValue(selector) {
+    return this.locator(selector).inputValue();
+  }
+
+  isEditable(selector) {
+    return this.locator(selector).isEditable();
+  }
 }
 
 class Page {
