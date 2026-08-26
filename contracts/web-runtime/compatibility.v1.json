@@ -1190,11 +1190,10 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "nested-locator"
+        "tap-touch"
       ],
       "known_differences": [
-        "alias of locator.click; no touch input path",
-        "performs locator.click (mouse path); not a Touchscreen tap"
+        "Servo InputEvent::Touch Down/Up at the locator center; no hasTouch context option or modifiers"
       ]
     },
     {
@@ -6767,10 +6766,10 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "nested-locator"
+        "tap-touch"
       ],
       "known_differences": [
-        "alias of Locator.click; not a Touchscreen path"
+        "Servo InputEvent::Touch Down/Up at the locator center; no hasTouch context option or modifiers"
       ]
     },
     {
@@ -10711,13 +10710,14 @@
       "symbol": "Touchscreen.tap",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "tap-touch"
+      ],
       "known_differences": [
-        "alias of mouse.click",
-        "Alias of mouse.click is not a touch input path. Calls MUST fail with unsupported_playwright_operation."
+        "Servo InputEvent::Touch Down/Up at device coordinates; no multi-touch identifiers"
       ]
     },
     {
@@ -14318,11 +14318,15 @@
       "symbol": "Page.touchscreen",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "tap-touch"
+      ],
+      "known_differences": [
+        "exposes tap(x,y) via Servo touch input; other Touchscreen methods stay unsupported"
+      ]
     },
     {
       "symbol": "Frame.type",

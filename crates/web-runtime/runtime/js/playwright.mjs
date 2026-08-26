@@ -272,7 +272,14 @@ class Locator {
   }
 
   async tap(options) {
-    return this.click(options);
+    if (options != null) {
+      return unsupported("Locator.tap.options")();
+    }
+    await engineCall("locator.tap", {
+      page: this._page._id,
+      selector: this._selector,
+    });
+    await this._page._flushPopups();
   }
 
   async fill(value, options) {
@@ -962,6 +969,11 @@ class Page {
     this._pendingConsole = [];
     this._mouseX = 0;
     this._mouseY = 0;
+    this.touchscreen = {
+      tap: async (x, y) => {
+        await engineCall("page.touch.tap", { page: this._id, x, y });
+      },
+    };
     this.mouse = {
       click: async (x, y) => {
         this._mouseX = Number(x) || 0;
@@ -1150,8 +1162,8 @@ class Page {
     await this.keyboard.press(key);
   }
 
-  tap(selector, options) {
-    return this.locator(selector).click(options);
+  async tap(selector, options) {
+    return this.locator(selector).tap(options);
   }
 
   dblclick(selector, options) {

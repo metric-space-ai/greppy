@@ -1913,6 +1913,11 @@ fn locator_screenshot_is_clipped_png() {
 }
 
 #[test]
+fn tap_dispatches_touch_events() {
+    run_named_fixture("tap-touch.mjs", "run_tap");
+}
+
+#[test]
 fn locator_filter_has_text_and_scroll() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-filter-{}.sock", std::process::id()));

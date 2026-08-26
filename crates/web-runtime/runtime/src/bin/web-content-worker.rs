@@ -4,8 +4,8 @@ use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
-    SoftwareRenderingContext, UrlRequest, WebResourceLoad, WebResourceResponse, WebView,
-    WebViewBuilder, WebViewDelegate, WebViewPoint,
+    SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType, UrlRequest,
+    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -677,6 +677,29 @@ impl ContentEngine {
                 {
                     let _ = self.assign_pending_files(&page_id, selector);
                 }
+                Ok(json!({}))
+            }
+            "locator.tap" => {
+                let resolved = self.resolve_actionable(&params)?;
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                tap_at(
+                    &webview,
+                    resolved.x,
+                    resolved.y,
+                    resolved.width,
+                    resolved.height,
+                );
+                self.servo.spin_event_loop();
+                Ok(json!({}))
+            }
+            "page.touch.tap" => {
+                let page_id = required_str(&params, "page")?;
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (webview, _) = self.page(&page_id)?.clone();
+                tap_at(&webview, x, y, 0.0, 0.0);
+                self.servo.spin_event_loop();
                 Ok(json!({}))
             }
             "locator.dblclick" => {
@@ -1889,6 +1912,26 @@ fn hover_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
         (y + height / 2.0) as f32,
     ));
     webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+}
+
+fn tap_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
+    let point = WebViewPoint::Device(DevicePoint::new(
+        (x + width / 2.0) as f32,
+        (y + height / 2.0) as f32,
+    ));
+    let id = TouchId(1);
+    webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
+        TouchEventType::Down,
+        id,
+        point,
+        TouchPointerType::Touch,
+    )));
+    webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
+        TouchEventType::Up,
+        id,
+        point,
+        TouchPointerType::Touch,
+    )));
 }
 
 fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
