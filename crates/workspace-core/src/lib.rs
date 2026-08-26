@@ -18,7 +18,7 @@ pub use chunk_store::{ChunkGcReport, ChunkId, ChunkStore, ChunkStoreStats, CHUNK
 pub use error::{Error, ErrorKind, Result};
 pub use namespace::{
     DirectoryEntry, NodeKind, NodeMetadata, ProposalRecord, WorkspaceCore, WorkspaceHandle,
-    WorkspaceStatus,
+    WorkspacePairLease, WorkspaceStatus,
 };
 pub use provider::{
     AdapterKind, ProviderCapabilities, ProviderInstallation, ProviderManifest, ProviderState,

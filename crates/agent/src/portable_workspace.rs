@@ -7,7 +7,7 @@
 use greppy_workspace_core::{
     capture_overlay_directory, capture_repository, capture_repository_incremental, BaselineEntry,
     BaselineSnapshot, ChunkStore, EntryKind, ProviderInstallation, RepositoryTrackerState,
-    WorkspaceCore, WorkspaceHandle,
+    WorkspaceCore, WorkspaceHandle, WorkspacePairLease,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +34,7 @@ pub struct AgentWorkspace {
     data_root: PathBuf,
     core: WorkspaceCore,
     handle: WorkspaceHandle,
+    pair_lease: WorkspacePairLease,
 }
 
 impl fmt::Debug for AgentWorkspace {
@@ -182,7 +183,7 @@ impl AgentWorkspace {
         let baseline_hash = baseline.baseline_hash.clone();
         let baseline_for_git = baseline.clone();
         let git_run_id = git_workspace_id(run_id);
-        core.begin_workspace_pair(run_id, &git_run_id)?;
+        let pair_lease = core.begin_workspace_pair(run_id, &git_run_id)?;
         let handle = if captured_snapshot_owns_chunks {
             core.create_workspace(run_id, baseline)
         } else {
@@ -275,6 +276,7 @@ impl AgentWorkspace {
             data_root,
             core,
             handle,
+            pair_lease,
         })
     }
 
@@ -429,6 +431,7 @@ impl AgentWorkspace {
         }
         self.core
             .remove_workspace_pair(self.handle, self.git_handle)?;
+        drop(self.pair_lease);
         Ok(())
     }
 

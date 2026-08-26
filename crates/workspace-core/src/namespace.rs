@@ -4,7 +4,8 @@ use crate::{BaselineSnapshot, ChunkGcReport, ChunkId, ChunkStore, Error, Result,
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
@@ -61,6 +62,33 @@ pub struct ProposalRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceHandle {
     id: String,
+}
+
+/// Process-lifetime ownership of a content/Git workspace pair.
+///
+/// The lock survives every SQLite transaction and provider callback. A newly
+/// opened core may therefore distinguish a live Agent from a fully committed
+/// pair whose owner crashed. Lease files are intentionally stable: removing a
+/// lock pathname while another process still has its inode open can split
+/// contenders across two different locks.
+pub struct WorkspacePairLease {
+    file: File,
+    content_id: String,
+}
+
+impl std::fmt::Debug for WorkspacePairLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspacePairLease")
+            .field("content_id", &self.content_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WorkspacePairLease {
+    fn drop(&mut self) {
+        unlock_pair_lease(&self.file);
+    }
 }
 
 impl WorkspaceHandle {
@@ -337,7 +365,11 @@ impl WorkspaceCore {
     /// Begin the crash-recoverable creation of the content/Git-state pair.
     /// Neither namespace is considered an Agent worktree until `complete` has
     /// atomically proven that both exist.
-    pub fn begin_workspace_pair(&self, content_id: &str, git_id: &str) -> Result<()> {
+    pub fn begin_workspace_pair(
+        &self,
+        content_id: &str,
+        git_id: &str,
+    ) -> Result<WorkspacePairLease> {
         validate_workspace_id(content_id)?;
         validate_workspace_id(git_id)?;
         if content_id == git_id {
@@ -345,13 +377,42 @@ impl WorkspaceCore {
                 "content and Git workspace IDs must differ".into(),
             ));
         }
+        let lease = self
+            .acquire_workspace_pair_lease(content_id, true)?
+            .ok_or_else(|| {
+                Error::AlreadyExists(format!("workspace pair {content_id} is already active"))
+            })?;
         let connection = self.lock_metadata()?;
         connection.execute(
             "INSERT INTO cow_workspace_pairs(content_id, git_id, state)
              VALUES(?1, ?2, 'creating')",
             params![content_id, git_id],
         )?;
-        Ok(())
+        Ok(lease)
+    }
+
+    fn acquire_workspace_pair_lease(
+        &self,
+        content_id: &str,
+        nonblocking: bool,
+    ) -> Result<Option<WorkspacePairLease>> {
+        validate_workspace_id(content_id)?;
+        let directory = self.root.join("pair-leases");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{content_id}.lease"));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        if !lock_pair_lease(&file, nonblocking)? {
+            return Ok(None);
+        }
+        Ok(Some(WorkspacePairLease {
+            file,
+            content_id: content_id.to_string(),
+        }))
     }
 
     pub fn complete_workspace_pair(
@@ -1305,11 +1366,11 @@ impl WorkspaceCore {
 
     pub fn recover(&self) -> Result<()> {
         {
-            let mut connection = self.lock_metadata()?;
-            let incomplete = {
+            let connection = self.lock_metadata()?;
+            let recoverable = {
                 let mut statement = connection.prepare(
                     "SELECT content_id, git_id FROM cow_workspace_pairs
-                     WHERE state IN ('creating', 'removing')",
+                     WHERE state IN ('creating', 'ready', 'removing')",
                 )?;
                 let rows = statement
                     .query_map([], |row| {
@@ -1318,8 +1379,20 @@ impl WorkspaceCore {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 rows
             };
+            drop(connection);
+            let abandoned = recoverable
+                .into_iter()
+                .map(|(content_id, git_id)| {
+                    self.acquire_workspace_pair_lease(&content_id, true)
+                        .map(|lease| (content_id, git_id, lease))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut connection = self.lock_metadata()?;
             let transaction = connection.transaction()?;
-            for (content_id, git_id) in incomplete {
+            for (content_id, git_id, lease) in abandoned {
+                let Some(_lease) = lease else {
+                    continue;
+                };
                 transaction.execute(
                     "DELETE FROM cow_workspaces WHERE id IN (?1, ?2)",
                     params![content_id, git_id],
@@ -1512,6 +1585,95 @@ impl WorkspaceCore {
         self.metadata.acquire()
     }
 }
+
+#[cfg(unix)]
+fn lock_pair_lease(file: &File, nonblocking: bool) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let operation = if nonblocking {
+        LOCK_EX | LOCK_NB
+    } else {
+        LOCK_EX
+    };
+    // SAFETY: flock operates only on the valid descriptor owned by `file`.
+    let result = unsafe { workspace_flock(file.as_raw_fd(), operation) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if nonblocking && error.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn unlock_pair_lease(file: &File) {
+    use std::os::fd::AsRawFd;
+    const LOCK_UN: i32 = 8;
+    // SAFETY: best-effort unlock of the valid descriptor owned by `file`.
+    let _ = unsafe { workspace_flock(file.as_raw_fd(), LOCK_UN) };
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "flock"]
+    fn workspace_flock(file_descriptor: i32, operation: i32) -> i32;
+}
+
+#[cfg(windows)]
+fn lock_pair_lease(file: &File, nonblocking: bool) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut flags = LOCKFILE_EXCLUSIVE_LOCK;
+    if nonblocking {
+        flags |= LOCKFILE_FAIL_IMMEDIATELY;
+    }
+    let mut overlapped = OVERLAPPED::default();
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            flags,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if nonblocking && matches!(error.raw_os_error(), Some(32 | 33 | 158)) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn unlock_pair_lease(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_pair_lease(_file: &File, _nonblocking: bool) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_pair_lease(_file: &File) {}
 
 fn open_metadata_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
@@ -2265,6 +2427,40 @@ mod tests {
         assert!(core.status(&git).is_ok());
         drop(core);
 
+        let recovered = WorkspaceCore::open(storage.path()).unwrap();
+        assert!(recovered.open_workspace(content.id()).is_err());
+        assert!(recovered.open_workspace(git.id()).is_err());
+        assert!(recovered.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_preserves_a_live_pair_and_removes_it_after_owner_crash() {
+        let (_repo, storage, core, content) = fixture();
+        let template = tempfile::tempdir().unwrap();
+        fs::write(template.path().join("HEAD"), b"ref: refs/heads/base\n").unwrap();
+        let baseline = crate::capture_overlay_directory(
+            storage.path().join("git-control-live-pair"),
+            template.path(),
+            core.chunks(),
+        )
+        .unwrap();
+        let lease = core
+            .begin_workspace_pair(content.id(), "git-state-live-pair")
+            .unwrap();
+        let git = core
+            .create_overlay_workspace("git-state-live-pair", baseline)
+            .unwrap();
+        core.complete_workspace_pair(&content, &git).unwrap();
+
+        let concurrent = WorkspaceCore::open(storage.path()).unwrap();
+        assert!(concurrent.open_workspace(content.id()).is_ok());
+        assert!(concurrent.open_workspace(git.id()).is_ok());
+        drop(concurrent);
+
+        // Simulate a process crash: the OS releases the process-lifetime
+        // lease without running normal pair cleanup.
+        drop(lease);
+        drop(core);
         let recovered = WorkspaceCore::open(storage.path()).unwrap();
         assert!(recovered.open_workspace(content.id()).is_err());
         assert!(recovered.open_workspace(git.id()).is_err());
