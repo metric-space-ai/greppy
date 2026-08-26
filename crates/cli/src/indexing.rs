@@ -426,42 +426,47 @@ pub(crate) fn dispatch_index_agent_worktree(
         crate::store_cow::ENV_FALLBACK_REASON,
     ]
     .map(|name| (name, std::env::var_os(name)));
-    let prepared_base = match crate::store_cow::prepare_base_store(&workspace, &shared_data_root) {
-        Ok(prepared) => {
-            if !cli_json_output() {
-                println!(
-                    "store mode: overlay (Base {}, {})",
-                    &prepared.identity_hash[..12],
-                    if prepared.reused {
-                        "reused"
-                    } else {
-                        "published"
-                    }
-                );
-            }
-            Some(prepared)
-        }
-        Err(error) => {
-            match restore_project {
-                Some(previous) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, previous),
-                None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
-            }
-            for (name, value) in cow_env {
-                match value {
-                    Some(previous) => std::env::set_var(name, previous),
-                    None => std::env::remove_var(name),
+    let prepared_base =
+        match crate::store_cow::prepare_base_store(&workspace, &shared_data_root, embedding_args) {
+            Ok(prepared) => {
+                if !cli_json_output() {
+                    println!(
+                        "store mode: overlay (Base {}, {})",
+                        &prepared.identity_hash[..12],
+                        if prepared.reused {
+                            "reused"
+                        } else {
+                            "published"
+                        }
+                    );
                 }
+                Some(prepared)
             }
-            let cleanup = workspace.cleanup();
-            let cleanup_detail = cleanup
-                .err()
-                .map(|cleanup_error| format!("; workspace cleanup also failed: {cleanup_error}"))
-                .unwrap_or_default();
-            return Err(Error::Invalid(format!(
-                "agent Base prewarm failed closed: {error}{cleanup_detail}"
-            )));
-        }
-    };
+            Err(error) => {
+                match restore_project {
+                    Some(previous) => {
+                        std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, previous)
+                    }
+                    None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
+                }
+                for (name, value) in cow_env {
+                    match value {
+                        Some(previous) => std::env::set_var(name, previous),
+                        None => std::env::remove_var(name),
+                    }
+                }
+                let cleanup = workspace.cleanup();
+                let cleanup_detail = cleanup
+                    .err()
+                    .map(|cleanup_error| {
+                        format!("; workspace cleanup also failed: {cleanup_error}")
+                    })
+                    .unwrap_or_default();
+                return Err(Error::Invalid(format!(
+                    "agent Base prewarm failed closed: {error}{cleanup_detail}"
+                )));
+            }
+        };
     // The agent does not read the operator's data root: `greppy -p` runs with
     // GREPPY_STORE_DIR pointed at an isolated tree beside the worktree, and the
     // sandbox grants only that tree. Warming under the operator's root writes a

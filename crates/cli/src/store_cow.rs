@@ -306,6 +306,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 pub(crate) fn prepare_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
+    embedding_args: crate::EmbeddingCliArgs<'_>,
 ) -> Result<PreparedBase> {
     let identity = base_identity(workspace)?;
     let layout = BaseStoreLayout::new(shared_data_root, &identity)
@@ -357,8 +358,10 @@ pub(crate) fn prepare_base_store(
         .map_err(|error| Error::io("create Base build data directory", error))?;
     let binary = std::env::current_exe()
         .map_err(|error| Error::io("resolve current greppy binary for Base build", error))?;
-    let status = Command::new(binary)
-        .arg("index")
+    let mut command = Command::new(binary);
+    command.arg("index");
+    append_embedding_cli_args(&mut command, embedding_args);
+    let status = command
         .current_dir(workspace.worktree_path())
         .env("GREPPY_STORE_DIR", &staging_data)
         // A published Base is not valid until every candidate has its vector;
@@ -421,6 +424,15 @@ pub(crate) fn prepare_base_store(
         .map_err(|error| Error::io("publish immutable Base Store", error))?;
     drop(builder_lease);
     prepared_base_with_reader(&layout, manifest, false)
+}
+
+fn append_embedding_cli_args(command: &mut Command, embedding_args: crate::EmbeddingCliArgs<'_>) {
+    if let Some(device) = embedding_args.device {
+        command.arg("--device").arg(device);
+    }
+    if embedding_args.no_gpu {
+        command.arg("--no-gpu");
+    }
 }
 
 fn validate_base_contents(
@@ -875,6 +887,37 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn immutable_base_build_preserves_explicit_embedding_device_contract() {
+        let mut cuda = Command::new("greppy");
+        cuda.arg("index");
+        append_embedding_cli_args(
+            &mut cuda,
+            crate::EmbeddingCliArgs {
+                device: Some("cuda"),
+                no_gpu: false,
+            },
+        );
+        assert_eq!(
+            cuda.get_args().collect::<Vec<_>>(),
+            ["index", "--device", "cuda"]
+        );
+
+        let mut cpu_only = Command::new("greppy");
+        cpu_only.arg("index");
+        append_embedding_cli_args(
+            &mut cpu_only,
+            crate::EmbeddingCliArgs {
+                device: None,
+                no_gpu: true,
+            },
+        );
+        assert_eq!(
+            cpu_only.get_args().collect::<Vec<_>>(),
+            ["index", "--no-gpu"]
+        );
     }
 
     #[test]

@@ -327,7 +327,14 @@ fn run_agent(args: AgentArgs) -> u8 {
         eprintln!("store mode: private (--private-store)");
         None
     } else {
-        match crate::store_cow::prepare_base_store(&workspace, &shared_data_root) {
+        match crate::store_cow::prepare_base_store(
+            &workspace,
+            &shared_data_root,
+            crate::EmbeddingCliArgs {
+                device: None,
+                no_gpu: false,
+            },
+        ) {
             Ok(prepared) => {
                 eprintln!(
                     "store mode: overlay (Base {}, {})",
