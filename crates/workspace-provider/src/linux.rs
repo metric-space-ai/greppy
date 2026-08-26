@@ -6,7 +6,8 @@ use fuser::{
 };
 use greppy_workspace_core::{
     AdapterKind, Error as CoreError, ErrorKind, NodeKind, NodeMetadata, ProviderCapabilities,
-    ProviderManifest, ProviderState, WorkspaceCore, WorkspaceHandle, PROVIDER_PROTOCOL_VERSION,
+    ProviderManifest, ProviderState, WorkspaceCore, WorkspaceFileHandle, WorkspaceHandle,
+    PROVIDER_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -44,7 +45,9 @@ struct PortableFuse {
     nodes: Mutex<HashMap<u64, Node>>,
     reverse: Mutex<HashMap<Node, u64>>,
     workspace_inodes: Mutex<HashMap<(String, u64), u64>>,
+    open_files: Mutex<HashMap<u64, WorkspaceFileHandle>>,
     next_inode: AtomicU64,
+    next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
     notifier: Arc<Mutex<Option<Notifier>>>,
@@ -75,7 +78,9 @@ impl PortableFuse {
             nodes: Mutex::new(nodes),
             reverse: Mutex::new(reverse),
             workspace_inodes: Mutex::new(HashMap::new()),
+            open_files: Mutex::new(HashMap::new()),
             next_inode: AtomicU64::new(16),
+            next_file_handle: AtomicU64::new(1),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
             notifier: Arc::new(Mutex::new(None)),
@@ -400,7 +405,7 @@ impl Filesystem for PortableFuse {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -414,9 +419,20 @@ impl Filesystem for PortableFuse {
                 return Err(Errno::EPERM);
             }
             if let Some(size) = size {
-                self.core
-                    .truncate(&workspace, &path, size)
-                    .map_err(core_errno)?;
+                if let Some(handle) = fh.and_then(|fh| {
+                    self.open_files
+                        .lock()
+                        .ok()
+                        .and_then(|files| files.get(&fh.0).cloned())
+                }) {
+                    self.core
+                        .truncate_open_file(&handle, size)
+                        .map_err(core_errno)?;
+                } else {
+                    self.core
+                        .truncate(&workspace, &path, size)
+                        .map_err(core_errno)?;
+                }
             }
             self.core
                 .set_metadata(
@@ -445,40 +461,72 @@ impl Filesystem for PortableFuse {
         }
     }
 
-    fn open(&self, _req: &Request, _inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(FileHandle(0), FopenFlags::empty());
+    fn open(&self, _req: &Request, inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let result = match self.node(inode) {
+            Some(Node::WorkspacePath { workspace, path }) => self
+                .core
+                .open_workspace(&workspace)
+                .map_err(core_errno)
+                .and_then(|workspace| self.core.open_file(&workspace, path).map_err(core_errno))
+                .and_then(|handle| {
+                    let fh = self.next_file_handle.fetch_add(1, Ordering::Relaxed);
+                    self.open_files
+                        .lock()
+                        .map_err(|_| Errno::EIO)?
+                        .insert(fh, handle);
+                    Ok(FileHandle(fh))
+                }),
+            Some(_) => Ok(FileHandle(0)),
+            None => Err(Errno::ENOENT),
+        };
+        match result {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(error) => reply.error(error),
+        }
     }
 
     fn read(
         &self,
         _req: &Request,
         inode: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let result = match self.node(inode) {
-            Some(Node::Marker) => self
-                .marker_bytes()
-                .map_err(serde_errno)
-                .map(|bytes| slice(bytes, offset, size)),
-            Some(Node::Doctor(relative)) => self
-                .doctor_path(&relative)
-                .and_then(|path| fs::read(path).map_err(io_errno))
-                .map(|bytes| slice(bytes, offset, size)),
-            Some(Node::WorkspacePath { workspace, path }) => self
-                .core
-                .open_workspace(&workspace)
-                .map_err(core_errno)
+        let result = if fh.0 != 0 {
+            self.open_files
+                .lock()
+                .map_err(|_| Errno::EIO)
+                .and_then(|files| files.get(&fh.0).cloned().ok_or(Errno::EBADF))
                 .and_then(|handle| {
                     self.core
-                        .read(&handle, path, offset, size as usize)
+                        .read_open_file(&handle, offset, size as usize)
                         .map_err(core_errno)
-                }),
-            _ => Err(Errno::EINVAL),
+                })
+        } else {
+            match self.node(inode) {
+                Some(Node::Marker) => self
+                    .marker_bytes()
+                    .map_err(serde_errno)
+                    .map(|bytes| slice(bytes, offset, size)),
+                Some(Node::Doctor(relative)) => self
+                    .doctor_path(&relative)
+                    .and_then(|path| fs::read(path).map_err(io_errno))
+                    .map(|bytes| slice(bytes, offset, size)),
+                Some(Node::WorkspacePath { workspace, path }) => self
+                    .core
+                    .open_workspace(&workspace)
+                    .map_err(core_errno)
+                    .and_then(|handle| {
+                        self.core
+                            .read(&handle, path, offset, size as usize)
+                            .map_err(core_errno)
+                    }),
+                _ => Err(Errno::EINVAL),
+            }
         };
         match result {
             Ok(bytes) => reply.data(&bytes),
@@ -490,7 +538,7 @@ impl Filesystem for PortableFuse {
         &self,
         _req: &Request,
         inode: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: fuser::WriteFlags,
@@ -498,31 +546,61 @@ impl Filesystem for PortableFuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        let result = match self.node(inode) {
-            Some(Node::Doctor(relative)) => self.doctor_path(&relative).and_then(|path| {
-                use std::os::unix::fs::FileExt;
-                let file = fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .map_err(io_errno)?;
-                file.write_all_at(data, offset).map_err(io_errno)?;
-                Ok(data.len())
-            }),
-            Some(Node::WorkspacePath { workspace, path }) => self
-                .core
-                .open_workspace(&workspace)
-                .map_err(core_errno)
+        let result = if fh.0 != 0 {
+            self.open_files
+                .lock()
+                .map_err(|_| Errno::EIO)
+                .and_then(|files| files.get(&fh.0).cloned().ok_or(Errno::EBADF))
                 .and_then(|handle| {
                     self.core
-                        .write(&handle, path, offset, data)
+                        .write_open_file(&handle, offset, data)
                         .map_err(core_errno)
+                })
+        } else {
+            match self.node(inode) {
+                Some(Node::Doctor(relative)) => self.doctor_path(&relative).and_then(|path| {
+                    use std::os::unix::fs::FileExt;
+                    let file = fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .map_err(io_errno)?;
+                    file.write_all_at(data, offset).map_err(io_errno)?;
+                    Ok(data.len())
                 }),
-            _ => Err(Errno::EROFS),
+                Some(Node::WorkspacePath { workspace, path }) => self
+                    .core
+                    .open_workspace(&workspace)
+                    .map_err(core_errno)
+                    .and_then(|handle| {
+                        self.core
+                            .write(&handle, path, offset, data)
+                            .map_err(core_errno)
+                    }),
+                _ => Err(Errno::EROFS),
+            }
         };
         match result {
             Ok(written) => reply.written(written as u32),
             Err(error) => reply.error(error),
         }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _inode: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if fh.0 != 0 {
+            if let Ok(mut files) = self.open_files.lock() {
+                files.remove(&fh.0);
+            }
+        }
+        reply.ok();
     }
 
     fn flush(
@@ -646,13 +724,31 @@ impl Filesystem for PortableFuse {
         reply: ReplyCreate,
     ) {
         match self.create_node(parent, name, mode, false) {
-            Ok((_inode, attr)) => reply.created(
-                &TTL,
-                &attr,
-                Generation(0),
-                FileHandle(0),
-                FopenFlags::empty(),
-            ),
+            Ok((inode, attr)) => {
+                let file_handle = match self.node(INodeNo(inode)) {
+                    Some(Node::WorkspacePath { workspace, path }) => self
+                        .core
+                        .open_workspace(&workspace)
+                        .map_err(core_errno)
+                        .and_then(|workspace| {
+                            self.core.open_file(&workspace, path).map_err(core_errno)
+                        })
+                        .and_then(|handle| {
+                            let fh = self.next_file_handle.fetch_add(1, Ordering::Relaxed);
+                            self.open_files
+                                .lock()
+                                .map_err(|_| Errno::EIO)?
+                                .insert(fh, handle);
+                            Ok(FileHandle(fh))
+                        }),
+                    Some(_) => Ok(FileHandle(0)),
+                    None => Err(Errno::ENOENT),
+                };
+                match file_handle {
+                    Ok(fh) => reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty()),
+                    Err(error) => reply.error(error),
+                }
+            }
             Err(error) => reply.error(error),
         }
     }

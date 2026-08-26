@@ -76,6 +76,12 @@ pub struct WorkspacePairLease {
     content_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFileHandle {
+    workspace_id: String,
+    inode: u64,
+}
+
 impl std::fmt::Debug for WorkspacePairLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -773,6 +779,55 @@ impl WorkspaceCore {
         read_chunks(&self.chunks, &inode.chunks, inode.size, offset, length)
     }
 
+    pub fn open_file(
+        &self,
+        workspace: &WorkspaceHandle,
+        path: impl AsRef<Path>,
+    ) -> Result<WorkspaceFileHandle> {
+        let path = normalize_path(path.as_ref(), false)?;
+        let inode = self.materialize(workspace, &path)?;
+        if inode.kind != NodeKind::File {
+            return Err(Error::IsDirectory(path));
+        }
+        Ok(WorkspaceFileHandle {
+            workspace_id: workspace.id.clone(),
+            inode: inode.id as u64,
+        })
+    }
+
+    pub fn read_open_file(
+        &self,
+        handle: &WorkspaceFileHandle,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let inode = self.load_open_inode(handle)?;
+        read_chunks(&self.chunks, &inode.chunks, inode.size, offset, length)
+    }
+
+    pub fn write_open_file(
+        &self,
+        handle: &WorkspaceFileHandle,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize> {
+        let inode = self.load_open_inode(handle)?;
+        self.write_inode(&handle.workspace_id, inode, offset, bytes)
+    }
+
+    pub fn truncate_open_file(&self, handle: &WorkspaceFileHandle, size: u64) -> Result<()> {
+        let inode = self.load_open_inode(handle)?;
+        self.truncate_inode(&handle.workspace_id, inode, size)
+    }
+
+    pub fn metadata_open_file(&self, handle: &WorkspaceFileHandle) -> Result<NodeMetadata> {
+        let inode = i64::try_from(handle.inode)
+            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
+        let connection = self.lock_metadata()?;
+        load_metadata_for_inode(&connection, &handle.workspace_id, inode)?
+            .ok_or_else(|| Error::NotFound(format!("open inode {}", handle.inode)))
+    }
+
     pub fn write(
         &self,
         workspace: &WorkspaceHandle,
@@ -781,10 +836,20 @@ impl WorkspaceCore {
         bytes: &[u8],
     ) -> Result<usize> {
         let path = normalize_path(path.as_ref(), false)?;
-        let mut inode = self.materialize(workspace, &path)?;
+        let inode = self.materialize(workspace, &path)?;
         if inode.kind != NodeKind::File {
             return Err(Error::IsDirectory(path));
         }
+        self.write_inode(&workspace.id, inode, offset, bytes)
+    }
+
+    fn write_inode(
+        &self,
+        workspace_id: &str,
+        mut inode: InodeRecord,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -837,11 +902,11 @@ impl WorkspaceCore {
             inode.chunks[index] = id;
         }
         let journal_id = self.begin_namespace_journal(
-            &workspace.id,
+            workspace_id,
             "write",
             &serde_json::to_vec(&(inode.id, new_size, &inode.chunks))?,
         )?;
-        self.update_inode(&workspace.id, inode.id, new_size, &inode.chunks)?;
+        self.update_inode(workspace_id, inode.id, new_size, &inode.chunks)?;
         self.complete_namespace_journal(journal_id)?;
         for id in old {
             self.chunks.unpin(id)?;
@@ -856,10 +921,19 @@ impl WorkspaceCore {
         new_size: u64,
     ) -> Result<()> {
         let path = normalize_path(path.as_ref(), false)?;
-        let mut inode = self.materialize(workspace, &path)?;
+        let inode = self.materialize(workspace, &path)?;
         if inode.kind != NodeKind::File {
             return Err(Error::IsDirectory(path));
         }
+        self.truncate_inode(&workspace.id, inode, new_size)
+    }
+
+    fn truncate_inode(
+        &self,
+        workspace_id: &str,
+        mut inode: InodeRecord,
+        new_size: u64,
+    ) -> Result<()> {
         let required = if new_size == 0 {
             0
         } else {
@@ -888,7 +962,7 @@ impl WorkspaceCore {
                 inode.chunks[last_index] = replacement;
             }
         }
-        self.update_inode(&workspace.id, inode.id, new_size, &inode.chunks)?;
+        self.update_inode(workspace_id, inode.id, new_size, &inode.chunks)?;
         for id in removed {
             self.chunks.unpin(id)?;
         }
@@ -1041,28 +1115,11 @@ impl WorkspaceCore {
         if metadata.kind == NodeKind::Directory && !self.read_dir(workspace, &path)?.is_empty() {
             return Err(Error::DirectoryNotEmpty(path));
         }
-        let inode = self.materialize(workspace, &path)?;
+        let _inode = self.materialize(workspace, &path)?;
         let mut connection = self.lock_metadata()?;
         let transaction = connection.transaction()?;
         insert_tombstone(&transaction, &workspace.id, &path)?;
-        let remaining: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM cow_entries
-             WHERE workspace_id = ?1 AND inode_id = ?2 AND tombstone = 0",
-            params![workspace.id, inode.id],
-            |row| row.get(0),
-        )?;
-        if remaining == 0 {
-            transaction.execute(
-                "DELETE FROM cow_inodes WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace.id, inode.id],
-            )?;
-        }
         transaction.commit()?;
-        if remaining == 0 {
-            for id in inode.chunks {
-                self.chunks.unpin(id)?;
-            }
-        }
         Ok(())
     }
 
@@ -1607,6 +1664,14 @@ impl WorkspaceCore {
         Ok(())
     }
 
+    fn load_open_inode(&self, handle: &WorkspaceFileHandle) -> Result<InodeRecord> {
+        let inode = i64::try_from(handle.inode)
+            .map_err(|_| Error::InvalidPath("workspace inode is out of range".into()))?;
+        let connection = self.lock_metadata()?;
+        load_inode_for_id(&connection, &handle.workspace_id, inode)?
+            .ok_or_else(|| Error::NotFound(format!("open inode {}", handle.inode)))
+    }
+
     fn lock_metadata(&self) -> Result<PooledConnection<'_>> {
         self.metadata.acquire()
     }
@@ -1836,6 +1901,70 @@ fn load_inode_for_path(
             })
         })
         .transpose()
+}
+
+fn load_inode_for_id(
+    connection: &Connection,
+    workspace_id: &str,
+    inode: i64,
+) -> Result<Option<InodeRecord>> {
+    connection
+        .query_row(
+            "SELECT id, kind, size, chunks_json FROM cow_inodes
+             WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, inode],
+            |row| {
+                let chunks: Vec<u8> = row.get(3)?;
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    chunks,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(id, kind, size, chunks)| {
+            Ok(InodeRecord {
+                id,
+                kind: parse_kind(&kind)?,
+                size: size as u64,
+                chunks: serde_json::from_slice(&chunks)?,
+            })
+        })
+        .transpose()
+}
+
+fn load_metadata_for_inode(
+    connection: &Connection,
+    workspace_id: &str,
+    inode: i64,
+) -> Result<Option<NodeMetadata>> {
+    connection
+        .query_row(
+            "SELECT i.id, i.kind, i.mode, i.size,
+                    (SELECT COUNT(*) FROM cow_entries links
+                     WHERE links.workspace_id = i.workspace_id
+                       AND links.inode_id = i.id AND links.tombstone = 0),
+                    i.accessed_unix_ns, i.modified_unix_ns, i.changed_unix_ns
+             FROM cow_inodes i
+             WHERE i.workspace_id = ?1 AND i.id = ?2",
+            params![workspace_id, inode],
+            |row| {
+                Ok(NodeMetadata {
+                    inode: row.get::<_, i64>(0)? as u64,
+                    kind: parse_kind(row.get::<_, String>(1)?.as_str())?,
+                    mode: row.get::<_, i64>(2)? as u32,
+                    size: row.get::<_, i64>(3)? as u64,
+                    nlink: row.get::<_, i64>(4)? as u32,
+                    accessed_unix_ns: row.get(5)?,
+                    modified_unix_ns: row.get(6)?,
+                    changed_unix_ns: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn workspace_chunks(connection: &Connection, workspace_id: &str) -> Result<Vec<ChunkId>> {
@@ -2314,25 +2443,33 @@ mod tests {
     }
 
     #[test]
-    fn unlink_releases_private_chunks_only_after_the_last_hard_link() {
+    fn open_handle_survives_rename_and_the_last_unlink() {
         let (_repo, _storage, core, workspace) = fixture();
         core.create_file(&workspace, "private.bin", 0o100600)
             .unwrap();
         core.write(&workspace, "private.bin", 0, b"private unique bytes")
             .unwrap();
-        core.hard_link(&workspace, "private.bin", "private.link")
+        let handle = core.open_file(&workspace, "private.bin").unwrap();
+        core.rename(&workspace, "private.bin", "renamed.bin")
+            .unwrap();
+        core.write_open_file(&handle, 8, b"stable").unwrap();
+        assert_eq!(
+            core.read(&workspace, "renamed.bin", 0, 64).unwrap(),
+            b"private stable bytes"
+        );
+        core.hard_link(&workspace, "renamed.bin", "private.link")
             .unwrap();
         let inode = core
-            .metadata(&workspace, "private.bin")
+            .metadata(&workspace, "renamed.bin")
             .unwrap()
             .unwrap()
             .inode;
         assert_eq!(
             core.path_for_inode(&workspace, inode).unwrap().as_deref(),
-            Some("private.bin")
+            Some("private.link")
         );
         let before = core.chunks().stats().unwrap().referenced_chunks;
-        core.unlink(&workspace, "private.bin").unwrap();
+        core.unlink(&workspace, "renamed.bin").unwrap();
         assert_eq!(
             core.path_for_inode(&workspace, inode).unwrap().as_deref(),
             Some("private.link")
@@ -2340,11 +2477,17 @@ mod tests {
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before);
         assert_eq!(
             core.read(&workspace, "private.link", 0, 64).unwrap(),
-            b"private unique bytes"
+            b"private stable bytes"
         );
         core.unlink(&workspace, "private.link").unwrap();
         assert_eq!(core.path_for_inode(&workspace, inode).unwrap(), None);
-        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before - 1);
+        assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before);
+        core.write_open_file(&handle, 0, b"PRIVATE").unwrap();
+        assert_eq!(
+            core.read_open_file(&handle, 0, 64).unwrap(),
+            b"PRIVATE stable bytes"
+        );
+        assert_eq!(core.metadata_open_file(&handle).unwrap().nlink, 0);
     }
 
     #[test]

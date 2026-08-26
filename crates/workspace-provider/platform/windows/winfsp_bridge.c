@@ -20,14 +20,20 @@ typedef struct GreppyWindowsStat
 typedef int (*GreppyDirectoryEmitter)(void *, const char *, const GreppyWindowsStat *, uint64_t);
 
 extern int greppy_windows_getattr(void *, const char *, GreppyWindowsStat *);
+extern int greppy_windows_getattr_handle(void *, uint64_t, GreppyWindowsStat *);
+extern int greppy_windows_open(void *, const char *, uint64_t *);
+extern int greppy_windows_release(void *, uint64_t);
 extern int greppy_windows_readdir(void *, const char *, uint64_t, void *, GreppyDirectoryEmitter);
 extern int greppy_windows_create(void *, const char *, uint32_t, int);
 extern int greppy_windows_unlink(void *, const char *, int);
 extern int greppy_windows_rename(void *, const char *, const char *, uint32_t);
 extern int greppy_windows_chmod(void *, const char *, uint32_t);
 extern int greppy_windows_truncate(void *, const char *, uint64_t);
+extern int greppy_windows_truncate_handle(void *, uint64_t, uint64_t);
 extern int greppy_windows_read(void *, const char *, uint64_t, uint8_t *, size_t);
+extern int greppy_windows_read_handle(void *, uint64_t, uint64_t, uint8_t *, size_t);
 extern int greppy_windows_write(void *, const char *, uint64_t, const uint8_t *, size_t);
+extern int greppy_windows_write_handle(void *, uint64_t, uint64_t, const uint8_t *, size_t);
 extern int greppy_windows_symlink(void *, const char *, const char *);
 extern int greppy_windows_hardlink(void *, const char *, const char *);
 extern int greppy_windows_readlink(void *, const char *, uint8_t *, size_t);
@@ -56,8 +62,9 @@ static void copy_stat(struct fuse_stat *destination, const GreppyWindowsStat *so
 static int greppy_getattr(const char *path, struct fuse_stat *value, struct fuse_file_info *file)
 {
     GreppyWindowsStat portable;
-    int result = greppy_windows_getattr(greppy_context(), path, &portable);
-    (void)file;
+    int result = 0 != file && 0 != file->fh
+        ? greppy_windows_getattr_handle(greppy_context(), file->fh, &portable)
+        : greppy_windows_getattr(greppy_context(), path, &portable);
     if (0 == result)
         copy_stat(value, &portable);
     return result;
@@ -98,15 +105,15 @@ static int greppy_mkdir(const char *path, fuse_mode_t mode)
 
 static int greppy_create(const char *path, fuse_mode_t mode, struct fuse_file_info *file)
 {
-    (void)file;
-    return greppy_windows_create(greppy_context(), path, mode, 0);
+    int result = greppy_windows_create(greppy_context(), path, mode, 0);
+    if (0 != result)
+        return result;
+    return greppy_windows_open(greppy_context(), path, &file->fh);
 }
 
 static int greppy_open(const char *path, struct fuse_file_info *file)
 {
-    GreppyWindowsStat value;
-    (void)file;
-    return greppy_windows_getattr(greppy_context(), path, &value);
+    return greppy_windows_open(greppy_context(), path, &file->fh);
 }
 
 static int greppy_unlink(const char *path)
@@ -132,29 +139,35 @@ static int greppy_chmod(const char *path, fuse_mode_t mode, struct fuse_file_inf
 
 static int greppy_truncate(const char *path, fuse_off_t size, struct fuse_file_info *file)
 {
-    (void)file;
     if (size < 0)
         return -EINVAL;
-    return greppy_windows_truncate(greppy_context(), path, (uint64_t)size);
+    return 0 != file && 0 != file->fh
+        ? greppy_windows_truncate_handle(greppy_context(), file->fh, (uint64_t)size)
+        : greppy_windows_truncate(greppy_context(), path, (uint64_t)size);
 }
 
 static int greppy_read(const char *path, char *buffer, size_t size, fuse_off_t offset,
     struct fuse_file_info *file)
 {
-    (void)file;
     if (offset < 0)
         return -EINVAL;
-    return greppy_windows_read(greppy_context(), path, (uint64_t)offset, (uint8_t *)buffer, size);
+    return 0 != file && 0 != file->fh
+        ? greppy_windows_read_handle(greppy_context(), file->fh, (uint64_t)offset,
+            (uint8_t *)buffer, size)
+        : greppy_windows_read(greppy_context(), path, (uint64_t)offset,
+            (uint8_t *)buffer, size);
 }
 
 static int greppy_write(const char *path, const char *buffer, size_t size, fuse_off_t offset,
     struct fuse_file_info *file)
 {
-    (void)file;
     if (offset < 0)
         return -EINVAL;
-    return greppy_windows_write(greppy_context(), path, (uint64_t)offset,
-        (const uint8_t *)buffer, size);
+    return 0 != file && 0 != file->fh
+        ? greppy_windows_write_handle(greppy_context(), file->fh, (uint64_t)offset,
+            (const uint8_t *)buffer, size)
+        : greppy_windows_write(greppy_context(), path, (uint64_t)offset,
+            (const uint8_t *)buffer, size);
 }
 
 static int greppy_symlink(const char *target, const char *path)
@@ -203,8 +216,9 @@ static int greppy_statfs(const char *path, struct fuse_statvfs *value)
 static int greppy_release(const char *path, struct fuse_file_info *file)
 {
     (void)path;
-    (void)file;
-    return 0;
+    return 0 != file && 0 != file->fh
+        ? greppy_windows_release(greppy_context(), file->fh)
+        : 0;
 }
 
 static int greppy_fsync(const char *path, int data_only, struct fuse_file_info *file)

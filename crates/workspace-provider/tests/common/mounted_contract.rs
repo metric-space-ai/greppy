@@ -76,6 +76,15 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     open_handle.write_all(b"-after").unwrap();
     open_handle.sync_all().unwrap();
     assert_eq!(fs::read(&open_destination).unwrap(), b"before-after");
+    fs::remove_file(&open_destination).unwrap();
+    open_handle.seek(SeekFrom::End(0)).unwrap();
+    open_handle.write_all(b"-unlinked").unwrap();
+    open_handle.seek(SeekFrom::Start(0)).unwrap();
+    let mut unlinked_contents = Vec::new();
+    open_handle.read_to_end(&mut unlinked_contents).unwrap();
+    assert_eq!(unlinked_contents, b"before-after-unlinked");
+    drop(open_handle);
+    assert!(!open_destination.exists());
 
     let unicode = root.join("contract-ä-東京.txt");
     fs::write(&unicode, b"unicode").unwrap();

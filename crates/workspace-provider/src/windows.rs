@@ -1,14 +1,17 @@
 use greppy_workspace_core::{
     AdapterKind, Error as CoreError, ErrorKind, NodeKind, NodeMetadata, ProviderCapabilities,
-    ProviderManifest, ProviderState, WorkspaceCore, WorkspaceHandle, PROVIDER_PROTOCOL_VERSION,
+    ProviderManifest, ProviderState, WorkspaceCore, WorkspaceFileHandle, WorkspaceHandle,
+    PROVIDER_PROTOCOL_VERSION,
 };
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -63,6 +66,8 @@ struct WindowsProvider {
     core: WorkspaceCore,
     doctor_root: PathBuf,
     manifest: Arc<RwLock<ProviderManifest>>,
+    open_files: Mutex<HashMap<u64, WorkspaceFileHandle>>,
+    next_open_file: AtomicU64,
 }
 
 pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
@@ -97,6 +102,8 @@ pub fn serve(data_root: PathBuf, mount_root: PathBuf) -> io::Result<()> {
         core,
         doctor_root,
         manifest,
+        open_files: Mutex::new(HashMap::new()),
+        next_open_file: AtomicU64::new(1),
     });
     let mount = CString::new(mount_root.to_string_lossy().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount path contains NUL"))?;
@@ -170,6 +177,27 @@ unsafe extern "C" {
 }
 
 impl WindowsProvider {
+    fn open_file(&self, raw: &str) -> Result<u64, c_int> {
+        let VirtualPath::WorkspacePath { workspace, path } = self.parse(raw)? else {
+            self.metadata(raw)?;
+            return Ok(0);
+        };
+        let workspace = self.workspace(&workspace)?;
+        let file = self.core.open_file(&workspace, path).map_err(core_errno)?;
+        let id = self.next_open_file.fetch_add(1, Ordering::Relaxed);
+        self.open_files.lock().map_err(|_| -EIO)?.insert(id, file);
+        Ok(id)
+    }
+
+    fn open_file_handle(&self, id: u64) -> Result<WorkspaceFileHandle, c_int> {
+        self.open_files
+            .lock()
+            .map_err(|_| -EIO)?
+            .get(&id)
+            .cloned()
+            .ok_or(-ENOENT)
+    }
+
     fn parse(&self, raw: &str) -> Result<VirtualPath, c_int> {
         let normalized = raw.replace('\\', "/");
         let components = normalized
@@ -299,6 +327,144 @@ impl WindowsProvider {
     fn manifest_bytes(&self) -> Result<Vec<u8>, c_int> {
         serde_json::to_vec(&*self.manifest.read().unwrap()).map_err(|_| -EIO)
     }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn greppy_windows_open(
+    context: *mut c_void,
+    path: *const c_char,
+    output: *mut u64,
+) -> c_int {
+    ffi_result(context, path, |provider, raw| {
+        if output.is_null() {
+            return Err(-EINVAL);
+        }
+        let handle = provider.open_file(raw)?;
+        unsafe { ptr::write(output, handle) };
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn greppy_windows_release(context: *mut c_void, handle: u64) -> c_int {
+    let Ok(provider) = provider(context) else {
+        return -EINVAL;
+    };
+    if handle != 0 {
+        let Ok(mut files) = provider.open_files.lock() else {
+            return -EIO;
+        };
+        files.remove(&handle);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn greppy_windows_getattr_handle(
+    context: *mut c_void,
+    handle: u64,
+    output: *mut GreppyWindowsStat,
+) -> c_int {
+    let Ok(provider) = provider(context) else {
+        return -EINVAL;
+    };
+    if output.is_null() {
+        return -EINVAL;
+    }
+    let result = provider
+        .open_file_handle(handle)
+        .and_then(|file| provider.core.metadata_open_file(&file).map_err(core_errno))
+        .map(portable_metadata);
+    match result {
+        Ok(value) => {
+            unsafe { ptr::write(output, value) };
+            0
+        }
+        Err(error) => error,
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn greppy_windows_truncate_handle(
+    context: *mut c_void,
+    handle: u64,
+    size: u64,
+) -> c_int {
+    let Ok(provider) = provider(context) else {
+        return -EINVAL;
+    };
+    provider
+        .open_file_handle(handle)
+        .and_then(|file| {
+            provider
+                .core
+                .truncate_open_file(&file, size)
+                .map_err(core_errno)
+        })
+        .map(|()| 0)
+        .unwrap_or_else(|error| error)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn greppy_windows_read_handle(
+    context: *mut c_void,
+    handle: u64,
+    offset: u64,
+    output: *mut u8,
+    capacity: usize,
+) -> c_int {
+    let Ok(provider) = provider(context) else {
+        return -EINVAL;
+    };
+    if capacity > c_int::MAX as usize || (capacity != 0 && output.is_null()) {
+        return -EINVAL;
+    }
+    let result = provider.open_file_handle(handle).and_then(|file| {
+        provider
+            .core
+            .read_open_file(&file, offset, capacity)
+            .map_err(core_errno)
+    });
+    match result {
+        Ok(bytes) => {
+            if !bytes.is_empty() {
+                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
+            }
+            bytes.len() as c_int
+        }
+        Err(error) => error,
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn greppy_windows_write_handle(
+    context: *mut c_void,
+    handle: u64,
+    offset: u64,
+    bytes: *const u8,
+    length: usize,
+) -> c_int {
+    let Ok(provider) = provider(context) else {
+        return -EINVAL;
+    };
+    if length > c_int::MAX as usize || (length != 0 && bytes.is_null()) {
+        return -EINVAL;
+    }
+    let bytes = if length == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, length) }
+    };
+    provider
+        .open_file_handle(handle)
+        .and_then(|file| {
+            provider
+                .core
+                .write_open_file(&file, offset, bytes)
+                .map_err(core_errno)
+        })
+        .map(|written| written as c_int)
+        .unwrap_or_else(|error| error)
 }
 
 #[unsafe(no_mangle)]
