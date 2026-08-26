@@ -1086,6 +1086,7 @@ dependencies = [
  "clap",
  "filetime",
  "fuser",
+ "greppy-agent",
  "greppy-workspace-core",
  "libc",
  "memmap2",

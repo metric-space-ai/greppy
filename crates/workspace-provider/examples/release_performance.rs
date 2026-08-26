@@ -1,4 +1,5 @@
 use clap::Parser;
+use greppy_agent::workspace::AgentWorkspace;
 use greppy_workspace_core::{capture_repository, ProviderInstallation, WorkspaceCore, CHUNK_SIZE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -102,106 +103,87 @@ fn main() {
         .unwrap_or_else(|error| fail(&format!("cannot read native probe path: {error}")));
     let core = WorkspaceCore::open(args.data_root.join("core"))
         .unwrap_or_else(|error| fail(&format!("cannot open WorkspaceCore: {error}")));
+    std::env::set_var("GREPPY_WORKSPACE_DIR", &args.data_root);
 
-    // Prime schemas, SQLite pages and provider path caches. Measurements start
-    // only after this workspace has been removed.
-    let prime = capture_repository(&args.repository, core.chunks()).unwrap();
-    let prime_handle = core.create_workspace("perf-prime", prime).unwrap();
-    let prime_root = provider.workspace_path(prime_handle.id()).unwrap();
+    // Prime the complete production lifecycle: tracker activation and fence,
+    // full Base/Dirty import, shared Git layer and mounted visibility.
+    let prime = AgentWorkspace::create(&args.repository, "perf-prime").unwrap();
+    let prime_root = prime.worktree_path();
     assert_eq!(
         fs::read(prime_root.join(&args.probe_path)).unwrap(),
         probe_expected
     );
-    core.remove_workspace(prime_handle).unwrap();
+    prime.cleanup().unwrap();
 
     let physical_before = allocated_tree_bytes(&args.data_root);
-    let untouched_baseline = capture_repository(&args.repository, core.chunks()).unwrap();
-    let untouched = core
-        .create_workspace("perf-untouched", untouched_baseline)
-        .unwrap();
-    let untouched_root = provider.workspace_path(untouched.id()).unwrap();
+    let untouched = AgentWorkspace::create(&args.repository, "perf-untouched").unwrap();
+    let untouched_root = untouched.worktree_path();
     assert_eq!(
         fs::read(untouched_root.join(&args.probe_path)).unwrap(),
         probe_expected
     );
     let physical_after = allocated_tree_bytes(&args.data_root);
     let untouched_physical_delta = physical_after.saturating_sub(physical_before);
-    core.remove_workspace(untouched).unwrap();
+    untouched.cleanup().unwrap();
     write_checkpoint(
         &args.output,
         "untouched-space-measured",
         serde_json::json!({"untouched_physical_delta_bytes": untouched_physical_delta}),
     );
 
-    let mut snapshot_ms = Vec::with_capacity(args.iterations);
     let mut visible_ms = Vec::with_capacity(args.iterations);
     let mut end_to_end_ms = Vec::with_capacity(args.iterations);
     for iteration in 0..args.iterations {
         let end_to_end_started = Instant::now();
-        let snapshot_started = Instant::now();
-        let baseline = capture_repository(&args.repository, core.chunks()).unwrap();
-        snapshot_ms.push(snapshot_started.elapsed().as_secs_f64() * 1_000.0);
-        let visible_started = Instant::now();
-        let handle = core
-            .create_workspace(&format!("perf-serial-{iteration}"), baseline)
-            .unwrap();
-        let root = provider.workspace_path(handle.id()).unwrap();
+        let workspace =
+            AgentWorkspace::create(&args.repository, &format!("perf-serial-{iteration}")).unwrap();
+        let root = workspace.worktree_path();
         assert_eq!(
             fs::read(root.join(&args.probe_path)).unwrap(),
             probe_expected
         );
-        visible_ms.push(visible_started.elapsed().as_secs_f64() * 1_000.0);
-        end_to_end_ms.push(end_to_end_started.elapsed().as_secs_f64() * 1_000.0);
-        core.remove_workspace(handle).unwrap();
+        let elapsed = end_to_end_started.elapsed().as_secs_f64() * 1_000.0;
+        visible_ms.push(elapsed);
+        end_to_end_ms.push(elapsed);
+        workspace.cleanup().unwrap();
     }
     write_checkpoint(
         &args.output,
         "serial-workspaces-measured",
-        serde_json::json!({"snapshot_ms": &snapshot_ms, "visible_ms": &visible_ms, "end_to_end_ms": &end_to_end_ms}),
+        serde_json::json!({"measurement": "AgentWorkspace::create through tracker fence, cached baseline, private Git state and mounted visibility", "visible_ms": &visible_ms, "end_to_end_ms": &end_to_end_ms}),
     );
 
     let parallel_started = Instant::now();
-    let parallel_baseline = capture_repository(&args.repository, core.chunks()).unwrap();
-    let parallel_owner = core
-        .create_workspace("perf-parallel-owner", parallel_baseline.clone())
-        .unwrap();
-    let owner_root = provider.workspace_path(parallel_owner.id()).unwrap();
+    let parallel_owner = AgentWorkspace::create(&args.repository, "perf-parallel-owner").unwrap();
+    let owner_root = parallel_owner.worktree_path();
     assert_eq!(
         fs::read(owner_root.join(&args.probe_path)).unwrap(),
         probe_expected
     );
-    let data_root = args.data_root.clone();
     let probe_path = args.probe_path.clone();
     let probe_expected_parallel = probe_expected.clone();
     let workers = (1..args.parallel)
         .map(|index| {
-            let data_root = data_root.clone();
+            let repository = args.repository.clone();
             let probe_path = probe_path.clone();
             let expected = probe_expected_parallel.clone();
-            let baseline = parallel_baseline.clone();
             thread::spawn(move || {
-                let core = WorkspaceCore::open(data_root.join("core")).unwrap();
-                let provider = ProviderInstallation::require_healthy(&data_root).unwrap();
-                let handle = core
-                    .create_workspace_from_shared_baseline(
-                        &format!("perf-parallel-{index}"),
-                        &baseline,
-                    )
-                    .unwrap();
-                let root = provider.workspace_path(handle.id()).unwrap();
+                let workspace =
+                    AgentWorkspace::create(&repository, &format!("perf-parallel-{index}")).unwrap();
+                let root = workspace.worktree_path();
                 assert_eq!(fs::read(root.join(probe_path)).unwrap(), expected);
-                handle
+                workspace
             })
         })
         .collect::<Vec<_>>();
-    let mut handles = workers
+    let mut workspaces = workers
         .into_iter()
         .map(|worker| worker.join().unwrap())
         .collect::<Vec<_>>();
-    handles.push(parallel_owner);
+    workspaces.push(parallel_owner);
     let parallel_ms = parallel_started.elapsed().as_secs_f64() * 1_000.0;
-    for handle in handles {
-        core.remove_workspace(handle).unwrap();
+    for workspace in workspaces {
+        workspace.cleanup().unwrap();
     }
     write_checkpoint(
         &args.output,
@@ -268,7 +250,7 @@ fn main() {
             serde_json::from_str::<ToolchainCase>(raw)
                 .unwrap_or_else(|error| fail(&format!("invalid --toolchain-case JSON: {error}")))
         })
-        .map(|case| measure_toolchain(&core, &provider, &args.repository, case))
+        .map(|case| measure_toolchain(&args.repository, case))
         .collect::<Vec<_>>();
     write_checkpoint(
         &args.output,
@@ -280,8 +262,6 @@ fn main() {
     let visible_p95_ms = percentile(&visible_ms, 95);
     let end_to_end_p50_ms = percentile(&end_to_end_ms, 50);
     let end_to_end_p95_ms = percentile(&end_to_end_ms, 95);
-    let snapshot_p50_ms = percentile(&snapshot_ms, 50);
-    let snapshot_p95_ms = percentile(&snapshot_ms, 95);
     let provider_sha256 = sha256_file(&args.provider_binary);
     let fixture_commit = git(&args.repository, &["rev-parse", "HEAD"]);
     let native_worktree_p50_ms = percentile(&native_worktree_ms, 50);
@@ -313,8 +293,9 @@ fn main() {
         "fixture_tracked_files": tracked_files,
         "iterations": args.iterations,
         "workspace_creation": {
-            "snapshot_p50_ms": snapshot_p50_ms,
-            "snapshot_p95_ms": snapshot_p95_ms,
+            "snapshot_p50_ms": null,
+            "snapshot_p95_ms": null,
+            "measurement": "AgentWorkspace::create through tracker fence, cached baseline, private Git state and mounted visibility",
             "visible_p50_ms": visible_p50_ms,
             "visible_p95_ms": visible_p95_ms,
             "end_to_end_p50_ms": end_to_end_p50_ms,
@@ -382,20 +363,13 @@ fn main() {
     }
 }
 
-fn measure_toolchain(
-    core: &WorkspaceCore,
-    provider: &ProviderInstallation,
-    repository: &Path,
-    case: ToolchainCase,
-) -> ToolchainResult {
+fn measure_toolchain(repository: &Path, case: ToolchainCase) -> ToolchainResult {
     if case.argv.is_empty() {
         fail("toolchain argv must not be empty");
     }
-    let baseline = capture_repository(repository, core.chunks()).unwrap();
-    let handle = core
-        .create_workspace(&format!("perf-toolchain-{}", case.name), baseline)
-        .unwrap();
-    let workspace = provider.workspace_path(handle.id()).unwrap();
+    let workspace_handle =
+        AgentWorkspace::create(repository, &format!("perf-toolchain-{}", case.name)).unwrap();
+    let workspace = workspace_handle.worktree_path();
     let native_cwd = repository.join(&case.cwd);
     let workspace_cwd = workspace.join(&case.cwd);
     run_argv(&native_cwd, &case.argv);
@@ -411,7 +385,7 @@ fn measure_toolchain(
             native_samples.push(timed_argv(&native_cwd, &case.argv).as_secs_f64() * 1_000.0);
         }
     }
-    core.remove_workspace(handle).unwrap();
+    workspace_handle.cleanup().unwrap();
     let native_ms = percentile(&native_samples, 50);
     let workspace_ms = percentile(&workspace_samples, 50);
     let overhead = if native_ms == 0.0 {
