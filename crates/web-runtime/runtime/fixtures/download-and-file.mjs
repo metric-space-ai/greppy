@@ -1,9 +1,19 @@
 import { chromium } from "playwright";
 
+function toHex(bytes) {
+  const view = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : new Uint8Array(bytes);
+  let out = "";
+  for (let i = 0; i < view.length; i++) {
+    out += (view[i] + 256).toString(16).slice(-2);
+  }
+  return out;
+}
+
 const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
 const payload = Uint8Array.from([0xff, 0xfe, 0x00, 0x80, 0x41]);
+const expectedHex = "fffe008041";
 await page.route("**/data.bin", (route) =>
   route.fulfill({
     body: payload,
@@ -15,20 +25,13 @@ await page.goto(fixtureUrl);
 await page.evaluate((url) => fetch(url), fixtureUrl + "data.bin");
 const response = await page.waitForResponse("data.bin");
 const raw = await response.body();
-const view = raw instanceof ArrayBuffer ? new Uint8Array(raw) : new Uint8Array(raw);
-if (
-  view.length !== 5 ||
-  view[0] !== 0xff ||
-  view[1] !== 0xfe ||
-  view[2] !== 0x00 ||
-  view[3] !== 0x80 ||
-  view[4] !== 0x41
-) {
-  throw new Error("binary body " + Array.from(view).join(","));
+if (toHex(raw) !== expectedHex) {
+  throw new Error("Response.body hex " + toHex(raw) + " expected " + expectedHex);
 }
 const asText = await response.text();
-if (asText.includes("\uFFFD") === false && view[0] === 0xff) {
-  // TextDecoder may produce replacement characters; it must not be the stored form.
+const afterText = await response.body();
+if (toHex(afterText) !== expectedHex) {
+  throw new Error("Response.body changed after text(): " + toHex(afterText) + " text=" + JSON.stringify(asText));
 }
 const download = await page.waitForEvent("download");
 if (!download || !String(download.url()).includes("data.bin")) {

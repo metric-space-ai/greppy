@@ -59,6 +59,15 @@ function decodeBase64(binary) {
   return Uint8Array.from(out);
 }
 
+function hexEncode(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let out = "";
+  for (let i = 0; i < arr.length; i++) {
+    out += (arr[i] + 256).toString(16).slice(-2);
+  }
+  return out;
+}
+
 function encodeBase64(bytes) {
   const alphabet =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1215,6 +1224,10 @@ class Page {
           throw new Error(
             "saveAs wrote " + result.bytes + " bytes, expected " + rec.byteLength,
           );
+        }
+        const expectedHex = hexEncode(decodeBase64(rec.bodyBase64 || ""));
+        if (String(result.hex) !== expectedHex) {
+          throw new Error("saveAs hex " + result.hex + " expected " + expectedHex);
         }
         rec.path = String(path);
       },

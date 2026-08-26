@@ -1103,19 +1103,17 @@ impl ContentEngine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("continue")
                     .to_owned();
-                let body = if let Some(b64) = params
-                    .get("bodyBase64")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.is_empty())
-                {
-                    base64_decode(b64)?
-                } else {
-                    params
-                        .get("body")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .as_bytes()
-                        .to_vec()
+                let body = match params.get("bodyBase64").and_then(|value| value.as_str()) {
+                    Some(b64) if !b64.is_empty() => base64_decode(b64)?,
+                    Some(_) => Vec::new(),
+                    None => {
+                        if params.get("body").is_some() {
+                            return Err(io::Error::other(
+                                "fulfill body must be bodyBase64; UTF-8 strings are not a canonical body",
+                            ));
+                        }
+                        Vec::new()
+                    }
                 };
                 let status = params.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                 let content_type = params
@@ -1214,7 +1212,11 @@ impl ContentEngine {
                 if written != bytes {
                     return Err(io::Error::other("saveDownload readback mismatch"));
                 }
-                Ok(json!({ "ok": true, "bytes": written.len() }))
+                Ok(json!({
+                    "ok": true,
+                    "bytes": written.len(),
+                    "hex": hex_encode(&written),
+                }))
             }
             "page.popups" => {
                 let page_id = required_str(&params, "page")?;
@@ -1880,6 +1882,16 @@ fn base64_decode(input: &str) -> io::Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn is_parent_eof(error: &io::Error) -> bool {

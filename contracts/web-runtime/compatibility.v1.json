@@ -9162,7 +9162,8 @@
       "known_differences": [
         "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body.",
         "writes decoded intercept bytes to the caller path; Playwright auto temp path is not created",
-        "binary octet-stream fulfill only; not Chromium-oracle compared"
+        "binary octet-stream fulfill only; not Chromium-oracle compared",
+        "exact non-UTF8 bytes [ff fe 00 80 41] compared on Response.body and Download.saveAs hex; intercept-only, behavior unverified"
       ]
     },
     {
@@ -10030,7 +10031,8 @@
         "intercept bodies are stored as base64 plus byteLength; UTF-8 is decoded only in Response.text(). String::from_utf8_lossy is not used as the canonical body.",
         "returns a Uint8Array of intercept bytes, not a Node Buffer",
         "only route.fulfill intercepts; unintercepted navigations are unsupported",
-        "not Chromium-oracle compared; not marked behavior passing"
+        "not Chromium-oracle compared; not marked behavior passing",
+        "exact non-UTF8 bytes [ff fe 00 80 41] compared on Response.body and Download.saveAs hex; intercept-only, behavior unverified"
       ]
     },
     {
