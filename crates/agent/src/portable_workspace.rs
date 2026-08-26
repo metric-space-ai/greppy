@@ -6,7 +6,7 @@
 
 use greppy_workspace_core::{
     capture_repository, BaselineEntry, BaselineSnapshot, ChunkStore, EntryKind,
-    ProviderInstallation, WorkspaceCore, WorkspaceHandle,
+    ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -173,7 +173,7 @@ impl AgentWorkspace {
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
         recover_apply_journals(&core)?;
-        let baseline = capture_repository(repo_root, core.chunks())?;
+        let baseline = capture_tracked_repository(repo_root, &core)?;
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
@@ -404,6 +404,70 @@ impl AgentWorkspace {
         }
         Ok(())
     }
+}
+
+fn capture_tracked_repository(
+    repository: &Path,
+    core: &WorkspaceCore,
+) -> Result<BaselineSnapshot, WorkspaceError> {
+    let repository = fs::canonicalize(repository)?;
+    core.request_repository_tracker(&repository)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let active = loop {
+        if let Some(status) = core.repository_tracker_status(&repository)? {
+            if status.state == RepositoryTrackerState::Active {
+                break status;
+            }
+            if status.state == RepositoryTrackerState::Gap {
+                return Err(WorkspaceError::AdapterUnavailable(format!(
+                    "repository tracker has an event gap: {}",
+                    status
+                        .detail
+                        .unwrap_or_else(|| "unknown watcher failure".into())
+                )));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(WorkspaceError::AdapterUnavailable(
+                "repository tracker did not become active within three seconds".into(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    for attempt in 0..2 {
+        let before = core
+            .repository_tracker_status(&repository)?
+            .ok_or_else(|| {
+                WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+            })?;
+        if before.state != RepositoryTrackerState::Active || before.epoch != active.epoch {
+            return Err(WorkspaceError::AdapterUnavailable(
+                "repository tracker restarted before snapshot capture".into(),
+            ));
+        }
+        let mut baseline = capture_repository(&repository, core.chunks())?;
+        let after = core
+            .repository_tracker_status(&repository)?
+            .ok_or_else(|| {
+                WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+            })?;
+        if after.state == RepositoryTrackerState::Active
+            && after.epoch == before.epoch
+            && after.generation == before.generation
+        {
+            baseline.tracker_epoch = Some(after.epoch);
+            baseline.tracker_generation = Some(after.generation);
+            return Ok(baseline);
+        }
+        release_snapshot(core.chunks(), baseline);
+        if attempt == 1 {
+            return Err(WorkspaceError::Unsupported(
+                "repository changed during both snapshot attempts".into(),
+            ));
+        }
+    }
+    unreachable!("two bounded snapshot attempts")
 }
 
 /// Apply a persisted proposal after its agent workspace has been cleaned up.
@@ -1629,6 +1693,14 @@ mod tests {
         let data = temp.path().join("provider-data");
         let mount = temp.path().join("provider-mount");
         publish_provider(&data, &mount);
+        let tracker_core = WorkspaceCore::open(data.join("core")).unwrap();
+        let tracked_repo = fs::canonicalize(&repo).unwrap();
+        tracker_core
+            .request_repository_tracker(&tracked_repo)
+            .unwrap();
+        tracker_core
+            .activate_repository_tracker(&tracked_repo, 1)
+            .unwrap();
         let worktree = mount.join("workspaces/test-run");
         fs::create_dir_all(&worktree).unwrap();
         fs::write(worktree.join(".gitignore"), "cache/\n").unwrap();

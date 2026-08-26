@@ -11,6 +11,7 @@ mod namespace;
 mod path_policy;
 mod provider;
 mod repository_layers;
+mod repository_tracker;
 mod snapshot;
 
 pub use chunk_store::{ChunkGcReport, ChunkId, ChunkStore, ChunkStoreStats, CHUNK_SIZE};
@@ -22,5 +23,8 @@ pub use namespace::{
 pub use provider::{
     AdapterKind, ProviderCapabilities, ProviderInstallation, ProviderManifest, ProviderState,
     PROVIDER_PROTOCOL_VERSION,
+};
+pub use repository_tracker::{
+    RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,
 };
 pub use snapshot::{capture_repository, BaselineEntry, BaselineSnapshot, EntryKind};

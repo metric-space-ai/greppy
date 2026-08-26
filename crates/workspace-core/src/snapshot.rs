@@ -40,6 +40,10 @@ pub struct BaselineSnapshot {
     pub index_hash: String,
     pub index_chunks: Vec<ChunkId>,
     pub entries: Vec<BaselineEntry>,
+    #[serde(default)]
+    pub tracker_epoch: Option<u64>,
+    #[serde(default)]
+    pub tracker_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +136,8 @@ fn capture_once(
         index_hash: first.index_hash.clone(),
         index_chunks,
         entries,
+        tracker_epoch: None,
+        tracker_generation: None,
     })
 }
 

@@ -1,4 +1,5 @@
 use crate::repository_layers::{self, LayerKind};
+use crate::repository_tracker;
 use crate::{BaselineSnapshot, ChunkGcReport, ChunkId, ChunkStore, Error, Result, CHUNK_SIZE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -208,6 +209,7 @@ impl WorkspaceCore {
              );",
         )?;
         repository_layers::install_schema(&connection)?;
+        repository_tracker::install_schema(&connection)?;
         let core = Self {
             root,
             chunks,
@@ -376,6 +378,63 @@ impl WorkspaceCore {
         repository_layers::remove_unreferenced(&mut connection, &self.chunks)?;
         drop(connection);
         self.chunks.gc()
+    }
+
+    pub fn request_repository_tracker(&self, repository: &Path) -> Result<()> {
+        let connection = self.lock_metadata()?;
+        repository_tracker::request(&connection, repository)
+    }
+
+    pub fn pending_repository_trackers(&self) -> Result<Vec<PathBuf>> {
+        let connection = self.lock_metadata()?;
+        repository_tracker::pending(&connection)
+    }
+
+    pub fn activate_repository_tracker(
+        &self,
+        repository: &Path,
+        heartbeat_unix_ms: u64,
+    ) -> Result<crate::RepositoryTrackerStatus> {
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::activate(&mut connection, repository, heartbeat_unix_ms)
+    }
+
+    pub fn record_repository_changes(
+        &self,
+        repository: &Path,
+        paths: &[String],
+        heartbeat_unix_ms: u64,
+    ) -> Result<()> {
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::record(&mut connection, repository, paths, heartbeat_unix_ms)
+    }
+
+    pub fn mark_repository_tracker_gap(
+        &self,
+        repository: &Path,
+        detail: &str,
+        heartbeat_unix_ms: u64,
+    ) -> Result<()> {
+        let connection = self.lock_metadata()?;
+        repository_tracker::mark_gap(&connection, repository, detail, heartbeat_unix_ms)
+    }
+
+    pub fn repository_tracker_status(
+        &self,
+        repository: &Path,
+    ) -> Result<Option<crate::RepositoryTrackerStatus>> {
+        let connection = self.lock_metadata()?;
+        repository_tracker::status(&connection, repository)
+    }
+
+    pub fn repository_changes_since(
+        &self,
+        repository: &Path,
+        epoch: u64,
+        generation: u64,
+    ) -> Result<crate::RepositoryChangeBatch> {
+        let connection = self.lock_metadata()?;
+        repository_tracker::changes_since(&connection, repository, epoch, generation)
     }
 
     pub fn metadata(
