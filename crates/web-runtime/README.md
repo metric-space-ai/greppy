@@ -77,7 +77,34 @@ Verified checkpoint evidence:
 - the real process-boundary integration smoke passes with both engines constructed and normally dropped;
 - isolated symbol inspection confirms the supervisor contains neither engine, the controller contains V8 but no Servo/mozjs, and the content worker contains Servo/mozjs but no `deno_core`/`rusty_v8`.
 
-This proves only dependency, framing, process isolation, and lifecycle viability. It does **not** yet implement the Playwright module, browser operations, Servo control bindings, or a single-file signed distribution.
+This proves only dependency, framing, process isolation, and lifecycle viability. It is not a Playwright compatibility claim by itself.
+
+### Phase 1 vertical spike (verified locally)
+
+The same three processes now execute the guide's unchanged Playwright script:
+
+```javascript
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+await page.getByRole("button", { name: "Load" }).click();
+await page.getByLabel("Query").fill("greppy");
+const result = await page.locator("main").innerText();
+const value = await page.evaluate(() => document.title);
+await browser.close();
+```
+
+The controller worker loads a virtual `playwright` module in `deno_core`, `firefox`/`webkit` launch fail with `browser_engine_not_available`, and other missing methods fail with `unsupported_playwright_operation`. The supervisor forwards engine calls. The content worker hosts a Servo `WebView` (`SoftwareRenderingContext`), navigates, waits for real layout via `getBoundingClientRect()`, clicks with Servo input events, fills through the page realm, and evaluates `document.title` in SpiderMonkey.
+
+Verified:
+
+```
+greppy bash-smart -- cargo test --manifest-path crates/web-runtime/Cargo.toml -p web-runtime --features controller-runtime,content-runtime --test phase1-spike -- --nocapture
+```
+
+`unchanged_playwright_script_controls_servo_across_process_boundary` passed in 9.35s (exit 0) on macOS. The fixture hydrates the button/label/main tree with `queueMicrotask` after first paint. This is an **experimental web-runtime spike**, not product Playwright compatibility, not a signed distributable, and not a Linux/Windows CI receipt.
 
 ### Alternative one-process experiment
 
@@ -85,6 +112,6 @@ The alternative one-process experiment is: vendor `mozjs_sys`, rebuild with `MOZ
 
 ## IPC
 
-Worker IPC v1 is implemented for the lifecycle checkpoint. Every frame is a 32-bit unsigned big-endian payload length followed by UTF-8 JSON, with a 1 MiB maximum; it is never JSON Lines. Every message carries schema `greppy.web-runtime.worker.v1` and version `1`. The current closed message set is `Hello`, `Ready`, `Shutdown`, and `ShutdownAck`.
+Worker IPC v1 is length-delimited (32-bit unsigned big-endian payload length, compact UTF-8 JSON, 1 MiB maximum), never JSON Lines. Every message carries schema `greppy.web-runtime.worker.v1` and version `1`. The closed message set is `Hello`, `Ready`, `Shutdown`, `ShutdownAck`, `RunScript`, `ScriptComplete`, `EngineCall`, and `EngineResult`.
 
-This worker protocol is intentionally smaller than the future Greppy client/supervisor and Playwright operation protocols.
+This worker protocol is still smaller than the Greppy client/supervisor protocol in `contracts/web-runtime/protocol.v1.schema.json`.

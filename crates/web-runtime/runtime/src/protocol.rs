@@ -17,7 +17,7 @@ pub enum WorkerKind {
     Content,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum Message {
     Hello {
@@ -38,6 +38,35 @@ pub enum Message {
         schema: ProtocolSchema,
         version: u32,
         worker: WorkerKind,
+    },
+    RunScript {
+        schema: ProtocolSchema,
+        version: u32,
+        specifier: String,
+        source: String,
+        fixture_url: String,
+    },
+    ScriptComplete {
+        schema: ProtocolSchema,
+        version: u32,
+        ok: bool,
+        result: serde_json::Value,
+        error: Option<String>,
+    },
+    EngineCall {
+        schema: ProtocolSchema,
+        version: u32,
+        request_id: u64,
+        method: String,
+        params: serde_json::Value,
+    },
+    EngineResult {
+        schema: ProtocolSchema,
+        version: u32,
+        request_id: u64,
+        ok: bool,
+        result: serde_json::Value,
+        error: Option<String>,
     },
 }
 
@@ -73,12 +102,62 @@ impl Message {
         }
     }
 
+    pub fn run_script(specifier: String, source: String, fixture_url: String) -> Self {
+        Self::RunScript {
+            schema: ProtocolSchema::WorkerV1,
+            version: PROTOCOL_VERSION,
+            specifier,
+            source,
+            fixture_url,
+        }
+    }
+
+    pub fn script_complete(ok: bool, result: serde_json::Value, error: Option<String>) -> Self {
+        Self::ScriptComplete {
+            schema: ProtocolSchema::WorkerV1,
+            version: PROTOCOL_VERSION,
+            ok,
+            result,
+            error,
+        }
+    }
+
+    pub fn engine_call(request_id: u64, method: String, params: serde_json::Value) -> Self {
+        Self::EngineCall {
+            schema: ProtocolSchema::WorkerV1,
+            version: PROTOCOL_VERSION,
+            request_id,
+            method,
+            params,
+        }
+    }
+
+    pub fn engine_result(
+        request_id: u64,
+        ok: bool,
+        result: serde_json::Value,
+        error: Option<String>,
+    ) -> Self {
+        Self::EngineResult {
+            schema: ProtocolSchema::WorkerV1,
+            version: PROTOCOL_VERSION,
+            request_id,
+            ok,
+            result,
+            error,
+        }
+    }
+
     fn validate_version(self) -> io::Result<Self> {
         let version = match self {
             Self::Hello { version, .. }
             | Self::Ready { version, .. }
             | Self::Shutdown { version, .. }
-            | Self::ShutdownAck { version, .. } => version,
+            | Self::ShutdownAck { version, .. }
+            | Self::RunScript { version, .. }
+            | Self::ScriptComplete { version, .. }
+            | Self::EngineCall { version, .. }
+            | Self::EngineResult { version, .. } => version,
         };
         if version != PROTOCOL_VERSION {
             return Err(invalid_data(format!(
@@ -146,6 +225,32 @@ fn validate_fields(value: &serde_json::Value) -> io::Result<()> {
     let allowed_fields: &[&str] = match message_type {
         "Hello" | "Ready" | "ShutdownAck" => &["type", "schema", "version", "worker"],
         "Shutdown" => &["type", "schema", "version"],
+        "RunScript" => &[
+            "type",
+            "schema",
+            "version",
+            "specifier",
+            "source",
+            "fixture_url",
+        ],
+        "ScriptComplete" => &["type", "schema", "version", "ok", "result", "error"],
+        "EngineCall" => &[
+            "type",
+            "schema",
+            "version",
+            "request_id",
+            "method",
+            "params",
+        ],
+        "EngineResult" => &[
+            "type",
+            "schema",
+            "version",
+            "request_id",
+            "ok",
+            "result",
+            "error",
+        ],
         other => return Err(invalid_data(format!("unknown protocol type {other:?}"))),
     };
     if let Some(unknown) = object
@@ -187,6 +292,26 @@ mod tests {
             Message::shutdown_ack(WorkerKind::Controller),
         ];
 
+        for expected in messages {
+            let mut bytes = Vec::new();
+            write_message(&mut bytes, &expected).unwrap();
+            let actual = read_message(&mut Cursor::new(bytes)).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn round_trips_engine_and_script_messages() {
+        let messages = [
+            Message::run_script(
+                "file:///tmp/spike.mjs".to_owned(),
+                "import { chromium } from \"playwright\";".to_owned(),
+                "data:text/html,hi".to_owned(),
+            ),
+            Message::script_complete(true, serde_json::json!({"ok": true}), None),
+            Message::engine_call(7, "page.goto".to_owned(), serde_json::json!({"url": "x"})),
+            Message::engine_result(7, true, serde_json::json!({"url": "x"}), None),
+        ];
         for expected in messages {
             let mut bytes = Vec::new();
             write_message(&mut bytes, &expected).unwrap();

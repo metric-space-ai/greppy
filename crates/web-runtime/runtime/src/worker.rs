@@ -1,5 +1,45 @@
 use crate::protocol::{read_message, write_message, Message, WorkerKind};
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
+
+pub fn require_capability(args: impl IntoIterator<Item = OsString>) -> io::Result<String> {
+    let mut capability = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--capability") => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing value after --capability",
+                    )
+                })?;
+                if value.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "empty --capability token",
+                    ));
+                }
+                if capability.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate --capability",
+                    ));
+                }
+                capability = Some(value);
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown worker argument {argument:?}"),
+                ));
+            }
+        }
+    }
+    capability
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --capability TOKEN"))
+        .map(|value| value.to_string_lossy().into_owned())
+}
 
 pub fn run_worker<R, W, T>(
     worker: WorkerKind,
@@ -77,6 +117,16 @@ mod tests {
             read_message(&mut output).unwrap(),
             Message::shutdown_ack(WorkerKind::Controller)
         );
+    }
+
+    #[test]
+    fn require_capability_reads_the_token() {
+        let token = require_capability([
+            std::ffi::OsString::from("--capability"),
+            std::ffi::OsString::from("secret-token"),
+        ])
+        .unwrap();
+        assert_eq!(token, "secret-token");
     }
 
     #[test]

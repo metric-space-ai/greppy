@@ -8,24 +8,26 @@ Archive SHA-256: 331e15df72165ca15b3945970c6870c4b7367be116ded058fda4f41190b265b
 License: MPL-2.0 (verified)
 Rust-version fact: 1.88.0
 
-This document is the Phase 0 embedding-gap inventory required by `docs/PLAYWRIGHT_INTERACTIVE_WEB_RUNTIME_GUIDE.md` section 12. It maps required engine behavior onto hooks the Greppy `WebEngine` trait needs. It does **not** describe a Servo API that was read from crate source.
+This document is the Phase 0 embedding-gap inventory required by `docs/PLAYWRIGHT_INTERACTIVE_WEB_RUNTIME_GUIDE.md` section 12. It maps required engine behavior onto hooks the Greppy `WebEngine` trait needs.
 
 ## 1. Inspection record
 
-Local inspection of servo 0.5.0 **did not succeed**. No embedding API names, traits, or method signatures from the crate are recorded here, because inventing them would be a false inventory.
+Local inspection of servo 0.5.0 **succeeded** after the crate was fetched as a `crates/web-runtime` dependency. Extracted path:
 
-Paths checked (none contained `servo-0.5.0`):
+`/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/servo-0.5.0`
 
-- `/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/servo-0.5.0`
-- `/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/` (present neighbor: `servo_arc-0.4.3` only)
-- `/Users/michaelwelsch/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/` (no `servo-0.5.0` crate archive)
-- `/Users/michaelwelsch/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rv/servo`
-- `/Users/michaelwelsch/.cargo/git/checkouts/` (no servo checkout)
-- `/Users/michaelwelsch/Documents/greppy/vendor` (absent)
+Phase 1 uses these embedding APIs from that crate:
 
-Why: the crate is not a current Greppy workspace dependency, so Cargo has not extracted it. Phase 0 MUST NOT download it to invent an API.
+- `ServoBuilder::default().build()` — `servo.rs`
+- `SoftwareRenderingContext::new(PhysicalSize)`
+- `WebViewBuilder::new(&Servo, Rc<dyn RenderingContext>).delegate(...).build()` — `webview.rs`
+- `WebView::show`, `focus`, `load`, `paint`, `evaluate_javascript`, `notify_input_event`, `load_status`, `url`
+- `Servo::spin_event_loop`
+- `EventLoopWaker` — `servo-embedder-traits-0.5.0`
 
-Status of every hook below: `unverified` against crate source. That is not `unsupported-because-we-guessed`. Later phases MUST inspect the extracted crate at this exact version and revision, then replace `unverified` with `present`, `missing`, or `partial` using the actual embedding API.
+Accessibility tree updates exist (`WebViewDelegate::notify_accessibility_tree_update`) but the Phase 1 spike resolves role/label via page-realm JavaScript plus real `getBoundingClientRect()` layout, not AccessKit.
+
+`present` below means the crate exposes a general-purpose API that the spike used. It does not mean Playwright behavior compatibility. Remaining table rows that the spike did not exercise stay as previously recorded until they are implemented.
 
 ## 2. Servo change process (guide §12.2)
 

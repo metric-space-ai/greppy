@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Greppy Spike</title>
+  </head>
+  <body>
+    <div id="root">hydrating</div>
+    <script>
+      function hydrate() {
+        document.getElementById("root").innerHTML =
+          '<button type="button" id="load">Load</button>' +
+          '<label for="query">Query</label>' +
+          '<input id="query" name="query" />' +
+          "<main>idle</main>";
+        document.getElementById("load").addEventListener("click", function () {
+          var query = document.getElementById("query").value;
+          document.querySelector("main").textContent = "loaded:" + query;
+          document.title = "Greppy Spike Loaded";
+        });
+      }
+      queueMicrotask(hydrate);
+    </script>
+  </body>
+</html>

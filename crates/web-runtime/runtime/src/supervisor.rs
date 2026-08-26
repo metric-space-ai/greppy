@@ -1,6 +1,7 @@
 use crate::protocol::{read_message, write_message, Message, WorkerKind};
 use std::ffi::OsString;
-use std::io::{self, BufReader, BufWriter};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -8,18 +9,23 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Config {
     pub controller_worker: PathBuf,
     pub content_worker: PathBuf,
+    pub script: Option<PathBuf>,
+    pub fixture_url: Option<String>,
 }
 
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut controller_worker = None;
         let mut content_worker = None;
+        let mut script = None;
+        let mut fixture_url = None;
         let mut args = args.into_iter();
 
         while let Some(argument) = args.next() {
@@ -30,6 +36,23 @@ impl Config {
                 Some("--content-worker") => {
                     set_path(&mut content_worker, "--content-worker", args.next())?;
                 }
+                Some("--script") => {
+                    set_path(&mut script, "--script", args.next())?;
+                }
+                Some("--fixture-url") => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "missing value after --fixture-url".to_owned())?;
+                    let value = value
+                        .into_string()
+                        .map_err(|value| format!("invalid --fixture-url {value:?}"))?;
+                    if value.is_empty() {
+                        return Err("empty value after --fixture-url".to_owned());
+                    }
+                    if fixture_url.replace(value).is_some() {
+                        return Err("duplicate --fixture-url".to_owned());
+                    }
+                }
                 _ => return Err(format!("unknown argument {argument:?}")),
             }
         }
@@ -39,6 +62,8 @@ impl Config {
                 .ok_or_else(|| "missing --controller-worker PATH".to_owned())?,
             content_worker: content_worker
                 .ok_or_else(|| "missing --content-worker PATH".to_owned())?,
+            script,
+            fixture_url,
         })
     }
 }
@@ -60,13 +85,27 @@ fn set_path(
 }
 
 pub fn run(config: Config) -> io::Result<()> {
-    let mut controller = WorkerProcess::spawn(&config.controller_worker, WorkerKind::Controller)?;
+    let mut controller = WorkerProcess::spawn(
+        &config.controller_worker,
+        WorkerKind::Controller,
+        random_capability()?,
+    )?;
     controller.handshake()?;
     println!("web_runtime.controller=ready");
 
-    let mut content = WorkerProcess::spawn(&config.content_worker, WorkerKind::Content)?;
+    let mut content = WorkerProcess::spawn(
+        &config.content_worker,
+        WorkerKind::Content,
+        random_capability()?,
+    )?;
     content.handshake()?;
     println!("web_runtime.content=ready");
+
+    if let Some(script) = &config.script {
+        let fixture_url = config.fixture_url.clone().unwrap_or_default();
+        run_script(&mut controller, &mut content, script, fixture_url)?;
+        println!("web_runtime.script=ok");
+    }
 
     content.shutdown()?;
     println!("web_runtime.content=stopped");
@@ -74,6 +113,127 @@ pub fn run(config: Config) -> io::Result<()> {
     println!("web_runtime.controller=stopped");
     println!("web_runtime.supervisor=stopped");
     Ok(())
+}
+
+fn random_capability() -> io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn run_script(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    script: &Path,
+    fixture_url: String,
+) -> io::Result<()> {
+    let source = std::fs::read_to_string(script).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read script {}: {error}", script.display()),
+        )
+    })?;
+    let specifier = script
+        .canonicalize()
+        .unwrap_or_else(|_| script.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    controller.send(&Message::run_script(specifier, source, fixture_url))?;
+
+    let deadline = Instant::now() + SCRIPT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {SCRIPT_TIMEOUT:?} running controller script"),
+            ));
+        }
+        match recv_any(controller, content, remaining)? {
+            Incoming::Controller(Message::EngineCall {
+                request_id,
+                method,
+                params,
+                ..
+            }) => {
+                content.send(&Message::engine_call(request_id, method, params))?;
+            }
+            Incoming::Content(Message::EngineResult {
+                request_id,
+                ok,
+                result,
+                error,
+                ..
+            }) => {
+                controller.send(&Message::engine_result(request_id, ok, result, error))?;
+            }
+            Incoming::Controller(Message::ScriptComplete {
+                ok, result, error, ..
+            }) => {
+                if !ok {
+                    return Err(io::Error::other(format!(
+                        "controller script failed: {}",
+                        error.unwrap_or_else(|| result.to_string())
+                    )));
+                }
+                return Ok(());
+            }
+            Incoming::Controller(message) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected controller message during script: {message:?}"),
+                ));
+            }
+            Incoming::Content(message) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected content message during script: {message:?}"),
+                ));
+            }
+        }
+    }
+}
+
+enum Incoming {
+    Controller(Message),
+    Content(Message),
+}
+
+fn recv_any(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    timeout: Duration,
+) -> io::Result<Incoming> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match controller.messages.try_recv() {
+            Ok(message) => return Ok(Incoming::Controller(message?)),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "controller worker protocol reader stopped",
+                ));
+            }
+        }
+        match content.messages.try_recv() {
+            Ok(message) => return Ok(Incoming::Content(message?)),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "content worker protocol reader stopped",
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for worker protocol traffic",
+            ));
+        }
+        thread::sleep(REAP_POLL_INTERVAL);
+    }
 }
 
 struct WorkerProcess {
@@ -86,8 +246,10 @@ struct WorkerProcess {
 }
 
 impl WorkerProcess {
-    fn spawn(path: &Path, worker: WorkerKind) -> io::Result<Self> {
+    fn spawn(path: &Path, worker: WorkerKind, capability: String) -> io::Result<Self> {
         let mut child = Command::new(path)
+            .arg("--capability")
+            .arg(capability)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -263,6 +425,7 @@ mod tests {
 
         assert_eq!(config.controller_worker, PathBuf::from("controller"));
         assert_eq!(config.content_worker, PathBuf::from("content"));
+        assert_eq!(config.script, None);
     }
 
     #[test]

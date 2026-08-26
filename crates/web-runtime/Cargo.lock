@@ -8791,9 +8791,13 @@ name = "web-runtime"
 version = "0.1.0"
 dependencies = [
  "deno_core",
+ "deno_error",
+ "dpi",
  "serde",
  "serde_json",
  "servo",
+ "tokio",
+ "url",
 ]
 
 [[package]]
