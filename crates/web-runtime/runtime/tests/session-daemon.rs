@@ -1663,3 +1663,35 @@ fn extra_http_headers_are_sent_on_goto() {
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
+
+fn run_named_fixture(name: &str, run_id: &str) {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-{run_id}-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, run_id, |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source(name);
+    let ran = run_playwright_source(
+        &socket,
+        run_id,
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{name}: {ran:?}");
+}
+
+#[test]
+fn console_messages_are_captured_from_page_evaluate() {
+    run_named_fixture("console-messages.mjs", "run_console");
+}
+
+#[test]
+fn frame_locator_queries_same_origin_iframe_document() {
+    run_named_fixture("frame-locator.mjs", "run_frloc");
+}
+
+#[test]
+fn locator_type_and_page_is_editable() {
+    run_named_fixture("locator-type.mjs", "run_loctype");
+}

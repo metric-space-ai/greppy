@@ -412,6 +412,43 @@ class Locator {
     }
     return this._page.setInputFiles(this._selector.value, files);
   }
+
+  async type(text) {
+    await this.focus();
+    await this._page.keyboard.type(text);
+  }
+}
+
+class FrameLocator {
+  constructor(page, frameSelector) {
+    this._page = page;
+    this._frame = frameSelector;
+  }
+
+  locator(selector) {
+    return new Locator(this._page, {
+      type: "framecss",
+      frame: this._frame,
+      value: selector,
+    });
+  }
+
+  getByText(text) {
+    return new Locator(this._page, {
+      type: "frametext",
+      frame: this._frame,
+      value: String(text),
+    });
+  }
+
+  getByRole(role, options = {}) {
+    return new Locator(this._page, {
+      type: "framerole",
+      frame: this._frame,
+      role,
+      name: options.name ?? null,
+    });
+  }
 }
 
 class Frame {
@@ -474,6 +511,10 @@ class Frame {
     return this.locator(selector).fill(value, options);
   }
 
+  async type(selector, text) {
+    return this.locator(selector).type(text);
+  }
+
   async innerText(selector) {
     return this.locator(selector).innerText();
   }
@@ -515,6 +556,8 @@ class Page {
     this._closed = false;
     this._timeout = 30_000;
     this._context = null;
+    this._handlers = {};
+    this._consoleSeen = 0;
     this.mouse = {
       click: async (x, y) => {
         await engineCall("page.mouse.click", { page: this._id, x, y });
@@ -578,6 +621,10 @@ class Page {
 
   locator(selector) {
     return new Locator(this, { type: "css", value: selector });
+  }
+
+  frameLocator(selector) {
+    return new FrameLocator(this, selector);
   }
 
   click(selector, options) {
@@ -759,29 +806,61 @@ class Page {
     const result = await engineCall("page.requests", { page: this._id });
     const requests = result.requests || [];
     for (const rec of requests) {
+      const headerList = rec.headers || [];
       const request = {
         url: () => rec.url,
-        method: () => "GET",
+        method: () => rec.method || "GET",
+        headers: () => {
+          const out = {};
+          headerList.forEach((h) => {
+            out[h.name] = h.value;
+          });
+          return out;
+        },
         resourceType: () => (rec.main_frame ? "document" : "other"),
         frame: () => this.mainFrame(),
       };
-      if (this._requestHandler) this._requestHandler(request);
-      if (this._responseHandler) {
-        this._responseHandler({
-          url: () => rec.url,
-          status: () => 200,
-          ok: () => true,
-          request: () => request,
-        });
+      this._emit("request", request);
+      this._emit("response", {
+        url: () => rec.url,
+        status: () => 200,
+        ok: () => true,
+        request: () => request,
+        text: async () => "",
+      });
+    }
+  }
+
+  _emit(event, payload) {
+    const list = (this._handlers && this._handlers[event]) || [];
+    for (const handler of list) {
+      const result = handler(payload);
+      if (result && typeof result.then === "function") {
+        result.catch(() => {});
       }
     }
   }
 
   async evaluate(pageFunction, arg) {
-    return engineCall("page.evaluate", {
+    const result = await engineCall("page.evaluate", {
       page: this._id,
       source: serializeEvaluate(pageFunction, arg),
-    }).then((result) => result.value);
+    });
+    await this._dispatchConsole();
+    return result.value;
+  }
+
+  async _dispatchConsole() {
+    const result = await engineCall("page.consoleMessages", { page: this._id });
+    const messages = result.messages || [];
+    for (let i = this._consoleSeen; i < messages.length; i++) {
+      const rec = messages[i];
+      this._emit("console", {
+        type: () => rec.type || "log",
+        text: () => rec.text || "",
+      });
+    }
+    this._consoleSeen = messages.length;
   }
 
   async url() {
@@ -911,21 +990,53 @@ class Page {
       if (result && typeof result.then === "function") {
         result.catch(() => {});
       }
+      this._handlers[event] = this._handlers[event] || [];
+      this._handlers[event].push(handler);
       return this;
     }
-    if (event === "request" || event === "response" || event === "download" || event === "popup") {
-      this[`_${event}Handler`] = handler;
+    if (
+      event === "request" ||
+      event === "response" ||
+      event === "download" ||
+      event === "popup" ||
+      event === "console"
+    ) {
+      this._handlers[event] = this._handlers[event] || [];
+      this._handlers[event].push(handler);
       return this;
     }
     return unsupported(`Page.on.${event}`)();
   }
 
+  off(event, handler) {
+    const list = this._handlers[event];
+    if (!list) return this;
+    this._handlers[event] = list.filter((item) => item !== handler);
+    return this;
+  }
+
   once(event, handler) {
-    return this.on(event, handler);
+    const wrap = (...args) => {
+      this.off(event, wrap);
+      return handler(...args);
+    };
+    return this.on(event, wrap);
   }
 
   addListener(event, handler) {
     return this.on(event, handler);
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler);
+  }
+
+  async consoleMessages() {
+    const result = await engineCall("page.consoleMessages", { page: this._id });
+    return (result.messages || []).map((rec) => ({
+      type: () => rec.type || "log",
+      text: () => rec.text || "",
+    }));
   }
 
   async emulateMedia() {

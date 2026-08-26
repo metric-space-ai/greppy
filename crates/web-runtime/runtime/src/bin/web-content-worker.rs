@@ -1,10 +1,11 @@
 use dpi::PhysicalSize;
 use serde_json::json;
 use servo::{
-    CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue,
-    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
-    RenderingContext, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, UrlRequest,
-    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
+    InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseMoveEvent, Preferences, RenderingContext, Servo, ServoBuilder, SimpleDialog,
+    SoftwareRenderingContext, UrlRequest, WebResourceLoad, WebResourceResponse, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -59,6 +60,7 @@ struct Delegate {
     init_scripts: RefCell<Vec<String>>,
     viewport: RefCell<(u32, u32)>,
     extra_headers: RefCell<Vec<(String, String)>>,
+    last_console: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
 }
 
@@ -77,6 +79,7 @@ impl Delegate {
             init_scripts: RefCell::new(Vec::new()),
             viewport: RefCell::new((800, 600)),
             extra_headers: RefCell::new(Vec::new()),
+            last_console: RefCell::new(Vec::new()),
             rendering_context,
         }
     }
@@ -86,6 +89,22 @@ impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
         *self.new_frame_ready.borrow_mut() = true;
         webview.paint();
+    }
+
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        let kind = match level {
+            ConsoleLogLevel::Log => "log",
+            ConsoleLogLevel::Debug => "debug",
+            ConsoleLogLevel::Info => "info",
+            ConsoleLogLevel::Warn => "warning",
+            ConsoleLogLevel::Error => "error",
+            ConsoleLogLevel::Trace => "trace",
+            ConsoleLogLevel::Dir => "dir",
+        };
+        self.last_console.borrow_mut().push(json!({
+            "type": kind,
+            "text": message,
+        }));
     }
 
     fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
@@ -146,10 +165,25 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
+        let headers: Vec<serde_json::Value> = load
+            .request
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| {
+                    json!({
+                        "name": name.as_str(),
+                        "value": value,
+                    })
+                })
+            })
+            .collect();
         self.requests.borrow_mut().push(json!({
             "url": url,
+            "method": load.request.method.to_string(),
             "main_frame": load.request.is_for_main_frame,
             "redirect": load.request.is_redirect,
+            "headers": headers,
         }));
         let matched = self
             .routes
@@ -962,6 +996,12 @@ impl ContentEngine {
                 };
                 Ok(json!({ "dialogs": dialogs }))
             }
+            "page.consoleMessages" => {
+                let page_id = required_str(&params, "page")?;
+                Ok(json!({
+                    "messages": self.page(&page_id)?.1.last_console.borrow().clone()
+                }))
+            }
             "context.close" => Ok(json!({})),
             "page.addRoute" => {
                 let page_id = required_str(&params, "page")?;
@@ -1371,6 +1411,33 @@ function greppyResolveIn(root, selector) {
   }
   if (selector.type === 'filter') {
     return pool;
+  }
+  if (selector.type === 'framecss' || selector.type === 'frametext' || selector.type === 'framerole') {
+    const frames = greppyQueryAll(root === document ? document : root, selector.frame || 'iframe');
+    let nodes = [];
+    for (let i = 0; i < frames.length; i++) {
+      try {
+        const doc = frames[i].contentDocument;
+        if (!doc) continue;
+        if (selector.type === 'framecss') {
+          nodes = nodes.concat(Array.from(doc.querySelectorAll(selector.value)));
+        } else if (selector.type === 'frametext') {
+          const wanted = selector.value;
+          nodes = nodes.concat(Array.from(doc.querySelectorAll('body *')).filter((el) => {
+            return ((el.innerText || el.textContent || '') + '').trim() === wanted;
+          }));
+        } else {
+          const role = selector.role;
+          const name = selector.name;
+          nodes = nodes.concat(Array.from(doc.querySelectorAll('body *')).filter((el) => {
+            if (greppyRoleOf(el) !== role) return false;
+            if (name == null) return true;
+            return greppyAccessibleName(el) === name;
+          }));
+        }
+      } catch (error) {}
+    }
+    return nodes;
   }
   return [];
 }

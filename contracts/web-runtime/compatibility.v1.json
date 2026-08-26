@@ -40,9 +40,9 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 162,
+    "implemented": 179,
     "unsupported": 251,
-    "unverified": 941
+    "unverified": 924
   },
   "entries": [
     {
@@ -209,11 +209,15 @@
       "symbol": "Page.consoleMessages",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "Servo show_console_message records; not Chromium ConsoleMessage.args"
+      ]
     },
     {
       "symbol": "Page.content",
@@ -392,11 +396,15 @@
       "symbol": "Page.frameLocator",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "frame-locator"
+      ],
+      "known_differences": [
+        "same-origin iframe contentDocument query only; cross-origin is empty"
+      ]
     },
     {
       "symbol": "Page.frames",
@@ -674,11 +682,15 @@
       "symbol": "Page.isEditable",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-type"
+      ],
+      "known_differences": [
+        "delegates to locator.isEditable"
+      ]
     },
     {
       "symbol": "Page.isEnabled",
@@ -751,11 +763,15 @@
       "symbol": "Page.off",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "removes a previously registered listener from the in-memory handler list"
+      ]
     },
     {
       "symbol": "Page.on",
@@ -895,11 +911,15 @@
       "symbol": "Page.removeListener",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "alias of Page.off"
+      ]
     },
     {
       "symbol": "Page.removeLocatorHandler",
@@ -8333,11 +8353,15 @@
       "symbol": "ConsoleMessage.text",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "text from Servo console message string"
+      ]
     },
     {
       "symbol": "ConsoleMessage.timestamp",
@@ -9425,11 +9449,15 @@
       "symbol": "Request.headers",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers"
+      ],
+      "known_differences": [
+        "HeaderMap to_str pairs from WebResourceRequest; not Chromium allHeaders"
+      ]
     },
     {
       "symbol": "Request.headersArray",
@@ -9455,11 +9483,16 @@
       "symbol": "Request.method",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "extra-headers",
+        "network-and-box"
+      ],
+      "known_differences": [
+        "from Servo WebResourceRequest.method; default GET if missing"
+      ]
     },
     {
       "symbol": "Request.postData",
@@ -9689,11 +9722,15 @@
       "symbol": "Response.ok",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "true when status stub is 200"
+      ]
     },
     {
       "symbol": "Response.request",
@@ -9729,11 +9766,15 @@
       "symbol": "Response.status",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "200 stub except fulfilled intercepts are not reflected on the Response object yet"
+      ]
     },
     {
       "symbol": "Response.statusText",
@@ -9759,11 +9800,15 @@
       "symbol": "Response.url",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "network-and-box"
+      ],
+      "known_differences": [
+        "uses the request URL; status is 200 unless a route intercepts"
+      ]
     },
     {
       "symbol": "Response.issuer",
@@ -9819,21 +9864,29 @@
       "symbol": "Route.abort",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "cancel intercepted load"
+      ]
     },
     {
       "symbol": "Route.continue",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "embedder-surface"
+      ],
+      "known_differences": [
+        "DoNotIntercept / unhandled pattern continues the load"
+      ]
     },
     {
       "symbol": "Route.fallback",
@@ -9859,11 +9912,15 @@
       "symbol": "Route.fulfill",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "route-fulfill"
+      ],
+      "known_differences": [
+        "Servo load_web_resource intercept in the content worker"
+      ]
     },
     {
       "symbol": "Route.request",
@@ -13674,11 +13731,13 @@
       "symbol": "Frame.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
+      "schema": "implemented",
       "source": "unverified",
       "behavior": "unverified",
       "tests": [],
-      "known_differences": []
+      "known_differences": [
+        "delegates to locator.type; main-frame CSS or iframe-element locator"
+      ]
     },
     {
       "symbol": "BrowserContext.clock",
@@ -13736,11 +13795,15 @@
       "symbol": "Locator.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "locator-type"
+      ],
+      "known_differences": [
+        "focus then keyboard.type DOM value append"
+      ]
     },
     {
       "symbol": "BrowserType.connectOverCDP",
@@ -13865,11 +13928,15 @@
       "symbol": "ConsoleMessage.type",
       "kind": "method",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
+      "schema": "implemented",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "console-messages"
+      ],
+      "known_differences": [
+        "mapped from ConsoleLogLevel; warn becomes warning"
+      ]
     },
     {
       "symbol": "Credentials.get",
