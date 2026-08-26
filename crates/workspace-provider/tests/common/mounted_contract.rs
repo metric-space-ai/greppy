@@ -3,8 +3,184 @@
 use greppy_workspace_core::{WorkspaceCore, CHUNK_SIZE};
 use memmap2::MmapOptions;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
+
+struct RangeLock<'a> {
+    file: &'a File,
+    offset: u64,
+    length: u64,
+}
+
+impl Drop for RangeLock<'_> {
+    fn drop(&mut self) {
+        unlock_range(self.file, self.offset, self.length).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_range(file: &File, offset: u64, length: u64) -> io::Result<RangeLock<'_>> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = offset.try_into().unwrap();
+    lock.l_len = length.try_into().unwrap();
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(RangeLock {
+        file,
+        offset,
+        length,
+    })
+}
+
+#[cfg(unix)]
+fn unlock_range(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_UNLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = offset.try_into().unwrap();
+    lock.l_len = length.try_into().unwrap();
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn overlapped_at(offset: u64) -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::OVERLAPPED_0_0;
+
+    let mut overlapped = windows_sys::Win32::System::IO::OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
+        Offset: offset as u32,
+        OffsetHigh: (offset >> 32) as u32,
+    };
+    overlapped
+}
+
+#[cfg(windows)]
+fn try_lock_range(file: &File, offset: u64, length: u64) -> io::Result<RangeLock<'_>> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+
+    let mut overlapped = overlapped_at(offset);
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            length as u32,
+            (length >> 32) as u32,
+            &mut overlapped,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(RangeLock {
+        file,
+        offset,
+        length,
+    })
+}
+
+#[cfg(windows)]
+fn unlock_range(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+
+    let mut overlapped = overlapped_at(offset);
+    let result = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle(),
+            0,
+            length as u32,
+            (length >> 32) as u32,
+            &mut overlapped,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[test]
+fn mounted_contract_range_lock_helper() {
+    let Some(path) = std::env::var_os("GREPPY_RANGE_LOCK_FILE") else {
+        return;
+    };
+    let ready = std::env::var_os("GREPPY_RANGE_LOCK_READY").unwrap();
+    let release = std::env::var_os("GREPPY_RANGE_LOCK_RELEASE").unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let _lock = try_lock_range(&file, 16, 16).unwrap();
+    fs::write(ready, b"ready").unwrap();
+    let started = Instant::now();
+    while !Path::new(&release).exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "parent never released the byte-range-lock helper"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn exercise_byte_range_lock_contract(root: &Path) {
+    let path = root.join("contract-range-lock.bin");
+    let ready = root.join("contract-range-lock.ready");
+    let release = root.join("contract-range-lock.release");
+    fs::write(&path, [0_u8; 128]).unwrap();
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mounted_contract::mounted_contract_range_lock_helper",
+            "--nocapture",
+        ])
+        .env("GREPPY_RANGE_LOCK_FILE", &path)
+        .env("GREPPY_RANGE_LOCK_READY", &ready)
+        .env("GREPPY_RANGE_LOCK_RELEASE", &release)
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !ready.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "byte-range-lock helper did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(
+        try_lock_range(&file, 24, 4).is_err(),
+        "an overlapping byte-range lock from another process must conflict"
+    );
+    drop(try_lock_range(&file, 40, 4).unwrap());
+
+    fs::write(&release, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+    drop(try_lock_range(&file, 24, 4).unwrap());
+}
 
 pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     let regular = root.join("contract-regular.bin");
@@ -62,6 +238,61 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     first.unlock().unwrap();
     second.try_lock().unwrap();
     second.unlock().unwrap();
+    exercise_byte_range_lock_contract(root);
+
+    let directory = root.join("contract-directory");
+    let nested = directory.join("segment-0000000000000001/segment-0000000000000002/segment-0000000000000003/segment-0000000000000004/segment-0000000000000005/segment-0000000000000006");
+    fs::create_dir_all(&nested).unwrap();
+    let long_path = nested.join("long-file-name-ä-東京.txt");
+    fs::write(&long_path, b"long path").unwrap();
+    assert_eq!(fs::read(&long_path).unwrap(), b"long path");
+    assert!(
+        fs::remove_dir(&directory).is_err(),
+        "removing a non-empty directory must fail"
+    );
+
+    let replace_source = root.join("contract-replace-source.txt");
+    let replace_destination = root.join("contract-replace-destination.txt");
+    fs::write(&replace_source, b"new").unwrap();
+    fs::write(&replace_destination, b"old").unwrap();
+    fs::rename(&replace_source, &replace_destination).unwrap();
+    assert_eq!(fs::read(&replace_destination).unwrap(), b"new");
+    assert!(!replace_source.exists());
+
+    let enumerated = root.join("contract-enumeration");
+    fs::create_dir(&enumerated).unwrap();
+    let writer_root = enumerated.clone();
+    let writer = thread::spawn(move || {
+        for index in 0..64 {
+            let path = writer_root.join(format!("entry-{index:03}.txt"));
+            fs::write(&path, index.to_string()).unwrap();
+            if index % 2 == 0 {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    });
+    while !writer.is_finished() {
+        for entry in fs::read_dir(&enumerated).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(name.to_string_lossy().starts_with("entry-"));
+        }
+    }
+    writer.join().unwrap();
+    let mut final_entries = fs::read_dir(&enumerated)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    final_entries.sort();
+    assert_eq!(final_entries.len(), 32);
+    assert!(final_entries
+        .iter()
+        .all(|name| name.to_string_lossy().starts_with("entry-")));
+
+    let missing = root.join("contract-missing.txt");
+    assert_eq!(
+        fs::read(&missing).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
 
     let open_source = root.join("contract-open-source.txt");
     let open_destination = root.join("contract-open-destination.txt");
