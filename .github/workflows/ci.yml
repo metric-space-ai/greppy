@@ -153,10 +153,13 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: agent benchmark precision grader
+      # These are deterministic unit tests for repository-owned parsers and
+      # harness code. They do not execute an agent, score an outcome, or make a
+      # benchmark result part of release eligibility.
+      - name: benchmark precision tooling unit tests (no agent outcomes)
         run: python3 -m unittest discover -s bench/agent_efficiency -p 'test_*.py' -v
 
-      - name: paired coding benchmark harness
+      - name: coding harness unit tests (no agent outcomes)
         run: |
           python3 -m unittest tools.test_materialize_benchmark_corpus -v
           python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
