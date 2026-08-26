@@ -69,7 +69,7 @@ pub fn capture_repository_with_observer(
 ) -> Result<BaselineSnapshot> {
     let repository = repository_root(repo.as_ref())?;
     observe_phase("snapshot-preflight-start");
-    preflight_repository(&repository)?;
+    preflight_repository_with_observer(&repository, &mut observe_phase)?;
     observe_phase("snapshot-preflight-complete");
 
     for attempt in 0..2 {
@@ -682,10 +682,18 @@ fn git_path(path: &[u8]) -> Result<String> {
 }
 
 fn preflight_repository(repository: &Path) -> Result<()> {
+    preflight_repository_with_observer(repository, &mut |_| {})
+}
+
+fn preflight_repository_with_observer(
+    repository: &Path,
+    observe_phase: &mut impl FnMut(&'static str),
+) -> Result<()> {
     let git_dir = PathBuf::from(git_text(
         repository,
         &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
     )?);
+    observe_phase("snapshot-preflight-gitdir-complete");
     for marker in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -700,8 +708,11 @@ fn preflight_repository(repository: &Path) -> Result<()> {
             )));
         }
     }
+    observe_phase("snapshot-preflight-operation-markers-complete");
 
+    observe_phase("snapshot-preflight-tree-start");
     let tree = git_output(repository, &["ls-tree", "-r", "-z", "HEAD"])?;
+    observe_phase("snapshot-preflight-tree-complete");
     for record in tree
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -713,7 +724,10 @@ fn preflight_repository(repository: &Path) -> Result<()> {
         }
     }
 
+    observe_phase("snapshot-preflight-tracked-start");
     let tracked = git_output(repository, &["ls-files", "-z"])?;
+    observe_phase("snapshot-preflight-tracked-complete");
+    observe_phase("snapshot-preflight-filter-check-start");
     let mut check = Command::new("git")
         .args(["check-attr", "-z", "--stdin", "filter"])
         .current_dir(repository)
@@ -733,6 +747,7 @@ fn preflight_repository(repository: &Path) -> Result<()> {
     if !filters.status.success() {
         return Err(git_error("git check-attr filter", &filters));
     }
+    observe_phase("snapshot-preflight-filter-check-complete");
     let fields: Vec<&[u8]> = filters
         .stdout
         .split(|byte| *byte == 0)
@@ -957,6 +972,14 @@ mod tests {
             phases,
             [
                 "snapshot-preflight-start",
+                "snapshot-preflight-gitdir-complete",
+                "snapshot-preflight-operation-markers-complete",
+                "snapshot-preflight-tree-start",
+                "snapshot-preflight-tree-complete",
+                "snapshot-preflight-tracked-start",
+                "snapshot-preflight-tracked-complete",
+                "snapshot-preflight-filter-check-start",
+                "snapshot-preflight-filter-check-complete",
                 "snapshot-preflight-complete",
                 "snapshot-first-observation-start",
                 "snapshot-first-observation-complete",
