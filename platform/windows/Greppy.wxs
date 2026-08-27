@@ -1,0 +1,75 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Greppy"
+      Manufacturer="Metric Space AI"
+      Version="$(var.Version)"
+      Language="1033"
+      UpgradeCode="{29805556-43E0-4E91-BF61-AD2E4DE4DBDE}"
+      Scope="perMachine"
+      InstallerVersion="500"
+      Compressed="yes">
+    <SummaryInformation Description="Greppy portable CoW workspaces" />
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of Greppy is already installed."
+        Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Greppy" />
+    </StandardDirectory>
+
+    <!--
+      The private transport DLL uses the same DllRegisterServer contract as
+      upstream WinFsp. Windows Installer invokes it only after the adjacent,
+      Microsoft-signed driver has been installed, and invokes
+      DllUnregisterServer before removing the pair.
+    -->
+    <Component
+        Id="GreppyWorkspaceDriver"
+        Directory="INSTALLFOLDER"
+        Guid="{8D62CD01-365D-45C5-BCCE-E9A05A778F16}"
+        Bitness="always64">
+      <File
+          Id="GreppyWorkspaceFspDll"
+          Name="greppyworkspacefsp-x64.dll"
+          Source="$(var.DistDir)\greppyworkspacefsp-x64.dll"
+          KeyPath="yes"
+          SelfRegCost="1" />
+      <File
+          Id="GreppyWorkspaceFspDriver"
+          Name="greppyworkspacefsp-x64.sys"
+          Source="$(var.DistDir)\greppyworkspacefsp-x64.sys" />
+    </Component>
+
+    <Component
+        Id="GreppySystemPath"
+        Directory="INSTALLFOLDER"
+        Guid="{1A52A0BB-C50C-4E7E-854A-9DD0F8415F4D}"
+        Bitness="always64">
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Metric Space AI\Greppy"
+          Name="InstallDir"
+          Type="string"
+          Value="[INSTALLFOLDER]"
+          KeyPath="yes" />
+      <Environment
+          Id="GreppyPath"
+          Name="PATH"
+          Value="[INSTALLFOLDER]"
+          Action="set"
+          Part="last"
+          Permanent="no"
+          System="yes" />
+    </Component>
+
+    <Feature Id="GreppyFeature" Title="Greppy" Level="1">
+      <Files Directory="INSTALLFOLDER" Include="$(var.DistDir)\**">
+        <Exclude Files="$(var.DistDir)\greppyworkspacefsp-x64.dll" />
+        <Exclude Files="$(var.DistDir)\greppyworkspacefsp-x64.sys" />
+      </Files>
+      <ComponentRef Id="GreppyWorkspaceDriver" />
+      <ComponentRef Id="GreppySystemPath" />
+    </Feature>
+  </Package>
+</Wix>

@@ -227,6 +227,12 @@ jobs:
       - name: Build Rust provider over the Greppy fork ABI
         run: cargo build -p greppy-workspace-provider --release --locked
 
+      - name: Build smoke CLI for MSI authoring
+        run: >-
+          cargo build -p greppy --bin greppy --release --locked
+          --no-default-features
+          --features ci-test-assets,cpu-only,bash-smart
+
       - name: Bind only the private Greppy runtime
         shell: pwsh
         run: |
@@ -239,6 +245,22 @@ jobs:
           if ($imports -match '(?im)^\s*winfsp-x64\.dll\s*$') {
             throw 'provider still imports the official WinFsp runtime'
           }
+
+      - name: Build and ICE-validate unsigned MSI shape
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'greppy-msi-smoke-dist'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target\release\greppy.exe,target\release\greppy-workspace-provider.exe $dist
+          Copy-Item "$env:GREPPY_WINFSP_FORK_ROOT\build\VStudio\build\Release\greppyworkspacefsp-x64.dll" $dist
+          Copy-Item "$env:GREPPY_WINFSP_FORK_ROOT\build\VStudio\build\Release\greppyworkspacefsp-x64.sys" $dist
+          Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock $dist
+          Copy-Item licenses (Join-Path $dist 'licenses') -Recurse
+          tools/build_windows_msi.ps1 `
+            -DistDir $dist `
+            -OutputPath "$env:RUNNER_TEMP\greppy-windows-x86_64-unsigned-smoke.msi" `
+            -Version '0.3.3' `
+            -AllowUnsignedForSmokeTest
 
   windows-winfsp-fork-compile:
     name: Windows minimal WinFsp fork compile
