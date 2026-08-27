@@ -13,12 +13,12 @@ if (!String(second).includes("/two")) {
 if (second === first) {
   throw new Error("second navigation did not change url");
 }
-await page.goBack();
+await page.goBack({ waitUntil: "load", timeout: 15_000 });
 const back = await page.url();
 if (back !== first) {
   throw new Error("goBack expected " + first + " got " + back);
 }
-await page.goForward();
+await page.goForward({ timeout: 15_000 });
 const forward = await page.url();
 if (!String(forward).includes("/two")) {
   throw new Error("goForward expected /two got " + forward);

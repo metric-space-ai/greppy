@@ -354,9 +354,10 @@ class Locator {
     });
   }
 
-  async hover() {
+  async hover(options) {
+    const timeout = actionTimeout(this, options, "Locator.hover");
     await engineCall("locator.hover", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
@@ -417,21 +418,24 @@ class Locator {
     throw new TimeoutError("timeout: Locator.waitForFunction");
   }
 
-  async check() {
+  async check(options) {
+    const timeout = actionTimeout(this, options, "Locator.check");
     await engineCall("locator.check", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
-  async uncheck() {
+  async uncheck(options) {
+    const timeout = actionTimeout(this, options, "Locator.uncheck");
     await engineCall("locator.uncheck", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
-  async selectOption(value) {
+  async selectOption(value, options) {
+    const timeout = actionTimeout(this, options, "Locator.selectOption");
     await engineCall("locator.selectOption", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
       value: Array.isArray(value) ? value[0] : value,
     });
   }
@@ -704,13 +708,19 @@ class Locator {
     return this._page.setInputFiles(this._selector.value, files);
   }
 
-  async type(text) {
-    await this.focus();
+  async type(text, options) {
+    const timeout = actionTimeout(this, options, "Locator.type");
+    await engineCall("locator.focus", {
+      ...locatorParams(this, { timeout }),
+    });
     await this._page.keyboard.type(text);
   }
 
-  async press(key) {
-    await this.focus();
+  async press(key, options) {
+    const timeout = actionTimeout(this, options, "Locator.press");
+    await engineCall("locator.focus", {
+      ...locatorParams(this, { timeout }),
+    });
     await this._page.keyboard.press(key);
   }
 
@@ -1235,10 +1245,8 @@ class Frame {
   }
 
   async waitForFunction(pageFunction, arg, options) {
-    if (options != null) {
-      return unsupported("Frame.waitForFunction.options")();
-    }
-    const deadline = Date.now() + (this._page._timeout || 30_000);
+    refuseLocatorOptions("Frame.waitForFunction", options, ["timeout"]);
+    const deadline = Date.now() + ((options && options.timeout) || this._page._timeout || 30_000);
     while (Date.now() < deadline) {
       const value = await this.evaluate(pageFunction, arg);
       if (value) {
@@ -1250,14 +1258,12 @@ class Frame {
   }
 
   async waitForURL(pattern, options) {
-    if (options != null) {
-      return unsupported("Frame.waitForURL.options")();
-    }
+    refuseLocatorOptions("Frame.waitForURL", options, ["timeout"]);
     if (pattern instanceof RegExp || typeof pattern === "function") {
       return unsupported("Frame.waitForURL.pattern")();
     }
     const needle = String(pattern);
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + ((options && options.timeout) || this._page._timeout || 30_000);
     while (Date.now() < deadline) {
       const url = this._isMain()
         ? await this._page.url()
@@ -2049,8 +2055,9 @@ class Page {
     this._emitLoad();
   }
 
-  async reload() {
-    await engineCall("page.reload", { page: this._id });
+  async reload(options) {
+    const timeout = navigationTimeout(this._timeout, options, "Page.reload");
+    await engineCall("page.reload", { page: this._id, timeout });
     await this._flushNavigation();
     await this._dispatchFrames();
     this._emitLoad();
@@ -2117,15 +2124,17 @@ class Page {
     return new Frame(this, { id: "main", name: "", url: "" });
   }
 
-  async goBack() {
-    const result = await engineCall("page.goBack", { page: this._id });
+  async goBack(options) {
+    const timeout = navigationTimeout(this._timeout, options, "Page.goBack");
+    const result = await engineCall("page.goBack", { page: this._id, timeout });
     await this._flushNavigation();
     await this._dispatchNetwork();
     return result.ok ? result : null;
   }
 
-  async goForward() {
-    const result = await engineCall("page.goForward", { page: this._id });
+  async goForward(options) {
+    const timeout = navigationTimeout(this._timeout, options, "Page.goForward");
+    const result = await engineCall("page.goForward", { page: this._id, timeout });
     await this._flushNavigation();
     await this._dispatchNetwork();
     return result.ok ? result : null;

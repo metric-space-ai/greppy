@@ -584,7 +584,8 @@
       ],
       "known_differences": [
         "Servo WebView::go_back",
-        "URL after go_back is asserted against the previous navigation"
+        "URL after go_back is asserted against the previous navigation",
+        "timeout and waitUntil load|domcontentloaded are accepted; other goBack options throw; return value is {ok,url} JSON, not a Playwright Response"
       ]
     },
     {
@@ -599,7 +600,7 @@
       ],
       "known_differences": [
         "Servo WebView::go_forward; URL after history traversal is asserted",
-        "return value is {ok,url} JSON, not a Playwright Response object"
+        "timeout and waitUntil load|domcontentloaded are accepted; other goForward options throw; return value is {ok,url} JSON, not a Playwright Response object"
       ]
     },
     {
@@ -968,7 +969,7 @@
         "reload"
       ],
       "known_differences": [
-        "reload re-navigates the current URL; options are unsupported"
+        "reload re-navigates the current URL; timeout and waitUntil load|domcontentloaded are accepted; other reload options throw"
       ]
     },
     {
@@ -3199,7 +3200,7 @@
       ],
       "known_differences": [
         "polls Frame.evaluate until truthy; returns the value not a JSHandle",
-        "child frames use frameEvaluate; polling/timeout options throw unsupported_playwright_operation"
+        "child frames use frameEvaluate; timeout is accepted; polling and other options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -3277,8 +3278,9 @@
         "frames"
       ],
       "known_differences": [
-        "substring match on location.href; regex/function/options throw unsupported_playwright_operation",
-        "child frames poll frameEvaluate location.href"
+        "substring match on location.href; regex/function throw unsupported_playwright_operation",
+        "child frames poll frameEvaluate location.href",
+        "timeout is accepted; other waitForURL options throw"
       ]
     },
     {
@@ -6540,7 +6542,8 @@
         "check-select"
       ],
       "known_differences": [
-        "sets input.checked; no actionability beyond waitFor"
+        "sets input.checked; no actionability beyond waitFor",
+        "timeout is accepted; other check options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -6994,7 +6997,8 @@
         "hover"
       ],
       "known_differences": [
-        "mousemove to box center; no pointer-event guarantees"
+        "mousemove to box center; no pointer-event guarantees",
+        "timeout is accepted; other hover options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -7223,7 +7227,8 @@
         "locator-type"
       ],
       "known_differences": [
-        "focus then keyboard.press DOM KeyboardEvent; not OS input"
+        "focus then keyboard.press DOM KeyboardEvent; not OS input",
+        "timeout is accepted; delay and other press options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -7280,7 +7285,8 @@
         "check-select"
       ],
       "known_differences": [
-        "assigns select.value; no label/index matching"
+        "assigns select.value; no label/index matching",
+        "timeout is accepted; other selectOption options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -7383,7 +7389,8 @@
         "check-select"
       ],
       "known_differences": [
-        "clears input.checked"
+        "clears input.checked",
+        "timeout is accepted; other uncheck options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -15568,7 +15575,8 @@
         "locator-type"
       ],
       "known_differences": [
-        "focus then keyboard.type DOM value append"
+        "focus then keyboard.type DOM value append",
+        "timeout is accepted; delay and other type options throw unsupported_playwright_operation"
       ]
     },
     {

@@ -1162,7 +1162,11 @@ impl ContentEngine {
                 let url = webview
                     .url()
                     .ok_or_else(|| io::Error::other("page has no url to reload"))?;
-                self.handle("page.goto", json!({ "page": page_id, "url": url.as_str() }))
+                let mut goto_params = json!({ "page": page_id, "url": url.as_str() });
+                if let Some(timeout) = params.get("timeout") {
+                    goto_params["timeout"] = timeout.clone();
+                }
+                self.handle("page.goto", goto_params)
             }
             "page.waitForLoadState" => {
                 let page_id = required_str(&params, "page")?;
@@ -1570,7 +1574,7 @@ impl ContentEngine {
                 if ok {
                     webview.go_back(1);
                     let loading = webview.clone();
-                    let _ = self.spin_until(ACTION_TIMEOUT, move || {
+                    let _ = self.spin_until(call_timeout(&params), move || {
                         loading.load_status() == LoadStatus::Complete
                     })?;
                     webview.paint();
@@ -1588,7 +1592,7 @@ impl ContentEngine {
                 if ok {
                     webview.go_forward(1);
                     let loading = webview.clone();
-                    let _ = self.spin_until(ACTION_TIMEOUT, move || {
+                    let _ = self.spin_until(call_timeout(&params), move || {
                         loading.load_status() == LoadStatus::Complete
                     })?;
                     webview.paint();

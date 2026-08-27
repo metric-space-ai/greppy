@@ -3499,3 +3499,68 @@ fn max_artifact_bytes_limit_is_enforced_on_read() {
         "{read:?}"
     );
 }
+
+#[test]
+fn hover_reload_check_and_history_accept_timeout_options() {
+    let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-actopt-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_actopt", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    for name in ["hover.mjs", "reload.mjs", "check-select.mjs", "goback.mjs"] {
+        let (path, source) = fixture_source(name);
+        let ran = run_playwright_source(
+            &socket,
+            "run_actopt",
+            &source,
+            Some(&path),
+            Duration::from_secs(60),
+        );
+        assert_eq!(ran.status, "ok", "{name}: {ran:?}");
+    }
+}
+
+#[test]
+fn wall_time_limit_is_enforced_by_supervisor() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-wall-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_wall", |command| {
+        command.env("GREPPY_WEB_WALL_MS", "20");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_wall",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    thread::sleep(Duration::from_millis(80));
+    let origin = serve_fixture("<p>wall</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_wall",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error.as_ref().unwrap().message.contains("wall time"),
+        "{read:?}"
+    );
+}

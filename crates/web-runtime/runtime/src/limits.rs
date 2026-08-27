@@ -88,6 +88,11 @@ impl SessionLimits {
                 limits.max_artifact_bytes = value;
             }
         }
+        if let Ok(ms) = std::env::var("GREPPY_WEB_WALL_MS") {
+            if let Ok(value) = ms.parse::<u64>() {
+                limits.wall_time = Duration::from_millis(value.clamp(20, 3_600_000));
+            }
+        }
         limits
     }
 
