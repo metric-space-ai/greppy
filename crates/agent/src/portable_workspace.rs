@@ -7,7 +7,7 @@
 use greppy_workspace_core::{
     capture_overlay_directory, capture_repository, capture_repository_incremental,
     capture_repository_with_observer, BaselineEntry, BaselineSnapshot, ChunkStore, EntryKind,
-    ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
+    ProposalRecord, ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
     WorkspacePairLease,
 };
 use serde::{Deserialize, Serialize};
@@ -775,6 +775,7 @@ fn apply_from_core(
             detail: "proposal belongs to a different repository".into(),
         });
     }
+    validate_proposal_git_binding(&canonical_target, &proposal)?;
     let observed = capture_repository(&canonical_target, core.chunks())?;
     let observed_hash = observed.baseline_hash.clone();
     release_snapshot(core.chunks(), observed);
@@ -875,6 +876,81 @@ fn apply_from_core(
         });
     }
     remove_apply_journal(&journal_path)?;
+    Ok(())
+}
+
+fn validate_proposal_git_binding(
+    repository: &Path,
+    proposal: &ProposalRecord,
+) -> Result<(), WorkspaceError> {
+    let read_git = |args: &[&str], subject: &str| -> Result<String, WorkspaceError> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .output()?;
+        if !output.status.success() {
+            return Err(WorkspaceError::Tampered {
+                path: repository.to_path_buf(),
+                detail: format!(
+                    "proposal {subject} is not present in the repository object graph: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    };
+
+    let ref_expression = format!("{}^{{commit}}", proposal.ref_name);
+    let ref_commit = read_git(&["rev-parse", "--verify", &ref_expression], "ref")?;
+    if ref_commit != proposal.proposal_commit {
+        return Err(WorkspaceError::Tampered {
+            path: repository.to_path_buf(),
+            detail: "proposal ref does not resolve to its pinned commit".into(),
+        });
+    }
+
+    let parents = read_git(
+        &[
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            &proposal.proposal_commit,
+        ],
+        "commit",
+    )?;
+    let parents = parents.split_ascii_whitespace().collect::<Vec<_>>();
+    if parents.as_slice()
+        != [
+            proposal.proposal_commit.as_str(),
+            proposal.base_commit.as_str(),
+        ]
+    {
+        return Err(WorkspaceError::Tampered {
+            path: repository.to_path_buf(),
+            detail: "proposal commit does not have exactly the pinned base commit as parent".into(),
+        });
+    }
+
+    let tree_expression = format!("{}^{{tree}}", proposal.proposal_commit);
+    let final_tree = read_git(&["rev-parse", "--verify", &tree_expression], "final tree")?;
+    if final_tree != proposal.final_tree {
+        return Err(WorkspaceError::Tampered {
+            path: repository.to_path_buf(),
+            detail: "proposal commit tree does not match the pinned final tree".into(),
+        });
+    }
+    let baseline_expression = format!("{}^{{tree}}", proposal.baseline_tree);
+    let baseline_tree = read_git(
+        &["rev-parse", "--verify", &baseline_expression],
+        "baseline tree",
+    )?;
+    if baseline_tree != proposal.baseline_tree {
+        return Err(WorkspaceError::Tampered {
+            path: repository.to_path_buf(),
+            detail: "proposal baseline tree is not a canonical Git tree".into(),
+        });
+    }
     Ok(())
 }
 
@@ -2688,6 +2764,15 @@ mod tests {
         assert!(!journal_path.exists());
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
         assert_eq!(fs::read(&index).unwrap(), index_before);
+
+        git(&repo, &["update-ref", &ref_name, &base]);
+        assert!(matches!(
+            apply_proposal(&repo, &ref_name),
+            Err(WorkspaceError::Tampered { .. })
+        ));
+        assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        git(&repo, &["update-ref", &ref_name, &commit]);
 
         apply_proposal(&repo, &ref_name).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");

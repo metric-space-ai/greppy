@@ -1,5 +1,38 @@
 use crate::{Error, Result};
 
+pub(crate) fn validate_portable_component(component: &str) -> Result<()> {
+    if component.chars().any(|character| {
+        matches!(
+            character,
+            '\0' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+        )
+    }) || component.ends_with(['.', ' '])
+    {
+        return Err(Error::InvalidPath(format!(
+            "path component is not portable: {component:?}"
+        )));
+    }
+
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    let reserved_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || stem.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || stem.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+    if reserved_device {
+        return Err(Error::InvalidPath(format!(
+            "path component is reserved on Windows: {component:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a symlink target using platform-neutral separators. The kernel
 /// must never be able to resolve a link from a mounted workspace back into the
 /// host namespace, even when a repository was created on another OS.
@@ -49,5 +82,21 @@ mod tests {
         ] {
             assert!(validate_symlink_target("src/link", target).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_non_portable_components_on_every_host() {
+        for component in [
+            "..\\host",
+            "file.txt:stream",
+            "CON.txt",
+            "lpt9.log",
+            "trailing.",
+            "trailing ",
+            "a*",
+        ] {
+            assert!(validate_portable_component(component).is_err());
+        }
+        validate_portable_component("Ä-Case.rs").unwrap();
     }
 }

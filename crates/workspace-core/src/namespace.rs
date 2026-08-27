@@ -1,3 +1,4 @@
+use crate::path_policy::validate_portable_component;
 use crate::repository_layers::{self, LayerKind};
 use crate::repository_tracker;
 use crate::{BaselineSnapshot, ChunkGcReport, ChunkId, ChunkStore, Error, Result, CHUNK_SIZE};
@@ -1681,15 +1682,30 @@ impl WorkspaceCore {
                     proposal_commit,
                     bytes,
                 )| {
+                    let baseline: BaselineSnapshot = serde_json::from_slice(&bytes)?;
+                    crate::snapshot::validate_repository_snapshot_integrity(&baseline)?;
+                    let repository = PathBuf::from(repository);
+                    if repository != baseline.repository
+                        || base_commit != baseline.base_commit
+                        || baseline_hash != baseline.baseline_hash
+                    {
+                        return Err(Error::Corrupt(format!(
+                            "proposal {ref_name} metadata does not match its pinned baseline"
+                        )));
+                    }
+                    validate_oid(&base_commit)?;
+                    validate_oid(&baseline_tree)?;
+                    validate_oid(&final_tree)?;
+                    validate_oid(&proposal_commit)?;
                     Ok(ProposalRecord {
                         ref_name: ref_name.into(),
-                        repository: PathBuf::from(repository),
+                        repository,
                         base_commit,
                         baseline_hash,
                         baseline_tree,
                         final_tree,
                         proposal_commit,
-                        baseline: serde_json::from_slice(&bytes)?,
+                        baseline,
                     })
                 },
             )
@@ -2557,11 +2573,13 @@ fn normalize_path(path: &Path, allow_root: bool) -> Result<String> {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::Normal(part) => parts.push(
-                part.to_str()
-                    .ok_or_else(|| Error::InvalidPath("path is not UTF-8".into()))?
-                    .to_string(),
-            ),
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidPath("path is not UTF-8".into()))?;
+                validate_portable_component(part)?;
+                parts.push(part.to_string());
+            }
             _ => return Err(Error::InvalidPath(path.display().to_string())),
         }
     }
@@ -2839,6 +2857,50 @@ mod tests {
         reopened.remove_workspace(workspace).unwrap();
         reopened.gc().unwrap();
         assert_eq!(reopened.chunks().stats().unwrap().referenced_chunks, 0);
+    }
+
+    #[test]
+    fn namespace_metadata_commit_failure_preserves_content_and_recovers_chunk_refs() {
+        let (_repo, storage, core, workspace) = fixture();
+        core.create_file(&workspace, "disk-full.txt", 0o100644)
+            .unwrap();
+        core.write(&workspace, "disk-full.txt", 0, b"committed")
+            .unwrap();
+        let references_before = core.chunks().stats().unwrap().referenced_chunks;
+        {
+            let connection = core.lock_metadata().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TEMP TRIGGER simulate_namespace_metadata_disk_full
+                     BEFORE INSERT ON cow_journal
+                     BEGIN
+                       SELECT RAISE(FAIL, 'database or disk is full');
+                     END;",
+                )
+                .unwrap();
+        }
+
+        assert!(core
+            .write(&workspace, "disk-full.txt", 0, b"uncommitted")
+            .is_err());
+        assert_eq!(
+            core.read(&workspace, "disk-full.txt", 0, 32).unwrap(),
+            b"committed"
+        );
+        drop(core);
+
+        let recovered = WorkspaceCore::open(storage.path()).unwrap();
+        let recovered_workspace = recovered.open_workspace(workspace.id()).unwrap();
+        assert_eq!(
+            recovered
+                .read(&recovered_workspace, "disk-full.txt", 0, 32)
+                .unwrap(),
+            b"committed"
+        );
+        assert_eq!(
+            recovered.chunks().stats().unwrap().referenced_chunks,
+            references_before
+        );
     }
 
     #[test]
@@ -3224,6 +3286,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_paths_reject_cross_platform_escape_ads_and_reserved_forms() {
+        assert_eq!(
+            normalize_path(Path::new("src/Ä/Case.rs"), false).unwrap(),
+            "src/Ä/Case.rs"
+        );
+        for path in [
+            "../host",
+            "..\\host",
+            "\\\\server\\share",
+            "\\\\?\\C:\\host",
+            "file.txt:stream",
+            "nested/CON.txt",
+            "nested/trailing.",
+            "nested/trailing ",
+            "nested/a*",
+        ] {
+            assert!(
+                normalize_path(Path::new(path), false).is_err(),
+                "accepted non-portable path {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cleanup_unpins_workspace_and_baseline_content() {
         let (_repo, _storage, core, workspace) = fixture();
         assert!(core.chunks().stats().unwrap().referenced_chunks > 0);
@@ -3255,5 +3341,32 @@ mod tests {
         core.remove_proposal(&record.ref_name).unwrap();
         core.gc().unwrap();
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, 0);
+    }
+
+    #[test]
+    fn proposal_reader_rejects_tampered_baseline_metadata() {
+        let (_repo, _storage, core, workspace) = fixture();
+        let record = core
+            .preserve_proposal(
+                &workspace,
+                "refs/greppy/agent/tampered-baseline",
+                &"1".repeat(40),
+                &"2".repeat(40),
+                &"3".repeat(40),
+            )
+            .unwrap();
+        {
+            let connection = core.lock_metadata().unwrap();
+            connection
+                .execute(
+                    "UPDATE cow_proposals SET baseline_hash = ?2 WHERE ref_name = ?1",
+                    params![record.ref_name, "0".repeat(64)],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            core.proposal(&record.ref_name),
+            Err(Error::Corrupt(_))
+        ));
     }
 }

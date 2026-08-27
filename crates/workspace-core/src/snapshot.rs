@@ -1,3 +1,4 @@
+use crate::path_policy::validate_portable_component;
 use crate::{ChunkId, ChunkStore, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -52,6 +53,35 @@ pub struct BaselineSnapshot {
     pub tracker_epoch: Option<u64>,
     #[serde(default)]
     pub tracker_generation: Option<u64>,
+}
+
+fn repository_baseline_hash(
+    base_commit: &str,
+    index_hash: &str,
+    entries: &[BaselineEntry],
+) -> Result<String> {
+    let canonical = serde_json::to_vec(&(base_commit, index_hash, entries))?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
+}
+
+pub(crate) fn validate_repository_snapshot_integrity(snapshot: &BaselineSnapshot) -> Result<()> {
+    if !snapshot.directories.is_empty() || snapshot.base_commit.starts_with("virtual-empty:") {
+        return Err(Error::Corrupt(
+            "a repository proposal contains an overlay-directory snapshot".into(),
+        ));
+    }
+    let expected = repository_baseline_hash(
+        &snapshot.base_commit,
+        &snapshot.index_hash,
+        &snapshot.entries,
+    )?;
+    if expected != snapshot.baseline_hash {
+        return Err(Error::Corrupt(format!(
+            "repository baseline hash mismatch: expected {expected}, found {}",
+            snapshot.baseline_hash
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,8 +329,7 @@ fn capture_once(
     // The baseline identity is content-derived rather than dependent on Git's
     // porcelain serialization. Full and journal-incremental captures must
     // produce the same identity for the same visible repository state.
-    let canonical = serde_json::to_vec(&(&first.head, &first.index_hash, &entries))?;
-    let baseline_hash = blake3::hash(&canonical).to_hex().to_string();
+    let baseline_hash = repository_baseline_hash(&first.head, &first.index_hash, &entries)?;
     Ok(BaselineSnapshot {
         repository: repository.to_path_buf(),
         base_commit: first.head.clone(),
@@ -450,11 +479,11 @@ fn capture_repository_incremental_once(
                 return Err(Error::ConcurrentRepositoryMutation);
             }
         }
-        let canonical = serde_json::to_vec(&(&head, &index_hash, &entries))?;
+        let baseline_hash = repository_baseline_hash(&head, &index_hash, &entries)?;
         Ok(BaselineSnapshot {
             repository,
             base_commit: head,
-            baseline_hash: blake3::hash(&canonical).to_hex().to_string(),
+            baseline_hash,
             index_hash,
             index_chunks,
             directories: cached.directories.clone(),
@@ -986,7 +1015,11 @@ fn validate_relative_path(path: &str) -> Result<()> {
     }
     for component in path.components() {
         match component {
-            Component::Normal(_) => {}
+            Component::Normal(component) => validate_portable_component(
+                component
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidPath("path is not UTF-8".into()))?,
+            )?,
             _ => return Err(Error::InvalidPath(path.display().to_string())),
         }
     }
@@ -1105,6 +1138,23 @@ mod tests {
             b"2 R. N... 100644 100644 100644 aaaaaaa bbbbbbb R100 renamed.txt\0"
         )
         .is_err());
+    }
+
+    #[test]
+    fn snapshot_inventory_rejects_non_portable_repository_paths() {
+        validate_relative_path("src/Ä/Case.rs").unwrap();
+        for path in [
+            "..\\host",
+            "file.txt:stream",
+            "nested/CON.txt",
+            "nested/trailing.",
+            "nested/a*",
+        ] {
+            assert!(
+                validate_relative_path(path).is_err(),
+                "accepted non-portable snapshot path {path:?}"
+            );
+        }
     }
 
     #[test]

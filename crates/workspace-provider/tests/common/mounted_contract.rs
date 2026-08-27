@@ -200,6 +200,10 @@ fn exercise_byte_range_lock_contract(root: &Path) {
 pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     let regular = root.join("contract-regular.bin");
     fs::write(&regular, b"alpha").unwrap();
+    assert!(
+        fs::write(root.join("contract-ads.txt:stream"), b"forbidden").is_err(),
+        "the mounted portable namespace must reject Windows alternate data streams"
+    );
     OpenOptions::new()
         .append(true)
         .open(&regular)

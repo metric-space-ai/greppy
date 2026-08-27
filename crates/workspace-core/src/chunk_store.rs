@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -474,8 +474,13 @@ impl ChunkStore {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
+        // Hold the cross-process SQLite writer lock while new segment files
+        // are materialized. Another opener cannot mistake an in-flight GC
+        // segment for a crash orphan before this transaction commits or rolls
+        // back.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows: Vec<(ChunkId, i64, u64, usize, i64)> = {
-            let mut statement = connection.prepare(
+            let mut statement = transaction.prepare(
                 "SELECT hash, segment_id, payload_offset, len, refs
                  FROM cow_chunks WHERE refs > 0 ORDER BY hash",
             )?;
@@ -494,7 +499,7 @@ impl ChunkStore {
             mapped.collect::<std::result::Result<Vec<_>, _>>()?
         };
         let old_segments: Vec<i64> = {
-            let mut statement = connection.prepare("SELECT id FROM cow_segments ORDER BY id")?;
+            let mut statement = transaction.prepare("SELECT id FROM cow_segments ORDER BY id")?;
             let values = statement
                 .query_map([], |row| row.get(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -541,7 +546,6 @@ impl ChunkStore {
         segments.last_mut().unwrap().1 = segment_len;
         sync_directory(&self.root.join("segments"))?;
 
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (id, len) in &segments {
             transaction.execute(
                 "INSERT INTO cow_segments(id, committed_len) VALUES(?1, ?2)",
@@ -612,8 +616,50 @@ impl ChunkStore {
                 statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        let registered = segments.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+        let segments_root = self.root.join("segments");
+        let mut removed_orphan = false;
+        for entry in fs::read_dir(&segments_root)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Error::Corrupt("segment filename is not UTF-8".into()))?;
+            let stem = name.strip_suffix(".gcws").ok_or_else(|| {
+                Error::Corrupt(format!("unexpected file in segment store: {name}"))
+            })?;
+            if stem.len() != 16 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::Corrupt(format!(
+                    "non-canonical segment filename: {name}"
+                )));
+            }
+            let parsed = u64::from_str_radix(stem, 16)
+                .ok()
+                .and_then(|id| i64::try_from(id).ok())
+                .ok_or_else(|| Error::Corrupt(format!("invalid segment id: {name}")))?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.file_type().is_file() {
+                return Err(Error::Corrupt(format!(
+                    "segment path is not a regular file: {name}"
+                )));
+            }
+            if !registered.contains(&parsed) {
+                fs::remove_file(entry.path())?;
+                removed_orphan = true;
+            }
+        }
+        if removed_orphan {
+            sync_directory(&segments_root)?;
+        }
         for (id, committed_len) in segments {
             let path = self.segment_path(id);
+            if let Ok(metadata) = fs::symlink_metadata(&path) {
+                if !metadata.file_type().is_file() {
+                    return Err(Error::Corrupt(format!(
+                        "segment {id} is not a regular file"
+                    )));
+                }
+            }
             let file = OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -893,6 +939,33 @@ mod tests {
     }
 
     #[test]
+    fn metadata_commit_failure_recovers_the_uncommitted_segment_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(temp.path()).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TEMP TRIGGER simulate_metadata_disk_full
+                     BEFORE INSERT ON cow_chunks
+                     BEGIN
+                       SELECT RAISE(FAIL, 'database or disk is full');
+                     END;",
+                )
+                .unwrap();
+        }
+        assert!(store.put(b"must-not-commit").is_err());
+        let segment = store.segment_path(1);
+        assert!(fs::metadata(&segment).unwrap().len() > 0);
+        drop(store);
+
+        let recovered = ChunkStore::open(temp.path()).unwrap();
+        assert_eq!(fs::metadata(&segment).unwrap().len(), 0);
+        assert_eq!(recovered.stats().unwrap().chunk_count, 0);
+        recovered.verify().unwrap();
+    }
+
+    #[test]
     fn gc_rewrites_only_referenced_chunks_and_keeps_them_readable() {
         let temp = tempfile::tempdir().unwrap();
         let store = ChunkStore::open(temp.path()).unwrap();
@@ -907,6 +980,43 @@ mod tests {
         assert_eq!(store.read(kept).unwrap(), b"kept");
         assert!(store.read(removed).is_err());
         store.verify().unwrap();
+    }
+
+    #[test]
+    fn gc_commit_failure_removes_orphan_segments_on_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(temp.path()).unwrap();
+        let kept = store.put(b"kept across failed gc").unwrap();
+        store.pin(kept).unwrap();
+        let unreferenced = store.put(b"unreferenced across failed gc").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TEMP TRIGGER simulate_gc_metadata_disk_full
+                     BEFORE INSERT ON cow_segments
+                     WHEN NEW.id > 1
+                     BEGIN
+                       SELECT RAISE(FAIL, 'database or disk is full');
+                     END;",
+                )
+                .unwrap();
+        }
+        assert!(store.gc().is_err());
+        let orphan = store.segment_path(2);
+        assert!(orphan.is_file());
+        assert_eq!(store.read(kept).unwrap(), b"kept across failed gc");
+        assert_eq!(
+            store.read(unreferenced).unwrap(),
+            b"unreferenced across failed gc"
+        );
+        drop(store);
+
+        let recovered = ChunkStore::open(temp.path()).unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(recovered.stats().unwrap().chunk_count, 2);
+        assert_eq!(recovered.read(kept).unwrap(), b"kept across failed gc");
+        recovered.verify().unwrap();
     }
 
     #[test]
