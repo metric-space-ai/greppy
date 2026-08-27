@@ -163,6 +163,7 @@ public static class GreppyPipeClient
 $DaemonPids = [Collections.Generic.HashSet[int]]::new()
 $ChildProcesses = [Collections.Generic.List[Diagnostics.Process]]::new()
 $QuerySequence = 0
+$PrewarmNavigation = $null
 
 function Write-Section([string]$Name) {
     Write-Host ""
@@ -231,6 +232,19 @@ function Write-FailureDiagnostics {
     }
     catch {
         Write-Host "process inventory unavailable: $($_.Exception.Message)"
+    }
+    if ($null -ne $script:PrewarmNavigation) {
+        $prewarmDiagnostic = [pscustomobject]@{
+            process_id = $script:PrewarmNavigation.Process.Id
+            process_exited = $script:PrewarmNavigation.Process.HasExited
+            stdout_completed = $script:PrewarmNavigation.Stdout.IsCompleted
+            stderr_completed = $script:PrewarmNavigation.Stderr.IsCompleted
+            elapsed_ms = [Math]::Round(
+                ([DateTime]::UtcNow - $script:PrewarmNavigation.StartedAtUtc).TotalMilliseconds,
+                3
+            )
+        }
+        Write-Host "prewarm-navigation=$($prewarmDiagnostic | ConvertTo-Json -Compress)"
     }
     try {
         $runtimeInventory = @(
@@ -496,7 +510,7 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     # opens an indexed store that already contains vectors. Drive that exact
     # contract before probing the private diagnostic endpoint; merely waiting
     # after `index` would test a lifecycle the CLI does not promise.
-    $prewarmNavigation = Start-GreppyProcess @(
+    $script:PrewarmNavigation = Start-GreppyProcess @(
         '--root', $RepoEmbed, 'search-symbol', 'ScoreLimits', '--json'
     )
     Wait-For 'embedding daemon endpoint after first graph-command prewarm' 120 {
@@ -508,10 +522,12 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     # healthy. Bound this separately so failure diagnostics retain both live
     # processes and their exact command lines instead of observing them only
     # after the TTL has expired.
-    Wait-For 'first graph command to exit after async daemon prewarm' 30 {
-        $prewarmNavigation.Process.HasExited
+    Wait-For 'first graph command process and redirected streams to close after async daemon prewarm' 30 {
+        $script:PrewarmNavigation.Process.HasExited -and
+            $script:PrewarmNavigation.Stdout.IsCompleted -and
+            $script:PrewarmNavigation.Stderr.IsCompleted
     }
-    Complete-GreppyProcess $prewarmNavigation `
+    Complete-GreppyProcess $script:PrewarmNavigation `
         (Join-Path $Work 'out\prewarm-navigation.json') $true
     $prewarmStatus = Get-DaemonStatus $EmbedEndpoint
     Write-Host "embedding-prewarm=$($prewarmStatus | ConvertTo-Json -Depth 5 -Compress)"

@@ -565,25 +565,28 @@ class ReleaseArtifactTests(unittest.TestCase):
             windows_daemon_stress,
         )
         self.assertIn(
-            "$prewarmNavigation = Start-GreppyProcess",
+            "$script:PrewarmNavigation = Start-GreppyProcess",
             windows_daemon_stress,
         )
         self.assertIn(
-            "first graph command to exit after async daemon prewarm",
+            "first graph command process and redirected streams to close after async daemon prewarm",
             windows_daemon_stress,
         )
+        self.assertIn("stdout_completed", windows_daemon_stress)
+        self.assertIn("stderr_completed", windows_daemon_stress)
+        self.assertIn("prewarm-navigation=", windows_daemon_stress)
         self.assertIn("prewarm-navigation.json", windows_daemon_stress)
         self.assertLess(
             windows_daemon_stress.index(
                 "embedding daemon endpoint after first graph-command prewarm"
             ),
             windows_daemon_stress.index(
-                "first graph command to exit after async daemon prewarm"
+                "first graph command process and redirected streams to close after async daemon prewarm"
             ),
         )
         self.assertLess(
             windows_daemon_stress.index(
-                "first graph command to exit after async daemon prewarm"
+                "first graph command process and redirected streams to close after async daemon prewarm"
             ),
             windows_daemon_stress.index("prewarm-navigation.json"),
         )
