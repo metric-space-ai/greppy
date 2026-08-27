@@ -6,7 +6,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Binary,
-    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) "greppy-daemon-stress-$([Guid]::NewGuid().ToString('N'))")
+    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) "greppy-daemon-stress-$([Guid]::NewGuid().ToString('N'))"),
+    [ValidateRange(30, 3600)]
+    [int]$ChildTimeoutSeconds = 900
 )
 
 Set-StrictMode -Version Latest
@@ -252,7 +254,32 @@ function Start-GreppyProcess([string[]]$Arguments) {
         Process = $process
         Stdout = $process.StandardOutput.ReadToEndAsync()
         Stderr = $process.StandardError.ReadToEndAsync()
+        StartedAtUtc = [DateTime]::UtcNow
+        CommandLabel = "greppy $($Arguments -join ' ')"
     }
+}
+
+function Wait-GreppyChild(
+    [pscustomobject]$Handle,
+    [string]$Operation
+) {
+    $elapsedMilliseconds = ([DateTime]::UtcNow - $Handle.StartedAtUtc).TotalMilliseconds
+    $remainingMilliseconds = [Math]::Floor(
+        ($ChildTimeoutSeconds * 1000.0) - $elapsedMilliseconds
+    )
+    if ($remainingMilliseconds -gt 0 -and
+        $Handle.Process.WaitForExit([int]$remainingMilliseconds)) {
+        return
+    }
+
+    try {
+        Stop-Process -Id $Handle.Process.Id -Force -ErrorAction SilentlyContinue
+        [void]$Handle.Process.WaitForExit(10000)
+    }
+    catch {
+        # The shared finally block retries cleanup for every tracked child.
+    }
+    throw "$Operation exceeded the $ChildTimeoutSeconds-second child deadline ($($Handle.CommandLabel))"
 }
 
 function Complete-GreppyProcess(
@@ -260,7 +287,7 @@ function Complete-GreppyProcess(
     [string]$OutputPath,
     [bool]$RequireSuccess
 ) {
-    $Handle.Process.WaitForExit()
+    Wait-GreppyChild $Handle 'concurrent semantic search'
     $stdout = $Handle.Stdout.GetAwaiter().GetResult()
     $stderr = $Handle.Stderr.GetAwaiter().GetResult()
     [IO.File]::WriteAllText($OutputPath, $stdout, [Text.UTF8Encoding]::new($false))
@@ -282,7 +309,7 @@ function Invoke-GreppyJson(
     [int[]]$AllowedExitCodes = @(0)
 ) {
     $process = Start-GreppyProcess $Arguments
-    $process.Process.WaitForExit()
+    Wait-GreppyChild $process 'Greppy JSON command'
     $stdout = $process.Stdout.GetAwaiter().GetResult()
     $stderr = $process.Stderr.GetAwaiter().GetResult()
     [IO.File]::WriteAllText($OutputPath, $stdout, [Text.UTF8Encoding]::new($false))
@@ -510,7 +537,7 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
         throw 'summary flood produced no classified capacity response'
     }
     $briefPath = Join-Path $Work 'out\brief.json'
-    $brief.Process.WaitForExit()
+    Wait-GreppyChild $brief 'summary brief command'
     $briefStdout = $brief.Stdout.GetAwaiter().GetResult()
     $briefStderr = $brief.Stderr.GetAwaiter().GetResult()
     [IO.File]::WriteAllText($briefPath, $briefStdout, [Text.UTF8Encoding]::new($false))

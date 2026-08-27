@@ -548,6 +548,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("Stop-Process", windows_daemon_stress)
         self.assertIn("48, 20000", windows_daemon_stress)
         self.assertIn("attempt < 3", windows_daemon_stress)
+        self.assertIn("[int]$ChildTimeoutSeconds = 900", windows_daemon_stress)
+        self.assertIn("function Wait-GreppyChild", windows_daemon_stress)
+        self.assertEqual(windows_daemon_stress.count("Wait-GreppyChild $"), 3)
+        self.assertNotIn(".Process.WaitForExit()", windows_daemon_stress)
         self.assertIn("GREPPY_EMBED_DAEMON_MODEL_TTL_S", windows_daemon_stress)
         self.assertIn(
             "Copy-Item bench/release_daemon_stress.ps1", workflow
