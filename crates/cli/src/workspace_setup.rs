@@ -400,6 +400,7 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
     let app = locate_macos_app(&current)?;
     require_bundled_file(&app, "signed FSKit application")?;
+    validate_macos_fskit_installation(&app)?;
     let status = Command::new("/usr/bin/open")
         .arg(&app)
         .status()
@@ -451,6 +452,100 @@ fn locate_macos_app(current_exe: &Path) -> Result<PathBuf, String> {
         return Ok(bundle.to_path_buf());
     }
     sibling(current_exe, "GreppyWorkspaceFS.app")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_fskit_profile_paths(app: &Path) -> [(PathBuf, &'static str); 2] {
+    [
+        (
+            app.join("Contents/embedded.provisionprofile"),
+            "FSKit host application provisioning profile",
+        ),
+        (
+            app.join(
+                "Contents/Extensions/GreppyWorkspaceFS.appex/Contents/embedded.provisionprofile",
+            ),
+            "FSKit extension provisioning profile",
+        ),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn require_macos_fskit_profiles(app: &Path) -> Result<[PathBuf; 2], String> {
+    let mut accepted = Vec::with_capacity(2);
+    for (profile, label) in macos_fskit_profile_paths(app) {
+        let metadata = fs::symlink_metadata(&profile).map_err(|error| {
+            format!(
+                "incomplete Greppy FSKit installation: {label} is missing at {}: {error}; reinstall the signed Greppy package",
+                profile.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "incomplete Greppy FSKit installation: {label} must be a regular embedded file at {}; reinstall the signed Greppy package",
+                profile.display()
+            ));
+        }
+        accepted.push(profile);
+    }
+    accepted.try_into().map_err(|_| {
+        "internal error while validating the two required Greppy FSKit profiles".to_string()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_fskit_installation(app: &Path) -> Result<(), String> {
+    let profiles = require_macos_fskit_profiles(app)?;
+    for profile in profiles {
+        let decoded = Command::new("/usr/bin/security")
+            .arg("cms")
+            .arg("-D")
+            .arg("-i")
+            .arg(&profile)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "cannot validate embedded FSKit provisioning profile {}: {error}",
+                    profile.display()
+                )
+            })?;
+        if !decoded.status.success() {
+            return Err(format!(
+                "invalid embedded FSKit provisioning profile at {}: {}; reinstall the signed Greppy package",
+                profile.display(),
+                String::from_utf8_lossy(&decoded.stderr).trim()
+            ));
+        }
+    }
+
+    let verified = Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg("--deep")
+        .arg("--strict")
+        .arg(app)
+        .output()
+        .map_err(|error| format!("cannot verify Greppy FSKit code signature: {error}"))?;
+    if !verified.status.success() {
+        return Err(format!(
+            "Greppy FSKit code signature is invalid: {}; reinstall the signed Greppy package",
+            String::from_utf8_lossy(&verified.stderr).trim()
+        ));
+    }
+
+    let assessed = Command::new("/usr/sbin/spctl")
+        .arg("--assess")
+        .arg("--type")
+        .arg("execute")
+        .arg(app)
+        .output()
+        .map_err(|error| format!("cannot run Gatekeeper assessment for Greppy FSKit: {error}"))?;
+    if !assessed.status.success() {
+        return Err(format!(
+            "Gatekeeper rejected Greppy FSKit: {}; install the notarized Greppy package before activating the extension",
+            String::from_utf8_lossy(&assessed.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -692,5 +787,30 @@ mod tests {
             locate_macos_app(Path::new("/tmp/release/greppy")).unwrap(),
             Path::new("/tmp/release/GreppyWorkspaceFS.app")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fskit_setup_requires_two_regular_embedded_profiles() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("GreppyWorkspaceFS.app");
+        let paths = macos_fskit_profile_paths(&app);
+        for (profile, _) in &paths {
+            fs::create_dir_all(profile.parent().unwrap()).unwrap();
+            fs::write(profile, b"profile").unwrap();
+        }
+        let accepted = require_macos_fskit_profiles(&app).unwrap();
+        assert_eq!(accepted[0], paths[0].0);
+        assert_eq!(accepted[1], paths[1].0);
+
+        fs::remove_file(&paths[1].0).unwrap();
+        let outside = root.path().join("outside.provisionprofile");
+        fs::write(&outside, b"profile").unwrap();
+        symlink(&outside, &paths[1].0).unwrap();
+        let error = require_macos_fskit_profiles(&app).unwrap_err();
+        assert!(error.contains("must be a regular embedded file"));
+        assert!(error.contains("reinstall the signed Greppy package"));
     }
 }

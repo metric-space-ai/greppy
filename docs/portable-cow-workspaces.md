@@ -135,7 +135,12 @@ baselines remain pinned until their refs are removed.
   either profile is absent and validates signature, expiry, distribution type,
   exact bundle ID, certificate and entitlement allowlist before signing.
   Notarization without these profiles is insufficient for FSKit activation and
-  is never accepted as release evidence.
+  is never accepted as release evidence. At runtime, `workspace setup` checks
+  both profiles as regular embedded CMS files and verifies the complete bundle
+  with Developer ID code-signing and Gatekeeper before it opens System
+  Settings. An older or incomplete installation therefore fails with a
+  reinstall diagnostic instead of directing the user to a switch macOS cannot
+  activate.
 - Windows x86_64 uses Greppy's minimal WinFsp transport fork because unchanged
   WinFsp 2.1 rejects `FileLinkInformation` before userspace. The fork forwards
   real hardlink operations to the same Rust provider and ships with its exact
