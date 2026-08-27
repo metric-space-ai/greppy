@@ -136,8 +136,18 @@ public static class GreppyPipeClient
             string requestId = prefix + "-" + index.ToString();
             string request = "{\"protocol\":2,\"op\":\"infer\",\"request_id\":\"" +
                 requestId + "\"}";
-            tasks[index] = Task.Run(() =>
-                RoundTripText(endpoint, requestId, request, timeoutMilliseconds));
+            tasks[index] = Task.Run(() => {
+                GreppyPipeResult result = null;
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    result = RoundTripText(
+                        endpoint, requestId, request, timeoutMilliseconds);
+                    if (String.IsNullOrEmpty(result.Error))
+                        return result;
+                    Thread.Sleep(100 * (attempt + 1));
+                }
+                return result;
+            });
         }
         Task.WaitAll(tasks);
         GreppyPipeResult[] results = new GreppyPipeResult[count];
@@ -149,6 +159,7 @@ public static class GreppyPipeClient
 '@
 
 $DaemonPids = [Collections.Generic.HashSet[int]]::new()
+$ChildProcesses = [Collections.Generic.List[Diagnostics.Process]]::new()
 $QuerySequence = 0
 
 function Write-Section([string]$Name) {
@@ -236,6 +247,7 @@ function Start-GreppyProcess([string[]]$Arguments) {
     if (-not $process.Start()) {
         throw "failed to start greppy $($Arguments -join ' ')"
     }
+    [void]$ChildProcesses.Add($process)
     return [pscustomobject]@{
         Process = $process
         Stdout = $process.StandardOutput.ReadToEndAsync()
@@ -308,14 +320,22 @@ function Convert-Burst([GreppyPipeResult[]]$Results) {
             continue
         }
         $response = $result.Response | ConvertFrom-Json
+        $requestIdProperty = $response.PSObject.Properties['request_id']
+        $errorKindProperty = $response.PSObject.Properties['error_kind']
+        $retryableProperty = $response.PSObject.Properties['retryable']
         $parsed += [pscustomobject]@{
             request_id = $result.RequestId
             client_error = $null
             capacity = (
-                $response.error_kind -eq 'capacity' -and
-                $response.retryable -eq $true
+                $null -ne $errorKindProperty -and
+                $errorKindProperty.Value -eq 'capacity' -and
+                $null -ne $retryableProperty -and
+                $retryableProperty.Value -eq $true
             )
-            echo_ok = $response.request_id -eq $result.RequestId
+            echo_ok = (
+                $null -ne $requestIdProperty -and
+                $requestIdProperty.Value -eq $result.RequestId
+            )
         }
     }
     return @($parsed)
@@ -532,7 +552,23 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     Write-Host "Windows release daemon stress passed: $Binary"
 }
 finally {
-    foreach ($daemonPid in $DaemonPids) {
+    foreach ($childProcess in @($ChildProcesses)) {
+        if (-not $childProcess.HasExited) {
+            Stop-Process -Id $childProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($endpointName in @('EmbedEndpoint', 'SummaryEndpoint')) {
+        $endpointVariable = Get-Variable -Name $endpointName -ErrorAction SilentlyContinue
+        if ($null -ne $endpointVariable) {
+            try {
+                [void](Get-DaemonStatus ([string]$endpointVariable.Value))
+            }
+            catch {
+                # An absent pipe is already clean; known owners are stopped below.
+            }
+        }
+    }
+    foreach ($daemonPid in @($DaemonPids)) {
         Stop-Process -Id $daemonPid -Force -ErrorAction SilentlyContinue
     }
 }

@@ -44,6 +44,7 @@ class WindowsMsiTests(unittest.TestCase):
         )
         self.assertIn("-AllowUnsignedForSmokeTest", workflow)
         self.assertIn(r"target\debug\greppy.exe", workflow)
+        self.assertIn("Parse Windows release harnesses natively", workflow)
         self.assertIn("Language.Parser]::ParseFile", workflow)
         self.assertIn("bench\\release_daemon_stress.ps1", workflow)
         self.assertIn("verify_windows_driver_signatures.ps1 $dist", workflow)
