@@ -2006,7 +2006,16 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "redirected streams remained inherited for {elapsed:?}"
         );
-        assert!(binaries.join("greppy-detach-daemon-started").is_file());
+        let started_marker = binaries.join("greppy-detach-daemon-started");
+        let started_deadline = Instant::now() + Duration::from_secs(2);
+        while !started_marker.is_file() && Instant::now() < started_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started_marker.is_file(), "detached child did not start");
+        assert!(
+            !binaries.join("greppy-detach-daemon-completed").is_file(),
+            "detached child completed before its three-second hold interval"
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !binaries.join("greppy-detach-daemon-completed").is_file()
