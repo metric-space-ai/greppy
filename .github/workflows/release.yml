@@ -567,9 +567,11 @@ jobs:
           mkdir -p "$clean/deb" "$clean/rpm"
           dpkg-deb -x "${{ matrix.asset }}" "$clean/deb"
           (cd "$clean/rpm" && rpm2cpio "$GITHUB_WORKSPACE/${{ matrix.secondary_asset }}" | cpio -idm --quiet)
-          deb_bin="$clean/deb/usr/lib/greppy/bin"
-          rpm_bin="$clean/rpm/usr/lib/greppy/bin"
-          deb_licenses="$clean/deb/usr/share/licenses/greppy"
+          deb_root="$clean/deb"
+          rpm_root="$clean/rpm"
+          deb_bin="$deb_root/usr/lib/greppy/bin"
+          rpm_bin="$rpm_root/usr/lib/greppy/bin"
+          deb_licenses="$deb_root/usr/share/licenses/greppy"
           test ! -e "$clean/deb/usr/bin/grep"
           test ! -e "$deb_licenses/WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt"
           ! compgen -G "$deb_licenses/RIFT-*" >/dev/null
