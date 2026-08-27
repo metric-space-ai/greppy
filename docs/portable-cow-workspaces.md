@@ -244,7 +244,8 @@ identical 300,000-file fixture, and runs through the real FUSE3, FSKit, or
 WinFsp mount. Linux and Windows use clean hosted runners. macOS uses an
 ephemeral Apple Silicon runner carrying the `greppy-fskit-performance` label,
 a configured
-`MACOS_CODE_SIGN_IDENTITY`, and an OS/MDM approval for the Greppy FSKit bundle
+`MACOS_SIGNING_IDENTITY` secret used by the release workflow, and an OS/MDM
+approval for the Greppy FSKit bundle
 identity. The job refuses an existing data or mount root; this prevents warm
 state from a previous run from becoming release evidence.
 
