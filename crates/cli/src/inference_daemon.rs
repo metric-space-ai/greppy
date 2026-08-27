@@ -466,9 +466,8 @@ pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Re
 fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null;
-    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
     if command.get_current_dir().is_some() || command.get_envs().next().is_some() {
@@ -498,14 +497,28 @@ fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()
     }
     command_line.push(0);
 
-    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let stdin = open_inheritable_null(windows_sys::Win32::Foundation::GENERIC_READ)?;
+    let stdout = open_inheritable_null(windows_sys::Win32::Foundation::GENERIC_WRITE)?;
+    let mut inherited_handles = [stdin.raw(), stdout.raw()];
+    let attributes = OwnedProcThreadAttributeList::new(&mut inherited_handles)?;
+
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin.raw();
+    startup.StartupInfo.hStdOutput = stdout.raw();
+    startup.StartupInfo.hStdError = stdout.raw();
+    startup.lpAttributeList = attributes.ptr;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = {
         use windows_sys::Win32::System::Threading::{
             CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+            EXTENDED_STARTUPINFO_PRESENT,
         };
-        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS
+        CREATE_NEW_PROCESS_GROUP
+            | CREATE_NO_WINDOW
+            | DETACHED_PROCESS
+            | EXTENDED_STARTUPINFO_PRESENT
     };
     let created = unsafe {
         CreateProcessW(
@@ -513,11 +526,11 @@ fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()
             command_line.as_mut_ptr(),
             null(),
             null(),
-            0,
+            1,
             flags,
             null(),
             null(),
-            &startup,
+            &startup.StartupInfo,
             &mut process,
         )
     };
@@ -525,10 +538,121 @@ fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()
         return Err(std::io::Error::last_os_error());
     }
     unsafe {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+        windows_sys::Win32::Foundation::CloseHandle(process.hThread);
+        windows_sys::Win32::Foundation::CloseHandle(process.hProcess);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct OwnedWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl OwnedWindowsHandle {
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedWindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_inheritable_null(access: u32) -> std::io::Result<OwnedWindowsHandle> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
+    };
+    let nul = [u16::from(b'N'), u16::from(b'U'), u16::from(b'L'), 0];
+    let handle = unsafe {
+        CreateFileW(
+            nul.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &mut security,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(OwnedWindowsHandle(handle))
+    }
+}
+
+#[cfg(windows)]
+struct OwnedProcThreadAttributeList {
+    _storage: Vec<usize>,
+    ptr: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+#[cfg(windows)]
+impl OwnedProcThreadAttributeList {
+    fn new(handles: &mut [windows_sys::Win32::Foundation::HANDLE]) -> std::io::Result<Self> {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        };
+
+        let mut bytes = 0usize;
+        unsafe {
+            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes);
+        }
+        if bytes == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let words = bytes.div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0usize; words];
+        let ptr = storage.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(ptr, 1, 0, &mut bytes) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let owned = Self {
+            _storage: storage,
+            ptr,
+        };
+        let updated = unsafe {
+            UpdateProcThreadAttribute(
+                owned.ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                std::mem::size_of_val(handles),
+                null_mut(),
+                null(),
+            )
+        };
+        if updated == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(owned)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedProcThreadAttributeList {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(self.ptr);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1858,8 +1982,10 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let intermediate = temp.path().join("greppy-detach-intermediate.exe");
-        let daemon = temp.path().join("greppy-detach-daemon.exe");
+        let binaries = temp.path().join("path with spaces");
+        std::fs::create_dir(&binaries).unwrap();
+        let intermediate = binaries.join("greppy-detach-intermediate.exe");
+        let daemon = binaries.join("greppy-detach-daemon.exe");
         std::fs::copy(&executable, &intermediate).unwrap();
         std::fs::copy(&executable, &daemon).unwrap();
 
@@ -1880,15 +2006,15 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "redirected streams remained inherited for {elapsed:?}"
         );
-        assert!(temp.path().join("greppy-detach-daemon-started").is_file());
+        assert!(binaries.join("greppy-detach-daemon-started").is_file());
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !temp.path().join("greppy-detach-daemon-completed").is_file()
+        while !binaries.join("greppy-detach-daemon-completed").is_file()
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(25));
         }
-        assert!(temp.path().join("greppy-detach-daemon-completed").is_file());
+        assert!(binaries.join("greppy-detach-daemon-completed").is_file());
     }
 
     #[test]
