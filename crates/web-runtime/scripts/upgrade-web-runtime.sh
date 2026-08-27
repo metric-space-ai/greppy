@@ -31,6 +31,7 @@ for member in SHA256SUMS sbom.json provenance.json README.txt UNSIGNED LICENSE .
     web_runtime_copy_regular_file "$src/$member" "$staging/$member"
   fi
 done
+web_runtime_verify_sha256sums "$staging"
 web_runtime_write_stamp "$staging"
 web_runtime_commit_staging "$staging" "$dest"
 staging=""

@@ -68,6 +68,16 @@ impl SessionLimits {
                 limits.controller_heap_bytes = value;
             }
         }
+        if let Ok(ms) = std::env::var("GREPPY_WEB_CONTENT_CPU_MS") {
+            if let Ok(value) = ms.parse::<u64>() {
+                limits.content_cpu_time = Duration::from_millis(value);
+            }
+        }
+        if let Ok(ms) = std::env::var("GREPPY_WEB_CONTROLLER_CPU_MS") {
+            if let Ok(value) = ms.parse::<u64>() {
+                limits.controller_cpu_time = Duration::from_millis(value);
+            }
+        }
         limits
     }
 
@@ -185,7 +195,12 @@ impl SessionLimits {
         }
     }
 
-    pub fn check_cpu_time(&self, used: Duration, limit: Duration, label: &str) -> Result<(), String> {
+    pub fn check_cpu_time(
+        &self,
+        used: Duration,
+        limit: Duration,
+        label: &str,
+    ) -> Result<(), String> {
         if used > limit {
             Err(format!("{label} cpu time exceeded ({used:?} > {limit:?})"))
         } else {
@@ -248,5 +263,33 @@ mod tests {
         assert!(limits.check_contexts(2).is_err());
         assert!(limits.check_requests(2).is_ok());
         assert!(limits.check_requests(3).is_err());
+    }
+
+    #[test]
+    fn console_download_and_cpu_limits_reject_overflow() {
+        let limits = SessionLimits {
+            max_console_bytes: 4,
+            max_download_bytes: 8,
+            content_cpu_time: Duration::from_millis(10),
+            ..SessionLimits::default()
+        };
+        assert!(limits.check_console_bytes(0, 4).is_ok());
+        assert!(limits.check_console_bytes(0, 5).is_err());
+        assert!(limits.check_download_bytes(0, 8).is_ok());
+        assert!(limits.check_download_bytes(7, 2).is_err());
+        assert!(limits
+            .check_cpu_time(
+                Duration::from_millis(10),
+                limits.content_cpu_time,
+                "content"
+            )
+            .is_ok());
+        assert!(limits
+            .check_cpu_time(
+                Duration::from_millis(11),
+                limits.content_cpu_time,
+                "content"
+            )
+            .is_err());
     }
 }

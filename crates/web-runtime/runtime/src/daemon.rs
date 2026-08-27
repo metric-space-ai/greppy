@@ -481,15 +481,11 @@ impl Daemon {
                     controller,
                     content,
                     Duration::from_millis(request.deadline_ms.max(1_000)),
-                    |method, params| {
-                        gate_session_engine(
-                            sessions,
-                            &session_key,
-                            content_pid,
-                            controller_pid,
-                            method,
-                            params,
-                        )
+                    SessionEngineGate {
+                        sessions,
+                        session_id: session_key,
+                        content_pid,
+                        controller_pid,
                     },
                 )
             }
@@ -829,6 +825,8 @@ impl Daemon {
         }
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
+        let content_cpu = Duration::from_millis(sample_cpu_ms(self.content.pid()));
+        let controller_cpu = Duration::from_millis(sample_cpu_ms(self.controller.pid()));
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
             if let Err(message) = session.begin_operation(&request.request_id) {
@@ -840,6 +838,20 @@ impl Daemon {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_controller_memory(controller_rss) {
+                let _ = session.transition(SessionState::Failed);
+                Some(("limit", message))
+            } else if let Err(message) = session.limits.check_cpu_time(
+                content_cpu,
+                session.limits.content_cpu_time,
+                "content",
+            ) {
+                let _ = session.transition(SessionState::Failed);
+                Some(("limit", message))
+            } else if let Err(message) = session.limits.check_cpu_time(
+                controller_cpu,
+                session.limits.controller_cpu_time,
+                "controller",
+            ) {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else {
@@ -949,6 +961,7 @@ impl Daemon {
         }
         self.engine_call("page.goto", json!({ "page": page, "url": url }))
             .map_err(|error| engine_error(request, error, 34))?;
+        self.apply_page_record_limits(session_id, page, request)?;
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
@@ -1082,6 +1095,28 @@ impl Daemon {
                 let _ = self.recover_content(&format!("content worker: {message}"));
                 Err(message)
             }
+        }
+    }
+
+    fn apply_page_record_limits(
+        &mut self,
+        session_id: &str,
+        page: &str,
+        request: &Request,
+    ) -> Result<(), Response> {
+        let console = self
+            .engine_call("page.consoleMessages", json!({ "page": page }))
+            .map_err(|error| engine_error(request, error, 34))?;
+        let downloads = self
+            .engine_call("page.downloads", json!({ "page": page }))
+            .map_err(|error| engine_error(request, error, 34))?;
+        let records = json!({
+            "messages": console.get("messages").cloned().unwrap_or(json!([])),
+            "downloads": downloads.get("downloads").cloned().unwrap_or(json!([])),
+        });
+        match apply_record_limits(&mut self.sessions, session_id, &records) {
+            Ok(()) => Ok(()),
+            Err(message) => Err(limit_error(request, message)),
         }
     }
 
@@ -1463,7 +1498,7 @@ fn gate_session_engine(
     content_pid: u32,
     controller_pid: u32,
     method: &str,
-    params: &serde_json::Value,
+    _params: &serde_json::Value,
 ) -> Result<(), String> {
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());
@@ -1475,6 +1510,16 @@ fn gate_session_engine(
     session
         .limits
         .check_controller_memory(sample_rss_bytes(controller_pid))?;
+    session.limits.check_cpu_time(
+        Duration::from_millis(sample_cpu_ms(content_pid)),
+        session.limits.content_cpu_time,
+        "content",
+    )?;
+    session.limits.check_cpu_time(
+        Duration::from_millis(sample_cpu_ms(controller_pid)),
+        session.limits.controller_cpu_time,
+        "controller",
+    )?;
     match method {
         "browser.newContext" => {
             session
@@ -1498,19 +1543,79 @@ fn gate_session_engine(
             session.requests = session.requests.saturating_add(1);
             session.network_bytes = session.network_bytes.saturating_add(4096);
         }
-        "page.saveDownload" => {
-            let extra = params
-                .get("byteLength")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(1);
-            session
-                .limits
-                .check_download_bytes(session.download_bytes, extra)?;
-            session.download_bytes = session.download_bytes.saturating_add(extra);
-        }
         _ => {}
     }
     Ok(())
+}
+
+struct SessionEngineGate<'a> {
+    sessions: &'a mut HashMap<String, Session>,
+    session_id: String,
+    content_pid: u32,
+    controller_pid: u32,
+}
+
+impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
+    fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String> {
+        gate_session_engine(
+            self.sessions,
+            &self.session_id,
+            self.content_pid,
+            self.controller_pid,
+            method,
+            params,
+        )
+    }
+
+    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+        apply_record_limits(self.sessions, &self.session_id, records)
+    }
+}
+
+fn apply_record_limits(
+    sessions: &mut HashMap<String, Session>,
+    session_id: &str,
+    records: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(session) = sessions.get_mut(session_id) else {
+        return Err("session was closed".to_owned());
+    };
+    let console_bytes = records
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .map(|rows| sum_text_bytes(rows))
+        .unwrap_or(0);
+    let download_bytes = records
+        .get("downloads")
+        .and_then(|value| value.as_array())
+        .map(|rows| sum_byte_lengths(rows))
+        .unwrap_or(0);
+    session.limits.check_console_bytes(0, console_bytes)?;
+    session.limits.check_download_bytes(0, download_bytes)?;
+    session.console_bytes = console_bytes;
+    session.download_bytes = download_bytes;
+    Ok(())
+}
+
+fn sum_text_bytes(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .map(|row| {
+            row.get("text")
+                .and_then(|value| value.as_str())
+                .map(|text| text.len() as u64)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn sum_byte_lengths(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .map(|row| {
+            row.get("byteLength")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 impl Daemon {

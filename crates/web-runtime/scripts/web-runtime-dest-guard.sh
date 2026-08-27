@@ -525,6 +525,28 @@ web_runtime_uninstall_owned_dist() {
   fi
 }
 
+
+web_runtime_verify_sha256sums() {
+  vs_root=$1
+  if [ -L "$vs_root" ] || [ -L "$vs_root/SHA256SUMS" ] || [ -L "$vs_root/bin" ]; then
+    web_runtime_die "refusing symlink SHA256SUMS root: $vs_root"
+  fi
+  if [ ! -f "$vs_root/SHA256SUMS" ]; then
+    web_runtime_die "missing SHA256SUMS"
+  fi
+  if [ ! -d "$vs_root/bin" ]; then
+    web_runtime_die "missing bin directory for SHA256SUMS verify"
+  fi
+  (
+    CDPATH= cd -- "$vs_root/bin" || exit 1
+    if command -v shasum >/dev/null; then
+      shasum -a 256 -c ../SHA256SUMS
+    else
+      sha256sum -c ../SHA256SUMS
+    fi
+  ) || web_runtime_die "SHA256SUMS verification failed for $vs_root"
+}
+
 web_runtime_write_stamp() {
   ws_dest=$1
   web_runtime_check_owned_real_dir "$ws_dest"

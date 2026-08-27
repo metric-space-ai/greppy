@@ -192,21 +192,39 @@ fn run_script(
     route_until_script_complete(controller, content, SCRIPT_TIMEOUT)
 }
 
+pub(crate) trait EngineGate {
+    fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String>;
+    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+        let _ = records;
+        Ok(())
+    }
+}
+
+struct AllowAllGate;
+
+impl EngineGate for AllowAllGate {
+    fn before_call(&mut self, _method: &str, _params: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 pub(crate) fn route_until_script_complete(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
     timeout: Duration,
 ) -> io::Result<()> {
-    route_until_script_complete_gated(controller, content, timeout, |_, _| Ok(()))
+    route_until_script_complete_gated(controller, content, timeout, AllowAllGate)
 }
 
 pub(crate) fn route_until_script_complete_gated(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
     timeout: Duration,
-    mut before_call: impl FnMut(&str, &serde_json::Value) -> Result<(), String>,
+    mut gate: impl EngineGate,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut sidecar = 1_u64 << 62;
+    let mut pending: Option<(u64, String, serde_json::Value)> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -222,9 +240,10 @@ pub(crate) fn route_until_script_complete_gated(
                 params,
                 ..
             }) => {
-                if let Err(message) = before_call(&method, &params) {
+                if let Err(message) = gate.before_call(&method, &params) {
                     return Err(io::Error::other(format!("resource_limit: {message}")));
                 }
+                pending = Some((request_id, method.clone(), params.clone()));
                 content.send(&Message::engine_call(request_id, method, params))?;
             }
             Incoming::Content(Message::EngineResult {
@@ -234,6 +253,29 @@ pub(crate) fn route_until_script_complete_gated(
                 error,
                 ..
             }) => {
+                if ok {
+                    if let Some((pending_id, method, params)) = pending.take() {
+                        if pending_id == request_id && tally_after(&method) {
+                            if let Err(message) = poll_session_records(
+                                content,
+                                &params,
+                                remaining,
+                                &mut sidecar,
+                                &mut gate,
+                            ) {
+                                let _ = controller.send(&Message::engine_result(
+                                    request_id,
+                                    false,
+                                    serde_json::json!({}),
+                                    Some(format!("resource_limit: {message}")),
+                                ));
+                                return Err(io::Error::other(format!("resource_limit: {message}")));
+                            }
+                        }
+                    }
+                } else {
+                    pending = None;
+                }
                 controller.send(&Message::engine_result(request_id, ok, result, error))?;
             }
             Incoming::Controller(Message::ScriptComplete {
@@ -260,6 +302,91 @@ pub(crate) fn route_until_script_complete_gated(
                 ));
             }
         }
+    }
+}
+
+fn tally_after(method: &str) -> bool {
+    matches!(
+        method,
+        "page.evaluate"
+            | "page.frameEvaluate"
+            | "page.goto"
+            | "page.reload"
+            | "page.goBack"
+            | "page.goForward"
+            | "page.frameGoto"
+            | "page.setContent"
+            | "page.saveDownload"
+            | "page.click"
+            | "page.fill"
+            | "page.type"
+            | "page.press"
+            | "locator.click"
+            | "locator.fill"
+            | "locator.type"
+            | "locator.press"
+    )
+}
+
+fn poll_session_records(
+    content: &mut WorkerProcess,
+    params: &serde_json::Value,
+    timeout: Duration,
+    sidecar: &mut u64,
+    gate: &mut impl EngineGate,
+) -> Result<(), String> {
+    let Some(page) = params.get("page").and_then(|value| value.as_str()) else {
+        return Ok(());
+    };
+    let console = sidecar_engine_call(
+        content,
+        sidecar,
+        "page.consoleMessages",
+        serde_json::json!({ "page": page }),
+        timeout,
+    )?;
+    let downloads = sidecar_engine_call(
+        content,
+        sidecar,
+        "page.downloads",
+        serde_json::json!({ "page": page }),
+        timeout,
+    )?;
+    let records = serde_json::json!({
+        "messages": console.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "downloads": downloads.get("downloads").cloned().unwrap_or_else(|| serde_json::json!([])),
+    });
+    gate.after_records(&records)
+}
+
+fn sidecar_engine_call(
+    content: &mut WorkerProcess,
+    sidecar: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    *sidecar = sidecar.saturating_add(1);
+    let request_id = *sidecar;
+    content
+        .send(&Message::engine_call(request_id, method.to_owned(), params))
+        .map_err(|error| error.to_string())?;
+    match content.recv(timeout) {
+        Ok(Message::EngineResult {
+            request_id: got,
+            ok,
+            result,
+            error,
+            ..
+        }) if got == request_id => {
+            if ok {
+                Ok(result)
+            } else {
+                Err(error.unwrap_or_else(|| format!("{method} sidecar failed")))
+            }
+        }
+        Ok(other) => Err(format!("unexpected sidecar message {other:?}")),
+        Err(error) => Err(error.to_string()),
     }
 }
 

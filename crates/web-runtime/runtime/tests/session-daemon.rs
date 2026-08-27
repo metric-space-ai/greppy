@@ -78,11 +78,7 @@ fn descendant_pids(root: u32) -> Vec<u32> {
 fn wait_pids_gone(pids: &[u32], timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let leftover: Vec<u32> = pids
-            .iter()
-            .copied()
-            .filter(|pid| pid_alive(*pid))
-            .collect();
+        let leftover: Vec<u32> = pids.iter().copied().filter(|pid| pid_alive(*pid)).collect();
         if leftover.is_empty() {
             return;
         }
@@ -706,8 +702,7 @@ fn workers_do_not_inherit_secret_environment() {
     const CANARY: &str = "GREPPY_WEB_SECRET_CANARY";
     const VALUE: &str = "should-not-leak-into-workers";
     std::env::set_var(CANARY, VALUE);
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-env-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-env-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let supervisor = Supervisor::spawn(&socket, "run_env", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
@@ -1217,6 +1212,17 @@ fn runtime_bin_names() -> [&'static str; 3] {
     ]
 }
 
+fn rewrite_sha256sums(dist: &Path) {
+    let bins = runtime_bin_names().join(" ");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("cd bin && shasum -a 256 {bins} > ../SHA256SUMS"))
+        .current_dir(dist)
+        .status()
+        .expect("rewrite SHA256SUMS");
+    assert!(status.success(), "rewrite SHA256SUMS failed: {status}");
+}
+
 fn write_canary_bins(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     for (index, name) in runtime_bin_names().iter().enumerate() {
@@ -1390,6 +1396,7 @@ fn install_upgrade_rollback_roundtrip() {
         &upgraded_bytes,
     )
     .unwrap();
+    rewrite_sha256sums(&packaged);
     let (code, stdout, stderr) = run_script_args(&upgrade_script(), &[&packaged, &installed]);
     assert_eq!(code, 0, "upgrade: stdout={stdout} stderr={stderr}");
     let after_upgrade =
@@ -1397,12 +1404,18 @@ fn install_upgrade_rollback_roundtrip() {
     assert_eq!(after_upgrade, upgraded_bytes, "upgrade did not copy source");
     let previous =
         std::fs::read(installed.join("previous").join("web-runtime-supervisor")).unwrap();
-    assert_eq!(previous, original, "upgrade did not snapshot previous image");
+    assert_eq!(
+        previous, original,
+        "upgrade did not snapshot previous image"
+    );
     let (code, stdout, stderr) = run_script(&rollback_script(), Some(&installed));
     assert_eq!(code, 0, "rollback: stdout={stdout} stderr={stderr}");
     let after_rollback =
         std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
-    assert_eq!(after_rollback, original, "rollback did not restore previous");
+    assert_eq!(
+        after_rollback, original,
+        "rollback did not restore previous"
+    );
     let sums = std::fs::read_to_string(installed.join("SHA256SUMS")).unwrap();
     let restored_digest = web_runtime::artifacts::hex_sha256(&after_rollback);
     assert!(
@@ -1430,10 +1443,7 @@ fn install_upgrade_rollback_refuse_hostile_destinations() {
     assert_refused(&rollback, Some(Path::new("/")), "rollback root");
     assert_refused(&rollback, Some(&repo), "rollback repo root");
     let (code, stdout, stderr) = run_script_args(&install, &[Path::new("/"), Path::new("/")]);
-    assert_ne!(
-        code, 0,
-        "install root: stdout={stdout} stderr={stderr}"
-    );
+    assert_ne!(code, 0, "install root: stdout={stdout} stderr={stderr}");
 }
 
 #[test]
@@ -1498,7 +1508,10 @@ fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
     );
     assert_canary_bins(&canary);
     let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
-    assert_eq!(after, original, "upgrade mutated dest through previous symlink");
+    assert_eq!(
+        after, original,
+        "upgrade mutated dest through previous symlink"
+    );
     let (code, stdout, stderr) = run_script(&rollback_script(), Some(&dest));
     assert_ne!(
         code, 0,
@@ -1534,7 +1547,10 @@ fn packaging_refuses_later_member_symlink_without_partial_erase() {
         code, 0,
         "package with later symlink member: stdout={stdout} stderr={stderr}"
     );
-    assert!(stamp.exists(), "package deleted stamp before refusing later member");
+    assert!(
+        stamp.exists(),
+        "package deleted stamp before refusing later member"
+    );
     assert!(
         supervisor.exists(),
         "package deleted earlier bin before refusing later member"
@@ -1548,7 +1564,10 @@ fn packaging_refuses_later_member_symlink_without_partial_erase() {
         code, 0,
         "uninstall with later symlink member: stdout={stdout} stderr={stderr}"
     );
-    assert!(stamp.exists(), "uninstall deleted stamp before refusing later member");
+    assert!(
+        stamp.exists(),
+        "uninstall deleted stamp before refusing later member"
+    );
     assert!(supervisor.exists(), "uninstall deleted earlier bin");
     assert_eq!(
         std::fs::read_to_string(&canary_file).unwrap(),
@@ -2742,7 +2761,8 @@ fn max_pages_limit_is_enforced_by_supervisor() {
 
 #[test]
 fn max_contexts_limit_is_enforced_by_supervisor() {
-    let socket = std::env::temp_dir().join(format!("greppy-web-maxctx-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-maxctx-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_maxctx", |command| {
         command.env("GREPPY_WEB_MAX_CONTEXTS", "0");
@@ -2787,7 +2807,8 @@ fn max_contexts_limit_is_enforced_by_supervisor() {
 
 #[test]
 fn max_requests_limit_is_enforced_on_read() {
-    let socket = std::env::temp_dir().join(format!("greppy-web-maxreq-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-maxreq-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_maxreq", |command| {
         command.env("GREPPY_WEB_MAX_REQUESTS", "0");
@@ -3067,9 +3088,13 @@ fn web_doctor_reports_process_health() {
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_doctor", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
-    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&socket).unwrap().permissions())
-        & 0o777;
-    assert_eq!(mode, 0o600, "supervisor socket must be owner-only, got {mode:o}");
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&socket).unwrap().permissions())
+            & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "supervisor socket must be owner-only, got {mode:o}"
+    );
     let doctor = unix_request(
         &socket,
         &Request::new("run_doctor", "web.doctor", json!({})),
@@ -3237,4 +3262,144 @@ fn file_chooser_wait_for_event_sets_dom_files() {
 #[test]
 fn popup_opener_returns_creating_page() {
     run_named_fixture("popup-opener.mjs", "run_opener");
+}
+
+#[test]
+fn max_console_bytes_limit_is_enforced_from_recorded_logs() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-maxcon-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxcon", |command| {
+        command.env("GREPPY_WEB_MAX_CONSOLE_BYTES", "8");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.evaluate(() => console.log("abcdefghijklmnop"));
+await browser.close();
+"#;
+    let ran = run_playwright_source(&socket, "run_maxcon", source, None, Duration::from_secs(40));
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        ran.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("console limit"),
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn max_download_bytes_limit_is_enforced_from_recorded_bodies() {
+    let origin = serve_fixture("<p>download-limit</p>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-maxdl-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxdl", |command| {
+        command
+            .env("GREPPY_WEB_MAX_DOWNLOAD_BYTES", "1")
+            .arg("--fixture-url")
+            .arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.route("**/data.bin", (route) =>
+  route.fulfill({
+    body: new Uint8Array([1, 2, 3, 4]),
+    contentType: "application/octet-stream",
+    status: 200,
+  }),
+);
+await page.goto(fixtureUrl);
+await page.evaluate((url) => fetch(url), fixtureUrl + "data.bin");
+await browser.close();
+"#;
+    let ran = run_playwright_source(&socket, "run_maxdl", source, None, Duration::from_secs(40));
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        ran.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("download limit"),
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn content_cpu_limit_is_enforced_by_supervisor() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-cpu-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_cpu", |command| {
+        command.env("GREPPY_WEB_CONTENT_CPU_MS", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_cpu",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>cpu</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_cpu",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error.as_ref().unwrap().message.contains("cpu time"),
+        "{read:?}"
+    );
+}
+
+#[test]
+fn install_refuses_mutated_bin_and_leaves_dest_unmutated() {
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("greppy-web-dist-mutsrc-{pid}"));
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-mutdst-{pid}"));
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
+    assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_eq!(code, 0, "first install: stdout={stdout} stderr={stderr}");
+    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let mut mutated = original.clone();
+    mutated.extend_from_slice(b"mutated-bin-bytes");
+    std::fs::write(src.join("bin").join("web-runtime-supervisor"), &mutated).unwrap();
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_ne!(
+        code, 0,
+        "mutated install should fail: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("SHA256SUMS") || stdout.contains("SHA256SUMS"),
+        "expected SHA256SUMS failure, stdout={stdout} stderr={stderr}"
+    );
+    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after, original, "mutated install replaced dest supervisor");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
 }
