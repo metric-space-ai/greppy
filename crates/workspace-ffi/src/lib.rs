@@ -958,6 +958,122 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_path_fuzz_corpus_is_fail_closed_and_read_only() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.test"][..],
+            &["config", "user.name", "Test"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.path().join("base.txt"), "base").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "base"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let storage = tempfile::tempdir().unwrap();
+        let workspace_id = c("ffi-fuzz");
+        let core = unsafe {
+            let core = greppy_workspace_core_open(c(storage.path().to_str().unwrap()).as_ptr());
+            assert!(!core.is_null());
+            assert_eq!(
+                greppy_workspace_create(
+                    core,
+                    workspace_id.as_ptr(),
+                    c(repo.path().to_str().unwrap()).as_ptr(),
+                ),
+                0
+            );
+            core
+        };
+
+        let mut corpus = [
+            "",
+            "../escape",
+            r"..\escape",
+            "/absolute",
+            r"C:\Windows\System32",
+            r"\\server\share",
+            r"\\?\C:\verbatim",
+            "file.txt:stream",
+            "CON",
+            "trailing.",
+            "trailing ",
+            "normal-ä-東京.txt",
+        ]
+        .into_iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+        corpus.extend([
+            vec![0xff],
+            vec![0xc0, 0x80],
+            vec![0xe0, 0x80, 0x80],
+            vec![0xf0, 0x80, 0x80, 0x80],
+            vec![0xed, 0xa0, 0x80],
+        ]);
+
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for index in 0..1024_usize {
+            let length = 1 + (index % 64);
+            let mut sample = Vec::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let byte = state as u8;
+                sample.push(if byte == 0 { 1 } else { byte });
+            }
+            corpus.push(sample);
+        }
+
+        for mut path in corpus {
+            path.push(0);
+            let mut metadata = GreppyWorkspaceMetadata::default();
+            unsafe {
+                let _ = greppy_workspace_metadata(
+                    core,
+                    workspace_id.as_ptr(),
+                    path.as_ptr().cast(),
+                    &mut metadata,
+                );
+            }
+        }
+
+        let mut output = [0_u8; 4];
+        unsafe {
+            assert_eq!(
+                greppy_workspace_read(
+                    core,
+                    workspace_id.as_ptr(),
+                    c("base.txt").as_ptr(),
+                    0,
+                    output.as_mut_ptr(),
+                    output.len(),
+                ),
+                output.len() as i64
+            );
+            assert_eq!(&output, b"base");
+            assert_eq!(greppy_workspace_remove(core, workspace_id.as_ptr()), 0);
+            greppy_workspace_core_close(core);
+        }
+    }
+
+    #[test]
     fn c_abi_exercises_workspace_lifecycle_and_io() {
         let repo = tempfile::tempdir().unwrap();
         for args in [
