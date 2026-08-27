@@ -240,8 +240,12 @@ jobs:
         run: cargo test -p greppy-workspace-provider --test windows_mount --locked -- --nocapture
 
   portable-agent-contract:
-    name: Portable agent lifecycle
-    runs-on: ubuntu-latest
+    name: Portable agent lifecycle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5

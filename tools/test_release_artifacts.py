@@ -309,6 +309,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("WINFSP-*|RIFT-*", linux_packager)
         self.assertIn('STAGING_ROOT=$(realpath -m "$6")', linux_packager)
         self.assertNotIn("RIFT-MIT", workflow)
+        cow_workflow = (
+            REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
+        ).read_text(encoding="utf-8")
+        portable_lifecycle = cow_workflow.split("portable-agent-contract:", 1)[1]
+        self.assertIn("name: Portable agent lifecycle (${{ matrix.os }})", portable_lifecycle)
+        self.assertIn("os: [ubuntu-latest, macos-15, windows-latest]", portable_lifecycle)
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         self.assertNotIn("agent benchmark, and the summary-quality gate", readme)
