@@ -568,6 +568,9 @@ where
             Err(error) => set_state(&status, LifecycleState::Faulted, Some(error)),
         }
         last_model_completed = Instant::now();
+        if let Ok(mut activity) = last_activity.lock() {
+            *activity = Instant::now();
+        }
     }
 
     loop {
@@ -2031,13 +2034,14 @@ mod tests {
         let server_address = endpoint.address().to_string();
         let (load_started_tx, load_started_rx) = mpsc::sync_channel(1);
         let (release_load_tx, release_load_rx) = mpsc::sync_channel(1);
+        let (load_finished_tx, load_finished_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
             run_server(
                 server_endpoint,
                 &server_address,
                 ServerPolicy {
                     model_ttl: Duration::from_secs(1),
-                    exit_ttl: Duration::from_millis(250),
+                    exit_ttl: Duration::from_millis(500),
                     request_deadline: Duration::from_secs(1),
                     hard_request_timeout: None,
                     max_request_bytes: 4096,
@@ -2047,6 +2051,7 @@ mod tests {
                 move || {
                     load_started_tx.send(()).expect("signal prewarm load");
                     release_load_rx.recv().expect("release prewarm load");
+                    load_finished_tx.send(()).expect("signal prewarm complete");
                     Ok::<_, String>(())
                 },
                 |_| Ok(()),
@@ -2089,7 +2094,33 @@ mod tests {
             "ping was unavailable during prewarm load: {ping:?}"
         );
 
+        // A long prewarm must not consume the daemon's post-load idle lifetime.
+        // The old lifecycle measured exit_ttl from process start and exited on
+        // the first loop iteration after a sufficiently slow model load.
+        std::thread::sleep(Duration::from_millis(600));
         release_load_tx.send(()).expect("finish prewarm load");
+        load_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prewarm load completed");
+        std::thread::sleep(LOOP_INTERVAL + Duration::from_millis(50));
+        assert!(
+            !server.is_finished(),
+            "daemon exited immediately because prewarm consumed exit_ttl"
+        );
+        let ready = request(
+            &endpoint,
+            serde_json::json!({"op": "status"}),
+            Duration::from_secs(1),
+            4096,
+            4096,
+        );
+        assert!(
+            matches!(
+                ready,
+                RequestOutcome::Response(ref value) if value["state"] == "ready"
+            ),
+            "status was unavailable after a slow prewarm load: {ready:?}"
+        );
         assert_eq!(server.join().expect("prewarm status server"), 0);
     }
 
