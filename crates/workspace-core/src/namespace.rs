@@ -58,6 +58,7 @@ pub struct ProposalRecord {
     pub final_tree: String,
     pub proposal_commit: String,
     pub baseline: BaselineSnapshot,
+    pub hardlink_groups: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +307,12 @@ impl WorkspaceCore {
                  final_tree TEXT NOT NULL,
                  proposal_commit TEXT NOT NULL,
                  baseline_json BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cow_proposal_hardlinks (
+                 ref_name TEXT NOT NULL REFERENCES cow_proposals(ref_name) ON DELETE CASCADE,
+                 group_id INTEGER NOT NULL,
+                 path TEXT NOT NULL,
+                 PRIMARY KEY(ref_name, group_id, path)
              );",
         )?;
         repository_layers::install_schema(&connection)?;
@@ -739,6 +746,36 @@ impl WorkspaceCore {
             }
         }
         Ok(paths.into_iter().collect())
+    }
+
+    pub fn hardlink_groups(
+        &self,
+        workspace: &WorkspaceHandle,
+        included_paths: &[String],
+    ) -> Result<Vec<Vec<String>>> {
+        let included = included_paths.iter().collect::<BTreeSet<_>>();
+        let connection = self.lock_metadata()?;
+        let mut statement = connection.prepare(
+            "SELECT inode_id, path FROM cow_entries
+             WHERE workspace_id = ?1 AND tombstone = 0 AND inode_id IS NOT NULL
+             ORDER BY inode_id, path",
+        )?;
+        let rows = statement.query_map(params![workspace.id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut by_inode = BTreeMap::<i64, Vec<String>>::new();
+        for row in rows {
+            let (inode, path) = row?;
+            if included.contains(&path) {
+                by_inode.entry(inode).or_default().push(path);
+            }
+        }
+        let mut groups = by_inode
+            .into_values()
+            .filter(|group| group.len() > 1)
+            .collect::<Vec<_>>();
+        groups.sort();
+        Ok(groups)
     }
 
     /// Drops cached repository/dirty layers that are not referenced by an
@@ -1655,6 +1692,7 @@ impl WorkspaceCore {
         baseline_tree: &str,
         final_tree: &str,
         proposal_commit: &str,
+        hardlink_groups: &[Vec<String>],
     ) -> Result<ProposalRecord> {
         validate_proposal_ref(ref_name)?;
         validate_oid(baseline_tree)?;
@@ -1674,10 +1712,13 @@ impl WorkspaceCore {
         };
         let repository = baseline.repository.clone();
         let baseline_json = serde_json::to_vec(&baseline)?;
+        let hardlink_groups = normalize_proposal_hardlink_groups(hardlink_groups)?;
         let insert = (|| -> Result<()> {
             let _writer = self.lock_metadata_writer()?;
-            let connection = self.lock_metadata()?;
-            connection.execute(
+            let mut connection = self.lock_metadata()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
                 "INSERT INTO cow_proposals(
                      ref_name, repository, base_commit, baseline_hash,
                      baseline_tree, final_tree, proposal_commit, baseline_json
@@ -1697,6 +1738,16 @@ impl WorkspaceCore {
                     baseline_json
                 ],
             )?;
+            for (group_id, group) in hardlink_groups.iter().enumerate() {
+                for path in group {
+                    transaction.execute(
+                        "INSERT INTO cow_proposal_hardlinks(ref_name, group_id, path)
+                         VALUES(?1, ?2, ?3)",
+                        params![ref_name, group_id as i64, path],
+                    )?;
+                }
+            }
+            transaction.commit()?;
             Ok(())
         })();
         insert?;
@@ -1709,13 +1760,22 @@ impl WorkspaceCore {
             final_tree: final_tree.into(),
             proposal_commit: proposal_commit.into(),
             baseline,
+            hardlink_groups,
         })
     }
 
     pub fn proposal(&self, ref_name: &str) -> Result<ProposalRecord> {
         validate_proposal_ref(ref_name)?;
         let connection = self.lock_metadata()?;
-        connection
+        let (
+            repository,
+            base_commit,
+            baseline_hash,
+            baseline_tree,
+            final_tree,
+            proposal_commit,
+            bytes,
+        ) = connection
             .query_row(
                 "SELECT repository, base_commit, baseline_hash, baseline_tree,
                         final_tree, proposal_commit, baseline_json
@@ -1734,44 +1794,64 @@ impl WorkspaceCore {
                 },
             )
             .optional()?
-            .ok_or_else(|| Error::InvalidPath(format!("unknown proposal {ref_name}")))
-            .and_then(
-                |(
-                    repository,
-                    base_commit,
-                    baseline_hash,
-                    baseline_tree,
-                    final_tree,
-                    proposal_commit,
-                    bytes,
-                )| {
-                    let baseline: BaselineSnapshot = serde_json::from_slice(&bytes)?;
-                    crate::snapshot::validate_repository_snapshot_integrity(&baseline)?;
-                    let repository = PathBuf::from(repository);
-                    if repository != baseline.repository
-                        || base_commit != baseline.base_commit
-                        || baseline_hash != baseline.baseline_hash
-                    {
-                        return Err(Error::Corrupt(format!(
-                            "proposal {ref_name} metadata does not match its pinned baseline"
-                        )));
-                    }
-                    validate_oid(&base_commit)?;
-                    validate_oid(&baseline_tree)?;
-                    validate_oid(&final_tree)?;
-                    validate_oid(&proposal_commit)?;
-                    Ok(ProposalRecord {
-                        ref_name: ref_name.into(),
-                        repository,
-                        base_commit,
-                        baseline_hash,
-                        baseline_tree,
-                        final_tree,
-                        proposal_commit,
-                        baseline,
-                    })
-                },
-            )
+            .ok_or_else(|| Error::InvalidPath(format!("unknown proposal {ref_name}")))?;
+        let baseline: BaselineSnapshot = serde_json::from_slice(&bytes)?;
+        crate::snapshot::validate_repository_snapshot_integrity(&baseline)?;
+        let repository = PathBuf::from(repository);
+        if repository != baseline.repository
+            || base_commit != baseline.base_commit
+            || baseline_hash != baseline.baseline_hash
+        {
+            return Err(Error::Corrupt(format!(
+                "proposal {ref_name} metadata does not match its pinned baseline"
+            )));
+        }
+        validate_oid(&base_commit)?;
+        validate_oid(&baseline_tree)?;
+        validate_oid(&final_tree)?;
+        validate_oid(&proposal_commit)?;
+
+        let mut statement = connection.prepare(
+            "SELECT group_id, path FROM cow_proposal_hardlinks
+             WHERE ref_name = ?1 ORDER BY group_id, path",
+        )?;
+        let rows = statement.query_map(params![ref_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut grouped = BTreeMap::<i64, Vec<String>>::new();
+        for row in rows {
+            let (group_id, path) = row?;
+            if group_id < 0 {
+                return Err(Error::Corrupt(format!(
+                    "proposal {ref_name} contains a negative hardlink group id"
+                )));
+            }
+            grouped.entry(group_id).or_default().push(path);
+        }
+        for (expected, group_id) in grouped.keys().copied().enumerate() {
+            if group_id != expected as i64 {
+                return Err(Error::Corrupt(format!(
+                    "proposal {ref_name} hardlink group ids are not contiguous"
+                )));
+            }
+        }
+        let raw_groups = grouped.into_values().collect::<Vec<_>>();
+        let hardlink_groups = normalize_proposal_hardlink_groups(&raw_groups).map_err(|error| {
+            Error::Corrupt(format!(
+                "proposal {ref_name} contains invalid hardlink metadata: {error}"
+            ))
+        })?;
+        Ok(ProposalRecord {
+            ref_name: ref_name.into(),
+            repository,
+            base_commit,
+            baseline_hash,
+            baseline_tree,
+            final_tree,
+            proposal_commit,
+            baseline,
+            hardlink_groups,
+        })
     }
 
     pub fn has_proposal(&self, ref_name: &str) -> Result<bool> {
@@ -2730,6 +2810,34 @@ fn validate_proposal_ref(value: &str) -> Result<()> {
     validate_workspace_id(suffix)
 }
 
+fn normalize_proposal_hardlink_groups(groups: &[Vec<String>]) -> Result<Vec<Vec<String>>> {
+    let mut normalized = Vec::with_capacity(groups.len());
+    let mut all_paths = BTreeSet::new();
+    for group in groups {
+        let mut paths = group
+            .iter()
+            .map(|path| normalize_path(Path::new(path), false))
+            .collect::<Result<Vec<_>>>()?;
+        paths.sort();
+        paths.dedup();
+        if paths.len() < 2 {
+            return Err(Error::InvalidPath(
+                "proposal hardlink group must contain at least two distinct paths".into(),
+            ));
+        }
+        for path in &paths {
+            if !all_paths.insert(path.clone()) {
+                return Err(Error::InvalidPath(format!(
+                    "proposal path {path} belongs to more than one hardlink group"
+                )));
+            }
+        }
+        normalized.push(paths);
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
 fn validate_oid(value: &str) -> Result<()> {
     if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Error::InvalidPath(format!(
@@ -3569,6 +3677,7 @@ mod tests {
                 &"1".repeat(40),
                 &"2".repeat(40),
                 &"3".repeat(40),
+                &[],
             )
             .unwrap();
         assert_eq!(
@@ -3592,6 +3701,7 @@ mod tests {
                 &"1".repeat(40),
                 &"2".repeat(40),
                 &"3".repeat(40),
+                &[],
             )
             .unwrap();
         {
@@ -3606,6 +3716,38 @@ mod tests {
         assert!(matches!(
             core.proposal(&record.ref_name),
             Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn proposal_round_trips_canonical_hardlink_groups_and_rejects_overlap() {
+        let (_repo, _storage, core, workspace) = fixture();
+        let record = core
+            .preserve_proposal(
+                &workspace,
+                "refs/greppy/agent/hardlink-proposal",
+                &"1".repeat(40),
+                &"2".repeat(40),
+                &"3".repeat(40),
+                &[vec!["linked-b".into(), "linked-a".into()]],
+            )
+            .unwrap();
+        assert_eq!(
+            record.hardlink_groups,
+            vec![vec![String::from("linked-a"), String::from("linked-b")]]
+        );
+        assert_eq!(core.proposal(&record.ref_name).unwrap(), record);
+
+        assert!(matches!(
+            core.preserve_proposal(
+                &workspace,
+                "refs/greppy/agent/overlapping-hardlinks",
+                &"4".repeat(40),
+                &"5".repeat(40),
+                &"6".repeat(40),
+                &[vec!["a".into(), "b".into()], vec!["b".into(), "c".into()],],
+            ),
+            Err(Error::InvalidPath(_))
         ));
     }
 }

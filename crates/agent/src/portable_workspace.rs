@@ -12,6 +12,7 @@ use greppy_workspace_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -361,6 +362,7 @@ impl AgentWorkspace {
             &self.private_index,
             self.core.changed_paths(&self.handle)?,
         )?;
+        let hardlink_groups = self.core.hardlink_groups(&self.handle, &changed_paths)?;
         if !changed_paths.is_empty() {
             let mut arguments = vec!["add", "-A", "--"];
             arguments.extend(changed_paths.iter().map(String::as_str));
@@ -370,7 +372,13 @@ impl AgentWorkspace {
         if final_tree == self.baseline_tree {
             return Ok(RunOutcome::Clean);
         }
-        let commit = commit_tree(&self.worktree, &final_tree, &self.base_commit, message)?;
+        let commit_message = proposal_commit_message(message, &hardlink_groups);
+        let commit = commit_tree(
+            &self.worktree,
+            &final_tree,
+            &self.base_commit,
+            &commit_message,
+        )?;
         let export_ref = "refs/greppy/export/proposal";
         git_ok(&self.worktree, &["update-ref", export_ref, &commit])?;
         let baseline_export_ref = "refs/greppy/export/baseline";
@@ -406,6 +414,7 @@ impl AgentWorkspace {
             &self.baseline_tree,
             &final_tree,
             &commit,
+            &hardlink_groups,
         )?;
         let patch = git_ok(
             &self.repo_root,
@@ -754,6 +763,8 @@ struct ProposalPublishJournal {
     baseline_tree: String,
     final_tree: String,
     proposal_commit: String,
+    #[serde(default)]
+    hardlink_groups: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -787,6 +798,7 @@ fn publish_proposal_transaction(
     baseline_tree: &str,
     final_tree: &str,
     proposal_commit: &str,
+    hardlink_groups: &[Vec<String>],
 ) -> Result<(), WorkspaceError> {
     let _operation_lease = acquire_repository_operation_lease(core, repository, ref_name)?;
     let baseline = core.workspace_baseline(workspace)?;
@@ -801,6 +813,7 @@ fn publish_proposal_transaction(
         baseline_tree: baseline_tree.into(),
         final_tree: final_tree.into(),
         proposal_commit: proposal_commit.into(),
+        hardlink_groups: hardlink_groups.to_vec(),
     };
     validate_proposal_publish_journal(core, &journal, Path::new("proposal publication"))?;
     let journal_path = publish_proposal_journal(core, &journal)?;
@@ -819,6 +832,7 @@ fn publish_proposal_transaction(
             &journal.baseline_tree,
             &journal.final_tree,
             &journal.proposal_commit,
+            &journal.hardlink_groups,
         )?;
         #[cfg(test)]
         test_crash_point("proposal-after-core-record");
@@ -931,6 +945,7 @@ fn recover_proposal_publish_journal_locked(
             || proposal.baseline_tree != journal.baseline_tree
             || proposal.final_tree != journal.final_tree
             || proposal.proposal_commit != journal.proposal_commit
+            || proposal.hardlink_groups != journal.hardlink_groups
         {
             return Err(WorkspaceError::Tampered {
                 path: journal_path.to_path_buf(),
@@ -1001,6 +1016,29 @@ fn validate_proposal_publish_journal(
             return Err(invalid(&format!("invalid {name}")));
         }
     }
+    let mut seen_paths = BTreeSet::new();
+    let mut prior_group = None::<&Vec<String>>;
+    for group in &journal.hardlink_groups {
+        if group.len() < 2 {
+            return Err(invalid(
+                "proposal hardlink group must contain at least two paths",
+            ));
+        }
+        if prior_group.is_some_and(|prior| prior >= group) {
+            return Err(invalid("proposal hardlink groups are not canonical"));
+        }
+        let mut prior_path = None::<&String>;
+        for path in group {
+            validate_apply_path(path)?;
+            if prior_path.is_some_and(|prior| prior >= path) || !seen_paths.insert(path) {
+                return Err(invalid(
+                    "proposal hardlink paths are not canonical and disjoint",
+                ));
+            }
+            prior_path = Some(path);
+        }
+        prior_group = Some(group);
+    }
     let repository = journal.repository.canonicalize()?;
     if repository != journal.repository {
         return Err(invalid("proposal publication repository is not canonical"));
@@ -1012,6 +1050,11 @@ fn validate_proposal_publish_journal(
             "proposal publication journal does not match the workspace baseline",
         ));
     }
+    validate_commit_hardlink_binding(
+        &repository,
+        &journal.proposal_commit,
+        &journal.hardlink_groups,
+    )?;
     Ok(workspace)
 }
 
@@ -1109,11 +1152,18 @@ fn apply_from_core(
 
     let index_path = git_path(&canonical_target, "index")?;
     let index_before = hash_optional_file(&index_path)?;
-    let affected_paths = changed_paths(
+    let mut affected_paths = changed_paths(
         &canonical_target,
         &proposal.baseline_tree,
         &proposal.final_tree,
-    )?;
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for path in proposal.hardlink_groups.iter().flatten() {
+        validate_apply_path(path)?;
+        affected_paths.insert(path.clone());
+    }
+    let affected_paths = affected_paths.into_iter().collect();
     let journal = ApplyJournal {
         schema: 1,
         ref_name: ref_name.into(),
@@ -1141,6 +1191,10 @@ fn apply_from_core(
         if journal.affected_paths.first() == Some(path) {
             test_crash_point("apply-after-first-path");
         }
+    }
+    if let Err(error) = materialize_hardlink_groups(&canonical_target, &proposal.hardlink_groups) {
+        restore_apply_journal(core, &journal_path, &journal)?;
+        return Err(error);
     }
     let index_after = hash_optional_file(&index_path)?;
     if index_before != index_after {
@@ -1273,6 +1327,63 @@ fn validate_proposal_git_binding(
         return Err(WorkspaceError::Tampered {
             path: repository.to_path_buf(),
             detail: "proposal baseline tree is not a canonical Git tree".into(),
+        });
+    }
+    validate_commit_hardlink_binding(
+        repository,
+        &proposal.proposal_commit,
+        &proposal.hardlink_groups,
+    )?;
+    Ok(())
+}
+
+const HARDLINK_BINDING_TRAILER: &str = "Greppy-Hardlinks-SHA256: ";
+
+fn proposal_hardlink_digest(groups: &[Vec<String>]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"greppy-proposal-hardlinks-v1\0");
+    digest.update((groups.len() as u64).to_le_bytes());
+    for group in groups {
+        digest.update((group.len() as u64).to_le_bytes());
+        for path in group {
+            digest.update((path.len() as u64).to_le_bytes());
+            digest.update(path.as_bytes());
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn proposal_commit_message(message: &str, hardlink_groups: &[Vec<String>]) -> String {
+    format!(
+        "{}\n\n{}{}",
+        message.trim_end(),
+        HARDLINK_BINDING_TRAILER,
+        proposal_hardlink_digest(hardlink_groups)
+    )
+}
+
+fn validate_commit_hardlink_binding(
+    repository: &Path,
+    proposal_commit: &str,
+    hardlink_groups: &[Vec<String>],
+) -> Result<(), WorkspaceError> {
+    let output = Command::new("git")
+        .args(["show", "-s", "--format=%B", proposal_commit])
+        .current_dir(repository)
+        .output()?;
+    if !output.status.success() {
+        return Err(git_failed("git show proposal hardlink binding", &output));
+    }
+    let message = String::from_utf8_lossy(&output.stdout);
+    let bindings = message
+        .lines()
+        .filter_map(|line| line.strip_prefix(HARDLINK_BINDING_TRAILER))
+        .collect::<Vec<_>>();
+    let expected = proposal_hardlink_digest(hardlink_groups);
+    if bindings.as_slice() != [expected.as_str()] {
+        return Err(WorkspaceError::Tampered {
+            path: repository.to_path_buf(),
+            detail: "proposal commit does not bind the pinned hardlink topology".into(),
         });
     }
     Ok(())
@@ -1635,6 +1746,59 @@ fn materialize_git_tree_entry(
                 path: target,
                 detail: format!("unsupported Git tree mode {mode}"),
             });
+        }
+    }
+    Ok(())
+}
+
+fn materialize_hardlink_groups(
+    repository: &Path,
+    groups: &[Vec<String>],
+) -> Result<(), WorkspaceError> {
+    let mut seen = BTreeSet::new();
+    for group in groups {
+        if group.len() < 2 {
+            return Err(WorkspaceError::Tampered {
+                path: repository.to_path_buf(),
+                detail: "proposal hardlink group contains fewer than two paths".into(),
+            });
+        }
+        let source_relative = &group[0];
+        validate_apply_path(source_relative)?;
+        let source = repository.join(source_relative);
+        let source_metadata = fs::symlink_metadata(&source)?;
+        if !source_metadata.file_type().is_file() {
+            return Err(WorkspaceError::Tampered {
+                path: source,
+                detail: "proposal hardlink source is not a regular file".into(),
+            });
+        }
+        for relative in group {
+            validate_apply_path(relative)?;
+            if !seen.insert(relative) {
+                return Err(WorkspaceError::Tampered {
+                    path: repository.join(relative),
+                    detail: "proposal path belongs to more than one hardlink group".into(),
+                });
+            }
+        }
+        for relative in &group[1..] {
+            let target = repository.join(relative);
+            let target_metadata = fs::symlink_metadata(&target)?;
+            if !target_metadata.file_type().is_file() {
+                return Err(WorkspaceError::Tampered {
+                    path: target,
+                    detail: "proposal hardlink target is not a regular file".into(),
+                });
+            }
+            remove_visible_path(&target)?;
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::hard_link(&source, &target)?;
+            if let Some(parent) = target.parent() {
+                sync_directory(parent)?;
+            }
         }
     }
     Ok(())
@@ -2637,6 +2801,7 @@ mod tests {
             &journal.baseline_tree,
             &journal.final_tree,
             &journal.proposal_commit,
+            &journal.hardlink_groups,
         )
         .unwrap();
         panic!("proposal publication crash point did not abort the child process");
@@ -2701,7 +2866,7 @@ mod tests {
             &repository,
             &final_tree,
             &base_commit,
-            "crash-safe proposal",
+            &proposal_commit_message("crash-safe proposal", &[]),
         )
         .unwrap();
         git(&repository, &["reset", "--hard", "-q", &base_commit]);
@@ -2717,6 +2882,7 @@ mod tests {
             baseline_tree,
             final_tree,
             proposal_commit,
+            hardlink_groups: vec![],
         };
         drop(core);
 
@@ -2767,6 +2933,7 @@ mod tests {
             &journal.baseline_tree,
             &journal.final_tree,
             &journal.proposal_commit,
+            &journal.hardlink_groups,
         )
         .unwrap();
         assert!(core.has_proposal(&journal.ref_name).unwrap());
@@ -3227,6 +3394,24 @@ mod tests {
             .core
             .write(&workspace.handle, "tracked.txt", 0, b"agent\n")
             .unwrap();
+        fs::write(workspace.worktree_path().join("linked-a.txt"), b"linked\n").unwrap();
+        fs::hard_link(
+            workspace.worktree_path().join("linked-a.txt"),
+            workspace.worktree_path().join("linked-b.txt"),
+        )
+        .unwrap();
+        workspace
+            .core
+            .create_file(&workspace.handle, "linked-a.txt", 0o100644)
+            .unwrap();
+        workspace
+            .core
+            .write(&workspace.handle, "linked-a.txt", 0, b"linked\n")
+            .unwrap();
+        workspace
+            .core
+            .hard_link(&workspace.handle, "linked-a.txt", "linked-b.txt")
+            .unwrap();
         fs::create_dir(workspace.worktree_path().join("cache")).unwrap();
         fs::write(
             workspace.worktree_path().join("cache/output.bin"),
@@ -3269,6 +3454,22 @@ mod tests {
         assert!(!agent_scratch.exists());
 
         let proposal = recovery_core.proposal(&ref_name).unwrap();
+        assert_eq!(
+            proposal.hardlink_groups,
+            vec![vec![
+                String::from("linked-a.txt"),
+                String::from("linked-b.txt"),
+            ]]
+        );
+        let mut tampered_hardlinks = proposal.clone();
+        tampered_hardlinks.hardlink_groups = vec![vec![
+            String::from("linked-a.txt"),
+            String::from("untracked.txt"),
+        ]];
+        assert!(matches!(
+            validate_proposal_git_binding(&repo, &tampered_hardlinks),
+            Err(WorkspaceError::Tampered { .. })
+        ));
         let journal = ApplyJournal {
             schema: 1,
             ref_name: ref_name.clone(),
@@ -3382,6 +3583,11 @@ mod tests {
         );
         apply_proposal(&repo, &ref_name).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
+        fs::write(repo.join("linked-b.txt"), b"same-inode\n").unwrap();
+        assert_eq!(
+            fs::read(repo.join("linked-a.txt")).unwrap(),
+            b"same-inode\n"
+        );
         assert_eq!(fs::read(&index).unwrap(), index_before);
         match previous {
             Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
