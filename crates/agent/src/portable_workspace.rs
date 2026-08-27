@@ -1152,26 +1152,7 @@ fn apply_from_core(
 
     let index_path = git_path(&canonical_target, "index")?;
     let index_before = hash_optional_file(&index_path)?;
-    let mut affected_paths = changed_paths(
-        &canonical_target,
-        &proposal.baseline_tree,
-        &proposal.final_tree,
-    )?
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    for path in proposal.hardlink_groups.iter().flatten() {
-        validate_apply_path(path)?;
-        affected_paths.insert(path.clone());
-    }
-    for group in &proposal.baseline.hardlink_groups {
-        if group.iter().any(|path| affected_paths.contains(path)) {
-            for path in group {
-                validate_apply_path(path)?;
-                affected_paths.insert(path.clone());
-            }
-        }
-    }
-    let affected_paths = affected_paths.into_iter().collect();
+    let affected_paths = apply_affected_paths(&canonical_target, &proposal)?;
     let journal = ApplyJournal {
         schema: 1,
         ref_name: ref_name.into(),
@@ -1427,6 +1408,29 @@ fn changed_paths(
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+fn apply_affected_paths(
+    repository: &Path,
+    proposal: &ProposalRecord,
+) -> Result<Vec<String>, WorkspaceError> {
+    let mut affected_paths =
+        changed_paths(repository, &proposal.baseline_tree, &proposal.final_tree)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+    for path in proposal.hardlink_groups.iter().flatten() {
+        validate_apply_path(path)?;
+        affected_paths.insert(path.clone());
+    }
+    for group in &proposal.baseline.hardlink_groups {
+        if group.iter().any(|path| affected_paths.contains(path)) {
+            for path in group {
+                validate_apply_path(path)?;
+                affected_paths.insert(path.clone());
+            }
+        }
+    }
+    Ok(affected_paths.into_iter().collect())
 }
 
 fn validate_apply_path(path: &str) -> Result<(), WorkspaceError> {
@@ -3568,8 +3572,7 @@ mod tests {
             repository: repo.canonicalize().unwrap(),
             baseline_hash: proposal.baseline_hash.clone(),
             baseline_tree: proposal.baseline_tree.clone(),
-            affected_paths: changed_paths(&repo, &proposal.baseline_tree, &proposal.final_tree)
-                .unwrap(),
+            affected_paths: apply_affected_paths(&repo, &proposal).unwrap(),
             modified_times: proposal
                 .baseline
                 .entries
