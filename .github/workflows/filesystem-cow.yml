@@ -248,6 +248,21 @@ jobs:
           GREPPY_RUN_WINFSP_TEST: "1"
         run: cargo test -p greppy-workspace-provider --test windows_mount --locked -- --nocapture
 
+  windows-winfsp-fork-compile:
+    name: Windows minimal WinFsp fork compile
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact Greppy candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Verify fork metadata and patch
+        run: python tools/verify_winfsp_fork.py
+
+      - name: Build exact patched WinFsp x86_64 transport
+        shell: pwsh
+        run: tools/build_winfsp_fork.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'winfsp-greppy')
+
   macos-release-performance:
     name: macOS ARM64 real FSKit performance
     if: github.event_name == 'workflow_dispatch' && inputs.full_platform_performance

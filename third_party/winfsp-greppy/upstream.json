@@ -1,0 +1,23 @@
+{
+  "schema": "greppy.winfsp-transport-upstream.v1",
+  "repository": "https://github.com/winfsp/winfsp",
+  "tag": "v2.1",
+  "commit": "ddca7bd5481857a65ba552f643b8776fd070836f",
+  "tag_object": "bcc52225ec7e6a9f5c889b5cdb8051adf41c4b91",
+  "license": "GPL-3.0-only WITH WinFsp-FLOSS-exception",
+  "patches": [
+    {
+      "path": "patches/0001-greppy-hardlink-transport.patch",
+      "sha256": "9ee6cf9f289a2b3707fa8cd0b2a99353ded014317ada1f6ab2453d776175d3cd",
+      "modified_files": [
+        "inc/winfsp/fsctl.h",
+        "inc/winfsp/winfsp.h",
+        "src/dll/fsop.c",
+        "src/dll/fuse/fuse_intf.c",
+        "src/dll/fuse/fuse_loop.c",
+        "src/sys/fileinfo.c",
+        "src/sys/volinfo.c"
+      ]
+    }
+  ]
+}
