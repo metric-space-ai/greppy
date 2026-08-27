@@ -341,8 +341,13 @@ class ReleaseArtifactTests(unittest.TestCase):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
+        ci_workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("cargo build --locked --release", workflow)
+        self.assertNotIn("native agent fallback", ci_workflow)
+        self.assertIn("portable agent fail-closed", ci_workflow)
         self.assertIn("tools.test_portable_cow_performance", workflow)
         windows_matrix = workflow.split("- name: windows-x86_64", 1)[1].split(
             "steps:", 1
