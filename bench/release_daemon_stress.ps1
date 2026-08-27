@@ -242,6 +242,45 @@ function Write-FailureDiagnostics {
     catch {
         Write-Host "runtime inventory unavailable: $($_.Exception.Message)"
     }
+    try {
+        $backgroundJobs = @(
+            Get-ChildItem -LiteralPath $env:GREPPY_STORE_DIR -Filter index.job -File -Recurse |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        path = $_.FullName
+                        content = Get-Content -LiteralPath $_.FullName -Raw
+                    }
+                }
+        )
+        Write-Host "background-jobs=$($backgroundJobs | ConvertTo-Json -Depth 4 -Compress)"
+    }
+    catch {
+        Write-Host "background job inventory unavailable: $($_.Exception.Message)"
+    }
+    try {
+        $indexOutputs = @(
+            Get-ChildItem -LiteralPath (Join-Path $Work 'out') -Filter 'index-*.txt*' -File |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        path = $_.FullName
+                        content = Get-Content -LiteralPath $_.FullName -Raw
+                    }
+                }
+        )
+        Write-Host "index-outputs=$($indexOutputs | ConvertTo-Json -Depth 4 -Compress)"
+    }
+    catch {
+        Write-Host "index output inventory unavailable: $($_.Exception.Message)"
+    }
+    try {
+        if ($RepoEmbed) {
+            $status = & $Binary --root $RepoEmbed index status --json 2>&1
+            Write-Host "index-status=$($status -join [Environment]::NewLine)"
+        }
+    }
+    catch {
+        Write-Host "index status unavailable: $($_.Exception.Message)"
+    }
     foreach ($endpointName in @('EmbedEndpoint', 'SummaryEndpoint')) {
         $endpointVariable = Get-Variable -Name $endpointName -ErrorAction SilentlyContinue
         if ($null -eq $endpointVariable) { continue }
