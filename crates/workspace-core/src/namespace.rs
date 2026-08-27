@@ -310,6 +310,10 @@ impl WorkspaceCore {
         )?;
         repository_layers::install_schema(&connection)?;
         repository_tracker::install_schema(&connection)?;
+        if recovering {
+            crate::verify_sqlite_integrity(&connection, "workspace metadata")?;
+            chunks.verify_integrity()?;
+        }
         let core = Self {
             root,
             chunks,
@@ -2814,6 +2818,60 @@ mod tests {
         connection.execute_batch("COMMIT").unwrap();
 
         opening.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn open_rejects_logically_corrupt_workspace_metadata() {
+        let (_repo, storage, core, workspace) = fixture();
+        drop(core);
+        let connection = Connection::open(storage.path().join("workspace.sqlite3")).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cow_inodes(
+                     workspace_id, kind, mode, size, accessed_unix_ns,
+                     modified_unix_ns, changed_unix_ns, chunks_json
+                 ) VALUES(?1, 'file', 33188, -1, 0, 0, 0, X'5B5D')",
+                params![workspace.id()],
+            )
+            .unwrap();
+        drop(connection);
+
+        match WorkspaceCore::open(storage.path()) {
+            Err(Error::Corrupt(detail)) => assert!(detail.contains("quick_check failed")),
+            Err(error) => panic!("unexpected corruption error: {error}"),
+            Ok(_) => panic!("logically corrupt workspace metadata was accepted"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_logically_corrupt_chunk_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let core = WorkspaceCore::open(storage.path()).unwrap();
+        let chunk = core.chunks().put(b"corrupt refs").unwrap();
+        drop(core);
+        let connection = Connection::open(storage.path().join("chunks.sqlite3")).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE cow_chunks SET refs = -1 WHERE hash = ?1",
+                    params![&chunk.0[..]],
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        match WorkspaceCore::open(storage.path()) {
+            Err(Error::Corrupt(detail)) => assert!(detail.contains("quick_check failed")),
+            Err(error) => panic!("unexpected corruption error: {error}"),
+            Ok(_) => panic!("logically corrupt chunk metadata was accepted"),
+        }
     }
 
     #[test]

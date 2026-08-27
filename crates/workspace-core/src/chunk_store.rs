@@ -132,6 +132,14 @@ impl ChunkStore {
         Ok(store)
     }
 
+    pub(crate) fn verify_integrity(&self) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        crate::verify_sqlite_integrity(&connection, "chunk metadata")
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

@@ -33,6 +33,35 @@ pub use snapshot::{
     EntryKind,
 };
 
+pub(crate) fn verify_sqlite_integrity(
+    connection: &rusqlite::Connection,
+    subject: &str,
+) -> Result<()> {
+    let mut quick_check = connection.prepare("PRAGMA quick_check")?;
+    let mut rows = quick_check.query([])?;
+    let first = rows
+        .next()?
+        .ok_or_else(|| Error::Corrupt(format!("{subject} quick_check returned no result")))?
+        .get::<_, String>(0)?;
+    if first != "ok" || rows.next()?.is_some() {
+        return Err(Error::Corrupt(format!(
+            "{subject} quick_check failed: {first}"
+        )));
+    }
+
+    let mut foreign_keys = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut violations = foreign_keys.query([])?;
+    if let Some(row) = violations.next()? {
+        let table: String = row.get(0)?;
+        let row_id: Option<i64> = row.get(1)?;
+        let parent: String = row.get(2)?;
+        return Err(Error::Corrupt(format!(
+            "{subject} foreign key violation: table={table}, row={row_id:?}, parent={parent}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn test_crash_point(point: &str) {
     if std::env::var_os("GREPPY_WORKSPACE_TEST_CRASH_POINT").as_deref()
