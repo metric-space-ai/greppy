@@ -291,6 +291,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("greppy-linux-x86_64.deb", workflow)
         self.assertIn("greppy-linux-x86_64.rpm", workflow)
         self.assertIn("platform/linux/build-packages.sh", workflow)
+        self.assertIn('"$deb_bin/greppy" workspace doctor --json', workflow)
         self.assertNotIn("greppy-linux-x86_64.tar.gz", workflow)
         self.assertIn("greppy-workspace-provider.exe", workflow)
         self.assertIn("winfsp-2.1.25156.msi", workflow)

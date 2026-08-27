@@ -768,6 +768,28 @@ jobs:
           bash "$deb_root/usr/lib/greppy/release-tests/release_daemon_stress.sh" \
             "$deb_bin/greppy" "$PWD/daemon-stress"
           ! ldd "$deb_bin/greppy" | grep -E 'cudart|cublas|nvrtc'
+          workspace_parent="$RUNNER_TEMP/greppy-installed-workspace"
+          export GREPPY_WORKSPACE_DIR="$workspace_parent/data"
+          cleanup_provider() {
+            mountpoint -q "$workspace_parent/workspace-mount" && \
+              fusermount3 -u "$workspace_parent/workspace-mount" || true
+            if [ -s "$GREPPY_WORKSPACE_DIR/provider.pid" ]; then
+              kill "$(cat "$GREPPY_WORKSPACE_DIR/provider.pid")" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_provider EXIT
+          "$deb_bin/greppy" workspace setup
+          "$deb_bin/greppy" workspace doctor --json > "$RUNNER_TEMP/workspace-doctor.json"
+          jq -e '
+            .healthy == true and
+            .smoke.read == true and
+            .smoke.write == true and
+            .smoke.partial_write == true and
+            .smoke.rename == true and
+            .smoke.delete == true
+          ' "$RUNNER_TEMP/workspace-doctor.json" >/dev/null
+          cleanup_provider
+          trap - EXIT
           test -s package/runtime-footprint-linux-x86_64-cpu.json
           python3 "$deb_root/usr/lib/greppy/release-tests/release_artifacts.py" verify-spdx \
             --sbom "package/${{ matrix.asset }}.spdx.json" \
