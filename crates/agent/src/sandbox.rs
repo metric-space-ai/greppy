@@ -902,9 +902,9 @@ fn open_trusted_root_fds(roots: &[PathBuf]) -> Result<Vec<OwnedDirFd>, SandboxEr
     Ok(out)
 }
 
-/// Test-only per-test-thread counter of pathname opens performed by
-/// [`open_trusted_root_fds`]. Rust runs tests concurrently, so a process-wide
-/// atomic makes otherwise unrelated sandbox tests race with these assertions.
+// Test-only per-test-thread counter of pathname opens performed by
+// `open_trusted_root_fds`. Rust runs tests concurrently, so a process-wide
+// atomic makes otherwise unrelated sandbox tests race with these assertions.
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static TRUSTED_ROOT_OPEN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
