@@ -1213,7 +1213,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_in_progress_merge_before_copying_content() {
+    fn captures_a_detached_head_as_the_exact_pinned_base() {
+        let repo = fixture();
+        let expected = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(repo.path(), &["checkout", "--detach", "--quiet", &expected]);
+        fs::write(repo.path().join("tracked.txt"), "detached dirty\n").unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let snapshot = capture_repository(repo.path(), &store).unwrap();
+        assert_eq!(snapshot.base_commit, expected);
+        assert_eq!(snapshot.entries[0].path, "tracked.txt");
+    }
+
+    #[test]
+    fn one_head_move_retries_once_and_repeated_moves_fail_closed_without_ref_leaks() {
+        let repo = fixture();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let mut moves = 0;
+        let snapshot = capture_repository_with_observer(repo.path(), &store, |phase| {
+            if phase == "snapshot-first-observation-complete" && moves == 0 {
+                moves += 1;
+                fs::write(repo.path().join("moved-once.txt"), "new head\n").unwrap();
+                git(repo.path(), &["add", "moved-once.txt"]);
+                git(repo.path(), &["commit", "-qm", "move once"]);
+            }
+        })
+        .unwrap();
+        assert_eq!(moves, 1);
+        assert_eq!(
+            snapshot.base_commit,
+            git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap()
+        );
+
+        let mut repeated_moves = 0;
+        let error = capture_repository_with_observer(repo.path(), &store, |phase| {
+            if phase == "snapshot-first-observation-complete" {
+                repeated_moves += 1;
+                let name = format!("moved-{repeated_moves}.txt");
+                fs::write(repo.path().join(&name), format!("head {repeated_moves}\n")).unwrap();
+                git(repo.path(), &["add", &name]);
+                git(
+                    repo.path(),
+                    &["commit", "-qm", &format!("move {repeated_moves}")],
+                );
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::ConcurrentRepositoryMutation));
+        assert_eq!(repeated_moves, 2);
+        assert_eq!(store.stats().unwrap().referenced_chunks, 1);
+    }
+
+    #[test]
+    fn rejects_every_in_progress_git_operation_before_copying_content() {
         let repo = fixture();
         let git_dir = PathBuf::from(git_text(repo.path(), &["rev-parse", "--git-dir"]).unwrap());
         let git_dir = if git_dir.is_absolute() {
@@ -1221,7 +1274,43 @@ mod tests {
         } else {
             repo.path().join(git_dir)
         };
-        fs::write(git_dir.join("MERGE_HEAD"), "deadbeef\n").unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        for marker in [
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "BISECT_LOG",
+            "rebase-apply",
+            "rebase-merge",
+        ] {
+            let path = git_dir.join(marker);
+            if marker.starts_with("rebase-") {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, "deadbeef\n").unwrap();
+            }
+            let error = capture_repository(repo.path(), &store).unwrap_err();
+            assert!(matches!(error, Error::UnsupportedRepository(_)));
+            assert_eq!(store.stats().unwrap().chunk_count, 0);
+            if path.is_dir() {
+                fs::remove_dir(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_a_tracked_gitlink_before_copying_content() {
+        let repo = fixture();
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let cache_info = format!("160000,{head},vendor/submodule");
+        git(
+            repo.path(),
+            &["update-index", "--add", "--cacheinfo", &cache_info],
+        );
+        git(repo.path(), &["commit", "-qm", "add gitlink"]);
         let store_root = tempfile::tempdir().unwrap();
         let store = ChunkStore::open(store_root.path()).unwrap();
         let error = capture_repository(repo.path(), &store).unwrap_err();

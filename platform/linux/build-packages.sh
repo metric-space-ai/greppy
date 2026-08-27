@@ -47,11 +47,14 @@ mkdir -p \
   "$STAGING_ROOT/usr/bin" \
   "$STAGING_ROOT/usr/lib/greppy/bin" \
   "$STAGING_ROOT/usr/lib/greppy/release-tests" \
+  "$STAGING_ROOT/usr/lib/systemd/user" \
   "$STAGING_ROOT/usr/share/doc/greppy" \
   "$STAGING_ROOT/usr/share/licenses/greppy"
 
 install -m 0755 "$GREPPY_BINARY" "$STAGING_ROOT/usr/lib/greppy/bin/greppy"
 install -m 0755 "$PROVIDER_BINARY" "$STAGING_ROOT/usr/lib/greppy/bin/greppy-workspace-provider"
+install -m 0644 "$repository_root/platform/linux/greppy-workspace-provider.service" \
+  "$STAGING_ROOT/usr/lib/systemd/user/greppy-workspace-provider.service"
 ln -s ../lib/greppy/bin/greppy "$STAGING_ROOT/usr/bin/greppy"
 install -m 0755 "$repository_root/bench/release_package_smoke.sh" \
   "$STAGING_ROOT/usr/lib/greppy/release-tests/release_package_smoke.sh"
@@ -153,6 +156,7 @@ fi
 %files
 /usr/bin/greppy
 /usr/lib/greppy
+/usr/lib/systemd/user/greppy-workspace-provider.service
 /usr/share/doc/greppy
 /usr/share/licenses/greppy
 

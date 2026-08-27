@@ -997,6 +997,70 @@ mod tests {
                 ),
                 0
             );
+            assert!(
+                greppy_workspace_create_file(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0o100600,
+                ) < 0
+            );
+            assert!(
+                greppy_workspace_create_file(
+                    core,
+                    std::ptr::null(),
+                    c("private.txt").as_ptr(),
+                    0o100600,
+                ) < 0
+            );
+            let invalid_utf8 = [0xff_u8, 0];
+            assert!(
+                greppy_workspace_create_file(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    invalid_utf8.as_ptr().cast(),
+                    0o100600,
+                ) < 0
+            );
+            assert!(
+                greppy_workspace_create_file(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("file.txt:stream").as_ptr(),
+                    0o100600,
+                ) < 0
+            );
+            assert!(
+                greppy_workspace_read(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("base.txt").as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    1,
+                ) < 0
+            );
+            assert!(
+                greppy_workspace_write(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("base.txt").as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    1,
+                ) < 0
+            );
+            assert!(
+                greppy_workspace_write(
+                    core,
+                    c("ffi-test").as_ptr(),
+                    c("base.txt").as_ptr(),
+                    u64::MAX,
+                    b"x".as_ptr(),
+                    1,
+                ) < 0
+            );
+            greppy_workspace_string_free(std::ptr::null_mut());
             let base_inode = greppy_workspace_open_file_read_only_inode(
                 core,
                 c("ffi-test").as_ptr(),

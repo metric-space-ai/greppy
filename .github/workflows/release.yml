@@ -575,6 +575,11 @@ jobs:
           ! compgen -G "$deb_licenses/RIFT-*" >/dev/null
           test -x "$deb_bin/greppy-workspace-provider"
           test -x "$rpm_bin/greppy-workspace-provider"
+          test -f "$deb_root/usr/lib/systemd/user/greppy-workspace-provider.service"
+          cmp "$deb_root/usr/lib/systemd/user/greppy-workspace-provider.service" \
+            "$rpm_root/usr/lib/systemd/user/greppy-workspace-provider.service"
+          grep -F 'Restart=on-failure' \
+            "$deb_root/usr/lib/systemd/user/greppy-workspace-provider.service"
           cmp "$deb_bin/greppy" "$rpm_bin/greppy"
           cmp "$deb_bin/greppy-workspace-provider" "$rpm_bin/greppy-workspace-provider"
           for license in \
@@ -782,9 +787,18 @@ jobs:
             if [ -s "$GREPPY_WORKSPACE_DIR/provider.pid" ]; then
               kill "$(cat "$GREPPY_WORKSPACE_DIR/provider.pid")" 2>/dev/null || true
             fi
+            autostart_root="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+            rm -f "$autostart_root/default.target.wants/greppy-workspace-provider.service"
+            rm -f "$autostart_root/greppy-workspace-provider.service"
           }
           trap cleanup_provider EXIT
           "$deb_bin/greppy" workspace setup
+          autostart_root="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+          test -f "$autostart_root/greppy-workspace-provider.service"
+          test "$(readlink "$autostart_root/default.target.wants/greppy-workspace-provider.service")" = \
+            ../greppy-workspace-provider.service
+          grep -F "ExecStart=\"$deb_bin/greppy-workspace-provider\"" \
+            "$autostart_root/greppy-workspace-provider.service"
           "$deb_bin/greppy" workspace doctor --json > "$RUNNER_TEMP/workspace-doctor.json"
           jq -e '
             .healthy == true and

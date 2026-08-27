@@ -396,6 +396,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_heartbeat_beyond_the_allowed_future_clock_skew() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let heartbeat = now + MAX_HEARTBEAT_FUTURE_SKEW + Duration::from_millis(1);
+        publish(&manifest(&data, &mount, heartbeat));
+        assert!(matches!(
+            ProviderInstallation::require_healthy_at(&data, now),
+            Err(Error::AdapterUnhealthy(_))
+        ));
+    }
+
+    #[test]
     fn doctor_exercises_partial_write_rename_and_delete() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");

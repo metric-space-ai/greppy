@@ -1,5 +1,7 @@
 use greppy_workspace_core::ProviderInstallation;
 use std::fs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -14,6 +16,7 @@ pub(crate) fn setup(data_root: &Path) -> Result<ProviderInstallation, String> {
         provider
             .doctor_io(&format!("setup-{}", std::process::id()))
             .map_err(|error| error.to_string())?;
+        install_platform_autostart(data_root, provider.mount_root())?;
         return Ok(provider);
     }
     fs::create_dir_all(data_root).map_err(|error| {
@@ -30,7 +33,9 @@ pub(crate) fn setup(data_root: &Path) -> Result<ProviderInstallation, String> {
         )
     })?;
     start_platform_adapter(data_root, &mount_root)?;
-    wait_until_healthy(data_root)
+    let provider = wait_until_healthy(data_root)?;
+    install_platform_autostart(data_root, provider.mount_root())?;
+    Ok(provider)
 }
 
 fn mount_root(data_root: &Path) -> Result<PathBuf, String> {
@@ -48,6 +53,202 @@ fn sibling(current_exe: &Path, name: &str) -> Result<PathBuf, String> {
         )
     })?;
     Ok(directory.join(name))
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_quote(value: &Path) -> Result<String, String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("systemd path is not UTF-8: {}", value.display()))?;
+    if value.contains(['\n', '\r']) {
+        return Err("systemd path contains a line break".into());
+    }
+    Ok(format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn render_systemd_user_unit(
+    adapter: &Path,
+    data_root: &Path,
+    mount_root: &Path,
+) -> Result<String, String> {
+    Ok(format!(
+        "[Unit]\n\
+         Description=Greppy portable CoW workspace provider\n\
+         After=default.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} --data-root {} --mount-root {}\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         KillMode=mixed\n\n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        systemd_quote(adapter)?,
+        systemd_quote(data_root)?,
+        systemd_quote(mount_root)?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn render_macos_launch_agent(cli: &Path, data_root: &Path) -> Result<String, String> {
+    let cli = cli
+        .to_str()
+        .ok_or_else(|| format!("CLI path is not UTF-8: {}", cli.display()))?;
+    let data_root = data_root
+        .to_str()
+        .ok_or_else(|| format!("workspace path is not UTF-8: {}", data_root.display()))?;
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+           <key>Label</key><string>ai.metric-space.greppy.workspace</string>\n\
+           <key>ProgramArguments</key>\n\
+           <array><string>{}</string><string>workspace</string><string>setup</string></array>\n\
+           <key>EnvironmentVariables</key>\n\
+           <dict><key>GREPPY_WORKSPACE_DIR</key><string>{}</string></dict>\n\
+           <key>RunAtLoad</key><true/>\n\
+           <key>ProcessType</key><string>Background</string>\n\
+           <key>ThrottleInterval</key><integer>5</integer>\n\
+         </dict>\n\
+         </plist>\n",
+        xml_escape(cli),
+        xml_escape(data_root),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_write_autostart(path: &Path, contents: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("autostart path has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("autostart filename is not UTF-8: {}", path.display()))?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&temporary)
+        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+    let result = (|| {
+        file.write_all(contents.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync {}: {error}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|error| {
+            format!(
+                "cannot atomically publish {} as {}: {error}",
+                temporary.display(),
+                path.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn install_platform_autostart(data_root: &Path, mount_root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let current = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
+    let adapter = sibling(&current, "greppy-workspace-provider")?;
+    require_bundled_file(&adapter, "Linux FUSE3 adapter")?;
+    let config_root = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) => PathBuf::from(value),
+        None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+            "HOME is unavailable for systemd user service installation".to_string()
+        })?)
+        .join(".config"),
+    };
+    if !config_root.is_absolute() {
+        return Err(format!(
+            "systemd user configuration root is not absolute: {}",
+            config_root.display()
+        ));
+    }
+    let unit_root = config_root.join("systemd/user");
+    let unit_name = "greppy-workspace-provider.service";
+    fs::create_dir_all(&unit_root)
+        .map_err(|error| format!("cannot create {}: {error}", unit_root.display()))?;
+    let unit_path = unit_root.join(unit_name);
+    atomic_write_autostart(
+        &unit_path,
+        &render_systemd_user_unit(&adapter, data_root, mount_root)?,
+    )?;
+    let wants = unit_root.join("default.target.wants");
+    fs::create_dir_all(&wants)
+        .map_err(|error| format!("cannot create {}: {error}", wants.display()))?;
+    let enabled = wants.join(unit_name);
+    match fs::read_link(&enabled) {
+        Ok(target) if target == Path::new("../greppy-workspace-provider.service") => {}
+        Ok(target) => {
+            return Err(format!(
+                "existing Greppy systemd enablement {} targets unexpected {}",
+                enabled.display(),
+                target.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            symlink("../greppy-workspace-provider.service", &enabled)
+                .map_err(|error| format!("cannot enable {}: {error}", unit_path.display()))?;
+        }
+        Err(error) => return Err(format!("cannot inspect {}: {error}", enabled.display())),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_platform_autostart(data_root: &Path, _mount_root: &Path) -> Result<(), String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
+    let home = PathBuf::from(
+        std::env::var_os("HOME")
+            .ok_or_else(|| "HOME is unavailable for LaunchAgent installation".to_string())?,
+    );
+    if !home.is_absolute() {
+        return Err(format!("HOME is not absolute: {}", home.display()));
+    }
+    let agents = home.join("Library/LaunchAgents");
+    fs::create_dir_all(&agents)
+        .map_err(|error| format!("cannot create {}: {error}", agents.display()))?;
+    let plist = agents.join("ai.metric-space.greppy.workspace.plist");
+    atomic_write_autostart(&plist, &render_macos_launch_agent(&current, data_root)?)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn install_platform_autostart(_data_root: &Path, _mount_root: &Path) -> Result<(), String> {
+    // Windows service installation is intentionally part of the selected,
+    // signed filesystem-provider installer. The current WinFsp diagnostic
+    // backend is not release-eligible and must not register persistence.
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -290,6 +491,59 @@ mod tests {
             sibling(Path::new("/opt/greppy/bin/greppy"), "provider").unwrap(),
             Path::new("/opt/greppy/bin/provider")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn autostart_publish_replaces_a_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        let target = root.path().join("autostart");
+        fs::write(&outside, "protected").unwrap();
+        symlink(&outside, &target).unwrap();
+
+        atomic_write_autostart(&target, "managed").unwrap();
+
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "protected");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "managed");
+        assert!(!fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_user_unit_is_persistent_restartable_and_argument_safe() {
+        let unit = render_systemd_user_unit(
+            Path::new("/opt/greppy %/bin/greppy-workspace-provider"),
+            Path::new("/home/test/workspace data"),
+            Path::new("/home/test/workspace mount"),
+        )
+        .unwrap();
+        assert!(unit.contains(
+            "ExecStart=\"/opt/greppy %%/bin/greppy-workspace-provider\" \
+             --data-root \"/home/test/workspace data\" \
+             --mount-root \"/home/test/workspace mount\""
+        ));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_replays_setup_at_login_with_exact_workspace_root() {
+        let plist = render_macos_launch_agent(
+            Path::new("/Applications/Greppy & Tools/greppy"),
+            Path::new("/Users/test/Greppy & Data"),
+        )
+        .unwrap();
+        assert!(plist.contains("/Applications/Greppy &amp; Tools/greppy"));
+        assert!(plist.contains("/Users/test/Greppy &amp; Data"));
+        assert!(plist.contains("<string>workspace</string><string>setup</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
     }
 
     #[cfg(target_os = "macos")]

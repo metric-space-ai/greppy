@@ -321,6 +321,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('STAGING_ROOT=$(realpath -m "$6")', linux_packager)
         self.assertIn("%global __strip /bin/true", linux_packager)
         self.assertIn("%global _build_id_links none", linux_packager)
+        self.assertIn("greppy-workspace-provider.service", linux_packager)
+        self.assertIn("default.target.wants/greppy-workspace-provider.service", workflow)
         self.assertNotIn("RIFT-MIT", workflow)
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"

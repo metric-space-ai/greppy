@@ -1,0 +1,13 @@
+[Unit]
+Description=Greppy portable CoW workspace provider
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/greppy/bin/greppy-workspace-provider --data-root %h/.local/share/greppy/workspace --mount-root %h/.local/share/greppy/workspace-mount
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
