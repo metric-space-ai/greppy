@@ -1351,6 +1351,13 @@ fn recover_apply_journals(core: &WorkspaceCore) -> Result<(), WorkspaceError> {
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::Tampered {
+                path,
+                detail: "apply recovery journal is not a regular file".into(),
+            });
+        }
         let bytes = fs::read(&path)?;
         let journal: ApplyJournal =
             serde_json::from_slice(&bytes).map_err(|error| WorkspaceError::Tampered {
@@ -3241,6 +3248,33 @@ mod tests {
                 .map(|entry| (entry.path.clone(), entry.modified_unix_ns))
                 .collect(),
         };
+        let apply_journals = apply_journal_root(&recovery_core);
+        fs::create_dir_all(&apply_journals).unwrap();
+        let foreign_type = apply_journals.join("foreign.json");
+        fs::create_dir(&foreign_type).unwrap();
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Tampered { .. })
+        ));
+        fs::remove_dir(&foreign_type).unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside-apply-journal.json");
+            fs::write(&outside, serde_json::to_vec(&journal).unwrap()).unwrap();
+            let escaped = apply_journals.join("escaped.json");
+            std::os::unix::fs::symlink(&outside, &escaped).unwrap();
+            assert!(matches!(
+                recover_apply_journals(&recovery_core),
+                Err(WorkspaceError::Tampered { .. })
+            ));
+            assert_eq!(
+                fs::read(&outside).unwrap(),
+                serde_json::to_vec(&journal).unwrap()
+            );
+            fs::remove_file(&escaped).unwrap();
+        }
+
         let unrelated = temp.path().join("unrelated");
         fs::create_dir(&unrelated).unwrap();
         let mut tampered_journal = journal.clone();
