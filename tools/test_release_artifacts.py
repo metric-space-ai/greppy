@@ -64,6 +64,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("Directory.Build.props", builder)
         self.assertIn("$propsImports", builder)
         self.assertIn("nuget verify -Signatures", builder)
+        self.assertIn("apply --ignore-space-change --check", builder)
         self.assertIn("build\\Release\\greppyworkspacefsp-x64.sys", builder)
         self.assertIn("build\\Release\\greppyworkspacefsp-x64.dll", builder)
         self.assertIn("build\\Release\\greppyworkspacefsp-x64.lib", builder)

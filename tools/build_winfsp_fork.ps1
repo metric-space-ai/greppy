@@ -35,9 +35,12 @@ if ($actualCommit -ne $manifest.commit) {
 
 foreach ($patch in $manifest.patches) {
     $patchPath = Join-Path $forkRoot $patch.path
-    & git -C $Destination apply --check $patchPath
+    # build.version.props is CRLF upstream while repository patch artifacts are
+    # normalized to LF. The source commit and patch bytes are already pinned,
+    # so ignoring line-ending whitespace remains fail-closed for content.
+    & git -C $Destination apply --ignore-space-change --check $patchPath
     if ($LASTEXITCODE -ne 0) { throw "WinFsp patch does not apply: $($patch.path)" }
-    & git -C $Destination apply $patchPath
+    & git -C $Destination apply --ignore-space-change $patchPath
     if ($LASTEXITCODE -ne 0) { throw "cannot apply WinFsp patch: $($patch.path)" }
 }
 
