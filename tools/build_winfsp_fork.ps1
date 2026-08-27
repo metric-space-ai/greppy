@@ -146,14 +146,13 @@ foreach ($project in $projects) {
     if ($LASTEXITCODE -ne 0) { throw "WinFsp project build failed: $project" }
 }
 
-$outputRoot = Join-Path $solutionRoot 'build\Release'
 $requiredOutputs = @(
-    'winfsp-x64.sys',
-    'winfsp-x64.dll',
-    'winfsp-tests-x64.exe'
+    'build\Release\winfsp-x64.sys',
+    'build\Release\winfsp-x64.dll',
+    'testing\build\Release\winfsp-tests-x64.exe'
 )
 foreach ($output in $requiredOutputs) {
-    $path = Join-Path $outputRoot $output
+    $path = Join-Path $solutionRoot $output
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "required WinFsp build output is absent: $path"
     }

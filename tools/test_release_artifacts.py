@@ -64,6 +64,9 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("Directory.Build.props", builder)
         self.assertIn("$propsImports", builder)
         self.assertIn("nuget verify -Signatures", builder)
+        self.assertIn("build\\Release\\winfsp-x64.sys", builder)
+        self.assertIn("build\\Release\\winfsp-x64.dll", builder)
+        self.assertIn("testing\\build\\Release\\winfsp-tests-x64.exe", builder)
         self.assertNotIn("/p:WindowsSdkDir=", builder)
 
     def test_training_archive_is_deterministic_and_self_verifying(self) -> None:
