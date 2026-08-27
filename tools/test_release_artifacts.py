@@ -269,6 +269,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("platform/linux/build-packages.sh", workflow)
         self.assertNotIn("greppy-linux-x86_64.tar.gz", workflow)
         self.assertIn("greppy-workspace-provider.exe", workflow)
+        self.assertIn("winfsp-2.1.25156.msi", workflow)
+        self.assertIn(
+            "signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy-workspace-provider.exe",
+            workflow,
+        )
+        self.assertNotIn("Windows direct-download binary is unsigned by design", workflow)
         linux_packager = (
             REPOSITORY_ROOT / "platform/linux/build-packages.sh"
         ).read_text(encoding="utf-8")

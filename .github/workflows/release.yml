@@ -287,6 +287,22 @@ jobs:
         if: runner.os == 'Windows' && matrix.features == 'cuda'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
+      - name: Install pinned unchanged WinFsp 2.1 runtime and SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
+          $actual = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
+          if ($actual -ne '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a') {
+            throw "WinFsp installer checksum mismatch: $actual"
+          }
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', 'INSTALLLEVEL=1000')
+          if ($install.ExitCode -ne 0) { throw "WinFsp installation failed: $($install.ExitCode)" }
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+            throw 'WinFsp Developer headers were not installed'
+          }
+
       - name: Build release binary
         run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features ${{ matrix.features }}
 
@@ -355,20 +371,18 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           if (-not $env:CERTIFICATE_PFX -or -not $env:CERTIFICATE_PASSWORD) {
-            # Owner decision 2026-07-13 (WINDOWS_SIGNING_MODE=MICROSOFT_STORE_MSIX):
-            # Windows ships via the Microsoft Store, where Microsoft signs the
-            # MSIX submission - the PFX secrets stay empty BY DESIGN. The
-            # direct-download binary is intentionally unsigned; release notes
-            # must point Windows users to the Store for a signed install.
-            Write-Host '::warning title=Windows direct-download binary is unsigned by design::Windows signing happens via Microsoft Store MSIX submission; the PFX path is intentionally disabled.'
-            exit 0
+            throw 'Windows release signing requires WINDOWS_CERTIFICATE_PFX_BASE64 and WINDOWS_CERTIFICATE_PASSWORD'
           }
           $cert = Join-Path $env:RUNNER_TEMP 'greppy-signing.pfx'
           [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:CERTIFICATE_PFX))
           & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy.exe
           if ($LASTEXITCODE -ne 0) { throw 'signtool sign failed' }
+          & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy-workspace-provider.exe
+          if ($LASTEXITCODE -ne 0) { throw 'provider signtool sign failed' }
           & signtool verify /pa /all /v target/release/greppy.exe
           if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed' }
+          & signtool verify /pa /all /v target/release/greppy-workspace-provider.exe
+          if ($LASTEXITCODE -ne 0) { throw 'provider signtool verify failed' }
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -817,8 +831,6 @@ jobs:
       - name: Verify clean Windows host
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          HAVE_WINDOWS_CERT_SECRETS: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' && '1' || '' }}
         run: |
           New-Item -ItemType Directory -Force unpack,store,repo | Out-Null
           $line = (Get-Content "package/${{ matrix.asset }}.sha256" -Raw).Trim()
@@ -829,14 +841,9 @@ jobs:
           if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
           if (-not (Test-Path "$PWD/unpack/greppy-workspace-provider.exe")) { throw 'missing portable workspace provider' }
           if ($env:GITHUB_REF -like 'refs/tags/*') {
-            if (-not $env:HAVE_WINDOWS_CERT_SECRETS) {
-              # Consistent with the signing step: Windows signing happens via
-              # the Microsoft Store MSIX channel; the direct-download binary is
-              # unsigned by design.
-              Write-Host '::warning title=Windows direct-download binary is unsigned by design::Authenticode verification skipped - signing happens via Microsoft Store MSIX.'
-            } else {
-              $signature = Get-AuthenticodeSignature "$PWD/unpack/greppy.exe"
-              if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
+            foreach ($binary in @('greppy.exe', 'greppy-workspace-provider.exe')) {
+              $signature = Get-AuthenticodeSignature "$PWD/unpack/$binary"
+              if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature for ${binary}: $($signature.Status)" }
             }
           }
           python unpack/release_artifacts.py verify-spdx `
