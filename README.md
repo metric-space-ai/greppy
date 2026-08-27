@@ -473,6 +473,13 @@ semantics remain in Rust. See
 [Portable CoW workspaces](docs/portable-cow-workspaces.md) for setup, lifecycle,
 proposal, recovery, and platform details.
 
+The distributed FSKit extension is Developer-ID signed, notarized, stapled,
+and embeds a Developer-ID provisioning profile for its exact bundle ID. That
+profile must authorize the FSKit Module entitlement, Greppy's application
+group, and the same signing team. A merely signed or notarized extension
+without that profile is rejected by the release build: Gatekeeper acceptance
+alone does not prove that macOS will allow the user to activate the module.
+
 `workspace setup` also installs the per-user login lifecycle: a restartable
 systemd user unit on Linux and an idempotent RunAtLoad LaunchAgent around the
 OS-managed FSKit activation on macOS. Both retain the exact configured

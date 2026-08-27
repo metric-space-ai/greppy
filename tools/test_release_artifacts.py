@@ -418,10 +418,18 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("name: Exact-SHA three-platform performance set", cow_workflow)
         self.assertIn("verify_portable_cow_performance.py", cow_workflow)
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        portable_docs = (
+            REPOSITORY_ROOT / "docs/portable-cow-workspaces.md"
+        ).read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         self.assertNotIn("agent benchmark, and the summary-quality gate", readme)
         self.assertNotIn("navigation benchmark is a hard", security)
         self.assertIn("never gate publication", security)
+        self.assertIn("Developer-ID provisioning profile", readme)
+        self.assertIn(
+            "ai.metricspace.greppy.workspacefs.extension", portable_docs
+        )
+        self.assertIn("Notarization without this profile is insufficient", portable_docs)
         # One Unix footprint invocation remains; the Windows measurement is out
         # of band (see the release-scope comment in release.yml). Manual
         # packaging dry-runs may skip the hours-long diagnostic, but immutable

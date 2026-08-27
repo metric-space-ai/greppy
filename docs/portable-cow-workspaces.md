@@ -124,7 +124,14 @@ baselines remain pinned until their refs are removed.
   extension. The one-time System Settings approval is an OS security boundary;
   Greppy remains unavailable until activation. A minimal Swift host bridges
   FSKit to the Rust core; the LaunchAgent only replays idempotent setup after
-  login and does not bypass that approval boundary.
+  login and does not bypass that approval boundary. Developer-ID builds also
+  require an embedded provisioning profile for exactly
+  `ai.metricspace.greppy.workspacefs.extension`; the profile must authorize
+  the FSKit Module entitlement, `group.ai.metricspace.greppy`, and the signing
+  team. The release build fails before compilation when this profile is absent
+  and validates its signature, expiry, distribution type and entitlement
+  allowlist before signing. Notarization without this profile is insufficient
+  for FSKit activation and is never accepted as release evidence.
 - Windows x86_64 is a release blocker until a licensed, signed kernel transport
   forwards real hardlink operations to Greppy's Rust provider. Official
   unchanged WinFsp 2.1 rejects `FileLinkInformation` before userspace, so the
