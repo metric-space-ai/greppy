@@ -73,6 +73,10 @@ class WindowsDriverContractTests(unittest.TestCase):
             value,
             contract.verify_contract(manifest, self.unsigned, self.signed, self.fork),
         )
+        self.assertEqual(
+            value,
+            contract.verify_signed_contract(manifest, self.signed, self.fork),
+        )
 
     def test_changed_payload_is_rejected(self):
         changed = bytearray(fake_pe(b"signed!!"))

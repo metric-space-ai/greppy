@@ -305,10 +305,13 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 27)
+        self.assertEqual(len(names), 28)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
+        self.assertIn("greppy-windows-x86_64.msi", names)
+        self.assertIn("greppy-windows-driver-contract.json", names)
+        self.assertNotIn("greppy-windows-x86_64.zip", names)
         # Release scope (SECURITY.md): the Windows runtime footprint is measured
         # out of band (hours-long CPU index on the hosted runner), and the
         # edit-regime coding benchmark publishes per commit but does not gate.
@@ -389,6 +392,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("winfsp-2.1.25156.msi", workflow)
         self.assertIn("tools/build_winfsp_fork.ps1", workflow)
         self.assertIn("greppyworkspacefsp-x64.dll", workflow)
+        self.assertIn("greppyworkspacefsp-x64.sys", workflow)
+        self.assertIn("tools/build_windows_msi.ps1", workflow)
+        self.assertIn("signtool verify /kp /all /v", workflow)
+        self.assertIn("WINDOWS_SIGNED_WINFSP_DRIVER_BASE64", workflow)
         self.assertIn("tools/package_winfsp_source.py create", workflow)
         self.assertIn("greppy-winfsp-source.tar.gz", workflow)
         self.assertIn(

@@ -79,7 +79,7 @@ def pe_identity(path: pathlib.Path) -> dict[str, Any]:
         removed_padding += 1
 
     return {
-        "path": str(path.resolve()),
+        "file_name": path.name,
         "sha256": sha256_bytes(raw),
         "canonical_pe_sha256": sha256_bytes(bytes(canonical)),
         "machine": f"0x{machine:04x}",
@@ -166,6 +166,25 @@ def verify_contract(
     return actual
 
 
+def verify_signed_contract(
+    manifest_path: pathlib.Path,
+    signed_path: pathlib.Path,
+    fork_manifest_path: pathlib.Path,
+) -> dict[str, Any]:
+    expected = json.loads(manifest_path.read_text(encoding="utf-8"))
+    verification = expected.get("kernel_policy_verification", {})
+    if expected.get("schema_version") != SCHEMA or verification.get("signtool_kp_verified") is not True:
+        raise ContractError("invalid or non-kernel-verified driver contract")
+    if expected.get("fork") != load_fork_manifest(fork_manifest_path):
+        raise ContractError("driver contract does not match the Greppy fork manifest")
+    signed = pe_identity(signed_path)
+    if expected.get("signed_driver") != signed:
+        raise ContractError("installed signed driver does not match its release contract")
+    if expected.get("payload_identity_sha256") != signed["canonical_pe_sha256"]:
+        raise ContractError("installed signed driver payload identity is inconsistent")
+    return expected
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -181,6 +200,10 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--signer-thumbprint", required=True)
     create.add_argument("--output", required=True, type=pathlib.Path)
     verify.add_argument("--manifest", required=True, type=pathlib.Path)
+    verify_signed = commands.add_parser("verify-signed")
+    verify_signed.add_argument("--signed", required=True, type=pathlib.Path)
+    verify_signed.add_argument("--fork-manifest", required=True, type=pathlib.Path)
+    verify_signed.add_argument("--manifest", required=True, type=pathlib.Path)
     return result
 
 
@@ -199,9 +222,13 @@ def main() -> int:
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        else:
+        elif args.command == "verify":
             value = verify_contract(
                 args.manifest, args.unsigned, args.signed, args.fork_manifest
+            )
+        else:
+            value = verify_signed_contract(
+                args.manifest, args.signed, args.fork_manifest
             )
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0

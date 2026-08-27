@@ -256,7 +256,7 @@ jobs:
           # Windows CUDA and macOS Intel remain outside this release gate.
           - name: windows-x86_64
             os: windows-2022
-            asset: greppy-windows-x86_64.zip
+            asset: greppy-windows-x86_64.msi
             features: cpu-only
             footprint_devices: 'cpu'
             runner_os: Windows
@@ -337,7 +337,33 @@ jobs:
         shell: pwsh
         run: |
           $runtime = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.dll'
+          $driver = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.sys'
           Copy-Item -LiteralPath $runtime -Destination target\release\greppyworkspacefsp-x64.dll
+          Copy-Item -LiteralPath $driver -Destination target\release\greppyworkspacefsp-x64.sys
+
+      - name: Import and bind Microsoft-signed private driver
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          SIGNED_DRIVER_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 }}
+          DRIVER_CONTRACT_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64 }}
+        run: |
+          if (-not $env:SIGNED_DRIVER_BASE64 -or -not $env:DRIVER_CONTRACT_BASE64) {
+            throw 'signed Windows release requires the Microsoft-signed Greppy driver and its contract'
+          }
+          $unsigned = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.sys'
+          $signed = Join-Path $PWD 'target\release\greppyworkspacefsp-x64.sys'
+          $contract = Join-Path $PWD 'target\release\greppy-windows-driver-contract.json'
+          [IO.File]::WriteAllBytes($signed, [Convert]::FromBase64String($env:SIGNED_DRIVER_BASE64))
+          [IO.File]::WriteAllBytes($contract, [Convert]::FromBase64String($env:DRIVER_CONTRACT_BASE64))
+          & signtool verify /kp /all /v $signed
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft-signed Greppy driver failed kernel-policy verification' }
+          python tools/windows_driver_contract.py verify `
+            --unsigned $unsigned `
+            --signed $signed `
+            --fork-manifest third_party/winfsp-greppy/upstream.json `
+            --manifest $contract
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft-signed Greppy driver is not bound to this fork build' }
 
       - name: Create deterministic WinFsp corresponding-source archive
         if: runner.os == 'Windows'
@@ -430,6 +456,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool verify failed' }
           & signtool verify /pa /all /v target/release/greppyworkspacefsp-x64.dll
           if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool verify failed' }
+          "WINDOWS_SIGNING_PFX_PATH=$cert" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -628,17 +655,48 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          SHOULD_SIGN: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
           Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
+          Copy-Item target/release/greppyworkspacefsp-x64.sys dist/greppyworkspacefsp-x64.sys
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
           Copy-Item tools/release_artifacts.py dist/release_artifacts.py
-          Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py dist/
+          Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py,tools/windows_driver_contract.py dist/
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
           Copy-Item licenses dist/licenses -Recurse
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
+          $version = (& target/release/greppy.exe --version).Split(' ')[-1]
+          $arguments = @{
+            DistDir = 'dist'
+            OutputPath = '${{ matrix.asset }}'
+            Version = $version
+          }
+          if ($env:SHOULD_SIGN -eq 'true') {
+            Copy-Item target/release/greppy-windows-driver-contract.json dist/
+            Copy-Item target/release/greppy-windows-driver-contract.json ./greppy-windows-driver-contract.json
+            $arguments.UnsignedDriverPath = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.sys'
+            $arguments.DriverContractPath = 'target/release/greppy-windows-driver-contract.json'
+          } else {
+            $arguments.AllowUnsignedForSmokeTest = $true
+          }
+          tools/build_windows_msi.ps1 @arguments
+
+      - name: Sign Windows MSI with Authenticode
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_SIGNING_PFX_PATH -or -not $env:CERTIFICATE_PASSWORD) {
+            throw 'Windows MSI signing material is unavailable'
+          }
+          & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $env:WINDOWS_SIGNING_PFX_PATH /p $env:CERTIFICATE_PASSWORD '${{ matrix.asset }}'
+          if ($LASTEXITCODE -ne 0) { throw 'MSI Authenticode signing failed' }
+          & signtool verify /pa /all /v '${{ matrix.asset }}'
+          if ($LASTEXITCODE -ne 0) { throw 'MSI Authenticode verification failed' }
 
       - name: Smoke-test packaged artifact (Unix)
         if: runner.os == 'Linux'
@@ -696,20 +754,23 @@ jobs:
         run: |
           $clean = Join-Path $env:RUNNER_TEMP 'greppy-package-smoke'
           New-Item -ItemType Directory -Force "$clean/bin","$clean/store","$clean/repo" | Out-Null
-          Expand-Archive -Path "${{ matrix.asset }}" -DestinationPath "$clean/bin" -Force
-          if (-not (Test-Path "$clean/bin/licenses/EMBEDDED-MODEL-TERMS.md")) { throw 'missing embedded model terms' }
-          if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt")) { throw 'missing EmbeddingGemma notice' }
-          if (-not (Test-Path "$clean/bin/licenses/GEMMA-TERMS.html")) { throw 'missing Gemma terms' }
-          if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt")) { throw 'missing EmbeddingGemma modification notice' }
-          if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-PROVENANCE.json")) { throw 'missing EmbeddingGemma provenance' }
-          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-APACHE-2.0.txt")) { throw 'missing Qwen license' }
-          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-MODIFICATIONS.txt")) { throw 'missing Qwen modification notice' }
-          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-PROVENANCE.json")) { throw 'missing Qwen provenance' }
-          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json")) { throw 'missing Qwen training-data manifest' }
-          if (-not (Test-Path "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json")) { throw 'missing model redistribution lock' }
-          if (-not (Test-Path "$clean/bin/greppyworkspacefsp-x64.dll")) { throw 'missing private Greppy WinFsp runtime' }
-          if (Test-Path "$clean/bin/winfsp-x64.dll") { throw 'official WinFsp runtime leaked into package' }
-          & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
+          $process = Start-Process msiexec.exe -ArgumentList @('/a', "`"$PWD\${{ matrix.asset }}`"", '/qn', "TARGETDIR=`"$clean\bin`"") -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) { throw "administrative MSI extraction failed: $($process.ExitCode)" }
+          $greppy = @(Get-ChildItem "$clean\bin" -Filter greppy.exe -File -Recurse)
+          if ($greppy.Count -ne 1) { throw "administrative image contains $($greppy.Count) greppy.exe files" }
+          $installed = $greppy[0].Directory.FullName
+          foreach ($license in @(
+            'EMBEDDED-MODEL-TERMS.md', 'EMBEDDINGGEMMA-NOTICE.txt', 'GEMMA-TERMS.html',
+            'EMBEDDINGGEMMA-MODIFICATIONS.txt', 'EMBEDDINGGEMMA-PROVENANCE.json',
+            'QWEN3.5-APACHE-2.0.txt', 'QWEN3.5-MODIFICATIONS.txt',
+            'QWEN3.5-PROVENANCE.json', 'QWEN3.5-TRAINING-DATA-MANIFEST.json',
+            'MODEL-REDISTRIBUTION.lock.json')) {
+            if (-not (Test-Path (Join-Path $installed "licenses\$license"))) { throw "missing $license" }
+          }
+          if (-not (Test-Path (Join-Path $installed 'greppyworkspacefsp-x64.dll'))) { throw 'missing private Greppy WinFsp runtime' }
+          if (-not (Test-Path (Join-Path $installed 'greppyworkspacefsp-x64.sys'))) { throw 'missing private Greppy WinFsp driver' }
+          if (Test-Path (Join-Path $installed 'winfsp-x64.dll')) { throw 'official WinFsp runtime leaked into package' }
+          & (Join-Path $installed 'release_package_smoke.ps1') -Binary (Join-Path $installed 'greppy.exe') -Work "$clean/work"
 
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
@@ -807,6 +868,12 @@ jobs:
         with:
           subject-path: greppy-winfsp-source.tar.gz
 
+      - name: Attest Microsoft-signed driver binding
+        if: runner.os == 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run)
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: greppy-windows-driver-contract.json
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -822,6 +889,7 @@ jobs:
             build-environment-${{ matrix.name }}.json
             greppy-winfsp-source.tar.gz
             greppy-winfsp-source.tar.gz.sha256
+            greppy-windows-driver-contract.json
 
   verify-packages:
     name: clean package (${{ matrix.name }})
@@ -844,7 +912,7 @@ jobs:
             rust_host: x86_64-unknown-linux-gnu
           - name: windows-x86_64
             os: windows-2022
-            asset: greppy-windows-x86_64.zip
+            asset: greppy-windows-x86_64.msi
             rust_host: x86_64-pc-windows-msvc
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -978,8 +1046,10 @@ jobs:
       - name: Verify clean Windows host
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          SHOULD_SIGN: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
         run: |
-          New-Item -ItemType Directory -Force unpack,store,repo | Out-Null
+          New-Item -ItemType Directory -Force administrative,store,repo | Out-Null
           $line = (Get-Content "package/${{ matrix.asset }}.sha256" -Raw).Trim()
           $want = ($line -split '\s+')[0]
           $got = (Get-FileHash -Algorithm SHA256 "package/${{ matrix.asset }}").Hash.ToLowerInvariant()
@@ -988,24 +1058,63 @@ jobs:
           $sourceWant = ($sourceLine -split '\s+')[0]
           $sourceGot = (Get-FileHash -Algorithm SHA256 'package/greppy-winfsp-source.tar.gz').Hash.ToLowerInvariant()
           if ($sourceWant -ne $sourceGot) { throw "source checksum mismatch: $sourceGot != $sourceWant" }
-          Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
           if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
-          if (-not (Test-Path "$PWD/unpack/greppy-workspace-provider.exe")) { throw 'missing portable workspace provider' }
-          if ($env:GITHUB_REF -like 'refs/tags/*') {
+          $admin = Start-Process msiexec.exe -ArgumentList @('/a', "`"$PWD\package\${{ matrix.asset }}`"", '/qn', "TARGETDIR=`"$PWD\administrative`"") -Wait -PassThru
+          if ($admin.ExitCode -notin @(0,3010)) { throw "administrative MSI extraction failed: $($admin.ExitCode)" }
+          $adminGreppy = @(Get-ChildItem administrative -Filter greppy.exe -File -Recurse)
+          if ($adminGreppy.Count -ne 1) { throw "administrative image contains $($adminGreppy.Count) greppy.exe files" }
+          $adminRoot = $adminGreppy[0].Directory.FullName
+          if (-not (Test-Path (Join-Path $adminRoot 'greppy-workspace-provider.exe'))) { throw 'missing portable workspace provider' }
+          if (-not (Test-Path (Join-Path $adminRoot 'greppyworkspacefsp-x64.dll'))) { throw 'missing private driver runtime' }
+          if (-not (Test-Path (Join-Path $adminRoot 'greppyworkspacefsp-x64.sys'))) { throw 'missing private kernel driver' }
+          if (Test-Path (Join-Path $adminRoot 'winfsp-x64.dll')) { throw 'official WinFsp runtime leaked into MSI' }
+          if ($env:SHOULD_SIGN -eq 'true') {
+            & signtool verify /pa /all /v "package/${{ matrix.asset }}"
+            if ($LASTEXITCODE -ne 0) { throw 'MSI signature verification failed' }
             foreach ($binary in @('greppy.exe', 'greppy-workspace-provider.exe', 'greppyworkspacefsp-x64.dll')) {
-              $signature = Get-AuthenticodeSignature "$PWD/unpack/$binary"
+              $signature = Get-AuthenticodeSignature (Join-Path $adminRoot $binary)
               if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature for ${binary}: $($signature.Status)" }
             }
+            & signtool verify /kp /all /v (Join-Path $adminRoot 'greppyworkspacefsp-x64.sys')
+            if ($LASTEXITCODE -ne 0) { throw 'kernel driver signature verification failed' }
+            python (Join-Path $adminRoot 'windows_driver_contract.py') verify-signed `
+              --signed (Join-Path $adminRoot 'greppyworkspacefsp-x64.sys') `
+              --fork-manifest third_party/winfsp-greppy/upstream.json `
+              --manifest (Join-Path $adminRoot 'greppy-windows-driver-contract.json')
+            if ($LASTEXITCODE -ne 0) { throw 'installed driver contract verification failed' }
           }
-          python unpack/release_artifacts.py verify-spdx `
+          python (Join-Path $adminRoot 'release_artifacts.py') verify-spdx `
             --sbom "package/${{ matrix.asset }}.spdx.json" `
-            --dist unpack `
-            --cargo-lock unpack/Cargo.lock `
+            --dist $adminRoot `
+            --cargo-lock (Join-Path $adminRoot 'Cargo.lock') `
             --target "${{ matrix.rust_host }}"
           if ($LASTEXITCODE -ne 0) { throw 'SPDX verification failed' }
-          python unpack/package_winfsp_source.py verify package/greppy-winfsp-source.tar.gz
+          python (Join-Path $adminRoot 'package_winfsp_source.py') verify package/greppy-winfsp-source.tar.gz
           if ($LASTEXITCODE -ne 0) { throw 'WinFsp corresponding-source verification failed' }
-          & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
+          & (Join-Path $adminRoot 'release_package_smoke.ps1') -Binary (Join-Path $adminRoot 'greppy.exe') -Work "$PWD/smoke"
+          if ($env:SHOULD_SIGN -eq 'true') {
+            $log = Join-Path $env:RUNNER_TEMP 'greppy-msi-install.log'
+            $install = Start-Process msiexec.exe -ArgumentList @('/i', "`"$PWD\package\${{ matrix.asset }}`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
+            if ($install.ExitCode -ne 0) { Get-Content $log; throw "MSI installation failed: $($install.ExitCode)" }
+            $installed = Join-Path $env:ProgramFiles 'Greppy'
+            if (-not (Test-Path (Join-Path $installed 'greppy.exe'))) { throw 'installed greppy.exe is missing' }
+            $env:GREPPY_WORKSPACE_DIR = Join-Path $env:RUNNER_TEMP 'installed-workspace\data'
+            & (Join-Path $installed 'greppy.exe') workspace setup
+            if ($LASTEXITCODE -ne 0) { throw 'installed workspace setup failed' }
+            & (Join-Path $installed 'greppy.exe') workspace doctor --json | Out-File "$env:RUNNER_TEMP\windows-workspace-doctor.json" -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw 'installed workspace doctor failed' }
+            $doctor = Get-Content "$env:RUNNER_TEMP\windows-workspace-doctor.json" -Raw | ConvertFrom-Json
+            if (-not $doctor.healthy -or -not $doctor.smoke.read -or -not $doctor.smoke.write -or -not $doctor.smoke.partial_write -or -not $doctor.smoke.rename -or -not $doctor.smoke.delete) {
+              throw 'installed workspace doctor did not pass the complete smoke contract'
+            }
+            $pidFile = Join-Path $env:GREPPY_WORKSPACE_DIR 'provider.pid'
+            if (Test-Path $pidFile) {
+              Stop-Process -Id ([int](Get-Content $pidFile -Raw).Trim()) -Force -ErrorAction SilentlyContinue
+            }
+            $uninstall = Start-Process msiexec.exe -ArgumentList @('/x', "`"$PWD\package\${{ matrix.asset }}`"", '/qn', '/norestart') -Wait -PassThru
+            if ($uninstall.ExitCode -notin @(0,3010)) { throw "MSI uninstall failed: $($uninstall.ExitCode)" }
+            if (Test-Path $installed) { throw 'MSI uninstall left the Greppy installation directory behind' }
+          }
           # TODO(windows daemon stress): port bench/release_daemon_stress.sh
           # to PowerShell for this leg. Portable as-is: concurrency/queue
           # limits/oversize/slow-client/protocol scenarios (the raw client

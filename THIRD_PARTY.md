@@ -130,6 +130,17 @@ component.
 The Windows provider's small C ABI bridge is original Greppy Apache-2.0 source;
 all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
 
+### WiX Toolset 5.0.2 (Windows installer build tool)
+
+- Purpose: build and ICE-validate Greppy's per-machine MSI. WiX is used only at
+  build time and is not installed as a Greppy runtime component.
+- Package: NuGet `wix` 5.0.2, source commit
+  `aa65968c419420d32e3e1b647aea0082f5ca5b78`, package SHA-256
+  `f30ef0c74e2a986126539c5780be93ac24e8136eaf723b1937b26272703ae173`.
+- License: Microsoft Reciprocal License (MS-RL); see
+  `licenses/WIX-MS-RL.txt`. The MSI authoring in `platform/windows/Greppy.wxs`
+  is original Greppy source and contains no copied WiX source code.
+
 ## Ported third-party code
 
 ### pi (agent loop semantics)
