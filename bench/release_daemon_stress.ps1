@@ -496,13 +496,23 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     # opens an indexed store that already contains vectors. Drive that exact
     # contract before probing the private diagnostic endpoint; merely waiting
     # after `index` would test a lifecycle the CLI does not promise.
-    [void](Invoke-GreppyJson @(
+    $prewarmNavigation = Start-GreppyProcess @(
         '--root', $RepoEmbed, 'search-symbol', 'ScoreLimits', '--json'
-    ) (Join-Path $Work 'out\prewarm-navigation.json'))
+    )
     Wait-For 'embedding daemon endpoint after first graph-command prewarm' 120 {
         $prewarmStatus = Get-DaemonStatus $EmbedEndpoint
         $prewarmStatus.state -in @('starting', 'loading', 'ready', 'evicted', 'faulted')
     }
+    # The prewarm is explicitly asynchronous. A compact graph lookup must not
+    # stay alive for the model TTL merely because its detached daemon remains
+    # healthy. Bound this separately so failure diagnostics retain both live
+    # processes and their exact command lines instead of observing them only
+    # after the TTL has expired.
+    Wait-For 'first graph command to exit after async daemon prewarm' 30 {
+        $prewarmNavigation.Process.HasExited
+    }
+    Complete-GreppyProcess $prewarmNavigation `
+        (Join-Path $Work 'out\prewarm-navigation.json') $true
     $prewarmStatus = Get-DaemonStatus $EmbedEndpoint
     Write-Host "embedding-prewarm=$($prewarmStatus | ConvertTo-Json -Depth 5 -Compress)"
     if ($prewarmStatus.state -eq 'faulted') {

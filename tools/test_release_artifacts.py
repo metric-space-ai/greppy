@@ -564,12 +564,28 @@ class ReleaseArtifactTests(unittest.TestCase):
             "'--root', $RepoEmbed, 'search-symbol', 'ScoreLimits', '--json'",
             windows_daemon_stress,
         )
+        self.assertIn(
+            "$prewarmNavigation = Start-GreppyProcess",
+            windows_daemon_stress,
+        )
+        self.assertIn(
+            "first graph command to exit after async daemon prewarm",
+            windows_daemon_stress,
+        )
         self.assertIn("prewarm-navigation.json", windows_daemon_stress)
         self.assertLess(
-            windows_daemon_stress.index("prewarm-navigation.json"),
             windows_daemon_stress.index(
                 "embedding daemon endpoint after first graph-command prewarm"
             ),
+            windows_daemon_stress.index(
+                "first graph command to exit after async daemon prewarm"
+            ),
+        )
+        self.assertLess(
+            windows_daemon_stress.index(
+                "first graph command to exit after async daemon prewarm"
+            ),
+            windows_daemon_stress.index("prewarm-navigation.json"),
         )
         self.assertIn(
             "embedding daemon endpoint after first graph-command prewarm",
