@@ -210,6 +210,26 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
+        Self::finish_spawn(socket, command)
+    }
+
+    fn spawn_from_dist(socket: &Path, run_id: &str, dist: &Path) -> Self {
+        let mut command = Command::new(dist.join("bin").join("web-runtime-supervisor"));
+        command
+            .arg("--dist")
+            .arg(dist)
+            .arg("--socket")
+            .arg(socket)
+            .arg("--run-id")
+            .arg(run_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        Self::finish_spawn(socket, command)
+    }
+
+    fn finish_spawn(socket: &Path, mut command: Command) -> Self {
         let lock = supervisor_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -3687,3 +3707,27 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
     );
 }
 
+#[test]
+fn supervisor_starts_from_stamped_dist_without_worker_flags() {
+    let pid = std::process::id();
+    let dist = std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}"));
+    let _ = std::fs::remove_dir_all(&dist);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dist));
+    assert_eq!(code, 0, "package dist: stdout={stdout} stderr={stderr}");
+    let socket = std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}.sock"));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn_from_dist(&socket, "run_distimg", &dist);
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_distimg",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let _ = std::fs::remove_dir_all(&dist);
+}
