@@ -887,7 +887,7 @@ fn web_status_reports_observability_fields() {
     }
     assert_eq!(result["playwright_compatibility_version"], "1.62.1");
     assert_eq!(result["inventory_entries"], 1354);
-    assert!(result["unsupported_capability_count"].as_u64().unwrap() > 0);
+    assert_eq!(result["unsupported_capability_count"], 501);
     assert_eq!(result["process_health"]["healthy"], true);
     assert_eq!(result["session_counts"]["total"], 0);
 }

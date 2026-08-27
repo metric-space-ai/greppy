@@ -235,7 +235,7 @@ impl Daemon {
                 },
                 "last_crash": self.last_crash.clone(),
                 "crash_receipts": self.crash_receipts.clone(),
-                "unsupported_capability_count": 337,
+                "unsupported_capability_count": 501,
                 "conformance_receipt_id": "contracts/web-runtime/receipts/oracle-setcontent.json",
                 "engines_linked_into_greppy_parent": false,
                 "signed_distributable": false,
@@ -509,6 +509,8 @@ impl Daemon {
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
+                response.metrics.content_cpu_ms = sample_cpu_ms(content_pid);
+                response.metrics.controller_cpu_ms = sample_cpu_ms(controller_pid);
                 response
             }
             Err(error) => {
@@ -1421,6 +1423,40 @@ fn sample_rss_bytes(pid: u32) -> u64 {
     kb.saturating_mul(1024)
 }
 
+fn sample_cpu_ms(pid: u32) -> u64 {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "time="])
+        .output();
+    let Ok(output) = output else {
+        return 0;
+    };
+    parse_ps_time(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn parse_ps_time(text: &str) -> u64 {
+    let text = text.trim();
+    if text.is_empty() {
+        return 0;
+    }
+    let mut parts = text.split(':');
+    let mut values = [0_f64; 3];
+    let mut count = 0;
+    for part in parts.by_ref() {
+        if count >= 3 {
+            break;
+        }
+        values[count] = part.parse().unwrap_or(0.0);
+        count += 1;
+    }
+    let seconds = match count {
+        1 => values[0],
+        2 => values[0] * 60.0 + values[1],
+        3 => values[0] * 3600.0 + values[1] * 60.0 + values[2],
+        _ => 0.0,
+    };
+    (seconds * 1000.0) as u64
+}
+
 fn gate_session_engine(
     sessions: &mut HashMap<String, Session>,
     session_id: &str,
@@ -1483,6 +1519,11 @@ impl Daemon {
             response.metrics.network_bytes = session.network_bytes;
             response.metrics.peak_rss_bytes = session.peak_rss_bytes;
         }
+        response.metrics.content_cpu_ms = sample_cpu_ms(self.content.pid());
+        response.metrics.controller_cpu_ms = sample_cpu_ms(self.controller.pid());
+        if response.metrics.peak_rss_bytes == 0 {
+            response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
+        }
     }
 }
 
@@ -1501,6 +1542,13 @@ pub fn socket_exists(path: &Path) -> bool {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn parse_ps_time_minutes_and_seconds() {
+        assert_eq!(super::parse_ps_time("0:01.50"), 1500);
+        assert_eq!(super::parse_ps_time("1:00.00"), 60_000);
+        assert_eq!(super::parse_ps_time(""), 0);
+    }
 
     #[test]
     fn recorded_main_frame_hops_are_kept() {
