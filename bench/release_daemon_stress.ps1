@@ -218,6 +218,43 @@ function Get-DaemonStatus([string]$Endpoint) {
     return $status
 }
 
+function Write-FailureDiagnostics {
+    Write-Host ""
+    Write-Host '=== fail-closed daemon diagnostics ==='
+    try {
+        $processes = @(
+            Get-CimInstance Win32_Process |
+                Where-Object { $_.ExecutablePath -eq $Binary } |
+                Select-Object ProcessId,CreationDate,CommandLine
+        )
+        Write-Host ($processes | ConvertTo-Json -Depth 3 -Compress)
+    }
+    catch {
+        Write-Host "process inventory unavailable: $($_.Exception.Message)"
+    }
+    try {
+        $runtimeInventory = @(
+            Get-ChildItem -LiteralPath $env:GREPPY_RUNTIME_DIR -Force -Recurse |
+                Select-Object FullName,Length,LastWriteTimeUtc,Attributes
+        )
+        Write-Host ($runtimeInventory | ConvertTo-Json -Depth 3 -Compress)
+    }
+    catch {
+        Write-Host "runtime inventory unavailable: $($_.Exception.Message)"
+    }
+    foreach ($endpointName in @('EmbedEndpoint', 'SummaryEndpoint')) {
+        $endpointVariable = Get-Variable -Name $endpointName -ErrorAction SilentlyContinue
+        if ($null -eq $endpointVariable) { continue }
+        try {
+            $status = Get-DaemonStatus ([string]$endpointVariable.Value)
+            Write-Host "$endpointName=$($status | ConvertTo-Json -Depth 5 -Compress)"
+        }
+        catch {
+            Write-Host "$endpointName unavailable: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Test-ProcessAlive([int]$ProcessId) {
     return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
 }
@@ -414,6 +451,17 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     [void][GreppyPipeClient]::PipeName($EmbedEndpoint)
     [void][GreppyPipeClient]::PipeName($SummaryEndpoint)
 
+    Write-Section 'index prewarm daemon readiness'
+    Wait-For 'embedding daemon endpoint after index prewarm' 120 {
+        $prewarmStatus = Get-DaemonStatus $EmbedEndpoint
+        $prewarmStatus.state -in @('starting', 'loading', 'ready', 'evicted', 'faulted')
+    }
+    $prewarmStatus = Get-DaemonStatus $EmbedEndpoint
+    Write-Host "embedding-prewarm=$($prewarmStatus | ConvertTo-Json -Depth 5 -Compress)"
+    if ($prewarmStatus.state -eq 'faulted') {
+        throw "embedding daemon prewarm faulted: $($prewarmStatus.last_error)"
+    }
+
     Write-Section 'spawn, protocol, malformed, oversize and slow-client contract'
     [void](Invoke-Semantic 'warmup' (New-Query 'warmup'))
     Wait-For 'embedding daemon to become ready' 30 {
@@ -577,6 +625,10 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
 
     Write-Host ""
     Write-Host "Windows release daemon stress passed: $Binary"
+}
+catch {
+    Write-FailureDiagnostics
+    throw
 }
 finally {
     foreach ($childProcess in @($ChildProcesses)) {

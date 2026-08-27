@@ -552,6 +552,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("function Wait-GreppyChild", windows_daemon_stress)
         self.assertEqual(windows_daemon_stress.count("Wait-GreppyChild $"), 3)
         self.assertNotIn(".Process.WaitForExit()", windows_daemon_stress)
+        self.assertIn("index prewarm daemon readiness", windows_daemon_stress)
+        self.assertIn("embedding daemon endpoint after index prewarm", windows_daemon_stress)
+        self.assertIn("function Write-FailureDiagnostics", windows_daemon_stress)
+        self.assertIn("Get-CimInstance Win32_Process", windows_daemon_stress)
+        self.assertIn("fail-closed daemon diagnostics", windows_daemon_stress)
         self.assertIn("GREPPY_EMBED_DAEMON_MODEL_TTL_S", windows_daemon_stress)
         self.assertIn(
             "Copy-Item bench/release_daemon_stress.ps1", workflow
