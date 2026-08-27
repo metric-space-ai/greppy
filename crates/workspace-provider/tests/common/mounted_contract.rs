@@ -116,6 +116,21 @@ fn unlock_range(file: &File, offset: u64, length: u64) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn windows_link_count(file: &File) -> io::Result<u32> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information.nNumberOfLinks)
+}
+
 #[test]
 fn mounted_contract_range_lock_helper() {
     let Some(path) = std::env::var_os("GREPPY_RANGE_LOCK_FILE") else {
@@ -288,6 +303,21 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
         .iter()
         .all(|name| name.to_string_lossy().starts_with("entry-")));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let executable = root.join("contract-executable.sh");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        assert_eq!(
+            fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
     let missing = root.join("contract-missing.txt");
     assert_eq!(
         fs::read(&missing).unwrap_err().kind(),
@@ -337,10 +367,25 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
             fs::metadata(&hard_link).unwrap().ino()
         );
     }
+    #[cfg(windows)]
+    assert_eq!(
+        windows_link_count(&File::open(&link_source).unwrap()).unwrap(),
+        2
+    );
     fs::write(&hard_link, b"updated").unwrap();
     assert_eq!(fs::read(&link_source).unwrap(), b"updated");
     fs::remove_file(&link_source).unwrap();
     assert_eq!(fs::read(&hard_link).unwrap(), b"updated");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(fs::metadata(&hard_link).unwrap().nlink(), 1);
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        windows_link_count(&File::open(&hard_link).unwrap()).unwrap(),
+        1
+    );
     fs::remove_file(&hard_link).unwrap();
 
     #[cfg(unix)]
@@ -352,6 +397,18 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
             fs::read_link(&symbolic).unwrap(),
             Path::new("contract-regular.bin")
         );
+        assert!(
+            symlink(
+                "../contract-outside.txt",
+                root.join("contract-escape-link.txt")
+            )
+            .is_err(),
+            "a mounted symlink must not escape the workspace root"
+        );
+        assert!(
+            symlink("/etc/passwd", root.join("contract-absolute-link.txt")).is_err(),
+            "a mounted symlink must not target the host namespace"
+        );
     }
 
     #[cfg(windows)]
@@ -362,6 +419,22 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
         assert_eq!(
             fs::read_link(&symbolic).unwrap(),
             Path::new("contract-regular.bin")
+        );
+        assert!(
+            symlink_file(
+                r"..\contract-outside.txt",
+                root.join("contract-escape-link.txt")
+            )
+            .is_err(),
+            "a mounted symlink must not escape the workspace root"
+        );
+        assert!(
+            symlink_file(
+                r"C:\Windows\System32",
+                root.join("contract-absolute-link.txt")
+            )
+            .is_err(),
+            "a mounted symlink must not target the host namespace"
         );
     }
 }
