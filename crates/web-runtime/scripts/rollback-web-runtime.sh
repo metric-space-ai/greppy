@@ -28,7 +28,16 @@ for bin in web-runtime-supervisor web-controller-worker web-content-worker; do
   web_runtime_copy_regular_file "$dest/previous/$bin" "$staging/bin/$bin"
   web_runtime_copy_regular_file "$dest/bin/$bin" "$staging/previous/$bin"
 done
-for member in SHA256SUMS sbom.json provenance.json README.txt UNSIGNED LICENSE .greppy-web-runtime-dist; do
+bins="web-runtime-supervisor web-controller-worker web-content-worker"
+(
+  cd "$staging/bin"
+  if command -v shasum >/dev/null; then
+    shasum -a 256 $bins > ../SHA256SUMS
+  else
+    sha256sum $bins > ../SHA256SUMS
+  fi
+)
+for member in sbom.json provenance.json README.txt UNSIGNED LICENSE .greppy-web-runtime-dist; do
   if [ -L "$dest/$member" ]; then
     web_runtime_die "refusing symlink member: $dest/$member"
   fi

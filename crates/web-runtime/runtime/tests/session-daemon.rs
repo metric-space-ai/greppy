@@ -1403,6 +1403,12 @@ fn install_upgrade_rollback_roundtrip() {
     let after_rollback =
         std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
     assert_eq!(after_rollback, original, "rollback did not restore previous");
+    let sums = std::fs::read_to_string(installed.join("SHA256SUMS")).unwrap();
+    let restored_digest = web_runtime::artifacts::hex_sha256(&after_rollback);
+    assert!(
+        sums.contains(&restored_digest),
+        "rollback SHA256SUMS must match restored supervisor, sums={sums}"
+    );
     let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&installed));
     assert_eq!(
         code, 0,

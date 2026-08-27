@@ -41,8 +41,8 @@
   "entry_count": 1354,
   "status_counts": {
     "implemented": 347,
-    "unsupported": 492,
-    "unverified": 515
+    "unsupported": 501,
+    "unverified": 506
   },
   "entries": [
     {
@@ -9709,41 +9709,57 @@
       "symbol": "Coverage.reportAnonymousScripts",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.resetOnNavigation",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.source",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Coverage.text",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Credentials.create",
@@ -10658,11 +10674,15 @@
       "symbol": "Keyboard.delay",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Logger.isEnabled",
@@ -10782,41 +10802,57 @@
       "symbol": "Mouse.button",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Mouse.clickCount",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Mouse.delay",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Mouse.steps",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Accessing unimplemented members on keyboard/mouse/coverage throws unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Request.allHeaders",
@@ -16574,8 +16610,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 845,
-    "unsupported": 492,
+    "unverified": 836,
+    "unsupported": 501,
     "passing": 17
   }
 }

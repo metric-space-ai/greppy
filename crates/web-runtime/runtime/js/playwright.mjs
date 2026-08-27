@@ -1311,22 +1311,28 @@ class Page {
     this._pendingDialogs = [];
     this._mouseX = 0;
     this._mouseY = 0;
-    this.coverage = {
-      startJSCoverage: unsupported("Coverage.startJSCoverage"),
-      stopJSCoverage: unsupported("Coverage.stopJSCoverage"),
-      startCSSCoverage: unsupported("Coverage.startCSSCoverage"),
-      stopCSSCoverage: unsupported("Coverage.stopCSSCoverage"),
-    };
+    this.coverage = withUnsupported(
+      {
+        startJSCoverage: unsupported("Coverage.startJSCoverage"),
+        stopJSCoverage: unsupported("Coverage.stopJSCoverage"),
+        startCSSCoverage: unsupported("Coverage.startCSSCoverage"),
+        stopCSSCoverage: unsupported("Coverage.stopCSSCoverage"),
+      },
+      "Coverage",
+    );
     this.request = withUnsupported({}, "APIRequestContext");
     this.screencast = withUnsupported({}, "Screencast");
     this.localStorage = withUnsupported({}, "WebStorage");
     this.sessionStorage = withUnsupported({}, "WebStorage");
-    this.touchscreen = {
-      tap: async (x, y) => {
-        await engineCall("page.touch.tap", { page: this._id, x, y });
+    this.touchscreen = withUnsupported(
+      {
+        tap: async (x, y) => {
+          await engineCall("page.touch.tap", { page: this._id, x, y });
+        },
       },
-    };
-    this.mouse = {
+      "Touchscreen",
+    );
+    this.mouse = withUnsupported({
       click: async (x, y) => {
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
@@ -1382,7 +1388,7 @@ class Page {
           y: this._mouseY,
         });
       },
-    };
+    }, "Mouse");
     return withUnsupported(this, "Page");
   }
 
@@ -2409,7 +2415,7 @@ class Page {
     }
   }
 
-  keyboard = {
+  keyboard = withUnsupported({
     type: async (text) => {
       await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
     },
@@ -2425,7 +2431,7 @@ class Page {
     insertText: async (text) => {
       await engineCall("page.keyboard.insertText", { page: this._id, text: String(text) });
     },
-  };
+  }, "Keyboard");
 
   async addInitScript(script) {
     const source =
