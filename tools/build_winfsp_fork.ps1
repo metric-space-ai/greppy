@@ -94,13 +94,14 @@ foreach ($project in $projects) {
     $projectPath = Join-Path $solutionRoot $project
     $arguments = @(
         'call', ('"' + $developerShell + '"'), '-arch=x64', '-host_arch=x64', '>', 'nul', '&&',
+        'set', ('"WindowsSdkDir=' + $wdkContentRoot + '\"'), '&&',
+        'set', ('"WindowsSdkDir_10=' + $wdkContentRoot + '\"'), '&&',
+        'set', ('"WDKContentRoot=' + $wdkContentRoot + '\"'), '&&',
+        'set', ('"UCRTContentRoot=' + $wdkContentRoot + '\"'), '&&',
+        'set', '"WDK_NuGet=true"', '&&',
         'msbuild', ('"' + $projectPath + '"'), '/m', '/nologo', '/verbosity:minimal',
         '/p:Configuration=Release', '/p:Platform=x64', "/p:MyTargetPlatformVersion=$sdkVersion",
         '/p:MyNtddiVersion=0x0A000006', '/p:MyWin32Version=0x0A00',
-        ('/p:WindowsSdkDir="' + $wdkContentRoot + '\"'),
-        ('/p:WindowsSdkDir_10="' + $wdkContentRoot + '\"'),
-        ('/p:WDKContentRoot="' + $wdkContentRoot + '\"'),
-        ('/p:UCRTContentRoot="' + $wdkContentRoot + '\"'),
         '/p:WDK_NuGet=true'
     )
     & cmd.exe /D /S /C ($arguments -join ' ')
