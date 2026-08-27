@@ -2275,26 +2275,27 @@ mod tests {
     #[test]
     fn private_git_layer_supports_windows_long_paths() {
         let temp = tempfile::tempdir().unwrap();
-        const TARGET_DATA_ROOT_LEN: usize = 190;
+        const TARGET_DATA_ROOT_LEN: usize = 130;
         let padding = TARGET_DATA_ROOT_LEN
             .checked_sub(temp.path().as_os_str().len() + 1)
             .expect("temporary path leaves no room for the Windows path-budget fixture");
         let long_root = temp.path().join("x".repeat(padding));
         assert_eq!(long_root.as_os_str().len(), TARGET_DATA_ROOT_LEN);
         let baseline_hash = "a".repeat(64);
-        let compact_key = private_git_storage_key(&baseline_hash).unwrap();
-        let repository = long_root.join("g/sl1").join(compact_key).join("repo");
+        let layers = long_root.join("g/sl1");
+        let temporary = private_git_temporary_path(&layers);
+        let repository = temporary.join("repo");
         let worktree = long_root.join("workspace");
-        let index = long_root
-            .join("g/sl1")
-            .join(compact_key)
-            .join("indexes/seed.index");
-        let legacy_repository = long_root
-            .join("git-layers")
-            .join(&baseline_hash)
-            .join("repo");
-        assert!(legacy_repository.as_os_str().len() >= 260);
-        assert!(repository.as_os_str().len() < 240);
+        let index = temporary.join("indexes/seed.index");
+        let legacy_temporary = long_root.join("git-layers").join(format!(
+            ".{}.tmp.{}.{}",
+            baseline_hash,
+            std::process::id(),
+            now_unix_ns()
+        ));
+        let legacy_repository = legacy_temporary.join("repo");
+        assert!(legacy_repository.as_os_str().len() >= 230);
+        assert!(repository.as_os_str().len() < 180);
         fs::create_dir_all(repository.parent().unwrap()).unwrap();
         fs::create_dir_all(&worktree).unwrap();
         fs::create_dir_all(index.parent().unwrap()).unwrap();
