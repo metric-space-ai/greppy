@@ -449,6 +449,14 @@ to a large file creates only the affected chunk plus metadata; it never copies
 the complete file. Ignored files and build caches are excluded from the dirty
 snapshot.
 
+The exclusive recovery opener checks both SQLite databases mechanically before
+marking the provider healthy. Proposal publication and `agent apply` share an
+OS-backed repository lease and fsync-bound journals: a real process crash is
+rolled back or completed before another agent starts, while a still-live owner
+is never rolled back underneath its operation. Foreign, symlinked, or
+metadata-mismatched recovery journals fail closed before touching Git or the
+working tree.
+
 The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3 and a macOS
 15+ FSKit app extension. The Windows core also compiles and passes its direct
 contract, but the release remains blocked: official unchanged WinFsp 2.1

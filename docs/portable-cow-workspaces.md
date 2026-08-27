@@ -46,6 +46,10 @@ second mount or traverse and copy the repository.
   most one new data chunk plus metadata.
 - Garbage collection removes only unreferenced chunks and fully recovered
   orphan workspaces. Live workspaces and proposal-pinned baselines are roots.
+- The first exclusive opener runs SQLite `quick_check` plus foreign-key checks
+  over namespace and chunk metadata before recovery. A logically corrupt
+  database remains unavailable; Greppy does not mark it healthy or start an
+  agent merely because SQLite can parse its header.
 
 The initial namespace is two immutable layers: the tree at a pinned commit and
 a dirty snapshot containing staged, unstaged, deleted, and untracked paths.
@@ -89,6 +93,16 @@ the current Git index unchanged, transfers only the agent delta, and uses a
 backup plus recovery journal. A crash is recovered or reported before another
 agent can start. Ordinary `git cherry-pick` is not a safe apply mechanism for
 dirty-based proposals.
+
+Proposal publication, apply, and both recovery paths share one OS-backed
+exclusive lease per canonical repository. Publication journals couple the
+baseline ref, pinned Core proposal, and public proposal ref; apply journals
+couple the exact initial snapshot to every affected path. Journals and their
+directories are synced before visible changes. The kernel releases the lease
+after a process crash. If the lease is still held, recovery treats the
+operation as active and fails closed instead of rolling it back underneath the
+owner. A journal that is a symlink, names another repository, or disagrees with
+the Core metadata is rejected before Git or filesystem restoration begins.
 
 `--keep-worktree` retains the namespace, provider data, and proposal pins for
 diagnosis. Normal cleanup removes the private namespace and delta; proposal

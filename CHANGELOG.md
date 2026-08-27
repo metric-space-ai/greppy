@@ -47,6 +47,15 @@ baseline hash, preserves the existing Git index, applies only the agent delta,
 and journals backup/recovery state. Ordinary cherry-pick is not advertised as
 safe for dirty-based proposals.
 
+Proposal publication and apply now use a shared, OS-backed exclusive lease per
+canonical repository. Fsync-bound publication journals recover an interruption
+between baseline ref, pinned proposal metadata, and the public proposal ref;
+apply journals recover a process death after visible path materialization while
+leaving the Git index byte-identical. Active operations are never mistaken for
+crashes, and symlinked, foreign-repository, or metadata-mismatched journals fail
+closed. The exclusive recovery opener also runs SQLite quick and foreign-key
+checks over namespace and chunk metadata before restoring a healthy marker.
+
 Agent Base prewarming is now fail-closed as well: a graph, embedding, summary,
 manifest, or publication failure aborts `index --agent-worktree` and `greppy
 -p` before the first model call instead of silently switching to a private
