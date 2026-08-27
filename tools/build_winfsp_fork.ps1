@@ -50,10 +50,28 @@ if ($difference.Count -ne 0) {
 & git -C $Destination diff --check
 if ($LASTEXITCODE -ne 0) { throw 'patched WinFsp source fails git diff --check' }
 
-$sdkVersion = '10.0.19041.0'
-$sdkInclude = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\$sdkVersion"
-if (-not (Test-Path -LiteralPath $sdkInclude -PathType Container)) {
-    throw "required Windows SDK is absent: $sdkInclude"
+$wdkVersion = '10.0.26100.6584'
+$sdkVersion = '10.0.26100.0'
+$wdkPackageSha256 = 'c393d03dfb640b5c92f546b32f6770ef68cd3aaf691956e7d66d8e2c28a1b55e'
+$wdkPackage = Join-Path (Split-Path -Parent $Destination) "microsoft.windows.wdk.x64.$wdkVersion.nupkg"
+$wdkRoot = Join-Path (Split-Path -Parent $Destination) "microsoft.windows.wdk.x64.$wdkVersion"
+if ((Test-Path -LiteralPath $wdkPackage) -or (Test-Path -LiteralPath $wdkRoot)) {
+    throw 'refusing to reuse an existing WDK package or extraction directory'
+}
+$wdkUri = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/$wdkVersion/microsoft.windows.wdk.x64.$wdkVersion.nupkg"
+Invoke-WebRequest -Uri $wdkUri -OutFile $wdkPackage
+$actualWdkHash = (Get-FileHash -LiteralPath $wdkPackage -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actualWdkHash -ne $wdkPackageSha256) {
+    throw "WDK NuGet package checksum mismatch: $actualWdkHash"
+}
+$nuget = (Get-Command nuget.exe -ErrorAction Stop).Source
+& $nuget verify -Signatures $wdkPackage
+if ($LASTEXITCODE -ne 0) { throw 'WDK NuGet signature verification failed' }
+[System.IO.Compression.ZipFile]::ExtractToDirectory($wdkPackage, $wdkRoot)
+$wdkContentRoot = Join-Path $wdkRoot 'c'
+$ntifs = Join-Path $wdkContentRoot "Include\$sdkVersion\km\ntifs.h"
+if (-not (Test-Path -LiteralPath $ntifs -PathType Leaf)) {
+    throw "pinned WDK package lacks ntifs.h: $ntifs"
 }
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
@@ -78,7 +96,12 @@ foreach ($project in $projects) {
         'call', ('"' + $developerShell + '"'), '-arch=x64', '-host_arch=x64', '>', 'nul', '&&',
         'msbuild', ('"' + $projectPath + '"'), '/m', '/nologo', '/verbosity:minimal',
         '/p:Configuration=Release', '/p:Platform=x64', "/p:MyTargetPlatformVersion=$sdkVersion",
-        '/p:MyNtddiVersion=0x0A000006', '/p:MyWin32Version=0x0A00'
+        '/p:MyNtddiVersion=0x0A000006', '/p:MyWin32Version=0x0A00',
+        ('/p:WindowsSdkDir="' + $wdkContentRoot + '\"'),
+        ('/p:WindowsSdkDir_10="' + $wdkContentRoot + '\"'),
+        ('/p:WDKContentRoot="' + $wdkContentRoot + '\"'),
+        ('/p:UCRTContentRoot="' + $wdkContentRoot + '\"'),
+        '/p:WDK_NuGet=true'
     )
     & cmd.exe /D /S /C ($arguments -join ' ')
     if ($LASTEXITCODE -ne 0) { throw "WinFsp project build failed: $project" }
