@@ -66,7 +66,12 @@ install -m 0644 \
   "$STAGING_ROOT/usr/share/doc/greppy/"
 install -m 0644 "$repository_root/LICENSE" \
   "$STAGING_ROOT/usr/share/licenses/greppy/LICENSE"
-cp -a "$repository_root/licenses/." "$STAGING_ROOT/usr/share/licenses/greppy/"
+for license_path in "$repository_root"/licenses/*; do
+  case "$(basename "$license_path")" in
+    WINFSP-*|RIFT-*) continue ;;
+  esac
+  install -m 0644 "$license_path" "$STAGING_ROOT/usr/share/licenses/greppy/"
+done
 
 "$STAGING_ROOT/usr/lib/greppy/bin/greppy" --version | grep -Fx "greppy $VERSION" >/dev/null || {
   echo "greppy version does not match package version $VERSION" >&2

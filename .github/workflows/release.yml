@@ -551,6 +551,8 @@ jobs:
           rpm_bin="$clean/rpm/usr/lib/greppy/bin"
           deb_licenses="$clean/deb/usr/share/licenses/greppy"
           test ! -e "$clean/deb/usr/bin/grep"
+          test ! -e "$deb_licenses/WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt"
+          ! compgen -G "$deb_licenses/RIFT-*" >/dev/null
           test -x "$deb_bin/greppy-workspace-provider"
           test -x "$rpm_bin/greppy-workspace-provider"
           cmp "$deb_bin/greppy" "$rpm_bin/greppy"

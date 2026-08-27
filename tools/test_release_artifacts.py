@@ -269,6 +269,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("platform/linux/build-packages.sh", workflow)
         self.assertNotIn("greppy-linux-x86_64.tar.gz", workflow)
         self.assertIn("greppy-workspace-provider.exe", workflow)
+        linux_packager = (
+            REPOSITORY_ROOT / "platform/linux/build-packages.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("WINFSP-*|RIFT-*", linux_packager)
         self.assertNotIn("RIFT-MIT", workflow)
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
