@@ -495,6 +495,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("agent benchmark, and the summary-quality gate", readme)
         self.assertNotIn("navigation benchmark is a hard", security)
         self.assertIn("never gate publication", security)
+        self.assertNotIn("`--workspace-backend auto`", security)
+        self.assertNotIn("unless `--fresh` is selected", security)
+        self.assertNotIn("falls back to a full private Store", security)
+        self.assertIn("has no Rift, reflink, native snapshot, or Git-", security)
+        self.assertIn("it never selects another\nworkspace backend", security)
         self.assertIn("Developer-ID provisioning profile", readme)
         self.assertIn(
             "ai.metricspace.greppy.workspacefs.extension", portable_docs

@@ -160,30 +160,36 @@ repository contents require additional at-rest protection. Use `greppy cache
 status --json` to audit stored paths and `greppy cache clear --root DIR --yes`
 or `greppy cache clear --all --yes` to remove managed data.
 
-Integrated agents in 0.3.2 reuse a content-identified Base Store containing
-source-derived graph rows, indexed spans, summaries, and embeddings. The Base is
-published atomically, verified against a complete identity manifest, opened
-read-only, and excluded from the agent's writable sandbox roots. Every run writes
-only to its private Delta Store. A shared Base is therefore a local
-confidentiality boundary, not a sanitised artifact: place `GREPPY_STORE_DIR` on
-storage with protection equivalent to the repository. On ephemeral or encrypted
-workstations, keep the Base cache on the same class of volume and clear it with
-the cache commands above before decommissioning the environment.
+Portable agents reuse two different content-identified bases. The graph Base
+Store contains source-derived graph rows, indexed spans, summaries, and
+embeddings. The workspace RepositoryBase and DirtyBaseline contain the pinned
+Git tree plus the captured staged, unstaged, deleted, and untracked state. Both
+are published atomically, verified against complete identity manifests, opened
+read-only, and excluded from the agent's writable sandbox roots. Ignored files
+and build caches are never captured. Every run writes only to its private
+workspace namespace, private Git state, graph Delta Store, and recovery journal.
+These shared bases are local confidentiality boundaries, not sanitised
+artifacts: place `GREPPY_STORE_DIR` and the workspace data root on storage with
+protection equivalent to the repository.
 
-Base corruption or incompatibility is fail-closed: Greppy quarantines an invalid
-generation and rebuilds it under an exclusive lease; if a complete Base cannot be
-prepared, that agent run falls back to a full private Store and reports the
-reason. Cache reclamation validates Greppy ownership markers and holds the same
-lifecycle lock used by live readers, so it cannot evict a Base in use or traverse
-unmanaged directories.
+Base corruption, incomplete publication, provider failure, and identity
+incompatibility are fail-closed. Greppy quarantines invalid graph generations
+and rebuilds them under an exclusive lease, but an agent does not automatically
+substitute a private graph store after a Base-preparation error. The explicit
+`--private-store` option changes graph-index isolation only; it does not bypass
+the portable workspace provider or any provider-health gate. Cache reclamation
+validates Greppy ownership markers and holds the same lifecycle locks used by
+live readers, so it cannot evict an in-use base or traverse unmanaged
+directories.
 
-The 0.3.3 Filesystem-CoW candidate additionally snapshots the working tree and,
-unless `--fresh` is selected, retained ignored build caches. Protect snapshot
-storage at the same level as the repository. Snapshot creation is serialized
-only while preparing the stable template; each run then replaces the linked
-Git control file with a private Git directory and verifies a clean pinned base.
-Identity, containment, and type checks run again before proposal publication
-and cleanup. A suspected rewrite or symlink attack fails closed and preserves
-the workspace for diagnosis. `--workspace-backend auto` may fall back before
-model startup to the unchanged native Git-worktree backend; forced `cow` never
-silently falls back.
+The portable 0.3.4 workspace has no Rift, reflink, native snapshot, or Git-
+worktree fallback. Chunk data is stored in append-only segments; SQLite-WAL
+manifests bind chunks, metadata, tombstones, redirects, namespaces, and recovery
+state. Private Git directories, indexes, refs, locks, and new objects stay
+outside the content mount. Snapshot creation double-captures HEAD, index,
+status, affected content, and metadata and fails closed if they do not remain
+stable. Identity, containment, symlink-escape, type, and baseline checks run
+again before proposal publication, apply, garbage collection, and cleanup. A
+suspected rewrite, traversal, mount substitution, or incomplete journal blocks
+new agents and preserves recoverable evidence; it never selects another
+workspace backend.
