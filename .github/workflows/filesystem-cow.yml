@@ -66,7 +66,10 @@ jobs:
           cargo test -p greppy-workspace-ffi --locked
 
       - name: Compile shared provider binary surface
-        run: cargo check -p greppy-workspace-provider --locked
+        run: |
+          cargo check -p greppy-workspace-provider --locked
+          cargo test -p greppy-workspace-provider \
+            --test mounted_contract_compile --no-run --locked
 
       - name: Build and validate macOS 15.4 FSKit application bundle
         if: runner.os == 'macOS'
