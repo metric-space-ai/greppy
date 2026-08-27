@@ -330,6 +330,19 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("greppy-agent-benchmark", workflow)
         self.assertIn("greppy-macos-arm64.pkg", workflow)
         self.assertIn("platform/macos/build-fskit-pkg.sh", workflow)
+        application_import = workflow.index("Import macOS application identity")
+        application_notarize = workflow.index(
+            "Notarize and staple macOS FSKit application"
+        )
+        dry_run_upload = workflow.index(
+            "Upload notarized macOS FSKit application for signed dry-run activation"
+        )
+        installer_import = workflow.index("Import macOS installer identity")
+        package_macos = workflow.index("Package (macOS)")
+        self.assertLess(application_import, application_notarize)
+        self.assertLess(application_notarize, dry_run_upload)
+        self.assertLess(dry_run_upload, installer_import)
+        self.assertLess(installer_import, package_macos)
         self.assertIn('xcrun stapler staple "${{ matrix.asset }}"', workflow)
         self.assertIn('spctl --assess --type install', workflow)
         self.assertNotIn("greppy-macos-arm64.tar.gz", workflow)
