@@ -3644,3 +3644,46 @@ fn controller_memory_limit_is_enforced_by_supervisor() {
         "{read:?}"
     );
 }
+
+#[test]
+fn controller_cpu_limit_is_enforced_by_supervisor() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-ctlcpu-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_ctlcpu", |command| {
+        command.env("GREPPY_WEB_CONTROLLER_CPU_MS", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_ctlcpu",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>ctlcpu</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_ctlcpu",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error.as_ref().unwrap().message.contains("cpu time"),
+        "{read:?}"
+    );
+}
+
