@@ -27,7 +27,7 @@ fuser = { version = "0.18", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 filetime = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_LibraryLoader"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 greppy-agent = { path = "../agent" }

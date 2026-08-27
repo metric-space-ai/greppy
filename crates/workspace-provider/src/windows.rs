@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
@@ -183,6 +184,7 @@ impl WindowsProvider {
             return Ok(0);
         };
         let workspace = self.workspace(&workspace)?;
+        let path = self.existing_workspace_path(&workspace, &path)?;
         let file = if read_only {
             self.core.open_file_read_only(&workspace, path)
         } else {
@@ -212,17 +214,25 @@ impl WindowsProvider {
         if components.iter().any(|part| matches!(*part, "." | "..")) {
             return Err(-EINVAL);
         }
+        if components.is_empty() {
+            return Ok(VirtualPath::Root);
+        }
+        if components.len() == 1 && windows_names_equal(components[0], ".greppy-provider.json") {
+            return Ok(VirtualPath::Marker);
+        }
+        if windows_names_equal(components[0], "doctor") {
+            return Ok(VirtualPath::Doctor(components[1..].join("/")));
+        }
+        if !windows_names_equal(components[0], "workspaces") {
+            return Err(-ENOENT);
+        }
         match components.as_slice() {
-            [] => Ok(VirtualPath::Root),
-            [".greppy-provider.json"] => Ok(VirtualPath::Marker),
-            ["doctor"] => Ok(VirtualPath::Doctor(String::new())),
-            ["doctor", rest @ ..] => Ok(VirtualPath::Doctor(rest.join("/"))),
-            ["workspaces"] => Ok(VirtualPath::Workspaces),
-            ["workspaces", workspace] => {
+            [_] => Ok(VirtualPath::Workspaces),
+            [_, workspace] => {
                 validate_identifier(workspace)?;
                 Ok(VirtualPath::WorkspaceRoot((*workspace).into()))
             }
-            ["workspaces", workspace, rest @ ..] => {
+            [_, workspace, rest @ ..] => {
                 validate_identifier(workspace)?;
                 Ok(VirtualPath::WorkspacePath {
                     workspace: (*workspace).into(),
@@ -259,6 +269,7 @@ impl WindowsProvider {
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = self.workspace(&workspace)?;
+                let path = self.existing_workspace_path(&handle, &path)?;
                 self.core
                     .metadata(&handle, &path)
                     .map_err(core_errno)?
@@ -290,7 +301,9 @@ impl WindowsProvider {
                 .collect(),
             VirtualPath::WorkspaceRoot(workspace) => self.workspace_entries(&workspace, ""),
             VirtualPath::WorkspacePath { workspace, path } => {
-                self.workspace_entries(&workspace, &path)
+                let handle = self.workspace(&workspace)?;
+                let path = self.existing_workspace_path(&handle, &path)?;
+                self.workspace_entries_from_handle(&handle, &path)
             }
             VirtualPath::Doctor(relative) => fs::read_dir(self.doctor_path(&relative)?)
                 .map_err(io_errno)?
@@ -310,8 +323,16 @@ impl WindowsProvider {
         parent: &str,
     ) -> Result<Vec<(String, GreppyWindowsStat)>, c_int> {
         let handle = self.workspace(workspace)?;
+        self.workspace_entries_from_handle(&handle, parent)
+    }
+
+    fn workspace_entries_from_handle(
+        &self,
+        handle: &WorkspaceHandle,
+        parent: &str,
+    ) -> Result<Vec<(String, GreppyWindowsStat)>, c_int> {
         self.core
-            .read_dir(&handle, parent)
+            .read_dir(handle, parent)
             .map_err(core_errno)?
             .into_iter()
             .map(|entry| Ok((entry.name, portable_metadata(entry.metadata))))
@@ -319,7 +340,117 @@ impl WindowsProvider {
     }
 
     fn workspace(&self, id: &str) -> Result<WorkspaceHandle, c_int> {
-        self.core.open_workspace(id).map_err(core_errno)
+        match self.core.open_workspace(id) {
+            Ok(handle) => Ok(handle),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let actual = self
+                    .core
+                    .list_workspaces()
+                    .map_err(core_errno)?
+                    .into_iter()
+                    .find(|workspace| windows_names_equal(&workspace.id, id))
+                    .map(|workspace| workspace.id)
+                    .ok_or(-ENOENT)?;
+                self.core.open_workspace(&actual).map_err(core_errno)
+            }
+            Err(error) => Err(core_errno(error)),
+        }
+    }
+
+    fn existing_workspace_path(
+        &self,
+        workspace: &WorkspaceHandle,
+        requested: &str,
+    ) -> Result<String, c_int> {
+        let mut resolved = String::new();
+        for component in requested
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            let entry = self
+                .core
+                .read_dir(workspace, &resolved)
+                .map_err(core_errno)?
+                .into_iter()
+                .find(|entry| windows_names_equal(&entry.name, component))
+                .ok_or(-ENOENT)?;
+            if !resolved.is_empty() {
+                resolved.push('/');
+            }
+            resolved.push_str(&entry.name);
+        }
+        Ok(resolved)
+    }
+
+    fn new_workspace_path(
+        &self,
+        workspace: &WorkspaceHandle,
+        requested: &str,
+    ) -> Result<String, c_int> {
+        let (parent, name) = requested.rsplit_once('/').unwrap_or(("", requested));
+        if name.is_empty() {
+            return Err(-EINVAL);
+        }
+        let parent = self.existing_workspace_path(workspace, parent)?;
+        if self
+            .core
+            .read_dir(workspace, &parent)
+            .map_err(core_errno)?
+            .into_iter()
+            .any(|entry| windows_names_equal(&entry.name, name))
+        {
+            return Err(-EEXIST);
+        }
+        Ok(if parent.is_empty() {
+            name.into()
+        } else {
+            format!("{parent}/{name}")
+        })
+    }
+
+    fn rename_destination_path(
+        &self,
+        workspace: &WorkspaceHandle,
+        requested: &str,
+        source: &str,
+        no_replace: bool,
+    ) -> Result<String, c_int> {
+        let (parent, name) = requested.rsplit_once('/').unwrap_or(("", requested));
+        if name.is_empty() {
+            return Err(-EINVAL);
+        }
+        let parent = self.existing_workspace_path(workspace, parent)?;
+        let existing = self
+            .core
+            .read_dir(workspace, &parent)
+            .map_err(core_errno)?
+            .into_iter()
+            .find(|entry| windows_names_equal(&entry.name, name))
+            .map(|entry| {
+                if parent.is_empty() {
+                    entry.name
+                } else {
+                    format!("{parent}/{}", entry.name)
+                }
+            });
+        if let Some(existing) = existing {
+            if existing == source {
+                return Ok(if parent.is_empty() {
+                    name.into()
+                } else {
+                    format!("{parent}/{name}")
+                });
+            }
+            if no_replace {
+                return Err(-EEXIST);
+            }
+            return Ok(existing);
+        }
+        Ok(if parent.is_empty() {
+            name.into()
+        } else {
+            format!("{parent}/{name}")
+        })
     }
 
     fn doctor_path(&self, relative: &str) -> Result<PathBuf, c_int> {
@@ -538,6 +669,7 @@ unsafe extern "C" fn greppy_windows_create(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.new_workspace_path(&handle, &path)?;
                 if directory != 0 {
                     provider
                         .core
@@ -574,6 +706,7 @@ unsafe extern "C" fn greppy_windows_unlink(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 let metadata = provider
                     .core
                     .metadata(&handle, &path)
@@ -625,17 +758,15 @@ unsafe extern "C" fn greppy_windows_rename(
                     workspace: destination_workspace,
                     path: destination,
                 },
-            ) if workspace == destination_workspace => {
+            ) if windows_names_equal(&workspace, &destination_workspace) => {
                 let handle = provider.workspace(&workspace)?;
-                if flags & RENAME_NOREPLACE != 0
-                    && provider
-                        .core
-                        .metadata(&handle, &destination)
-                        .map_err(core_errno)?
-                        .is_some()
-                {
-                    return Err(-EEXIST);
-                }
+                let path = provider.existing_workspace_path(&handle, &path)?;
+                let destination = provider.rename_destination_path(
+                    &handle,
+                    &destination,
+                    &path,
+                    flags & RENAME_NOREPLACE != 0,
+                )?;
                 provider
                     .core
                     .rename(&handle, &path, &destination)
@@ -664,6 +795,7 @@ unsafe extern "C" fn greppy_windows_chmod(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .set_metadata(&handle, &path, Some(mode), None, None)
@@ -692,6 +824,7 @@ unsafe extern "C" fn greppy_windows_truncate(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .truncate(&handle, &path, size)
@@ -727,6 +860,7 @@ unsafe extern "C" fn greppy_windows_read(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .read(&handle, &path, offset, capacity)
@@ -771,6 +905,7 @@ unsafe extern "C" fn greppy_windows_write(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .write(&handle, &path, offset, bytes)
@@ -804,6 +939,7 @@ unsafe extern "C" fn greppy_windows_symlink(
         }
         Ok(VirtualPath::WorkspacePath { workspace, path }) => {
             provider.workspace(&workspace).and_then(|handle| {
+                let path = provider.new_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .symlink(&handle, &path, target.as_bytes())
@@ -843,8 +979,10 @@ unsafe extern "C" fn greppy_windows_hardlink(
                 workspace: destination_workspace,
                 path: destination,
             }),
-        ) if workspace == destination_workspace => {
+        ) if windows_names_equal(&workspace, &destination_workspace) => {
             provider.workspace(&workspace).and_then(|handle| {
+                let path = provider.existing_workspace_path(&handle, &path)?;
+                let destination = provider.new_workspace_path(&handle, &destination)?;
                 provider
                     .core
                     .hard_link(&handle, &path, &destination)
@@ -875,6 +1013,7 @@ unsafe extern "C" fn greppy_windows_readlink(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .read_symlink(&handle, &path)
@@ -915,6 +1054,7 @@ unsafe extern "C" fn greppy_windows_set_times(
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = provider.workspace(&workspace)?;
+                let path = provider.existing_workspace_path(&handle, &path)?;
                 provider
                     .core
                     .set_metadata(&handle, &path, None, Some(accessed), Some(modified))
@@ -953,6 +1093,20 @@ fn required_str<'a>(value: *const c_char) -> Result<&'a str, ()> {
         return Err(());
     }
     unsafe { CStr::from_ptr(value) }.to_str().map_err(|_| ())
+}
+
+fn windows_names_equal(left: &str, right: &str) -> bool {
+    let left = left.encode_utf16().collect::<Vec<_>>();
+    let right = right.encode_utf16().collect::<Vec<_>>();
+    let Ok(left_len) = i32::try_from(left.len()) else {
+        return false;
+    };
+    let Ok(right_len) = i32::try_from(right.len()) else {
+        return false;
+    };
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    }
 }
 
 fn validate_identifier(value: &str) -> Result<(), c_int> {

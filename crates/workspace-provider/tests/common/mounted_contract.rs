@@ -376,6 +376,13 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
             .open(&uppercase)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let renamed_case = root.join("Contract-Case.txt");
+        fs::rename(&lowercase, &renamed_case).unwrap();
+        assert_eq!(fs::read(&uppercase).unwrap(), b"lowercase");
+        assert!(fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .any(|name| name == "Contract-Case.txt"));
     }
 
     let link_source = root.join("contract-link-source.txt");

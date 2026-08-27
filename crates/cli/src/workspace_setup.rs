@@ -136,8 +136,6 @@ fn render_macos_launch_agent(cli: &Path, data_root: &Path) -> Result<String, Str
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_write_autostart(path: &Path, contents: &str) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let parent = path
         .parent()
         .ok_or_else(|| format!("autostart path has no parent: {}", path.display()))?;
@@ -145,31 +143,34 @@ fn atomic_write_autostart(path: &Path, contents: &str) -> Result<(), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("autostart filename is not UTF-8: {}", path.display()))?;
-    let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(&temporary)
-        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
-    let result = (|| {
-        file.write_all(contents.as_bytes())
-            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
-        file.sync_all()
-            .map_err(|error| format!("cannot sync {}: {error}", temporary.display()))?;
-        drop(file);
-        fs::rename(&temporary, path).map_err(|error| {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| {
             format!(
-                "cannot atomically publish {} as {}: {error}",
-                temporary.display(),
-                path.display()
+                "cannot create temporary file in {}: {error}",
+                parent.display()
             )
-        })
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+        })?;
+    temporary.write_all(contents.as_bytes()).map_err(|error| {
+        format!(
+            "cannot write temporary file for {}: {error}",
+            path.display()
+        )
+    })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("cannot sync temporary file for {}: {error}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        format!(
+            "cannot atomically publish autostart file {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -512,6 +513,10 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+
+        fs::write(root.path().join(".autostart.stale.tmp"), "stale").unwrap();
+        atomic_write_autostart(&target, "updated").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "updated");
     }
 
     #[cfg(target_os = "linux")]
