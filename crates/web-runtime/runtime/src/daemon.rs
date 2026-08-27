@@ -11,6 +11,7 @@ use greppy_web_client::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +32,9 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     let _ = std::fs::remove_file(&config.socket);
     let mut daemon = Daemon::start(config)?;
     let listener = UnixListener::bind(&daemon.socket)?;
+    let mut permissions = std::fs::metadata(&daemon.socket)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&daemon.socket, permissions)?;
     // A closed probe connection or a single malformed client must not take
     // down the supervisor; leftover-worker flakes showed up as "socket never
     // created" when this loop exited.

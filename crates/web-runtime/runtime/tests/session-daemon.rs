@@ -2665,6 +2665,9 @@ fn web_doctor_reports_process_health() {
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_doctor", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&socket).unwrap().permissions())
+        & 0o777;
+    assert_eq!(mode, 0o600, "supervisor socket must be owner-only, got {mode:o}");
     let doctor = unix_request(
         &socket,
         &Request::new("run_doctor", "web.doctor", json!({})),
