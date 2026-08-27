@@ -12,6 +12,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
         .env_remove("GREPPY_WEB_RUNTIME_SUPERVISOR")
         .env_remove("GREPPY_WEB_CONTROLLER_WORKER")
         .env_remove("GREPPY_WEB_CONTENT_WORKER")
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
         .env("PATH", "/usr/bin:/bin")
         .output()
         .expect("greppy web");

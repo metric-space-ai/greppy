@@ -128,17 +128,8 @@ fn status(json: bool, root: Option<&str>) -> Result<i32> {
 }
 
 fn doctor(json: bool, root: Option<&str>) -> Result<i32> {
-    let supervisor = find_binary("web-runtime-supervisor");
-    let controller = find_binary("web-controller-worker");
-    let content = find_binary("web-content-worker");
-    let bins_ok = [&supervisor, &controller, &content]
-        .into_iter()
-        .all(|path| path.as_ref().is_some_and(|path| path.exists()));
-    if !bins_ok {
-        return emit_error(
-            json,
-            unavailable("web-runtime binaries are not installed next to greppy"),
-        );
+    if let Err(error) = resolve_runtime() {
+        return emit_error(json, error);
     }
     match ensure_supervisor(root) {
         Ok(ctx) => rpc_on(&ctx, json, "web.doctor", json!({}), None),
@@ -257,17 +248,17 @@ fn rpc_on(
 }
 
 fn ensure_supervisor(root: Option<&str>) -> std::result::Result<SupervisorCtx, ErrorObject> {
-    let supervisor = find_binary("web-runtime-supervisor")
-        .ok_or_else(|| unavailable("web-runtime-supervisor is not installed"))?;
-    let controller = find_binary("web-controller-worker")
-        .ok_or_else(|| unavailable("web-controller-worker is not installed"))?;
-    let content = find_binary("web-content-worker")
-        .ok_or_else(|| unavailable("web-content-worker is not installed"))?;
+    let RuntimeImages {
+        dist,
+        supervisor,
+        controller,
+        content,
+    } = resolve_runtime()?;
     let run_id =
         std::env::var("GREPPY_RUN_ID").unwrap_or_else(|_| format!("run_{}", std::process::id()));
     #[cfg(not(unix))]
     {
-        let _ = (root, supervisor, controller, content, run_id);
+        let _ = (root, dist, supervisor, controller, content, run_id);
         return Err(unavailable("web runtime sockets require Unix"));
     }
     #[cfg(unix)]
@@ -289,11 +280,17 @@ fn ensure_supervisor(root: Option<&str>) -> std::result::Result<SupervisorCtx, E
                 .arg("--socket")
                 .arg(endpoint.address())
                 .arg("--run-id")
-                .arg(&run_id)
-                .arg("--controller-worker")
-                .arg(&controller)
-                .arg("--content-worker")
-                .arg(&content)
+                .arg(&run_id);
+            if let Some(dist) = &dist {
+                command.arg("--dist").arg(dist);
+            } else {
+                command
+                    .arg("--controller-worker")
+                    .arg(&controller)
+                    .arg("--content-worker")
+                    .arg(&content);
+            }
+            command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -393,7 +390,7 @@ fn unavailable(message: &str) -> ErrorObject {
         message,
         new_request_id(),
         EXIT_WEB_UNAVAILABLE,
-        "install web-runtime-supervisor, web-controller-worker, and web-content-worker",
+        "install the web-runtime distributable (three separately linked images)",
     )
 }
 
@@ -407,18 +404,89 @@ fn invalid(message: &str) -> ErrorObject {
     )
 }
 
+struct RuntimeImages {
+    dist: Option<PathBuf>,
+    supervisor: PathBuf,
+    controller: PathBuf,
+    content: PathBuf,
+}
+
+fn is_symlink(path: &std::path::Path) -> bool {
+    path.symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn resolve_runtime() -> std::result::Result<RuntimeImages, ErrorObject> {
+    if let Ok(dist) = std::env::var("GREPPY_WEB_RUNTIME_DIST") {
+        return images_from_dist(std::path::Path::new(&dist));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("web-runtime");
+            if sibling.join(".greppy-web-runtime-dist").is_file() {
+                return images_from_dist(&sibling);
+            }
+            if let Some(images) = images_from_bin_dir(dir, None) {
+                return Ok(images);
+            }
+        }
+    }
+    images_from_path_env().ok_or_else(|| unavailable("web-runtime distributable is not installed"))
+}
+
+fn images_from_dist(dist: &std::path::Path) -> std::result::Result<RuntimeImages, ErrorObject> {
+    if is_symlink(dist) {
+        return Err(unavailable("refusing symlink web-runtime dist"));
+    }
+    let stamp = dist.join(".greppy-web-runtime-dist");
+    if is_symlink(&stamp) || !stamp.is_file() {
+        return Err(unavailable(
+            "web-runtime dist is missing the .greppy-web-runtime-dist stamp",
+        ));
+    }
+    images_from_bin_dir(&dist.join("bin"), Some(dist.to_path_buf()))
+        .ok_or_else(|| unavailable("web-runtime dist is missing separately linked images"))
+}
+
+fn images_from_bin_dir(bin: &std::path::Path, dist: Option<PathBuf>) -> Option<RuntimeImages> {
+    let supervisor = bin.join("web-runtime-supervisor");
+    let controller = bin.join("web-controller-worker");
+    let content = bin.join("web-content-worker");
+    for path in [&supervisor, &controller, &content] {
+        if is_symlink(path) || !path.is_file() {
+            return None;
+        }
+    }
+    Some(RuntimeImages {
+        dist,
+        supervisor,
+        controller,
+        content,
+    })
+}
+
+fn images_from_path_env() -> Option<RuntimeImages> {
+    Some(RuntimeImages {
+        dist: None,
+        supervisor: find_binary("web-runtime-supervisor")?,
+        controller: find_binary("web-controller-worker")?,
+        content: find_binary("web-content-worker")?,
+    })
+}
+
 fn find_binary(name: &str) -> Option<PathBuf> {
     let env_name = format!("GREPPY_{}", name.to_uppercase().replace('-', "_"));
     if let Ok(path) = std::env::var(&env_name) {
         let path = PathBuf::from(path);
-        if path.is_file() {
+        if path.is_file() && !is_symlink(&path) {
             return Some(path);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            if candidate.is_file() && !is_symlink(&candidate) {
                 return Some(candidate);
             }
         }
@@ -426,7 +494,7 @@ fn find_binary(name: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            if candidate.is_file() && !is_symlink(&candidate) {
                 return Some(candidate);
             }
         }
@@ -491,5 +559,40 @@ mod tests {
     #[test]
     fn missing_named_binary_is_none() {
         assert!(find_binary("web-runtime-supervisor-missing-name").is_none());
+    }
+
+    #[test]
+    fn stamped_dist_resolves_three_separately_linked_images() {
+        let root = std::env::temp_dir().join(format!("greppy-web-cli-dist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(
+            root.join(".greppy-web-runtime-dist"),
+            "greppy.web-runtime.package.v1\n",
+        )
+        .unwrap();
+        for name in [
+            "web-runtime-supervisor",
+            "web-controller-worker",
+            "web-content-worker",
+        ] {
+            std::fs::write(root.join("bin").join(name), name.as_bytes()).unwrap();
+        }
+        let images = images_from_dist(&root).expect("dist");
+        assert_eq!(images.dist.as_ref(), Some(&root));
+        assert!(images.supervisor.ends_with("web-runtime-supervisor"));
+        assert!(images.controller.ends_with("web-controller-worker"));
+        assert!(images.content.ends_with("web-content-worker"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unstamped_dir_is_not_a_web_runtime_dist() {
+        let root =
+            std::env::temp_dir().join(format!("greppy-web-cli-nodist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(images_from_dist(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

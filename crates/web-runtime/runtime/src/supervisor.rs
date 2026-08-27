@@ -26,6 +26,7 @@ impl Config {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut controller_worker = None;
         let mut content_worker = None;
+        let mut dist = None;
         let mut scripts = Vec::new();
         let mut fixture_url = None;
         let mut socket = None;
@@ -34,6 +35,15 @@ impl Config {
 
         while let Some(argument) = args.next() {
             match argument.to_str() {
+                Some("--role") | Some("--as-controller") | Some("--as-content") => {
+                    return Err(
+                        "same-binary role re-exec is not supported; use separately linked worker images"
+                            .to_owned(),
+                    );
+                }
+                Some("--dist") => {
+                    set_path(&mut dist, "--dist", args.next())?;
+                }
                 Some("--controller-worker") => {
                     set_path(&mut controller_worker, "--controller-worker", args.next())?;
                 }
@@ -80,16 +90,91 @@ impl Config {
             }
         }
 
+        if let Some(dist) = dist {
+            if controller_worker.is_some() || content_worker.is_some() {
+                return Err(
+                    "--dist cannot be combined with --controller-worker or --content-worker"
+                        .to_owned(),
+                );
+            }
+            let (controller, content) = workers_from_dist(&dist)?;
+            controller_worker = Some(controller);
+            content_worker = Some(content);
+        }
         Ok(Self {
             controller_worker: controller_worker
-                .ok_or_else(|| "missing --controller-worker PATH".to_owned())?,
+                .or_else(|| sibling_worker("web-controller-worker"))
+                .ok_or_else(|| {
+                    "missing --controller-worker PATH, --dist DIR, or sibling web-controller-worker"
+                        .to_owned()
+                })?,
             content_worker: content_worker
-                .ok_or_else(|| "missing --content-worker PATH".to_owned())?,
+                .or_else(|| sibling_worker("web-content-worker"))
+                .ok_or_else(|| {
+                    "missing --content-worker PATH, --dist DIR, or sibling web-content-worker"
+                        .to_owned()
+                })?,
             scripts,
             fixture_url,
             socket,
             run_id,
         })
+    }
+}
+
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+pub(crate) fn workers_from_dist(dist: &Path) -> Result<(PathBuf, PathBuf), String> {
+    if is_symlink(dist) {
+        return Err(format!("refusing symlink dist: {}", dist.display()));
+    }
+    let stamp = dist.join(".greppy-web-runtime-dist");
+    if is_symlink(&stamp) || !stamp.is_file() {
+        return Err(format!(
+            "not a stamped web-runtime dist: {}",
+            dist.display()
+        ));
+    }
+    let bin = dist.join("bin");
+    if is_symlink(&bin) || !bin.is_dir() {
+        return Err(format!(
+            "missing real dist bin directory: {}",
+            bin.display()
+        ));
+    }
+    let controller = bin.join("web-controller-worker");
+    let content = bin.join("web-content-worker");
+    for (label, path) in [("controller", &controller), ("content", &content)] {
+        if is_symlink(path) {
+            return Err(format!(
+                "refusing symlink {label} worker: {}",
+                path.display()
+            ));
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "missing {label} worker in dist: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok((controller, content))
+}
+
+fn sibling_worker(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join(name);
+    if is_symlink(&path) {
+        return None;
+    }
+    if path.is_file() && path != exe {
+        Some(path)
+    } else {
+        None
     }
 }
 
@@ -704,6 +789,62 @@ mod tests {
             OsString::from("controller"),
         ])
         .unwrap_err();
-        assert!(error.contains("--content-worker"));
+        assert!(error.contains("content-worker"), "{error}");
+    }
+
+    #[test]
+    fn refuses_same_binary_role_reexec() {
+        let error =
+            Config::parse([OsString::from("--role"), OsString::from("controller")]).unwrap_err();
+        assert!(error.contains("re-exec"), "{error}");
+    }
+
+    #[test]
+    fn dist_layout_supplies_separately_linked_workers() {
+        let root =
+            std::env::temp_dir().join(format!("greppy-web-dist-parse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(
+            root.join(".greppy-web-runtime-dist"),
+            "greppy.web-runtime.package.v1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("bin").join("web-controller-worker"),
+            b"controller",
+        )
+        .unwrap();
+        std::fs::write(root.join("bin").join("web-content-worker"), b"content").unwrap();
+        let config = Config::parse([
+            OsString::from("--dist"),
+            OsString::from(root.to_string_lossy().as_ref()),
+            OsString::from("--socket"),
+            OsString::from("/tmp/x.sock"),
+            OsString::from("--run-id"),
+            OsString::from("run_dist"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.controller_worker,
+            root.join("bin").join("web-controller-worker")
+        );
+        assert_eq!(
+            config.content_worker,
+            root.join("bin").join("web-content-worker")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dist_cannot_combine_with_explicit_worker_paths() {
+        let error = Config::parse([
+            OsString::from("--dist"),
+            OsString::from("/tmp/dist"),
+            OsString::from("--controller-worker"),
+            OsString::from("controller"),
+        ])
+        .unwrap_err();
+        assert!(error.contains("--dist"), "{error}");
     }
 }
