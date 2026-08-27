@@ -262,15 +262,24 @@ jobs:
           Copy-Item "$env:GREPPY_WINFSP_FORK_ROOT\build\VStudio\build\Release\greppyworkspacefsp-x64.sys" $dist
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock $dist
           Copy-Item tools\windows_driver_contract.py,tools\verify_windows_driver_signatures.ps1 $dist
+          Copy-Item bench\release_package_smoke.ps1,bench\release_daemon_stress.ps1 $dist
           Copy-Item licenses (Join-Path $dist 'licenses') -Recurse
-          $tokens = $null
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path tools\verify_windows_driver_signatures.ps1),
-            [ref]$tokens,
-            [ref]$parseErrors
-          ) | Out-Null
-          if ($parseErrors.Count -ne 0) { throw ($parseErrors | Out-String) }
+          foreach ($script in @(
+            'tools\verify_windows_driver_signatures.ps1',
+            'bench\release_package_smoke.ps1',
+            'bench\release_daemon_stress.ps1'
+          )) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -ne 0) {
+              throw "$script failed PowerShell syntax validation: $($parseErrors | Out-String)"
+            }
+          }
           tools/build_windows_msi.ps1 `
             -DistDir $dist `
             -OutputPath "$env:RUNNER_TEMP\greppy-windows-x86_64-unsigned-smoke.msi" `

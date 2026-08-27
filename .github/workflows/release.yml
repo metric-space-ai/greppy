@@ -682,6 +682,7 @@ jobs:
             Copy-Item target/release/greppyworkspacefsp-x64.cat dist/greppyworkspacefsp-x64.cat
           }
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
+          Copy-Item bench/release_daemon_stress.ps1 dist/release_daemon_stress.ps1
           Copy-Item tools/release_artifacts.py dist/release_artifacts.py
           Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py,tools/windows_driver_contract.py,tools/verify_windows_driver_signatures.ps1 dist/
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
@@ -1159,6 +1160,8 @@ jobs:
           python (Join-Path $adminRoot 'package_winfsp_source.py') verify package/greppy-winfsp-source.tar.gz
           if ($LASTEXITCODE -ne 0) { throw 'WinFsp corresponding-source verification failed' }
           & (Join-Path $adminRoot 'release_package_smoke.ps1') -Binary (Join-Path $adminRoot 'greppy.exe') -Work "$PWD/smoke"
+          & (Join-Path $adminRoot 'release_daemon_stress.ps1') -Binary (Join-Path $adminRoot 'greppy.exe') -Work "$PWD/daemon-stress"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaged daemon stress failed' }
           if ($env:SHOULD_SIGN -eq 'true') {
             $log = Join-Path $env:RUNNER_TEMP 'greppy-msi-install.log'
             $install = Start-Process msiexec.exe -ArgumentList @('/i', "`"$PWD\package\${{ matrix.asset }}`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
@@ -1182,17 +1185,6 @@ jobs:
             if ($uninstall.ExitCode -notin @(0,3010)) { throw "MSI uninstall failed: $($uninstall.ExitCode)" }
             if (Test-Path $installed) { throw 'MSI uninstall left the Greppy installation directory behind' }
           }
-          # TODO(windows daemon stress): port bench/release_daemon_stress.sh
-          # to PowerShell for this leg. Portable as-is: concurrency/queue
-          # limits/oversize/slow-client/protocol scenarios (the raw client
-          # needs System.IO.Pipes.NamedPipeClientStream against the
-          # \\.\pipe\greppy-* endpoints instead of unix sockets), kill -9
-          # (Stop-Process -Force) + respawn, and TTL-based eviction/exit.
-          # Genuinely NOT portable: the two stale-endpoint-file scenarios
-          # (leftover socket file after SIGKILL; junk regular file at the
-          # endpoint path) - named pipes vanish with their owning process,
-          # so no stale filesystem endpoint can exist on Windows.
-
   publish:
     name: publish gated release
     needs: [model-redistribution, build, verify-packages]

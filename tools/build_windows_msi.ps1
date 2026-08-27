@@ -45,6 +45,8 @@ $required = @(
     'SUPPORT.md',
     'CHANGELOG.md',
     'Cargo.lock',
+    'release_package_smoke.ps1',
+    'release_daemon_stress.ps1',
     'windows_driver_contract.py',
     'verify_windows_driver_signatures.ps1',
     'licenses\WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt'

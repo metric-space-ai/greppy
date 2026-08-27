@@ -37,6 +37,7 @@ class WindowsMsiTests(unittest.TestCase):
         self.assertIn("-DriverCatalogPath", source)
         self.assertIn("greppy-windows-driver-signature-evidence.json", source)
         self.assertIn("windows_driver_contract.py') verify", source)
+        self.assertIn("'release_daemon_stress.ps1'", source)
         self.assertIn("wix msi validate", source)
         workflow = (ROOT / ".github/workflows/filesystem-cow.yml").read_text(
             encoding="utf-8"
@@ -44,6 +45,7 @@ class WindowsMsiTests(unittest.TestCase):
         self.assertIn("-AllowUnsignedForSmokeTest", workflow)
         self.assertIn(r"target\debug\greppy.exe", workflow)
         self.assertIn("Language.Parser]::ParseFile", workflow)
+        self.assertIn("bench\\release_daemon_stress.ps1", workflow)
         self.assertIn("verify_windows_driver_signatures.ps1 $dist", workflow)
         self.assertNotIn(
             "cargo build -p greppy --bin greppy --release --locked\n"

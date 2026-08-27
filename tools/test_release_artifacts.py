@@ -525,6 +525,20 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn(' semantic-search \'', windows_smoke)
         self.assertIn(" search --json ", windows_smoke)
+        windows_daemon_stress = (
+            REPOSITORY_ROOT / "bench/release_daemon_stress.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("NamedPipeClientStream", windows_daemon_stress)
+        self.assertIn("Stop-Process", windows_daemon_stress)
+        self.assertIn("48, 20000", windows_daemon_stress)
+        self.assertIn("GREPPY_EMBED_DAEMON_MODEL_TTL_S", windows_daemon_stress)
+        self.assertIn(
+            "Copy-Item bench/release_daemon_stress.ps1", workflow
+        )
+        self.assertIn(
+            "(Join-Path $adminRoot 'release_daemon_stress.ps1')", workflow
+        )
+        self.assertNotIn("TODO(windows daemon stress)", workflow)
 
         unix_smoke = (
             REPOSITORY_ROOT / "bench/release_package_smoke.sh"
