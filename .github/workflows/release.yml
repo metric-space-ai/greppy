@@ -26,6 +26,12 @@ on:
           immutable release tag exists. Requires the signing secrets.
         type: boolean
         default: false
+      measure_runtime_footprint:
+        description: >-
+          Include the hours-long diagnostic CPU/Metal runtime-footprint
+          evidence in a manual dry-run. Release tags always include it.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -446,7 +452,7 @@ jobs:
           spctl --assess --type execute --verbose=2 "$app"
 
       - name: Measure runtime footprint (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)
         shell: bash
         run: |
           repo="$RUNNER_TEMP/greppy-footprint-serde"
@@ -687,7 +693,7 @@ jobs:
           subject-path: ${{ matrix.secondary_asset }}.spdx.json
 
       - name: Attest runtime footprint evidence
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: runtime-footprint-*.json
@@ -790,7 +796,9 @@ jobs:
           ' "$RUNNER_TEMP/workspace-doctor.json" >/dev/null
           cleanup_provider
           trap - EXIT
-          test -s package/runtime-footprint-linux-x86_64-cpu.json
+          if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]; then
+            test -s package/runtime-footprint-linux-x86_64-cpu.json
+          fi
           python3 "$deb_root/usr/lib/greppy/release-tests/release_artifacts.py" verify-spdx \
             --sbom "package/${{ matrix.asset }}.spdx.json" \
             --dist "$deb_root" \
@@ -842,8 +850,10 @@ jobs:
           "$cli" --version
           bash "$docs/release_package_smoke.sh" "$cli" "$PWD/smoke"
           bash "$docs/release_daemon_stress.sh" "$cli" "$PWD/daemon-stress"
-          test -s package/runtime-footprint-macos-arm64-cpu.json
-          test -s package/runtime-footprint-macos-arm64-metal.json
+          if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]; then
+            test -s package/runtime-footprint-macos-arm64-cpu.json
+            test -s package/runtime-footprint-macos-arm64-metal.json
+          fi
           python3 "$docs/release_artifacts.py" verify-spdx \
             --sbom "package/${{ matrix.asset }}.spdx.json" \
             --dist "$payload" \

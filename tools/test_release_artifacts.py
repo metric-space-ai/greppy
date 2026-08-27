@@ -314,9 +314,22 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("navigation benchmark is a hard", security)
         self.assertIn("never gate publication", security)
         # One Unix footprint invocation remains; the Windows measurement is out
-        # of band (see the release-scope comment in release.yml).
+        # of band (see the release-scope comment in release.yml). Manual
+        # packaging dry-runs may skip the hours-long diagnostic, but immutable
+        # release tags must always execute and verify it.
         self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 1)
         self.assertIn('if [ "$device" = cpu ]', workflow)
+        self.assertIn("measure_runtime_footprint:", workflow)
+        self.assertIn(
+            "runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)",
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count(
+                'if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]'
+            ),
+            2,
+        )
 
         windows_smoke = (
             REPOSITORY_ROOT / "bench/release_package_smoke.ps1"
