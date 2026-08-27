@@ -57,6 +57,31 @@ public static class GreppyPipeClient
         return endpoint.Substring(Prefix.Length);
     }
 
+    private static string JsonString(string value)
+    {
+        StringBuilder encoded = new StringBuilder("\"");
+        foreach (char character in value)
+        {
+            switch (character)
+            {
+                case '\"': encoded.Append("\\\""); break;
+                case '\\': encoded.Append("\\\\"); break;
+                case '\b': encoded.Append("\\b"); break;
+                case '\f': encoded.Append("\\f"); break;
+                case '\n': encoded.Append("\\n"); break;
+                case '\r': encoded.Append("\\r"); break;
+                case '\t': encoded.Append("\\t"); break;
+                default:
+                    if (character < 0x20)
+                        encoded.Append("\\u").Append(((int)character).ToString("x4"));
+                    else
+                        encoded.Append(character);
+                    break;
+            }
+        }
+        return encoded.Append('\"').ToString();
+    }
+
     public static GreppyPipeResult RoundTripText(
         string endpoint, string requestId, string text, int timeoutMilliseconds)
     {
@@ -129,21 +154,22 @@ public static class GreppyPipeClient
             RoundTripBytes(endpoint, requestId, payload, timeoutMilliseconds));
     }
 
-    public static GreppyPipeResult[] Burst(
-        string endpoint, string prefix, int count, int timeoutMilliseconds)
+    private static GreppyPipeResult[] BurstRequests(
+        string endpoint, string prefix, string[] requests,
+        int timeoutMilliseconds)
     {
+        int count = requests.Length;
         Task<GreppyPipeResult>[] tasks = new Task<GreppyPipeResult>[count];
         for (int index = 0; index < count; index++)
         {
-            string requestId = prefix + "-" + index.ToString();
-            string request = "{\"protocol\":2,\"op\":\"infer\",\"request_id\":\"" +
-                requestId + "\"}";
-            tasks[index] = Task.Run(() => {
+            int requestIndex = index;
+            string requestId = prefix + "-" + requestIndex.ToString();
+            tasks[requestIndex] = Task.Run(() => {
                 GreppyPipeResult result = null;
                 for (int attempt = 0; attempt < 3; attempt++)
                 {
                     result = RoundTripText(
-                        endpoint, requestId, request, timeoutMilliseconds);
+                        endpoint, requestId, requests[requestIndex], timeoutMilliseconds);
                     if (String.IsNullOrEmpty(result.Error))
                         return result;
                     Thread.Sleep(100 * (attempt + 1));
@@ -156,6 +182,41 @@ public static class GreppyPipeClient
         for (int index = 0; index < count; index++)
             results[index] = tasks[index].Result;
         return results;
+    }
+
+    public static GreppyPipeResult[] BurstEmbedding(
+        string endpoint, string prefix, int count, int timeoutMilliseconds,
+        string promptVersion, string modelKey)
+    {
+        string[] requests = new string[count];
+        for (int index = 0; index < count; index++)
+        {
+            string requestId = prefix + "-" + index.ToString();
+            requests[index] = "{\"protocol\":2,\"request_id\":" +
+                JsonString(requestId) + ",\"pv\":" + JsonString(promptVersion) +
+                ",\"mk\":" + JsonString(modelKey) + ",\"text\":" +
+                JsonString("capacity flood " + requestId) + "}";
+        }
+        return BurstRequests(endpoint, prefix, requests, timeoutMilliseconds);
+    }
+
+    public static GreppyPipeResult[] BurstSummary(
+        string endpoint, string prefix, int count, int timeoutMilliseconds,
+        string promptVersion, string filterVersion, string modelKey)
+    {
+        string[] requests = new string[count];
+        for (int index = 0; index < count; index++)
+        {
+            string requestId = prefix + "-" + index.ToString();
+            requests[index] = "{\"protocol\":2,\"request_id\":" +
+                JsonString(requestId) + ",\"pv\":" + JsonString(promptVersion) +
+                ",\"fv\":" + JsonString(filterVersion) +
+                ",\"mk\":" + JsonString(modelKey) +
+                ",\"mode\":\"brief\",\"path\":" +
+                JsonString("src/flood.rs") + ",\"source\":" +
+                JsonString("pub fn capacity_flood() -> usize { 48 }") + "}";
+        }
+        return BurstRequests(endpoint, prefix, requests, timeoutMilliseconds);
     }
 }
 '@
@@ -424,6 +485,55 @@ function Invoke-Semantic([string]$Label, [string]$Query) {
     return $result
 }
 
+function Get-EmbeddingModelKey(
+    [pscustomobject]$SearchResult,
+    [string]$StoreRoot
+) {
+    foreach ($field in @('model_id', 'prompt_version', 'task_profile')) {
+        $property = $SearchResult.PSObject.Properties[$field]
+        if ($null -eq $property -or [String]::IsNullOrWhiteSpace([string]$property.Value)) {
+            throw "semantic result lacks $field required by the daemon protocol"
+        }
+    }
+    $modelRoot = Join-Path $StoreRoot 'models\v1\embeddinggemma-300m-q4k'
+    $gguf = @(Get-ChildItem -LiteralPath $modelRoot -Filter '*.gguf' -File -Recurse)
+    $tokenizer = @(Get-ChildItem -LiteralPath $modelRoot -Filter 'tokenizer.json' -File -Recurse)
+    if ($gguf.Count -ne 1 -or $tokenizer.Count -ne 1) {
+        throw "expected one managed EmbeddingGemma GGUF and tokenizer, got $($gguf.Count) and $($tokenizer.Count)"
+    }
+    $ggufHash = (Get-FileHash -LiteralPath $gguf[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $tokenizerHash = (Get-FileHash -LiteralPath $tokenizer[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    return "$($SearchResult.model_id)|$($SearchResult.prompt_version)|$($SearchResult.task_profile)|gguf;$ggufHash;$tokenizerHash"
+}
+
+function Get-SummaryModelContract(
+    [pscustomobject]$Doctor,
+    [string]$StoreRoot
+) {
+    $summary = $Doctor.inference.models.summary
+    foreach ($field in @('model_id', 'prompt_version')) {
+        $property = $summary.PSObject.Properties[$field]
+        if ($null -eq $property -or [String]::IsNullOrWhiteSpace([string]$property.Value)) {
+            throw "summary model status lacks $field required by the daemon protocol"
+        }
+    }
+    $triagePromptVersion = 'qwen35-triage-v3'
+    $filterVersion = 'qwen35-brief-filter-v3'
+    $modelRoot = Join-Path $StoreRoot 'models\v1\qwen35-0.8b-mtp-q4km'
+    $gguf = @(Get-ChildItem -LiteralPath $modelRoot -Filter '*.gguf' -File -Recurse)
+    $tokenizer = @(Get-ChildItem -LiteralPath $modelRoot -Filter 'tokenizer.json' -File -Recurse)
+    if ($gguf.Count -ne 1 -or $tokenizer.Count -ne 1) {
+        throw "expected one managed Qwen GGUF and tokenizer, got $($gguf.Count) and $($tokenizer.Count)"
+    }
+    $ggufHash = (Get-FileHash -LiteralPath $gguf[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $tokenizerHash = (Get-FileHash -LiteralPath $tokenizer[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    return [pscustomobject]@{
+        prompt_version = [string]$summary.prompt_version
+        filter_version = $filterVersion
+        model_key = "$($summary.model_id):$($summary.prompt_version):$triagePromptVersion`:$filterVersion`:cpu`:$ggufHash`:$tokenizerHash"
+    }
+}
+
 function Convert-Burst([GreppyPipeResult[]]$Results) {
     $parsed = @()
     foreach ($result in $Results) {
@@ -437,6 +547,7 @@ function Convert-Burst([GreppyPipeResult[]]$Results) {
                 retryable = $false
                 capacity = $false
                 echo_ok = $false
+                inference_ok = $false
             }
             continue
         }
@@ -445,6 +556,8 @@ function Convert-Burst([GreppyPipeResult[]]$Results) {
         $responseErrorProperty = $response.PSObject.Properties['error']
         $errorKindProperty = $response.PSObject.Properties['error_kind']
         $retryableProperty = $response.PSObject.Properties['retryable']
+        $vectorProperty = $response.PSObject.Properties['v_bits']
+        $summaryProperty = $response.PSObject.Properties['s']
         $parsed += [pscustomobject]@{
             request_id = $result.RequestId
             client_error = $null
@@ -468,6 +581,17 @@ function Convert-Burst([GreppyPipeResult[]]$Results) {
             echo_ok = (
                 $null -ne $requestIdProperty -and
                 $requestIdProperty.Value -eq $result.RequestId
+            )
+            inference_ok = (
+                $null -ne $requestIdProperty -and
+                $requestIdProperty.Value -eq $result.RequestId -and
+                $null -ne $vectorProperty -and
+                @($vectorProperty.Value).Count -gt 0
+            ) -or (
+                $null -ne $requestIdProperty -and
+                $requestIdProperty.Value -eq $result.RequestId -and
+                $null -ne $summaryProperty -and
+                @($summaryProperty.Value).Count -gt 0
             )
         }
     }
@@ -552,7 +676,8 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     }
 
     Write-Section 'spawn, protocol, malformed, oversize and slow-client contract'
-    [void](Invoke-Semantic 'warmup' (New-Query 'warmup'))
+    $warmup = Invoke-Semantic 'warmup' (New-Query 'warmup')
+    $embedModelKey = Get-EmbeddingModelKey $warmup (Join-Path $Work 'store')
     Wait-For 'embedding daemon to become ready' 30 {
         (Get-DaemonStatus $EmbedEndpoint).state -eq 'ready'
     }
@@ -616,10 +741,23 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     }
     $floodStatusBefore = Get-DaemonStatus $EmbedEndpoint
     $flood = Convert-Burst (
-        [GreppyPipeClient]::Burst($EmbedEndpoint, 'flood', 48, 20000)
+        [GreppyPipeClient]::BurstEmbedding(
+            $EmbedEndpoint,
+            'flood',
+            48,
+            20000,
+            [string]$warmup.prompt_version,
+            $embedModelKey)
     )
     $floodStatusAfter = Get-DaemonStatus $EmbedEndpoint
     $floodCapacity = @($flood | Where-Object { $_.capacity -eq $true }).Count
+    $floodInference = @($flood | Where-Object { $_.inference_ok -eq $true }).Count
+    $floodClientErrors = @($flood | Where-Object { $_.client_error }).Count
+    $floodUnexpected = @(
+        $flood | Where-Object {
+            $_.capacity -ne $true -and $_.inference_ok -ne $true
+        }
+    ).Count
     $floodRejectedDelta =
         [int]$floodStatusAfter.rejected_requests -
         [int]$floodStatusBefore.rejected_requests
@@ -628,8 +766,10 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
         after_rejected_requests = [int]$floodStatusAfter.rejected_requests
         rejected_delta = $floodRejectedDelta
         capacity = $floodCapacity
+        inference_ok = $floodInference
+        unexpected = $floodUnexpected
         echo_ok = @($flood | Where-Object { $_.echo_ok -eq $true }).Count
-        client_errors = @($flood | Where-Object { $_.client_error }).Count
+        client_errors = $floodClientErrors
         results = @($flood)
     }
     $floodEvidenceJson = $floodEvidence | ConvertTo-Json -Depth 6 -Compress
@@ -645,15 +785,30 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
         }
         throw "busy 48-client flood produced no classified capacity response: $floodEvidenceJson"
     }
+    if ($floodInference -lt 1 -or $floodClientErrors -ne 0 -or $floodUnexpected -ne 0) {
+        throw "busy 48-client flood returned incomplete or invalid outcomes: $floodEvidenceJson"
+    }
     foreach ($child in $children) {
         Complete-GreppyProcess $child.Handle $child.Output $true
     }
     $burst = Convert-Burst (
-        [GreppyPipeClient]::Burst($EmbedEndpoint, 'burst', 26, 30000)
+        [GreppyPipeClient]::BurstEmbedding(
+            $EmbedEndpoint,
+            'burst',
+            26,
+            30000,
+            [string]$warmup.prompt_version,
+            $embedModelKey)
     )
+    $burstUnexpected = @(
+        $burst | Where-Object {
+            $_.capacity -ne $true -and $_.inference_ok -ne $true
+        }
+    ).Count
     if (@($burst | Where-Object client_error).Count -ne 0 -or
-        @($burst | Where-Object { $_.echo_ok -or $_.capacity }).Count -ne 26) {
-        throw '26-client burst lost or misclassified a response'
+        $burstUnexpected -ne 0 -or
+        @($burst | Where-Object inference_ok).Count -lt 1) {
+        throw "26-client burst returned incomplete or invalid outcomes: $($burst | ConvertTo-Json -Depth 6 -Compress)"
     }
     if ([int](Get-DaemonStatus $EmbedEndpoint).daemon_pid -ne $EmbedPid) {
         throw 'daemon owner changed during the concurrent-client gate'
@@ -685,6 +840,7 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     $EmbedPid = [int](Get-DaemonStatus $EmbedEndpoint).daemon_pid
 
     Write-Section 'summary daemon, queue pressure and frame limit'
+    $summaryContract = Get-SummaryModelContract $doctor (Join-Path $Work 'store')
     $brief = Start-GreppyProcess @(
         '--root', $RepoBrief, 'brief', 'apply_limit', '--json'
     )
@@ -693,10 +849,26 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
             [string](Get-DaemonStatus $SummaryEndpoint).active_request_id)
     }
     $summaryFlood = Convert-Burst (
-        [GreppyPipeClient]::Burst($SummaryEndpoint, 'summary-flood', 48, 5000)
+        [GreppyPipeClient]::BurstSummary(
+            $SummaryEndpoint,
+            'summary-flood',
+            48,
+            30000,
+            $summaryContract.prompt_version,
+            $summaryContract.filter_version,
+            $summaryContract.model_key)
     )
-    if (@($summaryFlood | Where-Object capacity).Count -lt 1) {
-        throw 'summary flood produced no classified capacity response'
+    $summaryCapacity = @($summaryFlood | Where-Object capacity).Count
+    $summaryInference = @($summaryFlood | Where-Object inference_ok).Count
+    $summaryUnexpected = @(
+        $summaryFlood | Where-Object {
+            $_.capacity -ne $true -and $_.inference_ok -ne $true
+        }
+    ).Count
+    if ($summaryCapacity -lt 1 -or $summaryInference -lt 1 -or
+        $summaryUnexpected -ne 0 -or
+        @($summaryFlood | Where-Object client_error).Count -ne 0) {
+        throw "summary flood returned incomplete or invalid outcomes: $($summaryFlood | ConvertTo-Json -Depth 6 -Compress)"
     }
     $briefPath = Join-Path $Work 'out\brief.json'
     Wait-GreppyChild $brief 'summary brief command'

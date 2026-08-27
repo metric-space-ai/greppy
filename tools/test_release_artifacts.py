@@ -551,11 +551,31 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("NamedPipeClientStream", windows_daemon_stress)
         self.assertIn("Stop-Process", windows_daemon_stress)
-        self.assertIn("48, 20000", windows_daemon_stress)
+        self.assertIn("BurstEmbedding", windows_daemon_stress)
+        self.assertIn("BurstSummary", windows_daemon_stress)
         self.assertIn("flood-evidence=", windows_daemon_stress)
         self.assertIn("flood-evidence.json", windows_daemon_stress)
         self.assertIn("raw_response", windows_daemon_stress)
         self.assertIn("rejected_delta", windows_daemon_stress)
+        self.assertIn("Get-EmbeddingModelKey", windows_daemon_stress)
+        self.assertIn("Get-SummaryModelContract", windows_daemon_stress)
+        self.assertIn("$warmup.prompt_version", windows_daemon_stress)
+        self.assertIn("JsonString(modelKey)", windows_daemon_stress)
+        self.assertIn(',\\\"pv\\\":', windows_daemon_stress)
+        self.assertIn(',\\\"mk\\\":', windows_daemon_stress)
+        self.assertIn(',\\\"text\\\":', windows_daemon_stress)
+        self.assertNotIn('"\\\"op\\\":\\\"infer\\\""', windows_daemon_stress)
+        self.assertIn("inference_ok", windows_daemon_stress)
+        self.assertIn("unexpected", windows_daemon_stress)
+        self.assertIn("summary flood returned incomplete or invalid outcomes", windows_daemon_stress)
+        self.assertIn(
+            "busy 48-client flood returned incomplete or invalid outcomes",
+            windows_daemon_stress,
+        )
+        self.assertIn(
+            "26-client burst returned incomplete or invalid outcomes",
+            windows_daemon_stress,
+        )
         self.assertIn(
             "daemon counted capacity rejections but no client received a classified response",
             windows_daemon_stress,
