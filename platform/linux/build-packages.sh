@@ -119,6 +119,7 @@ rpm_top="$work_root/rpmbuild"
 mkdir -p "$rpm_top/BUILD" "$rpm_top/BUILDROOT" "$rpm_top/RPMS" "$rpm_top/SOURCES" "$rpm_top/SPECS" "$rpm_top/SRPMS"
 rpm_spec="$rpm_top/SPECS/greppy.spec"
 cat > "$rpm_spec" <<'EOF'
+%global __strip /bin/true
 Name: greppy
 Version: %{greppy_version}
 Release: 1%{?dist}

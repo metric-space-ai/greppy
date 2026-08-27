@@ -308,6 +308,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("WINFSP-*|RIFT-*", linux_packager)
         self.assertIn('STAGING_ROOT=$(realpath -m "$6")', linux_packager)
+        self.assertIn("%global __strip /bin/true", linux_packager)
         self.assertNotIn("RIFT-MIT", workflow)
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
