@@ -270,6 +270,18 @@ web_runtime_is_owned_dist() {
     [ -L "$iod_dest/bin/$bin" ] && return 1
     [ -f "$iod_dest/bin/$bin" ] || return 1
   done
+  for name in $(ls -A "$iod_dest"); do
+    case "$name" in
+      .greppy-web-runtime-dist | README.txt | UNSIGNED | SHA256SUMS | sbom.json | provenance.json | LICENSE | SIGNING_RECEIPT | SIGNING_SKIPPED | SIGNING_STATUS | NOTARIZATION_RECEIPT | NOTARIZATION_SKIPPED | NOTARIZED_UNSIGNED | bin | previous) ;;
+      *) return 1 ;;
+    esac
+  done
+  for name in $(ls -A "$iod_dest/bin"); do
+    case "$name" in
+      web-runtime-supervisor | web-controller-worker | web-content-worker) ;;
+      *) return 1 ;;
+    esac
+  done
   return 0
 }
 
@@ -394,7 +406,7 @@ web_runtime_copy_regular_file() {
   if [ -e "$copy_parent" ]; then
     web_runtime_check_owned_real_dir "$copy_parent"
   else
-    mkdir -p "$copy_parent"
+    mkdir "$copy_parent" || web_runtime_die "failed to create dest parent $copy_parent"
     web_runtime_check_owned_real_dir "$copy_parent"
   fi
   copy_tmp="$copy_dest.greppy-tmp"
@@ -415,7 +427,8 @@ web_runtime_begin_staging() {
     n=$((n + 1))
     bs_staging="$bs_parent/greppy-web-dist-stage-$$-$n"
   done
-  mkdir -p "$bs_staging/bin"
+  mkdir "$bs_staging" || web_runtime_die "failed to create exclusive staging dir $bs_staging"
+  mkdir "$bs_staging/bin" || web_runtime_die "failed to create staging bin $bs_staging/bin"
   web_runtime_check_owned_real_dir "$bs_staging"
   web_runtime_check_owned_real_dir "$bs_staging/bin"
   printf '%s' "$bs_staging"

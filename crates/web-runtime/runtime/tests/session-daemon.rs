@@ -3731,3 +3731,26 @@ fn supervisor_starts_from_stamped_dist_without_worker_flags() {
     assert_eq!(created.status, "ok", "{created:?}");
     let _ = std::fs::remove_dir_all(&dist);
 }
+
+#[test]
+fn package_refuses_dest_with_unknown_extra_member() {
+    let pid = std::process::id();
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-extra-{pid}"));
+    let _ = std::fs::remove_dir_all(&dest);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_eq!(code, 0, "seed package: stdout={stdout} stderr={stderr}");
+    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    std::fs::write(dest.join("notes.txt"), "not part of the dist").unwrap();
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_ne!(
+        code, 0,
+        "package extra member: stdout={stdout} stderr={stderr}"
+    );
+    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after, original, "extra-member package mutated dest");
+    assert!(
+        dest.join("notes.txt").exists(),
+        "package deleted extra member"
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
