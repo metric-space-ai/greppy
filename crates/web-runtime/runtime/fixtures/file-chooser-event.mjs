@@ -3,8 +3,13 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setContent("<!DOCTYPE html><html><body><input id='f' type='file'></body></html>");
+let onChooser = null;
+page.on("filechooser", (item) => {
+  onChooser = item;
+});
 await page.locator("#f").click();
 const chooser = await page.waitForEvent("filechooser");
+if (!onChooser) throw new Error("page.on filechooser");
 if (chooser.isMultiple()) throw new Error("expected single file chooser");
 const chosen = chooser.element();
 if ((await chosen.getAttribute("id")) !== "f") {

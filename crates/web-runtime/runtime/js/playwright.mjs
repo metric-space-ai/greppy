@@ -2105,7 +2105,9 @@ class Page {
       if (!rec) {
         return unsupported("Page.waitForEvent.filechooser.empty")();
       }
-      return new FileChooser(this, rec);
+      const chooser = new FileChooser(this, rec);
+      this._emit("filechooser", chooser);
+      return chooser;
     }
     if (event === "popup" || event === "page") {
       return this._waitForPopup();
@@ -2200,7 +2202,8 @@ class Page {
       event === "framedetached" ||
       event === "framenavigated" ||
       event === "requestfailed" ||
-      event === "requestfinished"
+      event === "requestfinished" ||
+      event === "filechooser"
     ) {
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);

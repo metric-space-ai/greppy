@@ -2287,7 +2287,8 @@
         "file-chooser-event"
       ],
       "known_differences": [
-        "waitForEvent('filechooser') consumes recorded choosers"
+        "waitForEvent('filechooser') consumes recorded choosers",
+        "page.on('filechooser') is dispatched when waitForEvent consumes a recorded chooser"
       ]
     },
     {
