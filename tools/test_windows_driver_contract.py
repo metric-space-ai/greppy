@@ -45,8 +45,35 @@ class WindowsDriverContractTests(unittest.TestCase):
         )
         self.unsigned = self.root / "unsigned.sys"
         self.signed = self.root / "signed.sys"
+        self.catalog = self.root / "greppyworkspacefsp-x64.cat"
         self.unsigned.write_bytes(fake_pe())
         self.signed.write_bytes(fake_pe(b"signed!!"))
+        self.catalog.write_bytes(b"signed catalog")
+        self.signature_evidence = self.root / "signature-evidence.json"
+        self.write_signature_evidence()
+
+    def write_signature_evidence(self, *, attestation=False):
+        eku_oids = [contract.HLK_VERIFICATION_OID]
+        if attestation:
+            eku_oids.append(contract.ATTESTATION_OID)
+        self.signature_evidence.write_text(
+            json.dumps(
+                {
+                    "schema_version": contract.SIGNATURE_EVIDENCE_SCHEMA,
+                    "signature_class": "hlk-dashboard",
+                    "driver_sha256": contract.sha256_file(self.signed),
+                    "catalog_sha256": contract.sha256_file(self.catalog),
+                    "driver_signer_subject": "Microsoft Windows Hardware Compatibility Publisher",
+                    "driver_signer_thumbprint": "AA",
+                    "catalog_signer_subject": "Microsoft Windows Hardware Compatibility Publisher",
+                    "catalog_signer_thumbprint": "BB",
+                    "catalog_enhanced_key_usage_oids": eku_oids,
+                    "hardware_driver_verification_oid": contract.HLK_VERIFICATION_OID,
+                    "attestation_oid_absent": not attestation,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -62,19 +89,32 @@ class WindowsDriverContractTests(unittest.TestCase):
         value = contract.build_contract(
             self.unsigned,
             self.signed,
+            self.catalog,
             self.fork,
-            "Microsoft Windows Hardware Compatibility Publisher",
-            "AA BB",
+            self.signature_evidence,
         )
         manifest = self.root / "contract.json"
         manifest.write_text(json.dumps(value), encoding="utf-8")
         self.assertEqual(
             value,
-            contract.verify_contract(manifest, self.unsigned, self.signed, self.fork),
+            contract.verify_contract(
+                manifest,
+                self.unsigned,
+                self.signed,
+                self.catalog,
+                self.fork,
+                self.signature_evidence,
+            ),
         )
         self.assertEqual(
             value,
-            contract.verify_signed_contract(manifest, self.signed, self.fork),
+            contract.verify_signed_contract(
+                manifest,
+                self.signed,
+                self.catalog,
+                self.fork,
+                self.signature_evidence,
+            ),
         )
 
     def test_repository_fork_manifest_matches_driver_contract_schema(self):
@@ -94,14 +134,33 @@ class WindowsDriverContractTests(unittest.TestCase):
         self.signed.write_bytes(changed)
         with self.assertRaisesRegex(contract.ContractError, "payload differs"):
             contract.build_contract(
-                self.unsigned, self.signed, self.fork, "Microsoft", "AA"
+                self.unsigned,
+                self.signed,
+                self.catalog,
+                self.fork,
+                self.signature_evidence,
             )
 
     def test_unsigned_signed_artifact_is_rejected(self):
         self.signed.write_bytes(fake_pe())
         with self.assertRaisesRegex(contract.ContractError, "no embedded PE certificate"):
             contract.build_contract(
-                self.unsigned, self.signed, self.fork, "Microsoft", "AA"
+                self.unsigned,
+                self.signed,
+                self.catalog,
+                self.fork,
+                self.signature_evidence,
+            )
+
+    def test_attestation_signature_evidence_is_rejected(self):
+        self.write_signature_evidence(attestation=True)
+        with self.assertRaisesRegex(contract.ContractError, "attestation-signed"):
+            contract.build_contract(
+                self.unsigned,
+                self.signed,
+                self.catalog,
+                self.fork,
+                self.signature_evidence,
             )
 
 

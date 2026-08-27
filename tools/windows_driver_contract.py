@@ -12,7 +12,10 @@ import sys
 from typing import Any
 
 
-SCHEMA = "greppy.windows-driver-contract.v1"
+SCHEMA = "greppy.windows-driver-contract.v2"
+SIGNATURE_EVIDENCE_SCHEMA = "greppy.windows-driver-signature-evidence.v1"
+HLK_VERIFICATION_OID = "1.3.6.1.4.1.311.10.3.5"
+ATTESTATION_OID = "1.3.6.1.4.1.311.10.3.5.1"
 EXPECTED_MACHINE = 0x8664
 EXPECTED_FORK_SCHEMA = "greppy.winfsp-transport-upstream.v1"
 EXPECTED_UPSTREAM_REPOSITORY = "https://github.com/winfsp/winfsp"
@@ -119,12 +122,46 @@ def load_fork_manifest(path: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def load_signature_evidence(
+    path: pathlib.Path, signed_path: pathlib.Path, catalog_path: pathlib.Path
+) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schema_version") != SIGNATURE_EVIDENCE_SCHEMA:
+        raise ContractError("Windows driver signature evidence has an unexpected schema")
+    if data.get("signature_class") != "hlk-dashboard":
+        raise ContractError("Windows driver is not bound to an HLK/dashboard signature")
+    if data.get("driver_sha256") != sha256_file(signed_path):
+        raise ContractError("Windows driver signature evidence has another driver hash")
+    if data.get("catalog_sha256") != sha256_file(catalog_path):
+        raise ContractError("Windows driver signature evidence has another catalog hash")
+    eku_oids = data.get("catalog_enhanced_key_usage_oids")
+    if not isinstance(eku_oids, list) or not all(
+        isinstance(value, str) and value for value in eku_oids
+    ):
+        raise ContractError("Windows driver signature evidence has invalid catalog EKUs")
+    if HLK_VERIFICATION_OID not in eku_oids:
+        raise ContractError("Windows driver catalog lacks the HLK verification EKU")
+    if ATTESTATION_OID in eku_oids or data.get("attestation_oid_absent") is not True:
+        raise ContractError("attestation-signed Windows drivers are not release eligible")
+    for field in (
+        "driver_signer_subject",
+        "driver_signer_thumbprint",
+        "catalog_signer_subject",
+        "catalog_signer_thumbprint",
+    ):
+        if not isinstance(data.get(field), str) or not data[field].strip():
+            raise ContractError(f"Windows driver signature evidence lacks {field}")
+    if data.get("hardware_driver_verification_oid") != HLK_VERIFICATION_OID:
+        raise ContractError("Windows driver signature evidence has another verification OID")
+    return data
+
+
 def build_contract(
     unsigned_path: pathlib.Path,
     signed_path: pathlib.Path,
+    catalog_path: pathlib.Path,
     fork_manifest_path: pathlib.Path,
-    signer_subject: str,
-    signer_thumbprint: str,
+    signature_evidence_path: pathlib.Path,
 ) -> dict[str, Any]:
     unsigned = pe_identity(unsigned_path)
     signed = pe_identity(signed_path)
@@ -136,20 +173,21 @@ def build_contract(
         raise ContractError("the Microsoft-signed driver has no embedded PE certificate")
     if unsigned["canonical_pe_sha256"] != signed["canonical_pe_sha256"]:
         raise ContractError("signed driver payload differs from the unsigned Greppy fork build")
-    if not signer_subject.strip() or not signer_thumbprint.strip():
-        raise ContractError("signer subject and thumbprint are required")
+    signature_evidence = load_signature_evidence(
+        signature_evidence_path, signed_path, catalog_path
+    )
     return {
         "schema_version": SCHEMA,
         "architecture": "x86_64",
         "fork": load_fork_manifest(fork_manifest_path),
         "unsigned_driver": unsigned,
         "signed_driver": signed,
-        "payload_identity_sha256": unsigned["canonical_pe_sha256"],
-        "kernel_policy_verification": {
-            "signtool_kp_verified": True,
-            "signer_subject": signer_subject.strip(),
-            "signer_thumbprint": signer_thumbprint.replace(" ", "").upper(),
+        "signed_catalog": {
+            "file_name": catalog_path.name,
+            "sha256": sha256_file(catalog_path),
         },
+        "payload_identity_sha256": unsigned["canonical_pe_sha256"],
+        "signature_evidence": signature_evidence,
     }
 
 
@@ -157,18 +195,19 @@ def verify_contract(
     manifest_path: pathlib.Path,
     unsigned_path: pathlib.Path,
     signed_path: pathlib.Path,
+    catalog_path: pathlib.Path,
     fork_manifest_path: pathlib.Path,
+    signature_evidence_path: pathlib.Path,
 ) -> dict[str, Any]:
     expected = json.loads(manifest_path.read_text(encoding="utf-8"))
-    verification = expected.get("kernel_policy_verification", {})
-    if expected.get("schema_version") != SCHEMA or verification.get("signtool_kp_verified") is not True:
-        raise ContractError("invalid or non-kernel-verified driver contract")
+    if expected.get("schema_version") != SCHEMA:
+        raise ContractError("invalid Windows driver contract schema")
     actual = build_contract(
         unsigned_path,
         signed_path,
+        catalog_path,
         fork_manifest_path,
-        str(verification.get("signer_subject", "")),
-        str(verification.get("signer_thumbprint", "")),
+        signature_evidence_path,
     )
     if expected != actual:
         raise ContractError("driver contract does not match the supplied artifacts")
@@ -178,12 +217,13 @@ def verify_contract(
 def verify_signed_contract(
     manifest_path: pathlib.Path,
     signed_path: pathlib.Path,
+    catalog_path: pathlib.Path,
     fork_manifest_path: pathlib.Path,
+    signature_evidence_path: pathlib.Path,
 ) -> dict[str, Any]:
     expected = json.loads(manifest_path.read_text(encoding="utf-8"))
-    verification = expected.get("kernel_policy_verification", {})
-    if expected.get("schema_version") != SCHEMA or verification.get("signtool_kp_verified") is not True:
-        raise ContractError("invalid or non-kernel-verified driver contract")
+    if expected.get("schema_version") != SCHEMA:
+        raise ContractError("invalid Windows driver contract schema")
     if expected.get("fork") != load_fork_manifest(fork_manifest_path):
         raise ContractError("driver contract does not match the Greppy fork manifest")
     signed = pe_identity(signed_path)
@@ -191,6 +231,12 @@ def verify_signed_contract(
         raise ContractError("installed signed driver does not match its release contract")
     if expected.get("payload_identity_sha256") != signed["canonical_pe_sha256"]:
         raise ContractError("installed signed driver payload identity is inconsistent")
+    catalog = {"file_name": catalog_path.name, "sha256": sha256_file(catalog_path)}
+    if expected.get("signed_catalog") != catalog:
+        raise ContractError("installed signed catalog does not match its release contract")
+    evidence = load_signature_evidence(signature_evidence_path, signed_path, catalog_path)
+    if expected.get("signature_evidence") != evidence:
+        raise ContractError("installed signature evidence does not match its release contract")
     return expected
 
 
@@ -204,14 +250,16 @@ def parser() -> argparse.ArgumentParser:
     for command in (create, verify):
         command.add_argument("--unsigned", required=True, type=pathlib.Path)
         command.add_argument("--signed", required=True, type=pathlib.Path)
+        command.add_argument("--catalog", required=True, type=pathlib.Path)
         command.add_argument("--fork-manifest", required=True, type=pathlib.Path)
-    create.add_argument("--signer-subject", required=True)
-    create.add_argument("--signer-thumbprint", required=True)
+        command.add_argument("--signature-evidence", required=True, type=pathlib.Path)
     create.add_argument("--output", required=True, type=pathlib.Path)
     verify.add_argument("--manifest", required=True, type=pathlib.Path)
     verify_signed = commands.add_parser("verify-signed")
     verify_signed.add_argument("--signed", required=True, type=pathlib.Path)
+    verify_signed.add_argument("--catalog", required=True, type=pathlib.Path)
     verify_signed.add_argument("--fork-manifest", required=True, type=pathlib.Path)
+    verify_signed.add_argument("--signature-evidence", required=True, type=pathlib.Path)
     verify_signed.add_argument("--manifest", required=True, type=pathlib.Path)
     return result
 
@@ -225,19 +273,28 @@ def main() -> int:
             value = build_contract(
                 args.unsigned,
                 args.signed,
+                args.catalog,
                 args.fork_manifest,
-                args.signer_subject,
-                args.signer_thumbprint,
+                args.signature_evidence,
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         elif args.command == "verify":
             value = verify_contract(
-                args.manifest, args.unsigned, args.signed, args.fork_manifest
+                args.manifest,
+                args.unsigned,
+                args.signed,
+                args.catalog,
+                args.fork_manifest,
+                args.signature_evidence,
             )
         else:
             value = verify_signed_contract(
-                args.manifest, args.signed, args.fork_manifest
+                args.manifest,
+                args.signed,
+                args.catalog,
+                args.fork_manifest,
+                args.signature_evidence,
             )
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0

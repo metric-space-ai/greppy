@@ -144,9 +144,15 @@ baselines remain pinned until their refs are removed.
 - Windows x86_64 uses Greppy's minimal WinFsp transport fork because unchanged
   WinFsp 2.1 rejects `FileLinkInformation` before userspace. The fork forwards
   real hardlink operations to the same Rust provider and ships with its exact
-  corresponding source. The release remains blocked until the exact driver is
-  Microsoft-signed and the installed MSI passes the common mounted contract,
-  upgrade, uninstall, isolation and performance gates. Greppy does not
+  corresponding source. The release requires a Hardware Dev Center
+  HLK/dashboard signature: the returned catalog must contain Windows Hardware
+  Driver Verification EKU `1.3.6.1.4.1.311.10.3.5` and must not contain the
+  attestation EKU `1.3.6.1.4.1.311.10.3.5.1`. The catalog, signer evidence,
+  signed driver and canonical unsigned PE payload are hash-bound in the
+  release contract. Attestation signing is accepted neither as production
+  evidence nor as a release shortcut. The release remains blocked until that
+  exact driver is signed and the installed MSI passes the common mounted
+  contract, upgrade, uninstall, isolation and performance gates. Greppy does not
   substitute copies or aliases, does not use ProjFS, and does not rely on NTFS
   CoW behavior.
 

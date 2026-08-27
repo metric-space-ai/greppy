@@ -464,9 +464,12 @@ The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3 and a macOS
 transport fork compile and pass their direct contracts. The fork forwards
 `FileLinkInformation` to the Rust provider instead of rejecting hardlink
 creation in the transport layer. Greppy does not emulate hardlinks with copies
-or aliases. Release still requires the exact fork driver to be Microsoft-
-signed and to pass the identical mounted, install, upgrade, uninstall,
-isolation, and performance contracts on Windows before 0.3.4 can ship. None of
+or aliases. Release still requires the exact fork driver and returned catalog
+to carry a non-attestation Hardware Dev Center HLK/dashboard signature. Their
+hashes, signer EKUs and the canonical unsigned PE payload are bound into the
+release contract. The installed MSI must then pass the identical mounted,
+install, upgrade, uninstall, isolation, and performance contracts on Windows
+before 0.3.4 can ship. None of
 these providers requires APFS
 clones, Btrfs subvolumes, reflinks, NTFS block cloning, or another host-
 filesystem CoW feature. The small macOS extension host is Swift because FSKit

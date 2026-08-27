@@ -346,22 +346,31 @@ jobs:
         shell: pwsh
         env:
           SIGNED_DRIVER_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 }}
+          SIGNED_CATALOG_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_CATALOG_BASE64 }}
           DRIVER_CONTRACT_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64 }}
         run: |
-          if (-not $env:SIGNED_DRIVER_BASE64 -or -not $env:DRIVER_CONTRACT_BASE64) {
-            throw 'signed Windows release requires the Microsoft-signed Greppy driver and its contract'
+          if (-not $env:SIGNED_DRIVER_BASE64 -or -not $env:SIGNED_CATALOG_BASE64 -or -not $env:DRIVER_CONTRACT_BASE64) {
+            throw 'signed Windows release requires the HLK/dashboard-signed Greppy driver, catalog and contract'
           }
           $unsigned = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.sys'
           $signed = Join-Path $PWD 'target\release\greppyworkspacefsp-x64.sys'
+          $catalog = Join-Path $PWD 'target\release\greppyworkspacefsp-x64.cat'
+          $signatureEvidence = Join-Path $PWD 'target\release\greppy-windows-driver-signature-evidence.json'
           $contract = Join-Path $PWD 'target\release\greppy-windows-driver-contract.json'
           [IO.File]::WriteAllBytes($signed, [Convert]::FromBase64String($env:SIGNED_DRIVER_BASE64))
+          [IO.File]::WriteAllBytes($catalog, [Convert]::FromBase64String($env:SIGNED_CATALOG_BASE64))
           [IO.File]::WriteAllBytes($contract, [Convert]::FromBase64String($env:DRIVER_CONTRACT_BASE64))
-          & signtool verify /kp /all /v $signed
-          if ($LASTEXITCODE -ne 0) { throw 'Microsoft-signed Greppy driver failed kernel-policy verification' }
+          tools/verify_windows_driver_signatures.ps1 `
+            -DriverPath $signed `
+            -CatalogPath $catalog `
+            -OutputPath $signatureEvidence
+          if ($LASTEXITCODE -ne 0) { throw 'Greppy driver is not HLK/dashboard signed' }
           python tools/windows_driver_contract.py verify `
             --unsigned $unsigned `
             --signed $signed `
+            --catalog $catalog `
             --fork-manifest third_party/winfsp-greppy/upstream.json `
+            --signature-evidence $signatureEvidence `
             --manifest $contract
           if ($LASTEXITCODE -ne 0) { throw 'Microsoft-signed Greppy driver is not bound to this fork build' }
 
@@ -669,9 +678,12 @@ jobs:
           Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
           Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
           Copy-Item target/release/greppyworkspacefsp-x64.sys dist/greppyworkspacefsp-x64.sys
+          if (Test-Path target/release/greppyworkspacefsp-x64.cat) {
+            Copy-Item target/release/greppyworkspacefsp-x64.cat dist/greppyworkspacefsp-x64.cat
+          }
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
           Copy-Item tools/release_artifacts.py dist/release_artifacts.py
-          Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py,tools/windows_driver_contract.py dist/
+          Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py,tools/windows_driver_contract.py,tools/verify_windows_driver_signatures.ps1 dist/
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
           Copy-Item licenses dist/licenses -Recurse
           $version = (& target/release/greppy.exe --version).Split(' ')[-1]
@@ -683,7 +695,11 @@ jobs:
           if ($env:SHOULD_SIGN -eq 'true') {
             Copy-Item target/release/greppy-windows-driver-contract.json dist/
             Copy-Item target/release/greppy-windows-driver-contract.json ./greppy-windows-driver-contract.json
+            Copy-Item target/release/greppy-windows-driver-signature-evidence.json dist/
+            Copy-Item target/release/greppy-windows-driver-signature-evidence.json ./greppy-windows-driver-signature-evidence.json
+            Copy-Item target/release/greppyworkspacefsp-x64.cat ./greppyworkspacefsp-x64.cat
             $arguments.UnsignedDriverPath = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.sys'
+            $arguments.DriverCatalogPath = 'target/release/greppyworkspacefsp-x64.cat'
             $arguments.DriverContractPath = 'target/release/greppy-windows-driver-contract.json'
           } else {
             $arguments.AllowUnsignedForSmokeTest = $true
@@ -880,6 +896,14 @@ jobs:
         with:
           subject-path: greppy-windows-driver-contract.json
 
+      - name: Attest Windows HLK signature evidence
+        if: runner.os == 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run)
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: |
+            greppy-windows-driver-signature-evidence.json
+            greppyworkspacefsp-x64.cat
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -896,6 +920,8 @@ jobs:
             greppy-winfsp-source.tar.gz
             greppy-winfsp-source.tar.gz.sha256
             greppy-windows-driver-contract.json
+            greppy-windows-driver-signature-evidence.json
+            greppyworkspacefsp-x64.cat
 
   verify-packages:
     name: clean package (${{ matrix.name }})
@@ -1083,9 +1109,18 @@ jobs:
             }
             & signtool verify /kp /all /v (Join-Path $adminRoot 'greppyworkspacefsp-x64.sys')
             if ($LASTEXITCODE -ne 0) { throw 'kernel driver signature verification failed' }
+            $catalog = Join-Path $adminRoot 'greppyworkspacefsp-x64.cat'
+            $signatureEvidence = Join-Path $PWD 'clean-windows-driver-signature-evidence.json'
+            & (Join-Path $adminRoot 'verify_windows_driver_signatures.ps1') `
+              -DriverPath (Join-Path $adminRoot 'greppyworkspacefsp-x64.sys') `
+              -CatalogPath $catalog `
+              -OutputPath $signatureEvidence
+            if ($LASTEXITCODE -ne 0) { throw 'installed driver is not HLK/dashboard signed' }
             python (Join-Path $adminRoot 'windows_driver_contract.py') verify-signed `
               --signed (Join-Path $adminRoot 'greppyworkspacefsp-x64.sys') `
+              --catalog $catalog `
               --fork-manifest third_party/winfsp-greppy/upstream.json `
+              --signature-evidence $signatureEvidence `
               --manifest (Join-Path $adminRoot 'greppy-windows-driver-contract.json')
             if ($LASTEXITCODE -ne 0) { throw 'installed driver contract verification failed' }
           }

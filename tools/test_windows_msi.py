@@ -33,7 +33,9 @@ class WindowsMsiTests(unittest.TestCase):
             "$WixPackageSha256 = 'f30ef0c74e2a986126539c5780be93ac24e8136eaf723b1937b26272703ae173'",
             source,
         )
-        self.assertIn("signtool verify /kp /all /v", source)
+        self.assertIn("verify_windows_driver_signatures.ps1", source)
+        self.assertIn("-DriverCatalogPath", source)
+        self.assertIn("greppy-windows-driver-signature-evidence.json", source)
         self.assertIn("windows_driver_contract.py') verify", source)
         self.assertIn("wix msi validate", source)
         workflow = (ROOT / ".github/workflows/filesystem-cow.yml").read_text(
@@ -47,6 +49,17 @@ class WindowsMsiTests(unittest.TestCase):
             "          --features ci-test-assets,cpu-only,bash-smart",
             workflow,
         )
+
+    def test_driver_signature_gate_rejects_attestation(self):
+        source = (
+            ROOT / "tools/verify_windows_driver_signatures.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("signtool verify /kp /all /v", source)
+        self.assertIn("Get-AuthenticodeSignature", source)
+        self.assertIn("1.3.6.1.4.1.311.10.3.5'", source)
+        self.assertIn("1.3.6.1.4.1.311.10.3.5.1'", source)
+        self.assertIn("attestation-signed driver is not release eligible", source)
+        self.assertIn("signature_class = 'hlk-dashboard'", source)
 
 
 if __name__ == "__main__":

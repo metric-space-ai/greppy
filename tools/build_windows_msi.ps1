@@ -10,6 +10,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Version,
     [string]$UnsignedDriverPath,
+    [string]$DriverCatalogPath,
     [string]$DriverContractPath,
     [switch]$AllowUnsignedForSmokeTest
 )
@@ -44,6 +45,8 @@ $required = @(
     'SUPPORT.md',
     'CHANGELOG.md',
     'Cargo.lock',
+    'windows_driver_contract.py',
+    'verify_windows_driver_signatures.ps1',
     'licenses\WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt'
 )
 foreach ($relative in $required) {
@@ -60,24 +63,45 @@ if ($LASTEXITCODE -ne 0 -or $reported.Split(' ')[-1] -ne $Version) {
 
 $signedDriver = Join-Path $DistDir 'greppyworkspacefsp-x64.sys'
 if ($AllowUnsignedForSmokeTest) {
-    if ($UnsignedDriverPath -or $DriverContractPath) {
-        throw 'unsigned smoke builds must not accept a driver contract'
+    if ($UnsignedDriverPath -or $DriverCatalogPath -or $DriverContractPath) {
+        throw 'unsigned smoke builds must not accept signed driver evidence'
     }
     Write-Warning 'building an unsigned MSI for compile/ICE smoke only; it is not release eligible'
 } else {
-    if (-not $UnsignedDriverPath -or -not $DriverContractPath) {
-        throw 'release MSI requires -UnsignedDriverPath and -DriverContractPath'
+    if (-not $UnsignedDriverPath -or -not $DriverCatalogPath -or -not $DriverContractPath) {
+        throw 'release MSI requires -UnsignedDriverPath, -DriverCatalogPath and -DriverContractPath'
     }
     $UnsignedDriverPath = Resolve-FullPath $UnsignedDriverPath
+    $DriverCatalogPath = Resolve-FullPath $DriverCatalogPath
     $DriverContractPath = Resolve-FullPath $DriverContractPath
-    & signtool verify /kp /all /v $signedDriver
-    if ($LASTEXITCODE -ne 0) { throw 'private workspace driver failed kernel-policy signature verification' }
-    python (Join-Path $RepoRoot 'tools\windows_driver_contract.py') verify `
-        --unsigned $UnsignedDriverPath `
-        --signed $signedDriver `
-        --fork-manifest $ForkManifest `
-        --manifest $DriverContractPath
-    if ($LASTEXITCODE -ne 0) { throw 'private workspace driver contract verification failed' }
+    foreach ($releaseEvidence in @(
+        $DriverCatalogPath,
+        $DriverContractPath,
+        (Join-Path $DistDir 'greppy-windows-driver-signature-evidence.json')
+    )) {
+        if (-not (Test-Path -LiteralPath $releaseEvidence -PathType Leaf)) {
+            throw "release MSI is missing signed driver evidence: $releaseEvidence"
+        }
+    }
+    $signatureEvidence = Join-Path ([IO.Path]::GetTempPath()) "greppy-driver-signature-$([Guid]::NewGuid().ToString('N')).json"
+    try {
+        & (Join-Path $RepoRoot 'tools\verify_windows_driver_signatures.ps1') `
+            -DriverPath $signedDriver `
+            -CatalogPath $DriverCatalogPath `
+            -OutputPath $signatureEvidence
+        if ($LASTEXITCODE -ne 0) { throw 'private workspace driver is not HLK/dashboard signed' }
+        python (Join-Path $RepoRoot 'tools\windows_driver_contract.py') verify `
+            --unsigned $UnsignedDriverPath `
+            --signed $signedDriver `
+            --catalog $DriverCatalogPath `
+            --fork-manifest $ForkManifest `
+            --signature-evidence $signatureEvidence `
+            --manifest $DriverContractPath
+        if ($LASTEXITCODE -ne 0) { throw 'private workspace driver contract verification failed' }
+    }
+    finally {
+        Remove-Item -LiteralPath $signatureEvidence -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $scratch = Join-Path ([IO.Path]::GetTempPath()) "greppy-msi-$([Guid]::NewGuid().ToString('N'))"

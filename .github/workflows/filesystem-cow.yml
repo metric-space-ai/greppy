@@ -418,25 +418,34 @@ jobs:
         shell: pwsh
         env:
           SIGNED_DRIVER_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 }}
+          SIGNED_CATALOG_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_CATALOG_BASE64 }}
           DRIVER_CONTRACT_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64 }}
         run: |
-          if (-not $env:SIGNED_DRIVER_BASE64 -or -not $env:DRIVER_CONTRACT_BASE64) {
-            throw 'real Windows mount gate requires the Microsoft-signed private driver and contract'
+          if (-not $env:SIGNED_DRIVER_BASE64 -or -not $env:SIGNED_CATALOG_BASE64 -or -not $env:DRIVER_CONTRACT_BASE64) {
+            throw 'real Windows mount gate requires the HLK/dashboard-signed private driver, catalog and contract'
           }
           $build = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release'
           $runtime = Join-Path $env:RUNNER_TEMP 'greppy-winfsp-runtime'
           New-Item -ItemType Directory -Force $runtime | Out-Null
           Copy-Item "$build\greppyworkspacefsp-x64.dll" $runtime
           $signed = Join-Path $runtime 'greppyworkspacefsp-x64.sys'
+          $catalog = Join-Path $runtime 'greppyworkspacefsp-x64.cat'
+          $signatureEvidence = Join-Path $runtime 'greppy-windows-driver-signature-evidence.json'
           $contract = Join-Path $runtime 'greppy-windows-driver-contract.json'
           [IO.File]::WriteAllBytes($signed, [Convert]::FromBase64String($env:SIGNED_DRIVER_BASE64))
+          [IO.File]::WriteAllBytes($catalog, [Convert]::FromBase64String($env:SIGNED_CATALOG_BASE64))
           [IO.File]::WriteAllBytes($contract, [Convert]::FromBase64String($env:DRIVER_CONTRACT_BASE64))
-          & signtool verify /kp /all /v $signed
-          if ($LASTEXITCODE -ne 0) { throw 'private driver failed kernel-policy verification' }
+          tools/verify_windows_driver_signatures.ps1 `
+            -DriverPath $signed `
+            -CatalogPath $catalog `
+            -OutputPath $signatureEvidence
+          if ($LASTEXITCODE -ne 0) { throw 'private driver is not HLK/dashboard signed' }
           python tools/windows_driver_contract.py verify `
             --unsigned "$build\greppyworkspacefsp-x64.sys" `
             --signed $signed `
+            --catalog $catalog `
             --fork-manifest third_party/winfsp-greppy/upstream.json `
+            --signature-evidence $signatureEvidence `
             --manifest $contract
           if ($LASTEXITCODE -ne 0) { throw 'private driver contract verification failed' }
           & regsvr32.exe /s (Join-Path $runtime 'greppyworkspacefsp-x64.dll')

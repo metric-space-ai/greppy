@@ -21,6 +21,8 @@
     {"name": "greppy-windows-x86_64.msi.spdx.json", "role": "sbom"},
     {"name": "build-environment-windows-x86_64.json", "role": "build-environment"},
     {"name": "greppy-windows-driver-contract.json", "role": "driver-provenance"},
+    {"name": "greppy-windows-driver-signature-evidence.json", "role": "driver-signature-evidence"},
+    {"name": "greppyworkspacefsp-x64.cat", "role": "driver-catalog"},
     {"name": "greppy-winfsp-source.tar.gz", "role": "corresponding-source"},
     {"name": "greppy-winfsp-source.tar.gz.sha256", "role": "checksum-sidecar"},
     {"name": "model-redistribution-report.json", "role": "model-provenance"},
