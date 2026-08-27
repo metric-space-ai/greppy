@@ -26,7 +26,7 @@ all assets into an empty directory so the exact release manifest can reject
 missing or unexpected files:
 
 ```bash
-version=v0.3.2
+version=v0.3.3
 mkdir "greppy-$version" && cd "greppy-$version"
 gh release download "$version" --repo metric-space-ai/greppy
 python3 - <<'PY'
@@ -76,7 +76,7 @@ For Windows, verify both the aggregate checksum and the Authenticode chain and
 timestamp before running the binary:
 
 ```powershell
-$version = 'v0.3.2'
+$version = 'v0.3.3'
 gh release download $version --repo metric-space-ai/greppy
 $line = (Select-String 'greppy-windows-x86_64.zip$' SHA256SUMS).Line
 $want = ($line -split '\s+')[0]

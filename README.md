@@ -90,7 +90,7 @@ embedded.
 [SUPPORT.md](SUPPORT.md) for the exact target list):
 
 ```bash
-version=v0.3.2
+version=v0.3.3
 asset=greppy-macos-arm64.tar.gz        # or greppy-linux-x86_64.tar.gz
 gh release download "$version" --repo metric-space-ai/greppy \
   --pattern "$asset" --pattern SHA256SUMS
@@ -111,9 +111,9 @@ only the two "Source code" links. The API and the bundled inventory are the
 source of truth:
 
 ```bash
-gh release view v0.3.2 --repo metric-space-ai/greppy \
+gh release view v0.3.3 --repo metric-space-ai/greppy \
   --json assets -q '.assets | length'          # → 22
-gh release download v0.3.2 --repo metric-space-ai/greppy \
+gh release download v0.3.3 --repo metric-space-ai/greppy \
   --pattern RELEASE-ASSETS.json                # machine-readable asset inventory
 gh attestation verify "$asset" --repo metric-space-ai/greppy   # build provenance
 ```
@@ -123,7 +123,7 @@ downloads ~780 MB of model files):
 
 ```bash
 git clone https://github.com/metric-space-ai/greppy && cd greppy
-git checkout v0.3.2
+git checkout v0.3.3
 ./tools/fetch_model_assets.sh
 cargo build --locked --release --bin greppy
 install -m 0755 target/release/greppy "$HOME/.local/bin/greppy"
@@ -527,7 +527,7 @@ rm "$HOME/.local/bin/greppy"     # or wherever you installed it
 
 ## Status
 
-**Current release: [v0.3.2](https://github.com/metric-space-ai/greppy/releases/tag/v0.3.2)**.
+**Current release: [v0.3.3](https://github.com/metric-space-ai/greppy/releases/tag/v0.3.3)**.
 Releases ship after CI, CodeQL, the security audit, the task-bank audit, and the
 summary-quality gate pass on the release commit, then get signed, notarized,
 and attested (SBOM + provenance). Agent benchmarks remain non-blocking
