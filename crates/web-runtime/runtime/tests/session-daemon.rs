@@ -1171,6 +1171,35 @@ fn rollback_script() -> PathBuf {
         .join("rollback-web-runtime.sh")
 }
 
+fn runtime_bin_names() -> [&'static str; 3] {
+    [
+        "web-runtime-supervisor",
+        "web-controller-worker",
+        "web-content-worker",
+    ]
+}
+
+fn write_canary_bins(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for (index, name) in runtime_bin_names().iter().enumerate() {
+        std::fs::write(dir.join(name), format!("canary-{index}")).unwrap();
+    }
+}
+
+fn assert_canary_bins(dir: &Path) {
+    for (index, name) in runtime_bin_names().iter().enumerate() {
+        let path = dir.join(name);
+        assert!(path.exists(), "missing canary {name} in {}", dir.display());
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            body,
+            format!("canary-{index}"),
+            "canary mutated {}",
+            path.display()
+        );
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -1361,6 +1390,159 @@ fn install_upgrade_rollback_refuse_hostile_destinations() {
         code, 0,
         "install root: stdout={stdout} stderr={stderr}"
     );
+}
+
+#[test]
+fn package_refuses_bin_directory_symlink_and_preserves_canaries() {
+    let pid = std::process::id();
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-binsym-{pid}"));
+    let canary = std::env::temp_dir().join(format!("greppy-web-canary-bins-{pid}"));
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&canary);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_eq!(code, 0, "seed package: stdout={stdout} stderr={stderr}");
+    write_canary_bins(&canary);
+    let bin = dest.join("bin");
+    for name in runtime_bin_names() {
+        std::fs::remove_file(bin.join(name)).unwrap();
+    }
+    std::fs::remove_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(&canary, &bin).unwrap();
+    assert!(bin.is_symlink(), "bin must be a parent symlink");
+    let stamp = dest.join(".greppy-web-runtime-dist");
+    assert!(stamp.exists(), "stamp should remain");
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_ne!(
+        code, 0,
+        "package through bin symlink: stdout={stdout} stderr={stderr}"
+    );
+    assert_canary_bins(&canary);
+    assert!(stamp.exists(), "package erased stamp via bin symlink");
+    let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&dest));
+    assert_ne!(
+        code, 0,
+        "uninstall through bin symlink: stdout={stdout} stderr={stderr}"
+    );
+    assert_canary_bins(&canary);
+    std::fs::remove_file(&bin).unwrap();
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&canary);
+}
+
+#[test]
+fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("greppy-web-dist-prevsrc-{pid}"));
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-prevdst-{pid}"));
+    let canary = std::env::temp_dir().join(format!("greppy-web-canary-prev-{pid}"));
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&canary);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
+    assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_eq!(code, 0, "install dest: stdout={stdout} stderr={stderr}");
+    write_canary_bins(&canary);
+    let previous = dest.join("previous");
+    std::os::unix::fs::symlink(&canary, &previous).unwrap();
+    assert!(previous.is_symlink(), "previous must be a parent symlink");
+    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let (code, stdout, stderr) = run_script_args(&upgrade_script(), &[&src, &dest]);
+    assert_ne!(
+        code, 0,
+        "upgrade through previous symlink: stdout={stdout} stderr={stderr}"
+    );
+    assert_canary_bins(&canary);
+    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after, original, "upgrade mutated dest through previous symlink");
+    let (code, stdout, stderr) = run_script(&rollback_script(), Some(&dest));
+    assert_ne!(
+        code, 0,
+        "rollback through previous symlink: stdout={stdout} stderr={stderr}"
+    );
+    assert_canary_bins(&canary);
+    std::fs::remove_file(&previous).unwrap();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&canary);
+}
+
+#[test]
+fn packaging_refuses_later_member_symlink_without_partial_erase() {
+    let pid = std::process::id();
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-late-{pid}"));
+    let canary = std::env::temp_dir().join(format!("greppy-web-canary-late-{pid}"));
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&canary);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_eq!(code, 0, "seed package: stdout={stdout} stderr={stderr}");
+    std::fs::create_dir_all(&canary).unwrap();
+    let canary_file = canary.join("content-canary");
+    std::fs::write(&canary_file, "keep-content").unwrap();
+    let content = dest.join("bin").join("web-content-worker");
+    std::fs::remove_file(&content).unwrap();
+    std::os::unix::fs::symlink(&canary_file, &content).unwrap();
+    let stamp = dest.join(".greppy-web-runtime-dist");
+    let supervisor = dest.join("bin").join("web-runtime-supervisor");
+    assert!(stamp.exists() && supervisor.exists());
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_ne!(
+        code, 0,
+        "package with later symlink member: stdout={stdout} stderr={stderr}"
+    );
+    assert!(stamp.exists(), "package deleted stamp before refusing later member");
+    assert!(
+        supervisor.exists(),
+        "package deleted earlier bin before refusing later member"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary_file).unwrap(),
+        "keep-content"
+    );
+    let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&dest));
+    assert_ne!(
+        code, 0,
+        "uninstall with later symlink member: stdout={stdout} stderr={stderr}"
+    );
+    assert!(stamp.exists(), "uninstall deleted stamp before refusing later member");
+    assert!(supervisor.exists(), "uninstall deleted earlier bin");
+    assert_eq!(
+        std::fs::read_to_string(&canary_file).unwrap(),
+        "keep-content"
+    );
+    std::fs::remove_file(&content).unwrap();
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&canary);
+}
+
+#[test]
+fn install_does_not_mutate_dest_when_source_is_incomplete() {
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("greppy-web-dist-badsrc-{pid}"));
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-keep-{pid}"));
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
+    assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_eq!(code, 0, "first install: stdout={stdout} stderr={stderr}");
+    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    std::fs::remove_file(src.join("bin").join("web-content-worker")).unwrap();
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_ne!(
+        code, 0,
+        "install incomplete source: stdout={stdout} stderr={stderr}"
+    );
+    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after, original, "incomplete install mutated dest");
+    for name in runtime_bin_names() {
+        assert!(
+            dest.join("bin").join(name).exists(),
+            "incomplete install removed {name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
 }
 
 #[test]
