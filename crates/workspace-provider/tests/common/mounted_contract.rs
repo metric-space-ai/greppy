@@ -369,7 +369,19 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::fs::MetadataExt as _;
+
         assert_eq!(fs::read(&uppercase).unwrap(), b"lowercase");
+        let lowercase_metadata = fs::metadata(&lowercase).unwrap();
+        let uppercase_metadata = fs::metadata(&uppercase).unwrap();
+        assert_eq!(
+            lowercase_metadata.volume_serial_number(),
+            uppercase_metadata.volume_serial_number()
+        );
+        assert_eq!(
+            lowercase_metadata.file_index(),
+            uppercase_metadata.file_index()
+        );
         let error = OpenOptions::new()
             .write(true)
             .create_new(true)

@@ -246,13 +246,14 @@ impl WindowsProvider {
     fn metadata(&self, raw: &str) -> Result<GreppyWindowsStat, c_int> {
         let now = system_time_ns(SystemTime::now());
         match self.parse(raw)? {
-            VirtualPath::Root | VirtualPath::Workspaces => Ok(synthetic_directory(raw, now)),
+            VirtualPath::Root => Ok(synthetic_directory("/", now)),
+            VirtualPath::Workspaces => Ok(synthetic_directory("/workspaces", now)),
             VirtualPath::Marker => {
                 let size = self.manifest_bytes()?.len() as u64;
                 Ok(GreppyWindowsStat {
                     mode: S_IFREG | 0o444,
                     size,
-                    inode: hash_path(raw),
+                    inode: hash_path("/.greppy-provider.json"),
                     nlink: 1,
                     accessed_unix_ns: now,
                     modified_unix_ns: now,
@@ -260,12 +261,15 @@ impl WindowsProvider {
                 })
             }
             VirtualPath::Doctor(relative) if relative.is_empty() => {
-                Ok(synthetic_directory(raw, now))
+                Ok(synthetic_directory("/doctor", now))
             }
             VirtualPath::Doctor(relative) => native_metadata(&self.doctor_path(&relative)?),
             VirtualPath::WorkspaceRoot(workspace) => {
-                self.workspace(&workspace)?;
-                Ok(synthetic_directory(raw, now))
+                let workspace = self.workspace(&workspace)?;
+                Ok(synthetic_directory(
+                    &format!("/workspaces/{}", workspace.id()),
+                    now,
+                ))
             }
             VirtualPath::WorkspacePath { workspace, path } => {
                 let handle = self.workspace(&workspace)?;
