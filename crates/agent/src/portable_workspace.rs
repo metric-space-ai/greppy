@@ -181,6 +181,7 @@ impl AgentWorkspace {
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
         trace_workspace_phase(run_id, "core-open", started);
+        recover_proposal_publish_journals(&core)?;
         recover_apply_journals(&core)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
         let (baseline, captured_snapshot_owns_chunks) =
@@ -395,22 +396,17 @@ impl AgentWorkspace {
 
         let ref_name = self.ref_name();
         let baseline_ref = format!("refs/greppy/baselines/{}", self.run_id);
-        git_ok(
-            &self.repo_root,
-            &["update-ref", &baseline_ref, &self.baseline_view_commit],
-        )?;
-        self.core.preserve_proposal(
+        publish_proposal_transaction(
+            &self.core,
             &self.handle,
+            &self.repo_root,
             &ref_name,
+            &baseline_ref,
+            &self.baseline_view_commit,
             &self.baseline_tree,
             &final_tree,
             &commit,
         )?;
-        if let Err(error) = git_ok(&self.repo_root, &["update-ref", &ref_name, &commit]) {
-            let _ = self.core.remove_proposal(&ref_name);
-            let _ = git_ok(&self.repo_root, &["update-ref", "-d", &baseline_ref]);
-            return Err(error);
-        }
         let patch = git_ok(
             &self.repo_root,
             &["diff", "--binary", &self.baseline_tree, &final_tree],
@@ -740,8 +736,23 @@ fn wait_for_tracker_path(
 pub fn apply_proposal(target_checkout: &Path, ref_name: &str) -> Result<(), WorkspaceError> {
     let data_root = workspace_data_root()?;
     let core = WorkspaceCore::open(data_root.join("core"))?;
+    recover_proposal_publish_journals(&core)?;
     recover_apply_journals(&core)?;
     apply_from_core(&core, target_checkout, ref_name, None)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProposalPublishJournal {
+    schema: u32,
+    workspace_id: String,
+    ref_name: String,
+    baseline_ref: String,
+    repository: PathBuf,
+    baseline_hash: String,
+    baseline_view_commit: String,
+    baseline_tree: String,
+    final_tree: String,
+    proposal_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -762,6 +773,280 @@ fn test_crash_point(point: &str) {
     {
         std::process::abort();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_proposal_transaction(
+    core: &WorkspaceCore,
+    workspace: &WorkspaceHandle,
+    repository: &Path,
+    ref_name: &str,
+    baseline_ref: &str,
+    baseline_view_commit: &str,
+    baseline_tree: &str,
+    final_tree: &str,
+    proposal_commit: &str,
+) -> Result<(), WorkspaceError> {
+    let baseline = core.workspace_baseline(workspace)?;
+    let journal = ProposalPublishJournal {
+        schema: 1,
+        workspace_id: workspace.id().into(),
+        ref_name: ref_name.into(),
+        baseline_ref: baseline_ref.into(),
+        repository: repository.canonicalize()?,
+        baseline_hash: baseline.baseline_hash,
+        baseline_view_commit: baseline_view_commit.into(),
+        baseline_tree: baseline_tree.into(),
+        final_tree: final_tree.into(),
+        proposal_commit: proposal_commit.into(),
+    };
+    validate_proposal_publish_journal(core, &journal, Path::new("proposal publication"))?;
+    let journal_path = publish_proposal_journal(core, &journal)?;
+    let result = (|| -> Result<(), WorkspaceError> {
+        git_ok(
+            &journal.repository,
+            &[
+                "update-ref",
+                &journal.baseline_ref,
+                &journal.baseline_view_commit,
+            ],
+        )?;
+        core.preserve_proposal(
+            workspace,
+            &journal.ref_name,
+            &journal.baseline_tree,
+            &journal.final_tree,
+            &journal.proposal_commit,
+        )?;
+        #[cfg(test)]
+        test_crash_point("proposal-after-core-record");
+        git_ok(
+            &journal.repository,
+            &["update-ref", &journal.ref_name, &journal.proposal_commit],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => remove_proposal_publish_journal(&journal_path),
+        Err(error) => {
+            if recover_proposal_publish_journal(core, &journal_path, &journal)? {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn proposal_publish_journal_root(core: &WorkspaceCore) -> PathBuf {
+    core.root().join("proposal-publish-journals")
+}
+
+fn publish_proposal_journal(
+    core: &WorkspaceCore,
+    journal: &ProposalPublishJournal,
+) -> Result<PathBuf, WorkspaceError> {
+    let root = proposal_publish_journal_root(core);
+    fs::create_dir_all(&root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(journal.repository.as_os_str().to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(journal.ref_name.as_bytes());
+    let id = format!("{:x}", hasher.finalize());
+    let path = root.join(format!("{id}.json"));
+    let temporary = root.join(format!(".{id}.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(journal)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, &path)?;
+    sync_directory(&root)?;
+    Ok(path)
+}
+
+fn recover_proposal_publish_journals(core: &WorkspaceCore) -> Result<(), WorkspaceError> {
+    let root = proposal_publish_journal_root(core);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = entries
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::Tampered {
+                path,
+                detail: "proposal publication journal is not a regular file".into(),
+            });
+        }
+        let bytes = fs::read(&path)?;
+        let journal: ProposalPublishJournal =
+            serde_json::from_slice(&bytes).map_err(|error| WorkspaceError::Tampered {
+                path: path.clone(),
+                detail: format!("proposal publication journal is invalid: {error}"),
+            })?;
+        recover_proposal_publish_journal(core, &path, &journal)?;
+    }
+    Ok(())
+}
+
+fn recover_proposal_publish_journal(
+    core: &WorkspaceCore,
+    journal_path: &Path,
+    journal: &ProposalPublishJournal,
+) -> Result<bool, WorkspaceError> {
+    let _workspace = validate_proposal_publish_journal(core, journal, journal_path)?;
+    let proposal = if core.has_proposal(&journal.ref_name)? {
+        Some(core.proposal(&journal.ref_name)?)
+    } else {
+        None
+    };
+    if let Some(proposal) = proposal.as_ref() {
+        if proposal.repository != journal.repository
+            || proposal.baseline_hash != journal.baseline_hash
+            || proposal.baseline_tree != journal.baseline_tree
+            || proposal.final_tree != journal.final_tree
+            || proposal.proposal_commit != journal.proposal_commit
+        {
+            return Err(WorkspaceError::Tampered {
+                path: journal_path.to_path_buf(),
+                detail: "proposal publication journal does not match the pinned proposal".into(),
+            });
+        }
+    }
+    let proposal_ref = read_optional_commit_ref(&journal.repository, &journal.ref_name)?;
+    let baseline_ref = read_optional_commit_ref(&journal.repository, &journal.baseline_ref)?;
+    let complete = proposal.is_some()
+        && proposal_ref.as_deref() == Some(journal.proposal_commit.as_str())
+        && baseline_ref.as_deref() == Some(journal.baseline_view_commit.as_str());
+    if complete {
+        remove_proposal_publish_journal(journal_path)?;
+        return Ok(true);
+    }
+    delete_ref_if_expected(
+        &journal.repository,
+        &journal.ref_name,
+        proposal_ref,
+        &journal.proposal_commit,
+        journal_path,
+    )?;
+    delete_ref_if_expected(
+        &journal.repository,
+        &journal.baseline_ref,
+        baseline_ref,
+        &journal.baseline_view_commit,
+        journal_path,
+    )?;
+    if proposal.is_some() {
+        core.remove_proposal(&journal.ref_name)?;
+    }
+    remove_proposal_publish_journal(journal_path)?;
+    Ok(false)
+}
+
+fn validate_proposal_publish_journal(
+    core: &WorkspaceCore,
+    journal: &ProposalPublishJournal,
+    journal_path: &Path,
+) -> Result<WorkspaceHandle, WorkspaceError> {
+    let invalid = |detail: &str| WorkspaceError::Tampered {
+        path: journal_path.to_path_buf(),
+        detail: detail.into(),
+    };
+    if journal.schema != 1 {
+        return Err(invalid("unsupported proposal publication journal schema"));
+    }
+    validate_run_id(&journal.workspace_id)?;
+    if journal.ref_name != format!("refs/greppy/agent/{}", journal.workspace_id)
+        || journal.baseline_ref != format!("refs/greppy/baselines/{}", journal.workspace_id)
+    {
+        return Err(invalid(
+            "proposal publication refs do not match the workspace id",
+        ));
+    }
+    for (name, value) in [
+        (
+            "baseline view commit",
+            journal.baseline_view_commit.as_str(),
+        ),
+        ("baseline tree", journal.baseline_tree.as_str()),
+        ("final tree", journal.final_tree.as_str()),
+        ("proposal commit", journal.proposal_commit.as_str()),
+    ] {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid(&format!("invalid {name}")));
+        }
+    }
+    let repository = journal.repository.canonicalize()?;
+    if repository != journal.repository {
+        return Err(invalid("proposal publication repository is not canonical"));
+    }
+    let workspace = core.open_workspace(&journal.workspace_id)?;
+    let baseline = core.workspace_baseline(&workspace)?;
+    if baseline.repository != repository || baseline.baseline_hash != journal.baseline_hash {
+        return Err(invalid(
+            "proposal publication journal does not match the workspace baseline",
+        ));
+    }
+    Ok(workspace)
+}
+
+fn read_optional_commit_ref(
+    repository: &Path,
+    ref_name: &str,
+) -> Result<Option<String>, WorkspaceError> {
+    let expression = format!("{ref_name}^{{commit}}");
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &expression])
+        .current_dir(repository)
+        .output()?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().into()));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(git_failed("git read proposal publication ref", &output))
+}
+
+fn delete_ref_if_expected(
+    repository: &Path,
+    ref_name: &str,
+    observed: Option<String>,
+    expected: &str,
+    journal_path: &Path,
+) -> Result<(), WorkspaceError> {
+    let Some(observed) = observed else {
+        return Ok(());
+    };
+    if observed != expected {
+        return Err(WorkspaceError::Tampered {
+            path: journal_path.to_path_buf(),
+            detail: format!("{ref_name} moved during proposal publication recovery"),
+        });
+    }
+    git_ok(repository, &["update-ref", "-d", ref_name, expected])?;
+    Ok(())
+}
+
+fn remove_proposal_publish_journal(path: &Path) -> Result<(), WorkspaceError> {
+    fs::remove_file(path)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 fn apply_from_core(
@@ -821,7 +1106,7 @@ fn apply_from_core(
             .collect(),
     };
     let journal_path = publish_apply_journal(core, &journal)?;
-    for (index, path) in journal.affected_paths.iter().enumerate() {
+    for path in &journal.affected_paths {
         if let Err(error) =
             materialize_git_tree_entry(&canonical_target, &proposal.final_tree, path)
         {
@@ -829,7 +1114,7 @@ fn apply_from_core(
             return Err(error);
         }
         #[cfg(test)]
-        if index == 0 {
+        if journal.affected_paths.first() == Some(path) {
             test_crash_point("apply-after-first-path");
         }
     }
@@ -1090,12 +1375,13 @@ fn restore_apply_journal(
 ) -> Result<(), WorkspaceError> {
     let repository = journal.repository.canonicalize()?;
     let proposal = core.proposal(&journal.ref_name)?;
-    if proposal.baseline_hash != journal.baseline_hash
+    if proposal.repository != repository
+        || proposal.baseline_hash != journal.baseline_hash
         || proposal.baseline_tree != journal.baseline_tree
     {
         return Err(WorkspaceError::Tampered {
             path: journal_path.to_path_buf(),
-            detail: "apply recovery journal does not match its pinned proposal".into(),
+            detail: "apply recovery journal does not match its pinned proposal metadata".into(),
         });
     }
     for path in &journal.affected_paths {
@@ -2268,6 +2554,7 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const APPLY_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_applies_proposal";
+    const PROPOSAL_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_publishes_proposal";
 
     #[test]
     fn crash_child_applies_proposal() {
@@ -2294,6 +2581,158 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success(), "apply crash child exited cleanly");
+    }
+
+    #[test]
+    fn crash_child_publishes_proposal() {
+        if std::env::var_os("GREPPY_AGENT_TEST_CRASH_POINT").is_none() {
+            return;
+        }
+        let core_root = std::env::var_os("GREPPY_AGENT_TEST_CRASH_CORE").unwrap();
+        let journal: ProposalPublishJournal =
+            serde_json::from_str(&std::env::var("GREPPY_AGENT_TEST_CRASH_JOURNAL").unwrap())
+                .unwrap();
+        let core = WorkspaceCore::open(core_root).unwrap();
+        let workspace = core.open_workspace(&journal.workspace_id).unwrap();
+        publish_proposal_transaction(
+            &core,
+            &workspace,
+            &journal.repository,
+            &journal.ref_name,
+            &journal.baseline_ref,
+            &journal.baseline_view_commit,
+            &journal.baseline_tree,
+            &journal.final_tree,
+            &journal.proposal_commit,
+        )
+        .unwrap();
+        panic!("proposal publication crash point did not abort the child process");
+    }
+
+    fn abort_proposal_publish_child(core_root: &Path, journal: &ProposalPublishJournal) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(PROPOSAL_CRASH_CHILD_TEST)
+            .arg("--nocapture")
+            .env(
+                "GREPPY_AGENT_TEST_CRASH_POINT",
+                "proposal-after-core-record",
+            )
+            .env("GREPPY_AGENT_TEST_CRASH_CORE", core_root)
+            .env(
+                "GREPPY_AGENT_TEST_CRASH_JOURNAL",
+                serde_json::to_string(journal).unwrap(),
+            )
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "proposal publication crash child exited cleanly"
+        );
+    }
+
+    fn json_journal_count(root: &Path) -> usize {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .count()
+    }
+
+    #[test]
+    fn proposal_publication_process_crash_rolls_back_then_commits_atomically() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.email", "test@example.test"]);
+        git(&repository, &["config", "user.name", "Test"]);
+        fs::write(repository.join("tracked.txt"), b"base\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-qm", "base"]);
+        let base_commit = git(&repository, &["rev-parse", "HEAD"]);
+        let baseline_tree = git(&repository, &["rev-parse", "HEAD^{tree}"]);
+
+        let core_root = temp.path().join("core");
+        let core = WorkspaceCore::open(&core_root).unwrap();
+        let baseline = capture_repository(&repository, core.chunks()).unwrap();
+        let baseline_hash = baseline.baseline_hash.clone();
+        let workspace = core.create_workspace("proposal-crash", baseline).unwrap();
+        fs::write(repository.join("tracked.txt"), b"proposal\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        let final_tree = git(&repository, &["write-tree"]);
+        let proposal_commit = commit_tree(
+            &repository,
+            &final_tree,
+            &base_commit,
+            "crash-safe proposal",
+        )
+        .unwrap();
+        git(&repository, &["reset", "--hard", "-q", &base_commit]);
+
+        let journal = ProposalPublishJournal {
+            schema: 1,
+            workspace_id: workspace.id().into(),
+            ref_name: "refs/greppy/agent/proposal-crash".into(),
+            baseline_ref: "refs/greppy/baselines/proposal-crash".into(),
+            repository: repository.canonicalize().unwrap(),
+            baseline_hash,
+            baseline_view_commit: base_commit,
+            baseline_tree,
+            final_tree,
+            proposal_commit,
+        };
+        drop(core);
+
+        abort_proposal_publish_child(&core_root, &journal);
+        let core = WorkspaceCore::open(&core_root).unwrap();
+        assert!(core.has_proposal(&journal.ref_name).unwrap());
+        assert_eq!(
+            read_optional_commit_ref(&journal.repository, &journal.baseline_ref)
+                .unwrap()
+                .as_deref(),
+            Some(journal.baseline_view_commit.as_str())
+        );
+        assert!(
+            read_optional_commit_ref(&journal.repository, &journal.ref_name)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(json_journal_count(&proposal_publish_journal_root(&core)), 1);
+
+        recover_proposal_publish_journals(&core).unwrap();
+        assert!(!core.has_proposal(&journal.ref_name).unwrap());
+        assert!(
+            read_optional_commit_ref(&journal.repository, &journal.baseline_ref)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(json_journal_count(&proposal_publish_journal_root(&core)), 0);
+
+        let workspace = core.open_workspace(&journal.workspace_id).unwrap();
+        publish_proposal_transaction(
+            &core,
+            &workspace,
+            &journal.repository,
+            &journal.ref_name,
+            &journal.baseline_ref,
+            &journal.baseline_view_commit,
+            &journal.baseline_tree,
+            &journal.final_tree,
+            &journal.proposal_commit,
+        )
+        .unwrap();
+        assert!(core.has_proposal(&journal.ref_name).unwrap());
+        assert_eq!(
+            read_optional_commit_ref(&journal.repository, &journal.ref_name)
+                .unwrap()
+                .as_deref(),
+            Some(journal.proposal_commit.as_str())
+        );
+        assert_eq!(json_journal_count(&proposal_publish_journal_root(&core)), 0);
     }
 
     #[test]
@@ -2802,6 +3241,19 @@ mod tests {
                 .map(|entry| (entry.path.clone(), entry.modified_unix_ns))
                 .collect(),
         };
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        let mut tampered_journal = journal.clone();
+        tampered_journal.repository = unrelated.canonicalize().unwrap();
+        let tampered_path = publish_apply_journal(&recovery_core, &tampered_journal).unwrap();
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Tampered { .. })
+        ));
+        assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        remove_apply_journal(&tampered_path).unwrap();
+
         let journal_path = publish_apply_journal(&recovery_core, &journal).unwrap();
         fs::write(repo.join("tracked.txt"), "partially applied\n").unwrap();
         recover_apply_journals(&recovery_core).unwrap();

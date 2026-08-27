@@ -629,6 +629,22 @@ impl WorkspaceCore {
             .ok_or_else(|| Error::NotFound(format!("unknown workspace {}", workspace.id)))
     }
 
+    /// Returns the immutable baseline bound to a workspace.
+    pub fn workspace_baseline(&self, workspace: &WorkspaceHandle) -> Result<BaselineSnapshot> {
+        let connection = self.lock_metadata()?;
+        let bytes = connection
+            .query_row(
+                "SELECT baseline_json FROM cow_workspaces WHERE id = ?1",
+                params![workspace.id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("unknown workspace {}", workspace.id)))?;
+        let baseline: BaselineSnapshot = serde_json::from_slice(&bytes)?;
+        crate::snapshot::validate_repository_snapshot_integrity(&baseline)?;
+        Ok(baseline)
+    }
+
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceStatus>> {
         let connection = self.lock_metadata()?;
         let mut statement = connection.prepare(
@@ -1713,6 +1729,18 @@ impl WorkspaceCore {
                     })
                 },
             )
+    }
+
+    pub fn has_proposal(&self, ref_name: &str) -> Result<bool> {
+        validate_proposal_ref(ref_name)?;
+        let connection = self.lock_metadata()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cow_proposals WHERE ref_name = ?1)",
+                params![ref_name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn remove_proposal(&self, ref_name: &str) -> Result<()> {
