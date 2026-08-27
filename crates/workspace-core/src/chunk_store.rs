@@ -545,6 +545,8 @@ impl ChunkStore {
         current.sync_data()?;
         segments.last_mut().unwrap().1 = segment_len;
         sync_directory(&self.root.join("segments"))?;
+        #[cfg(test)]
+        crate::test_crash_point("gc-after-segments-synced");
 
         for (id, len) in &segments {
             transaction.execute(

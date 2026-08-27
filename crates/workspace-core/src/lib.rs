@@ -32,3 +32,12 @@ pub use snapshot::{
     capture_repository_with_observer, BaselineDirectory, BaselineEntry, BaselineSnapshot,
     EntryKind,
 };
+
+#[cfg(test)]
+pub(crate) fn test_crash_point(point: &str) {
+    if std::env::var_os("GREPPY_WORKSPACE_TEST_CRASH_POINT").as_deref()
+        == Some(std::ffi::OsStr::new(point))
+    {
+        std::process::abort();
+    }
+}

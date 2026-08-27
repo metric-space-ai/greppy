@@ -1124,6 +1124,8 @@ impl WorkspaceCore {
             "write",
             &serde_json::to_vec(&(inode.id, new_size, &inode.chunks))?,
         )?;
+        #[cfg(test)]
+        crate::test_crash_point("write-after-journal");
         self.update_inode(workspace_id, inode.id, new_size, &inode.chunks)?;
         self.complete_namespace_journal(journal_id)?;
         for id in old {
@@ -1414,6 +1416,8 @@ impl WorkspaceCore {
                 .optional()?;
             insert_entry(&transaction, &workspace.id, &destination, inode.id)?;
             insert_tombstone(&transaction, &workspace.id, &source)?;
+            #[cfg(test)]
+            crate::test_crash_point("rename-before-commit");
             let mut released = Vec::new();
             if let Some((replaced_inode, chunks)) = replaced {
                 let remaining: i64 = transaction.query_row(
@@ -2668,6 +2672,47 @@ fn validate_oid(value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    const CRASH_CHILD_TEST: &str = "namespace::tests::crash_child_performs_operation";
+
+    #[test]
+    fn crash_child_performs_operation() {
+        let Some(point) = std::env::var_os("GREPPY_WORKSPACE_TEST_CRASH_POINT") else {
+            return;
+        };
+        let root = std::env::var_os("GREPPY_WORKSPACE_TEST_CRASH_ROOT").unwrap();
+        let workspace_id = std::env::var("GREPPY_WORKSPACE_TEST_CRASH_WORKSPACE_ID").unwrap();
+        let core = WorkspaceCore::open(root).unwrap();
+        let workspace = core.open_workspace(&workspace_id).unwrap();
+        match point.to_str().unwrap() {
+            "write-after-journal" => {
+                core.write(&workspace, "committed.bin", 0, b"uncommitted")
+                    .unwrap();
+            }
+            "rename-before-commit" => {
+                core.rename(&workspace, "source.txt", "destination.txt")
+                    .unwrap();
+            }
+            "gc-after-segments-synced" => {
+                core.gc().unwrap();
+            }
+            other => panic!("unknown crash point {other}"),
+        }
+        panic!("crash point {point:?} did not abort the child process");
+    }
+
+    fn abort_child_at(root: &Path, workspace: &WorkspaceHandle, point: &str) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(CRASH_CHILD_TEST)
+            .arg("--nocapture")
+            .env("GREPPY_WORKSPACE_TEST_CRASH_POINT", point)
+            .env("GREPPY_WORKSPACE_TEST_CRASH_ROOT", root)
+            .env("GREPPY_WORKSPACE_TEST_CRASH_WORKSPACE_ID", workspace.id())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "crash child unexpectedly exited cleanly");
+    }
+
     #[test]
     fn open_waits_for_a_short_concurrent_metadata_writer() {
         let root = tempfile::tempdir().unwrap();
@@ -3263,6 +3308,54 @@ mod tests {
         assert!(recovered.open_workspace(content.id()).is_err());
         assert!(recovered.open_workspace(git.id()).is_err());
         assert!(recovered.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_crashes_during_write_rename_and_gc_recover_atomically() {
+        let (_repo, storage, core, workspace) = fixture();
+        core.create_file(&workspace, "committed.bin", 0o100644)
+            .unwrap();
+        core.write(&workspace, "committed.bin", 0, b"committed")
+            .unwrap();
+        core.create_file(&workspace, "source.txt", 0o100644)
+            .unwrap();
+        core.write(&workspace, "source.txt", 0, b"source").unwrap();
+        drop(core);
+
+        abort_child_at(storage.path(), &workspace, "write-after-journal");
+        let reopened = WorkspaceCore::open(storage.path()).unwrap();
+        assert_eq!(
+            reopened.read(&workspace, "committed.bin", 0, 32).unwrap(),
+            b"committed"
+        );
+        drop(reopened);
+
+        abort_child_at(storage.path(), &workspace, "rename-before-commit");
+        let reopened = WorkspaceCore::open(storage.path()).unwrap();
+        assert_eq!(
+            reopened.read(&workspace, "source.txt", 0, 32).unwrap(),
+            b"source"
+        );
+        assert!(reopened
+            .metadata(&workspace, "destination.txt")
+            .unwrap()
+            .is_none());
+        reopened.chunks().put(b"unreferenced-before-gc").unwrap();
+        drop(reopened);
+
+        abort_child_at(storage.path(), &workspace, "gc-after-segments-synced");
+        let reopened = WorkspaceCore::open(storage.path()).unwrap();
+        assert_eq!(
+            reopened.read(&workspace, "committed.bin", 0, 32).unwrap(),
+            b"committed"
+        );
+        assert_eq!(
+            reopened.read(&workspace, "source.txt", 0, 32).unwrap(),
+            b"source"
+        );
+        reopened.gc().unwrap();
+        let stats = reopened.chunks().stats().unwrap();
+        assert_eq!(stats.chunk_count, stats.referenced_chunks);
     }
 
     #[test]
