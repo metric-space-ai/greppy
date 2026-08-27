@@ -25,6 +25,16 @@ use web_runtime::worker::require_capability;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn call_timeout(params: &serde_json::Value) -> Duration {
+    Duration::from_millis(
+        params
+            .get("timeout")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(ACTION_TIMEOUT.as_millis() as u64)
+            .clamp(20, 120_000),
+    )
+}
+
 #[derive(Clone)]
 struct WakeFlag(Arc<AtomicBool>);
 
@@ -619,7 +629,7 @@ impl ContentEngine {
                 let loading = webview.clone();
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
-                if !self.spin_until(ACTION_TIMEOUT, move || {
+                if !self.spin_until(call_timeout(&params), move || {
                     denied.denied_navigation.borrow().is_some()
                         || (loading.load_status() == LoadStatus::Complete
                             && loading.url().is_some_and(|current| {
@@ -1158,7 +1168,7 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
-                if !self.spin_until(ACTION_TIMEOUT, move || {
+                if !self.spin_until(call_timeout(&params), move || {
                     loading.load_status() == LoadStatus::Complete
                 })? {
                     return Err(io::Error::new(

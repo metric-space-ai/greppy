@@ -614,7 +614,7 @@
         "session-daemon"
       ],
       "known_differences": [
-        "options are unsupported; URL match ignores trailing slash"
+        "timeout and waitUntil load|domcontentloaded are accepted; referer, networkidle, and commit throw unsupported_playwright_operation; URL match ignores trailing slash"
       ]
     },
     {
@@ -1136,7 +1136,8 @@
         "oracle-setcontent"
       ],
       "known_differences": [
-        "oracle-setcontent.json covers setContent of a static HTML document only"
+        "oracle-setcontent.json covers setContent of a static HTML document only",
+        "timeout and waitUntil load|domcontentloaded are accepted; other setContent options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -1387,7 +1388,8 @@
       ],
       "known_differences": [
         "state argument ignored; waits for Servo LoadStatus::Complete",
-        "networkidle and other states throw unsupported_playwright_operation; load/domcontentloaded wait for Servo LoadStatus::Complete"
+        "networkidle and other states throw unsupported_playwright_operation; load/domcontentloaded wait for Servo LoadStatus::Complete",
+        "options.timeout is accepted; other waitForLoadState options throw"
       ]
     },
     {
@@ -2822,8 +2824,8 @@
         "frames"
       ],
       "known_differences": [
-        "main frame delegates to Page.goto; options throw",
-        "child same-origin iframe assigns iframe.src after decide_url, waits for contentDocument.readyState; options throw; returns {url} not a Playwright Response"
+        "main frame delegates to Page.goto; timeout and waitUntil load|domcontentloaded are accepted; referer/networkidle/commit throw",
+        "child same-origin iframe assigns iframe.src after decide_url, waits for contentDocument.readyState; timeout is accepted; returns {url} not a Playwright Response"
       ]
     },
     {
@@ -3099,7 +3101,7 @@
       ],
       "known_differences": [
         "main frame uses page.setContent",
-        "child same-origin iframe uses document.open/write/close via frameEvaluate; options throw unsupported_playwright_operation"
+        "child same-origin iframe uses document.open/write/close via frameEvaluate; timeout and waitUntil load|domcontentloaded are accepted; other options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -3213,7 +3215,8 @@
       ],
       "known_differences": [
         "main frame waits for Servo LoadStatus::Complete",
-        "child same-origin iframe polls document.readyState; networkidle and other states throw unsupported_playwright_operation"
+        "child same-origin iframe polls document.readyState; networkidle and other states throw unsupported_playwright_operation",
+        "options.timeout is accepted; other waitForLoadState options throw"
       ]
     },
     {
@@ -4680,7 +4683,7 @@
         "cookies"
       ],
       "known_differences": [
-        "storageState is the only accepted option; other Browser.newContext options stay unsupported"
+        "storageState and extraHTTPHeaders are the accepted options; viewport/userAgent/locale/timezoneId/geolocation/permissions/colorScheme stay unsupported"
       ]
     },
     {
@@ -4694,7 +4697,7 @@
         "compat-core"
       ],
       "known_differences": [
-        "implemented as newContext()+newPage(); options are unsupported"
+        "implemented as newContext()+newPage(); options are forwarded to newContext (storageState and extraHTTPHeaders accepted; others throw)"
       ]
     },
     {
@@ -6568,9 +6571,9 @@
         "locator-options"
       ],
       "known_differences": [
-        "options are unsupported",
+        "timeout is accepted; force/trial/position and other click options throw unsupported_playwright_operation",
         "visible = non-empty box plus computed display/visibility; hit-target is elementFromPoint at box center (element or descendant); overlay and visibility:hidden time out; not Chromium animation-stability or force",
-        "force/trial/position/timeout-as-options throw; page default timeout is used instead. Off-screen targets may scrollIntoView nearest then hit-test; not Chromium scroll padding or sticky-header handling"
+        "page default timeout is used when click options omit timeout. Off-screen targets may scrollIntoView nearest then hit-test; not Chromium scroll padding or sticky-header handling"
       ]
     },
     {
@@ -6615,7 +6618,8 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "two click_at plus a bubbling dblclick event; not Chromium click count"
+        "two click_at plus a bubbling dblclick event; not Chromium click count",
+        "timeout is accepted; other dblclick options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -6773,9 +6777,9 @@
         "actionability"
       ],
       "known_differences": [
-        "options are unsupported",
-        "oracle-fill.json covers assigning input.value via locator.fill; options are unsupported",
-        "fill waits for visible enabled non-readonly hit-target; readonly times out; force/noWaitAfter stay unsupported"
+        "timeout is accepted; other fill options throw unsupported_playwright_operation",
+        "oracle-fill.json covers assigning input.value via locator.fill; force/noWaitAfter stay unsupported",
+        "fill waits for visible enabled non-readonly hit-target; readonly times out"
       ]
     },
     {
@@ -7335,7 +7339,8 @@
         "tap-touch"
       ],
       "known_differences": [
-        "Servo InputEvent::Touch Down/Up at the locator center; no hasTouch context option or modifiers"
+        "Servo InputEvent::Touch Down/Up at the locator center; no hasTouch context option or modifiers",
+        "timeout is accepted; other tap options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -7408,7 +7413,7 @@
         "locator-options"
       ],
       "known_differences": [
-        "polls locator.evaluate until truthy; returns the value not a JSHandle; options throw"
+        "polls locator.evaluate until truthy; returns the value not a JSHandle; timeout is accepted; polling and other options throw unsupported_playwright_operation"
       ]
     },
     {

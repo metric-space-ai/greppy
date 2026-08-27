@@ -3403,3 +3403,99 @@ fn install_refuses_mutated_bin_and_leaves_dest_unmutated() {
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+#[test]
+fn max_network_bytes_limit_is_enforced_on_read() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-maxnet-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxnet", |command| {
+        command.env("GREPPY_WEB_MAX_NETWORK_BYTES", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxnet",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>net</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxnet",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("network limit"),
+        "{read:?}"
+    );
+}
+
+#[test]
+fn max_artifact_bytes_limit_is_enforced_on_read() {
+    let body = format!(
+        "<!DOCTYPE html><html><body><p>{}</p></body></html>",
+        "artifact-limit ".repeat(80)
+    );
+    let origin = serve_fixture(Box::leak(body.into_boxed_str()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-maxart-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxart", |command| {
+        command.env("GREPPY_WEB_MAX_ARTIFACT_BYTES", "8");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxart",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxart",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("artifact limit"),
+        "{read:?}"
+    );
+}

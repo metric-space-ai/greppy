@@ -48,6 +48,7 @@ await expectUnsupported("getByText exact false", () => page.getByText("Hel", { e
 await expectUnsupported("getByLabel exact false", () => page.getByLabel("Name", { exact: false }));
 await expectUnsupported("click force", () => page.locator("button").click({ force: true }));
 await expectUnsupported("click position", () => page.locator("button").click({ position: { x: 1, y: 1 } }));
+await page.locator("button").click({ timeout: 5_000 });
 await expectUnsupported("filter hasText regex", () => page.locator("p").filter({ hasText: /Hel/ }));
 await expectUnsupported("elementHandle", () => page.locator("button").elementHandle());
 page.setDefaultTimeout(2_000);
@@ -60,6 +61,18 @@ await page.evaluate(() => {
 if (!(await page.locator("body").waitForFunction(() => window.__n === 1))) {
   throw new Error("Locator.waitForFunction");
 }
+await page.evaluate(() => {
+  window.__n2 = 0;
+  setTimeout(() => {
+    window.__n2 = 1;
+  }, 40);
+});
+if (!(await page.locator("body").waitForFunction(() => window.__n2 === 1, undefined, { timeout: 2_000 }))) {
+  throw new Error("Locator.waitForFunction timeout");
+}
+await expectUnsupported("waitForFunction polling", () =>
+  page.locator("body").waitForFunction(() => true, undefined, { polling: 10 }),
+);
 let closed = 0;
 let prependClosed = 0;
 let pageClosed = 0;

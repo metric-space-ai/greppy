@@ -78,6 +78,16 @@ impl SessionLimits {
                 limits.controller_cpu_time = Duration::from_millis(value);
             }
         }
+        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_NETWORK_BYTES") {
+            if let Ok(value) = bytes.parse::<u64>() {
+                limits.max_network_bytes = value;
+            }
+        }
+        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_ARTIFACT_BYTES") {
+            if let Ok(value) = bytes.parse::<u64>() {
+                limits.max_artifact_bytes = value;
+            }
+        }
         limits
     }
 

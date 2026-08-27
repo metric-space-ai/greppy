@@ -151,6 +151,25 @@ if ((await p3.locator("body").innerText()).trim() !== "HEADER_OK") {
   throw new Error("context extra headers");
 }
 await ctxHeaders.close();
+const ctxLaunchHeaders = await browser.newContext({
+  extraHTTPHeaders: { "x-greppy-test": "yes" },
+});
+const p4 = await ctxLaunchHeaders.newPage();
+await p4.goto(fixtureUrl, { waitUntil: "load", timeout: 15_000 });
+await p4.waitForLoadState("load", { timeout: 15_000 });
+if ((await p4.locator("body").innerText()).trim() !== "HEADER_OK") {
+  throw new Error("newContext extraHTTPHeaders");
+}
+await expectUnsupported("newContext viewport", () =>
+  browser.newContext({ viewport: { width: 800, height: 600 } }),
+);
+await expectUnsupported("goto networkidle", () =>
+  p4.goto(fixtureUrl, { waitUntil: "networkidle" }),
+);
+await expectUnsupported("goto referer", () =>
+  p4.goto(fixtureUrl, { referer: "https://example.invalid/" }),
+);
+await ctxLaunchHeaders.close();
 let paused = false;
 try {
   await page.pause();

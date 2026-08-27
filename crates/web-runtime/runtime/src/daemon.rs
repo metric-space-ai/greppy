@@ -1110,9 +1110,13 @@ impl Daemon {
         let downloads = self
             .engine_call("page.downloads", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
+        let recorded_responses = self
+            .engine_call("page.responses", json!({ "page": page }))
+            .map_err(|error| engine_error(request, error, 34))?;
         let records = json!({
             "messages": console.get("messages").cloned().unwrap_or(json!([])),
             "downloads": downloads.get("downloads").cloned().unwrap_or(json!([])),
+            "responses": recorded_responses.get("responses").cloned().unwrap_or(json!([])),
         });
         match apply_record_limits(&mut self.sessions, session_id, &records) {
             Ok(()) => Ok(()),
@@ -1594,6 +1598,16 @@ fn apply_record_limits(
     session.limits.check_download_bytes(0, download_bytes)?;
     session.console_bytes = console_bytes;
     session.download_bytes = download_bytes;
+    let recorded_network = records
+        .get("responses")
+        .and_then(|value| value.as_array())
+        .map(|rows| sum_byte_lengths(rows))
+        .unwrap_or(0);
+    if recorded_network > 0 {
+        let accounted = session.network_bytes.max(recorded_network);
+        session.limits.check_network_bytes(0, accounted)?;
+        session.network_bytes = accounted;
+    }
     Ok(())
 }
 

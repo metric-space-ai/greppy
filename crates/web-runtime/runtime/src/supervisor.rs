@@ -352,9 +352,17 @@ fn poll_session_records(
         serde_json::json!({ "page": page }),
         timeout,
     )?;
+    let responses = sidecar_engine_call(
+        content,
+        sidecar,
+        "page.responses",
+        serde_json::json!({ "page": page }),
+        timeout,
+    )?;
     let records = serde_json::json!({
         "messages": console.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
         "downloads": downloads.get("downloads").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "responses": responses.get("responses").cloned().unwrap_or_else(|| serde_json::json!([])),
     });
     gate.after_records(&records)
 }

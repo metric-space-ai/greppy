@@ -64,6 +64,27 @@ function refuseLocatorOptions(prefix, options, allowed) {
   }
 }
 
+function navigationTimeout(ownerTimeout, options, prefix) {
+  if (options != null) {
+    refuseLocatorOptions(prefix, options, ["timeout", "waitUntil"]);
+    if (
+      options.waitUntil != null &&
+      options.waitUntil !== "load" &&
+      options.waitUntil !== "domcontentloaded"
+    ) {
+      throwUnsupported(`${prefix}.waitUntil`);
+    }
+  }
+  return (options && options.timeout) || ownerTimeout || 30_000;
+}
+
+function actionTimeout(locator, options, prefix) {
+  if (options != null) {
+    refuseLocatorOptions(prefix, options, ["timeout"]);
+  }
+  return (options && options.timeout) || locator._page._timeout || 30_000;
+}
+
 function withUnsupported(target, prefix) {
   return new Proxy(target, {
     get(obj, prop) {
@@ -306,34 +327,28 @@ class Locator {
   }
 
   async click(options) {
-    if (options != null) {
-      return unsupported("Locator.click.options")();
-    }
+    const timeout = actionTimeout(this, options, "Locator.click");
     if (this._selector && this._selector.type === "css" && this._selector.value) {
       this._page._lastFileSelector = this._selector.value;
     }
     await engineCall("locator.click", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
     await this._page._flushPopups();
   }
 
   async tap(options) {
-    if (options != null) {
-      return unsupported("Locator.tap.options")();
-    }
+    const timeout = actionTimeout(this, options, "Locator.tap");
     await engineCall("locator.tap", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
     await this._page._flushPopups();
   }
 
   async fill(value, options) {
-    if (options != null) {
-      return unsupported("Locator.fill.options")();
-    }
+    const timeout = actionTimeout(this, options, "Locator.fill");
     await engineCall("locator.fill", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
       value: String(value),
       editable: true,
     });
@@ -390,10 +405,8 @@ class Locator {
   }
 
   async waitForFunction(pageFunction, arg, options) {
-    if (options != null) {
-      return unsupported("Locator.waitForFunction.options")();
-    }
-    const deadline = Date.now() + (this._page._timeout || 30_000);
+    refuseLocatorOptions("Locator.waitForFunction", options, ["timeout"]);
+    const deadline = Date.now() + ((options && options.timeout) || this._page._timeout || 30_000);
     while (Date.now() < deadline) {
       const value = await this.evaluate(pageFunction, arg);
       if (value) {
@@ -538,11 +551,9 @@ class Locator {
   }
 
   async dblclick(options) {
-    if (options != null) {
-      return unsupported("Locator.dblclick.options")();
-    }
+    const timeout = actionTimeout(this, options, "Locator.dblclick");
     await engineCall("locator.dblclick", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
@@ -1014,13 +1025,12 @@ class Frame {
 
   async goto(url, options) {
     if (this._id !== "main") {
-      if (options != null) {
-        return unsupported("Frame.goto.options")();
-      }
+      const timeout = navigationTimeout(this._page._timeout, options, "Frame.goto");
       const result = await engineCall("page.frameGoto", {
         page: this._page._id,
         index: Number(this._id),
         url: String(url),
+        timeout,
       });
       this._url = result.url || String(url);
       await this._page._dispatchFrames();
@@ -1030,9 +1040,7 @@ class Frame {
   }
 
   async setContent(html, options) {
-    if (options != null) {
-      return unsupported("Frame.setContent.options")();
-    }
+    navigationTimeout(this._page._timeout, options, "Frame.setContent");
     if (this._id !== "main") {
       await this.evaluate((markup) => {
         document.open();
@@ -1050,13 +1058,15 @@ class Frame {
     await this.locator(selector).waitFor();
   }
 
-  async waitForLoadState(state) {
+  async waitForLoadState(state, options) {
     if (state != null && state !== "load" && state !== "domcontentloaded") {
       return unsupported("Frame.waitForLoadState.state")();
     }
+    refuseLocatorOptions("Frame.waitForLoadState", options, ["timeout"]);
+    const timeout = (options && options.timeout) || this._page._timeout || 30_000;
     if (this._id !== "main") {
       const wantComplete = state == null || state === "load";
-      const deadline = Date.now() + (this._page._timeout || 30_000);
+      const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
         const ready = await this.evaluate(() => document.readyState);
         if (ready === "complete" || (!wantComplete && ready === "interactive")) {
@@ -1654,11 +1664,9 @@ class Page {
   }
 
   async goto(url, options) {
-    if (options != null) {
-      return unsupported("Page.goto.options")();
-    }
+    const timeout = navigationTimeout(this._timeout, options, "Page.goto");
     try {
-      const result = await engineCall("page.goto", { page: this._id, url });
+      const result = await engineCall("page.goto", { page: this._id, url, timeout });
       await this._flushPopups();
       await this._flushNavigation();
       await this._dispatchNetworkUntilSettled();
@@ -2034,7 +2042,8 @@ class Page {
     return decodeBase64(binary).buffer;
   }
 
-  async setContent(html) {
+  async setContent(html, options) {
+    navigationTimeout(this._timeout, options, "Page.setContent");
     await engineCall("page.setContent", { page: this._id, html: String(html) });
     await this._dispatchFrames();
     this._emitLoad();
@@ -2056,11 +2065,13 @@ class Page {
     ops.op_sleep_ms(Math.max(0, Number(ms) || 0));
   }
 
-  async waitForLoadState(state) {
+  async waitForLoadState(state, options) {
     if (state != null && state !== "load" && state !== "domcontentloaded") {
       return unsupported("Page.waitForLoadState.state")();
     }
-    await engineCall("page.waitForLoadState", { page: this._id });
+    refuseLocatorOptions("Page.waitForLoadState", options, ["timeout"]);
+    const timeout = (options && options.timeout) || this._timeout || 30_000;
+    await engineCall("page.waitForLoadState", { page: this._id, timeout });
   }
 
   waitForNavigation() {
@@ -2808,11 +2819,9 @@ class Browser {
 
   async newContext(options) {
     const storageState = options && options.storageState;
+    const extraHTTPHeaders = options && options.extraHTTPHeaders;
     if (options != null) {
-      const keys = Object.keys(options).filter((key) => options[key] !== undefined);
-      if (keys.some((key) => key !== "storageState")) {
-        return unsupported("Browser.newContext.options")();
-      }
+      refuseLocatorOptions("Browser.newContext", options, ["storageState", "extraHTTPHeaders"]);
     }
     const result = await engineCall("browser.newContext", { browser: this._id });
     const context = new BrowserContext(result.context);
@@ -2820,6 +2829,9 @@ class Browser {
     this._contexts.push(context);
     if (storageState) {
       await context._restoreStorageState(storageState);
+    }
+    if (extraHTTPHeaders) {
+      await context.setExtraHTTPHeaders(extraHTTPHeaders);
     }
     return context;
   }
@@ -2837,10 +2849,7 @@ class Browser {
   }
 
   async newPage(options) {
-    if (options != null) {
-      return unsupported("Browser.newPage.options")();
-    }
-    const context = await this.newContext();
+    const context = await this.newContext(options);
     return context.newPage();
   }
 
