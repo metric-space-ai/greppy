@@ -19,6 +19,10 @@ build caches are excluded. Merge, rebase, cherry-pick, submodule, Git LFS, and
 arbitrary checkout/smudge-filter states fail before model startup. Partial
 writes replace only touched chunks; private Git indexes, refs, and new objects
 remain isolated while existing objects are read-only.
+Dirty-baseline hardlink identity is now double-captured and hashed. Proposal
+metadata stores canonical hardlink groups, binds them into the proposal commit,
+and restores real shared inodes through crash-safe apply instead of degrading
+them into byte-identical independent files.
 
 New `workspace setup`, `workspace doctor --json`, `workspace status --json`,
 and `workspace gc` commands manage one persistent per-user provider mount.

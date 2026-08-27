@@ -12,6 +12,8 @@ pub(crate) struct LayerEntry {
     pub size: u64,
     pub modified_unix_ns: i64,
     pub chunks: Vec<ChunkId>,
+    pub hardlink_key: Option<String>,
+    pub hardlink_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +73,8 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
              size INTEGER NOT NULL CHECK(size >= 0),
              modified_unix_ns INTEGER NOT NULL,
              chunks_json BLOB NOT NULL,
+             hardlink_key TEXT,
+             hardlink_count INTEGER NOT NULL DEFAULT 1 CHECK(hardlink_count >= 1),
              PRIMARY KEY(layer_id, path)
          );
          CREATE INDEX IF NOT EXISTS cow_dirty_parent
@@ -85,6 +89,32 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
              dirty_layer_id TEXT NOT NULL UNIQUE REFERENCES cow_dirty_layers(id)
          );",
     )?;
+    ensure_column(connection, "cow_dirty_entries", "hardlink_key", "TEXT")?;
+    ensure_column(
+        connection,
+        "cow_dirty_entries",
+        "hardlink_count",
+        "INTEGER NOT NULL DEFAULT 1 CHECK(hardlink_count >= 1)",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    connection.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+    ))?;
     Ok(())
 }
 
@@ -117,6 +147,25 @@ pub(crate) fn ensure_layers(
         retain_snapshot_chunks(store, baseline)?;
     }
     let baseline_json = serde_json::to_vec(baseline)?;
+    let mut hardlinks = BTreeMap::<&str, (String, u64)>::new();
+    for (group_id, group) in baseline.hardlink_groups.iter().enumerate() {
+        if group.len() < 2 {
+            return Err(Error::Corrupt(
+                "dirty baseline hardlink group contains fewer than two paths".into(),
+            ));
+        }
+        let key = format!("{dirty_id}:{group_id}");
+        for path in group {
+            if hardlinks
+                .insert(path, (key.clone(), group.len() as u64))
+                .is_some()
+            {
+                return Err(Error::Corrupt(format!(
+                    "dirty baseline path {path} belongs to multiple hardlink groups"
+                )));
+            }
+        }
+    }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = (|| -> Result<()> {
         transaction.execute(
@@ -128,8 +177,8 @@ pub(crate) fn ensure_layers(
             transaction.execute(
                 "INSERT INTO cow_dirty_entries(
                      layer_id, path, parent, name, kind, mode, size,
-                     modified_unix_ns, chunks_json
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     modified_unix_ns, chunks_json, hardlink_key, hardlink_count
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     dirty_id,
                     entry.path,
@@ -139,7 +188,11 @@ pub(crate) fn ensure_layers(
                     entry.mode as i64,
                     entry.size as i64,
                     entry.modified_unix_ns,
-                    serde_json::to_vec(&entry.chunks)?
+                    serde_json::to_vec(&entry.chunks)?,
+                    hardlinks.get(entry.path.as_str()).map(|value| &value.0),
+                    hardlinks
+                        .get(entry.path.as_str())
+                        .map_or(1, |value| value.1) as i64,
                 ],
             )?;
         }
@@ -355,9 +408,9 @@ pub(crate) fn list_entries(
             "SELECT name, kind, mode, size, chunks_json{} FROM {table}
              WHERE {column} = ?1 AND parent = ?2 ORDER BY name",
             if table == "cow_dirty_entries" {
-                ", modified_unix_ns"
+                ", modified_unix_ns, hardlink_key, hardlink_count"
             } else {
-                ", 0"
+                ", 0, NULL, 1"
             }
         );
         let mut statement = connection.prepare(&sql)?;
@@ -369,10 +422,13 @@ pub(crate) fn list_entries(
                 row.get::<_, i64>(3)?,
                 row.get::<_, Vec<u8>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
         for row in rows {
-            let (name, kind, mode, size, chunks, modified_unix_ns) = row?;
+            let (name, kind, mode, size, chunks, modified_unix_ns, hardlink_key, hardlink_count) =
+                row?;
             let kind = parse_kind(&kind)?;
             if kind == LayerKind::Tombstone {
                 entries.remove(&name);
@@ -385,6 +441,8 @@ pub(crate) fn list_entries(
                         size: size as u64,
                         modified_unix_ns,
                         chunks: serde_json::from_slice(&chunks)?,
+                        hardlink_key,
+                        hardlink_count: hardlink_count as u64,
                     },
                 );
             }
@@ -436,6 +494,30 @@ pub(crate) fn count_references(connection: &Connection) -> Result<Vec<Vec<ChunkI
         all.push(snapshot.index_chunks);
     }
     Ok(all)
+}
+
+pub(crate) fn promoted_hardlink_groups(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<Vec<Vec<String>>> {
+    let mut statement = connection.prepare(
+        "SELECT d.hardlink_key, d.path
+         FROM cow_immutable_hardlink_promotions p
+         JOIN cow_workspace_layers w ON w.workspace_id = p.workspace_id
+         JOIN cow_dirty_entries d
+           ON d.layer_id = w.dirty_layer_id AND d.hardlink_key = p.hardlink_key
+         WHERE p.workspace_id = ?1
+         ORDER BY d.hardlink_key, d.path",
+    )?;
+    let rows = statement.query_map(params![workspace_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        let (key, path) = row?;
+        groups.entry(key).or_default().push(path);
+    }
+    Ok(groups.into_values().collect())
 }
 
 pub(crate) fn cached_snapshot(
@@ -551,9 +633,9 @@ fn lookup_table(
         "SELECT kind, mode, size, chunks_json{} FROM {table}
          WHERE {id_column} = ?1 AND path = ?2",
         if table == "cow_dirty_entries" {
-            ", modified_unix_ns"
+            ", modified_unix_ns, hardlink_key, hardlink_count"
         } else {
-            ", 0"
+            ", 0, NULL, 1"
         }
     );
     connection
@@ -566,18 +648,24 @@ fn lookup_table(
                 row.get::<_, i64>(2)?,
                 bytes,
                 row.get(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .optional()?
-        .map(|(kind, mode, size, chunks, modified)| {
-            Ok(LayerEntry {
-                kind: parse_kind(&kind)?,
-                mode: mode as u32,
-                size: size as u64,
-                modified_unix_ns: modified,
-                chunks: serde_json::from_slice(&chunks)?,
-            })
-        })
+        .map(
+            |(kind, mode, size, chunks, modified, hardlink_key, hardlink_count)| {
+                Ok(LayerEntry {
+                    kind: parse_kind(&kind)?,
+                    mode: mode as u32,
+                    size: size as u64,
+                    modified_unix_ns: modified,
+                    chunks: serde_json::from_slice(&chunks)?,
+                    hardlink_key,
+                    hardlink_count: hardlink_count as u64,
+                })
+            },
+        )
         .transpose()
 }
 
@@ -866,5 +954,37 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].chunks, files[1].chunks);
         assert_eq!(store.stats().unwrap().chunk_count, 1);
+    }
+
+    #[test]
+    fn schema_upgrade_adds_hardlink_metadata_to_existing_dirty_layers() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cow_dirty_entries (
+                     layer_id TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     parent TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     mode INTEGER NOT NULL,
+                     size INTEGER NOT NULL,
+                     modified_unix_ns INTEGER NOT NULL,
+                     chunks_json BLOB NOT NULL,
+                     PRIMARY KEY(layer_id, path)
+                 );",
+            )
+            .unwrap();
+        install_schema(&connection).unwrap();
+
+        let columns = connection
+            .prepare("PRAGMA table_info(cow_dirty_entries)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"hardlink_key".into()));
+        assert!(columns.contains(&"hardlink_count".into()));
     }
 }

@@ -1163,6 +1163,14 @@ fn apply_from_core(
         validate_apply_path(path)?;
         affected_paths.insert(path.clone());
     }
+    for group in &proposal.baseline.hardlink_groups {
+        if group.iter().any(|path| affected_paths.contains(path)) {
+            for path in group {
+                validate_apply_path(path)?;
+                affected_paths.insert(path.clone());
+            }
+        }
+    }
     let affected_paths = affected_paths.into_iter().collect();
     let journal = ApplyJournal {
         schema: 1,
@@ -1595,6 +1603,29 @@ fn restore_apply_journal(
             restore_pinned_baseline_entry(core, &repository, entry)?;
         }
     }
+    let baseline_hardlinks = proposal
+        .baseline
+        .hardlink_groups
+        .iter()
+        .filter(|group| {
+            group
+                .iter()
+                .any(|path| journal.affected_paths.contains(path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for group in &baseline_hardlinks {
+        if !group
+            .iter()
+            .all(|path| journal.affected_paths.contains(path))
+        {
+            return Err(WorkspaceError::Tampered {
+                path: journal_path.to_path_buf(),
+                detail: "apply journal contains only part of a baseline hardlink group".into(),
+            });
+        }
+    }
+    materialize_hardlink_groups(&repository, &baseline_hardlinks)?;
     for (path, modified_unix_ns) in &journal.modified_times {
         validate_apply_path(path)?;
         let target = repository.join(path);
@@ -3172,6 +3203,12 @@ mod tests {
         git(&repo, &["add", "tracked.txt"]);
         fs::write(repo.join("tracked.txt"), "dirty\n").unwrap();
         fs::write(repo.join("untracked.txt"), "user\n").unwrap();
+        fs::write(repo.join("baseline-linked-a.txt"), "baseline-linked\n").unwrap();
+        fs::hard_link(
+            repo.join("baseline-linked-a.txt"),
+            repo.join("baseline-linked-b.txt"),
+        )
+        .unwrap();
 
         let data = temp.path().join("provider-data");
         let mount = temp.path().join("provider-mount");
@@ -3236,6 +3273,12 @@ mod tests {
         fs::write(worktree.join(".gitignore"), "cache/\n").unwrap();
         fs::write(worktree.join("tracked.txt"), "dirty\n").unwrap();
         fs::write(worktree.join("untracked.txt"), "user\n").unwrap();
+        fs::write(worktree.join("baseline-linked-a.txt"), "baseline-linked\n").unwrap();
+        fs::hard_link(
+            worktree.join("baseline-linked-a.txt"),
+            worktree.join("baseline-linked-b.txt"),
+        )
+        .unwrap();
 
         // The unit test uses an ordinary directory instead of a mounted
         // provider. Mirror the immutable Git-control template exactly once so
@@ -3389,6 +3432,52 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+        let baseline_link_a = workspace
+            .core
+            .metadata(&workspace.handle, "baseline-linked-a.txt")
+            .unwrap()
+            .unwrap();
+        let baseline_link_b = workspace
+            .core
+            .metadata(&workspace.handle, "baseline-linked-b.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline_link_a.inode, baseline_link_b.inode);
+        assert_eq!(baseline_link_a.nlink, 2);
+        fs::write(
+            workspace.worktree_path().join("baseline-linked-a.txt"),
+            "baseline-change\n",
+        )
+        .unwrap();
+        workspace
+            .core
+            .write(
+                &workspace.handle,
+                "baseline-linked-a.txt",
+                0,
+                b"baseline-change\n",
+            )
+            .unwrap();
+        assert_eq!(
+            workspace
+                .core
+                .read(&workspace.handle, "baseline-linked-b.txt", 0, 64)
+                .unwrap(),
+            b"baseline-change\n"
+        );
+        let promoted_link_a = workspace
+            .core
+            .metadata(&workspace.handle, "baseline-linked-a.txt")
+            .unwrap()
+            .unwrap();
+        let promoted_link_b = workspace
+            .core
+            .metadata(&workspace.handle, "baseline-linked-b.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted_link_a.inode, promoted_link_b.inode);
+        assert_eq!(promoted_link_a.nlink, 2);
+        assert_eq!(promoted_link_b.nlink, 2);
         fs::write(workspace.worktree_path().join("tracked.txt"), "agent\n").unwrap();
         workspace
             .core
@@ -3443,7 +3532,7 @@ mod tests {
         assert_eq!(git(&repo, &["rev-parse", &format!("{commit}^1")]), base);
         assert!(patch.contains("-dirty"));
         assert!(patch.contains("+agent"));
-        assert!(!patch.contains("-base"));
+        assert!(!patch.lines().any(|line| line == "-base"));
         assert!(git(&repo, &["ls-tree", "-r", &commit, "--", "cache"]).is_empty());
 
         let index = git_path(&repo, "index").unwrap();
@@ -3456,10 +3545,13 @@ mod tests {
         let proposal = recovery_core.proposal(&ref_name).unwrap();
         assert_eq!(
             proposal.hardlink_groups,
-            vec![vec![
-                String::from("linked-a.txt"),
-                String::from("linked-b.txt"),
-            ]]
+            vec![
+                vec![
+                    String::from("baseline-linked-a.txt"),
+                    String::from("baseline-linked-b.txt"),
+                ],
+                vec![String::from("linked-a.txt"), String::from("linked-b.txt"),],
+            ]
         );
         let mut tampered_hardlinks = proposal.clone();
         tampered_hardlinks.hardlink_groups = vec![vec![
@@ -3583,6 +3675,11 @@ mod tests {
         );
         apply_proposal(&repo, &ref_name).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
+        fs::write(repo.join("baseline-linked-b.txt"), b"baseline-same-inode\n").unwrap();
+        assert_eq!(
+            fs::read(repo.join("baseline-linked-a.txt")).unwrap(),
+            b"baseline-same-inode\n"
+        );
         fs::write(repo.join("linked-b.txt"), b"same-inode\n").unwrap();
         assert_eq!(
             fs::read(repo.join("linked-a.txt")).unwrap(),

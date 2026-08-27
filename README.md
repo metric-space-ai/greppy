@@ -447,7 +447,9 @@ and an immutable dirty snapshot with a private namespace of changed chunks,
 tombstones, redirects, links, metadata, and private Git state. A one-byte write
 to a large file creates only the affected chunk plus metadata; it never copies
 the complete file. Ignored files and build caches are excluded from the dirty
-snapshot.
+snapshot. Existing hardlinks among captured dirty files retain one shared inode;
+new hardlinks and their topology survive proposal publication, crash recovery,
+and apply even though a plain Git tree cannot encode that relationship.
 
 The exclusive recovery opener checks both SQLite databases mechanically before
 marking the provider healthy. Proposal publication and `agent apply` share an

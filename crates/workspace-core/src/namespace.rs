@@ -285,6 +285,13 @@ impl WorkspaceCore {
                  PRIMARY KEY(workspace_id, origin_path),
                  UNIQUE(workspace_id, inode_id)
              );
+             CREATE TABLE IF NOT EXISTS cow_immutable_hardlink_promotions (
+                 workspace_id TEXT NOT NULL REFERENCES cow_workspaces(id) ON DELETE CASCADE,
+                 hardlink_key TEXT NOT NULL,
+                 inode_id INTEGER NOT NULL REFERENCES cow_inodes(id) ON DELETE CASCADE,
+                 PRIMARY KEY(workspace_id, hardlink_key),
+                 UNIQUE(workspace_id, inode_id)
+             );
              CREATE TABLE IF NOT EXISTS cow_redirects (
                  workspace_id TEXT NOT NULL REFERENCES cow_workspaces(id) ON DELETE CASCADE,
                  destination TEXT NOT NULL,
@@ -387,6 +394,7 @@ impl WorkspaceCore {
         empty_base: bool,
     ) -> Result<WorkspaceHandle> {
         validate_workspace_id(id)?;
+        crate::snapshot::validate_snapshot_hardlink_integrity(&baseline)?;
         let repository = baseline
             .repository
             .to_str()
@@ -745,6 +753,13 @@ impl WorkspaceCore {
                 }
             }
         }
+        for group in repository_layers::promoted_hardlink_groups(&connection, &workspace.id)? {
+            for path in group {
+                if path != ".git" && !path.starts_with(".git/") {
+                    paths.insert(path);
+                }
+            }
+        }
         Ok(paths.into_iter().collect())
     }
 
@@ -763,6 +778,7 @@ impl WorkspaceCore {
         let rows = statement.query_map(params![workspace.id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
+        let mut candidates = BTreeSet::<Vec<String>>::new();
         let mut by_inode = BTreeMap::<i64, Vec<String>>::new();
         for row in rows {
             let (inode, path) = row?;
@@ -770,12 +786,39 @@ impl WorkspaceCore {
                 by_inode.entry(inode).or_default().push(path);
             }
         }
-        let mut groups = by_inode
-            .into_values()
-            .filter(|group| group.len() > 1)
-            .collect::<Vec<_>>();
-        groups.sort();
-        Ok(groups)
+        candidates.extend(by_inode.into_values());
+        candidates.extend(repository_layers::promoted_hardlink_groups(
+            &connection,
+            &workspace.id,
+        )?);
+        drop(statement);
+        drop(connection);
+
+        let mut groups = BTreeSet::new();
+        for candidate in candidates {
+            let mut visible_by_inode = BTreeMap::<u64, Vec<String>>::new();
+            for path in candidate {
+                if !included.contains(&path) {
+                    continue;
+                }
+                if let Some(metadata) = self.metadata(workspace, &path)? {
+                    if metadata.kind == NodeKind::File {
+                        visible_by_inode
+                            .entry(metadata.inode)
+                            .or_default()
+                            .push(path);
+                    }
+                }
+            }
+            for mut group in visible_by_inode.into_values() {
+                group.sort();
+                group.dedup();
+                if group.len() > 1 {
+                    groups.insert(group);
+                }
+            }
+        }
+        Ok(groups.into_iter().collect())
     }
 
     /// Drops cached repository/dirty layers that are not referenced by an
@@ -888,16 +931,7 @@ impl WorkspaceCore {
         )?;
         if pristine_overlay {
             if let Some(entry) = repository_layers::lookup(&connection, &workspace.id, &path)? {
-                return Ok(Some(NodeMetadata {
-                    kind: layer_node_kind(entry.kind)?,
-                    mode: entry.mode,
-                    size: entry.size,
-                    inode: stable_inode(&workspace.id, &path),
-                    nlink: 1,
-                    accessed_unix_ns: entry.modified_unix_ns,
-                    modified_unix_ns: entry.modified_unix_ns,
-                    changed_unix_ns: entry.modified_unix_ns,
-                }));
+                return Ok(Some(layer_metadata(&workspace.id, &path, &entry)?));
             }
             if repository_layers::has_descendant(&connection, &workspace.id, &path)? {
                 return Ok(Some(NodeMetadata {
@@ -933,16 +967,12 @@ impl WorkspaceCore {
         }
         let translated = translate_redirect(&connection, &workspace.id, &path)?;
         if let Some(entry) = repository_layers::lookup(&connection, &workspace.id, &translated)? {
-            return Ok(Some(NodeMetadata {
-                kind: layer_node_kind(entry.kind)?,
-                mode: entry.mode,
-                size: entry.size,
-                inode: stable_inode(&workspace.id, &path),
-                nlink: 1,
-                accessed_unix_ns: entry.modified_unix_ns,
-                modified_unix_ns: entry.modified_unix_ns,
-                changed_unix_ns: entry.modified_unix_ns,
-            }));
+            if let Some(key) = entry.hardlink_key.as_deref() {
+                if let Some(inode) = load_inode_for_hardlink_key(&connection, &workspace.id, key)? {
+                    return load_metadata_for_inode(&connection, &workspace.id, inode.id);
+                }
+            }
+            return Ok(Some(layer_metadata(&workspace.id, &path, &entry)?));
         }
         if repository_layers::has_descendant(&connection, &workspace.id, &translated)? {
             return Ok(Some(NodeMetadata {
@@ -1032,16 +1062,17 @@ impl WorkspaceCore {
                 },
             });
         }
-        let metadata = NodeMetadata {
-            kind,
-            mode: entry.mode,
-            size: entry.size,
-            inode: stable_inode(&workspace.id, &path),
-            nlink: 1,
-            accessed_unix_ns: entry.modified_unix_ns,
-            modified_unix_ns: entry.modified_unix_ns,
-            changed_unix_ns: entry.modified_unix_ns,
-        };
+        if let Some(key) = entry.hardlink_key.as_deref() {
+            if let Some(inode) = load_inode_for_hardlink_key(&connection, &workspace.id, key)? {
+                return Ok(WorkspaceFileHandle {
+                    workspace_id: workspace.id.clone(),
+                    backing: WorkspaceFileBacking::Private {
+                        inode: inode.id as u64,
+                    },
+                });
+            }
+        }
+        let metadata = layer_metadata(&workspace.id, &path, &entry)?;
         Ok(WorkspaceFileHandle {
             workspace_id: workspace.id.clone(),
             backing: WorkspaceFileBacking::Immutable {
@@ -1602,19 +1633,17 @@ impl WorkspaceCore {
             } else {
                 format!("{path}/{name}")
             };
-            entries.insert(
-                name,
-                NodeMetadata {
-                    kind: layer_node_kind(entry.kind)?,
-                    mode: entry.mode,
-                    size: entry.size,
-                    inode: stable_inode(&workspace.id, &child),
-                    nlink: 1,
-                    accessed_unix_ns: entry.modified_unix_ns,
-                    modified_unix_ns: entry.modified_unix_ns,
-                    changed_unix_ns: entry.modified_unix_ns,
-                },
-            );
+            let metadata = if let Some(key) = entry.hardlink_key.as_deref() {
+                if let Some(inode) = load_inode_for_hardlink_key(&connection, &workspace.id, key)? {
+                    load_metadata_for_inode(&connection, &workspace.id, inode.id)?
+                        .ok_or_else(|| Error::Corrupt("promoted hardlink inode vanished".into()))?
+                } else {
+                    layer_metadata(&workspace.id, &child, &entry)?
+                }
+            } else {
+                layer_metadata(&workspace.id, &child, &entry)?
+            };
+            entries.insert(name, metadata);
         }
         let prefix = if path.is_empty() {
             String::new()
@@ -2050,6 +2079,11 @@ impl WorkspaceCore {
         let translated = translate_redirect(&connection, &workspace.id, path)?;
         let entry = repository_layers::lookup(&connection, &workspace.id, &translated)?
             .ok_or_else(|| Error::NotFound(path.into()))?;
+        if let Some(key) = entry.hardlink_key.as_deref() {
+            if let Some(inode) = load_inode_for_hardlink_key(&connection, &workspace.id, key)? {
+                return Ok(inode);
+            }
+        }
         Ok(InodeRecord {
             id: 0,
             kind: layer_node_kind(entry.kind)?,
@@ -2059,7 +2093,7 @@ impl WorkspaceCore {
     }
 
     fn materialize(&self, workspace: &WorkspaceHandle, path: &str) -> Result<InodeRecord> {
-        let origin_path = {
+        let (origin_path, hardlink_key) = {
             let connection = self.lock_metadata()?;
             if let Some(inode) = load_inode_for_path(&connection, &workspace.id, path)? {
                 return Ok(inode);
@@ -2067,7 +2101,10 @@ impl WorkspaceCore {
             if ancestor_tombstoned(&connection, &workspace.id, path)? {
                 return Err(Error::NotFound(path.into()));
             }
-            translate_redirect(&connection, &workspace.id, path)?
+            let origin_path = translate_redirect(&connection, &workspace.id, path)?;
+            let entry = repository_layers::lookup(&connection, &workspace.id, &origin_path)?
+                .ok_or_else(|| Error::NotFound(path.into()))?;
+            (origin_path, entry.hardlink_key)
         };
         let source = self.resolve_inode(workspace, path)?;
         let mode = self
@@ -2096,6 +2133,17 @@ impl WorkspaceCore {
             self.remember_promotion(&workspace.id, &origin_path, inode.id)?;
             return Ok(inode);
         }
+        if let Some(key) = hardlink_key.as_deref() {
+            if let Some(inode) = load_inode_for_hardlink_key(&transaction, &workspace.id, key)? {
+                insert_entry(&transaction, &workspace.id, path, inode.id)?;
+                transaction.commit()?;
+                for id in &source.chunks {
+                    self.chunks.unpin(*id)?;
+                }
+                self.remember_promotion(&workspace.id, &origin_path, inode.id)?;
+                return Ok(inode);
+            }
+        }
         let inode = insert_inode(
             &transaction,
             &workspace.id,
@@ -2110,6 +2158,14 @@ impl WorkspaceCore {
              VALUES(?1, ?2, ?3)",
             params![workspace.id, origin_path, inode],
         )?;
+        if let Some(key) = hardlink_key {
+            transaction.execute(
+                "INSERT INTO cow_immutable_hardlink_promotions(
+                     workspace_id, hardlink_key, inode_id
+                 ) VALUES(?1, ?2, ?3)",
+                params![workspace.id, key, inode],
+            )?;
+        }
         insert_entry(&transaction, &workspace.id, path, inode)?;
         transaction.commit()?;
         self.remember_promotion(&workspace.id, &origin_path, inode)?;
@@ -2437,37 +2493,18 @@ fn overlay_entry(
     workspace_id: &str,
     path: &str,
 ) -> Result<Option<NodeMetadata>> {
-    connection
+    let entry = connection
         .query_row(
-            "SELECT e.tombstone, i.id, i.kind, i.mode, i.size,
-                    (SELECT COUNT(*) FROM cow_entries links
-                     WHERE links.workspace_id = e.workspace_id
-                       AND links.inode_id = i.id AND links.tombstone = 0),
-                    i.accessed_unix_ns, i.modified_unix_ns, i.changed_unix_ns
-             FROM cow_entries e
-             LEFT JOIN cow_inodes i ON i.id = e.inode_id
-             WHERE e.workspace_id = ?1 AND e.path = ?2",
+            "SELECT tombstone, inode_id FROM cow_entries
+             WHERE workspace_id = ?1 AND path = ?2",
             params![workspace_id, path],
-            |row| {
-                let tombstone: i64 = row.get(0)?;
-                if tombstone != 0 {
-                    return Ok(None);
-                }
-                Ok(Some(NodeMetadata {
-                    inode: row.get::<_, i64>(1)? as u64,
-                    kind: parse_kind(row.get::<_, String>(2)?.as_str())?,
-                    mode: row.get::<_, i64>(3)? as u32,
-                    size: row.get::<_, i64>(4)? as u64,
-                    nlink: row.get::<_, i64>(5)? as u32,
-                    accessed_unix_ns: row.get(6)?,
-                    modified_unix_ns: row.get(7)?,
-                    changed_unix_ns: row.get(8)?,
-                }))
-            },
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<i64>>(1)?)),
         )
-        .optional()
-        .map(|row| row.flatten())
-        .map_err(Into::into)
+        .optional()?;
+    let Some((false, Some(inode))) = entry else {
+        return Ok(None);
+    };
+    load_metadata_for_inode(connection, workspace_id, inode)
 }
 
 fn now_unix_ns() -> i64 {
@@ -2576,6 +2613,41 @@ fn load_inode_for_origin(
         .transpose()
 }
 
+fn load_inode_for_hardlink_key(
+    connection: &Connection,
+    workspace_id: &str,
+    hardlink_key: &str,
+) -> Result<Option<InodeRecord>> {
+    connection
+        .query_row(
+            "SELECT i.id, i.kind, i.size, i.chunks_json
+             FROM cow_immutable_hardlink_promotions h
+             JOIN cow_inodes i ON i.id = h.inode_id
+             WHERE h.workspace_id = ?1 AND h.hardlink_key = ?2
+               AND i.workspace_id = h.workspace_id",
+            params![workspace_id, hardlink_key],
+            |row| {
+                let chunks: Vec<u8> = row.get(3)?;
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    chunks,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(id, kind, size, chunks)| {
+            Ok(InodeRecord {
+                id,
+                kind: parse_kind(&kind)?,
+                size: size as u64,
+                chunks: serde_json::from_slice(&chunks)?,
+            })
+        })
+        .transpose()
+}
+
 fn load_metadata_for_inode(
     connection: &Connection,
     workspace_id: &str,
@@ -2584,9 +2656,32 @@ fn load_metadata_for_inode(
     connection
         .query_row(
             "SELECT i.id, i.kind, i.mode, i.size,
+                    (SELECT COUNT(*)
+                     FROM cow_immutable_hardlink_promotions p
+                     JOIN cow_workspace_layers w ON w.workspace_id = p.workspace_id
+                     JOIN cow_dirty_entries d
+                       ON d.layer_id = w.dirty_layer_id
+                      AND d.hardlink_key = p.hardlink_key
+                     WHERE p.workspace_id = i.workspace_id AND p.inode_id = i.id
+                       AND NOT EXISTS(
+                           SELECT 1 FROM cow_entries hidden
+                           WHERE hidden.workspace_id = i.workspace_id
+                             AND hidden.path = d.path AND hidden.tombstone = 1
+                       ))
+                    +
                     (SELECT COUNT(*) FROM cow_entries links
                      WHERE links.workspace_id = i.workspace_id
-                       AND links.inode_id = i.id AND links.tombstone = 0),
+                       AND links.inode_id = i.id AND links.tombstone = 0
+                       AND NOT EXISTS(
+                           SELECT 1
+                           FROM cow_immutable_hardlink_promotions p
+                           JOIN cow_workspace_layers w ON w.workspace_id = p.workspace_id
+                           JOIN cow_dirty_entries d
+                             ON d.layer_id = w.dirty_layer_id
+                            AND d.hardlink_key = p.hardlink_key
+                           WHERE p.workspace_id = i.workspace_id
+                             AND p.inode_id = i.id AND d.path = links.path
+                       )),
                     i.accessed_unix_ns, i.modified_unix_ns, i.changed_unix_ns
              FROM cow_inodes i
              WHERE i.workspace_id = ?1 AND i.id = ?2",
@@ -2783,6 +2878,32 @@ fn layer_node_kind(kind: LayerKind) -> Result<NodeKind> {
             "tombstone escaped repository-layer resolution".into(),
         )),
     }
+}
+
+fn layer_metadata(
+    workspace_id: &str,
+    visible_path: &str,
+    entry: &repository_layers::LayerEntry,
+) -> Result<NodeMetadata> {
+    let nlink = u32::try_from(entry.hardlink_count.max(1))
+        .map_err(|_| Error::Corrupt("immutable hardlink count exceeds u32".into()))?;
+    let inode_identity = entry
+        .hardlink_key
+        .as_deref()
+        .map(|key| format!("\0immutable-hardlink\0{key}"));
+    Ok(NodeMetadata {
+        kind: layer_node_kind(entry.kind)?,
+        mode: entry.mode,
+        size: entry.size,
+        inode: stable_inode(
+            workspace_id,
+            inode_identity.as_deref().unwrap_or(visible_path),
+        ),
+        nlink,
+        accessed_unix_ns: entry.modified_unix_ns,
+        modified_unix_ns: entry.modified_unix_ns,
+        changed_unix_ns: entry.modified_unix_ns,
+    })
 }
 
 fn parse_kind(kind: &str) -> rusqlite::Result<NodeKind> {

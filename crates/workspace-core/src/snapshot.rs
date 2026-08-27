@@ -1,7 +1,7 @@
 use crate::path_policy::validate_portable_component;
 use crate::{ChunkId, ChunkStore, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
 use std::io::Write;
@@ -50,6 +50,8 @@ pub struct BaselineSnapshot {
     pub directories: Vec<BaselineDirectory>,
     pub entries: Vec<BaselineEntry>,
     #[serde(default)]
+    pub hardlink_groups: Vec<Vec<String>>,
+    #[serde(default)]
     pub tracker_epoch: Option<u64>,
     #[serde(default)]
     pub tracker_generation: Option<u64>,
@@ -59,8 +61,19 @@ fn repository_baseline_hash(
     base_commit: &str,
     index_hash: &str,
     entries: &[BaselineEntry],
+    hardlink_groups: &[Vec<String>],
 ) -> Result<String> {
-    let canonical = serde_json::to_vec(&(base_commit, index_hash, entries))?;
+    let canonical = if hardlink_groups.is_empty() {
+        serde_json::to_vec(&(base_commit, index_hash, entries))?
+    } else {
+        serde_json::to_vec(&(
+            "greppy.repository-baseline.v2",
+            base_commit,
+            index_hash,
+            entries,
+            hardlink_groups,
+        ))?
+    };
     Ok(blake3::hash(&canonical).to_hex().to_string())
 }
 
@@ -74,12 +87,65 @@ pub(crate) fn validate_repository_snapshot_integrity(snapshot: &BaselineSnapshot
         &snapshot.base_commit,
         &snapshot.index_hash,
         &snapshot.entries,
+        &snapshot.hardlink_groups,
     )?;
     if expected != snapshot.baseline_hash {
         return Err(Error::Corrupt(format!(
             "repository baseline hash mismatch: expected {expected}, found {}",
             snapshot.baseline_hash
         )));
+    }
+    validate_snapshot_hardlink_integrity(snapshot)
+}
+
+pub(crate) fn validate_snapshot_hardlink_integrity(snapshot: &BaselineSnapshot) -> Result<()> {
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    let mut prior_group = None::<&Vec<String>>;
+    for group in &snapshot.hardlink_groups {
+        if group.len() < 2 || prior_group.is_some_and(|prior| prior >= group) {
+            return Err(Error::Corrupt(
+                "snapshot hardlink groups are not canonical".into(),
+            ));
+        }
+        let mut prior_path = None::<&String>;
+        let mut expected = None::<&BaselineEntry>;
+        for path in group {
+            if prior_path.is_some_and(|prior| prior >= path) || !seen.insert(path) {
+                return Err(Error::Corrupt(
+                    "snapshot hardlink paths are not canonical and disjoint".into(),
+                ));
+            }
+            let entry = entries.get(path.as_str()).copied().ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "snapshot hardlink path {path} has no captured entry"
+                ))
+            })?;
+            if entry.kind != EntryKind::File {
+                return Err(Error::Corrupt(format!(
+                    "snapshot hardlink path {path} is not a regular file"
+                )));
+            }
+            if let Some(first) = expected {
+                if entry.mode != first.mode
+                    || entry.size != first.size
+                    || entry.content_hash != first.content_hash
+                    || entry.chunks != first.chunks
+                {
+                    return Err(Error::Corrupt(format!(
+                        "snapshot hardlink path {path} does not match its inode peers"
+                    )));
+                }
+            } else {
+                expected = Some(entry);
+            }
+            prior_path = Some(path);
+        }
+        prior_group = Some(group);
     }
     Ok(())
 }
@@ -170,6 +236,7 @@ pub fn capture_overlay_directory(
                 }
                 entries.push(entry);
             }
+            let hardlink_groups = capture_hardlink_groups(&directory, &first.paths)?;
             if overlay_inventory(&directory)? != first {
                 return Err(Error::ConcurrentRepositoryMutation);
             }
@@ -183,13 +250,26 @@ pub fn capture_overlay_directory(
                     return Err(Error::ConcurrentRepositoryMutation);
                 }
             }
+            if capture_hardlink_groups(&directory, &first.paths)? != hardlink_groups {
+                return Err(Error::ConcurrentRepositoryMutation);
+            }
             let identity_text = identity.to_string_lossy();
-            let canonical = serde_json::to_vec(&(
-                "greppy.overlay-directory.v1",
-                identity_text.as_ref(),
-                &first.directories,
-                &entries,
-            ))?;
+            let canonical = if hardlink_groups.is_empty() {
+                serde_json::to_vec(&(
+                    "greppy.overlay-directory.v1",
+                    identity_text.as_ref(),
+                    &first.directories,
+                    &entries,
+                ))?
+            } else {
+                serde_json::to_vec(&(
+                    "greppy.overlay-directory.v2",
+                    identity_text.as_ref(),
+                    &first.directories,
+                    &entries,
+                    &hardlink_groups,
+                ))?
+            };
             let baseline_hash = blake3::hash(&canonical).to_hex().to_string();
             Ok(BaselineSnapshot {
                 repository: identity.to_path_buf(),
@@ -199,6 +279,7 @@ pub fn capture_overlay_directory(
                 index_chunks: Vec::new(),
                 directories: first.directories.clone(),
                 entries,
+                hardlink_groups,
                 tracker_epoch: None,
                 tracker_generation: None,
             })
@@ -292,6 +373,7 @@ fn capture_once(
         }
         entries.push(entry);
     }
+    let hardlink_groups = capture_hardlink_groups(repository, &first.dirty_paths)?;
     observe_phase("snapshot-dirty-entries-complete");
 
     observe_phase("snapshot-index-capture-start");
@@ -324,12 +406,16 @@ fn capture_once(
             return Err(Error::ConcurrentRepositoryMutation);
         }
     }
+    if capture_hardlink_groups(repository, &first.dirty_paths)? != hardlink_groups {
+        return Err(Error::ConcurrentRepositoryMutation);
+    }
     observe_phase("snapshot-fingerprint-verification-complete");
 
     // The baseline identity is content-derived rather than dependent on Git's
     // porcelain serialization. Full and journal-incremental captures must
     // produce the same identity for the same visible repository state.
-    let baseline_hash = repository_baseline_hash(&first.head, &first.index_hash, &entries)?;
+    let baseline_hash =
+        repository_baseline_hash(&first.head, &first.index_hash, &entries, &hardlink_groups)?;
     Ok(BaselineSnapshot {
         repository: repository.to_path_buf(),
         base_commit: first.head.clone(),
@@ -338,6 +424,7 @@ fn capture_once(
         index_chunks,
         directories: Vec::new(),
         entries,
+        hardlink_groups,
         tracker_epoch: None,
         tracker_generation: None,
     })
@@ -454,6 +541,12 @@ fn capture_repository_incremental_once(
             }
             entries.push(entry);
         }
+        let dirty_paths = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let hardlink_groups = capture_hardlink_groups(&repository, &dirty_paths)?;
         let (index_chunks, _) = store.put_stream(index.as_slice())?;
         for chunk in &index_chunks {
             store.pin(*chunk)?;
@@ -479,7 +572,11 @@ fn capture_repository_incremental_once(
                 return Err(Error::ConcurrentRepositoryMutation);
             }
         }
-        let baseline_hash = repository_baseline_hash(&head, &index_hash, &entries)?;
+        if capture_hardlink_groups(&repository, &dirty_paths)? != hardlink_groups {
+            return Err(Error::ConcurrentRepositoryMutation);
+        }
+        let baseline_hash =
+            repository_baseline_hash(&head, &index_hash, &entries, &hardlink_groups)?;
         Ok(BaselineSnapshot {
             repository,
             base_commit: head,
@@ -488,6 +585,7 @@ fn capture_repository_incremental_once(
             index_chunks,
             directories: cached.directories.clone(),
             entries,
+            hardlink_groups,
             tracker_epoch: Some(tracker_epoch),
             tracker_generation: Some(tracker_generation),
         })
@@ -536,6 +634,83 @@ fn dirty_paths_for_candidates(repository: &Path, candidates: &[String]) -> Resul
         dirty.extend(nul_paths(&output.stdout)?);
     }
     Ok(dirty.into_iter().collect())
+}
+
+fn capture_hardlink_groups(repository: &Path, paths: &[String]) -> Result<Vec<Vec<String>>> {
+    let mut identities = BTreeMap::<HardlinkIdentity, Vec<String>>::new();
+    for relative in paths {
+        validate_relative_path(relative)?;
+        let metadata = match fs::symlink_metadata(repository.join(relative)) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(identity) = hardlink_identity(&repository.join(relative), &metadata)? {
+            identities
+                .entry(identity)
+                .or_default()
+                .push(relative.clone());
+        }
+    }
+    let mut groups = identities
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect::<Vec<_>>();
+    for group in &mut groups {
+        group.sort();
+    }
+    groups.sort();
+    Ok(groups)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HardlinkIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(unix)]
+fn hardlink_identity(_path: &Path, metadata: &Metadata) -> Result<Option<HardlinkIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((metadata.nlink() > 1).then_some(HardlinkIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    }))
+}
+
+#[cfg(windows)]
+fn hardlink_identity(path: &Path, _metadata: &Metadata) -> Result<Option<HardlinkIdentity>> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let success =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr()) };
+    if success == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(
+        (information.nNumberOfLinks > 1).then_some(HardlinkIdentity {
+            volume: information.dwVolumeSerialNumber as u64,
+            file: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+        }),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hardlink_identity(_path: &Path, _metadata: &Metadata) -> Result<Option<HardlinkIdentity>> {
+    Ok(None)
 }
 
 fn capture_entry(repository: &Path, relative: &str, store: &ChunkStore) -> Result<BaselineEntry> {

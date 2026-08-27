@@ -55,7 +55,9 @@ The initial namespace is two immutable layers: the tree at a pinned commit and
 a dirty snapshot containing staged, unstaged, deleted, and untracked paths.
 Ignored paths and build caches are not captured. The repository HEAD, index,
 status, affected contents, and metadata are sampled twice; a changing source
-is retried once and then rejected.
+is retried once and then rejected. Hardlink identity among captured dirty
+files is sampled in both observations and becomes part of the baseline hash;
+promoting any alias binds every visible peer to the same private inode.
 
 Merge, rebase, cherry-pick, submodule, Git LFS, and arbitrary checkout or
 smudge filters are rejected before workspace creation because Greppy cannot
@@ -80,7 +82,11 @@ An agent result is published under `refs/greppy/agent/<id>`. Its commit parent
 is the pinned source commit and its tree is the complete final tree. For a
 dirty source, the review patch is computed from the immutable initial snapshot
 to the final state, so the user's pre-existing dirty work is not presented as
-the agent's change.
+an agent edit. Because Git trees do not encode hardlink topology, Greppy stores
+canonical hardlink groups beside the proposal and binds their SHA-256 digest
+into the proposal commit message. Apply and crash recovery verify that binding,
+include every peer in the rollback journal, and recreate real hardlinks rather
+than independent copies.
 
 Apply with:
 
