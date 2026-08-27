@@ -2,6 +2,10 @@ import { chromium } from "playwright";
 
 const browser = await chromium.launch();
 const page = await browser.newPage();
+const ctxDialogs = [];
+page.context().on("dialog", (dialog) => {
+  ctxDialogs.push(dialog.message());
+});
 page.on("dialog", (dialog) => dialog.accept());
 
 const alertValue = await page.evaluate(() => {
@@ -20,6 +24,9 @@ if (alertDialog.type() !== "alert" || alertDialog.message() !== "native-hi") {
 }
 if (alertDialog.page() !== page && alertDialog.page()._id !== page._id) {
   throw new Error("dialog.page");
+}
+if (!ctxDialogs.includes("native-hi")) {
+  throw new Error("context dialog " + JSON.stringify(ctxDialogs));
 }
 
 const confirmed = await page.evaluate(() => confirm("native-confirm"));

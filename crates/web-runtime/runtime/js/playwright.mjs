@@ -2097,7 +2097,11 @@ class Page {
       if (!rec) {
         return unsupported("Page.waitForEvent.dialog.empty")();
       }
-      return new Dialog(this, rec);
+      const dialog = new Dialog(this, rec);
+      if (this._context) {
+        this._context._emit("dialog", dialog);
+      }
+      return dialog;
     }
     if (event === "filechooser") {
       const result = await engineCall("page.fileChoosers", { page: this._id, consume: true });
