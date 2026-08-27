@@ -37,7 +37,10 @@ done
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repository_root=$(cd "$script_dir/../.." && pwd)
-work_root=$(mktemp -d "${TMPDIR:-/tmp}/greppy-linux-packages.XXXXXX")
+# Keep the private build roots on the staging filesystem so hard-linking the
+# large, embedded-model payload is reliable and does not triple temporary disk
+# usage. The directory name is create-only and removed by the scoped trap.
+work_root=$(mktemp -d "$(dirname "$STAGING_ROOT")/.greppy-linux-packages.XXXXXX")
 trap 'rm -rf "$work_root"' EXIT
 
 mkdir -p \
