@@ -13,6 +13,7 @@ licenses/*.md text eol=lf
 licenses/*.txt text eol=lf
 training/qwen35/*.json text eol=lf
 training/qwen35/*.sha256 text eol=lf
+third_party/winfsp-greppy/** text eol=lf
 
 # Benchmark harness + drivers are tooling, not the shipped product (a single
 # native Rust binary). Exclude from GitHub's language stats so the repo language
