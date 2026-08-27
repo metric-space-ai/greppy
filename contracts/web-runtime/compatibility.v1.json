@@ -1374,7 +1374,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "polls page.evaluate until truthy; 30s cap; no JSHandle"
+        "polls page.evaluate until truthy; timeout is accepted; polling and other options throw; no JSHandle"
       ]
     },
     {
@@ -1418,7 +1418,8 @@
         "extra-headers"
       ],
       "known_differences": [
-        "polls retained load_web_resource records; method always GET"
+        "polls retained load_web_resource records; method always GET",
+        "timeout is accepted; regex/function patterns throw unsupported_playwright_operation"
       ]
     },
     {
@@ -1450,7 +1451,7 @@
         "wait-selector"
       ],
       "known_differences": [
-        "implemented as locator(selector).waitFor(); no state/timeout options"
+        "implemented as locator(selector).waitFor(); timeout and state visible|attached are accepted; hidden/detached throw"
       ]
     },
     {
@@ -1476,7 +1477,7 @@
         "extra-headers"
       ],
       "known_differences": [
-        "polls page.url for substring; not glob/RegExp"
+        "polls page.url for substring; timeout is accepted; glob/RegExp/function throw unsupported_playwright_operation"
       ]
     },
     {
@@ -2915,7 +2916,7 @@
       ],
       "known_differences": [
         "synchronous; main frame returns false while the Page is open",
-        "child frames throw unsupported_playwright_operation; live detach tracking is not implemented"
+        "child isDetached uses the last page.frames() snapshot after evaluate/goto/setContent, keyed by iframe name when present and by index otherwise; not a live Chromium detach bit"
       ]
     },
     {
@@ -3247,8 +3248,7 @@
         "frames"
       ],
       "known_differences": [
-        "locator.waitFor; child frames use same-origin FrameLocator CSS",
-        "child-frame waitFor/hit-test uses the iframe document elementFromPoint, not the parent composed overlay tree"
+        "delegates to locator.waitFor; timeout and state visible|attached are accepted"
       ]
     },
     {
@@ -3824,7 +3824,9 @@
         "phase1-spike",
         "compat-core"
       ],
-      "known_differences": []
+      "known_differences": [
+        "extraHTTPHeaders is accepted and merged over context headers; other newPage options throw"
+      ]
     },
     {
       "symbol": "BrowserContext.off",
@@ -7270,7 +7272,7 @@
         "filter-scroll"
       ],
       "known_differences": [
-        "Element.scrollIntoView(); no visibility check"
+        "waits for an attached visible target then Element.scrollIntoView(); timeout is accepted; not Chromium visibility padding"
       ]
     },
     {
@@ -7300,7 +7302,7 @@
         "filter-scroll"
       ],
       "known_differences": [
-        "HTMLInputElement.select or setSelectionRange"
+        "waits for an attached target then HTMLInputElement.select or setSelectionRange; timeout is accepted"
       ]
     },
     {
@@ -10665,7 +10667,8 @@
         "keyboard"
       ],
       "known_differences": [
-        "dispatches a DOM KeyboardEvent on the active element; not OS-level key input or form submit"
+        "dispatches a DOM KeyboardEvent on the active element; not OS-level key input or form submit",
+        "delay and other press options throw unsupported_playwright_operation"
       ]
     },
     {
@@ -15763,7 +15766,8 @@
         "keyboard"
       ],
       "known_differences": [
-        "appends to the active element's value; not a full keydown/keyup sequence per character"
+        "appends to the active element's value; not a full keydown/keyup sequence per character",
+        "delay and other type options throw unsupported_playwright_operation"
       ]
     },
     {

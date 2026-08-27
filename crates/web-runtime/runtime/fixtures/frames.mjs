@@ -160,7 +160,13 @@ await page.evaluate(() => {
 });
 if (!detached.includes("dyn")) throw new Error("framedetached " + JSON.stringify(detached));
 
-expectUnsupported("child isDetached", () => child.isDetached());
+if (child.isDetached()) throw new Error("child Frame.isDetached before remove");
+await page.evaluate(() => {
+  const iframe = document.querySelector("iframe[name=child]");
+  if (iframe) iframe.remove();
+  return true;
+});
+if (!child.isDetached()) throw new Error("child Frame.isDetached after remove");
 expectUnsupported("child frameLocator", () => child.frameLocator("iframe"));
 expectUnsupported("child waitForNavigation", () => child.waitForNavigation());
 expectUnsupported("nested FrameLocator.frameLocator", () => page.frameLocator("iframe").frameLocator("iframe"));

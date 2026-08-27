@@ -680,15 +680,19 @@ class Locator {
     });
   }
 
-  async scrollIntoViewIfNeeded() {
+  async scrollIntoViewIfNeeded(options) {
+    const timeout = actionTimeout(this, options, "Locator.scrollIntoViewIfNeeded");
+    await this.waitFor({ timeout });
     await engineCall("locator.scrollIntoViewIfNeeded", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
-  async selectText() {
+  async selectText(options) {
+    const timeout = actionTimeout(this, options, "Locator.selectText");
+    await this.waitFor({ timeout });
     await engineCall("locator.selectText", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
@@ -1064,8 +1068,8 @@ class Frame {
     return this._page.setContent(html);
   }
 
-  async waitForSelector(selector) {
-    await this.locator(selector).waitFor();
+  async waitForSelector(selector, options) {
+    await this.locator(selector).waitFor(options);
   }
 
   async waitForLoadState(state, options) {
@@ -1153,7 +1157,12 @@ class Frame {
     if (this._isMain()) {
       return false;
     }
-    throwUnsupported("Frame.isDetached.child");
+    const ids = this._page._childFrameIds;
+    if (!ids) {
+      return false;
+    }
+    const key = this._name ? "name:" + this._name : "id:" + String(this._id);
+    return !ids.has(key);
   }
 
   getByPlaceholder(name, options) {
@@ -1609,8 +1618,9 @@ class Page {
     });
   }
 
-  async waitForFunction(pageFunction, arg) {
-    const deadline = Date.now() + (this._timeout || 30_000);
+  async waitForFunction(pageFunction, arg, options) {
+    refuseLocatorOptions("Page.waitForFunction", options, ["timeout"]);
+    const deadline = Date.now() + ((options && options.timeout) || this._timeout || 30_000);
     while (Date.now() < deadline) {
       const value = await this.evaluate(pageFunction, arg);
       if (value) {
@@ -1621,9 +1631,13 @@ class Page {
     throw new TimeoutError("timeout: waitForFunction");
   }
 
-  async waitForURL(pattern) {
+  async waitForURL(pattern, options) {
+    refuseLocatorOptions("Page.waitForURL", options, ["timeout"]);
+    if (pattern instanceof RegExp || typeof pattern === "function") {
+      return unsupported("Page.waitForURL.pattern")();
+    }
     const needle = String(pattern);
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + ((options && options.timeout) || this._timeout || 30_000);
     while (Date.now() < deadline) {
       const url = await this.url();
       if (String(url).includes(needle)) {
@@ -1634,9 +1648,13 @@ class Page {
     throw new TimeoutError("timeout: waitForURL " + needle);
   }
 
-  async waitForRequest(pattern) {
+  async waitForRequest(pattern, options) {
+    refuseLocatorOptions("Page.waitForRequest", options, ["timeout"]);
+    if (pattern instanceof RegExp || typeof pattern === "function") {
+      return unsupported("Page.waitForRequest.pattern")();
+    }
     const needle = String(pattern);
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + ((options && options.timeout) || this._timeout || 30_000);
     while (Date.now() < deadline) {
       const result = await engineCall("page.requests", { page: this._id });
       const records = result.requests || [];
@@ -2095,13 +2113,16 @@ class Page {
     }
   }
 
-  async waitForSelector(selector) {
-    await this.locator(selector).waitFor();
+  async waitForSelector(selector, options) {
+    await this.locator(selector).waitFor(options);
   }
 
   async frames() {
     const result = await engineCall("page.frames", { page: this._id });
     const children = (result.frames || []).map((info) => new Frame(this, info));
+    this._childFrameIds = new Set(
+      children.map((frame) => (frame.name() ? "name:" + frame.name() : "id:" + String(frame._id))),
+    );
     const main = this.mainFrame();
     try {
       main._url = await this.url();
@@ -2436,19 +2457,24 @@ class Page {
   }
 
   keyboard = withUnsupported({
-    type: async (text) => {
+    type: async (text, options) => {
+      refuseLocatorOptions("Keyboard.type", options, []);
       await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
     },
-    press: async (key) => {
+    press: async (key, options) => {
+      refuseLocatorOptions("Keyboard.press", options, []);
       await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
     },
-    down: async (key) => {
+    down: async (key, options) => {
+      refuseLocatorOptions("Keyboard.down", options, []);
       await engineCall("page.keyboard.down", { page: this._id, key: String(key) });
     },
-    up: async (key) => {
+    up: async (key, options) => {
+      refuseLocatorOptions("Keyboard.up", options, []);
       await engineCall("page.keyboard.up", { page: this._id, key: String(key) });
     },
-    insertText: async (text) => {
+    insertText: async (text, options) => {
+      refuseLocatorOptions("Keyboard.insertText", options, []);
       await engineCall("page.keyboard.insertText", { page: this._id, text: String(text) });
     },
   }, "Keyboard");
@@ -2506,7 +2532,10 @@ class BrowserContext {
     return this._browser;
   }
 
-  async newPage() {
+  async newPage(options) {
+    if (options != null) {
+      refuseLocatorOptions("BrowserContext.newPage", options, ["extraHTTPHeaders"]);
+    }
     const result = await engineCall("context.newPage", { context: this._id });
     const page = new Page(result.page);
     page._context = this;
@@ -2516,8 +2545,13 @@ class BrowserContext {
     for (const pending of this._pendingRoutes || []) {
       await page.route(pending.url, pending.handler);
     }
-    if (this._extraHeaders && Object.keys(this._extraHeaders).length) {
-      await page.setExtraHTTPHeaders(this._extraHeaders);
+    const headers = Object.assign(
+      {},
+      this._extraHeaders || {},
+      (options && options.extraHTTPHeaders) || {},
+    );
+    if (Object.keys(headers).length) {
+      await page.setExtraHTTPHeaders(headers);
     }
     for (const source of this._initScripts || []) {
       await engineCall("page.addInitScript", { page: page._id, source });

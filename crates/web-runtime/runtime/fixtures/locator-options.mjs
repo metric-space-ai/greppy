@@ -49,6 +49,15 @@ await expectUnsupported("getByLabel exact false", () => page.getByLabel("Name", 
 await expectUnsupported("click force", () => page.locator("button").click({ force: true }));
 await expectUnsupported("click position", () => page.locator("button").click({ position: { x: 1, y: 1 } }));
 await page.locator("button").click({ timeout: 5_000 });
+await page.waitForSelector("button", { timeout: 5_000, state: "visible" });
+await expectUnsupported("waitForSelector hidden", () =>
+  page.waitForSelector("button", { state: "hidden" }),
+);
+if (!(await page.waitForFunction(() => true, undefined, { timeout: 2_000 }))) {
+  throw new Error("Page.waitForFunction timeout");
+}
+await expectUnsupported("waitForURL regex", () => page.waitForURL(/nope/, { timeout: 100 }));
+await expectUnsupported("keyboard type delay", () => page.keyboard.type("x", { delay: 5 }));
 await expectUnsupported("filter hasText regex", () => page.locator("p").filter({ hasText: /Hel/ }));
 await expectUnsupported("elementHandle", () => page.locator("button").elementHandle());
 page.setDefaultTimeout(2_000);

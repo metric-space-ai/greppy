@@ -170,6 +170,18 @@ await expectUnsupported("goto referer", () =>
   p4.goto(fixtureUrl, { referer: "https://example.invalid/" }),
 );
 await ctxLaunchHeaders.close();
+const ctxPageHeaders = await browser.newContext();
+const p5 = await ctxPageHeaders.newPage({
+  extraHTTPHeaders: { "x-greppy-test": "yes" },
+});
+await p5.goto(fixtureUrl, { timeout: 15_000 });
+if ((await p5.locator("body").innerText()).trim() !== "HEADER_OK") {
+  throw new Error("newPage extraHTTPHeaders");
+}
+await expectUnsupported("newPage viewport", () =>
+  ctxPageHeaders.newPage({ viewport: { width: 800, height: 600 } }),
+);
+await ctxPageHeaders.close();
 let paused = false;
 try {
   await page.pause();

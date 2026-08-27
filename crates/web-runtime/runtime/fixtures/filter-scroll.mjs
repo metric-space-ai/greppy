@@ -32,8 +32,8 @@ try {
   orClosed = String(error).includes("unsupported_playwright_operation: Locator.or");
 }
 if (!orClosed) throw new Error("Locator.or must fail closed");
-await page.locator("#q").scrollIntoViewIfNeeded();
-await page.locator("#q").selectText();
+await page.locator("#q").scrollIntoViewIfNeeded({ timeout: 5_000 });
+await page.locator("#q").selectText({ timeout: 5_000 });
 await page.mainFrame().hover("input");
 if (!(await page.mainFrame().isVisible("input"))) throw new Error("visible");
 await browser.close();
