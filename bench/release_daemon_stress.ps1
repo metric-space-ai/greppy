@@ -490,8 +490,16 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     [void][GreppyPipeClient]::PipeName($EmbedEndpoint)
     [void][GreppyPipeClient]::PipeName($SummaryEndpoint)
 
-    Write-Section 'index prewarm daemon readiness'
-    Wait-For 'embedding daemon endpoint after index prewarm' 120 {
+    Write-Section 'first graph command prewarm daemon readiness'
+    # Indexing owns its model only for the duration of the index operation.
+    # The public async daemon-prewarm contract begins when a graph command
+    # opens an indexed store that already contains vectors. Drive that exact
+    # contract before probing the private diagnostic endpoint; merely waiting
+    # after `index` would test a lifecycle the CLI does not promise.
+    [void](Invoke-GreppyJson @(
+        '--root', $RepoEmbed, 'search-symbol', 'ScoreLimits', '--json'
+    ) (Join-Path $Work 'out\prewarm-navigation.json'))
+    Wait-For 'embedding daemon endpoint after first graph-command prewarm' 120 {
         $prewarmStatus = Get-DaemonStatus $EmbedEndpoint
         $prewarmStatus.state -in @('starting', 'loading', 'ready', 'evicted', 'faulted')
     }

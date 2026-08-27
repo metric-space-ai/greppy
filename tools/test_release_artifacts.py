@@ -557,8 +557,24 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("function Wait-GreppyChild", windows_daemon_stress)
         self.assertEqual(windows_daemon_stress.count("Wait-GreppyChild $"), 3)
         self.assertNotIn(".Process.WaitForExit()", windows_daemon_stress)
-        self.assertIn("index prewarm daemon readiness", windows_daemon_stress)
-        self.assertIn("embedding daemon endpoint after index prewarm", windows_daemon_stress)
+        self.assertIn(
+            "first graph command prewarm daemon readiness", windows_daemon_stress
+        )
+        self.assertIn(
+            "'--root', $RepoEmbed, 'search-symbol', 'ScoreLimits', '--json'",
+            windows_daemon_stress,
+        )
+        self.assertIn("prewarm-navigation.json", windows_daemon_stress)
+        self.assertLess(
+            windows_daemon_stress.index("prewarm-navigation.json"),
+            windows_daemon_stress.index(
+                "embedding daemon endpoint after first graph-command prewarm"
+            ),
+        )
+        self.assertIn(
+            "embedding daemon endpoint after first graph-command prewarm",
+            windows_daemon_stress,
+        )
         self.assertIn("background-jobs=", windows_daemon_stress)
         self.assertIn("index-outputs=", windows_daemon_stress)
         self.assertIn("index-status=", windows_daemon_stress)
