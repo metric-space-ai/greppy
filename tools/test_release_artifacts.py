@@ -493,6 +493,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         self.assertNotIn("agent benchmark, and the summary-quality gate", readme)
+        self.assertNotIn("works in a disposable worktree", readme)
+        self.assertIn("uses a private portable CoW workspace", readme)
         self.assertNotIn("version=v0.3.2", readme)
         self.assertNotIn("releases/tag/v0.3.2", readme)
         self.assertNotIn("navigation benchmark is a hard", security)

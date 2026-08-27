@@ -54,7 +54,7 @@ greppy replace parse_config --verify < fix.rs  # one verified symbol replacement
 greppy patch --verify < refactor.diff          # coordinated all-or-nothing patch
 
 # And since 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
-greppy -p "add tests for clamp_value"          # works in a disposable worktree, returns a proposal ref
+greppy -p "add tests for clamp_value"          # uses a private portable CoW workspace, returns a proposal ref
 
 # In 0.3.2, concurrent agents share an immutable Base index and write private Deltas:
 greppy index --agent-worktree                  # build or validate the shared Base ahead of time
