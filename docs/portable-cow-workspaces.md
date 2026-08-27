@@ -156,6 +156,30 @@ baselines remain pinned until their refs are removed.
   substitute copies or aliases, does not use ProjFS, and does not rely on NTFS
   CoW behavior.
 
+For the Windows release-signing handoff, build the pinned fork on Windows,
+submit that exact driver through the Hardware Dev Center HLK flow, and download
+the returned `.sys` and `.cat`. Then generate and bind the evidence without
+editing either returned file:
+
+```powershell
+tools/verify_windows_driver_signatures.ps1 `
+  -DriverPath greppyworkspacefsp-x64.sys `
+  -CatalogPath greppyworkspacefsp-x64.cat `
+  -OutputPath greppy-windows-driver-signature-evidence.json
+python tools/windows_driver_contract.py create `
+  --unsigned path/to/fork/build/Release/greppyworkspacefsp-x64.sys `
+  --signed greppyworkspacefsp-x64.sys `
+  --catalog greppyworkspacefsp-x64.cat `
+  --fork-manifest third_party/winfsp-greppy/upstream.json `
+  --signature-evidence greppy-windows-driver-signature-evidence.json `
+  --output greppy-windows-driver-contract.json
+```
+
+The release workflow receives the signed driver, catalog, and contract through
+the three `WINDOWS_SIGNED_WINFSP_*_BASE64` secrets. It recreates the signature
+evidence from the supplied files and requires an exact semantic contract match;
+the evidence itself is therefore not accepted as a trusted secret.
+
 Release packages include the adapter, driver/runtime dependency, checksums,
 signatures, SBOM, provenance attestations, and complete third-party notices.
 The release remains blocked until clean-machine install, activation,
