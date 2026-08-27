@@ -64,8 +64,9 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("Directory.Build.props", builder)
         self.assertIn("$propsImports", builder)
         self.assertIn("nuget verify -Signatures", builder)
-        self.assertIn("build\\Release\\winfsp-x64.sys", builder)
-        self.assertIn("build\\Release\\winfsp-x64.dll", builder)
+        self.assertIn("build\\Release\\greppyworkspacefsp-x64.sys", builder)
+        self.assertIn("build\\Release\\greppyworkspacefsp-x64.dll", builder)
+        self.assertIn("build\\Release\\greppyworkspacefsp-x64.lib", builder)
         self.assertIn("testing\\build\\Release\\winfsp-tests-x64.exe", builder)
         self.assertNotIn("/p:WindowsSdkDir=", builder)
 
@@ -384,7 +385,9 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('"$deb_bin/greppy" workspace doctor --json', workflow)
         self.assertNotIn("greppy-linux-x86_64.tar.gz", workflow)
         self.assertIn("greppy-workspace-provider.exe", workflow)
-        self.assertIn("winfsp-2.1.25156.msi", workflow)
+        self.assertNotIn("winfsp-2.1.25156.msi", workflow)
+        self.assertIn("tools/build_winfsp_fork.ps1", workflow)
+        self.assertIn("greppyworkspacefsp-x64.dll", workflow)
         self.assertIn(
             "signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy-workspace-provider.exe",
             workflow,

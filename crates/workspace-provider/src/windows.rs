@@ -154,15 +154,21 @@ fn prepare_mount_point(mount_root: &Path) -> io::Result<()> {
 }
 
 fn configure_winfsp_runtime() -> io::Result<()> {
-    let program_files = std::env::var_os("ProgramFiles(x86)")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Program Files is unavailable"))?;
-    let runtime = PathBuf::from(program_files).join("WinFsp").join("bin");
-    let library = runtime.join("winfsp-x64.dll");
+    let executable = std::env::current_exe()?;
+    let runtime = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "workspace provider executable has no parent directory",
+        )
+    })?;
+    let library = runtime.join("greppyworkspacefsp-x64.dll");
     if !library.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("WinFsp 2.1 runtime is unavailable at {}", library.display()),
+            format!(
+                "bundled Greppy WinFsp runtime is unavailable at {}",
+                library.display()
+            ),
         ));
     }
     let mut wide: Vec<u16> = runtime.as_os_str().encode_wide().collect();

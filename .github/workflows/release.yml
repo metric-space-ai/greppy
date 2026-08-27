@@ -255,7 +255,7 @@ jobs:
           # v0.2.0 certifies Windows CPU inference and named-pipe daemons.
           # Windows CUDA and macOS Intel remain outside this release gate.
           - name: windows-x86_64
-            os: windows-latest
+            os: windows-2022
             asset: greppy-windows-x86_64.zip
             features: cpu-only
             footprint_devices: 'cpu'
@@ -321,24 +321,23 @@ jobs:
         if: runner.os == 'Windows' && matrix.features == 'cuda'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
-      - name: Install pinned unchanged WinFsp 2.1 runtime and SDK
+      - name: Build exact Greppy WinFsp transport fork
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
-          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
-          $actual = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
-          if ($actual -ne '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a') {
-            throw "WinFsp installer checksum mismatch: $actual"
-          }
-          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', 'INSTALLLEVEL=1000')
-          if ($install.ExitCode -ne 0) { throw "WinFsp installation failed: $($install.ExitCode)" }
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
-            throw 'WinFsp Developer headers were not installed'
-          }
+          $fork = Join-Path $env:RUNNER_TEMP 'greppy-winfsp-fork'
+          tools/build_winfsp_fork.ps1 -Destination $fork
+          "GREPPY_WINFSP_FORK_ROOT=$fork" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build release binary
         run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features ${{ matrix.features }}
+
+      - name: Stage private Greppy WinFsp user runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.dll'
+          Copy-Item -LiteralPath $runtime -Destination target\release\greppyworkspacefsp-x64.dll
 
       - name: Install Linux package builders
         if: runner.os == 'Linux'
@@ -410,10 +409,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'signtool sign failed' }
           & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy-workspace-provider.exe
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool sign failed' }
+          & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppyworkspacefsp-x64.dll
+          if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool sign failed' }
           & signtool verify /pa /all /v target/release/greppy.exe
           if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed' }
           & signtool verify /pa /all /v target/release/greppy-workspace-provider.exe
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool verify failed' }
+          & signtool verify /pa /all /v target/release/greppyworkspacefsp-x64.dll
+          if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool verify failed' }
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -616,6 +619,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
+          Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
           Copy-Item tools/release_artifacts.py dist/release_artifacts.py
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
@@ -689,6 +693,8 @@ jobs:
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-PROVENANCE.json")) { throw 'missing Qwen provenance' }
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json")) { throw 'missing Qwen training-data manifest' }
           if (-not (Test-Path "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json")) { throw 'missing model redistribution lock' }
+          if (-not (Test-Path "$clean/bin/greppyworkspacefsp-x64.dll")) { throw 'missing private Greppy WinFsp runtime' }
+          if (Test-Path "$clean/bin/winfsp-x64.dll") { throw 'official WinFsp runtime leaked into package' }
           & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
 
       - name: Generate SPDX SBOM

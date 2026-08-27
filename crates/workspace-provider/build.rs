@@ -1,17 +1,19 @@
 fn main() {
     println!("cargo:rerun-if-changed=platform/windows/winfsp_bridge.c");
+    println!("cargo:rerun-if-env-changed=GREPPY_WINFSP_FORK_ROOT");
     if std::env::var_os("CARGO_CFG_TARGET_OS").as_deref() != Some(std::ffi::OsStr::new("windows")) {
         return;
     }
-    let program_files = std::env::var_os("ProgramFiles(x86)")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .expect("WinFsp build requires Program Files");
-    let root = std::path::PathBuf::from(program_files).join("WinFsp");
+    let root = std::env::var_os("GREPPY_WINFSP_FORK_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("Windows provider builds require GREPPY_WINFSP_FORK_ROOT");
     let include = root.join("inc");
-    let library = root.join("lib");
-    if !include.join("fuse3/fuse.h").is_file() || !library.join("winfsp-x64.lib").is_file() {
+    let library = root.join("build/VStudio/build/Release");
+    if !include.join("fuse3/fuse.h").is_file()
+        || !library.join("greppyworkspacefsp-x64.lib").is_file()
+    {
         panic!(
-            "WinFsp 2.1 Developer files are required under {}",
+            "the exact Greppy WinFsp fork build is required under {}",
             root.display()
         );
     }
@@ -23,7 +25,9 @@ fn main() {
         .warnings(true)
         .compile("greppy_winfsp_bridge");
     println!("cargo:rustc-link-search=native={}", library.display());
-    println!("cargo:rustc-link-lib=dylib=winfsp-x64");
+    println!("cargo:rustc-link-lib=dylib=greppyworkspacefsp-x64");
     println!("cargo:rustc-link-lib=delayimp");
-    println!("cargo:rustc-link-arg-bin=greppy-workspace-provider=/DELAYLOAD:winfsp-x64.dll");
+    println!(
+        "cargo:rustc-link-arg-bin=greppy-workspace-provider=/DELAYLOAD:greppyworkspacefsp-x64.dll"
+    );
 }

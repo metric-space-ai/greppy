@@ -147,8 +147,9 @@ foreach ($project in $projects) {
 }
 
 $requiredOutputs = @(
-    'build\Release\winfsp-x64.sys',
-    'build\Release\winfsp-x64.dll',
+    'build\Release\greppyworkspacefsp-x64.sys',
+    'build\Release\greppyworkspacefsp-x64.dll',
+    'build\Release\greppyworkspacefsp-x64.lib',
     'testing\build\Release\winfsp-tests-x64.exe'
 )
 foreach ($output in $requiredOutputs) {

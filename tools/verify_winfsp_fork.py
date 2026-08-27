@@ -17,15 +17,21 @@ EXPECTED_TAG = "v2.1"
 EXPECTED_COMMIT = "ddca7bd5481857a65ba552f643b8776fd070836f"
 EXPECTED_TAG_OBJECT = "bcc52225ec7e6a9f5c889b5cdb8051adf41c4b91"
 EXPECTED_LICENSE = "GPL-3.0-only WITH WinFsp-FLOSS-exception"
-EXPECTED_FILES = {
-    "inc/winfsp/fsctl.h",
-    "inc/winfsp/winfsp.h",
-    "src/dll/fsop.c",
-    "src/dll/fuse/fuse_intf.c",
-    "src/dll/fuse/fuse_loop.c",
-    "src/sys/fileinfo.c",
-    "src/sys/volinfo.c",
+EXPECTED_PATCH_FILES = {
+    "patches/0001-greppy-hardlink-transport.patch": {
+        "inc/winfsp/fsctl.h",
+        "inc/winfsp/winfsp.h",
+        "src/dll/fsop.c",
+        "src/dll/fuse/fuse_intf.c",
+        "src/dll/fuse/fuse_loop.c",
+        "src/sys/fileinfo.c",
+        "src/sys/volinfo.c",
+    },
+    "patches/0002-greppy-product-identity.patch": {
+        "build/VStudio/build.version.props",
+    },
 }
+EXPECTED_FILES = set().union(*EXPECTED_PATCH_FILES.values())
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -88,26 +94,54 @@ def verify(root: Path) -> dict[str, Any]:
     require(manifest.get("tag_object") == EXPECTED_TAG_OBJECT, "upstream tag object changed")
     require(manifest.get("license") == EXPECTED_LICENSE, "license declaration changed")
     patches = manifest.get("patches")
-    require(isinstance(patches, list) and len(patches) == 1, "exactly one patch is required")
-    patch = patches[0]
-    require(isinstance(patch, dict), "patch record must be an object")
-    relative = safe_relative_path(patch.get("path"), "patch path")
-    patch_path = root / relative
-    regular_file(patch_path, str(patch_path))
-    digest = hashlib.sha256(patch_path.read_bytes()).hexdigest()
-    expected_digest = patch.get("sha256")
-    require(isinstance(expected_digest, str) and SHA256.fullmatch(expected_digest) is not None, "invalid patch SHA-256")
-    require(digest == expected_digest, "patch SHA-256 mismatch")
-    declared_files = patch.get("modified_files")
-    require(isinstance(declared_files, list), "modified_files must be an array")
-    declared = {
-        safe_relative_path(value, f"modified_files[{index}]")
-        for index, value in enumerate(declared_files)
-    }
-    require(len(declared) == len(declared_files), "modified_files contains duplicates")
-    require(declared == EXPECTED_FILES, "modified_files is not the minimal approved set")
-    actual = patch_files(patch_path.read_bytes(), patch_path)
-    require(actual == declared, "patch file set differs from manifest")
+    require(
+        isinstance(patches, list) and len(patches) == len(EXPECTED_PATCH_FILES),
+        f"exactly {len(EXPECTED_PATCH_FILES)} patches are required",
+    )
+    verified_patches: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    actual_files: set[str] = set()
+    for patch_index, patch in enumerate(patches):
+        require(isinstance(patch, dict), f"patches[{patch_index}] must be an object")
+        relative = safe_relative_path(patch.get("path"), f"patches[{patch_index}].path")
+        require(relative in EXPECTED_PATCH_FILES, f"unexpected patch path: {relative}")
+        require(relative not in seen_paths, f"duplicate patch path: {relative}")
+        seen_paths.add(relative)
+        patch_path = root / relative
+        regular_file(patch_path, str(patch_path))
+        digest = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+        expected_digest = patch.get("sha256")
+        require(
+            isinstance(expected_digest, str)
+            and SHA256.fullmatch(expected_digest) is not None,
+            f"{relative}: invalid patch SHA-256",
+        )
+        require(digest == expected_digest, f"{relative}: SHA-256 mismatch")
+        declared_files = patch.get("modified_files")
+        require(isinstance(declared_files, list), f"{relative}: modified_files must be an array")
+        declared = {
+            safe_relative_path(value, f"{relative}.modified_files[{index}]")
+            for index, value in enumerate(declared_files)
+        }
+        require(
+            len(declared) == len(declared_files),
+            f"{relative}: modified_files contains duplicates",
+        )
+        require(
+            declared == EXPECTED_PATCH_FILES[relative],
+            f"{relative}: modified_files is not the minimal approved set",
+        )
+        actual = patch_files(patch_path.read_bytes(), patch_path)
+        require(actual == declared, f"{relative}: patch file set differs from manifest")
+        actual_files.update(actual)
+        verified_patches.append(
+            {
+                "path": relative,
+                "sha256": digest,
+                "modified_files": sorted(actual),
+            }
+        )
+    require(seen_paths == set(EXPECTED_PATCH_FILES), "required patch path is absent")
     return {
         "schema": "greppy.winfsp-transport-verification.v1",
         "release_eligible_source": True,
@@ -116,8 +150,8 @@ def verify(root: Path) -> dict[str, Any]:
         "commit": EXPECTED_COMMIT,
         "tag_object": EXPECTED_TAG_OBJECT,
         "license": EXPECTED_LICENSE,
-        "patch_sha256": digest,
-        "modified_files": sorted(actual),
+        "patches": verified_patches,
+        "modified_files": sorted(actual_files),
     }
 
 

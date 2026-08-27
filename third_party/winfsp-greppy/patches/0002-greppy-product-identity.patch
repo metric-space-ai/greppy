@@ -1,0 +1,31 @@
+diff --git a/build/VStudio/build.version.props b/build/VStudio/build.version.props
+index dd1ec16..fa4e8fe 100644
+--- a/build/VStudio/build.version.props
++++ b/build/VStudio/build.version.props
+@@ -12,10 +12,10 @@
+         <MyGitRevision Condition="$(MyGitHead.StartsWith(ref: )) And !Exists('$(MyGitRoot)/.git/$(MyGitHead.Substring(5))')">$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText($(MyGitRoot)/.git/packed-refs)), '[0-9a-fA-F]{40,}.*$(MyGitHead.Substring(5))').Value.Substring(0, 7))</MyGitRevision>
+         <MyGitRevision Condition="!$(MyGitHead.StartsWith(ref: ))">$(MyGitHead.Substring(0, 7))</MyGitRevision>
+ 
+-        <MyProductName>WinFsp</MyProductName>
+-        <MyProductFileName>winfsp</MyProductFileName>
+-        <MyDescription>Windows File System Proxy</MyDescription>
+-        <MyCompanyName>Navimatics LLC</MyCompanyName>
++        <MyProductName>GreppyWorkspaceFsp</MyProductName>
++        <MyProductFileName>greppyworkspacefsp</MyProductFileName>
++        <MyDescription>Greppy portable workspace file system transport</MyDescription>
++        <MyCompanyName>Metric Space AI</MyCompanyName>
+         <MyCopyright>2015-$([System.DateTime]::Now.ToString(`yyyy`)) Bill Zissimopoulos</MyCopyright>
+ 
+         <MyCanonicalVersion>2.1</MyCanonicalVersion>
+@@ -38,8 +38,8 @@
+         <MyProductFileArch Condition="'$(Platform)'=='Win32'">x86</MyProductFileArch>
+ 
+         <!-- When rebranding WinFsp you MUST change the following GUIDs - use VS "Create GUID" tool -->
+-        <MyFspFsctlDeviceClassGuid>{ 0x6f9d25fa, 0x6dee, 0x4a9d, { 0x80, 0xf5, 0xe9, 0x8e, 0x14, 0xf3, 0x5e, 0x54 } }</MyFspFsctlDeviceClassGuid>
+-        <MyFspFsvrtDeviceClassGuid>{ 0xb48171c3, 0xdd50, 0x4852, { 0x83, 0xa3, 0x34, 0x4c, 0x50, 0xd9, 0x3b, 0x17 } }</MyFspFsvrtDeviceClassGuid>
++        <MyFspFsctlDeviceClassGuid>{ 0x109ceb60, 0x8a4f, 0x4c71, { 0xa1, 0x90, 0x53, 0x6e, 0x80, 0x40, 0xd5, 0x4f } }</MyFspFsctlDeviceClassGuid>
++        <MyFspFsvrtDeviceClassGuid>{ 0x87080d59, 0x351f, 0x40fc, { 0x97, 0x02, 0x88, 0xd8, 0x23, 0xe1, 0xa6, 0x5b } }</MyFspFsvrtDeviceClassGuid>
+ 
+         <!--
+             Configure paths used for registration via DllRegisterServer:
+

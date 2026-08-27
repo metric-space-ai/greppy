@@ -18,6 +18,13 @@
         "src/sys/fileinfo.c",
         "src/sys/volinfo.c"
       ]
+    },
+    {
+      "path": "patches/0002-greppy-product-identity.patch",
+      "sha256": "660885e43b96eb6596b4b7c1e39268e8a5967e9cc9b44e10e5c83664a9a28f68",
+      "modified_files": [
+        "build/VStudio/build.version.props"
+      ]
     }
   ]
 }

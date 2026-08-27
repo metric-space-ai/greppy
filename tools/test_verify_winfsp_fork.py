@@ -14,17 +14,29 @@ class WinFspForkVerifierTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.patch_path = self.root / "patches/0001.patch"
-        self.patch_path.parent.mkdir()
-        sections = []
-        for path in sorted(verifier.EXPECTED_FILES):
-            sections.append(
-                f"diff --git a/{path} b/{path}\n"
-                f"--- a/{path}\n"
-                f"+++ b/{path}\n"
-                "@@ -1 +1 @@\n-old\n+new\n"
+        self.patch_paths: list[Path] = []
+        patch_records = []
+        for relative, expected_files in verifier.EXPECTED_PATCH_FILES.items():
+            patch_path = self.root / relative
+            patch_path.parent.mkdir(exist_ok=True)
+            sections = []
+            for path in sorted(expected_files):
+                sections.append(
+                    f"diff --git a/{path} b/{path}\n"
+                    f"--- a/{path}\n"
+                    f"+++ b/{path}\n"
+                    "@@ -1 +1 @@\n-old\n+new\n"
+                )
+            patch_path.write_text("".join(sections), encoding="utf-8")
+            self.patch_paths.append(patch_path)
+            patch_records.append(
+                {
+                    "path": relative,
+                    "sha256": hashlib.sha256(patch_path.read_bytes()).hexdigest(),
+                    "modified_files": sorted(expected_files),
+                }
             )
-        self.patch_path.write_text("".join(sections), encoding="utf-8")
+        self.patch_path = self.patch_paths[0]
         self.manifest = {
             "schema": "greppy.winfsp-transport-upstream.v1",
             "repository": verifier.EXPECTED_REPOSITORY,
@@ -32,13 +44,7 @@ class WinFspForkVerifierTests(unittest.TestCase):
             "commit": verifier.EXPECTED_COMMIT,
             "tag_object": verifier.EXPECTED_TAG_OBJECT,
             "license": verifier.EXPECTED_LICENSE,
-            "patches": [
-                {
-                    "path": "patches/0001.patch",
-                    "sha256": hashlib.sha256(self.patch_path.read_bytes()).hexdigest(),
-                    "modified_files": sorted(verifier.EXPECTED_FILES),
-                }
-            ],
+            "patches": patch_records,
         }
         self.write_manifest()
 
@@ -93,11 +99,13 @@ class WinFspForkVerifierTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.ForkError, "traverse parents"):
             verifier.verify(self.root)
 
+        original_path = self.manifest["patches"][0]["path"]
         self.manifest["patches"][0]["path"] = "patches/link.patch"
         self.write_manifest()
         (self.root / "patches/link.patch").symlink_to(self.patch_path)
-        with self.assertRaisesRegex(verifier.ForkError, "not a regular file"):
+        with self.assertRaisesRegex(verifier.ForkError, "unexpected patch path"):
             verifier.verify(self.root)
+        self.manifest["patches"][0]["path"] = original_path
 
     def test_rejects_binary_add_delete_or_duplicate_sections(self) -> None:
         variants = (
