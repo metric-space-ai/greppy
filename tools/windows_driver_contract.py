@@ -14,6 +14,9 @@ from typing import Any
 
 SCHEMA = "greppy.windows-driver-contract.v1"
 EXPECTED_MACHINE = 0x8664
+EXPECTED_FORK_SCHEMA = "greppy.winfsp-transport-upstream.v1"
+EXPECTED_UPSTREAM_REPOSITORY = "https://github.com/winfsp/winfsp"
+EXPECTED_UPSTREAM_TAG = "v2.1"
 EXPECTED_UPSTREAM_COMMIT = "ddca7bd5481857a65ba552f643b8776fd070836f"
 
 
@@ -92,7 +95,13 @@ def pe_identity(path: pathlib.Path) -> dict[str, Any]:
 
 def load_fork_manifest(path: pathlib.Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("upstream", {}).get("commit") != EXPECTED_UPSTREAM_COMMIT:
+    if data.get("schema") != EXPECTED_FORK_SCHEMA:
+        raise ContractError("WinFsp fork manifest has an unexpected schema")
+    if data.get("repository") != EXPECTED_UPSTREAM_REPOSITORY:
+        raise ContractError("WinFsp fork manifest does not bind the expected repository")
+    if data.get("tag") != EXPECTED_UPSTREAM_TAG:
+        raise ContractError("WinFsp fork manifest does not bind the expected upstream tag")
+    if data.get("commit") != EXPECTED_UPSTREAM_COMMIT:
         raise ContractError("WinFsp fork manifest does not bind the expected upstream commit")
     patches = data.get("patches")
     if not isinstance(patches, list) or len(patches) != 2:
@@ -103,9 +112,9 @@ def load_fork_manifest(path: pathlib.Path) -> dict[str, Any]:
             raise ContractError("WinFsp fork manifest contains an invalid patch binding")
         normalized.append({"path": patch["path"], "sha256": patch["sha256"]})
     return {
-        "upstream_repository": data["upstream"]["repository"],
-        "upstream_tag": data["upstream"]["tag"],
-        "upstream_commit": data["upstream"]["commit"],
+        "upstream_repository": data["repository"],
+        "upstream_tag": data["tag"],
+        "upstream_commit": data["commit"],
         "patches": normalized,
     }
 

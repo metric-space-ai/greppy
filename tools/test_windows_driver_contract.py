@@ -31,11 +31,10 @@ class WindowsDriverContractTests(unittest.TestCase):
         self.fork.write_text(
             json.dumps(
                 {
-                    "upstream": {
-                        "repository": "https://github.com/winfsp/winfsp.git",
-                        "tag": "v2.1",
-                        "commit": contract.EXPECTED_UPSTREAM_COMMIT,
-                    },
+                    "schema": contract.EXPECTED_FORK_SCHEMA,
+                    "repository": contract.EXPECTED_UPSTREAM_REPOSITORY,
+                    "tag": contract.EXPECTED_UPSTREAM_TAG,
+                    "commit": contract.EXPECTED_UPSTREAM_COMMIT,
                     "patches": [
                         {"path": "patches/0001.patch", "sha256": "1" * 64},
                         {"path": "patches/0002.patch", "sha256": "2" * 64},
@@ -77,6 +76,17 @@ class WindowsDriverContractTests(unittest.TestCase):
             value,
             contract.verify_signed_contract(manifest, self.signed, self.fork),
         )
+
+    def test_repository_fork_manifest_matches_driver_contract_schema(self):
+        repository_manifest = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "third_party"
+            / "winfsp-greppy"
+            / "upstream.json"
+        )
+        loaded = contract.load_fork_manifest(repository_manifest)
+        self.assertEqual(contract.EXPECTED_UPSTREAM_COMMIT, loaded["upstream_commit"])
+        self.assertEqual(2, len(loaded["patches"]))
 
     def test_changed_payload_is_rejected(self):
         changed = bytearray(fake_pe(b"signed!!"))
