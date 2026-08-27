@@ -449,12 +449,17 @@ to a large file creates only the affected chunk plus metadata; it never copies
 the complete file. Ignored files and build caches are excluded from the dirty
 snapshot.
 
-The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3, a macOS 15+
-FSKit app extension, and unchanged signed WinFsp 2.1 on Windows. It does not
-require APFS clones, Btrfs subvolumes, reflinks, NTFS block cloning, or any other
-host-filesystem CoW feature. The small macOS extension host is Swift because
-FSKit requires an Apple extension boundary; all namespace, chunk, recovery,
-and Git semantics remain in Rust. See
+The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3 and a macOS
+15+ FSKit app extension. The Windows core also compiles and passes its direct
+contract, but the release remains blocked: official unchanged WinFsp 2.1
+rejects `FileLinkInformation` before it reaches the Rust provider, while the
+common contract requires real hardlinks. Greppy does not emulate them with
+copies or aliases. A licensed, signed Windows transport must pass the identical
+mounted contract before 0.3.4 can ship. None of these providers requires APFS
+clones, Btrfs subvolumes, reflinks, NTFS block cloning, or another host-
+filesystem CoW feature. The small macOS extension host is Swift because FSKit
+requires an Apple extension boundary; all namespace, chunk, recovery, and Git
+semantics remain in Rust. See
 [Portable CoW workspaces](docs/portable-cow-workspaces.md) for setup, lifecycle,
 proposal, recovery, and platform details.
 

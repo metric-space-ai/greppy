@@ -94,9 +94,12 @@ baselines remain pinned until their refs are removed.
   extension. The one-time System Settings approval is an OS security boundary;
   Greppy remains unavailable until activation. A minimal Swift host bridges
   FSKit to the Rust core.
-- Windows x86_64 uses Greppy's Rust provider over the official unchanged,
-  signed WinFsp 2.1 runtime. The installer may request UAC once. It does not use
-  ProjFS and does not rely on NTFS CoW behavior.
+- Windows x86_64 is a release blocker until a licensed, signed kernel transport
+  forwards real hardlink operations to Greppy's Rust provider. Official
+  unchanged WinFsp 2.1 rejects `FileLinkInformation` before userspace, so the
+  current diagnostic package intentionally fails the common mounted contract.
+  Greppy does not substitute copies or aliases, does not use ProjFS, and does
+  not rely on NTFS CoW behavior.
 
 Release packages include the adapter, driver/runtime dependency, checksums,
 signatures, SBOM, provenance attestations, and complete third-party notices.
