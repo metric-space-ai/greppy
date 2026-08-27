@@ -41,7 +41,7 @@ jobs:
         include:
           # Windows ships CPU-only inference (see release.yml): no CUDA here.
           - arch: x64
-            os: windows-latest
+            os: windows-2022
             rust_host: x86_64-pc-windows-msvc
           - arch: arm64
             os: windows-11-arm

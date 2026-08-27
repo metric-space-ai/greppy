@@ -417,7 +417,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         portable_lifecycle = cow_workflow.split("portable-agent-contract:", 1)[1]
         self.assertIn("name: Portable agent lifecycle (${{ matrix.os }})", portable_lifecycle)
-        self.assertIn("os: [ubuntu-latest, macos-15, windows-latest]", portable_lifecycle)
+        self.assertIn("os: [ubuntu-latest, macos-15, windows-2022]", portable_lifecycle)
+        self.assertNotIn("windows-latest", cow_workflow)
         self.assertIn("full_platform_performance:", cow_workflow)
         self.assertIn("runs-on: [self-hosted, macOS, ARM64", cow_workflow)
         self.assertIn("name: Windows x86_64 real WinFsp performance", cow_workflow)

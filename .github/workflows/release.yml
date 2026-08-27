@@ -843,7 +843,7 @@ jobs:
             secondary_asset: greppy-linux-x86_64.rpm
             rust_host: x86_64-unknown-linux-gnu
           - name: windows-x86_64
-            os: windows-latest
+            os: windows-2022
             asset: greppy-windows-x86_64.zip
             rust_host: x86_64-pc-windows-msvc
     steps:
