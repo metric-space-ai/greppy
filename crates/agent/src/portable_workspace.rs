@@ -1769,7 +1769,7 @@ fn open_shared_git_layer(
 }
 
 fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
-    let output = Command::new("git")
+    let output = private_git_command()
         .args([
             "init",
             "--bare",
@@ -1789,7 +1789,7 @@ fn configure_git_control_template(git_dir: &Path) -> Result<(), WorkspaceError> 
         ("core.autocrlf", "false"),
         ("core.symlinks", "true"),
     ] {
-        let output = Command::new("git")
+        let output = private_git_command()
             .args(["--git-dir", path_text(git_dir)?, "config", key, value])
             .output()?;
         output_text(&format!("git config {key}"), output)?;
@@ -1803,7 +1803,7 @@ fn commit_tree_in_git_dir(
     parent: &str,
     message: &str,
 ) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
+    let output = private_git_command()
         .args([
             "--git-dir",
             path_text(git_dir)?,
@@ -1857,7 +1857,7 @@ fn hash_blob(
     worktree: &Path,
     bytes: &[u8],
 ) -> Result<String, WorkspaceError> {
-    let mut child = Command::new("git")
+    let mut child = private_git_command()
         .args([
             "--git-dir",
             path_text(private_git_dir)?,
@@ -1885,7 +1885,7 @@ fn git_private(
     index: Option<&Path>,
     args: &[&str],
 ) -> Result<String, WorkspaceError> {
-    let mut command = Command::new("git");
+    let mut command = private_git_command();
     command
         .args(["--git-dir", path_text(private_git_dir)?])
         .args(["--work-tree", path_text(worktree)?]);
@@ -1901,6 +1901,19 @@ fn git_private(
         ),
         output,
     )
+}
+
+fn private_git_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("git");
+        command.args(["-c", "core.longpaths=true"]);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("git")
+    }
 }
 
 fn commit_tree(
@@ -2239,6 +2252,37 @@ mod tests {
                 fs::copy(source_path, destination_path).unwrap();
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_git_layer_supports_windows_long_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let long_root = temp.path().join("long".repeat(48));
+        let repository = long_root.join("private").join("repo");
+        let worktree = long_root.join("workspace");
+        let index = long_root.join("indexes").join("seed.index");
+        fs::create_dir_all(repository.parent().unwrap()).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+
+        init_bare(&repository, "sha1").unwrap();
+        configure_git_control_template(&repository).unwrap();
+        git_private(
+            &repository,
+            &worktree,
+            Some(&index),
+            &["read-tree", "--empty"],
+        )
+        .unwrap();
+        git_private(
+            &repository,
+            &worktree,
+            Some(&index),
+            &["update-index", "--split-index"],
+        )
+        .unwrap();
+        assert!(index.is_file());
     }
 
     #[test]
