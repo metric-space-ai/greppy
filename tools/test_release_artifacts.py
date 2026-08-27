@@ -552,6 +552,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("NamedPipeClientStream", windows_daemon_stress)
         self.assertIn("Stop-Process", windows_daemon_stress)
         self.assertIn("48, 20000", windows_daemon_stress)
+        self.assertIn("flood-evidence=", windows_daemon_stress)
+        self.assertIn("flood-evidence.json", windows_daemon_stress)
+        self.assertIn("raw_response", windows_daemon_stress)
+        self.assertIn("rejected_delta", windows_daemon_stress)
+        self.assertIn(
+            "daemon counted capacity rejections but no client received a classified response",
+            windows_daemon_stress,
+        )
         self.assertIn("attempt < 3", windows_daemon_stress)
         self.assertIn("[int]$ChildTimeoutSeconds = 900", windows_daemon_stress)
         self.assertIn("function Wait-GreppyChild", windows_daemon_stress)

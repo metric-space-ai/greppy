@@ -431,6 +431,10 @@ function Convert-Burst([GreppyPipeResult[]]$Results) {
             $parsed += [pscustomobject]@{
                 request_id = $result.RequestId
                 client_error = $result.Error
+                raw_response = $result.Response
+                response_error = $null
+                error_kind = $null
+                retryable = $false
                 capacity = $false
                 echo_ok = $false
             }
@@ -438,11 +442,23 @@ function Convert-Burst([GreppyPipeResult[]]$Results) {
         }
         $response = $result.Response | ConvertFrom-Json
         $requestIdProperty = $response.PSObject.Properties['request_id']
+        $responseErrorProperty = $response.PSObject.Properties['error']
         $errorKindProperty = $response.PSObject.Properties['error_kind']
         $retryableProperty = $response.PSObject.Properties['retryable']
         $parsed += [pscustomobject]@{
             request_id = $result.RequestId
             client_error = $null
+            raw_response = $result.Response
+            response_error = if ($null -ne $responseErrorProperty) {
+                $responseErrorProperty.Value
+            } else { $null }
+            error_kind = if ($null -ne $errorKindProperty) {
+                $errorKindProperty.Value
+            } else { $null }
+            retryable = (
+                $null -ne $retryableProperty -and
+                $retryableProperty.Value -eq $true
+            )
             capacity = (
                 $null -ne $errorKindProperty -and
                 $errorKindProperty.Value -eq 'capacity' -and
@@ -598,11 +614,36 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
         -not [String]::IsNullOrEmpty(
             [string](Get-DaemonStatus $EmbedEndpoint).active_request_id)
     }
+    $floodStatusBefore = Get-DaemonStatus $EmbedEndpoint
     $flood = Convert-Burst (
         [GreppyPipeClient]::Burst($EmbedEndpoint, 'flood', 48, 20000)
     )
-    if (@($flood | Where-Object capacity).Count -lt 1) {
-        throw 'busy 48-client flood produced no classified capacity response'
+    $floodStatusAfter = Get-DaemonStatus $EmbedEndpoint
+    $floodCapacity = @($flood | Where-Object { $_.capacity -eq $true }).Count
+    $floodRejectedDelta =
+        [int]$floodStatusAfter.rejected_requests -
+        [int]$floodStatusBefore.rejected_requests
+    $floodEvidence = [ordered]@{
+        before_rejected_requests = [int]$floodStatusBefore.rejected_requests
+        after_rejected_requests = [int]$floodStatusAfter.rejected_requests
+        rejected_delta = $floodRejectedDelta
+        capacity = $floodCapacity
+        echo_ok = @($flood | Where-Object { $_.echo_ok -eq $true }).Count
+        client_errors = @($flood | Where-Object { $_.client_error }).Count
+        results = @($flood)
+    }
+    $floodEvidenceJson = $floodEvidence | ConvertTo-Json -Depth 6 -Compress
+    [IO.File]::WriteAllText(
+        (Join-Path $Work 'out\flood-evidence.json'),
+        $floodEvidenceJson,
+        [Text.UTF8Encoding]::new($false)
+    )
+    Write-Host "flood-evidence=$floodEvidenceJson"
+    if ($floodCapacity -lt 1) {
+        if ($floodRejectedDelta -gt 0) {
+            throw "daemon counted capacity rejections but no client received a classified response: $floodEvidenceJson"
+        }
+        throw "busy 48-client flood produced no classified capacity response: $floodEvidenceJson"
     }
     foreach ($child in $children) {
         Complete-GreppyProcess $child.Handle $child.Output $true
