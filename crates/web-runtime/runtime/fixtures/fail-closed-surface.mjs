@@ -28,6 +28,10 @@ await page.evaluate(() => console.log("closed-log"));
 
 await expectUnsupported("Selectors.register", () => selectors.register("foo"));
 await expectUnsupported("Page.workers", () => page.workers());
+await expectUnsupported("Screencast.start", () => page.screencast.start());
+await expectUnsupported("WebStorage.clear", () => page.localStorage.clear());
+await expectUnsupported("WebStorage.getItem", () => page.sessionStorage.getItem("x"));
+await expectUnsupported("Page.prependListener websocket", () => page.prependListener("websocket", () => {}));
 await expectUnsupported("Page.on websocket", () => page.on("websocket", () => {}));
 await expectUnsupported("Page.on worker", () => page.on("worker", () => {}));
 await expectUnsupported("Page.on crash", () => page.on("crash", () => {}));

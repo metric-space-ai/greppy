@@ -302,11 +302,43 @@ pub(crate) struct WorkerProcess {
     reaped: bool,
 }
 
+fn inherited_worker_env() -> Vec<(OsString, OsString)> {
+    const ALLOW: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "LD_LIBRARY_PATH",
+        "FONTCONFIG_PATH",
+        "FONTCONFIG_FILE",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ];
+    std::env::vars_os()
+        .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))
+        .collect()
+}
+
 impl WorkerProcess {
     pub(crate) fn spawn(path: &Path, worker: WorkerKind, capability: String) -> io::Result<Self> {
         let mut child = Command::new(path)
             .arg("--capability")
             .arg(capability)
+            .env_clear()
+            .envs(inherited_worker_env())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

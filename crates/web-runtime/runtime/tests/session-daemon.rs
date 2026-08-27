@@ -693,6 +693,44 @@ fn observe_read_search_research_screenshot_and_policy() {
     assert_eq!(denied.error.as_ref().unwrap().exit_code, 36);
 }
 
+fn worker_environ(pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-wwwE"])
+        .output()
+        .expect("ps -wwwE");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn workers_do_not_inherit_secret_environment() {
+    const CANARY: &str = "GREPPY_WEB_SECRET_CANARY";
+    const VALUE: &str = "should-not-leak-into-workers";
+    std::env::set_var(CANARY, VALUE);
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-env-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let supervisor = Supervisor::spawn(&socket, "run_env", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let parent = supervisor.child.id();
+    let workers = child_pids(parent);
+    assert!(
+        workers.len() >= 2,
+        "expected controller and content workers, got {workers:?}"
+    );
+    for pid in workers {
+        let environ = worker_environ(pid);
+        assert!(
+            !environ.contains(VALUE),
+            "worker {pid} inherited secret env: {environ}"
+        );
+        assert!(
+            !environ.contains(CANARY),
+            "worker {pid} inherited secret key: {environ}"
+        );
+    }
+    std::env::remove_var(CANARY);
+}
+
 #[test]
 fn content_worker_exits_after_supervisor_is_killed() {
     let socket =

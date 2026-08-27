@@ -1318,6 +1318,9 @@ class Page {
       stopCSSCoverage: unsupported("Coverage.stopCSSCoverage"),
     };
     this.request = withUnsupported({}, "APIRequestContext");
+    this.screencast = withUnsupported({}, "Screencast");
+    this.localStorage = withUnsupported({}, "WebStorage");
+    this.sessionStorage = withUnsupported({}, "WebStorage");
     this.touchscreen = {
       tap: async (x, y) => {
         await engineCall("page.touch.tap", { page: this._id, x, y });
@@ -2273,8 +2276,15 @@ class Page {
   }
 
   prependListener(event, handler) {
-    this._handlers[event] = this._handlers[event] || [];
-    this._handlers[event].unshift(handler);
+    const result = this.on(event, handler);
+    if (result && typeof result.then === "function") {
+      return result;
+    }
+    const list = this._handlers && this._handlers[event];
+    if (list && list.length > 1) {
+      const last = list.pop();
+      list.unshift(last);
+    }
     return this;
   }
 

@@ -41,8 +41,8 @@
   "entry_count": 1354,
   "status_counts": {
     "implemented": 347,
-    "unsupported": 466,
-    "unverified": 541
+    "unsupported": 492,
+    "unverified": 515
   },
   "entries": [
     {
@@ -8083,181 +8083,253 @@
       "symbol": "Screencast.hideActions",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.hideOverlays",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.showActions",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.showChapter",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.showOverlay",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.showOverlays",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.start",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.stop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.annotate",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.cursor",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.description",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.duration",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.fontSize",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.onFrame",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.path",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.position",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.quality",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Screencast.size",
       "kind": "property",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is an unsupported object; Screencast methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "ElectronApplication.addListener",
@@ -12152,51 +12224,71 @@
       "symbol": "WebStorage.clear",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.localStorage/sessionStorage are unsupported objects; WebStorage methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "WebStorage.getItem",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.localStorage/sessionStorage are unsupported objects; WebStorage methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "WebStorage.items",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.localStorage/sessionStorage are unsupported objects; WebStorage methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "WebStorage.removeItem",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.localStorage/sessionStorage are unsupported objects; WebStorage methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "WebStorage.setItem",
       "kind": "method",
       "origin": "parser",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.localStorage/sessionStorage are unsupported objects; WebStorage methods MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Electron.launch",
@@ -15278,11 +15370,15 @@
       "symbol": "Page.localStorage",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.localStorage is not implemented. Members MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.mouse",
@@ -15312,21 +15408,29 @@
       "symbol": "Page.screencast",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.screencast is not implemented. Members MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.sessionStorage",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unverified",
-      "source": "unverified",
-      "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "schema": "unsupported",
+      "source": "unsupported",
+      "behavior": "unsupported",
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "Page.sessionStorage is not implemented. Members MUST fail with unsupported_playwright_operation."
+      ]
     },
     {
       "symbol": "Page.touchscreen",
@@ -16470,8 +16574,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 871,
-    "unsupported": 466,
+    "unverified": 845,
+    "unsupported": 492,
     "passing": 17
   }
 }
