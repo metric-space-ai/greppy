@@ -1057,7 +1057,33 @@ jobs:
           test "$(readlink "$payload/usr/local/bin/greppy")" = \
             /Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy
           codesign --verify --deep --strict --verbose=2 "$app"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.sign_dry_run }}" == true ]]; then
+            extension="$app/Contents/Extensions/GreppyWorkspaceFS.appex"
+            app_profile="$app/Contents/embedded.provisionprofile"
+            extension_profile="$extension/Contents/embedded.provisionprofile"
+            test -f "$app_profile" && test ! -L "$app_profile"
+            test -f "$extension_profile" && test ! -L "$extension_profile"
+            profile_evidence="$RUNNER_TEMP/greppy-clean-profile-evidence"
+            mkdir -p "$profile_evidence"
+            security cms -D -i "$app_profile" \
+              -o "$profile_evidence/app-profile.plist"
+            security cms -D -i "$extension_profile" \
+              -o "$profile_evidence/extension-profile.plist"
+            codesign -d \
+              --extract-certificates "$profile_evidence/codesign" "$app"
+            test -s "$profile_evidence/codesign0"
+            python3 tools/validate_macos_fskit_profile.py \
+              --plist "$profile_evidence/app-profile.plist" \
+              --bundle-id ai.metricspace.greppy.workspacefs \
+              --application-group group.ai.metricspace.greppy \
+              --role app \
+              --signing-certificate-der "$profile_evidence/codesign0"
+            python3 tools/validate_macos_fskit_profile.py \
+              --plist "$profile_evidence/extension-profile.plist" \
+              --bundle-id ai.metricspace.greppy.workspacefs.extension \
+              --application-group group.ai.metricspace.greppy \
+              --role fskit-extension \
+              --signing-certificate-der "$profile_evidence/codesign0"
             xcrun stapler validate "package/${{ matrix.asset }}"
             pkgutil --check-signature "package/${{ matrix.asset }}"
             spctl --assess --type install --verbose=2 "package/${{ matrix.asset }}"

@@ -400,6 +400,35 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         self.assertIn('xcrun stapler staple "${{ matrix.asset }}"', workflow)
         self.assertIn('spctl --assess --type install', workflow)
+        self.assertIn(
+            'test -f "$app_profile" && test ! -L "$app_profile"', workflow
+        )
+        self.assertIn(
+            'test -f "$extension_profile" && test ! -L "$extension_profile"',
+            workflow,
+        )
+        self.assertIn(
+            '--extract-certificates "$profile_evidence/codesign" "$app"',
+            workflow,
+        )
+        self.assertIn(
+            'if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.sign_dry_run }}" == true ]]; then',
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count("python3 tools/validate_macos_fskit_profile.py"),
+            2,
+        )
+        clean_macos = workflow.index("Verify clean macOS installer")
+        app_profile_validation = workflow.index(
+            "--bundle-id ai.metricspace.greppy.workspacefs", clean_macos
+        )
+        extension_profile_validation = workflow.index(
+            "--bundle-id ai.metricspace.greppy.workspacefs.extension",
+            clean_macos,
+        )
+        self.assertLess(clean_macos, app_profile_validation)
+        self.assertLess(app_profile_validation, extension_profile_validation)
         self.assertNotIn("greppy-macos-arm64.tar.gz", workflow)
         self.assertIn("greppy-linux-x86_64.deb", workflow)
         self.assertIn("greppy-linux-x86_64.rpm", workflow)
