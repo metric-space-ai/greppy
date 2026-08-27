@@ -2245,7 +2245,8 @@
         "native-dialog"
       ],
       "known_differences": [
-        "native alert is auto-accepted after diverting Servo ALERT stdout"
+        "native alert is auto-accepted after diverting Servo ALERT stdout",
+        "page.on(dialog) still sets next-dialog policy via a probe; recorded SimpleDialogs are dispatched after evaluate to page and context listeners. Not Chromium in-alert timing."
       ]
     },
     {

@@ -1300,12 +1300,15 @@ class Page {
     this._seenFrames = {};
     this._emittedNetwork = new Set();
     this._consoleSeen = 0;
+    this._dialogSeen = 0;
     this._popupWaiters = [];
     this._pendingPopups = [];
     this._openerId = null;
     this._navWaiters = [];
     this._consoleWaiters = [];
     this._pendingConsole = [];
+    this._dialogWaiters = [];
+    this._pendingDialogs = [];
     this._mouseX = 0;
     this._mouseY = 0;
     this.coverage = {
@@ -1869,6 +1872,7 @@ class Page {
     });
     await this._flushPopups();
     await this._dispatchConsole();
+    await this._dispatchDialogs();
     await this._dispatchFrames();
     return result.value;
   }
@@ -1908,6 +1912,35 @@ class Page {
     }
     return new Promise((resolve) => {
       this._consoleWaiters.push(resolve);
+    });
+  }
+
+  async _dispatchDialogs() {
+    this._dialogWaiters = this._dialogWaiters || [];
+    this._pendingDialogs = this._pendingDialogs || [];
+    const result = await engineCall("page.dialogs", { page: this._id });
+    const dialogs = result.dialogs || [];
+    for (let i = this._dialogSeen; i < dialogs.length; i++) {
+      const dialog = new Dialog(this, dialogs[i]);
+      const waiter = this._dialogWaiters.shift();
+      if (waiter) {
+        waiter(dialog);
+      } else {
+        this._pendingDialogs.push(dialog);
+      }
+      this._emit("dialog", dialog);
+    }
+    this._dialogSeen = dialogs.length;
+  }
+
+  _waitForDialog() {
+    this._pendingDialogs = this._pendingDialogs || [];
+    this._dialogWaiters = this._dialogWaiters || [];
+    if (this._pendingDialogs.length) {
+      return Promise.resolve(this._pendingDialogs.shift());
+    }
+    return new Promise((resolve) => {
+      this._dialogWaiters.push(resolve);
     });
   }
 
@@ -2092,16 +2125,7 @@ class Page {
 
   async waitForEvent(event) {
     if (event === "dialog") {
-      const result = await engineCall("page.dialogs", { page: this._id, consume: true });
-      const rec = (result.dialogs || [])[0];
-      if (!rec) {
-        return unsupported("Page.waitForEvent.dialog.empty")();
-      }
-      const dialog = new Dialog(this, rec);
-      if (this._context) {
-        this._context._emit("dialog", dialog);
-      }
-      return dialog;
+      return this._waitForDialog();
     }
     if (event === "filechooser") {
       const result = await engineCall("page.fileChoosers", { page: this._id, consume: true });

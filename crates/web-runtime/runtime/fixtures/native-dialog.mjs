@@ -3,10 +3,14 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 const ctxDialogs = [];
+const liveDialogs = [];
 page.context().on("dialog", (dialog) => {
   ctxDialogs.push(dialog.message());
 });
-page.on("dialog", (dialog) => dialog.accept());
+page.on("dialog", (dialog) => {
+  if (dialog.message()) liveDialogs.push(dialog.message());
+  return dialog.accept();
+});
 
 const alertValue = await page.evaluate(() => {
   alert("native-hi");
@@ -27,6 +31,9 @@ if (alertDialog.page() !== page && alertDialog.page()._id !== page._id) {
 }
 if (!ctxDialogs.includes("native-hi")) {
   throw new Error("context dialog " + JSON.stringify(ctxDialogs));
+}
+if (!liveDialogs.includes("native-hi")) {
+  throw new Error("page.on live dialog " + JSON.stringify(liveDialogs));
 }
 
 const confirmed = await page.evaluate(() => confirm("native-confirm"));
