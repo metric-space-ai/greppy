@@ -28,8 +28,9 @@ user unit with the exact selected data and mount roots. macOS installs a
 RunAtLoad LaunchAgent that repeats the idempotent FSKit setup/health check after
 login; FSKit activation itself remains controlled by macOS. Configuration files
 are atomically replaced and an existing symlink is replaced rather than
-followed. Windows service registration is intentionally absent from diagnostic
-builds until the signed hardlink-capable transport is selected and packaged.
+followed. The Windows MSI installs an uninstall-safe machine Run entry that
+replays setup at login; Greppy validates that it points to the current package
+before starting the adjacent private provider and driver.
 
 There is one persistent user mount with workspaces below `workspaces/<id>`.
 Creating an agent workspace updates namespace metadata; it does not create a
@@ -125,19 +126,24 @@ baselines remain pinned until their refs are removed.
   Greppy remains unavailable until activation. A minimal Swift host bridges
   FSKit to the Rust core; the LaunchAgent only replays idempotent setup after
   login and does not bypass that approval boundary. Developer-ID builds also
-  require an embedded provisioning profile for exactly
-  `ai.metricspace.greppy.workspacefs.extension`; the profile must authorize
-  the FSKit Module entitlement, `group.ai.metricspace.greppy`, and the signing
-  team. The release build fails before compilation when this profile is absent
-  and validates its signature, expiry, distribution type and entitlement
-  allowlist before signing. Notarization without this profile is insufficient
-  for FSKit activation and is never accepted as release evidence.
-- Windows x86_64 is a release blocker until a licensed, signed kernel transport
-  forwards real hardlink operations to Greppy's Rust provider. Official
-  unchanged WinFsp 2.1 rejects `FileLinkInformation` before userspace, so the
-  current diagnostic package intentionally fails the common mounted contract.
-  Greppy does not substitute copies or aliases, does not use ProjFS, and does
-  not rely on NTFS CoW behavior.
+  require separate embedded Developer-ID provisioning profiles for
+  `ai.metricspace.greppy.workspacefs` and
+  `ai.metricspace.greppy.workspacefs.extension`. Both must authorize
+  `group.ai.metricspace.greppy`, contain the selected signing certificate, and
+  bind the same team; the extension profile must additionally authorize the
+  FSKit Module entitlement. The release build fails before compilation when
+  either profile is absent and validates signature, expiry, distribution type,
+  exact bundle ID, certificate and entitlement allowlist before signing.
+  Notarization without these profiles is insufficient for FSKit activation and
+  is never accepted as release evidence.
+- Windows x86_64 uses Greppy's minimal WinFsp transport fork because unchanged
+  WinFsp 2.1 rejects `FileLinkInformation` before userspace. The fork forwards
+  real hardlink operations to the same Rust provider and ships with its exact
+  corresponding source. The release remains blocked until the exact driver is
+  Microsoft-signed and the installed MSI passes the common mounted contract,
+  upgrade, uninstall, isolation and performance gates. Greppy does not
+  substitute copies or aliases, does not use ProjFS, and does not rely on NTFS
+  CoW behavior.
 
 Release packages include the adapter, driver/runtime dependency, checksums,
 signatures, SBOM, provenance attestations, and complete third-party notices.

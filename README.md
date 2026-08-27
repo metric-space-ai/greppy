@@ -460,12 +460,14 @@ metadata-mismatched recovery journals fail closed before touching Git or the
 working tree.
 
 The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3 and a macOS
-15+ FSKit app extension. The Windows core also compiles and passes its direct
-contract, but the release remains blocked: official unchanged WinFsp 2.1
-rejects `FileLinkInformation` before it reaches the Rust provider, while the
-common contract requires real hardlinks. Greppy does not emulate them with
-copies or aliases. A licensed, signed Windows transport must pass the identical
-mounted contract before 0.3.4 can ship. None of these providers requires APFS
+15+ FSKit app extension. The Windows core and Greppy's minimal WinFsp
+transport fork compile and pass their direct contracts. The fork forwards
+`FileLinkInformation` to the Rust provider instead of rejecting hardlink
+creation in the transport layer. Greppy does not emulate hardlinks with copies
+or aliases. Release still requires the exact fork driver to be Microsoft-
+signed and to pass the identical mounted, install, upgrade, uninstall,
+isolation, and performance contracts on Windows before 0.3.4 can ship. None of
+these providers requires APFS
 clones, Btrfs subvolumes, reflinks, NTFS block cloning, or another host-
 filesystem CoW feature. The small macOS extension host is Swift because FSKit
 requires an Apple extension boundary; all namespace, chunk, recovery, and Git
@@ -473,18 +475,21 @@ semantics remain in Rust. See
 [Portable CoW workspaces](docs/portable-cow-workspaces.md) for setup, lifecycle,
 proposal, recovery, and platform details.
 
-The distributed FSKit extension is Developer-ID signed, notarized, stapled,
-and embeds a Developer-ID provisioning profile for its exact bundle ID. That
-profile must authorize the FSKit Module entitlement, Greppy's application
-group, and the same signing team. A merely signed or notarized extension
-without that profile is rejected by the release build: Gatekeeper acceptance
-alone does not prove that macOS will allow the user to activate the module.
+The distributed FSKit host app and extension are Developer-ID signed,
+notarized, and stapled. Each embeds its own Developer-ID provisioning profile
+for its exact bundle ID. Both profiles must authorize Greppy's application
+group and contain the selected signing certificate; the extension profile must
+also authorize the FSKit Module entitlement. A merely signed or notarized
+extension without these profile bindings is rejected by the release build:
+Gatekeeper acceptance alone does not prove that macOS will allow the user to
+activate the module.
 
-`workspace setup` also installs the per-user login lifecycle: a restartable
-systemd user unit on Linux and an idempotent RunAtLoad LaunchAgent around the
+`workspace setup` also installs the login lifecycle: a restartable systemd
+user unit on Linux and an idempotent RunAtLoad LaunchAgent around the
 OS-managed FSKit activation on macOS. Both retain the exact configured
-workspace root. Diagnostic Windows packages deliberately register no service
-until the signed hardlink-capable backend is selected.
+workspace root. The Windows MSI installs an uninstall-safe machine Run entry;
+`workspace setup` accepts it only when it points at the current signed package
+and the adjacent private provider, runtime, and driver are all present.
 
 Version 0.3.3 remains reproducible as the earlier limited native-CoW release:
 its APFS/Btrfs/reflink behavior, Rift-derived implementation, flags, and native

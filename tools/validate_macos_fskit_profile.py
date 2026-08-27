@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the decoded Developer ID profile for Greppy's FSKit extension."""
+"""Validate a decoded Developer ID profile used by Greppy's FSKit app."""
 
 from __future__ import annotations
 
@@ -22,7 +22,12 @@ def _fail(message: str) -> None:
 
 
 def validate_profile(
-    profile: Mapping[str, Any], bundle_id: str, application_group: str
+    profile: Mapping[str, Any],
+    bundle_id: str,
+    application_group: str,
+    *,
+    require_fskit: bool = True,
+    signing_certificate_der: bytes | None = None,
 ) -> str:
     expiration = profile.get("ExpirationDate")
     if not isinstance(expiration, datetime.datetime):
@@ -57,16 +62,22 @@ def validate_profile(
     expected_application_id = f"{team_id}.{bundle_id}"
     if entitlements.get("com.apple.application-identifier") != expected_application_id:
         _fail(f"profile does not authorize {bundle_id}")
-    if entitlements.get("com.apple.developer.fskit.fsmodule") is not True:
+    if (
+        require_fskit
+        and entitlements.get("com.apple.developer.fskit.fsmodule") is not True
+    ):
         _fail("FSKit Module entitlement is not authorized")
     groups = entitlements.get("com.apple.security.application-groups")
-    if groups is not None and (
-        not isinstance(groups, list) or application_group not in groups
-    ):
+    if not isinstance(groups, list) or application_group not in groups:
         _fail(f"profile does not authorize application group {application_group}")
     certificates = profile.get("DeveloperCertificates")
     if not isinstance(certificates, list) or not certificates:
         _fail("DeveloperCertificates is empty")
+    if (
+        signing_certificate_der is not None
+        and signing_certificate_der not in certificates
+    ):
+        _fail("profile does not contain the selected signing certificate")
     return team_id
 
 
@@ -75,12 +86,22 @@ def main() -> int:
     parser.add_argument("--plist", required=True, type=pathlib.Path)
     parser.add_argument("--bundle-id", required=True)
     parser.add_argument("--application-group", required=True)
+    parser.add_argument(
+        "--role", required=True, choices=("app", "fskit-extension")
+    )
+    parser.add_argument(
+        "--signing-certificate-der", required=True, type=pathlib.Path
+    )
     arguments = parser.parse_args()
     with arguments.plist.open("rb") as profile_file:
         profile = plistlib.load(profile_file)
     try:
         team_id = validate_profile(
-            profile, arguments.bundle_id, arguments.application_group
+            profile,
+            arguments.bundle_id,
+            arguments.application_group,
+            require_fskit=arguments.role == "fskit-extension",
+            signing_certificate_der=arguments.signing_certificate_der.read_bytes(),
         )
     except ProfileValidationError as error:
         parser.error(str(error))

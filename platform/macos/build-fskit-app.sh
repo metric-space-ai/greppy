@@ -5,9 +5,11 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 output_root=${1:?usage: build-fskit-app.sh OUTPUT_DIRECTORY}
 identity=${CODE_SIGN_IDENTITY:--}
 fskit_profile=${FSKIT_PROVISIONING_PROFILE:-}
+app_profile=${APP_PROVISIONING_PROFILE:-}
 target=arm64-apple-macos15.4
 app="$output_root/GreppyWorkspaceFS.app"
 extension="$app/Contents/Extensions/GreppyWorkspaceFS.appex"
+app_bundle_id=ai.metricspace.greppy.workspacefs
 extension_bundle_id=ai.metricspace.greppy.workspacefs.extension
 application_group=group.ai.metricspace.greppy
 cargo_target="$repository_root/target/fskit-aarch64-macos15.4"
@@ -30,6 +32,7 @@ case "$package_version" in
 esac
 
 extension_entitlements=platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements
+app_entitlements=platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.entitlements
 if [ "$identity" != "-" ]; then
     test -n "$fskit_profile" || {
         echo "signed FSKit builds require FSKIT_PROVISIONING_PROFILE" >&2
@@ -39,21 +42,60 @@ if [ "$identity" != "-" ]; then
         echo "FSKit provisioning profile is not a regular file: $fskit_profile" >&2
         exit 64
     }
+    test -n "$app_profile" || {
+        echo "signed FSKit builds require APP_PROVISIONING_PROFILE" >&2
+        exit 64
+    }
+    test -f "$app_profile" || {
+        echo "FSKit host-app provisioning profile is not a regular file: $app_profile" >&2
+        exit 64
+    }
     signing_temp=$(mktemp -d -t greppy-fskit-signing)
     resolved_extension_entitlements="$signing_temp/extension.entitlements"
-    profile_plist="$signing_temp/profile.plist"
+    resolved_app_entitlements="$signing_temp/app.entitlements"
+    extension_profile_plist="$signing_temp/extension-profile.plist"
+    app_profile_plist="$signing_temp/app-profile.plist"
+    signing_certificate_pem="$signing_temp/signing-certificate.pem"
+    signing_certificate_der="$signing_temp/signing-certificate.der"
     cleanup_signing_inputs() {
-        rm -f "$resolved_extension_entitlements" "$profile_plist"
+        rm -f \
+            "$resolved_extension_entitlements" \
+            "$resolved_app_entitlements" \
+            "$extension_profile_plist" \
+            "$app_profile_plist" \
+            "$signing_certificate_pem" \
+            "$signing_certificate_der"
         rmdir "$signing_temp" 2>/dev/null || true
     }
     trap cleanup_signing_inputs EXIT
     trap 'exit 1' HUP INT TERM
-    /usr/bin/security cms -D -i "$fskit_profile" -o "$profile_plist"
+    /usr/bin/security find-certificate -c "$identity" -p > "$signing_certificate_pem"
+    test -s "$signing_certificate_pem" || {
+        echo "cannot export selected FSKit signing certificate: $identity" >&2
+        exit 64
+    }
+    /usr/bin/openssl x509 -in "$signing_certificate_pem" -outform DER \
+        -out "$signing_certificate_der"
+    /usr/bin/security cms -D -i "$fskit_profile" -o "$extension_profile_plist"
+    /usr/bin/security cms -D -i "$app_profile" -o "$app_profile_plist"
     profile_team_id=$(/usr/bin/python3 \
         "$repository_root/tools/validate_macos_fskit_profile.py" \
-        --plist "$profile_plist" \
+        --plist "$extension_profile_plist" \
         --bundle-id "$extension_bundle_id" \
-        --application-group "$application_group")
+        --application-group "$application_group" \
+        --role fskit-extension \
+        --signing-certificate-der "$signing_certificate_der")
+    app_profile_team_id=$(/usr/bin/python3 \
+        "$repository_root/tools/validate_macos_fskit_profile.py" \
+        --plist "$app_profile_plist" \
+        --bundle-id "$app_bundle_id" \
+        --application-group "$application_group" \
+        --role app \
+        --signing-certificate-der "$signing_certificate_der")
+    test "$app_profile_team_id" = "$profile_team_id" || {
+        echo "FSKit host-app and extension profiles belong to different teams" >&2
+        exit 64
+    }
     cp "$extension_entitlements" "$resolved_extension_entitlements"
     /usr/libexec/PlistBuddy -c \
         "Add :com.apple.application-identifier string $profile_team_id.$extension_bundle_id" \
@@ -62,6 +104,14 @@ if [ "$identity" != "-" ]; then
         "Add :com.apple.developer.team-identifier string $profile_team_id" \
         "$resolved_extension_entitlements"
     extension_entitlements=$resolved_extension_entitlements
+    cp "$app_entitlements" "$resolved_app_entitlements"
+    /usr/libexec/PlistBuddy -c \
+        "Add :com.apple.application-identifier string $profile_team_id.$app_bundle_id" \
+        "$resolved_app_entitlements"
+    /usr/libexec/PlistBuddy -c \
+        "Add :com.apple.developer.team-identifier string $profile_team_id" \
+        "$resolved_app_entitlements"
+    app_entitlements=$resolved_app_entitlements
 fi
 
 test ! -e "$app" || {
@@ -70,6 +120,7 @@ test ! -e "$app" || {
 }
 mkdir -p "$app/Contents/MacOS" "$extension/Contents/MacOS"
 if [ "$identity" != "-" ]; then
+    cp "$app_profile" "$app/Contents/embedded.provisionprofile"
     cp "$fskit_profile" "$extension/Contents/embedded.provisionprofile"
 fi
 if [ -n "$cli_binary" ]; then
@@ -164,7 +215,15 @@ if [ -n "$cli_binary" ]; then
     fi
 fi
 sign_bundle \
-    platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.entitlements \
+    "$app_entitlements" \
     "$app"
+if [ "$identity" != "-" ]; then
+    signed_app_team_id=$(codesign -dvvv "$app" 2>&1 | \
+        awk -F= '$1 == "TeamIdentifier" { print $2; exit }')
+    test "$signed_app_team_id" = "$profile_team_id" || {
+        echo "FSKit host-app signing identity team $signed_app_team_id does not match profile team $profile_team_id" >&2
+        exit 1
+    }
+fi
 
 codesign --verify --deep --strict "$app"

@@ -414,18 +414,24 @@ jobs:
         env:
           SHOULD_SIGN: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
           APPLICATION_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APP_PROFILE_BASE64: ${{ secrets.MACOS_FSKIT_APP_PROVISIONING_PROFILE_BASE64 }}
           FSKIT_PROFILE_BASE64: ${{ secrets.MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64 }}
         run: |
           identity=-
+          app_profile=
           fskit_profile=
           if [ "$SHOULD_SIGN" = true ]; then
             test -n "$APPLICATION_SIGNING_IDENTITY"
+            test -n "$APP_PROFILE_BASE64"
             test -n "$FSKIT_PROFILE_BASE64"
             identity="$APPLICATION_SIGNING_IDENTITY"
+            app_profile="$RUNNER_TEMP/greppy-fskit-app.provisionprofile"
             fskit_profile="$RUNNER_TEMP/greppy-fskit-extension.provisionprofile"
+            printf '%s' "$APP_PROFILE_BASE64" | base64 -D > "$app_profile"
             printf '%s' "$FSKIT_PROFILE_BASE64" | base64 -D > "$fskit_profile"
           fi
           CODE_SIGN_IDENTITY="$identity" \
+          APP_PROVISIONING_PROFILE="$app_profile" \
           FSKIT_PROVISIONING_PROFILE="$fskit_profile" \
           GREPPY_CLI_BINARY="$PWD/target/release/greppy" \
             platform/macos/build-fskit-app.sh "$RUNNER_TEMP/greppy-fskit"

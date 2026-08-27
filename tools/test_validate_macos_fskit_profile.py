@@ -10,6 +10,7 @@ from tools.validate_macos_fskit_profile import (
 
 TEAM_ID = "2HS27B8739"
 BUNDLE_ID = "ai.metricspace.greppy.workspacefs.extension"
+APP_BUNDLE_ID = "ai.metricspace.greppy.workspacefs"
 APPLICATION_GROUP = "group.ai.metricspace.greppy"
 
 
@@ -76,6 +77,44 @@ class FSKitProfileValidationTests(unittest.TestCase):
         profile["Entitlements"] = entitlements
         with self.assertRaisesRegex(ProfileValidationError, "application group"):
             validate_profile(profile, BUNDLE_ID, APPLICATION_GROUP)
+
+    def test_rejects_missing_application_group(self) -> None:
+        profile = valid_profile()
+        entitlements = copy.deepcopy(profile["Entitlements"])
+        assert isinstance(entitlements, dict)
+        entitlements.pop("com.apple.security.application-groups")
+        profile["Entitlements"] = entitlements
+        with self.assertRaisesRegex(ProfileValidationError, "application group"):
+            validate_profile(profile, BUNDLE_ID, APPLICATION_GROUP)
+
+    def test_accepts_host_app_profile_without_fskit_entitlement(self) -> None:
+        profile = valid_profile()
+        entitlements = copy.deepcopy(profile["Entitlements"])
+        assert isinstance(entitlements, dict)
+        entitlements["com.apple.application-identifier"] = (
+            f"{TEAM_ID}.{APP_BUNDLE_ID}"
+        )
+        entitlements.pop("com.apple.developer.fskit.fsmodule")
+        profile["Entitlements"] = entitlements
+        self.assertEqual(
+            validate_profile(
+                profile,
+                APP_BUNDLE_ID,
+                APPLICATION_GROUP,
+                require_fskit=False,
+                signing_certificate_der=b"certificate",
+            ),
+            TEAM_ID,
+        )
+
+    def test_rejects_profile_for_another_signing_certificate(self) -> None:
+        with self.assertRaisesRegex(ProfileValidationError, "signing certificate"):
+            validate_profile(
+                valid_profile(),
+                BUNDLE_ID,
+                APPLICATION_GROUP,
+                signing_certificate_der=b"different-certificate",
+            )
 
 
 if __name__ == "__main__":

@@ -80,12 +80,27 @@ class ReleaseArtifactTests(unittest.TestCase):
         profile_gate = builder.index(
             'signed FSKit builds require FSKIT_PROVISIONING_PROFILE'
         )
+        app_profile_gate = builder.index(
+            'signed FSKit builds require APP_PROVISIONING_PROFILE'
+        )
         app_creation = builder.index(
             'mkdir -p "$app/Contents/MacOS" "$extension/Contents/MacOS"'
         )
         self.assertLess(profile_gate, app_creation)
+        self.assertLess(app_profile_gate, app_creation)
+        self.assertIn(
+            '/usr/bin/security find-certificate -c "$identity" -p', builder
+        )
         self.assertIn('/usr/bin/security cms -D -i "$fskit_profile"', builder)
+        self.assertIn('/usr/bin/security cms -D -i "$app_profile"', builder)
         self.assertIn("tools/validate_macos_fskit_profile.py", builder)
+        self.assertIn("--role fskit-extension", builder)
+        self.assertIn("--role app", builder)
+        self.assertIn("--signing-certificate-der", builder)
+        self.assertIn(
+            'cp "$app_profile" "$app/Contents/embedded.provisionprofile"',
+            builder,
+        )
         self.assertIn(
             'cp "$fskit_profile" "$extension/Contents/embedded.provisionprofile"',
             builder,
@@ -371,10 +386,13 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertLess(application_notarize, dry_run_upload)
         self.assertLess(dry_run_upload, installer_import)
         self.assertLess(installer_import, package_macos)
+        self.assertIn("MACOS_FSKIT_APP_PROVISIONING_PROFILE_BASE64", workflow)
         self.assertIn(
             "MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64", workflow
         )
+        self.assertIn('test -n "$APP_PROFILE_BASE64"', workflow)
         self.assertIn('test -n "$FSKIT_PROFILE_BASE64"', workflow)
+        self.assertIn('APP_PROVISIONING_PROFILE="$app_profile"', workflow)
         self.assertIn(
             'FSKIT_PROVISIONING_PROFILE="$fskit_profile"', workflow
         )
@@ -416,9 +434,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn("MACOS_FSKIT_APP_PROVISIONING_PROFILE_BASE64", cow_workflow)
         self.assertIn(
             "MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64", cow_workflow
         )
+        self.assertIn('APP_PROVISIONING_PROFILE="$app_profile"', cow_workflow)
         self.assertIn(
             'FSKIT_PROVISIONING_PROFILE="$fskit_profile"', cow_workflow
         )
@@ -443,7 +463,9 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn(
             "ai.metricspace.greppy.workspacefs.extension", portable_docs
         )
-        self.assertIn("Notarization without this profile is insufficient", portable_docs)
+        self.assertIn(
+            "Notarization without these profiles is insufficient", portable_docs
+        )
         # One Unix footprint invocation remains; the Windows measurement is out
         # of band (see the release-scope comment in release.yml). Manual
         # packaging dry-runs may skip the hours-long diagnostic, but immutable
