@@ -1104,6 +1104,12 @@ class Frame {
   }
 
   async addScriptTag(options) {
+    if (this._id === "main") {
+      if (options && options.path) {
+        return unsupported("Frame.addScriptTag.path")();
+      }
+      return this._page.addScriptTag(options || {});
+    }
     if (options && (options.url || options.path || options.type)) {
       return unsupported("Frame.addScriptTag.url")();
     }
@@ -2192,14 +2198,18 @@ class Page {
       return this._waitForDialog();
     }
     if (event === "filechooser") {
-      const result = await engineCall("page.fileChoosers", { page: this._id, consume: true });
-      const rec = (result.choosers || [])[0];
-      if (!rec) {
-        return unsupported("Page.waitForEvent.filechooser.empty")();
+      const deadline = Date.now() + (this._timeout || 30_000);
+      while (Date.now() < deadline) {
+        const result = await engineCall("page.fileChoosers", { page: this._id, consume: true });
+        const rec = (result.choosers || [])[0];
+        if (rec) {
+          const chooser = new FileChooser(this, rec);
+          this._emit("filechooser", chooser);
+          return chooser;
+        }
+        ops.op_sleep_ms(20);
       }
-      const chooser = new FileChooser(this, rec);
-      this._emit("filechooser", chooser);
-      return chooser;
+      throw new TimeoutError("timeout: waitForEvent filechooser");
     }
     if (event === "popup" || event === "page") {
       return this._waitForPopup();
@@ -2208,14 +2218,18 @@ class Page {
       return this._waitForConsole();
     }
     if (event === "download") {
-      const result = await engineCall("page.downloads", { page: this._id });
-      const rec = (result.downloads || [])[0];
-      if (!rec) {
-        return unsupported("Page.waitForEvent.download.empty")();
+      const deadline = Date.now() + (this._timeout || 30_000);
+      while (Date.now() < deadline) {
+        const result = await engineCall("page.downloads", { page: this._id });
+        const rec = (result.downloads || [])[0];
+        if (rec) {
+          const download = this._downloadFromRecord(rec);
+          this._emit("download", download);
+          return download;
+        }
+        ops.op_sleep_ms(20);
       }
-      const download = this._downloadFromRecord(rec);
-      this._emit("download", download);
-      return download;
+      throw new TimeoutError("timeout: waitForEvent download");
     }
     if (event === "request") {
       return this.waitForRequest("");

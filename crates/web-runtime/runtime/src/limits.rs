@@ -28,72 +28,61 @@ impl SessionLimits {
             limits.max_artifact_bytes = 4 * 1024 * 1024;
             limits.idle_ttl = Duration::from_secs(2 * 60);
         }
-        if let Ok(ms) = std::env::var("GREPPY_WEB_IDLE_TTL_MS") {
-            if let Ok(value) = ms.parse::<u64>() {
-                limits.idle_ttl = Duration::from_millis(value.clamp(20, 3_600_000));
-            }
-        }
-        if let Ok(pages) = std::env::var("GREPPY_WEB_MAX_PAGES") {
-            if let Ok(value) = pages.parse::<u32>() {
-                limits.max_pages = value;
-            }
-        }
-        if let Ok(contexts) = std::env::var("GREPPY_WEB_MAX_CONTEXTS") {
-            if let Ok(value) = contexts.parse::<u32>() {
-                limits.max_contexts = value;
-            }
-        }
-        if let Ok(requests) = std::env::var("GREPPY_WEB_MAX_REQUESTS") {
-            if let Ok(value) = requests.parse::<u64>() {
-                limits.max_requests = value;
-            }
-        }
-        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_CONSOLE_BYTES") {
-            if let Ok(value) = bytes.parse::<u64>() {
-                limits.max_console_bytes = value;
-            }
-        }
-        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_DOWNLOAD_BYTES") {
-            if let Ok(value) = bytes.parse::<u64>() {
-                limits.max_download_bytes = value;
-            }
-        }
-        if let Ok(bytes) = std::env::var("GREPPY_WEB_CONTENT_RSS_BYTES") {
-            if let Ok(value) = bytes.parse::<u64>() {
-                limits.content_rss_bytes = value;
-            }
-        }
-        if let Ok(bytes) = std::env::var("GREPPY_WEB_CONTROLLER_MEMORY_BYTES") {
-            if let Ok(value) = bytes.parse::<u64>() {
-                limits.controller_heap_bytes = value;
-            }
-        }
-        if let Ok(ms) = std::env::var("GREPPY_WEB_CONTENT_CPU_MS") {
-            if let Ok(value) = ms.parse::<u64>() {
-                limits.content_cpu_time = Duration::from_millis(value);
-            }
-        }
-        if let Ok(ms) = std::env::var("GREPPY_WEB_CONTROLLER_CPU_MS") {
-            if let Ok(value) = ms.parse::<u64>() {
-                limits.controller_cpu_time = Duration::from_millis(value);
-            }
-        }
-        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_NETWORK_BYTES") {
-            if let Ok(value) = bytes.parse::<u64>() {
-                limits.max_network_bytes = value;
-            }
-        }
-        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_ARTIFACT_BYTES") {
-            if let Ok(value) = bytes.parse::<u64>() {
-                limits.max_artifact_bytes = value;
-            }
-        }
-        if let Ok(ms) = std::env::var("GREPPY_WEB_WALL_MS") {
-            if let Ok(value) = ms.parse::<u64>() {
-                limits.wall_time = Duration::from_millis(value.clamp(20, 3_600_000));
-            }
-        }
+        limits.apply_overrides(|name| std::env::var(name).ok());
         limits
+    }
+
+    fn apply_overrides(&mut self, get: impl Fn(&str) -> Option<String>) {
+        if let Some(value) = get("GREPPY_WEB_IDLE_TTL_MS").and_then(|ms| ms.parse::<u64>().ok()) {
+            self.idle_ttl = Duration::from_millis(value.clamp(20, 3_600_000));
+        }
+        if let Some(value) = get("GREPPY_WEB_MAX_PAGES").and_then(|pages| pages.parse::<u32>().ok())
+        {
+            self.max_pages = value;
+        }
+        if let Some(value) = get("GREPPY_WEB_MAX_CONTEXTS").and_then(|v| v.parse::<u32>().ok()) {
+            self.max_contexts = value;
+        }
+        if let Some(value) = get("GREPPY_WEB_MAX_REQUESTS").and_then(|v| v.parse::<u64>().ok()) {
+            self.max_requests = value;
+        }
+        if let Some(value) = get("GREPPY_WEB_MAX_CONSOLE_BYTES").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.max_console_bytes = value;
+        }
+        if let Some(value) =
+            get("GREPPY_WEB_MAX_DOWNLOAD_BYTES").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.max_download_bytes = value;
+        }
+        if let Some(value) = get("GREPPY_WEB_CONTENT_RSS_BYTES").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.content_rss_bytes = value;
+        }
+        if let Some(value) =
+            get("GREPPY_WEB_CONTROLLER_MEMORY_BYTES").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.controller_heap_bytes = value;
+        }
+        if let Some(value) = get("GREPPY_WEB_CONTENT_CPU_MS").and_then(|v| v.parse::<u64>().ok()) {
+            self.content_cpu_time = Duration::from_millis(value);
+        }
+        if let Some(value) = get("GREPPY_WEB_CONTROLLER_CPU_MS").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.controller_cpu_time = Duration::from_millis(value);
+        }
+        if let Some(value) = get("GREPPY_WEB_MAX_NETWORK_BYTES").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.max_network_bytes = value;
+        }
+        if let Some(value) =
+            get("GREPPY_WEB_MAX_ARTIFACT_BYTES").and_then(|v| v.parse::<u64>().ok())
+        {
+            self.max_artifact_bytes = value;
+        }
+        if let Some(value) = get("GREPPY_WEB_WALL_MS").and_then(|v| v.parse::<u64>().ok()) {
+            self.wall_time = Duration::from_millis(value.clamp(20, 3_600_000));
+        }
     }
 
     pub fn check_pages(&self, pages: u32) -> Result<(), String> {
@@ -306,5 +295,40 @@ mod tests {
                 "content"
             )
             .is_err());
+    }
+
+    #[test]
+    fn env_overrides_clamp_idle_and_wall_and_ignore_garbage() {
+        let mut limits = SessionLimits::default();
+        let idle = limits.idle_ttl;
+        let pages = limits.max_pages;
+        limits.apply_overrides(|name| match name {
+            "GREPPY_WEB_IDLE_TTL_MS" => Some("5".into()),
+            "GREPPY_WEB_WALL_MS" => Some("9999999".into()),
+            "GREPPY_WEB_MAX_PAGES" => Some("not-a-number".into()),
+            _ => None,
+        });
+        assert_eq!(limits.idle_ttl, Duration::from_millis(20));
+        assert_eq!(limits.wall_time, Duration::from_millis(3_600_000));
+        assert_eq!(limits.max_pages, pages);
+        assert_eq!(idle, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn env_overrides_research_profile_caps() {
+        let mut limits = SessionLimits {
+            max_pages: 8,
+            max_network_bytes: 8 * 1024 * 1024,
+            ..SessionLimits::default()
+        };
+        limits.apply_overrides(|name| match name {
+            "GREPPY_WEB_MAX_PAGES" => Some("2".into()),
+            "GREPPY_WEB_MAX_NETWORK_BYTES" => Some("100".into()),
+            _ => None,
+        });
+        assert_eq!(limits.max_pages, 2);
+        assert_eq!(limits.max_network_bytes, 100);
+        assert!(limits.check_pages(3).is_err());
+        assert!(limits.check_network_bytes(0, 101).is_err());
     }
 }

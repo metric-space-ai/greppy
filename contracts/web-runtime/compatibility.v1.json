@@ -1357,10 +1357,10 @@
         "console-messages"
       ],
       "known_differences": [
-        "popup drains auxiliary WebViews; download returns last intercept record",
+        "popup drains auxiliary WebViews; download polls recorded intercepts until timeout",
         "dialog waitForEvent consumes retained SimpleDialog records after evaluate; Chromium requires waiting before the alert",
-        "filechooser consumes retained FilePicker records after click; Chromium emits during the picker",
-        "console uses a waiter queue flushed after evaluate, like popup; dialog/filechooser still consume recorded embedder events"
+        "filechooser polls retained FilePicker records after click until timeout, then TimeoutError; Chromium emits during the picker",
+        "console uses a waiter queue flushed after evaluate, like popup"
       ]
     },
     {
@@ -2484,8 +2484,8 @@
         "frames"
       ],
       "known_differences": [
-        "content injection only; url/path/type throw unsupported_playwright_operation",
-        "child same-origin iframe appends a script element via frameEvaluate; return value is not an ElementHandle"
+        "main frame delegates to Page.addScriptTag (content or url); path throws unsupported_playwright_operation",
+        "child same-origin iframe appends a script element via frameEvaluate for content only; url/path/type throw; return value is not an ElementHandle"
       ]
     },
     {
