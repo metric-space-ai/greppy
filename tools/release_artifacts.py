@@ -305,12 +305,32 @@ def _dist_files(dist: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
     files: list[tuple[str, pathlib.Path]] = []
     for path in sorted(dist.rglob("*")):
         if path.is_symlink():
-            raise ReleaseArtifactError(f"release dist contains a symlink: {path}")
-        if path.is_file():
+            files.append((path.relative_to(dist).as_posix(), path))
+        elif path.is_file():
             files.append((path.relative_to(dist).as_posix(), path))
     if not files:
         raise ReleaseArtifactError("release dist is empty")
     return files
+
+
+def _release_file_bytes(path: pathlib.Path) -> bytes:
+    if path.is_symlink():
+        return b"symlink\0" + os.fsencode(os.readlink(path))
+    return path.read_bytes()
+
+
+def _release_sha1(path: pathlib.Path) -> str:
+    return hashlib.sha1(_release_file_bytes(path)).hexdigest()
+
+
+def _release_sha256(path: pathlib.Path) -> str:
+    return hashlib.sha256(_release_file_bytes(path)).hexdigest()
+
+
+def _symlink_comment(path: pathlib.Path) -> str | None:
+    if not path.is_symlink():
+        return None
+    return f"Symbolic link target: {os.fsdecode(os.readlink(path))}"
 
 
 def _greppy_version(packages: list[dict[str, str]]) -> str:
@@ -382,7 +402,7 @@ def augment_spdx(
     described.append(RELEASE_PACKAGE_ID)
     document["documentDescribes"] = described
 
-    file_sha1 = [_sha1_file(path) for _, path in files]
+    file_sha1 = [_release_sha1(path) for _, path in files]
     verification_code = hashlib.sha1(
         "".join(sorted(file_sha1)).encode("ascii")
     ).hexdigest()
@@ -411,18 +431,21 @@ def augment_spdx(
 
     for relative, path in files:
         identifier = _file_id(relative)
-        document["files"].append(
-            {
+        file_entry: dict[str, Any] = {
                 "fileName": f"./{relative}",
                 "SPDXID": identifier,
                 "checksums": [
-                    {"algorithm": "SHA1", "checksumValue": _sha1_file(path)},
-                    {"algorithm": "SHA256", "checksumValue": _sha256_file(path)},
+                    {"algorithm": "SHA1", "checksumValue": _release_sha1(path)},
+                    {"algorithm": "SHA256", "checksumValue": _release_sha256(path)},
                 ],
                 "licenseConcluded": "NOASSERTION",
                 "copyrightText": "NOASSERTION",
             }
-        )
+        link_comment = _symlink_comment(path)
+        if link_comment is not None:
+            file_entry["fileTypes"] = ["OTHER"]
+            file_entry["comment"] = link_comment
+        document["files"].append(file_entry)
         document["relationships"].append(
             {
                 "spdxElementId": RELEASE_PACKAGE_ID,
@@ -537,12 +560,24 @@ def verify_spdx(
         if entry is None or entry.get("fileName") != f"./{relative}":
             raise ReleaseArtifactError(f"SBOM lacks release file {relative}")
         checksums = _checksum_map(entry)
-        expected_sha1 = _sha1_file(path)
+        expected_sha1 = _release_sha1(path)
         file_sha1.append(expected_sha1)
         if checksums.get("SHA1") != expected_sha1:
             raise ReleaseArtifactError(f"SBOM SHA1 mismatch for {relative}")
-        if checksums.get("SHA256") != _sha256_file(path):
+        if checksums.get("SHA256") != _release_sha256(path):
             raise ReleaseArtifactError(f"SBOM SHA256 mismatch for {relative}")
+        link_comment = _symlink_comment(path)
+        if link_comment is None:
+            if entry.get("fileTypes") == ["OTHER"] and str(
+                entry.get("comment", "")
+            ).startswith("Symbolic link target: "):
+                raise ReleaseArtifactError(
+                    f"SBOM incorrectly classifies regular file as symlink: {relative}"
+                )
+        elif entry.get("fileTypes") != ["OTHER"] or entry.get("comment") != link_comment:
+            raise ReleaseArtifactError(
+                f"SBOM symlink identity mismatch for {relative}"
+            )
     expected_code = hashlib.sha1("".join(sorted(file_sha1)).encode("ascii")).hexdigest()
     actual_code = root.get("packageVerificationCode", {}).get(
         "packageVerificationCodeValue"

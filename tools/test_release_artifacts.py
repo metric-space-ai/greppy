@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -117,6 +118,29 @@ class ReleaseArtifactTests(unittest.TestCase):
         release.augment_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
         (dist / "greppy").write_bytes(b"tampered")
 
+        with self.assertRaises(release.ReleaseArtifactError):
+            release.verify_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
+
+    @unittest.skipIf(os.name == "nt", "symlink creation is not portable on Windows CI")
+    def test_spdx_binds_symlink_identity_without_following_target(self) -> None:
+        dist, cargo_lock, sbom = self.make_spdx_fixture()
+        link = dist / "greppy-link"
+        link.symlink_to("greppy")
+
+        release.augment_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
+        release.verify_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
+
+        document = json.loads(sbom.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in document["files"]
+            if item["fileName"] == "./greppy-link"
+        )
+        self.assertEqual(entry["fileTypes"], ["OTHER"])
+        self.assertEqual(entry["comment"], "Symbolic link target: greppy")
+
+        link.unlink()
+        link.symlink_to("README.md")
         with self.assertRaises(release.ReleaseArtifactError):
             release.verify_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
 
