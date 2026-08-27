@@ -316,7 +316,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, greppy-fskit-performance, ephemeral]
     timeout-minutes: 45
     env:
-      CODE_SIGN_IDENTITY: ${{ vars.MACOS_CODE_SIGN_IDENTITY }}
+      CODE_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
       APP_PROFILE_BASE64: ${{ secrets.MACOS_FSKIT_APP_PROVISIONING_PROFILE_BASE64 }}
       FSKIT_PROFILE_BASE64: ${{ secrets.MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64 }}
     steps:

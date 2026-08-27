@@ -479,6 +479,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn(
             "MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64", cow_workflow
         )
+        self.assertIn(
+            "CODE_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}",
+            cow_workflow,
+        )
+        self.assertNotIn("vars.MACOS_CODE_SIGN_IDENTITY", cow_workflow)
         self.assertIn('APP_PROVISIONING_PROFILE="$app_profile"', cow_workflow)
         self.assertIn(
             'FSKIT_PROVISIONING_PROFILE="$fskit_profile"', cow_workflow
