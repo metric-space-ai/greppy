@@ -118,6 +118,22 @@ fn unlock_range(file: &File, offset: u64, length: u64) -> io::Result<()> {
 
 #[cfg(windows)]
 fn windows_link_count(file: &File) -> io::Result<u32> {
+    Ok(windows_file_information(file)?.nNumberOfLinks)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
+    let information = windows_file_information(file)?;
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    file: &File,
+) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -128,7 +144,7 @@ fn windows_link_count(file: &File) -> io::Result<u32> {
     if result == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(information.nNumberOfLinks)
+    Ok(information)
 }
 
 #[test]
@@ -369,18 +385,10 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-
         assert_eq!(fs::read(&uppercase).unwrap(), b"lowercase");
-        let lowercase_metadata = fs::metadata(&lowercase).unwrap();
-        let uppercase_metadata = fs::metadata(&uppercase).unwrap();
         assert_eq!(
-            lowercase_metadata.volume_serial_number(),
-            uppercase_metadata.volume_serial_number()
-        );
-        assert_eq!(
-            lowercase_metadata.file_index(),
-            uppercase_metadata.file_index()
+            windows_file_identity(&File::open(&lowercase).unwrap()).unwrap(),
+            windows_file_identity(&File::open(&uppercase).unwrap()).unwrap()
         );
         let error = OpenOptions::new()
             .write(true)
