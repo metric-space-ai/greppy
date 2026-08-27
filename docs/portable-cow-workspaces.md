@@ -141,6 +141,52 @@ baselines remain pinned until their refs are removed.
   Settings. An older or incomplete installation therefore fails with a
   reinstall diagnostic instead of directing the user to a switch macOS cannot
   activate.
+
+For the macOS release-signing handoff, the Apple Developer account for team
+`2HS27B8739` must contain these exact resources:
+
+- App ID `ai.metricspace.greppy.workspacefs`, with App Groups enabled for
+  `group.ai.metricspace.greppy`;
+- App ID `ai.metricspace.greppy.workspacefs.extension`, with App Groups and
+  the FSKit Module capability enabled;
+- one Developer ID provisioning profile for each App ID, both bound to the
+  same Developer ID Application certificate used by
+  `MACOS_SIGNING_IDENTITY`;
+- a Developer ID Installer certificate, including its private key, for signing
+  the final PKG.
+
+Download the two profiles without renaming their contents. Before adding any
+secret, verify the exact files by building the real app locally; the build
+decodes each CMS profile and rejects the wrong team, bundle ID, application
+group, FSKit role, expiry, distribution type, or signing certificate:
+
+```bash
+CODE_SIGN_IDENTITY='Developer ID Application: Michael Welsch (2HS27B8739)' \
+APP_PROVISIONING_PROFILE=/absolute/path/greppy-workspace-app.provisionprofile \
+FSKIT_PROVISIONING_PROFILE=/absolute/path/greppy-workspace-extension.provisionprofile \
+GREPPY_CLI_BINARY=/absolute/path/greppy \
+  platform/macos/build-fskit-app.sh /absolute/new/output-directory
+codesign --verify --deep --strict --verbose=2 \
+  /absolute/new/output-directory/GreppyWorkspaceFS.app
+```
+
+Store the validated inputs in GitHub under the exact names consumed by the
+release workflow:
+
+- `MACOS_FSKIT_APP_PROVISIONING_PROFILE_BASE64`;
+- `MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64`;
+- `MACOS_INSTALLER_CERTIFICATE_P12_BASE64`;
+- `MACOS_INSTALLER_CERTIFICATE_PASSWORD`;
+- `MACOS_INSTALLER_SIGNING_IDENTITY`.
+
+The existing application-certificate and notary secrets are separate inputs;
+an application certificate cannot sign an installer package. The signed
+release workflow imports both identities into an ephemeral keychain, validates
+both embedded profiles before writing the app, notarizes and staples the app,
+signs the PKG with the installer identity, then notarizes and staples the PKG.
+Neither an ad-hoc build nor a notarized app without both profiles is valid
+release evidence.
+
 - Windows x86_64 uses Greppy's minimal WinFsp transport fork because unchanged
   WinFsp 2.1 rejects `FileLinkInformation` before userspace. The fork forwards
   real hardlink operations to the same Rust provider and ships with its exact
