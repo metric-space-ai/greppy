@@ -1364,9 +1364,9 @@ fn ensure_git_control_template(
     source_objects: &Path,
     object_format: &str,
 ) -> Result<(BaselineSnapshot, bool, String), WorkspaceError> {
-    let templates = data_root.join("git-control-templates").join("v2");
+    let templates = data_root.join("g").join("ct3");
     fs::create_dir_all(&templates)?;
-    let final_root = templates.join(&repository_baseline.baseline_hash);
+    let final_root = templates.join(private_git_storage_key(&repository_baseline.baseline_hash)?);
     if final_root.exists() {
         let (snapshot, identity) = load_git_control_template(
             &final_root,
@@ -1377,12 +1377,7 @@ fn ensure_git_control_template(
         return Ok((snapshot, false, identity.baseline_view_commit));
     }
 
-    let temporary = templates.join(format!(
-        ".{}.tmp.{}.{}",
-        repository_baseline.baseline_hash,
-        std::process::id(),
-        now_unix_ns()
-    ));
+    let temporary = private_git_temporary_path(&templates);
     let payload = temporary.join("payload");
     fs::create_dir(&temporary)?;
     let build = (|| -> Result<(BaselineSnapshot, GitControlTemplateIdentity), WorkspaceError> {
@@ -1521,6 +1516,20 @@ fn git_workspace_id(run_id: &str) -> String {
     format!("git-{}", &digest[..32])
 }
 
+fn private_git_storage_key(baseline_hash: &str) -> Result<&str, WorkspaceError> {
+    const KEY_HEX_LEN: usize = 32;
+    if baseline_hash.len() != 64 || !baseline_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(WorkspaceError::Unsupported(
+            "private Git cache requires a canonical 256-bit hexadecimal baseline hash".into(),
+        ));
+    }
+    Ok(&baseline_hash[..KEY_HEX_LEN])
+}
+
+fn private_git_temporary_path(parent: &Path) -> PathBuf {
+    parent.join(format!(".t.{:x}.{:x}", std::process::id(), now_unix_ns()))
+}
+
 fn initialize_private_git(
     worktree: &Path,
     private_git_dir: &Path,
@@ -1598,19 +1607,14 @@ fn ensure_shared_git_layer(
     object_format: &str,
     source_objects: &Path,
 ) -> Result<SharedGitLayer, WorkspaceError> {
-    let layers = data_root.join("git-layers");
+    let layers = data_root.join("g").join("sl1");
     fs::create_dir_all(&layers)?;
-    let final_root = layers.join(&baseline.baseline_hash);
+    let final_root = layers.join(private_git_storage_key(&baseline.baseline_hash)?);
     if final_root.exists() {
         return open_shared_git_layer(&final_root, baseline, object_format);
     }
 
-    let temporary = layers.join(format!(
-        ".{}.tmp.{}.{}",
-        baseline.baseline_hash,
-        std::process::id(),
-        now_unix_ns()
-    ));
+    let temporary = private_git_temporary_path(&layers);
     fs::create_dir(&temporary)?;
     let build = (|| -> Result<SharedGitLayerManifest, WorkspaceError> {
         let repository = temporary.join("repo");
@@ -1726,11 +1730,12 @@ fn open_shared_git_layer(
                 detail: error.to_string(),
             }
         })?;
-    if manifest.schema != 1
-        || manifest.baseline_hash != baseline.baseline_hash
-        || manifest.base_commit != baseline.base_commit
-        || manifest.object_format != object_format
-    {
+    if !shared_git_layer_identity_matches(
+        &manifest,
+        &baseline.baseline_hash,
+        &baseline.base_commit,
+        object_format,
+    ) {
         return Err(WorkspaceError::Tampered {
             path: root.into(),
             detail: "shared Git layer identity does not match the captured baseline".into(),
@@ -1766,6 +1771,18 @@ fn open_shared_git_layer(
         shared_index: shared_indexes.remove(0),
         baseline_tree: manifest.baseline_tree,
     })
+}
+
+fn shared_git_layer_identity_matches(
+    manifest: &SharedGitLayerManifest,
+    baseline_hash: &str,
+    base_commit: &str,
+    object_format: &str,
+) -> bool {
+    manifest.schema == 1
+        && manifest.baseline_hash == baseline_hash
+        && manifest.base_commit == base_commit
+        && manifest.object_format == object_format
 }
 
 fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
@@ -2258,10 +2275,21 @@ mod tests {
     #[test]
     fn private_git_layer_supports_windows_long_paths() {
         let temp = tempfile::tempdir().unwrap();
-        let long_root = temp.path().join("long".repeat(48));
-        let repository = long_root.join("private").join("repo");
+        let long_root = temp.path().join("long".repeat(30));
+        let baseline_hash = "a".repeat(64);
+        let compact_key = private_git_storage_key(&baseline_hash).unwrap();
+        let repository = long_root.join("g/sl1").join(compact_key).join("repo");
         let worktree = long_root.join("workspace");
-        let index = long_root.join("indexes").join("seed.index");
+        let index = long_root
+            .join("g/sl1")
+            .join(compact_key)
+            .join("indexes/seed.index");
+        let legacy_repository = long_root
+            .join("git-layers")
+            .join(&baseline_hash)
+            .join("repo");
+        assert!(legacy_repository.as_os_str().len() >= 260);
+        assert!(repository.as_os_str().len() < 240);
         fs::create_dir_all(repository.parent().unwrap()).unwrap();
         fs::create_dir_all(&worktree).unwrap();
         fs::create_dir_all(index.parent().unwrap()).unwrap();
@@ -2283,6 +2311,35 @@ mod tests {
         )
         .unwrap();
         assert!(index.is_file());
+    }
+
+    #[test]
+    fn private_git_storage_keys_are_compact_but_full_identity_remains_authoritative() {
+        let prefix = "0123456789abcdef0123456789abcdef";
+        let first = format!("{prefix}{}", "0".repeat(32));
+        let second = format!("{prefix}{}", "f".repeat(32));
+        assert_eq!(private_git_storage_key(&first).unwrap(), prefix);
+        assert_eq!(private_git_storage_key(&second).unwrap(), prefix);
+        assert_ne!(first, second);
+        assert!(private_git_storage_key("not-a-baseline-hash").is_err());
+
+        let expected = SharedGitLayerManifest {
+            schema: 1,
+            baseline_hash: first.clone(),
+            base_commit: "1".repeat(40),
+            baseline_tree: "2".repeat(40),
+            object_format: "sha1".into(),
+        };
+        let colliding = SharedGitLayerManifest {
+            baseline_hash: second,
+            ..expected
+        };
+        assert!(!shared_git_layer_identity_matches(
+            &colliding,
+            &first,
+            &"1".repeat(40),
+            "sha1"
+        ));
     }
 
     #[test]
@@ -2378,7 +2435,7 @@ mod tests {
         let data_for_git = data.clone();
         let mount_for_git = mount.clone();
         let git_mount_emulator = std::thread::spawn(move || {
-            let templates = data_for_git.join("git-control-templates/v2");
+            let templates = data_for_git.join("g/ct3");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(entries) = fs::read_dir(&templates) {
