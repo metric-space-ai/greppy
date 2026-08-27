@@ -16,6 +16,13 @@ class WindowsMsiTests(unittest.TestCase):
         self.assertNotIn("winfsp-x64", source)
         self.assertIn('Permanent="no"', source)
         self.assertIn('System="yes"', source)
+        self.assertIn('Root="HKLM"', source)
+        self.assertIn('Key="Software\\Microsoft\\Windows\\CurrentVersion\\Run"', source)
+        self.assertIn('Name="GreppyWorkspaceProvider"', source)
+        self.assertIn(
+            'Value="&quot;[INSTALLFOLDER]greppy.exe&quot; workspace setup"',
+            source,
+        )
         guids = re.findall(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', source)
         self.assertEqual(len(guids), len(set(guids)))
 
@@ -29,9 +36,17 @@ class WindowsMsiTests(unittest.TestCase):
         self.assertIn("signtool verify /kp /all /v", source)
         self.assertIn("windows_driver_contract.py') verify", source)
         self.assertIn("wix msi validate", source)
-        self.assertIn("-AllowUnsignedForSmokeTest", (
-            ROOT / ".github/workflows/filesystem-cow.yml"
-        ).read_text(encoding="utf-8"))
+        workflow = (ROOT / ".github/workflows/filesystem-cow.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("-AllowUnsignedForSmokeTest", workflow)
+        self.assertIn(r"target\debug\greppy.exe", workflow)
+        self.assertNotIn(
+            "cargo build -p greppy --bin greppy --release --locked\n"
+            "          --no-default-features\n"
+            "          --features ci-test-assets,cpu-only,bash-smart",
+            workflow,
+        )
 
 
 if __name__ == "__main__":

@@ -134,6 +134,98 @@ fn render_macos_launch_agent(cli: &Path, data_root: &Path) -> Result<String, Str
     ))
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_quote_command_argument(value: &str) -> Result<String, String> {
+    if value.contains('\0') {
+        return Err("Windows command argument contains NUL".into());
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            quoted.push(character);
+        }
+        backslashes = 0;
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    Ok(quoted)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn render_windows_machine_autostart(cli: &Path) -> Result<String, String> {
+    let cli = cli
+        .to_str()
+        .ok_or_else(|| format!("CLI path is not Unicode: {}", cli.display()))?;
+    Ok(format!(
+        "{} workspace setup",
+        windows_quote_command_argument(cli)?
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_machine_autostart() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+    let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+        .encode_utf16()
+        .collect();
+    let name: Vec<u16> = "GreppyWorkspaceProvider\0".encode_utf16().collect();
+    let mut bytes = 0u32;
+    let first = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if first != ERROR_SUCCESS && first != ERROR_MORE_DATA {
+        return Err(format!(
+            "Greppy machine autostart registry value is unavailable (Win32 error {first})"
+        ));
+    }
+    if bytes < 2 || bytes % 2 != 0 {
+        return Err(format!(
+            "Greppy machine autostart registry value has invalid byte length {bytes}"
+        ));
+    }
+    let mut value = vec![0u16; bytes as usize / 2];
+    let second = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if second != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot read Greppy machine autostart registry value (Win32 error {second})"
+        ));
+    }
+    if let Some(end) = value.iter().position(|unit| *unit == 0) {
+        value.truncate(end);
+    }
+    String::from_utf16(&value)
+        .map_err(|_| "Greppy machine autostart registry value is not valid UTF-16".into())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_write_autostart(path: &Path, contents: &str) -> Result<(), String> {
     let parent = path
@@ -244,11 +336,23 @@ fn install_platform_autostart(data_root: &Path, _mount_root: &Path) -> Result<()
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
 fn install_platform_autostart(_data_root: &Path, _mount_root: &Path) -> Result<(), String> {
-    // Windows service installation is intentionally part of the selected,
-    // signed filesystem-provider installer. The current WinFsp diagnostic
-    // backend is not release-eligible and must not register persistence.
+    let current = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
+    let adapter = sibling(&current, "greppy-workspace-provider.exe")?;
+    let runtime = sibling(&current, "greppyworkspacefsp-x64.dll")?;
+    let driver = sibling(&current, "greppyworkspacefsp-x64.sys")?;
+    require_bundled_file(&adapter, "Windows workspace provider")?;
+    require_bundled_file(&runtime, "Greppy WinFsp runtime")?;
+    require_bundled_file(&driver, "Greppy WinFsp driver")?;
+    let expected = render_windows_machine_autostart(&current)?;
+    let actual = read_windows_machine_autostart()?;
+    if actual != expected {
+        return Err(format!(
+            "Greppy machine autostart is not bound to this installation; expected {expected:?}, found {actual:?}; repair the Greppy MSI"
+        ));
+    }
     Ok(())
 }
 
@@ -491,6 +595,19 @@ mod tests {
         assert_eq!(
             sibling(Path::new("/opt/greppy/bin/greppy"), "provider").unwrap(),
             Path::new("/opt/greppy/bin/provider")
+        );
+    }
+
+    #[test]
+    fn windows_machine_autostart_quotes_spaces_and_trailing_backslashes() {
+        assert_eq!(
+            render_windows_machine_autostart(Path::new(r"C:\Program Files\Greppy\greppy.exe"))
+                .unwrap(),
+            r#""C:\Program Files\Greppy\greppy.exe" workspace setup"#
+        );
+        assert_eq!(
+            windows_quote_command_argument(r"C:\Greppy\").unwrap(),
+            r#""C:\Greppy\\""#
         );
     }
 

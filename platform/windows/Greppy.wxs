@@ -53,6 +53,12 @@
           Type="string"
           Value="[INSTALLFOLDER]"
           KeyPath="yes" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="GreppyWorkspaceProvider"
+          Type="string"
+          Value="&quot;[INSTALLFOLDER]greppy.exe&quot; workspace setup" />
       <Environment
           Id="GreppyPath"
           Name="PATH"
