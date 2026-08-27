@@ -41,6 +41,31 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         return training, manifest
 
+    def test_winfsp_fork_builder_pins_and_imports_complete_wdk_dependency_set(
+        self,
+    ) -> None:
+        builder = (REPOSITORY_ROOT / "tools/build_winfsp_fork.ps1").read_text(
+            encoding="utf-8"
+        )
+        expected_packages = {
+            "Microsoft.Windows.WDK.x64": (
+                "c393d03dfb640b5c92f546b32f6770ef68cd3aaf691956e7d66d8e2c28a1b55e"
+            ),
+            "Microsoft.Windows.SDK.CPP.x64": (
+                "c29ce7a4641cb37ee32ebb8078cc65cfbabc7025076bcfba869039204b1e960d"
+            ),
+            "Microsoft.Windows.SDK.CPP": (
+                "5d31b38205bdd9ac761b4cb39fbbc6b7209b01c11194324afc674d7d119483a0"
+            ),
+        }
+        for package, checksum in expected_packages.items():
+            self.assertIn(package, builder)
+            self.assertIn(checksum, builder)
+        self.assertIn("Directory.Build.props", builder)
+        self.assertIn("$propsImports", builder)
+        self.assertIn("nuget verify -Signatures", builder)
+        self.assertNotIn("/p:WindowsSdkDir=", builder)
+
     def test_training_archive_is_deterministic_and_self_verifying(self) -> None:
         _, manifest = self.make_training_tree()
         first = self.root / "first.tar.gz"

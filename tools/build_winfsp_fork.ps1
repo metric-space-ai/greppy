@@ -52,22 +52,52 @@ if ($LASTEXITCODE -ne 0) { throw 'patched WinFsp source fails git diff --check' 
 
 $wdkVersion = '10.0.26100.6584'
 $sdkVersion = '10.0.26100.0'
-$wdkPackageSha256 = 'c393d03dfb640b5c92f546b32f6770ef68cd3aaf691956e7d66d8e2c28a1b55e'
-$wdkPackage = Join-Path (Split-Path -Parent $Destination) "microsoft.windows.wdk.x64.$wdkVersion.nupkg"
-$wdkRoot = Join-Path (Split-Path -Parent $Destination) "microsoft.windows.wdk.x64.$wdkVersion"
-if ((Test-Path -LiteralPath $wdkPackage) -or (Test-Path -LiteralPath $wdkRoot)) {
-    throw 'refusing to reuse an existing WDK package or extraction directory'
-}
-$wdkUri = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/$wdkVersion/microsoft.windows.wdk.x64.$wdkVersion.nupkg"
-Invoke-WebRequest -Uri $wdkUri -OutFile $wdkPackage
-$actualWdkHash = (Get-FileHash -LiteralPath $wdkPackage -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualWdkHash -ne $wdkPackageSha256) {
-    throw "WDK NuGet package checksum mismatch: $actualWdkHash"
-}
 $nuget = (Get-Command nuget.exe -ErrorAction Stop).Source
-& $nuget verify -Signatures $wdkPackage
-if ($LASTEXITCODE -ne 0) { throw 'WDK NuGet signature verification failed' }
-[System.IO.Compression.ZipFile]::ExtractToDirectory($wdkPackage, $wdkRoot)
+$packageParent = Split-Path -Parent $Destination
+$packageSpecs = @(
+    [pscustomobject]@{
+        Id = 'Microsoft.Windows.WDK.x64'
+        Sha256 = 'c393d03dfb640b5c92f546b32f6770ef68cd3aaf691956e7d66d8e2c28a1b55e'
+        Props = 'build\native\Microsoft.Windows.WDK.x64.props'
+    },
+    [pscustomobject]@{
+        Id = 'Microsoft.Windows.SDK.CPP.x64'
+        Sha256 = 'c29ce7a4641cb37ee32ebb8078cc65cfbabc7025076bcfba869039204b1e960d'
+        Props = 'build\native\Microsoft.Windows.SDK.cpp.x64.props'
+    },
+    [pscustomobject]@{
+        Id = 'Microsoft.Windows.SDK.CPP'
+        Sha256 = '5d31b38205bdd9ac761b4cb39fbbc6b7209b01c11194324afc674d7d119483a0'
+        Props = 'build\native\Microsoft.Windows.SDK.cpp.props'
+    }
+)
+$packageRoots = @{}
+$propsImports = @()
+foreach ($spec in $packageSpecs) {
+    $lowerId = $spec.Id.ToLowerInvariant()
+    $package = Join-Path $packageParent "$lowerId.$wdkVersion.nupkg"
+    $packageRoot = Join-Path $packageParent "$lowerId.$wdkVersion"
+    if ((Test-Path -LiteralPath $package) -or (Test-Path -LiteralPath $packageRoot)) {
+        throw "refusing to reuse an existing Windows kit package or extraction directory: $lowerId"
+    }
+    $uri = "https://api.nuget.org/v3-flatcontainer/$lowerId/$wdkVersion/$lowerId.$wdkVersion.nupkg"
+    Invoke-WebRequest -Uri $uri -OutFile $package
+    $actualHash = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $spec.Sha256) {
+        throw "$($spec.Id) NuGet package checksum mismatch: $actualHash"
+    }
+    & $nuget verify -Signatures $package
+    if ($LASTEXITCODE -ne 0) { throw "$($spec.Id) NuGet signature verification failed" }
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($package, $packageRoot)
+    $propsPath = Join-Path $packageRoot $spec.Props
+    if (-not (Test-Path -LiteralPath $propsPath -PathType Leaf)) {
+        throw "$($spec.Id) NuGet package lacks required MSBuild props: $propsPath"
+    }
+    $packageRoots[$spec.Id] = $packageRoot
+    $propsImports += $propsPath
+}
+
+$wdkRoot = $packageRoots['Microsoft.Windows.WDK.x64']
 $wdkContentRoot = Join-Path $wdkRoot 'c'
 if ($wdkContentRoot -match '\s') {
     throw "WDK extraction path must not contain whitespace: $wdkContentRoot"
@@ -76,6 +106,16 @@ $ntifs = Join-Path $wdkContentRoot "Include\$sdkVersion\km\ntifs.h"
 if (-not (Test-Path -LiteralPath $ntifs -PathType Leaf)) {
     throw "pinned WDK package lacks ntifs.h: $ntifs"
 }
+$importLines = foreach ($propsPath in $propsImports) {
+    $escaped = [Security.SecurityElement]::Escape($propsPath)
+    "  <Import Project=`"$escaped`" Condition=`"Exists('$escaped')`" />"
+}
+$directoryBuildProps = @('<Project>') + $importLines + @('</Project>', '')
+[IO.File]::WriteAllText(
+    (Join-Path $Destination 'Directory.Build.props'),
+    ($directoryBuildProps -join [Environment]::NewLine),
+    [Text.UTF8Encoding]::new($false)
+)
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
     throw "vswhere is absent: $vswhere"
@@ -97,18 +137,9 @@ foreach ($project in $projects) {
     $projectPath = Join-Path $solutionRoot $project
     $arguments = @(
         'call', ('"' + $developerShell + '"'), '-arch=x64', '-host_arch=x64', '>', 'nul', '&&',
-        'set', ('"WindowsSdkDir=' + $wdkContentRoot + '\"'), '&&',
-        'set', ('"WindowsSdkDir_10=' + $wdkContentRoot + '\"'), '&&',
-        'set', ('"WDKContentRoot=' + $wdkContentRoot + '\"'), '&&',
-        'set', ('"UCRTContentRoot=' + $wdkContentRoot + '\"'), '&&',
-        'set', '"WDK_NuGet=true"', '&&',
         'msbuild', ('"' + $projectPath + '"'), '/m', '/nologo', '/verbosity:minimal',
         '/p:Configuration=Release', '/p:Platform=x64', "/p:MyTargetPlatformVersion=$sdkVersion",
         '/p:MyNtddiVersion=0x0A000006', '/p:MyWin32Version=0x0A00',
-        ('/p:WindowsSdkDir=' + $wdkContentRoot + '\'),
-        ('/p:WindowsSdkDir_10=' + $wdkContentRoot + '\'),
-        ('/p:WDKContentRoot=' + $wdkContentRoot + '\'),
-        ('/p:UCRTContentRoot=' + $wdkContentRoot + '\'),
         '/p:WDK_NuGet=true'
     )
     & cmd.exe /D /S /C ($arguments -join ' ')
