@@ -217,7 +217,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 22)
+        self.assertEqual(len(names), 25)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
@@ -264,6 +264,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('xcrun stapler staple "${{ matrix.asset }}"', workflow)
         self.assertIn('spctl --assess --type install', workflow)
         self.assertNotIn("greppy-macos-arm64.tar.gz", workflow)
+        self.assertIn("greppy-linux-x86_64.deb", workflow)
+        self.assertIn("greppy-linux-x86_64.rpm", workflow)
+        self.assertIn("platform/linux/build-packages.sh", workflow)
+        self.assertNotIn("greppy-linux-x86_64.tar.gz", workflow)
+        self.assertIn("greppy-workspace-provider.exe", workflow)
         self.assertNotIn("RIFT-MIT", workflow)
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")

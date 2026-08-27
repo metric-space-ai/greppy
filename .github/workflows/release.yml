@@ -209,7 +209,8 @@ jobs:
           # 22.04 builds run on anything with glibc >= 2.35.
           - name: linux-x86_64
             os: ubuntu-22.04
-            asset: greppy-linux-x86_64.tar.gz
+            asset: greppy-linux-x86_64.deb
+            secondary_asset: greppy-linux-x86_64.rpm
             features: cuda
             footprint_devices: 'cpu'
             runner_os: Linux
@@ -287,7 +288,14 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
       - name: Build release binary
-        run: cargo build --locked --release --bin greppy --features ${{ matrix.features }}
+        run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features ${{ matrix.features }}
+
+      - name: Install Linux package builders
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rpm cpio
 
       - name: Import macOS application and installer identities
         if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
@@ -458,15 +466,16 @@ jobs:
 
       - name: Package (Unix)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          mkdir -p dist
-          cp target/release/greppy dist/greppy
-          cp bench/release_package_smoke.sh dist/
-          cp bench/release_daemon_stress.sh dist/
-          cp tools/release_artifacts.py dist/
-          cp README.md LICENSE THIRD_PARTY.md SECURITY.md SUPPORT.md CHANGELOG.md Cargo.lock dist/
-          cp -R licenses dist/licenses
-          tar -C dist -czf "${{ matrix.asset }}" .
+          version="$(target/release/greppy --version | awk '{print $NF}')"
+          platform/linux/build-packages.sh \
+            target/release/greppy \
+            target/release/greppy-workspace-provider \
+            "$version" \
+            "${{ matrix.asset }}" \
+            "${{ matrix.secondary_asset }}" \
+            dist
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -522,6 +531,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
+          Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
           Copy-Item tools/release_artifacts.py dist/release_artifacts.py
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
@@ -532,21 +542,29 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euo pipefail
           clean="$RUNNER_TEMP/greppy-package-smoke"
-          mkdir -p "$clean/bin" "$clean/store" "$clean/repo"
-          tar -C "$clean/bin" -xzf "${{ matrix.asset }}"
-          test ! -e "$clean/bin/grep"
-          test -s "$clean/bin/licenses/EMBEDDED-MODEL-TERMS.md"
-          test -s "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt"
-          test -s "$clean/bin/licenses/GEMMA-TERMS.html"
-          test -s "$clean/bin/licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt"
-          test -s "$clean/bin/licenses/EMBEDDINGGEMMA-PROVENANCE.json"
-          test -s "$clean/bin/licenses/QWEN3.5-APACHE-2.0.txt"
-          test -s "$clean/bin/licenses/QWEN3.5-MODIFICATIONS.txt"
-          test -s "$clean/bin/licenses/QWEN3.5-PROVENANCE.json"
-          test -s "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json"
-          test -s "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json"
-          bash "$clean/bin/release_package_smoke.sh" "$clean/bin/greppy" "$clean/work"
+          mkdir -p "$clean/deb" "$clean/rpm"
+          dpkg-deb -x "${{ matrix.asset }}" "$clean/deb"
+          (cd "$clean/rpm" && rpm2cpio "$GITHUB_WORKSPACE/${{ matrix.secondary_asset }}" | cpio -idm --quiet)
+          deb_bin="$clean/deb/usr/lib/greppy/bin"
+          rpm_bin="$clean/rpm/usr/lib/greppy/bin"
+          deb_licenses="$clean/deb/usr/share/licenses/greppy"
+          test ! -e "$clean/deb/usr/bin/grep"
+          test -x "$deb_bin/greppy-workspace-provider"
+          test -x "$rpm_bin/greppy-workspace-provider"
+          cmp "$deb_bin/greppy" "$rpm_bin/greppy"
+          cmp "$deb_bin/greppy-workspace-provider" "$rpm_bin/greppy-workspace-provider"
+          for license in \
+            EMBEDDED-MODEL-TERMS.md EMBEDDINGGEMMA-NOTICE.txt GEMMA-TERMS.html \
+            EMBEDDINGGEMMA-MODIFICATIONS.txt EMBEDDINGGEMMA-PROVENANCE.json \
+            QWEN3.5-APACHE-2.0.txt QWEN3.5-MODIFICATIONS.txt \
+            QWEN3.5-PROVENANCE.json QWEN3.5-TRAINING-DATA-MANIFEST.json \
+            MODEL-REDISTRIBUTION.lock.json; do
+            test -s "$deb_licenses/$license"
+          done
+          bash "$clean/deb/usr/lib/greppy/release-tests/release_package_smoke.sh" \
+            "$deb_bin/greppy" "$clean/work"
 
       - name: Smoke-test packaged artifact (macOS)
         if: runner.os == 'macOS'
@@ -601,11 +619,18 @@ jobs:
             --dist dist \
             --cargo-lock Cargo.lock \
             --target "${{ matrix.rust_host }}"
+          if [ "${{ runner.os }}" = Linux ]; then
+            cp "${{ matrix.asset }}.spdx.json" "${{ matrix.secondary_asset }}.spdx.json"
+          fi
 
       - name: Generate SHA256 checksum (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+        run: |
+          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          if [ "${{ runner.os }}" = Linux ]; then
+            shasum -a 256 "${{ matrix.secondary_asset }}" > "${{ matrix.secondary_asset }}.sha256"
+          fi
 
       - name: Generate SHA256 checksum (Windows)
         if: runner.os == 'Windows'
@@ -628,10 +653,22 @@ jobs:
         with:
           subject-path: ${{ matrix.asset }}
 
+      - name: Attest secondary Linux package provenance
+        if: runner.os == 'Linux'
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: ${{ matrix.secondary_asset }}
+
       - name: Attest SBOM provenance
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: ${{ matrix.asset }}.spdx.json
+
+      - name: Attest secondary Linux SBOM provenance
+        if: runner.os == 'Linux'
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: ${{ matrix.secondary_asset }}.spdx.json
 
       - name: Attest runtime footprint evidence
         if: runner.os != 'Windows'
@@ -652,6 +689,9 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
             ${{ matrix.asset }}.spdx.json
+            ${{ matrix.secondary_asset }}
+            ${{ matrix.secondary_asset }}.sha256
+            ${{ matrix.secondary_asset }}.spdx.json
             runtime-footprint-*.json
             build-environment-${{ matrix.name }}.json
 
@@ -671,7 +711,8 @@ jobs:
             rust_host: aarch64-apple-darwin
           - name: linux-x86_64-no-toolkit
             os: ubuntu-22.04
-            asset: greppy-linux-x86_64.tar.gz
+            asset: greppy-linux-x86_64.deb
+            secondary_asset: greppy-linux-x86_64.rpm
             rust_host: x86_64-unknown-linux-gnu
           - name: windows-x86_64
             os: windows-latest
@@ -687,19 +728,58 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p unpack store repo
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes rpm cpio
+          mkdir -p unpack-deb unpack-rpm store repo
           (cd package && shasum -a 256 -c "${{ matrix.asset }}.sha256")
-          tar -C unpack -xzf "package/${{ matrix.asset }}"
-          test ! -e unpack/grep
-          bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
-          bash unpack/release_daemon_stress.sh "$PWD/unpack/greppy" "$PWD/daemon-stress"
-          ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
+          (cd package && shasum -a 256 -c "${{ matrix.secondary_asset }}.sha256")
+          dpkg-deb -x "package/${{ matrix.asset }}" unpack-deb
+          (cd unpack-rpm && rpm2cpio "$GITHUB_WORKSPACE/package/${{ matrix.secondary_asset }}" | cpio -idm --quiet)
+          deb_root="$PWD/unpack-deb"
+          rpm_root="$PWD/unpack-rpm"
+          deb_bin="$deb_root/usr/lib/greppy/bin"
+          rpm_bin="$rpm_root/usr/lib/greppy/bin"
+          test ! -e "$deb_root/usr/bin/grep"
+          test -L "$deb_root/usr/bin/greppy"
+          test "$(readlink "$deb_root/usr/bin/greppy")" = ../lib/greppy/bin/greppy
+          test -x "$deb_bin/greppy-workspace-provider"
+          test -x "$rpm_bin/greppy-workspace-provider"
+          cmp "$deb_bin/greppy" "$rpm_bin/greppy"
+          cmp "$deb_bin/greppy-workspace-provider" "$rpm_bin/greppy-workspace-provider"
+          bash "$deb_root/usr/lib/greppy/release-tests/release_package_smoke.sh" \
+            "$deb_bin/greppy" "$PWD/smoke"
+          bash "$deb_root/usr/lib/greppy/release-tests/release_daemon_stress.sh" \
+            "$deb_bin/greppy" "$PWD/daemon-stress"
+          ! ldd "$deb_bin/greppy" | grep -E 'cudart|cublas|nvrtc'
           test -s package/runtime-footprint-linux-x86_64-cpu.json
-          python3 unpack/release_artifacts.py verify-spdx \
+          python3 "$deb_root/usr/lib/greppy/release-tests/release_artifacts.py" verify-spdx \
             --sbom "package/${{ matrix.asset }}.spdx.json" \
-            --dist unpack \
-            --cargo-lock unpack/Cargo.lock \
+            --dist "$deb_root" \
+            --cargo-lock "$deb_root/usr/share/doc/greppy/Cargo.lock" \
             --target "${{ matrix.rust_host }}"
+          python3 "$rpm_root/usr/lib/greppy/release-tests/release_artifacts.py" verify-spdx \
+            --sbom "package/${{ matrix.secondary_asset }}.spdx.json" \
+            --dist "$rpm_root" \
+            --cargo-lock "$rpm_root/usr/share/doc/greppy/Cargo.lock" \
+            --target "${{ matrix.rust_host }}"
+          docker run --rm -v "$PWD/package:/packages:ro" ubuntu:22.04 bash -ceu '
+            apt-get update >/dev/null
+            apt-get install --yes /packages/greppy-linux-x86_64.deb >/dev/null
+            greppy --version
+            test -x /usr/lib/greppy/bin/greppy-workspace-provider
+            apt-get remove --yes greppy >/dev/null
+            test ! -e /usr/bin/greppy
+            test ! -e /usr/lib/greppy
+          '
+          docker run --rm -v "$PWD/package:/packages:ro" fedora:latest bash -ceu '
+            dnf install --assumeyes /packages/greppy-linux-x86_64.rpm >/dev/null
+            greppy --version
+            test -x /usr/lib/greppy/bin/greppy-workspace-provider
+            dnf remove --assumeyes greppy >/dev/null
+            test ! -e /usr/bin/greppy
+            test ! -e /usr/lib/greppy
+          '
 
       - name: Verify clean macOS installer
         if: runner.os == 'macOS'
@@ -745,6 +825,7 @@ jobs:
           if ($want -ne $got) { throw "package checksum mismatch: $got != $want" }
           Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
           if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
+          if (-not (Test-Path "$PWD/unpack/greppy-workspace-provider.exe")) { throw 'missing portable workspace provider' }
           if ($env:GITHUB_REF -like 'refs/tags/*') {
             if (-not $env:HAVE_WINDOWS_CERT_SECRETS) {
               # Consistent with the signing step: Windows signing happens via
