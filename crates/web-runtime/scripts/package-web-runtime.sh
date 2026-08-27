@@ -74,6 +74,9 @@ cat > "$dest/README.txt" <<TXT
 Greppy web-runtime local distributable
 Contains three separately linked images. This archive is not signed.
 TXT
+if [ -f "$root/LICENSE" ] && [ ! -L "$root/LICENSE" ]; then
+  cp "$root/LICENSE" "$dest/LICENSE"
+fi
 echo "NOT_PRODUCTION_SIGNED" > "$dest/UNSIGNED"
 web_runtime_write_stamp "$dest"
 parent="$(dirname "$dest")"

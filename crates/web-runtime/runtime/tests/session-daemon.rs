@@ -1150,6 +1150,27 @@ fn uninstall_script() -> PathBuf {
         .join("uninstall-web-runtime.sh")
 }
 
+fn install_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("install-web-runtime.sh")
+}
+
+fn upgrade_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("upgrade-web-runtime.sh")
+}
+
+fn rollback_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("rollback-web-runtime.sh")
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -1160,10 +1181,17 @@ fn repo_root() -> PathBuf {
 }
 
 fn run_script(script: &Path, dest: Option<&Path>) -> (i32, String, String) {
+    match dest {
+        Some(dest) => run_script_args(script, &[dest]),
+        None => run_script_args(script, &[]),
+    }
+}
+
+fn run_script_args(script: &Path, args: &[&Path]) -> (i32, String, String) {
     let mut command = Command::new("sh");
     command.arg(script);
-    if let Some(dest) = dest {
-        command.arg(dest);
+    for arg in args {
+        command.arg(arg);
     }
     let output = command.output().expect("run script");
     (
@@ -1259,6 +1287,80 @@ fn package_and_uninstall_refuse_hostile_destinations() {
     let _ = std::fs::remove_dir_all(&real);
 
     assert!(repo.join("Cargo.toml").exists(), "repo still present");
+}
+
+#[test]
+fn install_upgrade_rollback_roundtrip() {
+    let pid = std::process::id();
+    let packaged = std::env::temp_dir().join(format!("greppy-web-dist-pkg-{pid}"));
+    let installed = std::env::temp_dir().join(format!("greppy-web-dist-inst-{pid}"));
+    let _ = std::fs::remove_dir_all(&packaged);
+    let _ = std::fs::remove_dir_all(&installed);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&packaged));
+    assert_eq!(
+        code, 0,
+        "package for install: stdout={stdout} stderr={stderr}"
+    );
+    assert!(packaged.join("LICENSE").exists(), "package LICENSE");
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&packaged, &installed]);
+    assert_eq!(code, 0, "install: stdout={stdout} stderr={stderr}");
+    for name in [
+        "web-runtime-supervisor",
+        "web-controller-worker",
+        "web-content-worker",
+    ] {
+        assert!(
+            installed.join("bin").join(name).exists(),
+            "install missing {name}"
+        );
+    }
+    let original = std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
+    let marker = b"greppy-web-runtime-upgrade-marker";
+    let mut upgraded_bytes = original.clone();
+    upgraded_bytes.extend_from_slice(marker);
+    std::fs::write(
+        packaged.join("bin").join("web-runtime-supervisor"),
+        &upgraded_bytes,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_script_args(&upgrade_script(), &[&packaged, &installed]);
+    assert_eq!(code, 0, "upgrade: stdout={stdout} stderr={stderr}");
+    let after_upgrade =
+        std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after_upgrade, upgraded_bytes, "upgrade did not copy source");
+    let previous =
+        std::fs::read(installed.join("previous").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(previous, original, "upgrade did not snapshot previous image");
+    let (code, stdout, stderr) = run_script(&rollback_script(), Some(&installed));
+    assert_eq!(code, 0, "rollback: stdout={stdout} stderr={stderr}");
+    let after_rollback =
+        std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after_rollback, original, "rollback did not restore previous");
+    let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&installed));
+    assert_eq!(
+        code, 0,
+        "uninstall after rollback: stdout={stdout} stderr={stderr}"
+    );
+    assert!(!installed.exists(), "uninstall left {installed:?}");
+    let _ = std::fs::remove_dir_all(&packaged);
+}
+
+#[test]
+fn install_upgrade_rollback_refuse_hostile_destinations() {
+    let install = install_script();
+    let upgrade = upgrade_script();
+    let rollback = rollback_script();
+    let repo = repo_root();
+    assert_refused(&install, None, "install without dest");
+    assert_refused(&upgrade, None, "upgrade without dest");
+    assert_refused(&rollback, None, "rollback without dest");
+    assert_refused(&rollback, Some(Path::new("/")), "rollback root");
+    assert_refused(&rollback, Some(&repo), "rollback repo root");
+    let (code, stdout, stderr) = run_script_args(&install, &[Path::new("/"), Path::new("/")]);
+    assert_ne!(
+        code, 0,
+        "install root: stdout={stdout} stderr={stderr}"
+    );
 }
 
 #[test]

@@ -189,7 +189,7 @@ web_runtime_is_owned_dist() {
 
 web_runtime_known_members() {
   printf '%s
-'     ".greppy-web-runtime-dist"     "README.txt"     "UNSIGNED"     "SHA256SUMS"     "sbom.json"     "provenance.json"     "SIGNING_RECEIPT"     "SIGNING_SKIPPED"     "SIGNING_STATUS"     "NOTARIZATION_RECEIPT"     "NOTARIZATION_SKIPPED"     "NOTARIZED_UNSIGNED"     "bin/web-runtime-supervisor"     "bin/web-controller-worker"     "bin/web-content-worker"
+'     ".greppy-web-runtime-dist"     "README.txt"     "UNSIGNED"     "SHA256SUMS"     "sbom.json"     "provenance.json"     "LICENSE"     "SIGNING_RECEIPT"     "SIGNING_SKIPPED"     "SIGNING_STATUS"     "NOTARIZATION_RECEIPT"     "NOTARIZATION_SKIPPED"     "NOTARIZED_UNSIGNED"     "bin/web-runtime-supervisor"     "bin/web-controller-worker"     "bin/web-content-worker"     "previous/web-runtime-supervisor"     "previous/web-controller-worker"     "previous/web-content-worker"
 }
 
 web_runtime_validate_dest_shape() {
@@ -260,7 +260,7 @@ web_runtime_remove_owned_dist_files() {
   web_runtime_is_owned_dist "$dest" ||
     web_runtime_die "not a web-runtime dist: $dest"
   me=$(web_runtime_uid)
-  for member in     .greppy-web-runtime-dist     README.txt     UNSIGNED     SHA256SUMS     sbom.json     provenance.json     SIGNING_RECEIPT     SIGNING_SKIPPED     SIGNING_STATUS     NOTARIZATION_RECEIPT     NOTARIZATION_SKIPPED     NOTARIZED_UNSIGNED     bin/web-runtime-supervisor     bin/web-controller-worker     bin/web-content-worker
+  for member in     .greppy-web-runtime-dist     README.txt     UNSIGNED     SHA256SUMS     sbom.json     provenance.json     LICENSE     SIGNING_RECEIPT     SIGNING_SKIPPED     SIGNING_STATUS     NOTARIZATION_RECEIPT     NOTARIZATION_SKIPPED     NOTARIZED_UNSIGNED     bin/web-runtime-supervisor     bin/web-controller-worker     bin/web-content-worker     previous/web-runtime-supervisor     previous/web-controller-worker     previous/web-content-worker
   do
     path="$dest/$member"
     if [ -L "$path" ]; then
@@ -280,6 +280,42 @@ web_runtime_remove_owned_dist_files() {
     fi
     rmdir "$dest/bin"
   fi
+  if [ -d "$dest/previous" ]; then
+    leftover=$(ls -A "$dest/previous" 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+      web_runtime_die "refusing to remove dest with unexpected previous members: $leftover"
+    fi
+    rmdir "$dest/previous"
+  fi
+}
+
+web_runtime_require_existing_dist() {
+  raw=${1:-}
+  label=${2:-dist}
+  [ -n "$raw" ] || web_runtime_die "$label dest is required"
+  dest=$(web_runtime_validate_dest_shape "$raw")
+  [ -e "$dest" ] || web_runtime_die "missing $label dest: $dest"
+  web_runtime_check_owned_dir "$dest"
+  web_runtime_is_owned_dist "$dest" ||
+    web_runtime_die "$label is not a stamped web-runtime dist: $dest"
+  printf '%s' "$dest"
+}
+
+web_runtime_copy_regular_file() {
+  copy_src=$1
+  copy_dest=$2
+  [ -e "$copy_src" ] || web_runtime_die "missing source file: $copy_src"
+  [ -L "$copy_src" ] && web_runtime_die "refusing symlink source: $copy_src"
+  [ -f "$copy_src" ] || web_runtime_die "source is not a file: $copy_src"
+  [ -L "$copy_dest" ] && web_runtime_die "refusing symlink dest file: $copy_dest"
+  copy_parent=$(dirname "$copy_dest")
+  mkdir -p "$copy_parent"
+  [ -L "$copy_parent" ] && web_runtime_die "refusing symlink dest parent: $copy_parent"
+  web_runtime_check_owned_dir "$copy_parent"
+  copy_tmp="$copy_dest.greppy-tmp"
+  [ -L "$copy_tmp" ] && web_runtime_die "refusing symlink temp: $copy_tmp"
+  cp "$copy_src" "$copy_tmp"
+  mv "$copy_tmp" "$copy_dest"
 }
 
 web_runtime_uninstall_owned_dist() {
