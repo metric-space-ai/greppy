@@ -445,20 +445,123 @@ pub(super) fn retry_delays() -> impl Iterator<Item = Duration> {
         .map(Duration::from_millis)
 }
 
-pub(super) fn detach_command(command: &mut std::process::Command) {
+pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        command.spawn().map(|_| ())
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
+        spawn_detached_windows(command)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        command.spawn().map(|_| ())
+    }
+}
+
+#[cfg(windows)]
+fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    if command.get_current_dir().is_some() || command.get_envs().next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "detached daemon commands must inherit the current directory and environment",
+        ));
+    }
+
+    let mut application = command
+        .get_program()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if application.len() == 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "detached daemon executable is empty",
+        ));
+    }
+
+    let mut command_line = Vec::new();
+    append_windows_command_arg(&mut command_line, command.get_program());
+    for arg in command.get_args() {
+        command_line.push(u16::from(b' '));
+        append_windows_command_arg(&mut command_line, arg);
+    }
+    command_line.push(0);
+
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let flags = {
         use windows_sys::Win32::System::Threading::{
             CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
         };
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS
+    };
+    let created = unsafe {
+        CreateProcessW(
+            application.as_mut_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            flags,
+            null(),
+            null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn append_windows_command_arg(command_line: &mut Vec<u16>, arg: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let encoded = arg.encode_wide().collect::<Vec<_>>();
+    let quoted = encoded.is_empty()
+        || encoded.iter().any(|unit| {
+            *unit == u16::from(b' ') || *unit == u16::from(b'\t') || *unit == u16::from(b'"')
+        });
+    if !quoted {
+        command_line.extend(encoded);
+        return;
+    }
+
+    command_line.push(u16::from(b'"'));
+    let mut backslashes = 0usize;
+    for unit in encoded {
+        if unit == u16::from(b'\\') {
+            backslashes += 1;
+            continue;
+        }
+        if unit == u16::from(b'"') {
+            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+        } else {
+            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+        }
+        backslashes = 0;
+        command_line.push(unit);
+    }
+    command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    command_line.push(u16::from(b'"'));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1725,6 +1828,67 @@ mod tests {
         let delays = retry_delays().collect::<Vec<_>>();
         assert_eq!(delays.first(), Some(&Duration::from_millis(50)));
         assert!(delays.iter().copied().sum::<Duration>() < Duration::from_secs(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detached_spawn_does_not_hold_redirected_parent_streams() {
+        const TEST_NAME: &str =
+            "inference_daemon::tests::windows_detached_spawn_does_not_hold_redirected_parent_streams";
+        let executable = std::env::current_exe().unwrap();
+        let stem = executable
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default();
+        let directory = executable.parent().unwrap();
+        let started = directory.join("greppy-detach-daemon-started");
+        let completed = directory.join("greppy-detach-daemon-completed");
+
+        if stem == "greppy-detach-daemon" {
+            std::fs::write(&started, b"started\n").unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            std::fs::write(&completed, b"completed\n").unwrap();
+            return;
+        }
+        if stem == "greppy-detach-intermediate" {
+            let mut daemon = std::process::Command::new(directory.join("greppy-detach-daemon.exe"));
+            daemon.arg("--exact").arg(TEST_NAME).arg("--nocapture");
+            spawn_detached(&mut daemon).unwrap();
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let intermediate = temp.path().join("greppy-detach-intermediate.exe");
+        let daemon = temp.path().join("greppy-detach-daemon.exe");
+        std::fs::copy(&executable, &intermediate).unwrap();
+        std::fs::copy(&executable, &daemon).unwrap();
+
+        let began = Instant::now();
+        let output = std::process::Command::new(&intermediate)
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .output()
+            .unwrap();
+        let elapsed = began.elapsed();
+        assert!(
+            output.status.success(),
+            "intermediate test process failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "redirected streams remained inherited for {elapsed:?}"
+        );
+        assert!(temp.path().join("greppy-detach-daemon-started").is_file());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !temp.path().join("greppy-detach-daemon-completed").is_file()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(temp.path().join("greppy-detach-daemon-completed").is_file());
     }
 
     #[test]

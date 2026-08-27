@@ -160,8 +160,7 @@ fn spawn_daemon(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    inference_daemon::detach_command(&mut command);
-    command.spawn().ok().map(|_| ())
+    inference_daemon::spawn_detached(&mut command).ok()
 }
 
 pub(super) fn prewarm_from_env(cfg: &super::EmbeddingModelConfig, model_key: &str) {

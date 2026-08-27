@@ -301,8 +301,7 @@ fn spawn_daemon(cfg: &super::QwenSummaryConfig, endpoint: &Endpoint, prewarm: bo
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    inference_daemon::detach_command(&mut command);
-    command.spawn().ok().map(|_| ())
+    inference_daemon::spawn_detached(&mut command).ok()
 }
 
 pub(super) fn daemon_main(socket: String, cfg: super::QwenSummaryConfig, prewarm: bool) -> ! {
