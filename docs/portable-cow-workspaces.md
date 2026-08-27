@@ -120,7 +120,7 @@ baselines remain pinned until their refs are removed.
   component, and user mount permissions. The package includes the systemd user
   unit and `workspace setup` binds it to the actual per-user roots. No
   particular backing filesystem is required.
-- macOS ARM64 requires macOS 15 or newer and a signed, notarized FSKit app
+- macOS ARM64 requires macOS 15.4 or newer and a signed, notarized FSKit app
   extension. The one-time System Settings approval is an OS security boundary;
   Greppy remains unavailable until activation. A minimal Swift host bridges
   FSKit to the Rust core; the LaunchAgent only replays idempotent setup after
@@ -138,6 +138,28 @@ The release remains blocked until clean-machine install, activation,
 upgrade/uninstall, cross-platform conformance, crash/security, isolation, and
 performance gates pass on one exact commit. Agent benchmarks are diagnostic;
 each suspected product defect is reproduced and classified independently.
+
+### Cross-platform performance evidence
+
+The manual `Portable CoW platform performance` workflow is the authoritative
+three-platform release gate. It builds the provider and measurement harness
+from the selected commit, generates the identical 300,000-file fixture, and
+runs through the real FUSE3, FSKit, or WinFsp mount. Linux and Windows use clean
+hosted runners. macOS uses an ephemeral Apple Silicon runner carrying the
+`greppy-fskit-performance` label, a configured
+`MACOS_CODE_SIGN_IDENTITY`, and an OS/MDM approval for the Greppy FSKit bundle
+identity. The job refuses an existing data or mount root; this prevents warm
+state from a previous run from becoming release evidence.
+
+Each platform uploads `greppy.portable-cow-performance.v1`. The final job
+runs `tools/verify_portable_cow_performance.py` and accepts exactly Linux
+x86_64, macOS ARM64, and Windows x86_64 from the same full Git commit. It also
+rejects a dirty source tree, non-release builds, modified fixture size,
+relaxed limits, P95 above 500 ms, more than 1 MiB for an untouched workspace,
+anything other than one changed 1-MiB chunk for a 1-byte write, fewer than 50
+parallel workspaces, or Rust/Python/Node overhead above 20%. The immutable
+release workflow requires a successful run of this workflow for its exact
+subject commit; a Linux-only result can never authorize `v0.3.4`.
 
 ## 0.3.3 compatibility
 

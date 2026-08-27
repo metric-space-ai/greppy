@@ -23,6 +23,10 @@ Dirty-baseline hardlink identity is now double-captured and hashed. Proposal
 metadata stores canonical hardlink groups, binds them into the proposal commit,
 and restores real shared inodes through crash-safe apply instead of degrading
 them into byte-identical independent files.
+Proposal staging hashes each hardlink group once and explicitly writes the
+same blob to every corresponding Git index entry. This avoids platform-specific
+Git stat-cache shortcuts from producing a commit whose tree disagrees with the
+bound hardlink topology.
 
 New `workspace setup`, `workspace doctor --json`, `workspace status --json`,
 and `workspace gc` commands manage one persistent per-user provider mount.
@@ -44,6 +48,12 @@ their type-only Git mode is never mistaken for filesystem permissions. A Base
 builder compares source and mounted inventories before indexing and verifies
 the final `file_state` row count before publishing `COMPLETE`, preventing a
 root-files-only index from becoming a reusable false-success Base.
+
+Release eligibility additionally requires one exact-SHA performance set from
+the real Linux FUSE3, macOS FSKit, and Windows provider mounts. A shared
+fail-closed verifier rejects missing platforms, mixed commits, dirty builds,
+relaxed thresholds, or any failed latency, storage, parallelism, or toolchain
+gate.
 
 Dirty-based proposals record the pinned commit as parent but expose only the
 initial-snapshot-to-final patch. `greppy agent apply REF` verifies the exact

@@ -1,0 +1,303 @@
+name: Portable CoW platform performance
+
+# Manual exact-SHA release gate. macOS deliberately targets an ephemeral,
+# MDM-preapproved Apple Silicon runner because FSKit activation is a one-time
+# OS permission that GitHub-hosted runners cannot grant honestly.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  linux:
+    name: Linux x86_64 real FUSE3 performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+      - name: Install FUSE3 and representative toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 nodejs
+          test -c /dev/fuse
+      - name: Build exact release provider and harness
+        run: |
+          cargo build -p greppy-workspace-provider --release --locked
+          cargo build -p greppy-workspace-provider --example release_performance --release --locked
+      - name: Create exact fixture
+        run: >-
+          python3 tools/generate_portable_cow_fixture.py
+          "$RUNNER_TEMP/repository" --files 300000 --modules 24
+      - name: Run hard gate over the real mount
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          data="$RUNNER_TEMP/data"
+          mount="$RUNNER_TEMP/mount"
+          evidence="$RUNNER_TEMP/greppy-cow-perf-linux.json"
+          mkdir -p "$data" "$mount"
+          target/release/greppy-workspace-provider --data-root "$data" --mount-root "$mount" \
+            >"$RUNNER_TEMP/provider-linux.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/provider-linux.pid"
+          for _ in $(seq 1 200); do
+            test -f "$data/provider.json" && mountpoint -q "$mount" && break
+            sleep 0.1
+          done
+          mountpoint -q "$mount"
+          timeout --signal=TERM --kill-after=15s 8m \
+            target/release/examples/release_performance \
+            --repository "$RUNNER_TEMP/repository" \
+            --data-root "$data" \
+            --probe-path files/000/000000.txt \
+            --output "$evidence" \
+            --phase-trace-dir "$RUNNER_TEMP/phases-linux" \
+            --source-commit "$GITHUB_SHA" \
+            --provider-binary "$GITHUB_WORKSPACE/target/release/greppy-workspace-provider" \
+            --native-baseline-root "$RUNNER_TEMP/native-baseline" \
+            --hardware "$(lscpu | tr '\n' ';')" \
+            --toolchain-case '{"name":"rust","cwd":"rust","argv":["rustc","main.rs","-o","/tmp/greppy-perf-rust"]}' \
+            --toolchain-case '{"name":"python","cwd":"python","argv":["python3","-B","test_sample.py"]}' \
+            --toolchain-case '{"name":"node","cwd":"node","argv":["npm","test","--silent"]}' \
+            --toolchain-case '{"name":"node-startup-diagnostic","cwd":"node","argv":["node","test.js"],"release_gate":false}' \
+            --enforce
+      - name: Cleanup provider
+        if: always()
+        shell: bash
+        run: |
+          mount="$RUNNER_TEMP/mount"
+          mountpoint -q "$mount" && fusermount3 -u "$mount" || true
+          test -f "$RUNNER_TEMP/provider-linux.pid" && \
+            kill "$(cat "$RUNNER_TEMP/provider-linux.pid")" || true
+      - name: Upload Linux evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: portable-cow-performance-set-linux-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/greppy-cow-perf-linux.json
+            ${{ runner.temp }}/provider-linux.log
+            ${{ runner.temp }}/phases-linux/*.jsonl
+          if-no-files-found: error
+
+  macos:
+    name: macOS ARM64 real FSKit performance
+    runs-on: [self-hosted, macOS, ARM64, greppy-fskit-performance, ephemeral]
+    timeout-minutes: 45
+    env:
+      CODE_SIGN_IDENTITY: ${{ vars.MACOS_CODE_SIGN_IDENTITY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+      - name: Require an ephemeral preapproved FSKit runner
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(sw_vers -productVersion | cut -d. -f1)" -ge 15
+          test -n "$CODE_SIGN_IDENTITY"
+          security find-identity -v -p codesigning | grep -F "$CODE_SIGN_IDENTITY"
+          data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
+          mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
+          test ! -e "$data"
+          test ! -e "$mount"
+      - name: Build and install the exact signed FSKit provider
+        shell: bash
+        run: |
+          platform/macos/build-fskit-app.sh "$RUNNER_TEMP/fskit"
+          app="$RUNNER_TEMP/fskit/GreppyWorkspaceFS.app"
+          codesign --verify --deep --strict "$app"
+          sudo -n ditto "$app" /Applications/GreppyWorkspaceFS.app
+          pluginkit -a /Applications/GreppyWorkspaceFS.app
+          pluginkit -m -A -D -i ai.metricspace.greppy.workspacefs.extension | \
+            grep -F ai.metricspace.greppy.workspacefs.extension
+      - name: Build release harness and fixture
+        shell: bash
+        run: |
+          cargo build -p greppy-workspace-provider --example release_performance --release --locked
+          python3 tools/generate_portable_cow_fixture.py \
+            "$RUNNER_TEMP/repository" --files 300000 --modules 24
+      - name: Mount the real FSKit extension
+        shell: bash
+        run: |
+          resource="$RUNNER_TEMP/greppy-workspace-resource.img"
+          mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
+          mkfile 1m "$resource"
+          device="$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$resource" | awk 'NR == 1 { print $1 }')"
+          test -n "$device"
+          echo "$device" >"$RUNNER_TEMP/fskit-device"
+          mkdir -p "$mount"
+          mount -t greppy-cow "$device" "$mount" >"$RUNNER_TEMP/provider-macos.log" 2>&1
+          data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
+          for _ in $(seq 1 300); do
+            test -f "$data/provider.json" && mount | grep -F " on $mount " && exit 0
+            sleep 0.1
+          done
+          echo "FSKit provider did not become healthy" >&2
+          exit 1
+      - name: Run hard gate over the real mount
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
+          provider="/Applications/GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex/Contents/MacOS/GreppyWorkspaceFSExtension"
+          target/release/examples/release_performance \
+            --repository "$RUNNER_TEMP/repository" \
+            --data-root "$data" \
+            --probe-path files/000/000000.txt \
+            --output "$RUNNER_TEMP/greppy-cow-perf-macos.json" \
+            --phase-trace-dir "$RUNNER_TEMP/phases-macos" \
+            --source-commit "$GITHUB_SHA" \
+            --provider-binary "$provider" \
+            --native-baseline-root "$RUNNER_TEMP/native-baseline" \
+            --hardware "$(system_profiler SPHardwareDataType | tr '\n' ';')" \
+            --toolchain-case '{"name":"rust","cwd":"rust","argv":["rustc","main.rs","-o","/tmp/greppy-perf-rust"]}' \
+            --toolchain-case '{"name":"python","cwd":"python","argv":["python3","-B","test_sample.py"]}' \
+            --toolchain-case '{"name":"node","cwd":"node","argv":["npm","test","--silent"]}' \
+            --toolchain-case '{"name":"node-startup-diagnostic","cwd":"node","argv":["node","test.js"],"release_gate":false}' \
+            --enforce
+      - name: Cleanup FSKit mount
+        if: always()
+        shell: bash
+        run: |
+          mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
+          mount | grep -F " on $mount " >/dev/null && diskutil unmount force "$mount" || true
+          test -f "$RUNNER_TEMP/fskit-device" && \
+            hdiutil detach -force "$(cat "$RUNNER_TEMP/fskit-device")" || true
+      - name: Upload macOS evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: portable-cow-performance-set-macos-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/greppy-cow-perf-macos.json
+            ${{ runner.temp }}/provider-macos.log
+            ${{ runner.temp }}/phases-macos/*.jsonl
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 real WinFsp performance
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - name: Install pinned unchanged WinFsp runtime and SDK
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
+          $actual = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
+          if ($actual -ne '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a') {
+            throw "WinFsp installer checksum mismatch: $actual"
+          }
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', 'INSTALLLEVEL=1000')
+          if ($install.ExitCode -ne 0) { throw "WinFsp installation failed: $($install.ExitCode)" }
+      - name: Build provider, harness and fixture
+        shell: pwsh
+        run: |
+          cargo build -p greppy-workspace-provider --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'provider build failed' }
+          cargo build -p greppy-workspace-provider --example release_performance --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'harness build failed' }
+          python tools/generate_portable_cow_fixture.py "$env:RUNNER_TEMP\repository" --files 300000 --modules 24
+          if ($LASTEXITCODE -ne 0) { throw 'fixture generation failed' }
+      - name: Mount real WinFsp provider
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP 'data'
+          $mount = Join-Path $env:RUNNER_TEMP 'mount'
+          New-Item -ItemType Directory -Force $data, $mount | Out-Null
+          $provider = (Resolve-Path 'target/release/greppy-workspace-provider.exe').Path
+          $process = Start-Process $provider -PassThru `
+            -ArgumentList @('--data-root', $data, '--mount-root', $mount) `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\provider-windows.stdout.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\provider-windows.stderr.log"
+          $process.Id | Set-Content -Encoding ascii "$env:RUNNER_TEMP\provider-windows.pid"
+          for ($attempt = 0; $attempt -lt 300; $attempt++) {
+            if ((Test-Path "$data\provider.json") -and (Test-Path "$mount\.greppy-provider.json")) { exit 0 }
+            Start-Sleep -Milliseconds 100
+          }
+          throw 'WinFsp provider did not become healthy'
+      - name: Run hard gate over the real mount
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $rustOutput = Join-Path $env:RUNNER_TEMP 'greppy-perf-rust.exe'
+          $rust = @{name='rust';cwd='rust';argv=@('rustc','main.rs','-o',$rustOutput)} | ConvertTo-Json -Compress
+          $python = @{name='python';cwd='python';argv=@('python3','-B','test_sample.py')} | ConvertTo-Json -Compress
+          $node = @{name='node';cwd='node';argv=@('npm','test','--silent')} | ConvertTo-Json -Compress
+          $startup = @{name='node-startup-diagnostic';cwd='node';argv=@('node','test.js');release_gate=$false} | ConvertTo-Json -Compress
+          $hardware = Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json -Compress
+          $provider = (Resolve-Path 'target/release/greppy-workspace-provider.exe').Path
+          $harness = (Resolve-Path 'target/release/examples/release_performance.exe').Path
+          & $harness `
+            --repository "$env:RUNNER_TEMP\repository" `
+            --data-root "$env:RUNNER_TEMP\data" `
+            --probe-path 'files/000/000000.txt' `
+            --output "$env:RUNNER_TEMP\greppy-cow-perf-windows.json" `
+            --phase-trace-dir "$env:RUNNER_TEMP\phases-windows" `
+            --source-commit "$env:GITHUB_SHA" `
+            --provider-binary $provider `
+            --native-baseline-root "$env:RUNNER_TEMP\native-baseline" `
+            --hardware $hardware `
+            --toolchain-case $rust --toolchain-case $python `
+            --toolchain-case $node --toolchain-case $startup --enforce
+          if ($LASTEXITCODE -ne 0) { throw "performance gate failed: $LASTEXITCODE" }
+      - name: Cleanup provider
+        if: always()
+        shell: pwsh
+        run: |
+          $pidPath = Join-Path $env:RUNNER_TEMP 'provider-windows.pid'
+          if (Test-Path $pidPath) {
+            Stop-Process -Id ([int](Get-Content $pidPath)) -Force -ErrorAction SilentlyContinue
+          }
+      - name: Upload Windows evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: portable-cow-performance-set-windows-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/greppy-cow-perf-windows.json
+            ${{ runner.temp }}/provider-windows.*.log
+            ${{ runner.temp }}/phases-windows/*.jsonl
+          if-no-files-found: error
+
+  verify-set:
+    name: Exact-SHA three-platform performance set
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: portable-cow-performance-set-*-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence
+          merge-multiple: true
+      - name: Verify complete immutable evidence set
+        run: |
+          python3 tools/verify_portable_cow_performance.py \
+            --source-commit "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/portable-cow-performance-set.json" \
+            "$RUNNER_TEMP/evidence/greppy-cow-perf-linux.json" \
+            "$RUNNER_TEMP/evidence/greppy-cow-perf-macos.json" \
+            "$RUNNER_TEMP/evidence/greppy-cow-perf-windows.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: portable-cow-performance-complete-${{ github.sha }}
+          path: ${{ runner.temp }}/portable-cow-performance-set.json
+          if-no-files-found: error

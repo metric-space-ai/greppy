@@ -48,7 +48,11 @@ jobs:
         with:
           fetch-depth: 0
       - name: Test release artifact contract and verifiers
-        run: python3 -m unittest tools.test_release_artifacts -v
+        run: >-
+          python3 -m unittest
+          tools.test_release_artifacts
+          tools.test_portable_cow_performance
+          -v
       - name: Require green CI, CodeQL, security-audit and task-bank for this commit
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -59,7 +63,7 @@ jobs:
           # require the remaining mechanical gates on the exact release subject
           # as well - a tag must never outrun its checks. Agent benchmarks are
           # diagnostic inputs for subsequent releases, never release gates.
-          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml filesystem-cow.yml; do
+          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml filesystem-cow.yml portable-cow-platform-performance.yml; do
             ok="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --limit 100 \

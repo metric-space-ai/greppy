@@ -270,6 +270,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
 
         self.assertIn("cargo build --locked --release", workflow)
+        self.assertIn("tools.test_portable_cow_performance", workflow)
         windows_matrix = workflow.split("- name: windows-x86_64", 1)[1].split(
             "steps:", 1
         )[0]
@@ -295,7 +296,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
         self.assertNotIn("--workflow agent-benchmark.yml", workflow)
-        self.assertIn("task-bank-audit.yml filesystem-cow.yml", workflow)
+        self.assertIn(
+            "task-bank-audit.yml filesystem-cow.yml portable-cow-platform-performance.yml",
+            workflow,
+        )
         self.assertNotIn("greppy-agent-benchmark", workflow)
         self.assertIn("greppy-macos-arm64.pkg", workflow)
         self.assertIn("platform/macos/build-fskit-pkg.sh", workflow)
@@ -332,6 +336,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         portable_lifecycle = cow_workflow.split("portable-agent-contract:", 1)[1]
         self.assertIn("name: Portable agent lifecycle (${{ matrix.os }})", portable_lifecycle)
         self.assertIn("os: [ubuntu-latest, macos-15, windows-latest]", portable_lifecycle)
+        platform_performance = (
+            REPOSITORY_ROOT
+            / ".github/workflows/portable-cow-platform-performance.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("runs-on: [self-hosted, macOS, ARM64", platform_performance)
+        self.assertIn("name: Windows x86_64 real WinFsp performance", platform_performance)
+        self.assertIn("name: Exact-SHA three-platform performance set", platform_performance)
+        self.assertIn("verify_portable_cow_performance.py", platform_performance)
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         self.assertNotIn("agent benchmark, and the summary-quality gate", readme)
