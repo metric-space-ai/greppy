@@ -368,6 +368,13 @@ impl AgentWorkspace {
             arguments.extend(changed_paths.iter().map(String::as_str));
             git_with_index(&self.worktree, &self.private_index, &arguments)?;
         }
+        stage_hardlink_groups(
+            &self.core,
+            &self.handle,
+            &self.worktree,
+            &self.private_index,
+            &hardlink_groups,
+        )?;
         let final_tree = git_with_index(&self.worktree, &self.private_index, &["write-tree"])?;
         if final_tree == self.baseline_tree {
             return Ok(RunOutcome::Clean);
@@ -1408,6 +1415,48 @@ fn changed_paths(
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+fn stage_hardlink_groups(
+    core: &WorkspaceCore,
+    workspace: &WorkspaceHandle,
+    worktree: &Path,
+    index: &Path,
+    hardlink_groups: &[Vec<String>],
+) -> Result<(), WorkspaceError> {
+    for group in hardlink_groups {
+        let Some(canonical) = group.first() else {
+            return Err(WorkspaceError::Tampered {
+                path: worktree.to_path_buf(),
+                detail: "proposal contains an empty hardlink group".into(),
+            });
+        };
+        let metadata =
+            core.metadata(workspace, canonical)?
+                .ok_or_else(|| WorkspaceError::Tampered {
+                    path: worktree.join(canonical),
+                    detail: "hardlink group canonical path disappeared before staging".into(),
+                })?;
+        let mode = if metadata.mode & 0o111 != 0 {
+            "100755"
+        } else {
+            "100644"
+        };
+        let object = git_ok(
+            worktree,
+            &["hash-object", "-w", "--no-filters", "--", canonical],
+        )?;
+        for path in group {
+            validate_apply_path(path)?;
+            let cache_info = format!("{mode},{object},{path}");
+            git_with_index(
+                worktree,
+                index,
+                &["update-index", "--add", "--cacheinfo", &cache_info],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_affected_paths(
@@ -3547,6 +3596,16 @@ mod tests {
         assert!(!agent_scratch.exists());
 
         let proposal = recovery_core.proposal(&ref_name).unwrap();
+        assert_eq!(
+            git(
+                &repo,
+                &["rev-parse", &format!("{commit}:baseline-linked-a.txt")]
+            ),
+            git(
+                &repo,
+                &["rev-parse", &format!("{commit}:baseline-linked-b.txt")]
+            )
+        );
         assert_eq!(
             proposal.hardlink_groups,
             vec![
