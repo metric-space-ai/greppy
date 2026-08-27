@@ -141,12 +141,15 @@ each suspected product defect is reproduced and classified independently.
 
 ### Cross-platform performance evidence
 
-The manual `Portable CoW platform performance` workflow is the authoritative
-three-platform release gate. It builds the provider and measurement harness
-from the selected commit, generates the identical 300,000-file fixture, and
-runs through the real FUSE3, FSKit, or WinFsp mount. Linux and Windows use clean
-hosted runners. macOS uses an ephemeral Apple Silicon runner carrying the
-`greppy-fskit-performance` label, a configured
+The existing `Portable CoW` workflow becomes the authoritative
+three-platform release gate when manually dispatched with
+`full_platform_performance=true`. Because that workflow already exists on the
+default branch, it can execute the feature-branch RC before merge. It builds
+the provider and measurement harness from the selected commit, generates the
+identical 300,000-file fixture, and runs through the real FUSE3, FSKit, or
+WinFsp mount. Linux and Windows use clean hosted runners. macOS uses an
+ephemeral Apple Silicon runner carrying the `greppy-fskit-performance` label,
+a configured
 `MACOS_CODE_SIGN_IDENTITY`, and an OS/MDM approval for the Greppy FSKit bundle
 identity. The job refuses an existing data or mount root; this prevents warm
 state from a previous run from becoming release evidence.

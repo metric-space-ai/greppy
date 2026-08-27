@@ -63,7 +63,7 @@ jobs:
           # require the remaining mechanical gates on the exact release subject
           # as well - a tag must never outrun its checks. Agent benchmarks are
           # diagnostic inputs for subsequent releases, never release gates.
-          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml filesystem-cow.yml portable-cow-platform-performance.yml; do
+          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml filesystem-cow.yml; do
             ok="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --limit 100 \
@@ -78,6 +78,30 @@ jobs:
             fi
             echo "$wf: green for $GITHUB_SHA"
           done
+          cow_performance_ok=0
+          while read -r run_id; do
+            test -n "$run_id" || continue
+            jobs="$(gh run view "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json jobs \
+              --jq '[.jobs[] | select(.name == "Exact-SHA three-platform performance set" and .conclusion == "success")] | length')"
+            if [ "${jobs:-0}" -ge 1 ]; then
+              cow_performance_ok=1
+              echo "three-platform portable CoW performance: green in run $run_id"
+              break
+            fi
+          done < <(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --workflow filesystem-cow.yml \
+            --commit "$GITHUB_SHA" \
+            --status completed \
+            --json databaseId,conclusion \
+            --jq '.[] | select(.conclusion == "success") | .databaseId')
+          if [ "$cow_performance_ok" -ne 1 ]; then
+            echo "::error::no successful exact-SHA three-platform performance set exists for $GITHUB_SHA"
+            exit 1
+          fi
       - name: Reject reused or replaced release subjects
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
