@@ -405,40 +405,6 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
             .any(|name| name == "Contract-Case.txt"));
     }
 
-    let link_source = root.join("contract-link-source.txt");
-    let hard_link = root.join("contract-hard-link.txt");
-    fs::write(&link_source, b"shared").unwrap();
-    fs::hard_link(&link_source, &hard_link).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        assert_eq!(fs::metadata(&link_source).unwrap().nlink(), 2);
-        assert_eq!(
-            fs::metadata(&link_source).unwrap().ino(),
-            fs::metadata(&hard_link).unwrap().ino()
-        );
-    }
-    #[cfg(windows)]
-    assert_eq!(
-        windows_link_count(&File::open(&link_source).unwrap()).unwrap(),
-        2
-    );
-    fs::write(&hard_link, b"updated").unwrap();
-    assert_eq!(fs::read(&link_source).unwrap(), b"updated");
-    fs::remove_file(&link_source).unwrap();
-    assert_eq!(fs::read(&hard_link).unwrap(), b"updated");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        assert_eq!(fs::metadata(&hard_link).unwrap().nlink(), 1);
-    }
-    #[cfg(windows)]
-    assert_eq!(
-        windows_link_count(&File::open(&hard_link).unwrap()).unwrap(),
-        1
-    );
-    fs::remove_file(&hard_link).unwrap();
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -487,5 +453,79 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
             .is_err(),
             "a mounted symlink must not target the host namespace"
         );
+
+        let outside = std::env::temp_dir().join(format!(
+            "greppy-junction-escape-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel.txt");
+        fs::write(&sentinel, b"outside").unwrap();
+        let junction = root.join("contract-escape-junction");
+        let created = Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        if created.status.success() {
+            assert!(
+                fs::read(junction.join("sentinel.txt")).is_err(),
+                "a mounted junction must not expose a host directory"
+            );
+            assert!(
+                fs::write(junction.join("created-by-mount.txt"), b"escape").is_err(),
+                "a mounted junction must not write into a host directory"
+            );
+            let removed = Command::new("cmd")
+                .args(["/D", "/C", "rmdir"])
+                .arg(&junction)
+                .status()
+                .unwrap();
+            assert!(removed.success());
+        } else {
+            assert!(fs::symlink_metadata(&junction).is_err());
+        }
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+        assert!(!outside.join("created-by-mount.txt").exists());
+        fs::remove_dir_all(outside).unwrap();
     }
+
+    let link_source = root.join("contract-link-source.txt");
+    let hard_link = root.join("contract-hard-link.txt");
+    fs::write(&link_source, b"shared").unwrap();
+    fs::hard_link(&link_source, &hard_link).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(fs::metadata(&link_source).unwrap().nlink(), 2);
+        assert_eq!(
+            fs::metadata(&link_source).unwrap().ino(),
+            fs::metadata(&hard_link).unwrap().ino()
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        windows_link_count(&File::open(&link_source).unwrap()).unwrap(),
+        2
+    );
+    fs::write(&hard_link, b"updated").unwrap();
+    assert_eq!(fs::read(&link_source).unwrap(), b"updated");
+    fs::remove_file(&link_source).unwrap();
+    assert_eq!(fs::read(&hard_link).unwrap(), b"updated");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(fs::metadata(&hard_link).unwrap().nlink(), 1);
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        windows_link_count(&File::open(&hard_link).unwrap()).unwrap(),
+        1
+    );
+    fs::remove_file(&hard_link).unwrap();
 }
