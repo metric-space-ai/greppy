@@ -44,6 +44,10 @@ class WinFspForkVerifierTests(unittest.TestCase):
             "commit": verifier.EXPECTED_COMMIT,
             "tag_object": verifier.EXPECTED_TAG_OBJECT,
             "license": verifier.EXPECTED_LICENSE,
+            "submodules": [
+                {"path": path, **record}
+                for path, record in verifier.EXPECTED_SUBMODULES.items()
+            ],
             "patches": patch_records,
         }
         self.write_manifest()
@@ -61,6 +65,10 @@ class WinFspForkVerifierTests(unittest.TestCase):
         self.assertTrue(result["release_eligible_source"])
         self.assertEqual(result["commit"], verifier.EXPECTED_COMMIT)
         self.assertEqual(result["modified_files"], sorted(verifier.EXPECTED_FILES))
+        self.assertEqual(
+            {record["path"] for record in result["submodules"]},
+            set(verifier.EXPECTED_SUBMODULES),
+        )
 
     def test_rejects_changed_source_identity_or_license(self) -> None:
         for key, replacement in (
@@ -76,6 +84,16 @@ class WinFspForkVerifierTests(unittest.TestCase):
                     verifier.verify(self.root)
                 self.manifest[key] = original
         self.write_manifest()
+
+    def test_rejects_changed_or_missing_submodule_identity(self) -> None:
+        self.manifest["submodules"][0]["commit"] = "0" * 40
+        self.write_manifest()
+        with self.assertRaisesRegex(verifier.ForkError, "commit changed"):
+            verifier.verify(self.root)
+        self.manifest["submodules"] = []
+        self.write_manifest()
+        with self.assertRaisesRegex(verifier.ForkError, "required submodule"):
+            verifier.verify(self.root)
 
     def test_rejects_patch_tampering(self) -> None:
         self.patch_path.write_text(

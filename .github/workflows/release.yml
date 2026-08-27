@@ -339,6 +339,19 @@ jobs:
           $runtime = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.dll'
           Copy-Item -LiteralPath $runtime -Destination target\release\greppyworkspacefsp-x64.dll
 
+      - name: Create deterministic WinFsp corresponding-source archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python tools/package_winfsp_source.py create `
+            --source $env:GREPPY_WINFSP_FORK_ROOT `
+            --repository-root . `
+            --fork-root third_party/winfsp-greppy `
+            --output greppy-winfsp-source.tar.gz
+          if ($LASTEXITCODE -ne 0) { throw 'WinFsp corresponding-source creation failed' }
+          python tools/package_winfsp_source.py verify greppy-winfsp-source.tar.gz
+          if ($LASTEXITCODE -ne 0) { throw 'WinFsp corresponding-source verification failed' }
+
       - name: Install Linux package builders
         if: runner.os == 'Linux'
         shell: bash
@@ -622,6 +635,7 @@ jobs:
           Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
           Copy-Item tools/release_artifacts.py dist/release_artifacts.py
+          Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py dist/
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
           Copy-Item licenses dist/licenses -Recurse
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
@@ -746,6 +760,13 @@ jobs:
           if (($bytes -contains [byte]13) -or ($bytes[-1] -ne [byte]10)) {
             throw 'checksum sidecar must use a single LF-terminated portable line'
           }
+          $source = 'greppy-winfsp-source.tar.gz'
+          $sourceHash = (Get-FileHash -Algorithm SHA256 $source).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "$source.sha256",
+            "$sourceHash  $source`n",
+            [Text.Encoding]::ASCII
+          )
 
       - name: Attest release package provenance
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
@@ -780,6 +801,12 @@ jobs:
         with:
           subject-path: build-environment-${{ matrix.name }}.json
 
+      - name: Attest WinFsp corresponding source
+        if: runner.os == 'Windows'
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
+        with:
+          subject-path: greppy-winfsp-source.tar.gz
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -793,6 +820,8 @@ jobs:
             ${{ matrix.secondary_asset }}.spdx.json
             runtime-footprint-*.json
             build-environment-${{ matrix.name }}.json
+            greppy-winfsp-source.tar.gz
+            greppy-winfsp-source.tar.gz.sha256
 
   verify-packages:
     name: clean package (${{ matrix.name }})
@@ -955,11 +984,15 @@ jobs:
           $want = ($line -split '\s+')[0]
           $got = (Get-FileHash -Algorithm SHA256 "package/${{ matrix.asset }}").Hash.ToLowerInvariant()
           if ($want -ne $got) { throw "package checksum mismatch: $got != $want" }
+          $sourceLine = (Get-Content 'package/greppy-winfsp-source.tar.gz.sha256' -Raw).Trim()
+          $sourceWant = ($sourceLine -split '\s+')[0]
+          $sourceGot = (Get-FileHash -Algorithm SHA256 'package/greppy-winfsp-source.tar.gz').Hash.ToLowerInvariant()
+          if ($sourceWant -ne $sourceGot) { throw "source checksum mismatch: $sourceGot != $sourceWant" }
           Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
           if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
           if (-not (Test-Path "$PWD/unpack/greppy-workspace-provider.exe")) { throw 'missing portable workspace provider' }
           if ($env:GITHUB_REF -like 'refs/tags/*') {
-            foreach ($binary in @('greppy.exe', 'greppy-workspace-provider.exe')) {
+            foreach ($binary in @('greppy.exe', 'greppy-workspace-provider.exe', 'greppyworkspacefsp-x64.dll')) {
               $signature = Get-AuthenticodeSignature "$PWD/unpack/$binary"
               if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature for ${binary}: $($signature.Status)" }
             }
@@ -970,6 +1003,8 @@ jobs:
             --cargo-lock unpack/Cargo.lock `
             --target "${{ matrix.rust_host }}"
           if ($LASTEXITCODE -ne 0) { throw 'SPDX verification failed' }
+          python unpack/package_winfsp_source.py verify package/greppy-winfsp-source.tar.gz
+          if ($LASTEXITCODE -ne 0) { throw 'WinFsp corresponding-source verification failed' }
           & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
           # TODO(windows daemon stress): port bench/release_daemon_stress.sh
           # to PowerShell for this leg. Portable as-is: concurrency/queue

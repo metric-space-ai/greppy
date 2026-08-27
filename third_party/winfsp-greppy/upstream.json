@@ -5,6 +5,13 @@
   "commit": "ddca7bd5481857a65ba552f643b8776fd070836f",
   "tag_object": "bcc52225ec7e6a9f5c889b5cdb8051adf41c4b91",
   "license": "GPL-3.0-only WITH WinFsp-FLOSS-exception",
+  "submodules": [
+    {
+      "path": "ext/test",
+      "repository": "https://github.com/billziss-gh/secfs.test.git",
+      "commit": "6ac65cda46abc2be39c7b137debf9521052edbaf"
+    }
+  ],
   "patches": [
     {
       "path": "patches/0001-greppy-hardlink-transport.patch",

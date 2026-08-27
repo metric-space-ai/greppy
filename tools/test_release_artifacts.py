@@ -305,7 +305,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 25)
+        self.assertEqual(len(names), 27)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
@@ -389,6 +389,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("winfsp-2.1.25156.msi", workflow)
         self.assertIn("tools/build_winfsp_fork.ps1", workflow)
         self.assertIn("greppyworkspacefsp-x64.dll", workflow)
+        self.assertIn("tools/package_winfsp_source.py create", workflow)
+        self.assertIn("greppy-winfsp-source.tar.gz", workflow)
         self.assertIn(
             "signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy-workspace-provider.exe",
             workflow,

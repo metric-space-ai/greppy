@@ -17,6 +17,12 @@ EXPECTED_TAG = "v2.1"
 EXPECTED_COMMIT = "ddca7bd5481857a65ba552f643b8776fd070836f"
 EXPECTED_TAG_OBJECT = "bcc52225ec7e6a9f5c889b5cdb8051adf41c4b91"
 EXPECTED_LICENSE = "GPL-3.0-only WITH WinFsp-FLOSS-exception"
+EXPECTED_SUBMODULES = {
+    "ext/test": {
+        "repository": "https://github.com/billziss-gh/secfs.test.git",
+        "commit": "6ac65cda46abc2be39c7b137debf9521052edbaf",
+    }
+}
 EXPECTED_PATCH_FILES = {
     "patches/0001-greppy-hardlink-transport.patch": {
         "inc/winfsp/fsctl.h",
@@ -93,6 +99,27 @@ def verify(root: Path) -> dict[str, Any]:
     require(manifest.get("commit") == EXPECTED_COMMIT, "upstream commit changed")
     require(manifest.get("tag_object") == EXPECTED_TAG_OBJECT, "upstream tag object changed")
     require(manifest.get("license") == EXPECTED_LICENSE, "license declaration changed")
+    submodules = manifest.get("submodules")
+    require(isinstance(submodules, list), "submodules must be an array")
+    verified_submodules: list[dict[str, str]] = []
+    seen_submodules: set[str] = set()
+    for index, record in enumerate(submodules):
+        require(isinstance(record, dict), f"submodules[{index}] must be an object")
+        relative = safe_relative_path(record.get("path"), f"submodules[{index}].path")
+        require(relative in EXPECTED_SUBMODULES, f"unexpected submodule path: {relative}")
+        require(relative not in seen_submodules, f"duplicate submodule path: {relative}")
+        seen_submodules.add(relative)
+        expected = EXPECTED_SUBMODULES[relative]
+        require(record.get("repository") == expected["repository"], f"{relative}: repository changed")
+        require(record.get("commit") == expected["commit"], f"{relative}: commit changed")
+        verified_submodules.append(
+            {
+                "path": relative,
+                "repository": expected["repository"],
+                "commit": expected["commit"],
+            }
+        )
+    require(seen_submodules == set(EXPECTED_SUBMODULES), "required submodule is absent")
     patches = manifest.get("patches")
     require(
         isinstance(patches, list) and len(patches) == len(EXPECTED_PATCH_FILES),
@@ -150,6 +177,7 @@ def verify(root: Path) -> dict[str, Any]:
         "commit": EXPECTED_COMMIT,
         "tag_object": EXPECTED_TAG_OBJECT,
         "license": EXPECTED_LICENSE,
+        "submodules": verified_submodules,
         "patches": verified_patches,
         "modified_files": sorted(actual_files),
     }

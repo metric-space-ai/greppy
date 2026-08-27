@@ -33,6 +33,25 @@ if ($actualCommit -ne $manifest.commit) {
     throw "WinFsp source commit mismatch: $actualCommit"
 }
 
+foreach ($submodule in $manifest.submodules) {
+    $indexRecord = (& git -C $Destination ls-files --stage -- $submodule.path).Trim()
+    $expectedRecord = "160000 $($submodule.commit) 0`t$($submodule.path)"
+    if ($indexRecord -ne $expectedRecord) {
+        throw "WinFsp submodule gitlink mismatch for $($submodule.path): $indexRecord"
+    }
+    & git -C $Destination -c protocol.version=2 submodule update --init --depth 1 -- $submodule.path
+    if ($LASTEXITCODE -ne 0) { throw "cannot initialize WinFsp submodule: $($submodule.path)" }
+    $submoduleRoot = Join-Path $Destination $submodule.path
+    $actualSubmoduleCommit = (& git -C $submoduleRoot rev-parse HEAD).Trim()
+    if ($actualSubmoduleCommit -ne $submodule.commit) {
+        throw "WinFsp submodule commit mismatch for $($submodule.path): $actualSubmoduleCommit"
+    }
+    $actualSubmoduleRepository = (& git -C $submoduleRoot remote get-url origin).Trim()
+    if ($actualSubmoduleRepository -ne $submodule.repository) {
+        throw "WinFsp submodule repository mismatch for $($submodule.path): $actualSubmoduleRepository"
+    }
+}
+
 foreach ($patch in $manifest.patches) {
     $patchPath = Join-Path $forkRoot $patch.path
     # build.version.props is CRLF upstream while repository patch artifacts are
@@ -50,7 +69,9 @@ $difference = @(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject
 if ($difference.Count -ne 0) {
     throw "patched WinFsp file set differs from manifest: $($difference | Out-String)"
 }
-& git -C $Destination diff --check
+# The upstream MSBuild property file is CRLF by contract. Treat its terminal
+# CR as an end-of-line marker while still rejecting real trailing whitespace.
+& git -C $Destination -c core.whitespace=cr-at-eol diff --check
 if ($LASTEXITCODE -ne 0) { throw 'patched WinFsp source fails git diff --check' }
 
 $wdkVersion = '10.0.26100.6584'

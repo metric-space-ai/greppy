@@ -36,3 +36,10 @@ hashes, the WinFsp copyright notice, SBOM entries, signatures and provenance.
 Greppy remains a separate Apache-2.0 FLOSS work linked through WinFsp's FLOSS
 exception; the exception for distributing an unmodified upstream installer
 does not remove the GPL obligations for this modified driver.
+
+`tools/package_winfsp_source.py` therefore archives every tracked upstream
+source file, the exact patched content, the pinned `ext/test` submodule, both
+patches and the Greppy build/verification tooling into a deterministic,
+self-verifying `greppy-winfsp-source.tar.gz`. Release publication is
+fail-closed when the upstream commit, submodule, changed-file set or any member
+digest differs.

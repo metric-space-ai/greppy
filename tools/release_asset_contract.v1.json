@@ -20,6 +20,8 @@
     {"name": "greppy-windows-x86_64.zip.sha256", "role": "checksum-sidecar"},
     {"name": "greppy-windows-x86_64.zip.spdx.json", "role": "sbom"},
     {"name": "build-environment-windows-x86_64.json", "role": "build-environment"},
+    {"name": "greppy-winfsp-source.tar.gz", "role": "corresponding-source"},
+    {"name": "greppy-winfsp-source.tar.gz.sha256", "role": "checksum-sidecar"},
     {"name": "model-redistribution-report.json", "role": "model-provenance"},
     {"name": "greppy-summary-quality.tar.gz", "role": "summary-quality-evidence"},
     {"name": "greppy-summary-quality.tar.gz.sha256", "role": "checksum-sidecar"},

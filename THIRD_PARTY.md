@@ -101,19 +101,31 @@ SBOM, model notices, checksums, signatures, or build provenance are missing.
   portable workspace provider. WinFsp contains no Greppy namespace, Chunk-CoW,
   Git, proposal, or policy logic.
 - Upstream: [`winfsp/winfsp`](https://github.com/winfsp/winfsp), release `v2.1`,
-  source commit `fde790d8ea41283606d1c56b557608a17e455f59`.
-- Distributed artifact: the unchanged official
-  `winfsp-2.1.25156.msi`, SHA-256
-  `073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`.
+  source commit `ddca7bd5481857a65ba552f643b8776fd070836f` and tag object
+  `bcc52225ec7e6a9f5c889b5cdb8051adf41c4b91`.
+- Distributed artifact: Greppy's minimal fork under the private product and
+  service identity `GreppyWorkspaceFsp`. Patch 1 adds only the required
+  hardlink transport; patch 2 assigns private file names and device-class
+  GUIDs. Exact patch hashes and modified files are pinned in
+  `third_party/winfsp-greppy/upstream.json`.
 - License: GPL-3.0 with WinFsp's FLOSS exception. Greppy is Apache-2.0 FLOSS;
-  the exception permits linking to the platform DLL and redistribution of the
-  unmodified official installer. Greppy does not use or redistribute the
-  separately GPL-3.0-licensed `winfsp-rs` crates.
+  the exception permits linking to the platform DLL. Because the driver and
+  DLL are modified, the release also ships `greppy-winfsp-source.tar.gz` with
+  the complete patched upstream source, build/verification scripts, exact
+  patches, manifest, checksums and provenance. Greppy does not use or
+  redistribute the separately GPL-3.0-licensed `winfsp-rs` crates.
 
 Required notice: WinFsp - Windows File System Proxy, Copyright (C) Bill
 Zissimopoulos. Source: <https://github.com/winfsp/winfsp>. The complete pinned
 license and FLOSS exception are shipped in
 [`licenses/WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt`](licenses/WINFSP-GPL-3.0-WITH-FLOSS-EXCEPTION.txt).
+
+The source archive also binds WinFsp's test-only `ext/test` submodule
+[`billziss-gh/secfs.test`](https://github.com/billziss-gh/secfs.test) at commit
+`6ac65cda46abc2be39c7b137debf9521052edbaf`. Its component-specific license
+files and public-domain porting notice are preserved inside the corresponding-
+source archive; none of those test programs is installed as a Greppy runtime
+component.
 
 The Windows provider's small C ABI bridge is original Greppy Apache-2.0 source;
 all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
