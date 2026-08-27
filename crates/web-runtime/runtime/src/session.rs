@@ -25,8 +25,13 @@ pub struct Session {
     pub limits: SessionLimits,
     pub page_id: Option<String>,
     pub pages: u32,
+    pub contexts: u32,
+    pub requests: u64,
     pub network_bytes: u64,
     pub artifact_bytes: u64,
+    pub download_bytes: u64,
+    pub console_bytes: u64,
+    pub peak_rss_bytes: u64,
     pub started: Instant,
 }
 
@@ -42,8 +47,13 @@ impl Session {
             limits: SessionLimits::for_profile(profile.as_str()),
             page_id: None,
             pages: 0,
+            contexts: 0,
+            requests: 0,
             network_bytes: 0,
             artifact_bytes: 0,
+            download_bytes: 0,
+            console_bytes: 0,
+            peak_rss_bytes: 0,
             started: Instant::now(),
         }
     }

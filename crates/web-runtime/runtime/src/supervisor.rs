@@ -197,6 +197,15 @@ pub(crate) fn route_until_script_complete(
     content: &mut WorkerProcess,
     timeout: Duration,
 ) -> io::Result<()> {
+    route_until_script_complete_gated(controller, content, timeout, |_, _| Ok(()))
+}
+
+pub(crate) fn route_until_script_complete_gated(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    timeout: Duration,
+    mut before_call: impl FnMut(&str, &serde_json::Value) -> Result<(), String>,
+) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -213,6 +222,9 @@ pub(crate) fn route_until_script_complete(
                 params,
                 ..
             }) => {
+                if let Err(message) = before_call(&method, &params) {
+                    return Err(io::Error::other(format!("resource_limit: {message}")));
+                }
                 content.send(&Message::engine_call(request_id, method, params))?;
             }
             Incoming::Content(Message::EngineResult {
@@ -436,6 +448,10 @@ impl WorkerProcess {
                 format!("{:?} worker protocol reader stopped", self.worker),
             )),
         }
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub(crate) fn is_running(&mut self) -> bool {

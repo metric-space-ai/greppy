@@ -2741,6 +2741,182 @@ fn max_pages_limit_is_enforced_by_supervisor() {
 }
 
 #[test]
+fn max_contexts_limit_is_enforced_by_supervisor() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-maxctx-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxctx", |command| {
+        command.env("GREPPY_WEB_MAX_CONTEXTS", "0");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxctx",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_maxctx",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "text",
+            "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nawait browser.newContext();\nawait browser.close();\n",
+        }),
+    );
+    run.deadline_ms = 30_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(40)).expect("run");
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        ran.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("context limit"),
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn max_requests_limit_is_enforced_on_read() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-maxreq-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_maxreq", |command| {
+        command.env("GREPPY_WEB_MAX_REQUESTS", "0");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxreq",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>limit</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_maxreq",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("request limit"),
+        "{read:?}"
+    );
+}
+
+#[test]
+fn content_rss_limit_is_enforced_by_supervisor() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-rss-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_rss", |command| {
+        command.env("GREPPY_WEB_CONTENT_RSS_BYTES", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_rss",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>rss</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_rss",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error.as_ref().unwrap().message.contains("rss"),
+        "{read:?}"
+    );
+}
+
+#[test]
+fn web_read_metrics_include_network_and_rss() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-metrics-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_metrics", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_metrics",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>metrics</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_metrics",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(20),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    assert!(
+        read.metrics.network_bytes >= 4096,
+        "expected accounted navigation bytes, got {:?}",
+        read.metrics
+    );
+    assert!(
+        read.metrics.peak_rss_bytes > 0,
+        "expected sampled content rss, got {:?}",
+        read.metrics
+    );
+}
+
+#[test]
 fn idle_sessions_are_reaped() {
     let socket = std::env::temp_dir().join(format!("greppy-web-reap-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);

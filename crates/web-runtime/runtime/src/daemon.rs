@@ -463,14 +463,42 @@ impl Daemon {
             return engine_error(request, error, 34);
         }
         let started = Instant::now();
-        let outcome = run_script_on_workers(
-            &mut self.controller,
-            &mut self.content,
-            &specifier,
-            source,
-            self.fixture_url.clone(),
-            Duration::from_millis(request.deadline_ms.max(1_000)),
-        );
+        let content_pid = self.content.pid();
+        let controller_pid = self.controller.pid();
+        let outcome = {
+            let controller = &mut self.controller;
+            let content = &mut self.content;
+            let sessions = &mut self.sessions;
+            let session_key = session_id.clone();
+            if let Err(error) = controller.send(&crate::protocol::Message::run_script(
+                specifier.clone(),
+                source,
+                self.fixture_url.clone(),
+            )) {
+                Err(error)
+            } else {
+                crate::supervisor::route_until_script_complete_gated(
+                    controller,
+                    content,
+                    Duration::from_millis(request.deadline_ms.max(1_000)),
+                    |method, params| {
+                        gate_session_engine(
+                            sessions,
+                            &session_key,
+                            content_pid,
+                            controller_pid,
+                            method,
+                            params,
+                        )
+                    },
+                )
+            }
+        };
+        let (network_bytes, peak_rss) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.network_bytes, session.peak_rss_bytes))
+            .unwrap_or((0, 0));
         self.finish_session(&session_id);
         match outcome {
             Ok(()) => {
@@ -479,12 +507,25 @@ impl Daemon {
                     serde_json::json!({ "session_id": session_id, "completed": true }),
                 );
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
+                response.metrics.network_bytes = network_bytes;
+                response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
                 response
             }
             Err(error) => {
+                let message = error.to_string();
+                if let Some(limit) = message.strip_prefix("resource_limit: ") {
+                    let mut response = limit_error(request, limit);
+                    if let Some(error) = response.error.as_mut() {
+                        error.session_id = Some(session_id);
+                    }
+                    response.metrics.wall_ms = started.elapsed().as_millis() as u64;
+                    response.metrics.network_bytes = network_bytes;
+                    response.metrics.peak_rss_bytes = peak_rss;
+                    return response;
+                }
                 let mut object = ErrorObject::new(
                     "controller_exception",
-                    error.to_string(),
+                    message,
                     request.request_id.clone(),
                     33,
                     "inspect the controller script and retry",
@@ -588,15 +629,17 @@ impl Daemon {
             Ok((session_id, page)) => {
                 match self.navigate_and_extract(&session_id, &page, url, request) {
                     Ok(source) => {
-                        self.finish_session(&session_id);
-                        Response::ok(
+                        let mut response = Response::ok(
                             request,
                             json!({
                                 "session_id": session_id,
                                 "source": source,
                                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
                             }),
-                        )
+                        );
+                        self.attach_session_metrics(&session_id, &mut response);
+                        self.finish_session(&session_id);
+                        response
                     }
                     Err(response) => {
                         self.finish_session(&session_id);
@@ -782,10 +825,19 @@ impl Daemon {
         if !self.sessions.contains_key(&session_id) {
             return Err(missing_session(request, &session_id));
         }
+        let content_rss = sample_rss_bytes(self.content.pid());
+        let controller_rss = sample_rss_bytes(self.controller.pid());
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
+            session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
             if let Err(message) = session.begin_operation(&request.request_id) {
                 Some(("engine", message))
             } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
+                let _ = session.transition(SessionState::Failed);
+                Some(("limit", message))
+            } else if let Err(message) = session.limits.check_content_rss(content_rss) {
+                let _ = session.transition(SessionState::Failed);
+                Some(("limit", message))
+            } else if let Err(message) = session.limits.check_controller_memory(controller_rss) {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else {
@@ -880,10 +932,17 @@ impl Daemon {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if let Err(message) = session
                 .limits
+                .check_requests(session.requests.saturating_add(1))
+            {
+                return Err(limit_error(request, message));
+            }
+            if let Err(message) = session
+                .limits
                 .check_network_bytes(session.network_bytes, 4096)
             {
                 return Err(limit_error(request, message));
             }
+            session.requests = session.requests.saturating_add(1);
             session.network_bytes = session.network_bytes.saturating_add(4096);
         }
         self.engine_call("page.goto", json!({ "page": page, "url": url }))
@@ -1348,20 +1407,83 @@ fn redirect_chain(
     chain
 }
 
-fn run_script_on_workers(
-    controller: &mut WorkerProcess,
-    content: &mut WorkerProcess,
-    specifier: &str,
-    source: String,
-    fixture_url: String,
-    timeout: Duration,
-) -> io::Result<()> {
-    controller.send(&Message::run_script(
-        specifier.to_owned(),
-        source,
-        fixture_url,
-    ))?;
-    crate::supervisor::route_until_script_complete(controller, content, timeout)
+fn sample_rss_bytes(pid: u32) -> u64 {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "rss="])
+        .output();
+    let Ok(output) = output else {
+        return 0;
+    };
+    let kb = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    kb.saturating_mul(1024)
+}
+
+fn gate_session_engine(
+    sessions: &mut HashMap<String, Session>,
+    session_id: &str,
+    content_pid: u32,
+    controller_pid: u32,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(session) = sessions.get_mut(session_id) else {
+        return Err("session was closed".to_owned());
+    };
+    session.limits.check_wall_time(session.started.elapsed())?;
+    let content_rss = sample_rss_bytes(content_pid);
+    session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
+    session.limits.check_content_rss(content_rss)?;
+    session
+        .limits
+        .check_controller_memory(sample_rss_bytes(controller_pid))?;
+    match method {
+        "browser.newContext" => {
+            session
+                .limits
+                .check_contexts(session.contexts.saturating_add(1))?;
+            session.contexts = session.contexts.saturating_add(1);
+        }
+        "context.newPage" | "session.ensurePage" => {
+            session
+                .limits
+                .check_pages(session.pages.saturating_add(1))?;
+            session.pages = session.pages.saturating_add(1);
+        }
+        "page.goto" | "page.reload" | "page.goBack" | "page.goForward" | "page.frameGoto" => {
+            session
+                .limits
+                .check_requests(session.requests.saturating_add(1))?;
+            session
+                .limits
+                .check_network_bytes(session.network_bytes, 4096)?;
+            session.requests = session.requests.saturating_add(1);
+            session.network_bytes = session.network_bytes.saturating_add(4096);
+        }
+        "page.saveDownload" => {
+            let extra = params
+                .get("byteLength")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1);
+            session
+                .limits
+                .check_download_bytes(session.download_bytes, extra)?;
+            session.download_bytes = session.download_bytes.saturating_add(extra);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl Daemon {
+    fn attach_session_metrics(&self, session_id: &str, response: &mut Response) {
+        if let Some(session) = self.sessions.get(session_id) {
+            response.metrics.network_bytes = session.network_bytes;
+            response.metrics.peak_rss_bytes = session.peak_rss_bytes;
+        }
+    }
 }
 
 fn random_token() -> io::Result<String> {

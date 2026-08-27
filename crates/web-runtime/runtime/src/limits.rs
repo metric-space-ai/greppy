@@ -38,6 +38,36 @@ impl SessionLimits {
                 limits.max_pages = value;
             }
         }
+        if let Ok(contexts) = std::env::var("GREPPY_WEB_MAX_CONTEXTS") {
+            if let Ok(value) = contexts.parse::<u32>() {
+                limits.max_contexts = value;
+            }
+        }
+        if let Ok(requests) = std::env::var("GREPPY_WEB_MAX_REQUESTS") {
+            if let Ok(value) = requests.parse::<u64>() {
+                limits.max_requests = value;
+            }
+        }
+        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_CONSOLE_BYTES") {
+            if let Ok(value) = bytes.parse::<u64>() {
+                limits.max_console_bytes = value;
+            }
+        }
+        if let Ok(bytes) = std::env::var("GREPPY_WEB_MAX_DOWNLOAD_BYTES") {
+            if let Ok(value) = bytes.parse::<u64>() {
+                limits.max_download_bytes = value;
+            }
+        }
+        if let Ok(bytes) = std::env::var("GREPPY_WEB_CONTENT_RSS_BYTES") {
+            if let Ok(value) = bytes.parse::<u64>() {
+                limits.content_rss_bytes = value;
+            }
+        }
+        if let Ok(bytes) = std::env::var("GREPPY_WEB_CONTROLLER_MEMORY_BYTES") {
+            if let Ok(value) = bytes.parse::<u64>() {
+                limits.controller_heap_bytes = value;
+            }
+        }
         limits
     }
 
@@ -86,6 +116,82 @@ impl SessionLimits {
             Ok(())
         }
     }
+
+    pub fn check_contexts(&self, contexts: u32) -> Result<(), String> {
+        if contexts > self.max_contexts {
+            Err(format!(
+                "context limit exceeded ({contexts} > {})",
+                self.max_contexts
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_requests(&self, requests: u64) -> Result<(), String> {
+        if requests > self.max_requests {
+            Err(format!(
+                "request limit exceeded ({requests} > {})",
+                self.max_requests
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_download_bytes(&self, used: u64, additional: u64) -> Result<(), String> {
+        let next = used.saturating_add(additional);
+        if next > self.max_download_bytes {
+            Err(format!(
+                "download limit exceeded ({next} > {})",
+                self.max_download_bytes
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_console_bytes(&self, used: u64, additional: u64) -> Result<(), String> {
+        let next = used.saturating_add(additional);
+        if next > self.max_console_bytes {
+            Err(format!(
+                "console limit exceeded ({next} > {})",
+                self.max_console_bytes
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_content_rss(&self, rss_bytes: u64) -> Result<(), String> {
+        if rss_bytes > self.content_rss_bytes {
+            Err(format!(
+                "content rss exceeded ({rss_bytes} > {})",
+                self.content_rss_bytes
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_controller_memory(&self, bytes: u64) -> Result<(), String> {
+        if bytes > self.controller_heap_bytes {
+            Err(format!(
+                "controller memory exceeded ({bytes} > {})",
+                self.controller_heap_bytes
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_cpu_time(&self, used: Duration, limit: Duration, label: &str) -> Result<(), String> {
+        if used > limit {
+            Err(format!("{label} cpu time exceeded ({used:?} > {limit:?})"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Default for SessionLimits {
@@ -129,5 +235,18 @@ mod tests {
         };
         assert!(limits.check_artifact_bytes(8, 3).is_err());
         assert!(limits.check_artifact_bytes(8, 2).is_ok());
+    }
+
+    #[test]
+    fn context_and_request_limits_reject_overflow() {
+        let limits = SessionLimits {
+            max_contexts: 1,
+            max_requests: 2,
+            ..SessionLimits::default()
+        };
+        assert!(limits.check_contexts(1).is_ok());
+        assert!(limits.check_contexts(2).is_err());
+        assert!(limits.check_requests(2).is_ok());
+        assert!(limits.check_requests(3).is_err());
     }
 }
