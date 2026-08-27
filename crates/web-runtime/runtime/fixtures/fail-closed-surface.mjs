@@ -33,6 +33,7 @@ await expectUnsupported("Keyboard.delay", () => page.keyboard.delay());
 await expectUnsupported("Keyboard.type delay", () => page.keyboard.type("x", { delay: 5 }));
 await expectUnsupported("Keyboard.press delay", () => page.keyboard.press("a", { delay: 5 }));
 await expectUnsupported("Mouse.button", () => page.mouse.button());
+await expectUnsupported("Mouse.click button", () => page.mouse.click(1, 1, { button: "right" }));
 await expectUnsupported("Coverage.reportAnonymousScripts", () => page.coverage.reportAnonymousScripts());
 await expectUnsupported("WebStorage.clear", () => page.localStorage.clear());
 await expectUnsupported("WebStorage.getItem", () => page.sessionStorage.getItem("x"));

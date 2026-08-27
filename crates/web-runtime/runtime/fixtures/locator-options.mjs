@@ -58,6 +58,9 @@ if (!(await page.waitForFunction(() => true, undefined, { timeout: 2_000 }))) {
 }
 await expectUnsupported("waitForURL regex", () => page.waitForURL(/nope/, { timeout: 100 }));
 await expectUnsupported("keyboard type delay", () => page.keyboard.type("x", { delay: 5 }));
+await page.hover("button", { timeout: 5_000 });
+await expectUnsupported("page hover force", () => page.hover("button", { force: true }));
+await expectUnsupported("mouse click button", () => page.mouse.click(1, 1, { button: "right" }));
 await expectUnsupported("filter hasText regex", () => page.locator("p").filter({ hasText: /Hel/ }));
 await expectUnsupported("elementHandle", () => page.locator("button").elementHandle());
 page.setDefaultTimeout(2_000);

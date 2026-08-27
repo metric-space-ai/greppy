@@ -1530,7 +1530,7 @@ impl ContentEngine {
                     "(function(index, want) {{ var frame = document.querySelectorAll('iframe')[index]; if (!frame) return false; try {{ var loc = String(frame.contentWindow.location.href || ''); var doc = frame.contentDocument; return loc.indexOf(want) !== -1 && doc && (doc.readyState === 'complete' || doc.readyState === 'interactive'); }} catch (e) {{ return false; }} }})({index}, {})",
                     serde_json::to_string(&url).map_err(io::Error::other)?
                 );
-                let deadline = Instant::now() + ACTION_TIMEOUT;
+                let deadline = Instant::now() + call_timeout(&params);
                 loop {
                     if self.parent_dead() {
                         return Err(Self::parent_gone());

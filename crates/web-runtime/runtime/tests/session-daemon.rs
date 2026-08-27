@@ -3564,3 +3564,83 @@ fn wall_time_limit_is_enforced_by_supervisor() {
         "{read:?}"
     );
 }
+
+#[test]
+fn install_refuses_incomplete_sha256sums_and_leaves_dest_unmutated() {
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("greppy-web-dist-sumsrc-{pid}"));
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-sumdst-{pid}"));
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
+    assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_eq!(code, 0, "first install: stdout={stdout} stderr={stderr}");
+    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let sums = std::fs::read_to_string(src.join("SHA256SUMS")).unwrap();
+    let trimmed: String = sums
+        .lines()
+        .filter(|line| !line.contains("web-content-worker"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(src.join("SHA256SUMS"), trimmed + "\n").unwrap();
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
+    assert_ne!(
+        code, 0,
+        "incomplete SHA256SUMS should fail: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("SHA256SUMS") || stdout.contains("SHA256SUMS"),
+        "expected SHA256SUMS completeness failure, stdout={stdout} stderr={stderr}"
+    );
+    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_eq!(after, original, "incomplete sums install mutated dest");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn controller_memory_limit_is_enforced_by_supervisor() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-ctlmem-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_ctlmem", |command| {
+        command.env("GREPPY_WEB_CONTROLLER_MEMORY_BYTES", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_ctlmem",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>ctlmem</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_ctlmem",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+    assert!(
+        read.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("controller memory"),
+        "{read:?}"
+    );
+}

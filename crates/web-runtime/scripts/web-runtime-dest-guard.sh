@@ -537,6 +537,11 @@ web_runtime_verify_sha256sums() {
   if [ ! -d "$vs_root/bin" ]; then
     web_runtime_die "missing bin directory for SHA256SUMS verify"
   fi
+  vs_listed=$(awk '{print $NF}' "$vs_root/SHA256SUMS" | LC_ALL=C sort)
+  vs_expected=$(printf '%s\n' web-content-worker web-controller-worker web-runtime-supervisor)
+  if [ "$vs_listed" != "$vs_expected" ]; then
+    web_runtime_die "SHA256SUMS must list exactly the three runtime images"
+  fi
   (
     CDPATH= cd -- "$vs_root/bin" || exit 1
     if command -v shasum >/dev/null; then

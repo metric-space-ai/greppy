@@ -490,15 +490,19 @@ class Locator {
     return result.html;
   }
 
-  async focus() {
+  async focus(options) {
+    const timeout = actionTimeout(this, options, "Locator.focus");
+    await this.waitFor({ timeout });
     await engineCall("locator.focus", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
-  async blur() {
+  async blur(options) {
+    const timeout = actionTimeout(this, options, "Locator.blur");
+    await this.waitFor({ timeout });
     await engineCall("locator.blur", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
     });
   }
 
@@ -898,7 +902,8 @@ class FrameLocator {
     });
   }
 
-  getByTestId(name) {
+  getByTestId(name, options) {
+    refuseLocatorOptions("FrameLocator.getByTestId", options, []);
     return new Locator(this._page, {
       type: "testid",
       name: String(name),
@@ -1029,8 +1034,8 @@ class Frame {
     return this.locator(selector).fill(value, options);
   }
 
-  async type(selector, text) {
-    return this.locator(selector).type(text);
+  async type(selector, text, options) {
+    return this.locator(selector).type(text, options);
   }
 
   async innerText(selector) {
@@ -1065,7 +1070,7 @@ class Frame {
       await this._page._dispatchFrames();
       return;
     }
-    return this._page.setContent(html);
+    return this._page.setContent(html, options);
   }
 
   async waitForSelector(selector, options) {
@@ -1125,12 +1130,12 @@ class Frame {
     return this._page.addStyleTag(options || {});
   }
 
-  hover(selector) {
-    return this.locator(selector).hover();
+  hover(selector, options) {
+    return this.locator(selector).hover(options);
   }
 
-  check(selector) {
-    return this.locator(selector).check();
+  check(selector, options) {
+    return this.locator(selector).check(options);
   }
 
   isVisible(selector) {
@@ -1221,16 +1226,16 @@ class Frame {
     return this.locator(selector).isHidden();
   }
 
-  press(selector, key) {
-    return this.locator(selector).press(key);
+  press(selector, key, options) {
+    return this.locator(selector).press(key, options);
   }
 
-  selectOption(selector, value) {
-    return this.locator(selector).selectOption(value);
+  selectOption(selector, value, options) {
+    return this.locator(selector).selectOption(value, options);
   }
 
-  uncheck(selector) {
-    return this.locator(selector).uncheck();
+  uncheck(selector, options) {
+    return this.locator(selector).uncheck(options);
   }
 
   setChecked(selector, checked) {
@@ -1358,7 +1363,8 @@ class Page {
       "Touchscreen",
     );
     this.mouse = withUnsupported({
-      click: async (x, y) => {
+      click: async (x, y, options) => {
+        refuseLocatorOptions("Mouse.click", options, []);
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
         await engineCall("page.mouse.click", {
@@ -1367,7 +1373,8 @@ class Page {
           y: this._mouseY,
         });
       },
-      move: async (x, y) => {
+      move: async (x, y, options) => {
+        refuseLocatorOptions("Mouse.move", options, []);
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
         await engineCall("page.mouse.move", {
@@ -1376,21 +1383,24 @@ class Page {
           y: this._mouseY,
         });
       },
-      down: async () => {
+      down: async (options) => {
+        refuseLocatorOptions("Mouse.down", options, []);
         await engineCall("page.mouse.down", {
           page: this._id,
           x: this._mouseX,
           y: this._mouseY,
         });
       },
-      up: async () => {
+      up: async (options) => {
+        refuseLocatorOptions("Mouse.up", options, []);
         await engineCall("page.mouse.up", {
           page: this._id,
           x: this._mouseX,
           y: this._mouseY,
         });
       },
-      wheel: async (deltaX, deltaY) => {
+      wheel: async (deltaX, deltaY, options) => {
+        refuseLocatorOptions("Mouse.wheel", options, []);
         await engineCall("page.mouse.wheel", {
           page: this._id,
           x: this._mouseX,
@@ -1399,7 +1409,8 @@ class Page {
           deltaY: Number(deltaY) || 0,
         });
       },
-      dblclick: async (x, y) => {
+      dblclick: async (x, y, options) => {
+        refuseLocatorOptions("Mouse.dblclick", options, []);
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
         await engineCall("page.mouse.click", {
@@ -1502,27 +1513,27 @@ class Page {
     return this.locator(selector).fill(value, options);
   }
 
-  hover(selector) {
-    return this.locator(selector).hover();
+  hover(selector, options) {
+    return this.locator(selector).hover(options);
   }
 
-  check(selector) {
-    return this.locator(selector).check();
+  check(selector, options) {
+    return this.locator(selector).check(options);
   }
 
-  uncheck(selector) {
-    return this.locator(selector).uncheck();
+  uncheck(selector, options) {
+    return this.locator(selector).uncheck(options);
   }
 
-  async setChecked(selector, checked) {
+  async setChecked(selector, checked, options) {
     if (checked) {
-      return this.locator(selector).check();
+      return this.locator(selector).check(options);
     }
-    return this.locator(selector).uncheck();
+    return this.locator(selector).uncheck(options);
   }
 
-  selectOption(selector, value) {
-    return this.locator(selector).selectOption(value);
+  selectOption(selector, value, options) {
+    return this.locator(selector).selectOption(value, options);
   }
 
   innerText(selector) {
@@ -1565,18 +1576,16 @@ class Page {
     return this.locator(selector).isDisabled();
   }
 
-  focus(selector) {
-    return this.locator(selector).focus();
+  focus(selector, options) {
+    return this.locator(selector).focus(options);
   }
 
-  async type(selector, text) {
-    await this.focus(selector);
-    await this.keyboard.type(text);
+  async type(selector, text, options) {
+    return this.locator(selector).type(text, options);
   }
 
-  async press(selector, key) {
-    await this.focus(selector);
-    await this.keyboard.press(key);
+  async press(selector, key, options) {
+    return this.locator(selector).press(key, options);
   }
 
   async tap(selector, options) {
