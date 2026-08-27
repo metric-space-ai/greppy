@@ -2172,7 +2172,7 @@ mod tests {
         AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
         PROVIDER_PROTOCOL_VERSION,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -2248,6 +2248,39 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).unwrap();
         fs::write(data.join("provider.json"), &bytes).unwrap();
         fs::write(mount.join(".greppy-provider.json"), bytes).unwrap();
+    }
+
+    struct TestProviderHeartbeat {
+        stop: Option<mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TestProviderHeartbeat {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn heartbeat_provider(data: &Path, mount: &Path) -> TestProviderHeartbeat {
+        publish_provider(data, mount);
+        let data = data.to_owned();
+        let mount = mount.to_owned();
+        let (stop, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || loop {
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => publish_provider(&data, &mount),
+            }
+        });
+        TestProviderHeartbeat {
+            stop: Some(stop),
+            worker: Some(worker),
+        }
     }
 
     fn copy_test_tree(source: &Path, destination: &Path) {
@@ -2373,7 +2406,7 @@ mod tests {
 
         let data = temp.path().join("provider-data");
         let mount = temp.path().join("provider-mount");
-        publish_provider(&data, &mount);
+        let _provider_heartbeat = heartbeat_provider(&data, &mount);
         let tracker_core = Arc::new(WorkspaceCore::open(data.join("core")).unwrap());
         let tracked_repo = fs::canonicalize(&repo).unwrap();
         tracker_core

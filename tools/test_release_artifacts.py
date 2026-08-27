@@ -121,6 +121,17 @@ class ReleaseArtifactTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseArtifactError):
             release.verify_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
 
+    def test_spdx_inventory_mismatch_names_the_exact_dist_path(self) -> None:
+        dist, cargo_lock, sbom = self.make_spdx_fixture()
+        release.augment_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
+        (dist / "unexpected.cache").write_bytes(b"runtime residue")
+
+        with self.assertRaisesRegex(
+            release.ReleaseArtifactError,
+            r"dist files missing from SBOM=\['unexpected\.cache'\]",
+        ):
+            release.verify_spdx(sbom, dist, cargo_lock, "x86_64-unknown-linux-gnu")
+
     @unittest.skipIf(os.name == "nt", "symlink creation is not portable on Windows CI")
     def test_spdx_binds_symlink_identity_without_following_target(self) -> None:
         dist, cargo_lock, sbom = self.make_spdx_fixture()

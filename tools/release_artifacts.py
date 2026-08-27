@@ -553,7 +553,22 @@ def verify_spdx(
         and relationship.get("relationshipType") == "CONTAINS"
     }
     if contains != expected_file_ids:
-        raise ReleaseArtifactError("SBOM package file relationships do not match dist")
+        relative_by_id = {
+            _file_id(relative): relative for relative, _ in dist_files
+        }
+        missing = sorted(
+            relative_by_id[identifier]
+            for identifier in expected_file_ids - contains
+        )
+        unexpected = sorted(
+            file_by_id.get(identifier, {}).get("fileName", identifier)
+            for identifier in contains - expected_file_ids
+        )
+        raise ReleaseArtifactError(
+            "SBOM package file relationships do not match dist; "
+            f"dist files missing from SBOM={missing}; "
+            f"SBOM files absent from dist={unexpected}"
+        )
     file_sha1: list[str] = []
     for relative, path in dist_files:
         entry = file_by_id.get(_file_id(relative))
