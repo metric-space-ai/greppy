@@ -77,6 +77,15 @@ pub struct WorkspacePairLease {
     content_id: String,
 }
 
+/// Exclusive process-lifetime lease for repository-visible operations.
+///
+/// Apply, proposal publication and their recovery paths use the same
+/// canonical-repository key. The kernel releases the lease on process death;
+/// stable lease pathnames are never removed.
+pub struct WorkspaceOperationLease {
+    file: File,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileHandle {
     workspace_id: String,
@@ -106,6 +115,12 @@ impl std::fmt::Debug for WorkspacePairLease {
 }
 
 impl Drop for WorkspacePairLease {
+    fn drop(&mut self) {
+        unlock_pair_lease(&self.file);
+    }
+}
+
+impl Drop for WorkspaceOperationLease {
     fn drop(&mut self) {
         unlock_pair_lease(&self.file);
     }
@@ -474,6 +489,30 @@ impl WorkspaceCore {
             file,
             content_id: content_id.to_string(),
         }))
+    }
+
+    pub fn try_repository_operation_lease(
+        &self,
+        repository: &Path,
+    ) -> Result<Option<WorkspaceOperationLease>> {
+        let canonical = repository.canonicalize()?;
+        let text = canonical
+            .to_str()
+            .ok_or_else(|| Error::UnsupportedRepository("repository path is not UTF-8".into()))?;
+        let key = blake3::hash(text.as_bytes()).to_hex();
+        let directory = self.root.join("operation-leases");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("repository-{key}.lease"));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        if !lock_pair_lease(&file, true)? {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceOperationLease { file }))
     }
 
     pub fn complete_workspace_pair(
@@ -2701,6 +2740,27 @@ mod tests {
     use super::*;
 
     const CRASH_CHILD_TEST: &str = "namespace::tests::crash_child_performs_operation";
+
+    #[test]
+    fn repository_operation_lease_is_exclusive_and_released_by_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let first_core = WorkspaceCore::open(root.path()).unwrap();
+        let second_core = WorkspaceCore::open(root.path()).unwrap();
+        let first = first_core
+            .try_repository_operation_lease(repository.path())
+            .unwrap()
+            .unwrap();
+        assert!(second_core
+            .try_repository_operation_lease(repository.path())
+            .unwrap()
+            .is_none());
+        drop(first);
+        assert!(second_core
+            .try_repository_operation_lease(repository.path())
+            .unwrap()
+            .is_some());
+    }
 
     #[test]
     fn crash_child_performs_operation() {

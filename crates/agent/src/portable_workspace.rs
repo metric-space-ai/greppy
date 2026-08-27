@@ -738,6 +738,7 @@ pub fn apply_proposal(target_checkout: &Path, ref_name: &str) -> Result<(), Work
     let core = WorkspaceCore::open(data_root.join("core"))?;
     recover_proposal_publish_journals(&core)?;
     recover_apply_journals(&core)?;
+    let _operation_lease = acquire_repository_operation_lease(&core, target_checkout, ref_name)?;
     apply_from_core(&core, target_checkout, ref_name, None)
 }
 
@@ -787,6 +788,7 @@ fn publish_proposal_transaction(
     final_tree: &str,
     proposal_commit: &str,
 ) -> Result<(), WorkspaceError> {
+    let _operation_lease = acquire_repository_operation_lease(core, repository, ref_name)?;
     let baseline = core.workspace_baseline(workspace)?;
     let journal = ProposalPublishJournal {
         schema: 1,
@@ -829,7 +831,7 @@ fn publish_proposal_transaction(
     match result {
         Ok(()) => remove_proposal_publish_journal(&journal_path),
         Err(error) => {
-            if recover_proposal_publish_journal(core, &journal_path, &journal)? {
+            if recover_proposal_publish_journal_locked(core, &journal_path, &journal)? {
                 Ok(())
             } else {
                 Err(error)
@@ -903,6 +905,16 @@ fn recover_proposal_publish_journals(core: &WorkspaceCore) -> Result<(), Workspa
 }
 
 fn recover_proposal_publish_journal(
+    core: &WorkspaceCore,
+    journal_path: &Path,
+    journal: &ProposalPublishJournal,
+) -> Result<bool, WorkspaceError> {
+    let _operation_lease =
+        acquire_repository_operation_lease(core, &journal.repository, &journal.ref_name)?;
+    recover_proposal_publish_journal_locked(core, journal_path, journal)
+}
+
+fn recover_proposal_publish_journal_locked(
     core: &WorkspaceCore,
     journal_path: &Path,
     journal: &ProposalPublishJournal,
@@ -1047,6 +1059,18 @@ fn remove_proposal_publish_journal(path: &Path) -> Result<(), WorkspaceError> {
         sync_directory(parent)?;
     }
     Ok(())
+}
+
+fn acquire_repository_operation_lease(
+    core: &WorkspaceCore,
+    repository: &Path,
+    ref_name: &str,
+) -> Result<greppy_workspace_core::WorkspaceOperationLease, WorkspaceError> {
+    core.try_repository_operation_lease(repository)?
+        .ok_or_else(|| WorkspaceError::Conflict {
+            ref_name: ref_name.into(),
+            detail: "another proposal/apply operation is active for this repository".into(),
+        })
 }
 
 fn apply_from_core(
@@ -1364,6 +1388,8 @@ fn recover_apply_journals(core: &WorkspaceCore) -> Result<(), WorkspaceError> {
                 path: path.clone(),
                 detail: format!("apply recovery journal is invalid: {error}"),
             })?;
+        let _operation_lease =
+            acquire_repository_operation_lease(core, &journal.repository, &journal.ref_name)?;
         if journal.schema != 1 {
             return Err(WorkspaceError::Tampered {
                 path,
@@ -2710,6 +2736,17 @@ mod tests {
         );
         assert_eq!(json_journal_count(&proposal_publish_journal_root(&core)), 1);
 
+        let active_publish = core
+            .try_repository_operation_lease(&journal.repository)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            recover_proposal_publish_journals(&core),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        assert!(core.has_proposal(&journal.ref_name).unwrap());
+        assert_eq!(json_journal_count(&proposal_publish_journal_root(&core)), 1);
+        drop(active_publish);
         recover_proposal_publish_journals(&core).unwrap();
         assert!(!core.has_proposal(&journal.ref_name).unwrap());
         assert!(
@@ -3290,6 +3327,20 @@ mod tests {
 
         let journal_path = publish_apply_journal(&recovery_core, &journal).unwrap();
         fs::write(repo.join("tracked.txt"), "partially applied\n").unwrap();
+        let active_apply = recovery_core
+            .try_repository_operation_lease(&repo)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        assert!(journal_path.exists());
+        assert_eq!(
+            fs::read(repo.join("tracked.txt")).unwrap(),
+            b"partially applied\n"
+        );
+        drop(active_apply);
         recover_apply_journals(&recovery_core).unwrap();
         assert!(!journal_path.exists());
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
@@ -3303,6 +3354,18 @@ mod tests {
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
         assert_eq!(fs::read(&index).unwrap(), index_before);
         git(&repo, &["update-ref", &ref_name, &commit]);
+
+        let competing = recovery_core
+            .try_repository_operation_lease(&repo)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            apply_proposal(&repo, &ref_name),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        drop(competing);
 
         abort_apply_child(&data, &repo, &ref_name);
         assert_eq!(fs::read(&index).unwrap(), index_before);
