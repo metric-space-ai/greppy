@@ -307,6 +307,7 @@ class ReleaseArtifactTests(unittest.TestCase):
             REPOSITORY_ROOT / "platform/linux/build-packages.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("WINFSP-*|RIFT-*", linux_packager)
+        self.assertIn('STAGING_ROOT=$(realpath -m "$6")', linux_packager)
         self.assertNotIn("RIFT-MIT", workflow)
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")

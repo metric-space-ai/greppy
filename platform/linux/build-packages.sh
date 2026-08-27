@@ -13,7 +13,7 @@ PROVIDER_BINARY=$2
 VERSION=$3
 DEB_OUTPUT=$4
 RPM_OUTPUT=$5
-STAGING_ROOT=$6
+STAGING_ROOT=$(realpath -m "$6")
 
 [[ -x "$GREPPY_BINARY" ]] || { echo "greppy binary is not executable: $GREPPY_BINARY" >&2; exit 66; }
 [[ -x "$PROVIDER_BINARY" ]] || { echo "workspace provider is not executable: $PROVIDER_BINARY" >&2; exit 66; }
