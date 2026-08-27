@@ -4,9 +4,12 @@ set -eu
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 output_root=${1:?usage: build-fskit-app.sh OUTPUT_DIRECTORY}
 identity=${CODE_SIGN_IDENTITY:--}
+fskit_profile=${FSKIT_PROVISIONING_PROFILE:-}
 target=arm64-apple-macos15.4
 app="$output_root/GreppyWorkspaceFS.app"
 extension="$app/Contents/Extensions/GreppyWorkspaceFS.appex"
+extension_bundle_id=ai.metricspace.greppy.workspacefs.extension
+application_group=group.ai.metricspace.greppy
 cargo_target="$repository_root/target/fskit-aarch64-macos15.4"
 ffi_archive="$cargo_target/aarch64-apple-darwin/release/libgreppy_workspace_ffi.a"
 cli_binary=${GREPPY_CLI_BINARY:-}
@@ -26,11 +29,49 @@ case "$package_version" in
         ;;
 esac
 
+extension_entitlements=platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements
+if [ "$identity" != "-" ]; then
+    test -n "$fskit_profile" || {
+        echo "signed FSKit builds require FSKIT_PROVISIONING_PROFILE" >&2
+        exit 64
+    }
+    test -f "$fskit_profile" || {
+        echo "FSKit provisioning profile is not a regular file: $fskit_profile" >&2
+        exit 64
+    }
+    signing_temp=$(mktemp -d -t greppy-fskit-signing)
+    resolved_extension_entitlements="$signing_temp/extension.entitlements"
+    profile_plist="$signing_temp/profile.plist"
+    cleanup_signing_inputs() {
+        rm -f "$resolved_extension_entitlements" "$profile_plist"
+        rmdir "$signing_temp" 2>/dev/null || true
+    }
+    trap cleanup_signing_inputs EXIT
+    trap 'exit 1' HUP INT TERM
+    /usr/bin/security cms -D -i "$fskit_profile" -o "$profile_plist"
+    profile_team_id=$(/usr/bin/python3 \
+        "$repository_root/tools/validate_macos_fskit_profile.py" \
+        --plist "$profile_plist" \
+        --bundle-id "$extension_bundle_id" \
+        --application-group "$application_group")
+    cp "$extension_entitlements" "$resolved_extension_entitlements"
+    /usr/libexec/PlistBuddy -c \
+        "Add :com.apple.application-identifier string $profile_team_id.$extension_bundle_id" \
+        "$resolved_extension_entitlements"
+    /usr/libexec/PlistBuddy -c \
+        "Add :com.apple.developer.team-identifier string $profile_team_id" \
+        "$resolved_extension_entitlements"
+    extension_entitlements=$resolved_extension_entitlements
+fi
+
 test ! -e "$app" || {
     echo "refusing to replace existing FSKit application: $app" >&2
     exit 1
 }
 mkdir -p "$app/Contents/MacOS" "$extension/Contents/MacOS"
+if [ "$identity" != "-" ]; then
+    cp "$fskit_profile" "$extension/Contents/embedded.provisionprofile"
+fi
 if [ -n "$cli_binary" ]; then
     test -f "$cli_binary" && test -x "$cli_binary" || {
         echo "GREPPY_CLI_BINARY is not an executable file: $cli_binary" >&2
@@ -103,8 +144,16 @@ sign_bundle() {
 }
 
 sign_bundle \
-    platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements \
+    "$extension_entitlements" \
     "$extension"
+if [ "$identity" != "-" ]; then
+    signed_team_id=$(codesign -dvvv "$extension" 2>&1 | \
+        awk -F= '$1 == "TeamIdentifier" { print $2; exit }')
+    test "$signed_team_id" = "$profile_team_id" || {
+        echo "FSKit signing identity team $signed_team_id does not match profile team $profile_team_id" >&2
+        exit 1
+    }
+fi
 if [ -n "$cli_binary" ]; then
     if [ "$identity" = "-" ]; then
         codesign --force --timestamp=none --options runtime \

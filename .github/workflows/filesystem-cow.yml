@@ -270,6 +270,7 @@ jobs:
     timeout-minutes: 45
     env:
       CODE_SIGN_IDENTITY: ${{ vars.MACOS_CODE_SIGN_IDENTITY }}
+      FSKIT_PROFILE_BASE64: ${{ secrets.MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
@@ -281,6 +282,7 @@ jobs:
           test "$(uname -m)" = arm64
           test "$(sw_vers -productVersion | cut -d. -f1)" -ge 15
           test -n "$CODE_SIGN_IDENTITY"
+          test -n "$FSKIT_PROFILE_BASE64"
           security find-identity -v -p codesigning | grep -F "$CODE_SIGN_IDENTITY"
           data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
           mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
@@ -289,7 +291,10 @@ jobs:
       - name: Build and install the exact signed FSKit provider
         shell: bash
         run: |
-          platform/macos/build-fskit-app.sh "$RUNNER_TEMP/fskit"
+          fskit_profile="$RUNNER_TEMP/greppy-fskit-extension.provisionprofile"
+          printf '%s' "$FSKIT_PROFILE_BASE64" | base64 -D > "$fskit_profile"
+          FSKIT_PROVISIONING_PROFILE="$fskit_profile" \
+            platform/macos/build-fskit-app.sh "$RUNNER_TEMP/fskit"
           app="$RUNNER_TEMP/fskit/GreppyWorkspaceFS.app"
           codesign --verify --deep --strict "$app"
           sudo -n ditto "$app" /Applications/GreppyWorkspaceFS.app

@@ -69,6 +69,29 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("testing\\build\\Release\\winfsp-tests-x64.exe", builder)
         self.assertNotIn("/p:WindowsSdkDir=", builder)
 
+    def test_signed_fskit_builder_requires_exact_profile_before_writing_app(
+        self,
+    ) -> None:
+        builder = (
+            REPOSITORY_ROOT / "platform/macos/build-fskit-app.sh"
+        ).read_text(encoding="utf-8")
+        profile_gate = builder.index(
+            'signed FSKit builds require FSKIT_PROVISIONING_PROFILE'
+        )
+        app_creation = builder.index(
+            'mkdir -p "$app/Contents/MacOS" "$extension/Contents/MacOS"'
+        )
+        self.assertLess(profile_gate, app_creation)
+        self.assertIn('/usr/bin/security cms -D -i "$fskit_profile"', builder)
+        self.assertIn("tools/validate_macos_fskit_profile.py", builder)
+        self.assertIn(
+            'cp "$fskit_profile" "$extension/Contents/embedded.provisionprofile"',
+            builder,
+        )
+        self.assertIn("com.apple.application-identifier", builder)
+        self.assertIn("com.apple.developer.team-identifier", builder)
+        self.assertIn('test "$signed_team_id" = "$profile_team_id"', builder)
+
     def test_training_archive_is_deterministic_and_self_verifying(self) -> None:
         _, manifest = self.make_training_tree()
         first = self.root / "first.tar.gz"
@@ -343,6 +366,13 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertLess(application_notarize, dry_run_upload)
         self.assertLess(dry_run_upload, installer_import)
         self.assertLess(installer_import, package_macos)
+        self.assertIn(
+            "MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64", workflow
+        )
+        self.assertIn('test -n "$FSKIT_PROFILE_BASE64"', workflow)
+        self.assertIn(
+            'FSKIT_PROVISIONING_PROFILE="$fskit_profile"', workflow
+        )
         self.assertIn('xcrun stapler staple "${{ matrix.asset }}"', workflow)
         self.assertIn('spctl --assess --type install', workflow)
         self.assertNotIn("greppy-macos-arm64.tar.gz", workflow)
@@ -373,6 +403,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn(
+            "MACOS_FSKIT_EXTENSION_PROVISIONING_PROFILE_BASE64", cow_workflow
+        )
+        self.assertIn(
+            'FSKIT_PROVISIONING_PROFILE="$fskit_profile"', cow_workflow
+        )
         portable_lifecycle = cow_workflow.split("portable-agent-contract:", 1)[1]
         self.assertIn("name: Portable agent lifecycle (${{ matrix.os }})", portable_lifecycle)
         self.assertIn("os: [ubuntu-latest, macos-15, windows-latest]", portable_lifecycle)
