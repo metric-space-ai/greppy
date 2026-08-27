@@ -238,7 +238,13 @@ jobs:
         run: |
           $runtime = Join-Path $env:GREPPY_WINFSP_FORK_ROOT 'build\VStudio\build\Release\greppyworkspacefsp-x64.dll'
           Copy-Item -LiteralPath $runtime -Destination target\release\greppyworkspacefsp-x64.dll
-          $imports = (& dumpbin /imports target\release\greppy-workspace-provider.exe) -join "`n"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
+          if (-not $vsRoot) { throw 'Visual Studio x86_64 tools are unavailable' }
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw 'dumpbin.exe is unavailable' }
+          $imports = (& $dumpbin /imports target\release\greppy-workspace-provider.exe) -join "`n"
           if ($imports -notmatch '(?i)greppyworkspacefsp-x64\.dll') {
             throw 'provider does not import the Greppy WinFsp runtime'
           }
