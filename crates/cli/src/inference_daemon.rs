@@ -2021,6 +2021,79 @@ mod tests {
     }
 
     #[test]
+    fn status_and_ping_remain_available_while_prewarm_model_loads() {
+        let endpoint = Endpoint::for_identity(
+            "prewarm-status-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let server_endpoint = endpoint.clone();
+        let server_address = endpoint.address().to_string();
+        let (load_started_tx, load_started_rx) = mpsc::sync_channel(1);
+        let (release_load_tx, release_load_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            run_server(
+                server_endpoint,
+                &server_address,
+                ServerPolicy {
+                    model_ttl: Duration::from_secs(1),
+                    exit_ttl: Duration::from_millis(250),
+                    request_deadline: Duration::from_secs(1),
+                    hard_request_timeout: None,
+                    max_request_bytes: 4096,
+                    max_response_bytes: 4096,
+                },
+                true,
+                move || {
+                    load_started_tx.send(()).expect("signal prewarm load");
+                    release_load_rx.recv().expect("release prewarm load");
+                    Ok::<_, String>(())
+                },
+                |_| Ok(()),
+                |_raw, model| serde_json::json!({"ok": model.is_some()}),
+                "prewarm-status-test",
+            )
+        });
+
+        load_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prewarm load started after listener setup");
+        let status = request(
+            &endpoint,
+            serde_json::json!({"op": "status"}),
+            Duration::from_secs(1),
+            4096,
+            4096,
+        );
+        assert!(
+            matches!(
+                status,
+                RequestOutcome::Response(ref value)
+                    if value["state"] == "loading"
+                        && value["daemon_pid"].as_u64().unwrap_or_default() > 0
+            ),
+            "status was unavailable during prewarm load: {status:?}"
+        );
+        let ping = request(
+            &endpoint,
+            serde_json::json!({"op": "ping"}),
+            Duration::from_secs(1),
+            4096,
+            4096,
+        );
+        assert!(
+            matches!(
+                ping,
+                RequestOutcome::Response(ref value) if value["ok"] == true
+            ),
+            "ping was unavailable during prewarm load: {ping:?}"
+        );
+
+        release_load_tx.send(()).expect("finish prewarm load");
+        assert_eq!(server.join().expect("prewarm status server"), 0);
+    }
+
+    #[test]
     fn live_server_serializes_clients_evicts_and_reloads_one_model() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
