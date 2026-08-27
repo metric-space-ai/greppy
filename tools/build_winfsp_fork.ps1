@@ -69,6 +69,9 @@ $nuget = (Get-Command nuget.exe -ErrorAction Stop).Source
 if ($LASTEXITCODE -ne 0) { throw 'WDK NuGet signature verification failed' }
 [System.IO.Compression.ZipFile]::ExtractToDirectory($wdkPackage, $wdkRoot)
 $wdkContentRoot = Join-Path $wdkRoot 'c'
+if ($wdkContentRoot -match '\s') {
+    throw "WDK extraction path must not contain whitespace: $wdkContentRoot"
+}
 $ntifs = Join-Path $wdkContentRoot "Include\$sdkVersion\km\ntifs.h"
 if (-not (Test-Path -LiteralPath $ntifs -PathType Leaf)) {
     throw "pinned WDK package lacks ntifs.h: $ntifs"
@@ -102,6 +105,10 @@ foreach ($project in $projects) {
         'msbuild', ('"' + $projectPath + '"'), '/m', '/nologo', '/verbosity:minimal',
         '/p:Configuration=Release', '/p:Platform=x64', "/p:MyTargetPlatformVersion=$sdkVersion",
         '/p:MyNtddiVersion=0x0A000006', '/p:MyWin32Version=0x0A00',
+        ('/p:WindowsSdkDir=' + $wdkContentRoot + '\'),
+        ('/p:WindowsSdkDir_10=' + $wdkContentRoot + '\'),
+        ('/p:WDKContentRoot=' + $wdkContentRoot + '\'),
+        ('/p:UCRTContentRoot=' + $wdkContentRoot + '\'),
         '/p:WDK_NuGet=true'
     )
     & cmd.exe /D /S /C ($arguments -join ' ')
