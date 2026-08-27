@@ -6559,7 +6559,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "fill empty string"
+        "fill empty string; timeout is accepted; other clear options throw"
       ]
     },
     {
@@ -6680,7 +6680,8 @@
         "drag-to"
       ],
       "known_differences": [
-        "mouse down/move/up between bounding boxes; not HTML5 drag events"
+        "mouse down/move/up between bounding boxes; not HTML5 drag events",
+        "timeout is accepted; force/sourcePosition/targetPosition/trial throw unsupported_playwright_operation"
       ]
     },
     {
@@ -6737,7 +6738,8 @@
         "locator-evaluate"
       ],
       "known_differences": [
-        "eval(pageFunction)(element) in page JS; not Playwright JSHandle/world isolation"
+        "eval(pageFunction)(element) in page JS; not Playwright JSHandle/world isolation",
+        "timeout waits for an attached target; other evaluate options throw"
       ]
     },
     {
@@ -7244,7 +7246,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "alias of locator.type / keyboard.type value append; not per-character delay"
+        "delegates to locator.type / keyboard.type value append; timeout is accepted; delay throws unsupported_playwright_operation"
       ]
     },
     {
@@ -7316,7 +7318,7 @@
         "extra-selectors"
       ],
       "known_differences": [
-        "delegates to check/uncheck"
+        "delegates to check/uncheck; timeout is accepted; other setChecked options throw"
       ]
     },
     {

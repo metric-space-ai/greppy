@@ -11,7 +11,7 @@ await page.evaluate(() => {
   document.getElementById("src").addEventListener("mousedown", () => window.__drag.push("src-down"));
   document.getElementById("dst").addEventListener("mouseup", () => window.__drag.push("dst-up"));
 });
-await page.locator("#src").dragTo(page.locator("#dst"));
+await page.locator("#src").dragTo(page.locator("#dst"), { timeout: 5_000 });
 const seq = await page.evaluate(() => window.__drag);
 if (!seq.includes("src-down") || !seq.includes("dst-up")) {
   throw new Error("dragTo mouse path missing: " + JSON.stringify(seq));

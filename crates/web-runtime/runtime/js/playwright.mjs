@@ -530,7 +530,10 @@ class Locator {
     return this.allTextContents();
   }
 
-  async evaluate(pageFunction, arg) {
+  async evaluate(pageFunction, arg, options) {
+    refuseLocatorOptions("Locator.evaluate", options, ["timeout"]);
+    const timeout = (options && options.timeout) || this._page._timeout || 30_000;
+    await this.waitFor({ timeout });
     const fn =
       typeof pageFunction === "function" ? pageFunction.toString() : String(pageFunction);
     const source =
@@ -538,7 +541,7 @@ class Locator {
         ? fn
         : "function(el) { return (" + fn + ")(el, " + JSON.stringify(arg) + "); }";
     const result = await engineCall("locator.evaluate", {
-      ...locatorParams(this),
+      ...locatorParams(this, { timeout }),
       source,
     });
     return result.value;
@@ -572,8 +575,8 @@ class Locator {
     });
   }
 
-  async clear() {
-    await this.fill("");
+  async clear(options) {
+    await this.fill("", options);
   }
 
   async isEditable() {
@@ -736,12 +739,12 @@ class Locator {
     return this._page;
   }
 
-  async setChecked(checked) {
-    return checked ? this.check() : this.uncheck();
+  async setChecked(checked, options) {
+    return checked ? this.check(options) : this.uncheck(options);
   }
 
-  async pressSequentially(text) {
-    return this.type(text);
+  async pressSequentially(text, options) {
+    return this.type(text, options);
   }
 
   describe(description) {
@@ -815,7 +818,9 @@ class Locator {
     return new FrameLocator(this._page, this._selector.value + " " + selector, index);
   }
 
-  async dragTo(target) {
+  async dragTo(target, options) {
+    const timeout = actionTimeout(this, options, "Locator.dragTo");
+    await this.waitFor({ timeout });
     const from = await this.boundingBox();
     const to = await target.boundingBox();
     if (!from || !to) {
