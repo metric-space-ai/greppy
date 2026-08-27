@@ -22,10 +22,14 @@ remain isolated while existing objects are read-only.
 
 New `workspace setup`, `workspace doctor --json`, `workspace status --json`,
 and `workspace gc` commands manage one persistent per-user provider mount.
-Linux uses FUSE3, macOS 15+ uses a bundled FSKit app extension with a minimal
-Swift system boundary, and Windows uses the official unchanged WinFsp 2.1
-runtime through Greppy's Rust provider. Adapter failure has no hidden native
-fallback. Concurrent provider and CLI opens wait for short SQLite-WAL writers
+Linux uses FUSE3 and installs a restartable systemd user service; macOS 15+
+uses a bundled FSKit app extension with a minimal Swift system boundary and a
+RunAtLoad LaunchAgent that revalidates setup after login. These per-user
+registrations are published atomically without following existing symlinks.
+The Windows package remains diagnostic until the selected signed transport
+can forward real hardlink operations to Greppy's Rust provider; unchanged
+WinFsp 2.1 does not satisfy that contract. Adapter failure has no hidden
+native fallback. Concurrent provider and CLI opens wait for short SQLite-WAL writers
 instead of failing nondeterministically with `database is locked`.
 Control and mounted provider manifests now bind the same immutable identity and
 capability set while validating their independently refreshed heartbeats

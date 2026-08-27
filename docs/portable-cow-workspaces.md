@@ -22,6 +22,15 @@ operations. `greppy -p` repeats the mechanical health preflight and makes no
 model request if the provider is unavailable, stale, recovering, or has a
 different identity.
 
+Setup also records the provider for the next login using the platform's
+per-user lifecycle mechanism. Linux installs and enables a restartable systemd
+user unit with the exact selected data and mount roots. macOS installs a
+RunAtLoad LaunchAgent that repeats the idempotent FSKit setup/health check after
+login; FSKit activation itself remains controlled by macOS. Configuration files
+are atomically replaced and an existing symlink is replaced rather than
+followed. Windows service registration is intentionally absent from diagnostic
+builds until the signed hardlink-capable transport is selected and packaged.
+
 There is one persistent user mount with workspaces below `workspaces/<id>`.
 Creating an agent workspace updates namespace metadata; it does not create a
 second mount or traverse and copy the repository.
@@ -88,12 +97,14 @@ baselines remain pinned until their refs are removed.
 ## Platforms
 
 - Linux x86_64 uses FUSE3. Package setup validates `/dev/fuse`, the kernel
-  component, and user mount permissions. No particular backing filesystem is
-  required.
+  component, and user mount permissions. The package includes the systemd user
+  unit and `workspace setup` binds it to the actual per-user roots. No
+  particular backing filesystem is required.
 - macOS ARM64 requires macOS 15 or newer and a signed, notarized FSKit app
   extension. The one-time System Settings approval is an OS security boundary;
   Greppy remains unavailable until activation. A minimal Swift host bridges
-  FSKit to the Rust core.
+  FSKit to the Rust core; the LaunchAgent only replays idempotent setup after
+  login and does not bypass that approval boundary.
 - Windows x86_64 is a release blocker until a licensed, signed kernel transport
   forwards real hardlink operations to Greppy's Rust provider. Official
   unchanged WinFsp 2.1 rejects `FileLinkInformation` before userspace, so the

@@ -463,6 +463,12 @@ semantics remain in Rust. See
 [Portable CoW workspaces](docs/portable-cow-workspaces.md) for setup, lifecycle,
 proposal, recovery, and platform details.
 
+`workspace setup` also installs the per-user login lifecycle: a restartable
+systemd user unit on Linux and an idempotent RunAtLoad LaunchAgent around the
+OS-managed FSKit activation on macOS. Both retain the exact configured
+workspace root. Diagnostic Windows packages deliberately register no service
+until the signed hardlink-capable backend is selected.
+
 Version 0.3.3 remains reproducible as the earlier limited native-CoW release:
 its APFS/Btrfs/reflink behavior, Rift-derived implementation, flags, and native
 fallback are historical 0.3.3 behavior documented in the changelog. None of

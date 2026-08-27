@@ -358,6 +358,26 @@ pub fn exercise_mounted_contract(root: &Path, core: &WorkspaceCore) {
         .map(|entry| entry.unwrap().file_name())
         .any(|name| name == "contract-ä-東京.txt"));
 
+    let lowercase = root.join("contract-case.txt");
+    let uppercase = root.join("CONTRACT-CASE.TXT");
+    fs::write(&lowercase, b"lowercase").unwrap();
+    #[cfg(unix)]
+    {
+        fs::write(&uppercase, b"uppercase").unwrap();
+        assert_eq!(fs::read(&lowercase).unwrap(), b"lowercase");
+        assert_eq!(fs::read(&uppercase).unwrap(), b"uppercase");
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(fs::read(&uppercase).unwrap(), b"lowercase");
+        let error = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&uppercase)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
     let link_source = root.join("contract-link-source.txt");
     let hard_link = root.join("contract-hard-link.txt");
     fs::write(&link_source, b"shared").unwrap();
