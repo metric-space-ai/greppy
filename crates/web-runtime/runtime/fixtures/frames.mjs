@@ -65,6 +65,12 @@ if ((await page.frameLocator("iframe").getByLabel("Name").count()) !== 1) {
 if ((await page.frameLocator("iframe").getByPlaceholder("search").count()) !== 1) {
   throw new Error("FrameLocator.getByPlaceholder");
 }
+if ((await child.getByLabel("Name").count()) !== 1) {
+  throw new Error("child Frame.getByLabel");
+}
+if ((await child.getByPlaceholder("search").count()) !== 1) {
+  throw new Error("child Frame.getByPlaceholder");
+}
 if ((await page.frameLocator("iframe").first().locator("#in").innerText()).trim() !== "frame-ok") {
   throw new Error("FrameLocator.first");
 }
@@ -155,11 +161,6 @@ await page.evaluate(() => {
 if (!detached.includes("dyn")) throw new Error("framedetached " + JSON.stringify(detached));
 
 expectUnsupported("child isDetached", () => child.isDetached());
-expectUnsupported("child getByPlaceholder", () => child.getByPlaceholder("search"));
-expectUnsupported("child getByAltText", () => child.getByAltText("logo"));
-expectUnsupported("child getByTitle", () => child.getByTitle("brand"));
-expectUnsupported("child getByTestId", () => child.getByTestId("hero"));
-expectUnsupported("child getByLabel", () => child.getByLabel("Name"));
 expectUnsupported("child frameLocator", () => child.frameLocator("iframe"));
 expectUnsupported("child waitForNavigation", () => child.waitForNavigation());
 expectUnsupported("nested FrameLocator.frameLocator", () => page.frameLocator("iframe").frameLocator("iframe"));

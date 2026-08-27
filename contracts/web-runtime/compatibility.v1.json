@@ -2714,7 +2714,7 @@
       ],
       "known_differences": [
         "main-frame delegates to Page.getByAltText",
-        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
+        "child same-origin iframe uses FrameLocator.getByAltText; nested frameLocator stays unsupported"
       ]
     },
     {
@@ -2730,7 +2730,7 @@
       ],
       "known_differences": [
         "main-frame delegates to Page.getByLabel",
-        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
+        "child same-origin iframe uses FrameLocator.getByLabel; nested frameLocator stays unsupported"
       ]
     },
     {
@@ -2746,7 +2746,7 @@
       ],
       "known_differences": [
         "main-frame delegates to Page.getByPlaceholder",
-        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
+        "child same-origin iframe uses FrameLocator.getByPlaceholder; nested frameLocator stays unsupported"
       ]
     },
     {
@@ -2778,7 +2778,7 @@
       ],
       "known_differences": [
         "main-frame delegates to Page.getByTestId",
-        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
+        "child same-origin iframe uses FrameLocator.getByTestId; nested frameLocator stays unsupported"
       ]
     },
     {
@@ -2794,7 +2794,7 @@
       ],
       "known_differences": [
         "main-frame delegates to Page.getByText",
-        "child CSS/text/role locators use same-origin FrameLocator contentDocument query; getByLabel/placeholder/alt/title/testid child calls throw"
+        "child CSS/text/role/label/placeholder/alt/title/testid locators use same-origin FrameLocator contentDocument query; nested frameLocator and nested childFrames stay unsupported"
       ]
     },
     {
@@ -2810,7 +2810,7 @@
       ],
       "known_differences": [
         "main-frame delegates to Page.getByTitle",
-        "child frames throw unsupported_playwright_operation; not a locator('body').first() placeholder"
+        "child same-origin iframe uses FrameLocator.getByTitle; nested frameLocator stays unsupported"
       ]
     },
     {

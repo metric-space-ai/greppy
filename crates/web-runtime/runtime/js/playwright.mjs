@@ -999,18 +999,18 @@ class Frame {
     return this._childFrameLocator().getByRole(role, options);
   }
 
-  getByText(text) {
+  getByText(text, options) {
     if (this._isMain()) {
-      return this._page.getByText(text);
+      return this._page.getByText(text, options);
     }
-    return this._childFrameLocator().getByText(text);
+    return this._childFrameLocator().getByText(text, options);
   }
 
-  getByLabel(name) {
+  getByLabel(name, options) {
     if (this._isMain()) {
-      return this._page.getByLabel(name);
+      return this._page.getByLabel(name, options);
     }
-    throwUnsupported("Frame.getByLabel.child");
+    return this._childFrameLocator().getByLabel(name, options);
   }
 
   click(selector, options) {
@@ -1156,32 +1156,32 @@ class Frame {
     throwUnsupported("Frame.isDetached.child");
   }
 
-  getByPlaceholder(name) {
+  getByPlaceholder(name, options) {
     if (this._isMain()) {
-      return this._page.getByPlaceholder(name);
+      return this._page.getByPlaceholder(name, options);
     }
-    throwUnsupported("Frame.getByPlaceholder.child");
+    return this._childFrameLocator().getByPlaceholder(name, options);
   }
 
-  getByAltText(name) {
+  getByAltText(name, options) {
     if (this._isMain()) {
-      return this._page.getByAltText(name);
+      return this._page.getByAltText(name, options);
     }
-    throwUnsupported("Frame.getByAltText.child");
+    return this._childFrameLocator().getByAltText(name, options);
   }
 
-  getByTitle(name) {
+  getByTitle(name, options) {
     if (this._isMain()) {
-      return this._page.getByTitle(name);
+      return this._page.getByTitle(name, options);
     }
-    throwUnsupported("Frame.getByTitle.child");
+    return this._childFrameLocator().getByTitle(name, options);
   }
 
   getByTestId(name) {
     if (this._isMain()) {
       return this._page.getByTestId(name);
     }
-    throwUnsupported("Frame.getByTestId.child");
+    return this._childFrameLocator().getByTestId(name);
   }
 
   getAttribute(selector, name) {
