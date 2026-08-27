@@ -4141,13 +4141,6 @@ fn spawn_background_job(
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
-    // This worker must outlive the short foreground index process that
-    // launched it. In particular, Windows package runners tear down an
-    // attached descendant when that launcher exits; the worker then never
-    // reaches inference-daemon startup even though the foreground command
-    // correctly reported a deferred semantic index. Keep this in the same
-    // detached process group contract as the daemon it will spawn.
-    inference_daemon::detach_command(&mut command);
     let Ok(child) = command.spawn() else {
         return false;
     };
