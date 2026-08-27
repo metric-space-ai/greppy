@@ -2275,7 +2275,12 @@ mod tests {
     #[test]
     fn private_git_layer_supports_windows_long_paths() {
         let temp = tempfile::tempdir().unwrap();
-        let long_root = temp.path().join("long".repeat(30));
+        const TARGET_DATA_ROOT_LEN: usize = 190;
+        let padding = TARGET_DATA_ROOT_LEN
+            .checked_sub(temp.path().as_os_str().len() + 1)
+            .expect("temporary path leaves no room for the Windows path-budget fixture");
+        let long_root = temp.path().join("x".repeat(padding));
+        assert_eq!(long_root.as_os_str().len(), TARGET_DATA_ROOT_LEN);
         let baseline_hash = "a".repeat(64);
         let compact_key = private_git_storage_key(&baseline_hash).unwrap();
         let repository = long_root.join("g/sl1").join(compact_key).join("repo");
