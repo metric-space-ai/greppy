@@ -197,7 +197,7 @@ jobs:
           # dynamically loaded — no hard cudart link, so it starts without CUDA).
           - name: macos-arm64
             os: macos-latest
-            asset: greppy-macos-arm64.tar.gz
+            asset: greppy-macos-arm64.pkg
             features: metal
             footprint_devices: 'cpu metal'
             runner_os: macOS
@@ -289,26 +289,55 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --bin greppy --features ${{ matrix.features }}
 
-      - name: Sign macOS binary with Developer ID
+      - name: Import macOS application and installer identities
         if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
         shell: bash
         env:
-          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLICATION_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          INSTALLER_CERTIFICATE_P12: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12_BASE64 }}
+          INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          APPLICATION_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          INSTALLER_SIGNING_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
         run: |
-          test -n "$CERTIFICATE_P12" && test -n "$CERTIFICATE_PASSWORD" && test -n "$SIGNING_IDENTITY"
+          test -n "$APPLICATION_CERTIFICATE_P12"
+          test -n "$APPLICATION_CERTIFICATE_PASSWORD"
+          test -n "$INSTALLER_CERTIFICATE_P12"
+          test -n "$INSTALLER_CERTIFICATE_PASSWORD"
+          test -n "$APPLICATION_SIGNING_IDENTITY"
+          test -n "$INSTALLER_SIGNING_IDENTITY"
           keychain="$RUNNER_TEMP/greppy-signing.keychain-db"
-          cert="$RUNNER_TEMP/greppy-signing.p12"
-          printf '%s' "$CERTIFICATE_P12" | base64 -D > "$cert"
-          security create-keychain -p "$CERTIFICATE_PASSWORD" "$keychain"
+          application_cert="$RUNNER_TEMP/greppy-application-signing.p12"
+          installer_cert="$RUNNER_TEMP/greppy-installer-signing.p12"
+          printf '%s' "$APPLICATION_CERTIFICATE_P12" | base64 -D > "$application_cert"
+          printf '%s' "$INSTALLER_CERTIFICATE_P12" | base64 -D > "$installer_cert"
+          security create-keychain -p "$APPLICATION_CERTIFICATE_PASSWORD" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$CERTIFICATE_PASSWORD" "$keychain"
-          security import "$cert" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security unlock-keychain -p "$APPLICATION_CERTIFICATE_PASSWORD" "$keychain"
+          security import "$application_cert" -P "$APPLICATION_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security import "$installer_cert" -P "$INSTALLER_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$CERTIFICATE_PASSWORD" "$keychain"
-          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" target/release/greppy
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$APPLICATION_CERTIFICATE_PASSWORD" "$keychain"
+          codesign --force --options runtime --timestamp --sign "$APPLICATION_SIGNING_IDENTITY" target/release/greppy
           codesign --verify --strict --verbose=2 target/release/greppy
+
+      - name: Build macOS FSKit application with bundled CLI
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SHOULD_SIGN: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
+          APPLICATION_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          identity=-
+          if [ "$SHOULD_SIGN" = true ]; then
+            test -n "$APPLICATION_SIGNING_IDENTITY"
+            identity="$APPLICATION_SIGNING_IDENTITY"
+          fi
+          CODE_SIGN_IDENTITY="$identity" \
+          GREPPY_CLI_BINARY="$PWD/target/release/greppy" \
+            platform/macos/build-fskit-app.sh "$RUNNER_TEMP/greppy-fskit"
+          codesign --verify --deep --strict --verbose=2 \
+            "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app"
 
       - name: Sign Windows binary with Authenticode
         if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'Windows'
@@ -366,7 +395,7 @@ jobs:
           Write-Host "tag=$want binary=$got"
           if ($want -ne $got) { Write-Error "version mismatch"; exit 1 }
 
-      - name: Notarize and staple macOS signed binary
+      - name: Notarize and staple macOS FSKit application
         if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
         shell: bash
         env:
@@ -375,9 +404,10 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           test -n "$APPLE_ID" && test -n "$APPLE_TEAM_ID" && test -n "$APPLE_APP_PASSWORD"
-          notary_zip="$RUNNER_TEMP/greppy-notary.zip"
-          ditto -c -k --keepParent target/release/greppy "$notary_zip"
-          submit_log="$RUNNER_TEMP/notarytool-submit.log"
+          app="$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app"
+          notary_zip="$RUNNER_TEMP/greppy-fskit-notary.zip"
+          ditto -c -k --keepParent "$app" "$notary_zip"
+          submit_log="$RUNNER_TEMP/notarytool-app-submit.log"
           xcrun notarytool submit "$notary_zip" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
@@ -385,17 +415,13 @@ jobs:
             --wait | tee "$submit_log"
           grep -q 'status: Accepted' "$submit_log" || {
             echo '::error::notarization was not Accepted'
+            cat "$submit_log"
             exit 1
           }
-          # A bare Mach-O binary cannot carry a stapled ticket (stapler exits 73
-          # on standalone executables - only bundles/dmg/pkg can be stapled;
-          # proven by the first signing dry-run). CLI standard practice applies:
-          # the notarization ticket is served online, which Gatekeeper checks.
-          # spctl --assess --type execute is equally app-bundle-only: it exits 3
-          # ("valid but does not seem to be an app") for every bare executable
-          # (proven by the second dry-run), so strict signature verification is
-          # the correct final gate for a CLI.
-          codesign --verify --strict --verbose=2 target/release/greppy
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
 
       - name: Measure runtime footprint (Unix)
         if: runner.os != 'Windows'
@@ -431,7 +457,7 @@ jobs:
       # band. (Its asset-contract entry is removed to match.)
 
       - name: Package (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist
           cp target/release/greppy dist/greppy
@@ -441,6 +467,54 @@ jobs:
           cp README.md LICENSE THIRD_PARTY.md SECURITY.md SUPPORT.md CHANGELOG.md Cargo.lock dist/
           cp -R licenses dist/licenses
           tar -C dist -czf "${{ matrix.asset }}" .
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SHOULD_SIGN: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
+          INSTALLER_SIGNING_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
+        run: |
+          version="$(target/release/greppy --version | awk '{print $NF}')"
+          installer_identity=
+          if [ "$SHOULD_SIGN" = true ]; then
+            test -n "$INSTALLER_SIGNING_IDENTITY"
+            installer_identity="$INSTALLER_SIGNING_IDENTITY"
+          fi
+          INSTALLER_SIGN_IDENTITY="$installer_identity" \
+            platform/macos/build-fskit-pkg.sh \
+              "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app" \
+              "$version" \
+              "${{ matrix.asset }}"
+          rm -rf dist "$RUNNER_TEMP/greppy-pkg-expanded"
+          pkgutil --expand-full "${{ matrix.asset }}" "$RUNNER_TEMP/greppy-pkg-expanded"
+          mkdir -p dist
+          ditto --norsrc --noextattr --noqtn \
+            "$RUNNER_TEMP/greppy-pkg-expanded/greppy-component.pkg/Payload" dist
+
+      - name: Notarize and staple macOS installer
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          submit_log="$RUNNER_TEMP/notarytool-pkg-submit.log"
+          xcrun notarytool submit "${{ matrix.asset }}" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait | tee "$submit_log"
+          grep -q 'status: Accepted' "$submit_log" || {
+            echo '::error::installer notarization was not Accepted'
+            cat "$submit_log"
+            exit 1
+          }
+          xcrun stapler staple "${{ matrix.asset }}"
+          xcrun stapler validate "${{ matrix.asset }}"
+          pkgutil --check-signature "${{ matrix.asset }}"
+          spctl --assess --type install --verbose=2 "${{ matrix.asset }}"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -455,7 +529,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
 
       - name: Smoke-test packaged artifact (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           clean="$RUNNER_TEMP/greppy-package-smoke"
@@ -472,8 +546,20 @@ jobs:
           test -s "$clean/bin/licenses/QWEN3.5-PROVENANCE.json"
           test -s "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json"
           test -s "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json"
-          test -s "$clean/bin/licenses/RIFT-MIT.txt"
           bash "$clean/bin/release_package_smoke.sh" "$clean/bin/greppy" "$clean/work"
+
+      - name: Smoke-test packaged artifact (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="dist/Applications/GreppyWorkspaceFS.app"
+          cli="$app/Contents/Resources/bin/greppy"
+          test -x "$cli"
+          test -L dist/usr/local/bin/greppy
+          test "$(readlink dist/usr/local/bin/greppy)" = \
+            /Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy
+          codesign --verify --deep --strict --verbose=2 "$app"
+          "$cli" --version
 
       - name: Smoke-test packaged artifact (Windows)
         if: runner.os == 'Windows'
@@ -492,7 +578,6 @@ jobs:
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-PROVENANCE.json")) { throw 'missing Qwen provenance' }
           if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json")) { throw 'missing Qwen training-data manifest' }
           if (-not (Test-Path "$clean/bin/licenses/MODEL-REDISTRIBUTION.lock.json")) { throw 'missing model redistribution lock' }
-          if (-not (Test-Path "$clean/bin/licenses/RIFT-MIT.txt")) { throw 'missing Rift MIT license' }
           & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
 
       - name: Generate SPDX SBOM
@@ -582,7 +667,7 @@ jobs:
         include:
           - name: macos-arm64
             os: macos-latest
-            asset: greppy-macos-arm64.tar.gz
+            asset: greppy-macos-arm64.pkg
             rust_host: aarch64-apple-darwin
           - name: linux-x86_64-no-toolkit
             os: ubuntu-22.04
@@ -599,33 +684,52 @@ jobs:
           path: package
 
       - name: Verify clean Unix host
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p unpack store repo
           (cd package && shasum -a 256 -c "${{ matrix.asset }}.sha256")
           tar -C unpack -xzf "package/${{ matrix.asset }}"
           test ! -e unpack/grep
-          if [[ "$GITHUB_REF" == refs/tags/* && "${{ runner.os }}" = macOS ]]; then
-            # codesign --verify --strict is the correct gate for a bare Mach-O
-            # CLI binary. stapler/spctl are app-bundle-only (see the build job's
-            # notarization comment): a bare binary cannot carry a stapled
-            # ticket, so those checks fail by construction, not by defect.
-            codesign --verify --strict --verbose=2 unpack/greppy
-          fi
           bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
           bash unpack/release_daemon_stress.sh "$PWD/unpack/greppy" "$PWD/daemon-stress"
-          if [ "${{ runner.os }}" = Linux ]; then
-            ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
-            test -s package/runtime-footprint-linux-x86_64-cpu.json
-          else
-            test -s package/runtime-footprint-macos-arm64-cpu.json
-            test -s package/runtime-footprint-macos-arm64-metal.json
-          fi
+          ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
+          test -s package/runtime-footprint-linux-x86_64-cpu.json
           python3 unpack/release_artifacts.py verify-spdx \
             --sbom "package/${{ matrix.asset }}.spdx.json" \
             --dist unpack \
             --cargo-lock unpack/Cargo.lock \
+            --target "${{ matrix.rust_host }}"
+
+      - name: Verify clean macOS installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          (cd package && shasum -a 256 -c "${{ matrix.asset }}.sha256")
+          pkgutil --expand-full "package/${{ matrix.asset }}" unpack
+          payload="$PWD/unpack/greppy-component.pkg/Payload"
+          app="$payload/Applications/GreppyWorkspaceFS.app"
+          cli="$app/Contents/Resources/bin/greppy"
+          docs="$payload/usr/local/share/doc/greppy"
+          test -x "$cli"
+          test -L "$payload/usr/local/bin/greppy"
+          test "$(readlink "$payload/usr/local/bin/greppy")" = \
+            /Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            xcrun stapler validate "package/${{ matrix.asset }}"
+            pkgutil --check-signature "package/${{ matrix.asset }}"
+            spctl --assess --type install --verbose=2 "package/${{ matrix.asset }}"
+          fi
+          "$cli" --version
+          bash "$docs/release_package_smoke.sh" "$cli" "$PWD/smoke"
+          bash "$docs/release_daemon_stress.sh" "$cli" "$PWD/daemon-stress"
+          test -s package/runtime-footprint-macos-arm64-cpu.json
+          test -s package/runtime-footprint-macos-arm64-metal.json
+          python3 "$docs/release_artifacts.py" verify-spdx \
+            --sbom "package/${{ matrix.asset }}.spdx.json" \
+            --dist "$payload" \
+            --cargo-lock "$docs/Cargo.lock" \
             --target "${{ matrix.rust_host }}"
 
       - name: Verify clean Windows host

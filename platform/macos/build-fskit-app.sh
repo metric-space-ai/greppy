@@ -9,9 +9,37 @@ app="$output_root/GreppyWorkspaceFS.app"
 extension="$app/Contents/Extensions/GreppyWorkspaceFS.appex"
 cargo_target="$repository_root/target/fskit-aarch64-macos15.4"
 ffi_archive="$cargo_target/aarch64-apple-darwin/release/libgreppy_workspace_ffi.a"
+cli_binary=${GREPPY_CLI_BINARY:-}
+if [ -n "$cli_binary" ]; then
+    package_version=$("$cli_binary" --version | awk '{print $NF}')
+else
+    package_version=${GREPPY_PACKAGE_VERSION:-$(
+        cargo metadata --manifest-path "$repository_root/Cargo.toml" \
+            --no-deps --format-version 1 |
+            python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "greppy"))'
+    )}
+fi
+case "$package_version" in
+    ''|*[!0-9A-Za-z.-]*)
+        echo "invalid FSKit package version: $package_version" >&2
+        exit 64
+        ;;
+esac
 
-rm -rf "$app"
+test ! -e "$app" || {
+    echo "refusing to replace existing FSKit application: $app" >&2
+    exit 1
+}
 mkdir -p "$app/Contents/MacOS" "$extension/Contents/MacOS"
+if [ -n "$cli_binary" ]; then
+    test -f "$cli_binary" && test -x "$cli_binary" || {
+        echo "GREPPY_CLI_BINARY is not an executable file: $cli_binary" >&2
+        exit 1
+    }
+    mkdir -p "$app/Contents/Resources/bin"
+    cp "$cli_binary" "$app/Contents/Resources/bin/greppy"
+    chmod 0755 "$app/Contents/Resources/bin/greppy"
+fi
 
 cd "$repository_root"
 MACOSX_DEPLOYMENT_TARGET=15.4 CARGO_TARGET_DIR="$cargo_target" cargo build \
@@ -55,6 +83,12 @@ verify_minos "$app/Contents/MacOS/GreppyWorkspaceFS"
 
 cp platform/macos/GreppyWorkspaceFS/Info.plist "$extension/Contents/Info.plist"
 cp platform/macos/GreppyWorkspaceApp/Info.plist "$app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c \
+    "Set :CFBundleShortVersionString $package_version" \
+    "$extension/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c \
+    "Set :CFBundleShortVersionString $package_version" \
+    "$app/Contents/Info.plist"
 
 sign_bundle() {
     entitlements=$1
@@ -71,6 +105,15 @@ sign_bundle() {
 sign_bundle \
     platform/macos/GreppyWorkspaceFS/GreppyWorkspaceFS.entitlements \
     "$extension"
+if [ -n "$cli_binary" ]; then
+    if [ "$identity" = "-" ]; then
+        codesign --force --timestamp=none --options runtime \
+            --sign "$identity" "$app/Contents/Resources/bin/greppy"
+    else
+        codesign --force --timestamp --options runtime \
+            --sign "$identity" "$app/Contents/Resources/bin/greppy"
+    fi
+fi
 sign_bundle \
     platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.entitlements \
     "$app"

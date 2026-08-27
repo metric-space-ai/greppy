@@ -92,7 +92,7 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
 fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
-    let app = sibling(&current, "GreppyWorkspaceFS.app")?;
+    let app = locate_macos_app(&current)?;
     require_bundled_file(&app, "signed FSKit application")?;
     let status = Command::new("/usr/bin/open")
         .arg(&app)
@@ -134,6 +134,17 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
         "macOS did not mount Greppy Workspace FS; enable it once in System Settings > General > Login Items & Extensions > File System Extensions, then rerun `greppy workspace setup`"
             .into(),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn locate_macos_app(current_exe: &Path) -> Result<PathBuf, String> {
+    if let Some(bundle) = current_exe.ancestors().find(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "GreppyWorkspaceFS.app")
+    }) {
+        return Ok(bundle.to_path_buf());
+    }
+    sibling(current_exe, "GreppyWorkspaceFS.app")
 }
 
 #[cfg(target_os = "macos")]
@@ -289,5 +300,21 @@ mod tests {
             Some(PathBuf::from("/dev/disk9"))
         );
         assert_eq!(parse_hdiutil_device("hdiutil: no device\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn locates_installed_or_sibling_fskit_application() {
+        assert_eq!(
+            locate_macos_app(Path::new(
+                "/Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy"
+            ))
+            .unwrap(),
+            Path::new("/Applications/GreppyWorkspaceFS.app")
+        );
+        assert_eq!(
+            locate_macos_app(Path::new("/tmp/release/greppy")).unwrap(),
+            Path::new("/tmp/release/GreppyWorkspaceFS.app")
+        );
     }
 }

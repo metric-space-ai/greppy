@@ -2,9 +2,9 @@
   "schema_version": "greppy.release-asset-contract.v1",
   "repository": "metric-space-ai/greppy",
   "assets": [
-    {"name": "greppy-macos-arm64.tar.gz", "role": "package"},
-    {"name": "greppy-macos-arm64.tar.gz.sha256", "role": "checksum-sidecar"},
-    {"name": "greppy-macos-arm64.tar.gz.spdx.json", "role": "sbom"},
+    {"name": "greppy-macos-arm64.pkg", "role": "package"},
+    {"name": "greppy-macos-arm64.pkg.sha256", "role": "checksum-sidecar"},
+    {"name": "greppy-macos-arm64.pkg.spdx.json", "role": "sbom"},
     {"name": "runtime-footprint-macos-arm64-cpu.json", "role": "runtime-evidence"},
     {"name": "runtime-footprint-macos-arm64-metal.json", "role": "runtime-evidence"},
     {"name": "build-environment-macos-arm64.json", "role": "build-environment"},
