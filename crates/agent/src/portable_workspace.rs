@@ -755,6 +755,15 @@ struct ApplyJournal {
     modified_times: Vec<(String, i64)>,
 }
 
+#[cfg(test)]
+fn test_crash_point(point: &str) {
+    if std::env::var_os("GREPPY_AGENT_TEST_CRASH_POINT").as_deref()
+        == Some(std::ffi::OsStr::new(point))
+    {
+        std::process::abort();
+    }
+}
+
 fn apply_from_core(
     core: &WorkspaceCore,
     target_checkout: &Path,
@@ -812,11 +821,17 @@ fn apply_from_core(
             .collect(),
     };
     let journal_path = publish_apply_journal(core, &journal)?;
-    if let Err(error) = journal.affected_paths.iter().try_for_each(|path| {
-        materialize_git_tree_entry(&canonical_target, &proposal.final_tree, path)
-    }) {
-        restore_apply_journal(core, &journal_path, &journal)?;
-        return Err(error);
+    for (index, path) in journal.affected_paths.iter().enumerate() {
+        if let Err(error) =
+            materialize_git_tree_entry(&canonical_target, &proposal.final_tree, path)
+        {
+            restore_apply_journal(core, &journal_path, &journal)?;
+            return Err(error);
+        }
+        #[cfg(test)]
+        if index == 0 {
+            test_crash_point("apply-after-first-path");
+        }
     }
     let index_after = hash_optional_file(&index_path)?;
     if index_before != index_after {
@@ -2252,6 +2267,34 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const APPLY_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_applies_proposal";
+
+    #[test]
+    fn crash_child_applies_proposal() {
+        if std::env::var_os("GREPPY_AGENT_TEST_CRASH_POINT").is_none() {
+            return;
+        }
+        let data = std::env::var_os("GREPPY_AGENT_TEST_CRASH_DATA").unwrap();
+        let repository = std::env::var_os("GREPPY_AGENT_TEST_CRASH_REPOSITORY").unwrap();
+        let ref_name = std::env::var("GREPPY_AGENT_TEST_CRASH_REF").unwrap();
+        std::env::set_var("GREPPY_WORKSPACE_DIR", data);
+        apply_proposal(Path::new(&repository), &ref_name).unwrap();
+        panic!("apply crash point did not abort the child process");
+    }
+
+    fn abort_apply_child(data: &Path, repository: &Path, ref_name: &str) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(APPLY_CRASH_CHILD_TEST)
+            .arg("--nocapture")
+            .env("GREPPY_AGENT_TEST_CRASH_POINT", "apply-after-first-path")
+            .env("GREPPY_AGENT_TEST_CRASH_DATA", data)
+            .env("GREPPY_AGENT_TEST_CRASH_REPOSITORY", repository)
+            .env("GREPPY_AGENT_TEST_CRASH_REF", ref_name)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "apply crash child exited cleanly");
+    }
 
     #[test]
     fn tracker_fences_are_internal_but_other_git_paths_are_mutations() {
@@ -2556,6 +2599,7 @@ mod tests {
                 if let Ok(entries) = fs::read_dir(&templates) {
                     if let Some(template) = entries
                         .filter_map(|entry| entry.ok())
+                        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
                         .map(|entry| entry.path())
                         .find(|path| path.join("COMPLETE").is_file())
                     {
@@ -2774,6 +2818,19 @@ mod tests {
         assert_eq!(fs::read(&index).unwrap(), index_before);
         git(&repo, &["update-ref", &ref_name, &commit]);
 
+        abort_apply_child(&data, &repo, &ref_name);
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        assert_eq!(
+            fs::read_dir(recovery_core.root().join("apply-journals"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("json")
+                )
+                .count(),
+            1
+        );
         apply_proposal(&repo, &ref_name).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
         assert_eq!(fs::read(&index).unwrap(), index_before);
