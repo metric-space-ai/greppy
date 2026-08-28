@@ -347,32 +347,48 @@ fn sqlite_read_only_uri(path: &Path) -> Result<String> {
 /// Base ids are negated while Delta ids remain positive. SQLite AUTOINCREMENT
 /// starts at one, so the two namespaces cannot collide.
 const OVERLAY_VIEWS_SQL: &str = r#"
+CREATE TEMP VIEW greppy_base_project_map AS
+SELECT b.name AS base_name,
+       CASE
+         WHEN (SELECT COUNT(*) FROM greppy_base.projects) = 1
+          AND (SELECT COUNT(*) FROM main.projects) = 1
+         THEN (SELECT name FROM main.projects LIMIT 1)
+         ELSE b.name
+       END AS target_name
+FROM greppy_base.projects b;
+
 CREATE TEMP VIEW projects AS
 SELECT * FROM main.projects
 UNION ALL
-SELECT b.* FROM greppy_base.projects b
-WHERE NOT EXISTS (SELECT 1 FROM main.projects d WHERE d.name = b.name);
+SELECT m.target_name AS name, b.indexed_at, b.root_path
+FROM greppy_base.projects b
+JOIN greppy_base_project_map m ON m.base_name = b.name
+WHERE NOT EXISTS (
+    SELECT 1 FROM main.projects d WHERE d.name = m.target_name
+);
 
 CREATE TEMP VIEW nodes AS
 SELECT * FROM main.nodes
 UNION ALL
-SELECT -b.id AS id, b.project, b.label, b.name, b.qualified_name,
+SELECT -b.id AS id, m.target_name AS project, b.label, b.name, b.qualified_name,
        b.file_path, b.start_line, b.end_line, b.properties
 FROM greppy_base.nodes b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 )
 AND NOT EXISTS (
     SELECT 1 FROM main.nodes d
-    WHERE d.project = b.project AND d.qualified_name = b.qualified_name
+    WHERE d.project = m.target_name AND d.qualified_name = b.qualified_name
 );
 
 CREATE TEMP VIEW raw_edges AS
 SELECT * FROM main.raw_edges
 UNION ALL
-SELECT -b.id AS id, b.project, b.file_path, b.source_qname,
+SELECT -b.id AS id, m.target_name AS project, b.file_path, b.source_qname,
        b.target_qname, b.edge_type, b.properties
 FROM greppy_base.raw_edges b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 );
@@ -389,24 +405,25 @@ JOIN nodes visible_target
   ON visible_target.project = d.project
  AND visible_target.qualified_name = d.target_qualified_name
 UNION ALL
-SELECT -e.id AS id, e.project, visible_source.id AS source_id,
+SELECT -e.id AS id, m.target_name AS project, visible_source.id AS source_id,
        visible_target.id AS target_id, e.edge_type, e.properties,
        e.url_path_gen
 FROM greppy_base.edges e
 JOIN greppy_base.nodes base_source ON base_source.id = e.source_id
 JOIN greppy_base.nodes base_target ON base_target.id = e.target_id
+JOIN greppy_base_project_map m ON m.base_name = e.project
 JOIN nodes visible_source
-  ON visible_source.project = base_source.project
+  ON visible_source.project = m.target_name
  AND visible_source.qualified_name = base_source.qualified_name
 JOIN nodes visible_target
-  ON visible_target.project = base_target.project
+  ON visible_target.project = m.target_name
  AND visible_target.qualified_name = base_target.qualified_name
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
 )
 AND NOT EXISTS (
     SELECT 1 FROM main.overlay_edges d
-    WHERE d.project = e.project
+    WHERE d.project = m.target_name
       AND d.source_qualified_name = base_source.qualified_name
       AND d.target_qualified_name = base_target.qualified_name
       AND d.edge_type = e.edge_type
@@ -415,7 +432,11 @@ AND NOT EXISTS (
 CREATE TEMP VIEW file_state AS
 SELECT * FROM main.file_state
 UNION ALL
-SELECT b.* FROM greppy_base.file_state b
+SELECT m.target_name AS project, b.rel_path, b.sha256, b.mtime_ns, b.size,
+       b.parser_version, b.extractor_version, b.last_indexed_generation,
+       b.language
+FROM greppy_base.file_state b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.rel_path
 );
@@ -423,8 +444,10 @@ WHERE NOT EXISTS (
 CREATE TEMP VIEW file_content AS
 SELECT * FROM main.file_content
 UNION ALL
-SELECT -b.id AS id, b.project, b.rel_path, b.line, b.snippet, b.file_path
+SELECT -b.id AS id, m.target_name AS project, b.rel_path, b.line, b.snippet,
+       b.file_path
 FROM greppy_base.file_content b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 );
@@ -432,12 +455,13 @@ WHERE NOT EXISTS (
 CREATE TEMP VIEW vector_embeddings AS
 SELECT * FROM main.vector_embeddings
 UNION ALL
-SELECT -b.id AS id, b.project, b.model_id, b.prompt_version, b.task,
+SELECT -b.id AS id, m.target_name AS project, b.model_id, b.prompt_version, b.task,
        CASE WHEN b.node_id IS NULL THEN NULL ELSE -b.node_id END AS node_id,
        b.chunk_idx, b.qualified_name, b.file_path, b.start_line, b.end_line,
        b.content_sha256, b.graph_generation, b.dim, b.vector_norm,
        b.vector, b.created_at, b.vector_i8, b.i8_scale
 FROM greppy_base.vector_embeddings b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 );
@@ -445,16 +469,24 @@ WHERE NOT EXISTS (
 CREATE TEMP VIEW provider_state AS
 SELECT * FROM main.provider_state
 UNION ALL
-SELECT b.* FROM greppy_base.provider_state b
+SELECT m.target_name AS project, b.language, b.provider_version, b.status,
+       b.supported_edge_classes, b.unsupported_edge_classes, b.files_seen,
+       b.files_indexed, b.files_failed, b.diagnostics,
+       b.last_indexed_generation, b.updated_at
+FROM greppy_base.provider_state b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM main.provider_state d
-    WHERE d.project = b.project AND d.language = b.language
+    WHERE d.project = m.target_name AND d.language = b.language
 );
 
 CREATE TEMP VIEW index_skips AS
 SELECT * FROM main.index_skips
 UNION ALL
-SELECT b.* FROM greppy_base.index_skips b
+SELECT m.target_name AS project, b.rel_path, b.language, b.reason, b.detail,
+       b.size, b.mtime_ns, b.last_indexed_generation, b.updated_at
+FROM greppy_base.index_skips b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.rel_path
 );
@@ -462,7 +494,9 @@ WHERE NOT EXISTS (
 CREATE TEMP VIEW file_identity AS
 SELECT * FROM main.file_identity
 UNION ALL
-SELECT b.* FROM greppy_base.file_identity b
+SELECT m.target_name AS project, b.rel_path, b.ctime_ns, b.file_id
+FROM greppy_base.file_identity b
+JOIN greppy_base_project_map m ON m.base_name = b.project
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.rel_path
 );
