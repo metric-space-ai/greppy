@@ -218,7 +218,7 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
         &base_store,
         &["index", "."],
         None,
-        &[("GREPPY_PROJECT_IDENTITY", "source")],
+        &[("GREPPY_PROJECT_IDENTITY", "WALinuxAgent")],
     );
     assert_eq!(
         base_code, 0,
@@ -269,7 +269,7 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
 
     let overlay = Some((base_layout.graph.as_path(), base_commit.as_str()));
     let overlay_env = [
-        ("GREPPY_PROJECT_IDENTITY", "Azure__WALinuxAgent"),
+        ("GREPPY_PROJECT_IDENTITY", "WALinuxAgent"),
         ("GREPPY_AGENT_BASE_REUSED", "1"),
     ];
     let (delta_code, delta_out, delta_err) = run_with_env(
