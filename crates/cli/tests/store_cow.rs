@@ -182,6 +182,137 @@ fn normalize_ephemeral_fields(value: &mut serde_json::Value) {
 }
 
 #[test]
+fn committed_task_delta_status_uses_base_union_across_worktrees() {
+    let scratch = tempfile::tempdir().unwrap();
+    let base_repo = scratch.path().join("base-repo");
+    let task_repo = scratch.path().join("task-repo");
+    let base_store = scratch.path().join("base-store");
+    let delta_store = scratch.path().join("delta-store");
+    std::fs::create_dir_all(base_repo.join("src")).unwrap();
+    std::fs::write(
+        base_repo.join("src/changed.rs"),
+        "pub fn changed_at_base() -> usize { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base_repo.join("src/other.rs"),
+        "pub fn unchanged_other() -> usize { 2 }\n",
+    )
+    .unwrap();
+    for index in 0..100 {
+        std::fs::write(
+            base_repo.join(format!("src/unchanged_{index:03}.rs")),
+            format!("pub fn unchanged_{index:03}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    git(&base_repo, &["init", "-q"]);
+    git(&base_repo, &["config", "user.email", "cow@test.invalid"]);
+    git(&base_repo, &["config", "user.name", "Store CoW"]);
+    git(&base_repo, &["add", "."]);
+    git(&base_repo, &["commit", "-q", "-m", "base"]);
+    let base_commit = git(&base_repo, &["rev-parse", "HEAD"]);
+
+    let (base_code, base_out, base_err) = run_with_env(
+        &base_repo,
+        &base_store,
+        &["index", "."],
+        None,
+        &[("GREPPY_PROJECT_IDENTITY", "WALinuxAgent")],
+    );
+    assert_eq!(
+        base_code, 0,
+        "base index failed\nstdout={base_out}\nstderr={base_err}"
+    );
+    let base_source_graph = graph_db_under(&base_store);
+    let base_identity = greppy_store::BaseStoreIdentity {
+        format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+        canonical_repository_identity: "fixture:WALinuxAgent".into(),
+        git_object_format: "sha1".into(),
+        base_tree_oid: git(&base_repo, &["rev-parse", "HEAD^{tree}"]),
+        store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+        indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
+        parser_and_extractor_versions: "fixture-parser-v1".into(),
+        summary_model_and_prompt_version: "fixture-summary-v1".into(),
+        embedding_model: "fixture-embedding-v1".into(),
+        embedding_prompt_version: "fixture-prompt-v1".into(),
+        embedding_dimensions: 768,
+        embedding_encoding: "f32+i8-v1".into(),
+    };
+    let published_root = scratch.path().join("published-base-root");
+    let base_layout = greppy_store::BaseStoreLayout::new(&published_root, &base_identity).unwrap();
+    let _builder = base_layout.acquire_builder(false).unwrap().unwrap();
+    let summary_dir = scratch.path().join("published-base-summary");
+    drop(greppy_store::SummaryCache::open(&summary_dir).unwrap());
+    base_layout
+        .publish_graph_with_summary(
+            base_identity,
+            &base_source_graph,
+            &summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE),
+        )
+        .unwrap();
+
+    let task_repo_string = task_repo.to_string_lossy().into_owned();
+    git(
+        &base_repo,
+        &["worktree", "add", "-q", task_repo_string.as_str()],
+    );
+    git(&task_repo, &["config", "user.email", "cow@test.invalid"]);
+    git(&task_repo, &["config", "user.name", "Store CoW"]);
+    std::fs::write(
+        task_repo.join("src/changed.rs"),
+        "pub fn changed_in_task_commit() -> usize { 3 }\n",
+    )
+    .unwrap();
+    git(&task_repo, &["add", "src/changed.rs"]);
+    git(&task_repo, &["commit", "-q", "-m", "task change"]);
+
+    let overlay = Some((base_layout.graph.as_path(), base_commit.as_str()));
+    let overlay_env = [
+        ("GREPPY_PROJECT_IDENTITY", "WALinuxAgent"),
+        ("GREPPY_AGENT_BASE_REUSED", "1"),
+    ];
+    let (delta_code, delta_out, delta_err) = run_with_env(
+        &task_repo,
+        &delta_store,
+        &["index", "."],
+        overlay,
+        &overlay_env,
+    );
+    assert_eq!(
+        delta_code, 0,
+        "Delta index failed\nstdout={delta_out}\nstderr={delta_err}"
+    );
+    let (status_code, status_out, status_err) = run_with_env(
+        &task_repo,
+        &delta_store,
+        &["index", "status", "--json"],
+        overlay,
+        &overlay_env,
+    );
+    assert_eq!(
+        status_code, 0,
+        "a committed one-file Delta over a complete Base must be healthy; \
+         stderr={status_err}\nstdout={status_out}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status["healthy"], true, "{status:#}");
+    assert_eq!(status["fresh"], true, "{status:#}");
+    assert_eq!(status["git_tracked_files"], 102, "{status:#}");
+    assert_eq!(status["stats"]["files"], 102, "{status:#}");
+    assert_eq!(
+        status["coverage_warning"],
+        serde_json::Value::Null,
+        "{status:#}"
+    );
+    assert_eq!(status["store_cow"]["mode"], "overlay", "{status:#}");
+    assert_eq!(status["store_cow"]["base_cache_hit"], true, "{status:#}");
+    assert_eq!(status["store_cow"]["base_complete"], true, "{status:#}");
+    assert_eq!(status["store_cow"]["dirty_file_count"], 1, "{status:#}");
+    assert_eq!(status["store_cow"]["deleted_file_count"], 0, "{status:#}");
+}
+
+#[test]
 fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_files() {
     let scratch = tempfile::tempdir().unwrap();
     let repo = scratch.path().join("repo");
@@ -288,6 +419,29 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
     assert!(diagnostics["store_cow"]["delta_identity"]
         .as_str()
         .is_some_and(|identity| identity.len() == 64));
+
+    let (status_code, status_out, status_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        status_code, 0,
+        "a complete Base plus its indexed Delta must be healthy; \
+         stderr={status_err}\nstdout={status_out}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status["healthy"], true, "{status:#}");
+    assert_eq!(status["fresh"], true, "{status:#}");
+    assert_eq!(
+        status["coverage_warning"],
+        serde_json::Value::Null,
+        "{status:#}"
+    );
+    assert_eq!(status["git_tracked_files"], 4, "{status:#}");
+    assert_eq!(status["stats"]["files"], 4, "{status:#}");
+    assert_eq!(
+        status["store_cow"]["base_cache_hit"],
+        serde_json::Value::Null
+    );
+    assert_eq!(status["store_cow"]["base_complete"], true, "{status:#}");
     index(&repo, &full_store, None);
 
     let delta_graph_before_failure = graph_db_under(&delta_store);
