@@ -35,7 +35,10 @@ pub mod sandbox;
 pub mod wire;
 pub mod workspace;
 
-pub use agent_loop::{run_agent_loop, AgentConfig, LoopError, LoopEvent, LoopResult, LoopStop};
+pub use agent_loop::{
+    run_agent_loop, run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult,
+    LoopStop,
+};
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
 pub use greppy_env::{

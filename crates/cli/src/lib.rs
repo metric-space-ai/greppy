@@ -78,6 +78,9 @@ mod search;
 use search::*;
 mod read;
 mod web;
+mod web_attach;
+pub use web::web_runtime_socket;
+pub use web_attach::{generate_attach_token, give_child_attach_token};
 use read::*;
 mod plus;
 use plus::*;
@@ -90,6 +93,7 @@ mod bash_smart;
 mod context;
 use context::*;
 mod agent;
+mod agent_tui;
 mod store_cow;
 
 use clap::{Parser, Subcommand};
@@ -427,6 +431,7 @@ impl Cli {
 /// bytes, including non-UTF-8 patterns/paths, to real grep).
 const SUBCOMMANDS: &[&str] = &[
     "grep",
+    "agent",
     "index",
     "where-am-i",
     "cache",
@@ -653,12 +658,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     }
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
-    // `greppy -p` is a structured agent invocation. Intercept before
+    // `greppy -p` and `greppy agent` are structured agent invocations. Intercept before
     // unknown-verb / grep-passthrough so `-p` never becomes a real-grep
     // pattern, and so grep flags like `-p` (Perl regex on GNU grep) still
     // work for non-leading positions via ordinary passthrough.
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
+    }
+    if agent::is_agent_tui_invocation(&argv) {
+        return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
         println!("{message}");
@@ -3584,7 +3592,10 @@ struct BackgroundJobGuard {
     eta_seconds: Option<u64>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
+    indexing_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
+    last_index_stage: Option<greppy_indexer::IndexProgressStage>,
+    current_detail: Option<String>,
     complete: bool,
 }
 
@@ -3643,7 +3654,10 @@ impl BackgroundJobGuard {
                 .and_then(serde_json::Value::as_u64),
             rate_milli_documents_per_second: None,
             embedding_started: None,
+            indexing_started: None,
             last_progress_write: None,
+            last_index_stage: None,
+            current_detail: None,
             complete: false,
         }
     }
@@ -3652,7 +3666,57 @@ impl BackgroundJobGuard {
         self.path.is_some()
     }
 
+    fn indexing_progress(&mut self, progress: greppy_indexer::IndexProgress) {
+        let stage_changed = self.last_index_stage != Some(progress.stage);
+        let state = match progress.stage {
+            greppy_indexer::IndexProgressStage::Analyze => {
+                let started = *self
+                    .indexing_started
+                    .get_or_insert_with(std::time::Instant::now);
+                self.completed_documents = progress.completed_files;
+                self.total_documents = progress.total_files;
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                self.eta_seconds = observed_embedding_eta_seconds(
+                    self.completed_documents,
+                    self.total_documents,
+                    elapsed_ms,
+                );
+                self.rate_milli_documents_per_second =
+                    observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+                "analyzing"
+            }
+            greppy_indexer::IndexProgressStage::Store => {
+                self.completed_documents = 0;
+                self.total_documents = 0;
+                self.rate_milli_documents_per_second = None;
+                self.eta_seconds = None;
+                "storing"
+            }
+        };
+        let now = std::time::Instant::now();
+        let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
+        let publish = background_progress_should_publish(
+            stage_changed,
+            finished,
+            self.last_progress_write,
+            now,
+        );
+        if publish {
+            self.write_state(state, None);
+            self.last_progress_write = Some(now);
+            self.last_index_stage = Some(progress.stage);
+        }
+    }
+
     fn embedding_loading(&mut self) {
+        self.completed_documents = 0;
+        self.total_documents = 0;
+        self.rate_milli_documents_per_second = None;
+        self.eta_seconds = None;
+        self.indexing_started = None;
+        self.current_detail = None;
         self.write_state("loading_model", None);
     }
 
@@ -3662,7 +3726,9 @@ impl BackgroundJobGuard {
         self.total_documents = total_documents;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
+        self.indexing_started = None;
         self.rate_milli_documents_per_second = None;
+        self.current_detail = None;
         self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
         self.write_state("embedding", None);
         self.last_progress_write = Some(now);
@@ -3671,6 +3737,7 @@ impl BackgroundJobGuard {
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
+        self.current_detail = progress.current_symbol;
         if let Some(started) = self.embedding_started {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis())
                 .unwrap_or(u64::MAX)
@@ -3728,6 +3795,7 @@ impl BackgroundJobGuard {
             "eta_seconds": self.eta_seconds,
             "eta_minutes": eta_minutes,
             "eta_unix_secs": eta_unix_secs,
+            "current_detail": self.current_detail,
             "last_error": last_error,
         });
         let _ = write_background_job(path, &value);
@@ -3753,6 +3821,40 @@ impl BackgroundJobGuard {
     fn degraded(&mut self, reason: &str) {
         self.write_state("failed", Some(reason));
         self.complete = true;
+    }
+}
+
+fn background_progress_should_publish(
+    stage_changed: bool,
+    finished: bool,
+    last_progress_write: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    stage_changed
+        || finished
+        || last_progress_write
+            .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
+}
+
+#[cfg(test)]
+mod background_progress_tests {
+    use super::background_progress_should_publish;
+
+    #[test]
+    fn phase_change_bypasses_progress_throttle() {
+        let now = std::time::Instant::now();
+        assert!(background_progress_should_publish(
+            true,
+            false,
+            Some(now),
+            now
+        ));
+        assert!(!background_progress_should_publish(
+            false,
+            false,
+            Some(now),
+            now
+        ));
     }
 }
 
@@ -3830,25 +3932,43 @@ fn current_embedding_candidate_count(root: &std::path::Path) -> usize {
 /// Start at most one detached refresh for a worktree. A spawn lock closes the
 /// cross-process race and the atomically published job record is the public
 /// progress surface used by semantic-search.
-fn spawn_background_job(
+pub(crate) enum BackgroundJobLaunch {
+    Owned {
+        child: std::process::Child,
+        path: std::path::PathBuf,
+    },
+    Attached {
+        path: std::path::PathBuf,
+    },
+}
+
+impl BackgroundJobLaunch {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Owned { path, .. } | Self::Attached { path } => path,
+        }
+    }
+}
+
+fn spawn_background_job_handle(
     root: Option<&str>,
     cause: &str,
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
-) -> bool {
+) -> Option<BackgroundJobLaunch> {
     // Integration tests use short-lived stores and explicitly opt out of
     // inference. A detached child can outlive the fixture guard, recreate the
     // removed store, and extract hundreds of MiB of embedded model assets per
     // test process. Honour the test contract for the complete background
     // lifecycle, not just the foreground inference call.
     if test_inference_skipped() && kind == "embedding" {
-        return false;
+        return None;
     }
     let Ok(root) = resolve_root(root) else {
-        return false;
+        return None;
     };
     if greppy_core::cache::ensure_workspace_store(&root).is_err() {
-        return false;
+        return None;
     }
     let hash = greppy_core::workspace::workspace_hash(&root);
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
@@ -3856,7 +3976,7 @@ fn spawn_background_job(
         greppy_core::cache::LockMode::Exclusive,
         false,
     ) else {
-        return false;
+        return None;
     };
     let job_path = background_job_path(&root);
     if let Some(job) = read_background_job(&job_path) {
@@ -3866,7 +3986,7 @@ fn spawn_background_job(
             .and_then(|pid| u32::try_from(pid).ok())
             .is_some_and(process_is_alive)
         {
-            return true;
+            return Some(BackgroundJobLaunch::Attached { path: job_path });
         }
     }
     let target_generation = greppy_store::Store::open_with(
@@ -3884,7 +4004,7 @@ fn spawn_background_job(
     .unwrap_or(0)
     .saturating_add(1);
     let Ok(exe) = std::env::current_exe() else {
-        return false;
+        return None;
     };
     let started_at = unix_now_secs_cli();
     let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
@@ -3915,8 +4035,9 @@ fn spawn_background_job(
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
-    let Ok(child) = command.spawn() else {
-        return false;
+    agent::scrub_credential_env(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return None;
     };
     let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
     let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
@@ -3940,11 +4061,46 @@ fn spawn_background_job(
         "eta_unix_secs": eta_unix_secs,
         "last_error": serde_json::Value::Null,
     });
-    write_background_job(&job_path, &value).is_ok()
+    if write_background_job(&job_path, &value).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    Some(BackgroundJobLaunch::Owned {
+        child,
+        path: job_path,
+    })
+}
+
+fn spawn_background_job(
+    root: Option<&str>,
+    cause: &str,
+    kind: &str,
+    embedding_cfg: Option<&EmbeddingModelConfig>,
+) -> bool {
+    let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
+        return false;
+    };
+    if let BackgroundJobLaunch::Owned { mut child, .. } = launch {
+        // Detached refreshes still need a reaper in this long-lived process.
+        let _ = std::thread::Builder::new()
+            .name("greppy-index-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+    true
 }
 
 fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
     spawn_background_job(root, cause, "index", None)
+}
+
+pub(crate) fn spawn_agent_background_index(
+    root: Option<&str>,
+    cause: &str,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle(root, cause, "index", None)
 }
 
 /// Kick off the complete atomic graph + embedding snapshot as a detached

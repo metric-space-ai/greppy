@@ -206,6 +206,23 @@ pub struct IndexOptions {
     pub only_paths: Option<std::collections::BTreeSet<String>>,
 }
 
+/// Observable progress for the graph-index phase.  The callback variant of
+/// the indexer uses actual inventory work units, so interactive clients can
+/// show an honest percentage and derive a rate/ETA without duplicating file
+/// discovery or extraction logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexProgress {
+    pub stage: IndexProgressStage,
+    pub completed_files: usize,
+    pub total_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexProgressStage {
+    Analyze,
+    Store,
+}
+
 /// Run the indexer against `root`. The store is mutated in-place; nodes
 /// and file_state rows are upserted, edges are inserted, and the
 /// workspace generation counter is bumped.
@@ -226,6 +243,17 @@ pub fn index_with_options(
     root: &Path,
     project_name: &str,
     options: &IndexOptions,
+) -> Result<IndexReport> {
+    index_with_options_and_progress(store, root, project_name, options, &mut |_| {})
+}
+
+/// Run the indexer with explicit discovery options and graph progress.
+pub fn index_with_options_and_progress(
+    store: &mut Store,
+    root: &Path,
+    project_name: &str,
+    options: &IndexOptions,
+    progress: &mut dyn FnMut(IndexProgress),
 ) -> Result<IndexReport> {
     let abs_root = greppy_discover::detect_repo_root(root)?;
     let discovered_entries = greppy_discover::walk_with_policy_and_overrides(
@@ -298,6 +326,11 @@ pub fn index_with_options(
     let controls = IndexControls::from_env();
     let controlled_entries = apply_large_repo_controls(&all_entries, &controls, &mut report);
     let entries = controlled_entries.active;
+    progress(IndexProgress {
+        stage: IndexProgressStage::Analyze,
+        completed_files: 0,
+        total_files: entries.len(),
+    });
 
     // Did a prior run of THIS (migrated) indexer materialize raw edges for
     // this project? We must NOT treat a run as incremental unless the store's
@@ -361,6 +394,7 @@ pub fn index_with_options(
             generation,
             worker_count,
             &mut report,
+            progress,
         )?;
 
         // PHASE B (incremental). Re-resolve only the edges that PHASE A's
@@ -378,6 +412,7 @@ pub fn index_with_options(
             generation,
             worker_count,
             &mut report,
+            progress,
         )?;
         if profile {
             eprintln!(
@@ -429,6 +464,11 @@ pub fn index_with_options(
     sync_provider_states(store, project_name, &all_entries, generation)?;
 
     report.graph_generation = generation;
+    progress(IndexProgress {
+        stage: IndexProgressStage::Store,
+        completed_files: entries.len(),
+        total_files: entries.len(),
+    });
     Ok(report)
 }
 
@@ -455,8 +495,11 @@ fn run_full(
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
+    progress: &mut dyn FnMut(IndexProgress),
 ) -> Result<()> {
     let max_size = max_file_size_bytes();
+    let total_files = entries.len();
+    let mut completed_files = 0usize;
 
     // ── Classification (serial, cheap stat only) ────────────────────
     let mut supported: Vec<(usize, &InventoryEntry, Language)> = Vec::new();
@@ -478,6 +521,12 @@ fn run_full(
                 "language provider is unsupported",
                 generation,
             )?;
+            completed_files = completed_files.saturating_add(1);
+            progress(IndexProgress {
+                stage: IndexProgressStage::Analyze,
+                completed_files,
+                total_files,
+            });
             continue;
         }
         // Skip oversized files before reading them.
@@ -493,6 +542,12 @@ fn run_full(
                     &format!("file size {} exceeds cap {}", md.len(), max_size),
                     generation,
                 )?;
+                completed_files = completed_files.saturating_add(1);
+                progress(IndexProgress {
+                    stage: IndexProgressStage::Analyze,
+                    completed_files,
+                    total_files,
+                });
                 continue;
             }
         }
@@ -502,7 +557,15 @@ fn run_full(
     // ── PHASE A1 — parallel extract (CPU-bound, no store) ───────────
     let profile = std::env::var("GREPPY_PROFILE").is_ok();
     let t_a1 = std::time::Instant::now();
-    let (extractions, throttled) = parallel_extract(&supported, worker_count);
+    let classified_files = completed_files;
+    let (extractions, throttled) =
+        parallel_extract(&supported, worker_count, &mut |extracted_files| {
+            progress(IndexProgress {
+                stage: IndexProgressStage::Analyze,
+                completed_files: classified_files.saturating_add(extracted_files),
+                total_files,
+            });
+        });
     report.throttled_for_memory = throttled;
     if profile {
         eprintln!(
@@ -513,6 +576,11 @@ fn run_full(
 
     // ── PHASE A2 — serial store writes (single-writer) ──────────────
     let t_a2 = std::time::Instant::now();
+    progress(IndexProgress {
+        stage: IndexProgressStage::Store,
+        completed_files: 0,
+        total_files: 0,
+    });
     // Content rows are collected here and written in ONE batched transaction
     // after the loop (see insert_file_content_batch) — content-FTS was the
     // dominant cold-index cost and one-commit-per-file was much of it.
@@ -608,12 +676,15 @@ fn run_incremental(
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
+    progress: &mut dyn FnMut(IndexProgress),
 ) -> Result<std::collections::HashSet<String>> {
     let max_size = max_file_size_bytes();
     let mut changed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Diff the on-disk inventory against the persisted file_state.
     let diffs = greppy_freshness::compute_file_diff(store, project_name, entries)?;
+    let total_files = diffs.len();
+    let mut completed_files = 0usize;
 
     // Map rel_path → inventory entry so a diff can recover the abs_path /
     // language for re-extraction.
@@ -627,6 +698,12 @@ fn run_incremental(
         match diff {
             greppy_freshness::FileDiff::Unchanged => {
                 report.files_skipped += 1;
+                completed_files = completed_files.saturating_add(1);
+                progress(IndexProgress {
+                    stage: IndexProgressStage::Analyze,
+                    completed_files,
+                    total_files,
+                });
             }
             greppy_freshness::FileDiff::Deleted(rel) => {
                 // Remove the file's nodes (FK-cascades its edges), content,
@@ -637,6 +714,12 @@ fn run_incremental(
                 store.delete_index_skip(project_name, rel)?;
                 delete_raw_edges_for_file(store, project_name, rel)?;
                 changed_files.insert(rel.clone());
+                completed_files = completed_files.saturating_add(1);
+                progress(IndexProgress {
+                    stage: IndexProgressStage::Analyze,
+                    completed_files,
+                    total_files,
+                });
             }
             greppy_freshness::FileDiff::Added(entry)
             | greppy_freshness::FileDiff::Modified { entry, .. } => {
@@ -664,6 +747,12 @@ fn run_incremental(
                     let _ = store.delete_nodes_for_file(project_name, &entry.rel_path)?;
                     let _ = store.delete_file_content(project_name, &entry.rel_path)?;
                     delete_raw_edges_for_file(store, project_name, &entry.rel_path)?;
+                    completed_files = completed_files.saturating_add(1);
+                    progress(IndexProgress {
+                        stage: IndexProgressStage::Analyze,
+                        completed_files,
+                        total_files,
+                    });
                     continue;
                 }
                 if let Ok(md) = std::fs::metadata(&full_entry.abs_path) {
@@ -682,6 +771,12 @@ fn run_incremental(
                         let _ = store.delete_nodes_for_file(project_name, &entry.rel_path)?;
                         let _ = store.delete_file_content(project_name, &entry.rel_path)?;
                         delete_raw_edges_for_file(store, project_name, &entry.rel_path)?;
+                        completed_files = completed_files.saturating_add(1);
+                        progress(IndexProgress {
+                            stage: IndexProgressStage::Analyze,
+                            completed_files,
+                            total_files,
+                        });
                         continue;
                     }
                 }
@@ -698,8 +793,21 @@ fn run_incremental(
 
     // Re-extract the changed files in parallel, then apply writes serially
     // in inventory order (same determinism contract as the full path).
-    let (extractions, throttled) = parallel_extract(&changed, worker_count);
+    let classified_files = completed_files;
+    let (extractions, throttled) =
+        parallel_extract(&changed, worker_count, &mut |extracted_files| {
+            progress(IndexProgress {
+                stage: IndexProgressStage::Analyze,
+                completed_files: classified_files.saturating_add(extracted_files),
+                total_files,
+            });
+        });
     report.throttled_for_memory = throttled;
+    progress(IndexProgress {
+        stage: IndexProgressStage::Store,
+        completed_files: 0,
+        total_files: 0,
+    });
     for outcome in extractions {
         match outcome {
             FileOutcome::Extracted {
@@ -943,6 +1051,7 @@ fn validate_or_degrade(
 fn parallel_extract(
     supported: &[(usize, &InventoryEntry, Language)],
     worker_count: usize,
+    progress: &mut dyn FnMut(usize),
 ) -> (Vec<FileOutcome>, bool) {
     let n = supported.len();
     if n == 0 {
@@ -956,6 +1065,7 @@ fn parallel_extract(
             .iter()
             .map(|(_, entry, lang)| extract_one(entry, *lang))
             .collect();
+        progress(n);
         return (out, false);
     }
 
@@ -972,6 +1082,7 @@ fn parallel_extract(
                 .iter()
                 .map(|(_, entry, lang)| extract_one(entry, *lang))
                 .collect();
+            progress(n);
             return (out, false);
         }
     };
@@ -988,7 +1099,9 @@ fn parallel_extract(
     // still executes at most `worker_count` parses simultaneously; the wider
     // window only gives idle workers enough queued files to steal. We retain
     // periodic memory-budget checks between bounded windows.
-    const WORK_STEALING_WINDOW_MULTIPLIER: usize = 16;
+    // Four waves keep enough work available for stealing while giving the
+    // startup UI regular, honest progress updates on medium-sized projects.
+    const WORK_STEALING_WINDOW_MULTIPLIER: usize = 4;
     let chunk = worker_count
         .saturating_mul(WORK_STEALING_WINDOW_MULTIPLIER)
         .max(worker_count)
@@ -1003,6 +1116,7 @@ fn parallel_extract(
             for (slot, (_, entry, lang)) in slots[pos..].iter_mut().zip(&supported[pos..]) {
                 *slot = Some(extract_one(entry, *lang));
             }
+            progress(n);
             break;
         }
 
@@ -1018,6 +1132,7 @@ fn parallel_extract(
             *slot = Some(res);
         }
         pos = end;
+        progress(pos);
     }
 
     let out = slots
@@ -4686,7 +4801,7 @@ def Widget():
             "need several files to exercise ordering"
         );
 
-        let (out, _throttled) = parallel_extract(&supported, 8);
+        let (out, _throttled) = parallel_extract(&supported, 8, &mut |_| {});
         assert_eq!(out.len(), supported.len());
         // Each extracted outcome's rel_path must equal the rel_path of the
         // supported entry at the SAME position (order preserved).

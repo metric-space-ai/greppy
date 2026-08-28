@@ -4,6 +4,52 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Interactive agent TUI (0.3.4)
+
+`greppy agent` is a production interactive TUI on the same isolated
+CoW/native worktree, sandbox, and `refs/greppy/agent/<run-id>` proposal as
+`greppy -p`. The terminal event loop stays on the main thread; model
+streaming and tools run on a worker. Token and thinking deltas are coalesced
+through a capped buffer so a slow renderer cannot grow memory without bound.
+Conversation history is preserved across prompts without cloning it on every
+streamed token.
+
+The surface is a one-line header (agent, repository, branch/worktree, model,
+sandbox), a Markdown transcript with tool rows and collapsed thinking, a
+grapheme-aware multiline composer, and a status footer with activity, tokens,
+turns, and queued follow-ups. Submissions while the agent is busy become
+visible queued follow-ups. Enter submits; Shift+Enter / Alt+Enter insert a
+newline when the terminal reports those modifiers. PageUp/PageDown scroll by
+the viewport. Follow-tail is automatic only at the bottom; End or a new
+prompt restores it.
+
+Slash commands: `/help`, `/clear` (confirms before discarding visible
+context), `/model`, `/usage`, `/tools`, `/copy` (OSC 52 with a fallback
+message), `/sessions`, `/name TITLE`, `/compact`, `/exit` `/quit` `/q`.
+Ctrl+C cancels at a safe tool boundary and never interrupts an in-flight
+edit; a second Ctrl+C exits after RAII terminal restoration (raw mode,
+alternate screen, mouse, bracketed paste, cursor, title). Non-TTY stdin or
+stdout refuse full-screen mode without emitting control sequences. `NO_COLOR`
+and an ASCII fallback are honoured. Below 60×18 the UI shows a stable
+"terminal too small" view and recovers on resize.
+
+Sessions persist as versioned append-only JSONL under the Greppy data root
+(`agent-sessions/<project>/`). `--continue` restores the latest project
+session; `--resume SESSION_ID` restores a named one. A truncated tail
+recovers the valid prefix. Persistence failure warns and keeps the in-memory
+conversation. `/compact` retains recent messages plus an extractive summary.
+Secrets and authorization headers are redacted from display and disk.
+
+`--apply`, `--diff`, `--keep-worktree`, `--fresh`, `--workspace-backend`,
+`--no-sandbox`, `--skip-selfcheck`, deadline, and token/turn limits remain
+valid in interactive mode. `greppy -p` stdout/stderr/exit-code, sandbox,
+workspace, proposal-ref, and apply behaviour are unchanged; `greppy -e -p`
+still reaches grep passthrough.
+
+The agent loop honours a cooperative cancel flag at the same safe boundaries
+as the wall-clock deadline (between turns, after a stream, after a tool
+returns) and exposes `LoopStop::Cancelled`.
+
 ## [0.3.3] — 2026-08-25
 
 ### Filesystem-CoW agent workspaces

@@ -56,6 +56,10 @@ greppy patch --verify < refactor.diff          # coordinated all-or-nothing patc
 # And since 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
 greppy -p "add tests for clamp_value"          # works in a disposable worktree, returns a proposal ref
 
+# And since 0.3.4, the same agent in an interactive terminal UI:
+greppy agent --model MODEL                     # full-screen session, same isolated workspace
+greppy agent --continue --model MODEL          # restore this project's most recent session
+
 # In 0.3.2, concurrent agents share an immutable Base index and write private Deltas:
 greppy index --agent-worktree                  # build or validate the shared Base ahead of time
 greppy -p --private-store "diagnose indexing"  # opt out for one run and use a full private Store
@@ -200,13 +204,21 @@ named symbols, one `search` for concept discovery, `search-pattern` for literal
 text, `read-file` for paths, and run builds/tests through `bash-smart`.
 
 The integrated agent allocates its workspace before the first model request.
-The 0.3.3 candidate defaults to `--workspace-backend auto`: use an exact native
+For an interactive full-screen session, run `greppy agent`; pass an optional
+initial prompt as `greppy agent "TASK"`. The transcript keeps context across
+prompts and shows streaming replies, tool activity, and token usage. `/exit` or
+Ctrl+C finishes the current turn and publishes the session's reviewable
+proposal. `greppy -p "TASK"` remains the headless one-shot mode for scripts.
+
+The agent defaults to `--workspace-backend auto`: use an exact native
 Filesystem-CoW snapshot only when capability probing guarantees no full-tree
 metadata traversal, otherwise retain the 0.3.2 Git-worktree behavior. Use
 `native` to force the 0.3.2 backend or `cow` to require exact CoW, including a
 per-file reflink tree, and receive an explicit error when it is unavailable:
 
 ```bash
+greppy agent --model MODEL
+greppy agent "TASK" --model MODEL
 greppy -p "TASK" --model MODEL --workspace-backend auto
 greppy -p "TASK" --model MODEL --workspace-backend native
 greppy -p "TASK" --model MODEL --workspace-backend cow
@@ -368,6 +380,34 @@ itself pins LSPs for oracle validation.
 
 The difference to hosted code-search services is simpler: greppy has no
 service. Nothing leaves the machine.
+
+
+## Interactive coding agent
+
+`greppy agent` opens a full-screen TUI on the same isolated CoW/native worktree,
+sandbox, and `refs/greppy/agent/<run-id>` proposal as `greppy -p`. History is
+kept across prompts; token/thinking deltas are coalesced so a slow terminal
+cannot grow memory without bound. Ctrl+C cancels at a safe tool boundary (it
+never interrupts an in-flight edit); a second Ctrl+C exits after the terminal
+is restored.
+
+Slash commands: `/help`, `/clear`, `/model`, `/usage`, `/tools`, `/copy`,
+`/sessions`, `/name TITLE`, `/compact`, `/exit`. `/compact` keeps recent
+messages and an extractive summary of earlier turns. Sessions are append-only
+JSONL under the Greppy data root (`…/agent-sessions/<project>/`); a truncated
+tail restores the valid prefix. `--continue` and `--resume SESSION_ID` reload
+them. The one-shot `greppy -p "TASK"` stdout/stderr/exit-code contract is
+unchanged; `greppy -e -p` still reaches grep passthrough.
+
+Deterministic TUI previews (production renderer, not a mock layout):
+
+```bash
+GREPPY_WRITE_TUI_PREVIEWS=1 cargo test -p greppy --lib \
+  --features ci-test-assets,cpu-only agent_tui::preview_write -- --nocapture
+```
+
+The PNGs land at [`docs/assets/tui/agent-tui-120x36.png`](docs/assets/tui/agent-tui-120x36.png)
+and [`docs/assets/tui/agent-tui-80x24.png`](docs/assets/tui/agent-tui-80x24.png).
 
 ## Paper
 
