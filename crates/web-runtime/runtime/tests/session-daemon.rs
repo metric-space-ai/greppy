@@ -557,11 +557,34 @@ fn tree_rss_bytes(pid: u32) -> u64 {
     pids.into_iter().map(rss_bytes).sum()
 }
 
+fn this_web_runtime_image() -> PathBuf {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_web-runtime"));
+    std::fs::canonicalize(&exe).unwrap_or(exe)
+}
+
+fn leftover_matches_this_image(comm: &str, args: &str, own: &Path) -> bool {
+    let is_runtime = comm == "web-runtime" || comm.ends_with("/web-runtime");
+    let is_cliparent = comm.contains("cliparent") || args.contains("run_cliparent");
+    if !is_runtime && !is_cliparent {
+        return false;
+    }
+    if !is_runtime {
+        return true;
+    }
+    let argv0 = args.split_whitespace().next().unwrap_or("");
+    let argv0_path = Path::new(argv0);
+    if let Ok(canon) = std::fs::canonicalize(argv0_path) {
+        return canon == own;
+    }
+    argv0_path == own || args.starts_with(&format!("{} ", own.display()))
+}
+
 fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
     let self_pid = std::process::id();
+    let own = this_web_runtime_image();
     let exe = env!("CARGO_BIN_EXE_web-runtime");
     let mut found = Vec::new();
-    for pattern in [exe, "internal-role", "run_cliparent", "cliparent"] {
+    for pattern in [exe, own.to_str().unwrap_or(exe), "internal-role", "run_cliparent", "cliparent"] {
         let output = Command::new("pgrep")
             .args(["-lf", pattern])
             .output()
@@ -579,15 +602,8 @@ fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
             if pid == self_pid {
                 continue;
             }
-            // pgrep -lf matches any command line that mentions the binary path,
-            // including zsh -c copy scripts and workers from other worktrees.
             let comm = process_comm(pid);
-            let is_runtime = comm == "web-runtime" || comm.ends_with("/web-runtime");
-            let is_cliparent = comm.contains("cliparent") || args.contains("run_cliparent");
-            if !is_runtime && !is_cliparent {
-                continue;
-            }
-            if is_runtime && !args.contains(exe) {
+            if !leftover_matches_this_image(&comm, args, &own) {
                 continue;
             }
             found.push((pid, args.trim().to_owned()));
@@ -596,6 +612,33 @@ fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
     found.sort_by_key(|(pid, _)| *pid);
     found.dedup_by_key(|(pid, _)| *pid);
     found
+}
+
+
+#[test]
+fn leftover_matches_this_image_ignores_other_trees_and_copy_scripts() {
+    let own = Path::new("/Users/me/greppy/crates/web-runtime/target/debug/web-runtime");
+    assert!(
+        leftover_matches_this_image(
+            "web-runtime",
+            "/Users/me/greppy/crates/web-runtime/target/debug/web-runtime --internal-role content",
+            own
+        )
+    );
+    assert!(
+        !leftover_matches_this_image(
+            "web-runtime",
+            "/Volumes/tmp/greppy-acceptance/crates/web-runtime/target/debug/web-runtime --internal-role content",
+            own
+        )
+    );
+    assert!(
+        !leftover_matches_this_image(
+            "zsh",
+            "zsh -c cp /Users/me/greppy/crates/web-runtime/target/debug/web-runtime /tmp/out",
+            own
+        )
+    );
 }
 
 fn assert_no_leftover_web_runtime_processes() {
