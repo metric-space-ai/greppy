@@ -936,6 +936,66 @@ impl ContentEngine {
         }
     }
 
+    fn load_committed(&self, webview: &WebView, last_js: &mut Instant) -> bool {
+        match webview.load_status() {
+            LoadStatus::Complete => true,
+            LoadStatus::HeadParsed if last_js.elapsed() >= Duration::from_millis(200) => {
+                *last_js = Instant::now();
+                match self.evaluate_until(
+                    webview.clone(),
+                    "document.readyState",
+                    Duration::from_millis(150),
+                ) {
+                    Ok(JSValue::String(state)) => {
+                        load_status_allows_navigation(LoadStatus::HeadParsed, Some(&state))
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn spin_until_loaded(
+        &self,
+        webview: &WebView,
+        timeout: Duration,
+        mut url_settled: impl FnMut() -> bool,
+    ) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut last_js = Instant::now() - Duration::from_millis(200);
+        loop {
+            if self.parent_dead() {
+                return Err(Self::parent_gone());
+            }
+            if url_settled() && self.load_committed(webview, &mut last_js) {
+                return Ok(true);
+            }
+            self.servo.spin_event_loop();
+            if url_settled() && self.load_committed(webview, &mut last_js) {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            match poll_wake_step(
+                &self.wake,
+                &mut || false,
+                remaining.min(Duration::from_millis(10)),
+            ) {
+                WakePoll::Ready | WakePoll::TimedOut => {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                }
+                WakePoll::NeedSpin { .. } => {
+                    self.servo.spin_event_loop();
+                }
+            }
+        }
+    }
+
     fn next_pump_token(&self) -> String {
         track_pump_token(&self.pump_pending, &self.pump_nonce)
     }
@@ -1652,13 +1712,12 @@ impl ContentEngine {
                 let loading = webview.clone();
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
-                if !self.spin_until(call_timeout(&params), move || {
+                if !self.spin_until_loaded(&loading, call_timeout(&params), || {
                     denied.denied_navigation.borrow().is_some()
-                        || (loading.load_status() == LoadStatus::Complete
-                            && loading.url().is_some_and(|current| {
-                                urls_match(&current, &expected)
-                                    || previous.as_ref().is_some_and(|old| current != *old)
-                            }))
+                        || loading.url().is_some_and(|current| {
+                            urls_match(&current, &expected)
+                                || previous.as_ref().is_some_and(|old| current != *old)
+                        })
                 })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -2304,9 +2363,7 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
-                if !self.spin_until(call_timeout(&params), move || {
-                    loading.load_status() == LoadStatus::Complete
-                })? {
+                if !self.spin_until_loaded(&loading, call_timeout(&params), || true)? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out waiting for load state",
@@ -2847,9 +2904,7 @@ impl ContentEngine {
                 if ok {
                     webview.go_back(1);
                     let loading = webview.clone();
-                    let _ = self.spin_until(call_timeout(&params), move || {
-                        loading.load_status() == LoadStatus::Complete
-                    })?;
+                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
                     webview.paint();
                     self.servo.spin_event_loop();
                 }
@@ -2865,9 +2920,7 @@ impl ContentEngine {
                 if ok {
                     webview.go_forward(1);
                     let loading = webview.clone();
-                    let _ = self.spin_until(call_timeout(&params), move || {
-                        loading.load_status() == LoadStatus::Complete
-                    })?;
+                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
                     webview.paint();
                     self.servo.spin_event_loop();
                 }
@@ -3484,6 +3537,14 @@ fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
     )));
 }
 
+fn load_status_allows_navigation(status: LoadStatus, ready_state: Option<&str>) -> bool {
+    match status {
+        LoadStatus::Complete => true,
+        LoadStatus::HeadParsed => matches!(ready_state, Some("complete") | Some("interactive")),
+        LoadStatus::Started => false,
+    }
+}
+
 fn urls_match(current: &Url, expected: &Url) -> bool {
     current.scheme() == expected.scheme()
         && current.host() == expected.host()
@@ -3675,6 +3736,31 @@ mod serialize_tests {
             .unwrap()["serialized"]["o"][0]["k"],
             json!("answer")
         );
+    }
+
+    #[test]
+    fn headparsed_with_interactive_ready_state_commits_navigation() {
+        assert!(load_status_allows_navigation(
+            LoadStatus::Complete,
+            None
+        ));
+        assert!(load_status_allows_navigation(
+            LoadStatus::HeadParsed,
+            Some("interactive")
+        ));
+        assert!(load_status_allows_navigation(
+            LoadStatus::HeadParsed,
+            Some("complete")
+        ));
+        assert!(!load_status_allows_navigation(
+            LoadStatus::HeadParsed,
+            Some("loading")
+        ));
+        assert!(!load_status_allows_navigation(LoadStatus::HeadParsed, None));
+        assert!(!load_status_allows_navigation(
+            LoadStatus::Started,
+            Some("complete")
+        ));
     }
 
     #[test]
