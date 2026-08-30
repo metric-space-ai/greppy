@@ -1,0 +1,12 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "wait-for-function-value.mjs",
+  "test": "wait_for_function_preserves_value_error_and_ignores_forged_nonce",
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Page.waitForFunction"
+  ],
+  "scope": "Named Greppy fixture proves waitForFunction returns nontrivial predicate values, preserves predicate errors, and ignores forged waiter nonces. Not an oracle comparison against playwright@1.62.1 + Chromium.",
+  "behavior": "unverified"
+}

@@ -1,0 +1,12 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "spa-hydrate.mjs",
+  "test": "hydrated_spa_wait_for_function_sees_async_dom_update",
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Page.waitForFunction"
+  ],
+  "scope": "Named Greppy fixture proves Page.waitForFunction observes async DOM hydrate after setContent timers. Not an oracle comparison against playwright@1.62.1 + Chromium.",
+  "behavior": "unverified"
+}

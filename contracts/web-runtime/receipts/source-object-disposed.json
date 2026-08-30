@@ -1,0 +1,20 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "object-disposed.mjs",
+  "test": "closed_page_and_browser_throw_object_disposed",
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Page.close",
+    "Page.isClosed",
+    "Page.evaluate",
+    "Locator.click",
+    "Browser.close",
+    "Browser.newPage",
+    "Browser.newContext",
+    "BrowserContext.close",
+    "BrowserContext.newPage"
+  ],
+  "scope": "Named Greppy fixture proves closed/stale Page, BrowserContext, and Browser handles throw object_disposed. Not an oracle comparison against playwright@1.62.1 + Chromium.",
+  "behavior": "unverified"
+}

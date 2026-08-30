@@ -43,7 +43,10 @@
         "web.search",
         "web.read",
         "web.research",
-        "web.artifacts"
+        "web.artifacts",
+        "web.shutdown",
+        "web.cancel",
+        "web.heartbeat"
       ]
     },
     "public_operations": {
@@ -476,7 +479,8 @@
         "run_id",
         "deadline_ms",
         "operation",
-        "payload"
+        "payload",
+        "capability"
       ],
       "properties": {
         "schema": { "$ref": "#/$defs/schema_id" },
@@ -485,7 +489,8 @@
         "session_id": { "$ref": "#/$defs/session_id" },
         "deadline_ms": { "type": "integer", "minimum": 0 },
         "operation": { "$ref": "#/$defs/operation" },
-        "payload": { "type": "object" }
+        "payload": { "type": "object" },
+        "capability": { "$ref": "#/$defs/capability" }
       },
       "allOf": [
         {

@@ -1,0 +1,19 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "actionability.mjs",
+  "tests": [
+    "actionability fixture via run_actab / sequential run_seq2"
+  ],
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Locator.click",
+    "Locator.fill",
+    "Locator.isVisible",
+    "Locator.waitFor",
+    "Page.getByRole",
+    "Page.setDefaultTimeout"
+  ],
+  "scope": "Named Greppy fixture exercises locator actionability waits with setDefaultTimeout. Not an oracle comparison against playwright@1.62.1 + Chromium. Locator.fill/isVisible may also have separate Chromium oracle receipts.",
+  "behavior": "unverified"
+}

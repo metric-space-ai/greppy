@@ -217,7 +217,8 @@
       "behavior": "unverified",
       "tests": [
         "keyboard",
-        "locator-state"
+        "locator-state",
+        "object-disposed"
       ],
       "known_differences": [
         "drops the Servo WebView from the content worker; not Chromium target close"
@@ -336,7 +337,8 @@
         "compat-core",
         "native-dialog",
         "oracle-setcontent",
-        "evaluate-arg"
+        "evaluate-arg",
+        "object-disposed"
       ],
       "known_differences": [
         "oracle-setcontent.json covers numeric evaluate 1+1 only",
@@ -710,7 +712,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "locator-state"
+        "locator-state",
+        "object-disposed"
       ],
       "known_differences": [
         "true after page.close removes the Servo WebView"
@@ -1051,10 +1054,11 @@
       "behavior": "unverified",
       "tests": [
         "embedder-surface",
-        "route-fulfill"
+        "route-fulfill",
+        "route-continue"
       ],
       "known_differences": [
-        "handler is invoked with a stub Route that registers abort/fulfill/continue patterns",
+        "handler is invoked at page.route() registration and stores a static RouteRule (abort/fulfill/continue); per-request Playwright callbacks are not yet implemented",
         "Servo load_web_resource intercept in content-worker only"
       ]
     },
@@ -1181,9 +1185,10 @@
         "extra-headers"
       ],
       "known_differences": [
-        "accepted and ignored; not attached to Servo requests",
-        "headers are attached to subsequent page.goto main-frame navigations via Servo UrlRequest",
-        "subresource requests are not rewritten; that is not claimed as Chromium extraHTTPHeaders behavior"
+        "headers ride WebResourceLoad::continue_with_headers in the vendored fetch pipeline above TLS (HTTP and HTTPS documents, /sub.js, 302 redirects)",
+        "page extras override context extras on the same name; non-overlapping context extras still send",
+        "sibling contexts do not inherit extras",
+        "not a Chromium extraHTTPHeaders parity claim; behavior:unverified until an oracle receipt exists"
       ]
     },
     {
@@ -1371,7 +1376,9 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "extra-selectors"
+        "extra-selectors",
+        "spa-hydrate",
+        "wait-for-function-value"
       ],
       "known_differences": [
         "polls page.evaluate until truthy; timeout is accepted; polling and other options throw; no JSHandle"
@@ -3729,7 +3736,8 @@
       "behavior": "unverified",
       "tests": [
         "cookies",
-        "locator-options"
+        "locator-options",
+        "object-disposed"
       ],
       "known_differences": [
         "engine no-op besides acknowledging close; pages are not torn down independently of Browser.close",
@@ -3822,7 +3830,8 @@
       "behavior": "unverified",
       "tests": [
         "phase1-spike",
-        "compat-core"
+        "compat-core",
+        "object-disposed"
       ],
       "known_differences": [
         "extraHTTPHeaders is accepted and merged over context headers; other newPage options throw"
@@ -4022,8 +4031,9 @@
         "extra-headers"
       ],
       "known_differences": [
-        "applies Page.setExtraHTTPHeaders to current and later pages in the context",
-        "same limitation as Page.setExtraHTTPHeaders: main-frame goto via Servo UrlRequest, not subresources"
+        "applies to current and later pages in the context via the same continue_with_headers path as Page.setExtraHTTPHeaders",
+        "page extras override context extras on the same name",
+        "not a Chromium extraHTTPHeaders parity claim; behavior:unverified until an oracle receipt exists"
       ]
     },
     {
@@ -4627,7 +4637,8 @@
         "phase1-spike",
         "compat-core",
         "launch-close",
-        "locator-options"
+        "locator-options",
+        "object-disposed"
       ],
       "known_differences": [
         "closes remaining contexts then emits disconnected; engine browser.close clears Servo pages"
@@ -4684,7 +4695,8 @@
       "tests": [
         "phase1-spike",
         "compat-core",
-        "cookies"
+        "cookies",
+        "object-disposed"
       ],
       "known_differences": [
         "storageState and extraHTTPHeaders are the accepted options; viewport/userAgent/locale/timezoneId/geolocation/permissions/colorScheme stay unsupported"
@@ -4698,7 +4710,8 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "compat-core"
+        "compat-core",
+        "object-disposed"
       ],
       "known_differences": [
         "implemented as newContext()+newPage(); options are forwarded to newContext (storageState and extraHTTPHeaders accepted; others throw)"
@@ -6573,7 +6586,8 @@
         "phase1-spike",
         "hover",
         "actionability",
-        "locator-options"
+        "locator-options",
+        "object-disposed"
       ],
       "known_differences": [
         "timeout is accepted; force/trial/position and other click options throw unsupported_playwright_operation",
@@ -9782,10 +9796,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "unverified",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "fail-closed; no Credentials factory"
+      ]
     },
     {
       "symbol": "Credentials.delete",
@@ -9942,10 +9960,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "unverified",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "fail-closed; no Debugger factory"
+      ]
     },
     {
       "symbol": "Debugger.resume",
@@ -10716,10 +10738,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "unverified",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "fail-closed; no Logger factory"
+      ]
     },
     {
       "symbol": "Logger.color",
@@ -11497,10 +11523,13 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "embedder-surface"
+        "embedder-surface",
+        "route-continue"
       ],
       "known_differences": [
-        "DoNotIntercept / unhandled pattern continues the load"
+        "DoNotIntercept / unhandled pattern continues the load",
+        "handler is invoked at page.route() registration and stores a static RouteRule; per-request Playwright callbacks are not yet implemented",
+        "Route.continue headers merge onto the matched request (page extras then continue headers); url/method/postData stay fail-closed"
       ]
     },
     {
@@ -12066,10 +12095,14 @@
       "kind": "method",
       "origin": "parser",
       "schema": "unverified",
-      "source": "unverified",
+      "source": "passing",
       "behavior": "unverified",
-      "tests": [],
-      "known_differences": []
+      "tests": [
+        "fail-closed-surface"
+      ],
+      "known_differences": [
+        "fail-closed; no WebError factory"
+      ]
     },
     {
       "symbol": "WebError.location",
