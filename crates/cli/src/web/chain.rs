@@ -19,6 +19,30 @@ pub enum ChainCommand {
         #[command(subcommand)]
         command: ScriptCommand,
     },
+    /// Run several web commands in one process, separated by `::`.
+    ///
+    ///   greppy web do --json open URL :: click css=#btn :: observe
+    ///
+    /// Own flags come BEFORE the first step: everything after it belongs to
+    /// the steps, so a trailing `--json` would be read as an argument of the
+    /// last command.
+    ///
+    /// One session, one runtime, no teardown between steps. Stops at the
+    /// first failing step so a chain cannot walk on through an unknown page
+    /// state.
+    Do {
+        /// Steps, separated by a literal `::` argument.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        steps: Vec<String>,
+        /// Keep going after a failing step instead of stopping.
+        #[arg(long)]
+        continue_on_error: bool,
+        /// Print the parsed steps and exit without running them.
+        #[arg(long)]
+        explain: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,7 +92,15 @@ pub enum ScriptCommand {
 }
 
 pub(super) fn dispatch(command: ChainCommand, root: Option<&str>) -> Result<i32> {
-    let ChainCommand::Script { command } = command;
+    let command = match command {
+        ChainCommand::Do {
+            steps,
+            continue_on_error,
+            explain,
+            json,
+        } => return run_chain(root, &steps, continue_on_error, explain, json),
+        ChainCommand::Script { command } => command,
+    };
     match command {
         ScriptCommand::Save {
             name,
@@ -319,9 +351,155 @@ fn run_saved(
     rpc(root, json_out, "web.run", payload, Some(session))
 }
 
+/// Split the trailing argument list on the literal `::` separator.
+fn split_steps(steps: &[String]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for token in steps {
+        if token == "::" {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(token.clone());
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn run_chain(
+    root: Option<&str>,
+    steps: &[String],
+    continue_on_error: bool,
+    explain: bool,
+    json_out: bool,
+) -> Result<i32> {
+    use clap::Parser;
+
+    let parsed = split_steps(steps);
+    if parsed.is_empty() {
+        return emit_error(
+            json_out,
+            invalid("web do requires at least one step, e.g. `web do open URL :: observe`"),
+        );
+    }
+
+    // Parse every step before running any of them: a typo in step four must
+    // not surface after step three has already changed the page.
+    #[derive(Parser)]
+    #[command(name = "greppy web", no_binary_name = true)]
+    struct StepParser {
+        #[command(subcommand)]
+        command: super::WebCommand,
+    }
+
+    let mut commands = Vec::new();
+    for (index, step) in parsed.iter().enumerate() {
+        match StepParser::try_parse_from(step) {
+            Ok(parsed) => commands.push(parsed.command),
+            Err(error) => {
+                let first = error.to_string();
+                let first = first.lines().next().unwrap_or("unparsable step");
+                return emit_error(
+                    json_out,
+                    invalid(&format!(
+                        "web do: step {} (`{}`) is not a valid command: {first}",
+                        index + 1,
+                        step.join(" ")
+                    )),
+                );
+            }
+        }
+    }
+
+    if explain {
+        let plan: Vec<serde_json::Value> = parsed
+            .iter()
+            .enumerate()
+            .map(|(index, step)| json!({ "step": index + 1, "argv": step }))
+            .collect();
+        return ok(json_out, "web.do.explain", json!({ "steps": plan }));
+    }
+
+    let mut ran = 0usize;
+    let mut failed = 0usize;
+    let mut last_code = 0i32;
+    for (index, command) in commands.into_iter().enumerate() {
+        // `dispatch_inner`, not `dispatch`: the outer guard already owns the
+        // runtime lifetime for the whole chain.
+        let code = super::dispatch_inner(command, root)?;
+        ran += 1;
+        if code != 0 {
+            failed += 1;
+            last_code = code;
+            if !continue_on_error {
+                emit_web(
+                    json_out,
+                    &json!({
+                        "schema": "greppy.web-runtime.v1",
+                        "status": "error",
+                        "operation": "web.do",
+                        "result": {
+                            "steps_total": parsed.len(),
+                            "steps_ran": ran,
+                            "steps_failed": failed,
+                            "stopped_at": index + 1,
+                            "argv": parsed[index],
+                        },
+                    }),
+                )?;
+                return Ok(code);
+            }
+        }
+    }
+    emit_web(
+        json_out,
+        &json!({
+            "schema": "greppy.web-runtime.v1",
+            "status": if failed == 0 { "ok" } else { "error" },
+            "operation": "web.do",
+            "result": {
+                "steps_total": parsed.len(),
+                "steps_ran": ran,
+                "steps_failed": failed,
+            },
+        }),
+    )?;
+    Ok(if failed == 0 { 0 } else { last_code })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steps_split_on_the_double_colon() {
+        let argv: Vec<String> = ["open", "URL", "::", "click", "css=#b", "::", "observe"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let steps = split_steps(&argv);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], vec!["open", "URL"]);
+        assert_eq!(steps[2], vec!["observe"]);
+    }
+
+    #[test]
+    fn empty_segments_do_not_become_steps() {
+        let argv: Vec<String> = ["::", "observe", "::", "::"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(split_steps(&argv), vec![vec!["observe".to_string()]]);
+    }
+
+    #[test]
+    fn no_steps_at_all_yields_nothing() {
+        assert!(split_steps(&[]).is_empty());
+    }
 
     #[test]
     fn names_may_not_escape_the_store() {

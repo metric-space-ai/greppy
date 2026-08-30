@@ -52,6 +52,15 @@ pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
         }
     }
     let _standalone = StandaloneShutdown;
+    dispatch_inner(command, root)
+}
+
+/// Dispatch without the standalone-shutdown guard.
+///
+/// `web do` runs several commands inside one process. Routing each step
+/// through `dispatch` would arm a second guard whose `Drop` tears the runtime
+/// down after the first step, so a chain must use this entry instead.
+pub(super) fn dispatch_inner(command: WebCommand, root: Option<&str>) -> Result<i32> {
     match command {
         WebCommand::Sessions(command) => sessions::dispatch(command, root),
         WebCommand::Results(command) => results::dispatch(command, root),
