@@ -79,9 +79,9 @@ use search::*;
 mod read;
 mod web;
 mod web_attach;
+use read::*;
 pub use web::web_runtime_socket;
 pub use web_attach::{generate_attach_token, give_child_attach_token};
-use read::*;
 mod plus;
 use plus::*;
 mod indexing;
@@ -605,7 +605,22 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
 /// `grep` passthrough and forward the original `OsString` argv to real
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
+pub fn startup_trace(phase: &str) {
+    if std::env::var_os("GREPPY_STARTUP_TRACE").is_none() {
+        return;
+    }
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static T0: OnceLock<Instant> = OnceLock::new();
+    let t0 = T0.get_or_init(Instant::now);
+    eprintln!(
+        "startup-trace +{:.3}ms {phase}",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
+    startup_trace("run_os.enter");
     // Hidden Landlock launcher (Linux only): the agent sandbox rewrites tool
     // spawns as `<exe> __agent-sandbox-landlock <spec> -- <real argv…>`. Intercept
     // before every other route — including grep-name argv0 and `-p` — so this
@@ -702,16 +717,31 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     // invocation cannot touch Greppy state.
     // Skip under GREPPY_AGENT_RUN: agent tool children only have write access to
     // their own store + lock namespace, not trash/other workspaces that GC needs.
-    if !is_trial_invocation(&argv) && std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_none() {
+    // `web doctor` is facts-only: it must not spawn engines and must not scan
+    // the Greppy store. Other structured commands still run throttled GC.
+    let skip_gc = is_trial_invocation(&argv)
+        || is_web_doctor_invocation(&argv)
+        || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
+    startup_trace(if skip_gc {
+        "run_os.gc_skipped"
+    } else {
+        "run_os.gc_begin"
+    });
+    if !skip_gc {
         maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+        startup_trace("run_os.gc_end");
     }
     // Structured subcommand (or help/version): clap can parse it. Any
     // non-UTF-8 here is a genuine usage error for a structured command.
     // P3: a failed agent call must TEACH the correct retry in the same
     // output — one short error line plus the affected subcommand's usage,
     // never a multi-KB dump. Explicit --help/--version keep clap's output.
+    startup_trace("run_os.clap_begin");
     let cli = match <Cli as Parser>::try_parse_from(argv.iter()) {
-        Ok(cli) => cli,
+        Ok(cli) => {
+            startup_trace("run_os.clap_ok");
+            cli
+        }
         Err(e) => {
             use clap::error::ErrorKind;
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
@@ -1305,7 +1335,7 @@ fn peek_root_arg(argv: &[std::ffi::OsString]) -> Option<String> {
 /// Trial arms own their complete cache/config namespace. Skip the normal
 /// structured-command cache maintenance pass so the parent process cannot
 /// touch an ambient Greppy store before those namespaces are installed.
-fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
+fn first_structured_verb(argv: &[std::ffi::OsString]) -> Option<&std::ffi::OsStr> {
     let mut i = 1;
     while i < argv.len() {
         let token = &argv[i];
@@ -1321,7 +1351,42 @@ fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
             i += 1;
             continue;
         }
-        return token == "trial";
+        return Some(token.as_os_str());
+    }
+    None
+}
+
+fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
+    first_structured_verb(argv).is_some_and(|verb| verb == "trial")
+}
+
+fn is_web_doctor_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let mut i = 1;
+    let mut seen_web = false;
+    while i < argv.len() {
+        let token = &argv[i];
+        if token == "--root" || token == "--device" {
+            i += 2;
+            continue;
+        }
+        let token_lossy = token.to_string_lossy();
+        if token_lossy.starts_with("--root=")
+            || token_lossy.starts_with("--device=")
+            || token == "--no-gpu"
+            || token_lossy.starts_with("--")
+        {
+            i += 1;
+            continue;
+        }
+        if !seen_web {
+            if token == "web" {
+                seen_web = true;
+                i += 1;
+                continue;
+            }
+            return false;
+        }
+        return token == "doctor";
     }
     false
 }
@@ -6977,6 +7042,111 @@ fn embedded_asset_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Debug/test profile only: copy digest-verified files from the compile-time
+/// repo path. This is not a production one-binary or signed-release cold-start
+/// claim. Release builds still `include_bytes!` the same pinned assets.
+#[cfg(debug_assertions)]
+fn extract_repo_model_asset(
+    model_root: &std::path::Path,
+    expected_sha: &str,
+    name: &str,
+    src: &str,
+) -> Option<String> {
+    let src = std::path::Path::new(src);
+    let digest = embedded_asset_sha256_file(src).ok()?;
+    if digest != expected_sha {
+        return None;
+    }
+    let bytes = std::fs::read(src).ok()?;
+    extract_embedded_asset(model_root, expected_sha, name, &bytes)
+}
+
+#[cfg(all(test, debug_assertions))]
+mod debug_repo_model_asset_guards {
+    #[test]
+    fn extract_repo_model_asset_rejects_digest_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "greppy-debug-asset-mismatch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bogus.bin");
+        std::fs::write(&src, b"not a model").unwrap();
+        assert!(
+            super::extract_repo_model_asset(
+                std::path::Path::new("debug-asset-mismatch"),
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "asset.bin",
+                src.to_str().unwrap(),
+            )
+            .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_time_repo_assets_match_pinned_digests() {
+        for (path, sha) in [
+            (
+                env!("GREPPY_EMBEDDED_GGUF_PATH"),
+                env!("GREPPY_EMBEDDED_GGUF_SHA"),
+            ),
+            (
+                env!("GREPPY_EMBEDDED_TOK_PATH"),
+                env!("GREPPY_EMBEDDED_TOK_SHA"),
+            ),
+            (
+                env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"),
+                env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA"),
+            ),
+            (
+                env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"),
+                env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA"),
+            ),
+        ] {
+            let path = std::path::Path::new(path);
+            assert!(path.is_file(), "{}", path.display());
+            assert_eq!(
+                super::embedded_asset_sha256_file(path).unwrap(),
+                sha,
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+mod release_embedded_model_guards {
+    #[test]
+    fn release_include_bytes_match_pinned_digests() {
+        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
+        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
+        static QWEN: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
+        static QWEN_TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
+        assert_eq!(
+            super::embedded_asset_sha256(GGUF),
+            env!("GREPPY_EMBEDDED_GGUF_SHA")
+        );
+        assert_eq!(
+            super::embedded_asset_sha256(TOK),
+            env!("GREPPY_EMBEDDED_TOK_SHA")
+        );
+        assert_eq!(
+            super::embedded_asset_sha256(QWEN),
+            env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA")
+        );
+        assert_eq!(
+            super::embedded_asset_sha256(QWEN_TOK),
+            env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA")
+        );
+        assert!(
+            GGUF.len() > 1024 * 1024 && QWEN.len() > 1024 * 1024,
+            "release must bake the product models, not CI sentinels"
+        );
+    }
+}
+
 /// Built-in EmbeddingGemma: the Q4_K GGUF and
 /// tokenizer are baked into the binary at build time and extracted once
 /// to `<data>/greppy/models/embeddinggemma-300m-q4k/<sha>/` (mmap needs a real
@@ -6989,14 +7159,34 @@ mod embeddinggemma_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
-        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
-        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
-        let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
-        let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-        Some((gguf, tok))
+        #[cfg(not(debug_assertions))]
+        {
+            static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
+            static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
+            let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
+            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+            return Some((gguf, tok));
+        }
+        #[cfg(debug_assertions)]
+        {
+            let gguf = super::extract_repo_model_asset(
+                &root,
+                GGUF_SHA,
+                "embeddinggemma-300M-Q4_K.gguf",
+                env!("GREPPY_EMBEDDED_GGUF_PATH"),
+            )?;
+            let tok = super::extract_repo_model_asset(
+                &root,
+                TOK_SHA,
+                "tokenizer.json",
+                env!("GREPPY_EMBEDDED_TOK_PATH"),
+            )?;
+            Some((gguf, tok))
+        }
     }
 
+    #[cfg(not(debug_assertions))]
     fn extract(
         root: &std::path::Path,
         expected_sha: &str,
@@ -7008,7 +7198,14 @@ mod embeddinggemma_assets {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
+        fn extract(
+            root: &std::path::Path,
+            expected_sha: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Option<String> {
+            crate::extract_embedded_asset(root, expected_sha, name, bytes)
+        }
 
         #[test]
         fn cached_asset_resolves_while_model_has_shared_lease() {
@@ -7069,14 +7266,34 @@ mod qwen35_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
-        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
-        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
         let root = greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km");
-        let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
-        let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-        Some((gguf, tok))
+        #[cfg(not(debug_assertions))]
+        {
+            static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
+            static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
+            let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
+            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+            return Some((gguf, tok));
+        }
+        #[cfg(debug_assertions)]
+        {
+            let gguf = super::extract_repo_model_asset(
+                &root,
+                GGUF_SHA,
+                "Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
+                env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"),
+            )?;
+            let tok = super::extract_repo_model_asset(
+                &root,
+                TOK_SHA,
+                "tokenizer.json",
+                env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"),
+            )?;
+            Some((gguf, tok))
+        }
     }
 
+    #[cfg(not(debug_assertions))]
     fn extract(
         root: &std::path::Path,
         expected_sha: &str,
@@ -7088,7 +7305,14 @@ mod qwen35_assets {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
+        fn extract(
+            root: &std::path::Path,
+            expected_sha: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Option<String> {
+            crate::extract_embedded_asset(root, expected_sha, name, bytes)
+        }
 
         #[test]
         fn cached_asset_resolves_while_model_has_shared_lease() {

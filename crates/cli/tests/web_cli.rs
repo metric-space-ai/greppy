@@ -1,6 +1,8 @@
 //! `greppy web` CLI wiring. Does not require JavaScript engines.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
@@ -9,10 +11,9 @@ fn bin() -> &'static str {
 fn run(args: &[&str]) -> (i32, String, String) {
     let output = Command::new(bin())
         .args(args)
-        .env_remove("GREPPY_WEB_RUNTIME_SUPERVISOR")
-        .env_remove("GREPPY_WEB_CONTROLLER_WORKER")
-        .env_remove("GREPPY_WEB_CONTENT_WORKER")
+        .env_remove("GREPPY_WEB_RUNTIME")
         .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
         .env("PATH", "/usr/bin:/bin")
         .output()
         .expect("greppy web");
@@ -51,4 +52,586 @@ fn web_run_requires_session() {
     let (code, stdout, _stderr) = run(&["web", "run", "--script-file", "x.js", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");
     assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_observe_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "observe", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_search_requires_query() {
+    let (code, stdout, _stderr) = run(&["web", "search", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("query"));
+}
+
+#[test]
+fn web_read_requires_url() {
+    let (code, stdout, _stderr) = run(&["web", "read", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("url"));
+}
+
+#[test]
+fn web_research_requires_query() {
+    let (code, stdout, _stderr) = run(&["web", "research", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("query"));
+}
+
+#[test]
+fn web_search_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "search", "--query", "greppy", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_read_requires_session() {
+    let (code, stdout, _stderr) =
+        run(&["web", "read", "--url", "https://example.com", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_research_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "research", "--query", "greppy", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_search_accepts_fixture_url_and_search_endpoint_flags() {
+    let (code, stdout, stderr) = run(&[
+        "web",
+        "search",
+        "--query",
+        "greppy",
+        "--session",
+        "wrs_1",
+        "--fixture-url",
+        "http://127.0.0.1:9/search.html",
+        "--search-endpoint",
+        "http://127.0.0.1:9/search",
+        "--json",
+    ]);
+    assert_ne!(code, 2, "must not be unknown clap usage: stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("panicked") && !stdout.contains("panicked"),
+        "stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn web_search_limit_does_not_panic() {
+    let (code, stdout, stderr) = run(&[
+        "web",
+        "search",
+        "--query",
+        "greppy",
+        "--session",
+        "wrs_1",
+        "--limit",
+        "3",
+        "--json",
+    ]);
+    assert_ne!(
+        code, 101,
+        "web search --limit must not panic from clap type clash: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stdout.contains("panicked"),
+        "web search --limit panicked: stdout={stdout} stderr={stderr}"
+    );
+    assert_ne!(code, 2, "web search --limit must parse: stdout={stdout} stderr={stderr}");
+}
+
+#[test]
+fn web_search_result_limit_is_parsed() {
+    let (code, stdout, stderr) = run(&[
+        "web",
+        "search",
+        "--query",
+        "greppy",
+        "--session",
+        "wrs_1",
+        "--result-limit",
+        "3",
+        "--json",
+    ]);
+    assert_ne!(
+        code, 2,
+        "web search --result-limit must be a recognised flag: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stdout.contains("panicked"),
+        "stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn web_fixture_url_env_is_not_a_production_path() {
+    let output = Command::new(bin())
+        .args(["web", "status", "--json"])
+        .env_remove("GREPPY_WEB_RUNTIME")
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .env("GREPPY_WEB_FIXTURE_URL", "http://127.0.0.1:9/search.html")
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("greppy web status fixture env");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code().unwrap_or(1),
+        30,
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("GREPPY_WEB_FIXTURE_URL") || stderr.contains("GREPPY_WEB_FIXTURE_URL"),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("not a production path") || stderr.contains("not a production path"),
+        "must fail-closed rather than silently forward env, stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn web_status_resolves_packaged_dist_env() {
+    let pid = std::process::id();
+    let dist = std::env::temp_dir().join(format!("greppy-web-dist-cli-{pid}"));
+    let _ = std::fs::remove_dir_all(&dist);
+    std::fs::create_dir_all(dist.join("bin")).unwrap();
+    std::fs::write(
+        dist.join(".greppy-web-runtime-dist"),
+        "greppy.web-runtime.package.v1\n",
+    )
+    .unwrap();
+    let dummy = dist.join("bin").join("web-runtime");
+    std::fs::write(&dummy, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dummy).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dummy, perms).unwrap();
+    }
+    let mut child = Command::new(bin())
+        .args(["web", "status", "--json"])
+        .env_remove("GREPPY_WEB_RUNTIME")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
+        .env("GREPPY_WEB_RUNTIME_DIST", &dist)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("greppy web status dist");
+    let mut stdout_pipe = child.stdout.take().expect("stdout");
+    let mut stderr_pipe = child.stderr.take().expect("stderr");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&dist);
+                panic!(
+                    "web status against dummy dist exceeded 8s; dummy must exit without blocking on worker capability FD"
+                );
+            }
+            Err(error) => panic!("wait dummy dist status: {error}"),
+        }
+    };
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    stdout_pipe.read_to_end(&mut stdout_buf).ok();
+    stderr_pipe.read_to_end(&mut stderr_buf).ok();
+    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    let _ = std::fs::remove_dir_all(&dist);
+    #[cfg(unix)]
+    {
+        let dummy_path = dummy.display().to_string();
+        let leaked = Command::new("ps")
+            .args(["-ax", "-o", "args="])
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.contains(&dummy_path) && !line.contains("ps "))
+            })
+            .unwrap_or(false);
+        assert!(
+            !leaked,
+            "failed dummy web-runtime must be reaped, not left as PPID 1"
+        );
+    }
+    assert_ne!(
+        status.code().unwrap_or(1),
+        2,
+        "web must not be unknown clap usage: {stderr}"
+    );
+    assert!(
+        !stdout.contains("web-runtime distributable is not installed"),
+        "GREPPY_WEB_RUNTIME_DIST must resolve the stamped dist, stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("runtime_unavailable")
+            || stdout.contains("failed to spawn")
+            || stdout.contains("did not create")
+            || stdout.contains("greppy.web-runtime.v1"),
+        "expected a spawn/runtime failure against the dummy dist, stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn web_doctor_json_does_not_spawn_runtime() {
+    let pid = std::process::id();
+    let dist = std::env::temp_dir().join(format!("greppy-web-dist-doctor-{pid}"));
+    let store = std::env::temp_dir().join(format!("greppy-web-store-doctor-{pid}"));
+    let _ = std::fs::remove_dir_all(&dist);
+    let _ = std::fs::remove_dir_all(&store);
+    std::fs::create_dir_all(dist.join("bin")).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        dist.join(".greppy-web-runtime-dist"),
+        "greppy.web-runtime.package.v1\n",
+    )
+    .unwrap();
+    let dummy = dist.join("bin").join("web-runtime");
+    std::fs::write(&dummy, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dummy).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dummy, perms).unwrap();
+    }
+    let started = Instant::now();
+    let output = Command::new(bin())
+        .args(["web", "doctor", "--json"])
+        .env_remove("GREPPY_WEB_RUNTIME")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
+        .env("GREPPY_WEB_RUNTIME_DIST", &dist)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("greppy web doctor dist");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let dummy_path = dummy.display().to_string();
+    let _ = std::fs::remove_dir_all(&dist);
+    let _ = std::fs::remove_dir_all(&store);
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "doctor hung instead of returning handshake facts, elapsed={elapsed:?} stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        output.status.code().unwrap_or(1),
+        0,
+        "doctor against dummy dist must succeed without exec, stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("\"protocol_version\"") || stdout.contains("greppy.web-runtime.v1"),
+        "doctor must report handshake schema, stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("web-runtime-0.1.0"),
+        "doctor must report runtime_build_id, stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("process_health") && !stdout.contains("controller_alive"),
+        "doctor must not report live workers, stdout={stdout}"
+    );
+    #[cfg(unix)]
+    {
+        let leaked = Command::new("ps")
+            .args(["-ax", "-o", "args="])
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.contains(&dummy_path) && !line.contains("ps "))
+            })
+            .unwrap_or(false);
+        assert!(
+            !leaked,
+            "doctor must not spawn the dummy web-runtime executable"
+        );
+    }
+}
+
+
+#[cfg(unix)]
+fn locate_web_runtime() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("GREPPY_WEB_RUNTIME") {
+        let path = std::path::PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+    }
+    let greppy = std::path::PathBuf::from(bin());
+    if let Some(dir) = greppy.parent() {
+        let sibling = dir.join("web-runtime");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest.join("../web-runtime/runtime/target/debug/web-runtime"),
+        manifest.join("../web-runtime/target/debug/web-runtime"),
+        manifest.join("../../target/debug/web-runtime"),
+        manifest.join("../web-runtime/runtime/target/release/web-runtime"),
+    ];
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "web-runtime binary not found for attach CLI proof; build crates/web-runtime/runtime"
+    );
+}
+
+#[cfg(unix)]
+fn wait_unix_socket(path: &std::path::Path, child: &mut std::process::Child, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => panic!(
+                "supervisor exited {status} before socket {} accepted",
+                path.display()
+            ),
+            Ok(None) | Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    panic!(
+        "supervisor socket {} was not accepting within {budget:?}",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+fn greppy_web_status(run_id: &str, runtime: &std::path::Path, token: Option<&str>) -> (i32, String, String) {
+    use greppy::give_child_attach_token;
+    let mut cmd = Command::new(bin());
+    cmd.args(["web", "status", "--json"])
+        .env("GREPPY_RUN_ID", run_id)
+        .env("GREPPY_WEB_RUNTIME", runtime)
+        .env_remove("GREPPY_WEB_ATTACH")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null());
+    let hold = token.map(|token| {
+        give_child_attach_token(&mut cmd, token).expect("inherit attach token fd")
+    });
+    let output = cmd.output().expect("greppy web status child");
+    drop(hold);
+    (
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_owned_attach_authorizes_separate_cli_children_and_denies_others() {
+    use greppy::{generate_attach_token, give_child_attach_token, web_runtime_socket};
+    use greppy_web_client::Request;
+    use serde_json::json;
+    use std::os::unix::process::CommandExt;
+
+    let runtime = locate_web_runtime();
+    let run_id = format!(
+        "run_attachcli_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let token = generate_attach_token().expect("urandom must fail-closed, not yield zeros silently");
+    assert!(token.len() >= 16, "token={token}");
+    assert_ne!(token, "0".repeat(token.len()), "entropy must not be silent zeros");
+    let socket = web_runtime_socket(&run_id).expect("web-runtime socket path");
+    let _ = std::fs::remove_file(&socket);
+
+    let mut supervisor = Command::new(&runtime);
+    supervisor
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--run-id")
+        .arg(&run_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    let pass = give_child_attach_token(&mut supervisor, &token).expect("supervisor attach fd");
+    let mut supervisor_child = supervisor.spawn().expect("spawn supervisor");
+    drop(pass);
+    wait_unix_socket(&socket, &mut supervisor_child, Duration::from_secs(60));
+
+    let (code, stdout, stderr) = greppy_web_status(&run_id, &runtime, Some(&token));
+    assert_eq!(
+        code, 0,
+        "authorized child 1 must attach via inherited fd, stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("GREPPY_WEB_ATTACH") && !stderr.contains("GREPPY_WEB_ATTACH"),
+        "capability must not travel through env, stdout={stdout} stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = greppy_web_status(&run_id, &runtime, Some(&token));
+    assert_eq!(
+        code, 0,
+        "authorized child 2 is a separate process and must reuse the parent token via fd, stdout={stdout} stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = greppy_web_status(&run_id, &runtime, None);
+    assert_ne!(code, 0, "missing fd must fail-closed, stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("session_not_owned") || stderr.contains("session_not_owned"),
+        "missing attach must be session_not_owned, stdout={stdout} stderr={stderr}"
+    );
+
+    let wrong = "00".repeat(16);
+    let (code, stdout, stderr) = greppy_web_status(&run_id, &runtime, Some(&wrong));
+    assert_ne!(code, 0, "wrong token must fail-closed, stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("session_not_owned") || stderr.contains("session_not_owned"),
+        "wrong attach must be session_not_owned, stdout={stdout} stderr={stderr}"
+    );
+
+    let mut missing = Request::new(&run_id, "web.status", json!({}));
+    missing.capability = String::new();
+    let denied = greppy_web_client::unix_request(&socket, &missing, Duration::from_secs(5))
+        .expect("endpoint-only connect");
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert_eq!(
+        denied.error.as_ref().map(|error| error.code.as_str()),
+        Some("session_not_owned"),
+        "{denied:?}"
+    );
+
+    let mut shutdown = Request::new(&run_id, "web.shutdown", json!({}));
+    shutdown.capability = token;
+    let stopped = greppy_web_client::unix_request(&socket, &shutdown, Duration::from_secs(5))
+        .expect("authorized shutdown");
+    assert_eq!(stopped.status, "ok", "{stopped:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match supervisor_child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = supervisor_child.try_wait();
+                panic!("supervisor did not exit after web.shutdown; do not treat kill as success");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+
+#[cfg(unix)]
+fn unrelated_child_must_not_see_token(token: &str) -> (i32, String, String) {
+    let output = Command::new("/usr/bin/perl")
+        .arg("-e")
+        .arg(
+            r#"
+use Fcntl;
+my $token = $ARGV[0];
+for my $fd (3 .. 64) {
+    my $flags = fcntl($fd, F_GETFD, 0);
+    next unless defined $flags;
+    if ($fd == 4) {
+        print "FD4_OPEN\n";
+        exit 3;
+    }
+    my $buf = "";
+    sysseek($fd, 0, 0);
+    sysread($fd, $buf, 256);
+    if (index($buf, $token) >= 0) {
+        print "TOKEN_ON_FD_${fd}\n";
+        exit 2;
+    }
+}
+exit 0;
+"#,
+        )
+        .arg(token)
+        .stdin(Stdio::null())
+        .output()
+        .expect("unrelated child");
+    (
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_unrelated_children_do_not_inherit_attach_token_fd() {
+    use greppy::{generate_attach_token, give_child_attach_token};
+    use std::thread;
+
+    let token = generate_attach_token().expect("urandom");
+    let mut holder = Command::new("/usr/bin/true");
+    holder.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let pass = give_child_attach_token(&mut holder, &token).expect("atomic cloexec token fd");
+
+    let mut joins = Vec::new();
+    for _ in 0..12 {
+        let token = token.clone();
+        joins.push(thread::spawn(move || unrelated_child_must_not_see_token(&token)));
+    }
+    for join in joins {
+        let (code, stdout, stderr) = join.join().expect("thread");
+        assert_eq!(
+            code, 0,
+            "unrelated child inherited attach fd/token stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains(&token) && !stderr.contains(&token),
+            "token leaked to unrelated child stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("FD4_OPEN") && !stdout.contains("TOKEN_ON_FD_"),
+            "attach fd leaked stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    let mut authorized = Command::new("/usr/bin/perl");
+    authorized
+        .arg("-e")
+        .arg("my $buf=''; open(F,q{<&=},4) or die $!; sysread(F,$b,256); print $b;")
+        .stdin(Stdio::null());
+    let auth_pass = give_child_attach_token(&mut authorized, &token).expect("authorized fd");
+    let output = authorized.output().expect("authorized child");
+    drop(auth_pass);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&token),
+        "authorized child must read token from fd 4, stdout={stdout:?}"
+    );
+    drop(pass);
+    drop(holder);
 }

@@ -70,6 +70,8 @@ walkdir = "2"
 rayon = "1"
 libc = "0.2"
 windows-sys = "0.61"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
 
 [profile.release]
 lto = "thin"
@@ -78,3 +80,10 @@ strip = true
 
 [profile.dev]
 debug = 1
+
+# Only the `sha2` crate in debug (build-script and library). Does not opt
+# all build scripts/proc-macros (that would rebuild syn/tree-sitter at
+# opt-level 3). Release profiles unchanged. CLI `build.rs` still SHA-256s
+# the GGUF files; unoptimized `compress` is CPU-bound for minutes.
+[profile.dev.package.sha2]
+opt-level = 3

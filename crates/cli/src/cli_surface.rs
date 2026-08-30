@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "Code navigation for coding agents, with byte-exact real-grep passthrough for ordinary grep invocations.",
     long_about = None,
+    after_help = "Agent modes:\n  greppy agent [\"INITIAL TASK\"] --model MODEL   Interactive TUI\n  greppy -p \"TASK\" --model MODEL                Headless one-shot",
     allow_external_subcommands = true,
     disable_help_subcommand = true,
     trailing_var_arg = true,
@@ -795,8 +796,15 @@ pub enum WebCommand {
         query: Option<String>,
         #[arg(long)]
         domain: Option<String>,
+        /// Cap search hits. Distinct from the global `--limit` (usize).
+        #[arg(long = "result-limit")]
+        result_limit: Option<u32>,
         #[arg(long)]
-        limit: Option<u32>,
+        session: Option<String>,
+        #[arg(long = "fixture-url")]
+        fixture_url: Option<String>,
+        #[arg(long = "search-endpoint")]
+        search_endpoint: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -806,6 +814,12 @@ pub enum WebCommand {
         url: Option<String>,
         #[arg(long)]
         query: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "fixture-url")]
+        fixture_url: Option<String>,
+        #[arg(long = "search-endpoint")]
+        search_endpoint: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -818,12 +832,36 @@ pub enum WebCommand {
         #[arg(long)]
         depth: Option<String>,
         #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "fixture-url")]
+        fixture_url: Option<String>,
+        #[arg(long = "search-endpoint")]
+        search_endpoint: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     /// List artifacts for a session.
     Artifacts {
         #[arg(long)]
         session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a specific in-flight web.run by request id.
+    Cancel {
+        #[arg(long)]
+        session: String,
+        #[arg(long = "target-request-id")]
+        target_request_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Heartbeat a busy session so its idle timer stays fresh.
+    Heartbeat {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        seq: Option<u64>,
         #[arg(long)]
         json: bool,
     },

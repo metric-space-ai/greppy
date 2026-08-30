@@ -12,6 +12,8 @@ pub struct Request {
     pub deadline_ms: u64,
     pub operation: String,
     pub payload: serde_json::Value,
+    #[serde(default)]
+    pub capability: String,
 }
 
 impl Request {
@@ -28,6 +30,7 @@ impl Request {
             deadline_ms: 30_000,
             operation: operation.into(),
             payload,
+            capability: String::new(),
         }
     }
 }
@@ -133,6 +136,37 @@ pub struct Handshake {
     pub max_artifact_bytes: u64,
 }
 
+impl Handshake {
+    pub fn runtime_facts() -> Self {
+        Self {
+            protocol_version: SCHEMA.to_owned(),
+            runtime_build_id: "web-runtime-0.1.0".to_owned(),
+            playwright_compatibility_version: "1.62.1".to_owned(),
+            servo_revision: "77fccacc1f1fdce10498d50173aafaa09d02879e".to_owned(),
+            v8_revision: "deno_core-0.410.0".to_owned(),
+            platform: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            supported_capabilities: vec![
+                "chromium.launch".into(),
+                "session".into(),
+                "web.run".into(),
+                "web.observe".into(),
+                "web.screenshot".into(),
+                "web.read".into(),
+                "web.search".into(),
+                "web.research".into(),
+                "web.artifacts".into(),
+                "page.route".into(),
+                "page.frames".into(),
+                "page.setInputFiles".into(),
+            ],
+            compatibility_coverage_level: "unverified".to_owned(),
+            max_message_bytes: crate::MAX_FRAME_BYTES as u64,
+            max_artifact_bytes: crate::MAX_FRAME_BYTES as u64,
+        }
+    }
+}
+
 pub fn new_request_id() -> String {
     format!("wrq_{}", random_token())
 }
@@ -142,12 +176,19 @@ pub fn new_session_id() -> String {
 }
 
 fn random_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{:x}{:x}", std::process::id(), nanos)
+    format!(
+        "{:x}{:x}{:x}",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

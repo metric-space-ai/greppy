@@ -35,6 +35,11 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
