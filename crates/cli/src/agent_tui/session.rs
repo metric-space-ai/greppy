@@ -395,6 +395,13 @@ fn persist_part(part: &ContentPart) -> PersistedPart {
             name: String::new(),
             is_error: *is_error,
         },
+        ContentPart::Image { media_type, .. } => PersistedPart {
+            kind: "image".to_string(),
+            text: format!("[{media_type} omitted from session log]"),
+            id: String::new(),
+            name: media_type.clone(),
+            is_error: false,
+        },
     }
 }
 

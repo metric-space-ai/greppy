@@ -214,6 +214,9 @@ impl App {
                     preview: String::new(),
                     expanded: false,
                 }),
+                "image" => self.items.push(TranscriptItem::User {
+                    text: sanitize_terminal_text(&part.text).into_owned(),
+                }),
                 "tool_result" => {
                     let id = sanitize_terminal_text(&part.id).into_owned();
                     if let Some(TranscriptItem::Tool {
