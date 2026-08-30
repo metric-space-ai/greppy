@@ -732,6 +732,10 @@ impl Daemon {
             "web.research" => self.web_research(&request),
             "web.artifacts" => self.web_artifacts(&request),
             "web.result.next" => self.web_result_next(&request),
+            "web.goto" => self.web_goto(&request),
+            "web.back" => self.web_history(&request, "page.goBack", "web.back"),
+            "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
+            "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             other => Response::error(
                 &request,
                 ErrorObject::new(
@@ -2016,6 +2020,73 @@ impl Daemon {
                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
             }),
         )
+    }
+
+    fn web_goto(&mut self, request: &Request) -> Response {
+        let Some(url) = request
+            .payload
+            .get("url")
+            .and_then(|value| value.as_str())
+            .filter(|url| !url.is_empty())
+        else {
+            return protocol_error(request, "web.goto requires url");
+        };
+        let url = url.to_owned();
+        match self.with_session_page(request, "web.goto") {
+            Err(response) => response,
+            Ok((session_id, page)) => match self.engine_call(
+                "page.goto",
+                json!({ "page": page, "url": url, "timeout": 30_000 }),
+            ) {
+                Ok(result) => {
+                    self.finish_session(&session_id);
+                    Response::ok(
+                        request,
+                        json!({
+                            "session_id": session_id,
+                            "url": result.get("url").cloned().unwrap_or(json!(url)),
+                            "status": result.get("status").cloned().unwrap_or(json!(0)),
+                            "ok": result.get("ok").cloned().unwrap_or(json!(false)),
+                            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                        }),
+                    )
+                }
+                Err(error) => {
+                    self.finish_session(&session_id);
+                    engine_error(request, error, 34)
+                }
+            },
+        }
+    }
+
+    fn web_history(&mut self, request: &Request, method: &str, operation: &str) -> Response {
+        match self.with_session_page(request, operation) {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.engine_call(method, json!({ "page": page, "timeout": 30_000 })) {
+                    Ok(result) => {
+                        self.finish_session(&session_id);
+                        let url = result
+                            .get("url")
+                            .cloned()
+                            .unwrap_or(json!(""));
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "url": url,
+                                "ok": result.get("ok").cloned().unwrap_or(json!(true)),
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        engine_error(request, error, 34)
+                    }
+                }
+            }
+        }
     }
 
     fn with_session_page(

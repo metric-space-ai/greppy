@@ -94,6 +94,26 @@ fn web_result_next_requires_session() {
 }
 
 #[test]
+fn web_goto_back_forward_reload_open_are_listed() {
+    let (code, stdout, stderr) = run(&["web", "--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    for verb in ["goto", "back", "forward", "reload", "open"] {
+        assert!(stdout.contains(verb), "missing {verb} in {stdout}");
+    }
+    assert!(
+        !stdout.contains("web nav"),
+        "navigation must stay flat, stdout={stdout}"
+    );
+}
+
+#[test]
+fn web_goto_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "goto", "http://example.com/", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
 fn web_run_requires_session() {
     let (code, stdout, _stderr) = run(&["web", "run", "--script-file", "x.js", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");

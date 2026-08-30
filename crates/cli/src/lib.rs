@@ -62,7 +62,7 @@ mod web;
 mod web_attach;
 mod cli_surface;
 pub use cli_surface::*;
-pub use web::{web_runtime_socket, WebCommand, SessionsCommand, ResultsCommand};
+pub use web::{web_runtime_socket, WebCommand, SessionsCommand, ResultsCommand, NavCommand};
 pub use web_attach::{generate_attach_token, give_child_attach_token};
 mod nav;
 use nav::*;

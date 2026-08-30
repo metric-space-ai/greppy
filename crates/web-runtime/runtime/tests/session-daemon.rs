@@ -3104,6 +3104,56 @@ fn web_screenshot_returns_inline_png_bytes() {
 }
 
 #[test]
+fn web_goto_navigates_a_fixture() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body><p>nav-goto</p></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-goto-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_goto", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_goto",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let went = unix_request(
+        &socket,
+        &Request::new(
+            "run_goto",
+            "web.goto",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("goto");
+    assert_eq!(went.status, "ok", "{went:?}");
+    let url = went.result.as_ref().unwrap()["url"].as_str().unwrap_or("");
+    assert!(
+        url.contains("127.0.0.1") || url == fixture,
+        "goto url={url} fixture={fixture} {went:?}"
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_goto",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
 fn project_profile_can_load_a_public_http_host() {
     let socket = std::env::temp_dir().join(format!("greppy-web-egress-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);

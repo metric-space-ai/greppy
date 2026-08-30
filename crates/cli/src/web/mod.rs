@@ -19,6 +19,7 @@ use clap::Subcommand;
 use greppy_core::error::Result;
 
 pub use common::{shutdown_if_running, web_runtime_socket};
+pub use nav::NavCommand;
 pub use results::ResultsCommand;
 pub use sessions::SessionsCommand;
 
@@ -28,6 +29,8 @@ pub enum WebCommand {
     Sessions(SessionsCommand),
     #[command(flatten)]
     Results(ResultsCommand),
+    #[command(flatten)]
+    Nav(NavCommand),
 }
 
 pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
@@ -43,6 +46,7 @@ pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
     match command {
         WebCommand::Sessions(command) => sessions::dispatch(command, root),
         WebCommand::Results(command) => results::dispatch(command, root),
+        WebCommand::Nav(command) => nav::dispatch(command, root),
     }
 }
 
@@ -76,6 +80,31 @@ mod tests {
                 command: WebCommand::Sessions(SessionsCommand::Status { json: true })
             })
         ));
+    }
+
+    #[test]
+    fn parse_web_goto_is_flat_not_nested_under_nav() {
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "goto",
+            "http://example.com/",
+            "--session",
+            "wrs_1",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Nav(NavCommand::Goto {
+                    url,
+                    session: Some(session),
+                    json: true,
+                })
+            }) if url == "http://example.com/" && session == "wrs_1"
+        ));
+        assert!(Cli::try_parse_from(["greppy", "web", "nav", "goto", "http://example.com/"]).is_err());
     }
 
     #[test]
