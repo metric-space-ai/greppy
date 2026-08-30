@@ -1,6 +1,6 @@
-//! `greppy web` client. Does not link V8 or Servo.
+//! Shared web-CLI helpers: RPC, supervisor spawn, envelope/error mapping.
 
-use super::*;
+use greppy_core::error::{Error, Result};
 use greppy_web_client::{new_request_id, ErrorObject, Handshake, Request, Response, SCHEMA};
 use serde_json::json;
 use std::cell::RefCell;
@@ -33,7 +33,7 @@ pub fn web_runtime_socket(run_id: &str) -> Option<PathBuf> {
         .map(|endpoint| PathBuf::from(endpoint.address()))
 }
 
-fn web_run_id() -> String {
+pub(super) fn web_run_id() -> String {
     if let Ok(run_id) = std::env::var("GREPPY_RUN_ID") {
         if !run_id.is_empty() {
             return run_id;
@@ -48,7 +48,7 @@ fn web_run_id() -> String {
     format!("run_{}", std::process::id())
 }
 
-fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Value {
+pub(super) fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Value {
     if let Ok(agent) = std::env::var("GREPPY_WEB_AGENT") {
         let agent = agent.trim();
         if !agent.is_empty() {
@@ -62,235 +62,14 @@ fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Value {
     payload
 }
 
-pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
-    struct StandaloneShutdown;
-    impl Drop for StandaloneShutdown {
-        fn drop(&mut self) {
-            if crate::web_attach::should_shutdown_on_scope_end() {
-                shutdown_if_running();
-            }
-        }
-    }
-    let _standalone = StandaloneShutdown;
-    match command {
-        WebCommand::Status { json } => status(json, root),
-        WebCommand::Doctor { json } => doctor(json, root),
-        WebCommand::Session { command } => match command {
-            WebSessionCommand::Create { profile, json } => rpc(
-                root,
-                json,
-                "web.session.create",
-                json!({ "profile": profile }),
-                None,
-            ),
-            WebSessionCommand::List { json } => {
-                rpc(root, json, "web.session.list", json!({}), None)
-            }
-            WebSessionCommand::Close { session, json } => rpc(
-                root,
-                json,
-                "web.session.close",
-                json!({ "session_id": session }),
-                Some(session),
-            ),
-        },
-        WebCommand::Run {
-            session,
-            script_file,
-            script_stdin,
-            timeout,
-            json,
-        } => run(root, session, script_file, script_stdin, timeout, json),
-        WebCommand::Observe {
-            session,
-            format,
-            json,
-        } => {
-            let Some(session) = session else {
-                return emit_error(json, invalid("web observe requires --session SESSION"));
-            };
-            rpc(
-                root,
-                json,
-                "web.observe",
-                json!({ "session_id": session, "format": format.unwrap_or_else(|| "agent-tree".into()) }),
-                Some(session),
-            )
-        }
-        WebCommand::Screenshot {
-            session,
-            output,
-            json,
-        } => screenshot(root, session, output, json),
-        WebCommand::Search {
-            query,
-            domain,
-            result_limit,
-            session,
-            fixture_url,
-            search_endpoint,
-            json,
-        } => {
-            let Some(query) = query.filter(|query| !query.is_empty()) else {
-                return emit_error(json, invalid("web search requires --query QUERY"));
-            };
-            let Some(session) = session else {
-                return emit_error(json, invalid("web search requires --session SESSION"));
-            };
-            rpc_with_spawn(
-                root,
-                json,
-                "web.search",
-                json!({
-                    "query": query,
-                    "domain": domain,
-                    "limit": result_limit,
-                    "session_id": session
-                }),
-                Some(session),
-                SupervisorSpawn {
-                    fixture_url,
-                    search_endpoint,
-                },
-            )
-        }
-        WebCommand::Read {
-            url,
-            query,
-            session,
-            fixture_url,
-            search_endpoint,
-            json,
-        } => {
-            let Some(url) = url.filter(|url| !url.is_empty()) else {
-                return emit_error(json, invalid("web read requires --url URL"));
-            };
-            let Some(session) = session else {
-                return emit_error(json, invalid("web read requires --session SESSION"));
-            };
-            rpc_with_spawn(
-                root,
-                json,
-                "web.read",
-                json!({ "url": url, "query": query, "session_id": session }),
-                Some(session),
-                SupervisorSpawn {
-                    fixture_url,
-                    search_endpoint,
-                },
-            )
-        }
-        WebCommand::Research {
-            query,
-            max_sources,
-            depth,
-            session,
-            fixture_url,
-            search_endpoint,
-            json,
-        } => {
-            let Some(query) = query.filter(|query| !query.is_empty()) else {
-                return emit_error(json, invalid("web research requires --query QUERY"));
-            };
-            let Some(session) = session else {
-                return emit_error(json, invalid("web research requires --session SESSION"));
-            };
-            rpc_with_spawn(
-                root,
-                json,
-                "web.research",
-                json!({
-                    "query": query,
-                    "max_sources": max_sources,
-                    "depth": depth,
-                    "session_id": session
-                }),
-                Some(session),
-                SupervisorSpawn {
-                    fixture_url,
-                    search_endpoint,
-                },
-            )
-        }
-        WebCommand::Artifacts { session, json } => rpc(
-            root,
-            json,
-            "web.artifacts",
-            json!({ "session_id": session }),
-            session,
-        ),
-        WebCommand::Cancel {
-            session,
-            target_request_id,
-            json,
-        } => rpc(
-            root,
-            json,
-            "web.cancel",
-            json!({
-                "session_id": session,
-                "target_request_id": target_request_id
-            }),
-            Some(session),
-        ),
-        WebCommand::Heartbeat { session, seq, json } => rpc(
-            root,
-            json,
-            "web.heartbeat",
-            json!({ "session_id": session, "seq": seq.unwrap_or(1) }),
-            session,
-        ),
-        WebCommand::Runtime { command } => match command {
-            WebRuntimeCommand::Status { json } => runtime_status(json, root),
-            WebRuntimeCommand::Stop { json } => runtime_stop(json, root),
-            WebRuntimeCommand::Restart { json } => runtime_restart(json, root),
-        },
-        WebCommand::Artifact { command } => match command {
-            WebArtifactCommand::List { session, json } => {
-                let Some(session) = session else {
-                    return emit_error(json, invalid("web artifact list requires --session SESSION"));
-                };
-                rpc(
-                    root,
-                    json,
-                    "web.artifacts",
-                    json!({ "session_id": session }),
-                    Some(session),
-                )
-            }
-        },
-        WebCommand::Result { command } => match command {
-            WebResultCommand::Next {
-                cursor,
-                session,
-                json,
-            } => {
-                let Some(session) = session else {
-                    return emit_error(json, invalid("web result next requires --session SESSION"));
-                };
-                if cursor.trim().is_empty() {
-                    return emit_error(json, invalid("web result next requires a cursor"));
-                }
-                rpc(
-                    root,
-                    json,
-                    "web.result.next",
-                    json!({ "session_id": session, "cursor": cursor }),
-                    Some(session),
-                )
-            }
-        },
-    }
-}
-
-fn status(json: bool, root: Option<&str>) -> Result<i32> {
+pub(super) fn status(json: bool, root: Option<&str>) -> Result<i32> {
     match ensure_supervisor(root, &SupervisorSpawn::default()) {
         Ok(ctx) => rpc_on(&ctx, json, "web.status", json!({}), None),
         Err(error) => emit_error(json, error),
     }
 }
 
-fn runtime_run_id(root: Option<&str>) -> (String, String) {
+pub(super) fn runtime_run_id(root: Option<&str>) -> (String, String) {
     let run_id =
         web_run_id();
     let identity = match root {
@@ -300,7 +79,7 @@ fn runtime_run_id(root: Option<&str>) -> (String, String) {
     (run_id, identity)
 }
 
-fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
+pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
     let (run_id, identity) = runtime_run_id(root);
     let Some(socket) = web_runtime_socket(&identity) else {
         return emit_error(json, unavailable("cannot allocate web-runtime socket"));
@@ -324,12 +103,12 @@ fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-fn runtime_stop(json: bool, root: Option<&str>) -> Result<i32> {
+pub(super) fn runtime_stop(json: bool, root: Option<&str>) -> Result<i32> {
     shutdown_if_running();
     runtime_status(json, root)
 }
 
-fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
+pub(super) fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
     if let Err(error) = crate::web_attach::claim_persistent_parent() {
         return emit_error(
             json,
@@ -343,7 +122,7 @@ fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
     }
 }
 
-fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
+pub(super) fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
     crate::startup_trace("web.doctor.enter");
     let runtime = match resolve_runtime() {
         Ok(runtime) => runtime,
@@ -379,7 +158,7 @@ fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-fn run(
+pub(super) fn run(
     root: Option<&str>,
     session: Option<String>,
     script_file: Option<String>,
@@ -436,7 +215,7 @@ fn run(
     rpc(root, json, "web.run", payload, Some(session))
 }
 
-fn screenshot(
+pub(super) fn screenshot(
     root: Option<&str>,
     session: Option<String>,
     output: Option<String>,
@@ -489,7 +268,7 @@ fn screenshot(
     }
 }
 
-fn artifact_store_root(run_id: &str) -> PathBuf {
+pub(super) fn artifact_store_root(run_id: &str) -> PathBuf {
     let base = std::env::var("GREPPY_STORE_DIR")
         .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
         .map(PathBuf::from)
@@ -497,7 +276,7 @@ fn artifact_store_root(run_id: &str) -> PathBuf {
     base.join("web-runtime").join(run_id)
 }
 
-fn export_screenshot_artifact(
+pub(super) fn export_screenshot_artifact(
     run_id: &str,
     response: &Response,
     dest: &str,
@@ -534,7 +313,7 @@ fn export_screenshot_artifact(
     export_regular_file(Path::new(dest), &bytes)
 }
 
-fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, ErrorObject> {
+pub(super) fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, ErrorObject> {
     if dest.as_os_str().is_empty() {
         return Err(invalid("--output path is empty"));
     }
@@ -564,7 +343,7 @@ fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, ErrorObject>
     Ok(out)
 }
 
-fn export_regular_file(dest: &Path, bytes: &[u8]) -> std::result::Result<(), ErrorObject> {
+pub(super) fn export_regular_file(dest: &Path, bytes: &[u8]) -> std::result::Result<(), ErrorObject> {
     let dest = lexical_output_path(dest)?;
     let mut cursor = dest.clone();
     loop {
@@ -621,12 +400,12 @@ fn export_regular_file(dest: &Path, bytes: &[u8]) -> std::result::Result<(), Err
 }
 
 #[derive(Default)]
-struct SupervisorSpawn {
-    fixture_url: Option<String>,
-    search_endpoint: Option<String>,
+pub(super) struct SupervisorSpawn {
+    pub(super) fixture_url: Option<String>,
+    pub(super) search_endpoint: Option<String>,
 }
 
-fn rpc(
+pub(super) fn rpc(
     root: Option<&str>,
     json_out: bool,
     operation: &str,
@@ -643,7 +422,7 @@ fn rpc(
     )
 }
 
-fn rpc_with_spawn(
+pub(super) fn rpc_with_spawn(
     root: Option<&str>,
     json_out: bool,
     operation: &str,
@@ -657,13 +436,13 @@ fn rpc_with_spawn(
     }
 }
 
-struct SupervisorCtx {
+pub(super) struct SupervisorCtx {
     socket: PathBuf,
     run_id: String,
     capability: String,
 }
 
-fn rpc_on(
+pub(super) fn rpc_on(
     ctx: &SupervisorCtx,
     json_out: bool,
     operation: &str,
@@ -709,7 +488,7 @@ fn rpc_on(
     }
 }
 
-fn ensure_supervisor(
+pub(super) fn ensure_supervisor(
     root: Option<&str>,
     spawn: &SupervisorSpawn,
 ) -> std::result::Result<SupervisorCtx, ErrorObject> {
@@ -850,7 +629,7 @@ fn ensure_supervisor(
     }
 }
 
-fn socket_connected(socket: &std::path::Path) -> bool {
+pub(super) fn socket_connected(socket: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         std::os::unix::net::UnixStream::connect(socket).is_ok()
@@ -862,7 +641,7 @@ fn socket_connected(socket: &std::path::Path) -> bool {
     }
 }
 
-fn not_owned(message: &str) -> ErrorObject {
+pub(super) fn not_owned(message: &str) -> ErrorObject {
     ErrorObject::new(
         "session_not_owned",
         message,
@@ -872,7 +651,7 @@ fn not_owned(message: &str) -> ErrorObject {
     )
 }
 
-fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> bool {
+pub(super) fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> bool {
     if !socket.exists() {
         return false;
     }
@@ -899,7 +678,7 @@ pub fn shutdown_if_running() {
     }
 }
 
-fn wait_child_exit(child: &mut std::process::Child, budget: Duration) -> bool {
+pub(super) fn wait_child_exit(child: &mut std::process::Child, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
@@ -910,7 +689,7 @@ fn wait_child_exit(child: &mut std::process::Child, budget: Duration) -> bool {
     }
 }
 
-fn reap_detached_runtime(
+pub(super) fn reap_detached_runtime(
     child: &mut std::process::Child,
     socket: &std::path::Path,
     run_id: &str,
@@ -936,7 +715,7 @@ fn reap_detached_runtime(
     let _ = child.try_wait();
 }
 
-fn emit_response(json_out: bool, response: Response) -> Result<i32> {
+pub(super) fn emit_response(json_out: bool, response: Response) -> Result<i32> {
     let code = response
         .error
         .as_ref()
@@ -949,7 +728,7 @@ fn emit_response(json_out: bool, response: Response) -> Result<i32> {
     Ok(code)
 }
 
-fn emit_error(json_out: bool, error: ErrorObject) -> Result<i32> {
+pub(super) fn emit_error(json_out: bool, error: ErrorObject) -> Result<i32> {
     let code = error.exit_code;
     let payload = json!({
         "schema": SCHEMA,
@@ -961,7 +740,7 @@ fn emit_error(json_out: bool, error: ErrorObject) -> Result<i32> {
     Ok(code)
 }
 
-fn emit_web(json_out: bool, payload: &serde_json::Value) -> Result<()> {
+pub(super) fn emit_web(json_out: bool, payload: &serde_json::Value) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -984,7 +763,7 @@ fn emit_web(json_out: bool, payload: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn unavailable(message: &str) -> ErrorObject {
+pub(super) fn unavailable(message: &str) -> ErrorObject {
     ErrorObject::new(
         "runtime_unavailable",
         message,
@@ -994,7 +773,7 @@ fn unavailable(message: &str) -> ErrorObject {
     )
 }
 
-fn invalid(message: &str) -> ErrorObject {
+pub(super) fn invalid(message: &str) -> ErrorObject {
     ErrorObject::new(
         "protocol_violation",
         message,
@@ -1004,18 +783,18 @@ fn invalid(message: &str) -> ErrorObject {
     )
 }
 
-struct ResolvedRuntime {
-    dist: Option<PathBuf>,
-    executable: PathBuf,
+pub(super) struct ResolvedRuntime {
+    pub(super) dist: Option<PathBuf>,
+    pub(super) executable: PathBuf,
 }
 
-fn is_symlink(path: &std::path::Path) -> bool {
+pub(super) fn is_symlink(path: &std::path::Path) -> bool {
     path.symlink_metadata()
         .map(|meta| meta.file_type().is_symlink())
         .unwrap_or(false)
 }
 
-fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObject> {
+pub(super) fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObject> {
     if let Ok(dist) = std::env::var("GREPPY_WEB_RUNTIME_DIST") {
         return images_from_dist(std::path::Path::new(&dist));
     }
@@ -1043,7 +822,7 @@ fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObject> {
     images_from_path_env().ok_or_else(|| unavailable("web-runtime distributable is not installed"))
 }
 
-fn images_from_dist(dist: &std::path::Path) -> std::result::Result<ResolvedRuntime, ErrorObject> {
+pub(super) fn images_from_dist(dist: &std::path::Path) -> std::result::Result<ResolvedRuntime, ErrorObject> {
     if is_symlink(dist) {
         return Err(unavailable("refusing symlink web-runtime dist"));
     }
@@ -1080,7 +859,7 @@ fn images_from_dist(dist: &std::path::Path) -> std::result::Result<ResolvedRunti
     })
 }
 
-fn runtime_from_file(path: &std::path::Path, dist: Option<PathBuf>) -> Option<ResolvedRuntime> {
+pub(super) fn runtime_from_file(path: &std::path::Path, dist: Option<PathBuf>) -> Option<ResolvedRuntime> {
     if is_symlink(path) || !path.is_file() {
         return None;
     }
@@ -1090,14 +869,14 @@ fn runtime_from_file(path: &std::path::Path, dist: Option<PathBuf>) -> Option<Re
     })
 }
 
-fn images_from_path_env() -> Option<ResolvedRuntime> {
+pub(super) fn images_from_path_env() -> Option<ResolvedRuntime> {
     Some(ResolvedRuntime {
         dist: None,
         executable: find_binary("web-runtime")?,
     })
 }
 
-fn find_binary(name: &str) -> Option<PathBuf> {
+pub(super) fn find_binary(name: &str) -> Option<PathBuf> {
     let env_name = format!("GREPPY_{}", name.to_uppercase().replace('-', "_"));
     if let Ok(path) = std::env::var(&env_name) {
         let path = PathBuf::from(path);
@@ -1124,455 +903,3 @@ fn find_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    static EXPORT_CWD_LOCK: Mutex<()> = Mutex::new(());
-
-    fn export_sandbox(name: &str) -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn parse_web_status_json() {
-        let cli = Cli::try_parse_from(["greppy", "web", "status", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Status { json: true }
-            })
-        ));
-    }
-
-    #[test]
-    fn parse_web_doctor_json() {
-        let cli = Cli::try_parse_from(["greppy", "web", "doctor", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Doctor { json: true }
-            })
-        ));
-    }
-
-    #[test]
-    fn parse_web_observe_search_read_research_flags() {
-        let cli = Cli::try_parse_from(["greppy", "web", "observe", "--session", "wrs_1", "--json"])
-            .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Observe {
-                    session: Some(session),
-                    json: true,
-                    ..
-                }
-            }) if session == "wrs_1"
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "search",
-            "--query",
-            "greppy",
-            "--domain",
-            "example.com",
-            "--session",
-            "wrs_1",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Search {
-                    query: Some(query),
-                    domain: Some(domain),
-                    session: Some(session),
-                    json: true,
-                    ..
-                }
-            }) if query == "greppy" && domain == "example.com" && session == "wrs_1"
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "read",
-            "--url",
-            "https://example.com/article",
-            "--session",
-            "wrs_1",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Read {
-                    url: Some(url),
-                    session: Some(session),
-                    json: true,
-                    ..
-                }
-            }) if url == "https://example.com/article" && session == "wrs_1"
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "research",
-            "--query",
-            "greppy",
-            "--max-sources",
-            "2",
-            "--depth",
-            "shallow",
-            "--session",
-            "wrs_1",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Research {
-                    query: Some(query),
-                    max_sources: Some(2),
-                    depth: Some(depth),
-                    session: Some(session),
-                    json: true,
-                    ..
-                }
-            }) if query == "greppy" && depth == "shallow" && session == "wrs_1"
-        ));
-    }
-
-    #[test]
-    fn parse_web_search_result_limit_and_global_limit() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "search",
-            "--query",
-            "greppy",
-            "--session",
-            "wrs_1",
-            "--limit",
-            "3",
-            "--json",
-        ])
-        .expect("web search --limit must not panic from the global/subcommand clap type clash");
-        assert_eq!(cli.limit, Some(3));
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Search {
-                    result_limit: None,
-                    json: true,
-                    ..
-                }
-            })
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "search",
-            "--query",
-            "greppy",
-            "--session",
-            "wrs_1",
-            "--result-limit",
-            "7",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Search {
-                    result_limit: Some(7),
-                    json: true,
-                    ..
-                }
-            })
-        ));
-    }
-
-    #[test]
-    fn parse_web_search_fixture_url_and_search_endpoint() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "search",
-            "--query",
-            "greppy",
-            "--session",
-            "wrs_1",
-            "--fixture-url",
-            "http://127.0.0.1:9/search.html",
-            "--search-endpoint",
-            "http://127.0.0.1:9/search",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Search {
-                    fixture_url: Some(fixture_url),
-                    search_endpoint: Some(search_endpoint),
-                    json: true,
-                    ..
-                }
-            }) if fixture_url == "http://127.0.0.1:9/search.html"
-                && search_endpoint == "http://127.0.0.1:9/search"
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "read",
-            "--url",
-            "https://example.com/article",
-            "--session",
-            "wrs_1",
-            "--fixture-url",
-            "http://127.0.0.1:9/page.html",
-            "--search-endpoint",
-            "http://127.0.0.1:9/search",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Read {
-                    fixture_url: Some(fixture_url),
-                    search_endpoint: Some(search_endpoint),
-                    json: true,
-                    ..
-                }
-            }) if fixture_url == "http://127.0.0.1:9/page.html"
-                && search_endpoint == "http://127.0.0.1:9/search"
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "research",
-            "--query",
-            "greppy",
-            "--session",
-            "wrs_1",
-            "--fixture-url",
-            "http://127.0.0.1:9/search.html",
-            "--search-endpoint",
-            "http://127.0.0.1:9/search",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Research {
-                    fixture_url: Some(fixture_url),
-                    search_endpoint: Some(search_endpoint),
-                    json: true,
-                    ..
-                }
-            }) if fixture_url == "http://127.0.0.1:9/search.html"
-                && search_endpoint == "http://127.0.0.1:9/search"
-        ));
-    }
-
-    #[test]
-    fn parse_web_screenshot_output() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "screenshot",
-            "--session",
-            "wrs_1",
-            "--output",
-            "/tmp/shot.png",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Screenshot {
-                    output: Some(path),
-                    json: true,
-                    ..
-                }
-            }) if path == "/tmp/shot.png"
-        ));
-    }
-
-    #[test]
-    fn export_regular_file_writes_and_refuses_symlink_and_directory() {
-        let dir = export_sandbox("greppy-web-export");
-        let file = dir.join("shot.png");
-        export_regular_file(&file, b"png-bytes").unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), b"png-bytes");
-
-        let existing = dir.join("exists.bin");
-        std::fs::write(&existing, b"keep-me").unwrap();
-        let exist_err = export_regular_file(&existing, b"clobber").unwrap_err();
-        assert!(exist_err.message.contains("existing"), "{exist_err:?}");
-        assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
-
-        let subdir = dir.join("subdir");
-        std::fs::create_dir(&subdir).unwrap();
-        let dir_err = export_regular_file(&subdir, b"nope").unwrap_err();
-        assert!(dir_err.message.contains("directory"), "{dir_err:?}");
-
-        let target = dir.join("target.bin");
-        std::fs::write(&target, b"orig").unwrap();
-        let link = dir.join("link.png");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let link_err = export_regular_file(&link, b"hijack").unwrap_err();
-        assert!(link_err.message.contains("symlink"), "{link_err:?}");
-        assert_eq!(std::fs::read(&target).unwrap(), b"orig");
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-
-        let linked_parent = dir.join("linked-parent");
-        std::os::unix::fs::symlink(&dir, &linked_parent).unwrap();
-        let nested = linked_parent.join("nested.png");
-        let parent_err = export_regular_file(&nested, b"escape").unwrap_err();
-        assert!(parent_err.message.contains("symlink"), "{parent_err:?}");
-        assert!(
-            !nested.exists()
-                || std::fs::symlink_metadata(&nested)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn export_regular_file_rejects_relative_path_through_symlinked_ancestor() {
-        let _cwd = EXPORT_CWD_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let dir = export_sandbox("greppy-web-export-rel");
-        let real = dir.join("real");
-        std::fs::create_dir(&real).unwrap();
-        let link = dir.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let err = export_regular_file(Path::new("link/shot.png"), b"rel");
-        let cwd_after = std::env::current_dir();
-        let _ = std::env::set_current_dir(&previous);
-        let err = err.unwrap_err();
-        assert!(
-            err.message.contains("symlink"),
-            "{err:?} cwd_after={cwd_after:?}"
-        );
-        assert!(
-            !real.join("shot.png").exists(),
-            "relative export must not write through symlink ancestor"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_web_session_and_run() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "session",
-            "create",
-            "--profile",
-            "project",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Session {
-                    command: WebSessionCommand::Create { .. }
-                }
-            })
-        ));
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "web",
-            "run",
-            "--session",
-            "wrs_1",
-            "--script-file",
-            "spec.mjs",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web {
-                command: WebCommand::Run { json: true, .. }
-            })
-        ));
-    }
-
-    #[test]
-    fn missing_named_binary_is_none() {
-        assert!(find_binary("web-runtime-missing-name").is_none());
-    }
-
-    #[test]
-    fn stamped_dist_resolves_one_linked_executable() {
-        let root = std::env::temp_dir().join(format!("greppy-web-cli-dist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::write(
-            root.join(".greppy-web-runtime-dist"),
-            "greppy.web-runtime.package.v1\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("bin").join("web-runtime"), b"web-runtime").unwrap();
-        let runtime = images_from_dist(&root).expect("dist");
-        assert_eq!(runtime.dist.as_ref(), Some(&root));
-        assert!(runtime.executable.ends_with("web-runtime"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stamped_dist_refuses_bin_member_symlink() {
-        let root =
-            std::env::temp_dir().join(format!("greppy-web-cli-dist-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::write(
-            root.join(".greppy-web-runtime-dist"),
-            "greppy.web-runtime.package.v1\n",
-        )
-        .unwrap();
-        let target = root.join("payload");
-        std::fs::write(&target, b"web-runtime").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("bin").join("web-runtime")).unwrap();
-        assert!(images_from_dist(&root).is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn unstamped_dir_is_not_a_web_runtime_dist() {
-        let root =
-            std::env::temp_dir().join(format!("greppy-web-cli-nodist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(images_from_dist(&root).is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}

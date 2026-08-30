@@ -1252,7 +1252,7 @@ fn parse_index_status_json_and_doctor_json() {
     assert!(matches!(
         cli.command,
         Some(Command::Web {
-            command: WebCommand::Status { json: true }
+            command: WebCommand::Sessions(SessionsCommand::Status { json: true })
         })
     ));
     assert!(
