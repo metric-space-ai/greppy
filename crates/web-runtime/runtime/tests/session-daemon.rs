@@ -705,7 +705,7 @@ fn session_create_run_close_over_unix_socket() {
         &Request::new(
             "run_test",
             "web.session.create",
-            json!({ "profile": "research" }),
+            json!({ "profile": "project" }),
         ),
         Duration::from_secs(5),
     )
@@ -1245,19 +1245,29 @@ fn greppy_cli_parent_survives_content_worker_kill() {
     );
     let runtime = PathBuf::from(env!("CARGO_BIN_EXE_web-runtime"));
     let run_id = format!("run_cliparent_{}", std::process::id());
-    let _shutdown = CliparentShutdown {
-        run_id: run_id.clone(),
-    };
     let store = std::env::temp_dir().join(format!("greppy-store-cliparent-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&store);
-    let create = Command::new(&greppy)
+    let mut token_bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| {
+            use std::io::Read;
+            file.read_exact(&mut token_bytes)
+        })
+        .expect("urandom");
+    let token: String = token_bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let _shutdown = CliparentShutdown {
+        run_id: run_id.clone(),
+        token: token.clone(),
+    };
+    let mut create = Command::new(&greppy);
+    create
         .args(["web", "session", "create", "--profile", "project", "--json"])
         .env("GREPPY_WEB_RUNTIME", &runtime)
         .env("GREPPY_RUN_ID", &run_id)
         .env("GREPPY_STORE_DIR", &store)
-        .env_remove("GREPPY_WEB_RUNTIME_DIST")
-        .output()
-        .expect("greppy web session create");
+        .env_remove("GREPPY_WEB_RUNTIME_DIST");
+    let _create_pass = give_child_attach_token(&mut create, &token).expect("create attach token");
+    let create = create.output().expect("greppy web session create");
     let stdout = String::from_utf8_lossy(&create.stdout);
     assert!(
         create.status.success() || stdout.contains("session_id"),
@@ -1270,7 +1280,8 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         .and_then(|rest| rest.split('"').next())
         .expect("session_id in create stdout")
         .to_owned();
-    let mut child = Command::new(&greppy)
+    let mut child_cmd = Command::new(&greppy);
+    child_cmd
         .args([
             "web",
             "run",
@@ -1287,9 +1298,9 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         .env_remove("GREPPY_WEB_RUNTIME_DIST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("greppy web run");
+        .stderr(Stdio::piped());
+    let _run_pass = give_child_attach_token(&mut child_cmd, &token).expect("run attach token");
+    let mut child = child_cmd.spawn().expect("greppy web run");
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().expect("stdin");
@@ -1311,6 +1322,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         }
         thread::sleep(Duration::from_millis(100));
     };
+    register_attach_token(&socket, token.clone());
     if let Some(content) = content_worker_pid(parent) {
         let _ = Command::new("kill")
             .args(["-KILL", &content.to_string()])
@@ -1373,6 +1385,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
 
 struct CliparentShutdown {
     run_id: String,
+    token: String,
 }
 
 impl Drop for CliparentShutdown {
@@ -1380,6 +1393,7 @@ impl Drop for CliparentShutdown {
         let Some((pid, socket)) = web_runtime_supervisor_for_run(&self.run_id) else {
             return;
         };
+        register_attach_token(&socket, self.token.clone());
         let _ = unix_request(
             &socket,
             &Request::new(&self.run_id, "web.shutdown", json!({})),
@@ -5127,7 +5141,7 @@ fn tap_dispatches_touch_events() {
 }
 
 #[test]
-fn set_viewport_size_is_unsupported() {
+fn viewport_reports_playwright_default_and_set_size_applies() {
     run_named_fixture("viewport.mjs", "run_vp");
 }
 
