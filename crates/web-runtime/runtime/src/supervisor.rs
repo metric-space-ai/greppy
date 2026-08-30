@@ -1,5 +1,6 @@
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{read_message, Message, WorkerKind, MAX_FRAME_BYTES};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -308,12 +309,14 @@ fn run_script(
         .into_owned();
     if fixture_url_grants_project_loopback(&fixture_url) {
         let mut sidecar = 0;
+        let mut parked = VecDeque::new();
         sidecar_engine_call(
             content,
             &mut sidecar,
             "session.setProfile",
             serde_json::json!({ "profile": "project" }),
             PROCESS_TIMEOUT,
+            &mut parked,
         )
         .map_err(|error| io::Error::other(error))?;
         emit_line("web_runtime.local_origin_grant=project");
@@ -383,7 +386,8 @@ pub(crate) fn route_until_script_complete_gated(
 ) -> io::Result<serde_json::Value> {
     let deadline = Instant::now() + timeout;
     let mut sidecar = 1_u64 << 62;
-    let mut pending: Option<(u64, String, serde_json::Value)> = None;
+    let mut pending: HashMap<u64, (String, serde_json::Value)> = HashMap::new();
+    let mut parked: VecDeque<Message> = VecDeque::new();
     let mut wait_point = "controller:script-complete".to_owned();
     let stale = content.discard_stale_engine_results();
     if stale > 0 {
@@ -393,24 +397,23 @@ pub(crate) fn route_until_script_complete_gated(
     loop {
         gate.poll_control();
         if gate.is_cancelled() {
-            if let Some(engine_id) = gate
-                .inflight_engine_id()
-                .or_else(|| pending.as_ref().map(|row| row.0))
-            {
-                loop {
-                    match content.messages.try_recv() {
-                        Ok(Ok(crate::protocol::Message::EngineResult {
-                            request_id,
-                            ok,
-                            error,
-                            ..
-                        })) if request_id == engine_id => {
+            loop {
+                match content.messages.try_recv() {
+                    Ok(Ok(crate::protocol::Message::EngineResult {
+                        request_id,
+                        ok,
+                        error,
+                        ..
+                    })) => {
+                        if pending.remove(&request_id).is_some() {
                             gate.note_discarded_engine_result(request_id, ok, error);
+                        }
+                        if pending.is_empty() {
                             break;
                         }
-                        Ok(Ok(_)) => continue,
-                        Ok(Err(_)) | Err(_) => break,
                     }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) | Err(_) => break,
                 }
             }
             return Err(io::Error::other("cancelled"));
@@ -425,99 +428,102 @@ pub(crate) fn route_until_script_complete_gated(
                 ),
             ));
         }
-        let slice = remaining.min(Duration::from_millis(50));
-        match recv_any(controller, content, slice) {
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
-            Err(error) => return Err(error),
-            Ok(incoming) => match incoming {
-            Incoming::Controller(Message::EngineCall {
-                request_id,
-                method,
-                params,
-                ..
-            }) => {
-                if let Err(message) = gate.before_call(&method, &params) {
-                    return Err(io::Error::other(format!("resource_limit: {message}")));
-                }
-                wait_point = format!("content:{method}");
-                eprintln!("web-runtime: phase run-wait point={wait_point}");
-                pending = Some((request_id, method.clone(), params.clone()));
-                content.send_timeout(
-                    &Message::engine_call(request_id, method.clone(), params),
-                    remaining,
-                )?;
-                gate.note_inflight_engine(request_id, &method);
-            }
-            Incoming::Content(Message::EngineResult {
-                request_id,
-                ok,
-                result,
-                error,
-                ..
-            }) => {
-                let matches_pending = pending
-                    .as_ref()
-                    .is_some_and(|(pending_id, _, _)| *pending_id == request_id);
-                if !matches_pending {
-                    gate.note_discarded_engine_result(request_id, ok, error);
-                    eprintln!(
-                        "web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
-                    );
+        let incoming = if let Some(message) = parked.pop_front() {
+            Ok(Incoming::Content(message))
+        } else {
+            let slice = remaining.min(Duration::from_millis(50));
+            match recv_any(controller, content, slice) {
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     continue;
                 }
-                if ok {
-                    if let Some((pending_id, method, params)) = pending.take() {
-                        if pending_id == request_id && tally_after(&method) {
-                            if let Err(message) = poll_session_records(
-                                content,
-                                &params,
-                                remaining,
-                                &mut sidecar,
-                                &mut gate,
-                            ) {
-                                let _ = controller.send(&Message::engine_result(
-                                    request_id,
-                                    false,
-                                    serde_json::json!({}),
-                                    Some(format!("resource_limit: {message}")),
-                                ));
-                                return Err(io::Error::other(format!("resource_limit: {message}")));
-                            }
+                other => other,
+            }
+        };
+        match incoming {
+            Err(error) => return Err(error),
+            Ok(incoming) => match incoming {
+                Incoming::Controller(Message::EngineCall {
+                    request_id,
+                    method,
+                    params,
+                    ..
+                }) => {
+                    if let Err(message) = gate.before_call(&method, &params) {
+                        return Err(io::Error::other(format!("resource_limit: {message}")));
+                    }
+                    wait_point = format!("content:{method}");
+                    eprintln!("web-runtime: phase run-wait point={wait_point}");
+                    pending.insert(request_id, (method.clone(), params.clone()));
+                    content.send_timeout(
+                        &Message::engine_call(request_id, method.clone(), params),
+                        remaining,
+                    )?;
+                    gate.note_inflight_engine(request_id, &method);
+                }
+                Incoming::Content(Message::EngineResult {
+                    request_id,
+                    ok,
+                    result,
+                    error,
+                    ..
+                }) => {
+                    let Some((method, params)) = pending.remove(&request_id) else {
+                        gate.note_discarded_engine_result(request_id, ok, error);
+                        eprintln!(
+                            "web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
+                        );
+                        continue;
+                    };
+                    if ok && tally_after(&method) {
+                        if let Err(message) = poll_session_records(
+                            content,
+                            &params,
+                            remaining,
+                            &mut sidecar,
+                            &mut gate,
+                            &mut parked,
+                        ) {
+                            let _ = controller.send(&Message::engine_result(
+                                request_id,
+                                false,
+                                serde_json::json!({}),
+                                Some(format!("resource_limit: {message}")),
+                            ));
+                            return Err(io::Error::other(format!("resource_limit: {message}")));
                         }
                     }
-                } else {
-                    pending = None;
+                    controller.send_timeout(
+                        &Message::engine_result(request_id, ok, result, error),
+                        remaining,
+                    )?;
+                    if pending.is_empty() {
+                        wait_point = "controller:script-complete".to_owned();
+                    }
                 }
-                controller.send_timeout(
-                    &Message::engine_result(request_id, ok, result, error),
-                    remaining,
-                )?;
-                wait_point = "controller:script-complete".to_owned();
-            }
-            Incoming::Controller(Message::ScriptComplete {
-                ok, result, error, ..
-            }) => {
-                if !ok {
-                    return Err(io::Error::other(format!(
-                        "controller script failed: {}",
-                        error.unwrap_or_else(|| result.to_string())
-                    )));
+                Incoming::Controller(Message::ScriptComplete {
+                    ok, result, error, ..
+                }) => {
+                    if !ok {
+                        return Err(io::Error::other(format!(
+                            "controller script failed: {}",
+                            error.unwrap_or_else(|| result.to_string())
+                        )));
+                    }
+                    return Ok(result);
                 }
-                return Ok(result);
-            }
-            Incoming::Controller(message) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unexpected controller message during script: {message:?}"),
-                ));
-            }
-            Incoming::Content(message) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unexpected content message during script: {message:?}"),
-                ));
-            }
-            }
+                Incoming::Controller(message) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected controller message during script: {message:?}"),
+                    ));
+                }
+                Incoming::Content(message) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected content message during script: {message:?}"),
+                    ));
+                }
+            },
         }
     }
 }
@@ -551,6 +557,7 @@ fn poll_session_records(
     timeout: Duration,
     sidecar: &mut u64,
     gate: &mut impl EngineGate,
+    parked: &mut VecDeque<Message>,
 ) -> Result<(), String> {
     let Some(page) = params.get("page").and_then(|value| value.as_str()) else {
         return Ok(());
@@ -561,6 +568,7 @@ fn poll_session_records(
         "page.consoleMessages",
         serde_json::json!({ "page": page }),
         timeout,
+        parked,
     )?;
     let downloads = sidecar_engine_call(
         content,
@@ -568,6 +576,7 @@ fn poll_session_records(
         "page.downloads",
         serde_json::json!({ "page": page }),
         timeout,
+        parked,
     )?;
     let responses = sidecar_engine_call(
         content,
@@ -575,6 +584,7 @@ fn poll_session_records(
         "page.responses",
         serde_json::json!({ "page": page }),
         timeout,
+        parked,
     )?;
     let records = serde_json::json!({
         "messages": console.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
@@ -590,6 +600,7 @@ fn sidecar_engine_call(
     method: &str,
     params: serde_json::Value,
     timeout: Duration,
+    parked: &mut VecDeque<Message>,
 ) -> Result<serde_json::Value, String> {
     *sidecar = sidecar.saturating_add(1);
     let request_id = *sidecar;
@@ -616,15 +627,8 @@ fn sidecar_engine_call(
                     Err(error.unwrap_or_else(|| format!("{method} sidecar failed")))
                 };
             }
-            Ok(Message::EngineResult {
-                request_id: got,
-                ok,
-                error,
-                ..
-            }) => {
-                eprintln!(
-                    "web-runtime: discarded unmatched sidecar EngineResult id={got} want={request_id} ok={ok} err={error:?}"
-                );
+            Ok(message @ Message::EngineResult { .. }) => {
+                parked.push_back(message);
             }
             Ok(other) => return Err(format!("unexpected sidecar message {other:?}")),
             Err(error) => return Err(error.to_string()),

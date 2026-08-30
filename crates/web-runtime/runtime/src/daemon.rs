@@ -3063,8 +3063,6 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
             error,
         });
         if let Some(session) = self.sessions.get_mut(&self.session_id) {
-            session.inflight_engine_request_id = None;
-            session.inflight_engine_method = None;
             session.discarded_engine_results = session.discarded_engine_results.saturating_add(1);
         }
     }
