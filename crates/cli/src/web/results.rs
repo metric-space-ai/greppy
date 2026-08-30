@@ -27,6 +27,8 @@ pub enum ResultsCommand {
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
+        tab: Option<String>,
+        #[arg(long)]
         format: Option<String>,
         #[arg(long)]
         json: bool,
@@ -187,19 +189,23 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
         } => run(root, session, script_file, script_stdin, timeout, json),
         ResultsCommand::Observe {
             session,
+            tab,
             format,
             json,
         } => {
-            let Some(session) = session else {
-                return emit_error(json, invalid("web observe requires --session SESSION"));
+            let session = match resolve_session(root, session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(json, error),
             };
-            rpc(
-                root,
-                json,
-                "web.observe",
-                json!({ "session_id": session, "format": format.unwrap_or_else(|| "agent-tree".into()) }),
-                Some(session),
-            )
+            let tab = resolve_tab(root, tab);
+            let mut payload = json!({
+                "session_id": session,
+                "format": format.unwrap_or_else(|| "agent-tree".into()),
+            });
+            if let Some(tab) = tab {
+                payload["tab_id"] = json!(tab);
+            }
+            rpc(root, json, "web.observe", payload, Some(session))
         }
         ResultsCommand::Screenshot {
             session,
@@ -218,8 +224,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             let Some(query) = query.filter(|query| !query.is_empty()) else {
                 return emit_error(json, invalid("web search requires --query QUERY"));
             };
-            let Some(session) = session else {
-                return emit_error(json, invalid("web search requires --session SESSION"));
+            let session = match resolve_session(root, session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(json, error),
             };
             rpc_with_spawn(
                 root,
@@ -249,8 +256,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             let Some(url) = url.filter(|url| !url.is_empty()) else {
                 return emit_error(json, invalid("web read requires --url URL"));
             };
-            let Some(session) = session else {
-                return emit_error(json, invalid("web read requires --session SESSION"));
+            let session = match resolve_session(root, session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(json, error),
             };
             rpc_with_spawn(
                 root,
@@ -276,8 +284,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             let Some(query) = query.filter(|query| !query.is_empty()) else {
                 return emit_error(json, invalid("web research requires --query QUERY"));
             };
-            let Some(session) = session else {
-                return emit_error(json, invalid("web research requires --session SESSION"));
+            let session = match resolve_session(root, session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(json, error),
             };
             rpc_with_spawn(
                 root,
@@ -296,13 +305,19 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 },
             )
         }
-        ResultsCommand::Artifacts { session, json } => rpc(
-            root,
-            json,
-            "web.artifacts",
-            json!({ "session_id": session }),
-            session,
-        ),
+        ResultsCommand::Artifacts { session, json } => {
+            let session = match resolve_session(root, session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(json, error),
+            };
+            rpc(
+                root,
+                json,
+                "web.artifacts",
+                json!({ "session_id": session }),
+                Some(session),
+            )
+        }
         ResultsCommand::Cancel {
             session,
             target_request_id,
@@ -317,17 +332,24 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             }),
             Some(session),
         ),
-        ResultsCommand::Heartbeat { session, seq, json } => rpc(
-            root,
-            json,
-            "web.heartbeat",
-            json!({ "session_id": session, "seq": seq.unwrap_or(1) }),
-            session,
-        ),
+        ResultsCommand::Heartbeat { session, seq, json } => {
+            let session = match resolve_session(root, session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(json, error),
+            };
+            rpc(
+                root,
+                json,
+                "web.heartbeat",
+                json!({ "session_id": session, "seq": seq.unwrap_or(1) }),
+                Some(session),
+            )
+        }
         ResultsCommand::Artifact { command } => match command {
             ArtifactCommand::List { session, json } => {
-                let Some(session) = session else {
-                    return emit_error(json, invalid("web artifact list requires --session SESSION"));
+                let session = match resolve_session(root, session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(json, error),
                 };
                 rpc(
                     root,
@@ -338,8 +360,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 )
             }
             ArtifactCommand::Show { id, session, json } => {
-                let Some(session) = session else {
-                    return emit_error(json, invalid("web artifact show requires --session SESSION"));
+                let session = match resolve_session(root, session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(json, error),
                 };
                 if id.trim().is_empty() {
                     return emit_error(json, invalid("web artifact show requires an artifact id"));
@@ -353,8 +376,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 )
             }
             ArtifactCommand::Path { id, session, json } => {
-                let Some(session) = session else {
-                    return emit_error(json, invalid("web artifact path requires --session SESSION"));
+                let session = match resolve_session(root, session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(json, error),
                 };
                 if id.trim().is_empty() {
                     return emit_error(json, invalid("web artifact path requires an artifact id"));
@@ -380,8 +404,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 session,
                 json,
             } => {
-                let Some(session) = session else {
-                    return emit_error(json, invalid("web result next requires --session SESSION"));
+                let session = match resolve_session(root, session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(json, error),
                 };
                 if cursor.trim().is_empty() {
                     return emit_error(json, invalid("web result next requires a cursor"));
@@ -411,8 +436,9 @@ fn artifact_export(
             invalid("artifact export writes raw bytes and cannot be combined with --json"),
         );
     }
-    let Some(session) = session else {
-        return emit_error(false, invalid("web artifact export requires --session SESSION"));
+    let session = match resolve_session(root, session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(false, error),
     };
     if id.trim().is_empty() {
         return emit_error(false, invalid("web artifact export requires an artifact id"));

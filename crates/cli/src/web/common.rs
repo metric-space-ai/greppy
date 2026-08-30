@@ -33,7 +33,12 @@ pub fn web_runtime_socket(run_id: &str) -> Option<PathBuf> {
         .map(|endpoint| PathBuf::from(endpoint.address()))
 }
 
+#[allow(dead_code)]
 pub(super) fn web_run_id() -> String {
+    web_run_id_for(None)
+}
+
+pub(super) fn web_run_id_for(root: Option<&str>) -> String {
     if let Ok(run_id) = std::env::var("GREPPY_RUN_ID") {
         if !run_id.is_empty() {
             return run_id;
@@ -45,7 +50,144 @@ pub(super) fn web_run_id() -> String {
             return format!("run_{agent}");
         }
     }
-    format!("run_{}", std::process::id())
+    workspace_run_id(root)
+}
+
+fn workspace_run_id(root: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let key = workspace_dir(root);
+    let mut hash = Sha256::new();
+    hash.update(b"greppy-web-run\0");
+    hash.update(key.to_string_lossy().as_bytes());
+    let digest = hash.finalize();
+    format!(
+        "run_ws_{}",
+        digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+pub(super) fn workspace_dir(root: Option<&str>) -> PathBuf {
+    if let Some(root) = root {
+        if !root.is_empty() {
+            return PathBuf::from(root);
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn current_scope_path(root: Option<&str>) -> PathBuf {
+    workspace_dir(root).join(".greppy/web/current.json")
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct CurrentScope {
+    pub session: Option<String>,
+    pub tab: Option<String>,
+}
+
+pub(super) fn read_current_scope(root: Option<&str>) -> CurrentScope {
+    let path = current_scope_path(root);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return CurrentScope::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return CurrentScope::default();
+    };
+    CurrentScope {
+        session: value
+            .get("session")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        tab: value
+            .get("tab")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    }
+}
+
+pub(super) fn write_current_scope(
+    root: Option<&str>,
+    session: &str,
+    tab: Option<&str>,
+) -> std::result::Result<(), ErrorObject> {
+    let path = current_scope_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            invalid(&format!("cannot create {}: {error}", parent.display()))
+        })?;
+    }
+    let mut body = json!({ "session": session });
+    if let Some(tab) = tab.filter(|tab| !tab.is_empty()) {
+        body["tab"] = json!(tab);
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}\n".to_vec()),
+    )
+    .map_err(|error| invalid(&format!("cannot write {}: {error}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn nonempty_flag(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+pub(super) fn no_session(message: &str) -> ErrorObject {
+    ErrorObject::new(
+        "NO_SESSION",
+        message,
+        new_request_id(),
+        EXIT_WEB_INVALID,
+        "greppy web open URL",
+    )
+}
+
+pub(super) fn resolve_session(
+    root: Option<&str>,
+    flagged: Option<String>,
+) -> std::result::Result<String, ErrorObject> {
+    if let Some(session) = nonempty_flag(flagged) {
+        return Ok(session);
+    }
+    if let Ok(session) = std::env::var("GREPPY_WEB_SESSION") {
+        let session = session.trim();
+        if !session.is_empty() {
+            return Ok(session.to_owned());
+        }
+    }
+    if let Some(session) = read_current_scope(root).session {
+        return Ok(session);
+    }
+    Err(no_session(
+        "no current web session; pass --session, set GREPPY_WEB_SESSION, or run greppy web open URL",
+    ))
+}
+
+pub(super) fn resolve_tab(root: Option<&str>, flagged: Option<String>) -> Option<String> {
+    if let Some(tab) = nonempty_flag(flagged) {
+        return Some(tab);
+    }
+    if let Ok(tab) = std::env::var("GREPPY_WEB_TAB") {
+        let tab = tab.trim();
+        if !tab.is_empty() {
+            return Some(tab.to_owned());
+        }
+    }
+    read_current_scope(root).tab
 }
 
 pub(super) fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Value {
@@ -70,8 +212,7 @@ pub(super) fn status(json: bool, root: Option<&str>) -> Result<i32> {
 }
 
 pub(super) fn runtime_run_id(root: Option<&str>) -> (String, String) {
-    let run_id =
-        web_run_id();
+    let run_id = web_run_id_for(root);
     let identity = match root {
         Some(root) => format!("{run_id}:{root}"),
         None => run_id.clone(),
@@ -85,7 +226,7 @@ pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
         return emit_error(json, unavailable("cannot allocate web-runtime socket"));
     };
     let running = socket_connected(&socket);
-    let owned = match crate::web_attach::current_token() {
+    let owned = match crate::web_attach::current_token().or_else(|| load_attach_cookie(&socket)) {
         Some(capability) if running => socket_is_live(&socket, &run_id, &capability),
         _ => false,
     };
@@ -104,7 +245,7 @@ pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
 }
 
 pub(super) fn runtime_stop(json: bool, root: Option<&str>) -> Result<i32> {
-    shutdown_if_running();
+    shutdown_runtime(root);
     runtime_status(json, root)
 }
 
@@ -166,8 +307,9 @@ pub(super) fn run(
     timeout: Option<u64>,
     json: bool,
 ) -> Result<i32> {
-    let Some(session) = session else {
-        return emit_error(json, invalid("web run requires --session SESSION"));
+    let session = match resolve_session(root, session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(json, error),
     };
     if script_file.is_some() && script_stdin {
         return emit_error(
@@ -221,6 +363,10 @@ pub(super) fn screenshot(
     output: Option<String>,
     json: bool,
 ) -> Result<i32> {
+    let session = match resolve_session(root, session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(json, error),
+    };
     let payload = json!({ "session_id": session });
     match ensure_supervisor(root, &SupervisorSpawn::default()) {
         Err(error) => emit_error(json, error),
@@ -233,7 +379,7 @@ pub(super) fn screenshot(
             #[cfg(unix)]
             {
                 let mut request = Request::new(&ctx.run_id, "web.screenshot", payload);
-                request.session_id = session;
+                request.session_id = Some(session);
                 request.capability = ctx.capability.clone();
                 match greppy_web_client::unix_request(
                     &ctx.socket,
@@ -518,45 +664,44 @@ pub(super) fn ensure_supervisor(
         ));
     }
     let ResolvedRuntime { dist, executable } = resolve_runtime()?;
-    let run_id =
-        web_run_id();
+    let (run_id, identity) = runtime_run_id(root);
     #[cfg(not(unix))]
     {
-        let _ = (root, dist, executable, run_id, spawn);
+        let _ = (root, dist, executable, run_id, identity, spawn);
         return Err(unavailable("web runtime sockets require Unix"));
     }
     #[cfg(unix)]
     {
-        let identity = match root {
-            Some(root) => format!("{run_id}:{root}"),
-            None => run_id.clone(),
-        };
         let endpoint = crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
             .ok_or_else(|| unavailable("cannot allocate web-runtime socket"))?;
         let socket = PathBuf::from(endpoint.address());
-        if crate::web_attach::current_token().is_none() && socket_connected(&socket) {
-            return Err(not_owned(
-                "web-runtime is running but this process has no inherited attach token",
-            ));
+        if crate::web_attach::current_token().is_none() {
+            if let Some(cookie) = load_attach_cookie(&socket) {
+                crate::web_attach::adopt_persistent_token(cookie);
+            } else if socket_connected(&socket) {
+                return Err(not_owned(
+                    "web-runtime is running but this process has no inherited attach token",
+                ));
+            }
         }
         let capability = match crate::web_attach::current_token() {
-            Some(token) => token,
-            None => crate::web_attach::become_standalone_owner().map_err(|error| {
+            Some(token) => {
+                let _ = crate::web_attach::claim_persistent_parent();
+                token
+            }
+            None => crate::web_attach::claim_persistent_parent().map_err(|error| {
                 unavailable(&format!("failed to generate attach token: {error}"))
             })?,
         };
-        if socket_is_live(&socket, &run_id, &capability) {
-            return Ok(SupervisorCtx {
-                socket,
-                run_id,
-                capability,
-            });
+        if let Some(ctx) = wait_live_supervisor(&socket, &run_id, &capability) {
+            return Ok(ctx);
         }
         if socket_connected(&socket) {
             return Err(not_owned(
                 "attach capability does not match the live web-runtime supervisor",
             ));
         }
+        save_attach_cookie(&socket, &capability);
         let _ = std::fs::remove_file(&socket);
         let spawned_child: RefCell<Option<std::process::Child>> = RefCell::new(None);
         let issued_for_child = capability.clone();
@@ -649,6 +794,49 @@ pub(super) fn ensure_supervisor(
     }
 }
 
+fn attach_cookie_path(socket: &Path) -> PathBuf {
+    socket.with_extension("attach")
+}
+
+fn load_attach_cookie(socket: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(attach_cookie_path(socket)).ok()?;
+    let token = text.trim().to_owned();
+    (token.len() >= 16).then_some(token)
+}
+
+fn save_attach_cookie(socket: &Path, token: &str) {
+    let path = attach_cookie_path(socket);
+    if std::fs::write(&path, format!("{token}\n")).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn wait_live_supervisor(
+    socket: &Path,
+    run_id: &str,
+    capability: &str,
+) -> Option<SupervisorCtx> {
+    let started = Instant::now();
+    let budget = Duration::from_secs(60);
+    loop {
+        if socket_is_live(socket, run_id, capability) {
+            return Some(SupervisorCtx {
+                socket: socket.to_path_buf(),
+                run_id: run_id.to_owned(),
+                capability: capability.to_owned(),
+            });
+        }
+        if !socket_connected(socket) || started.elapsed() >= budget {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 pub(super) fn socket_connected(socket: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
@@ -681,20 +869,31 @@ pub(super) fn socket_is_live(socket: &std::path::Path, run_id: &str, capability:
 }
 
 pub fn shutdown_if_running() {
+    shutdown_runtime(None);
+}
+
+pub(super) fn shutdown_runtime(root: Option<&str>) {
     #[cfg(unix)]
     {
-        let run_id = web_run_id();
-        let Some(capability) = crate::web_attach::current_token() else {
+        let (run_id, identity) = runtime_run_id(root);
+        let Some(capability) = crate::web_attach::current_token().or_else(|| {
+            crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
+                .and_then(|endpoint| load_attach_cookie(&PathBuf::from(endpoint.address())))
+        }) else {
             return;
         };
         if let Some(endpoint) =
-            crate::inference_daemon::Endpoint::for_identity("web-runtime", &run_id)
+            crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
         {
             let socket = PathBuf::from(endpoint.address());
             let mut request = Request::new(&run_id, "web.shutdown", json!({}));
             request.capability = capability;
             let _ = greppy_web_client::unix_request(&socket, &request, Duration::from_secs(3));
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
     }
 }
 
@@ -1134,6 +1333,77 @@ mod target_tests {
     fn parse_rejects_combined_nth_flags() {
         let error = parse_target("css=a", true, true, None).unwrap_err();
         assert_eq!(error.code, "QUERY_SYNTAX");
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn restore(name: &str, value: Option<String>) {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    fn with_clean_env<T>(body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_session = std::env::var("GREPPY_WEB_SESSION").ok();
+        let prev_tab = std::env::var("GREPPY_WEB_TAB").ok();
+        let prev_run = std::env::var("GREPPY_RUN_ID").ok();
+        let prev_agent = std::env::var("GREPPY_WEB_AGENT").ok();
+        std::env::remove_var("GREPPY_WEB_SESSION");
+        std::env::remove_var("GREPPY_WEB_TAB");
+        std::env::remove_var("GREPPY_RUN_ID");
+        std::env::remove_var("GREPPY_WEB_AGENT");
+        let result = body();
+        restore("GREPPY_WEB_SESSION", prev_session);
+        restore("GREPPY_WEB_TAB", prev_tab);
+        restore("GREPPY_RUN_ID", prev_run);
+        restore("GREPPY_WEB_AGENT", prev_agent);
+        result
+    }
+
+    #[test]
+    fn resolve_session_flag_beats_env_beats_file() {
+        with_clean_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            write_current_scope(Some(root), "file_sess", Some("t_file")).unwrap();
+            std::env::set_var("GREPPY_WEB_SESSION", "env_sess");
+            std::env::set_var("GREPPY_WEB_TAB", "t_env");
+            assert_eq!(
+                resolve_session(Some(root), Some("flag_sess".into())).unwrap(),
+                "flag_sess"
+            );
+            assert_eq!(resolve_session(Some(root), None).unwrap(), "env_sess");
+            std::env::remove_var("GREPPY_WEB_SESSION");
+            assert_eq!(resolve_session(Some(root), None).unwrap(), "file_sess");
+            assert_eq!(resolve_tab(Some(root), Some("t_flag".into())).as_deref(), Some("t_flag"));
+            assert_eq!(resolve_tab(Some(root), None).as_deref(), Some("t_env"));
+            std::env::remove_var("GREPPY_WEB_TAB");
+            assert_eq!(resolve_tab(Some(root), None).as_deref(), Some("t_file"));
+            std::fs::remove_file(current_scope_path(Some(root))).unwrap();
+            let error = resolve_session(Some(root), None).unwrap_err();
+            assert_eq!(error.code, "NO_SESSION");
+            assert!(error.message.contains("session"), "{}", error.message);
+        });
+    }
+
+    #[test]
+    fn workspace_run_id_is_stable_for_the_same_root() {
+        with_clean_env(|| {
+            let a = web_run_id_for(Some("/tmp/greppy-ws-a"));
+            let b = web_run_id_for(Some("/tmp/greppy-ws-a"));
+            let c = web_run_id_for(Some("/tmp/greppy-ws-b"));
+            assert_eq!(a, b);
+            assert_ne!(a, c);
+            assert!(a.starts_with("run_ws_"), "{a}");
+        });
     }
 }
 

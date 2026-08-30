@@ -11,6 +11,8 @@ pub struct TargetOpts {
     #[arg(long)]
     pub session: Option<String>,
     #[arg(long)]
+    pub tab: Option<String>,
+    #[arg(long)]
     pub first: bool,
     #[arg(long)]
     pub last: bool,
@@ -110,6 +112,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.click",
             &target,
             opts.first,
@@ -129,6 +132,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
                 root,
                 opts.json,
                 opts.session,
+                opts.tab,
                 "web.fill",
                 &target,
                 opts.first,
@@ -141,6 +145,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.type",
             &target,
             opts.first,
@@ -152,6 +157,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.fill",
             &target,
             opts.first,
@@ -167,6 +173,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.select",
             &target,
             opts.first,
@@ -178,6 +185,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.check",
             &target,
             opts.first,
@@ -189,6 +197,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.uncheck",
             &target,
             opts.first,
@@ -201,14 +210,18 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             key,
             opts,
         } => {
-            let Some(session) = opts.session else {
-                return emit_error(opts.json, invalid("web press requires --session SESSION"));
+            let session = match resolve_session(root, opts.session) {
+                Ok(session) => session,
+                Err(error) => return emit_error(opts.json, error),
             };
             let (target, key) = match key {
                 Some(key) => (Some(target_or_key), key),
                 None => (None, target_or_key),
             };
             let mut payload = json!({ "session_id": session, "key": key });
+            if let Some(tab) = resolve_tab(root, opts.tab) {
+                payload["tab_id"] = json!(tab);
+            }
             if let Some(target) = target {
                 match parse_target(&target, opts.first, opts.last, opts.nth) {
                     Ok(parsed) => payload["selector"] = parsed.selector,
@@ -221,6 +234,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             root,
             opts.json,
             opts.session,
+            opts.tab,
             "web.hover",
             &target,
             opts.first,
@@ -233,6 +247,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
                 root,
                 opts.json,
                 opts.session,
+                opts.tab,
                 "web.scroll",
                 &target,
                 opts.first,
@@ -241,16 +256,15 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
                 json!({}),
             ),
             (None, Some(delta)) => {
-                let Some(session) = opts.session else {
-                    return emit_error(opts.json, invalid("web scroll requires --session SESSION"));
+                let session = match resolve_session(root, opts.session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(opts.json, error),
                 };
-                rpc(
-                    root,
-                    opts.json,
-                    "web.scroll",
-                    json!({ "session_id": session, "delta_y": delta }),
-                    Some(session),
-                )
+                let mut payload = json!({ "session_id": session, "delta_y": delta });
+                if let Some(tab) = resolve_tab(root, opts.tab) {
+                    payload["tab_id"] = json!(tab);
+                }
+                rpc(root, opts.json, "web.scroll", payload, Some(session))
             }
             _ => emit_error(
                 opts.json,
@@ -269,6 +283,7 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
                 root,
                 opts.json,
                 opts.session,
+                opts.tab,
                 "web.upload",
                 &target,
                 opts.first,
@@ -284,6 +299,7 @@ fn locator_rpc(
     root: Option<&str>,
     json_out: bool,
     session: Option<String>,
+    tab: Option<String>,
     operation: &str,
     target: &str,
     first: bool,
@@ -291,11 +307,9 @@ fn locator_rpc(
     nth: Option<i64>,
     extra: serde_json::Value,
 ) -> Result<i32> {
-    let Some(session) = session else {
-        return emit_error(
-            json_out,
-            invalid(&format!("{operation} requires --session SESSION")),
-        );
+    let session = match resolve_session(root, session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(json_out, error),
     };
     let parsed = match parse_target(target, first, last, nth) {
         Ok(parsed) => parsed,
@@ -305,6 +319,9 @@ fn locator_rpc(
         "session_id": session,
         "selector": parsed.selector,
     });
+    if let Some(tab) = resolve_tab(root, tab) {
+        payload["tab_id"] = json!(tab);
+    }
     if let Some(object) = extra.as_object() {
         if let Some(dst) = payload.as_object_mut() {
             for (key, value) in object {

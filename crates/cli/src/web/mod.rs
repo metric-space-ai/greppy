@@ -22,6 +22,7 @@ pub use act::ActCommand;
 pub use common::{shutdown_if_running, web_runtime_socket};
 pub use nav::NavCommand;
 pub use results::ResultsCommand;
+pub use chain::ChainCommand;
 pub use see::SeeCommand;
 pub use sessions::SessionsCommand;
 
@@ -37,6 +38,8 @@ pub enum WebCommand {
     Act(ActCommand),
     #[command(flatten)]
     See(SeeCommand),
+    #[command(flatten)]
+    Chain(ChainCommand),
 }
 
 pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
@@ -55,6 +58,7 @@ pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
         WebCommand::Nav(command) => nav::dispatch(command, root),
         WebCommand::Act(command) => act::dispatch(command, root),
         WebCommand::See(command) => see::dispatch(command, root),
+        WebCommand::Chain(command) => chain::dispatch(command, root),
     }
 }
 
@@ -109,6 +113,7 @@ mod tests {
                     url,
                     session: Some(session),
                     json: true,
+                    ..
                 })
             }) if url == "http://example.com/" && session == "wrs_1"
         ));

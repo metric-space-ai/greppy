@@ -54,6 +54,16 @@ pub fn claim_persistent_parent() -> io::Result<String> {
     Ok(token)
 }
 
+/// Install a reconnect cookie so a later CLI process can talk to the same
+/// owner without inheriting fd 4. Does not replace an already-held token.
+pub fn adopt_persistent_token(token: String) {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.token.is_none() {
+        guard.token = Some(token);
+    }
+    guard.role = Role::PersistentParent;
+}
+
 #[cfg(unix)]
 pub fn current_token() -> Option<String> {
     let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
@@ -77,6 +87,7 @@ pub fn current_token() -> Option<String> {
         .clone()
 }
 
+#[allow(dead_code)]
 pub fn become_standalone_owner() -> io::Result<String> {
     let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(token) = guard.token.clone() {

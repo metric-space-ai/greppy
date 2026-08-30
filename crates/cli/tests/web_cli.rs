@@ -792,3 +792,127 @@ fn concurrent_unrelated_children_do_not_inherit_attach_token_fd() {
     drop(pass);
     drop(holder);
 }
+
+#[cfg(unix)]
+fn serve_scope_pages() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind scope pages");
+    let address = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let n = stream.read(&mut buffer).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buffer[..n]);
+            let body = if req.contains("GET /001/") {
+                "<!DOCTYPE html><html><head><title>001</title></head><body><h1>Seite-001</h1></body></html>"
+            } else {
+                "<!DOCTYPE html><html><head><title>fx</title></head><body><h1>Kopf</h1></body></html>"
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    format!("http://{address}")
+}
+
+#[cfg(unix)]
+fn run_scoped(
+    workspace: &std::path::Path,
+    runtime: &std::path::Path,
+    run_id: &str,
+    args: &[&str],
+) -> (i32, String, String) {
+    let output = Command::new(bin())
+        .arg("--root")
+        .arg(workspace)
+        .args(args)
+        .current_dir(workspace)
+        .env("GREPPY_RUN_ID", run_id)
+        .env("GREPPY_WEB_RUNTIME", runtime)
+        .env_remove("GREPPY_WEB_SESSION")
+        .env_remove("GREPPY_WEB_TAB")
+        .env_remove("GREPPY_WEB_AGENT")
+        .env_remove("GREPPY_WEB_ATTACH")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("greppy web scoped");
+    (
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn web_open_observe_goto_observe_share_session_without_flag() {
+    let runtime = locate_web_runtime();
+    let run_id = format!(
+        "run_scope_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let workspace = std::env::temp_dir().join(format!("greppy-web-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let base = serve_scope_pages();
+    let fx = format!("{base}/_fx/index.html");
+    let page = format!("{base}/001/index.html");
+
+    let (code, stdout, stderr) = run_scoped(&workspace, &runtime, &run_id, &["web", "open", &fx, "--json"]);
+    if code != 0 {
+        let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+        let _ = std::fs::remove_dir_all(&workspace);
+        panic!("open failed code={code} stdout={stdout} stderr={stderr}");
+    }
+    let current = workspace.join(".greppy/web/current.json");
+    assert!(
+        current.is_file(),
+        "open must write current.json at {}",
+        current.display()
+    );
+
+    let (code, stdout, stderr) =
+        run_scoped(&workspace, &runtime, &run_id, &["web", "observe", "--json"]);
+    if code != 0 || !stdout.contains("Kopf") {
+        let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+        let _ = std::fs::remove_dir_all(&workspace);
+        panic!("observe after open must show Kopf without --session code={code} stdout={stdout} stderr={stderr}");
+    }
+
+    let (code, stdout, stderr) =
+        run_scoped(&workspace, &runtime, &run_id, &["web", "goto", &page, "--json"]);
+    if code != 0 {
+        let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+        let _ = std::fs::remove_dir_all(&workspace);
+        panic!("goto without --session failed code={code} stdout={stdout} stderr={stderr}");
+    }
+
+    let (code, stdout, stderr) =
+        run_scoped(&workspace, &runtime, &run_id, &["web", "observe", "--json"]);
+    let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+    let _ = std::fs::remove_dir_all(&workspace);
+    assert_eq!(code, 0, "second observe failed stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("Seite-001"),
+        "observe after goto must show the new page, stdout={stdout}"
+    );
+}
+
+#[test]
+fn web_goto_without_scope_is_no_session() {
+    let (code, stdout, _stderr) = run(&["web", "goto", "http://example.com/", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("NO_SESSION") || stdout.contains("session"), "stdout={stdout}");
+}

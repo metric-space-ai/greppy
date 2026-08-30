@@ -72,13 +72,29 @@ pub(super) fn dispatch(command: SessionsCommand, root: Option<&str>) -> Result<i
         SessionsCommand::Status { json } => status(json, root),
         SessionsCommand::Doctor { json } => doctor(json, root),
         SessionsCommand::Session { command } => match command {
-            SessionCommand::Create { profile, json } => rpc(
-                root,
-                json,
-                "web.session.create",
-                json!({ "profile": profile }),
-                None,
-            ),
+            SessionCommand::Create { profile, json } => {
+                match rpc_response(
+                    root,
+                    "web.session.create",
+                    json!({ "profile": profile }),
+                    None,
+                ) {
+                    Err(error) => emit_error(json, error),
+                    Ok(response) => {
+                        if response.status == "ok" {
+                            if let Some(session) = response
+                                .result
+                                .as_ref()
+                                .and_then(|value| value.get("session_id"))
+                                .and_then(|value| value.as_str())
+                            {
+                                let _ = write_current_scope(root, session, None);
+                            }
+                        }
+                        emit_response(json, response)
+                    }
+                }
+            }
             SessionCommand::List { json } => rpc(root, json, "web.session.list", json!({}), None),
             SessionCommand::Close { session, json } => rpc(
                 root,
