@@ -235,9 +235,66 @@ fn op_capture_stdout(state: Rc<RefCell<OpState>>, #[string] line: String) {
         .push(line);
 }
 
+fn confine_screenshot_sidecar(path: &str) -> Result<PathBuf, JsErrorBox> {
+    let requested = PathBuf::from(path);
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let canon = requested
+        .canonicalize()
+        .map_err(|error| JsErrorBox::generic(error.to_string()))?;
+    if !canon.starts_with(&root) {
+        return Err(JsErrorBox::generic(format!(
+            "path outside worker temp: {}",
+            canon.display()
+        )));
+    }
+    let name = canon
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !name.starts_with("greppy-web-shot-") || !name.ends_with(".png") {
+        return Err(JsErrorBox::generic("refusing non-screenshot sidecar"));
+    }
+    Ok(canon)
+}
+
+fn base64_encode_png(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = chunk.get(1).copied().unwrap_or(0) as u32;
+        let c = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (a << 16) | (b << 8) | c;
+        out.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[op2]
+#[string]
+fn op_read_temp_png(#[string] path: String) -> Result<String, JsErrorBox> {
+    let confined = confine_screenshot_sidecar(&path)?;
+    let bytes = std::fs::read(&confined).map_err(|error| JsErrorBox::generic(error.to_string()))?;
+    let _ = std::fs::remove_file(&confined);
+    Ok(base64_encode_png(&bytes))
+}
+
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms, op_capture_stdout],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);

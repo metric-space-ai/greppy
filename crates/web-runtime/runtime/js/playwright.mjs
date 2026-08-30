@@ -28,6 +28,14 @@ const disposedPages = new Set();
 const disposedContexts = new Set();
 const disposedBrowsers = new Set();
 
+function screenshotBuffer(result) {
+  if (result && result.png_path) {
+    const encoded = ops.op_read_temp_png(String(result.png_path));
+    return decodeBase64(encoded).buffer;
+  }
+  return decodeBase64((result && result.png_base64) || "").buffer;
+}
+
 function engineCall(method, params) {
   const payload = params ? Object.assign({}, params) : {};
   if (
@@ -667,7 +675,7 @@ class Locator {
     const result = await engineCall("locator.screenshot", {
       ...locatorParams(this),
     });
-    return decodeBase64(result.png_base64 || "").buffer;
+    return screenshotBuffer(result);
   }
 
   async allTextContents() {
@@ -2286,8 +2294,7 @@ class Page {
       };
     }
     const result = await engineCall("page.screenshot", { page: this._id, clip });
-    const binary = result.png_base64 || "";
-    return decodeBase64(binary).buffer;
+    return screenshotBuffer(result);
   }
 
   async setContent(html, options) {

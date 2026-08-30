@@ -1643,11 +1643,7 @@ impl Daemon {
             Ok((session_id, page)) => {
                 match self.engine_call("page.screenshot", json!({ "page": page })) {
                     Ok(result) => {
-                        let Some(b64) = result.get("png_base64").and_then(|v| v.as_str()) else {
-                            self.finish_session(&session_id);
-                            return engine_error(request, "screenshot missing png", 34);
-                        };
-                        let bytes = match decode_base64(b64) {
+                        let bytes = match screenshot_png_bytes(&result) {
                             Ok(bytes) => bytes,
                             Err(error) => {
                                 self.finish_session(&session_id);
@@ -1665,17 +1661,17 @@ impl Daemon {
                         self.finish_session(&session_id);
                         match stored {
                             Ok(manifest) => {
-                                let mut response = Response::ok(
-                                    request,
-                                    json!({
-                                        "session_id": session_id,
-                                        "digest": manifest.digest.hex,
-                                        "byte_count": manifest.byte_count,
-                                        "object_path": manifest.object_path,
-                                        "png_base64": b64,
-                                        "media_type": "image/png",
-                                    }),
-                                );
+                                let mut payload = json!({
+                                    "session_id": session_id,
+                                    "digest": manifest.digest.hex,
+                                    "byte_count": manifest.byte_count,
+                                    "object_path": manifest.object_path,
+                                    "media_type": "image/png",
+                                });
+                                if let Some(b64) = result.get("png_base64").cloned() {
+                                    payload["png_base64"] = b64;
+                                }
+                                let mut response = Response::ok(request, payload);
                                 response
                                     .artifacts
                                     .push(serde_json::to_value(manifest).unwrap_or(json!({})));
@@ -2568,6 +2564,40 @@ fn urlencoding(value: &str) -> String {
         }
     }
     out
+}
+
+fn confine_screenshot_sidecar(path: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(path);
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let canon = requested.canonicalize().map_err(|error| error.to_string())?;
+    if !canon.starts_with(&root) {
+        return Err(format!("path outside worker temp: {}", canon.display()));
+    }
+    let name = canon
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !name.starts_with("greppy-web-shot-") || !name.ends_with(".png") {
+        return Err("refusing non-screenshot sidecar".into());
+    }
+    Ok(canon)
+}
+
+fn screenshot_png_bytes(result: &serde_json::Value) -> Result<Vec<u8>, String> {
+    if let Some(b64) = result.get("png_base64").and_then(|value| value.as_str()) {
+        if !b64.is_empty() {
+            return decode_base64(b64);
+        }
+    }
+    if let Some(path) = result.get("png_path").and_then(|value| value.as_str()) {
+        let confined = confine_screenshot_sidecar(path)?;
+        let bytes = std::fs::read(&confined).map_err(|error| error.to_string())?;
+        let _ = std::fs::remove_file(&confined);
+        return Ok(bytes);
+    }
+    Err("screenshot missing png".into())
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {

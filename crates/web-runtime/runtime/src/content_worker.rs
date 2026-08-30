@@ -1,6 +1,8 @@
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
 use crate::policy_proxy::PolicyProxy;
-use crate::protocol::{read_message, timeout_ms_from_json, write_message, Message, WorkerKind};
+use crate::protocol::{
+    read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
+};
 use crate::worker::require_worker_auth;
 use dpi::PhysicalSize;
 use serde_json::json;
@@ -17,7 +19,7 @@ use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -1990,7 +1992,7 @@ impl ContentEngine {
                     Some((x, y, width, height))
                 });
                 let png = self.screenshot_png(&webview, clip)?;
-                Ok(json!({ "png_base64": base64_encode(&png) }))
+                screenshot_engine_result(&png)
             }
             "locator.count" => {
                 let page_id = required_str(&params, "page")?;
@@ -2152,7 +2154,7 @@ impl ContentEngine {
                     resolved.height.max(1.0) as u32,
                 ));
                 let png = self.screenshot_png(&webview, clip)?;
-                Ok(json!({ "png_base64": base64_encode(&png) }))
+                screenshot_engine_result(&png)
             }
             "locator.allTextContents" => {
                 let page_id = required_str(&params, "page")?;
@@ -4103,6 +4105,65 @@ mod serialize_tests {
         assert_eq!(calls, 2, "deadline must recheck predicate without a wake");
         assert_eq!(wake.generation(), start);
     }
+
+    #[test]
+    fn oversized_screenshot_engine_result_uses_sidecar_file() {
+        let small = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let small_value = screenshot_engine_result(&small).expect("small screenshot");
+        assert!(
+            small_value.get("png_base64").and_then(|v| v.as_str()).is_some(),
+            "small PNG must stay inline: {small_value:?}"
+        );
+        assert!(small_value.get("png_path").is_none());
+        let mut small_frame = Vec::new();
+        write_message(
+            &mut small_frame,
+            &Message::engine_result(1, true, small_value, None),
+        )
+        .expect("small screenshot must fit the worker frame");
+
+        let large = vec![0xA5; 900_000];
+        let large_inline = json!({
+            "png_base64": base64_encode(&large),
+            "byte_count": large.len(),
+        });
+        assert!(
+            engine_result_frame_len(&large_inline) > MAX_FRAME_BYTES,
+            "900 KiB PNG base64 must exceed the 1 MiB worker frame"
+        );
+        let mut too_big = Vec::new();
+        let inline_err = write_message(
+            &mut too_big,
+            &Message::engine_result(1, true, large_inline, None),
+        )
+        .expect_err("inline oversized PNG must be refused");
+        assert!(
+            inline_err.to_string().contains("exceeds"),
+            "{inline_err}"
+        );
+
+        let large_value = screenshot_engine_result(&large).expect("large screenshot");
+        let path = large_value
+            .get("png_path")
+            .and_then(|v| v.as_str())
+            .expect("sidecar path")
+            .to_owned();
+        assert!(
+            large_value.get("png_base64").is_none(),
+            "oversized PNG must not ride the frame as base64: {large_value:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("sidecar bytes"),
+            large
+        );
+        let mut large_frame = Vec::new();
+        write_message(
+            &mut large_frame,
+            &Message::engine_result(1, true, large_value, None),
+        )
+        .expect("sidecar screenshot must fit the worker frame");
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 const OBSERVE_JS: &str = r#"JSON.stringify({
@@ -4116,6 +4177,40 @@ const OBSERVE_JS: &str = r#"JSON.stringify({
     return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
   })
 })"#;
+
+static SCREENSHOT_SIDECAR_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn engine_result_frame_len(result: &serde_json::Value) -> usize {
+    serde_json::to_vec(&Message::engine_result(0, true, result.clone(), None))
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn write_screenshot_sidecar(png: &[u8]) -> io::Result<PathBuf> {
+    let seq = SCREENSHOT_SIDECAR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "greppy-web-shot-{}-{seq}.png",
+        std::process::id()
+    ));
+    let confined = confine_worker_path(&path)?;
+    std::fs::write(&confined, png)?;
+    Ok(confined)
+}
+
+fn screenshot_engine_result(png: &[u8]) -> io::Result<serde_json::Value> {
+    let inline = json!({
+        "png_base64": base64_encode(png),
+        "byte_count": png.len(),
+    });
+    if engine_result_frame_len(&inline) <= MAX_FRAME_BYTES {
+        return Ok(inline);
+    }
+    let path = write_screenshot_sidecar(png)?;
+    Ok(json!({
+        "png_path": path.to_string_lossy(),
+        "byte_count": png.len(),
+    }))
+}
 
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -4293,7 +4388,16 @@ pub fn run() -> io::Result<()> {
                     ),
                 };
                 engine.wake.wake();
-                write_message(&mut protocol_out, &reply)?;
+                if let Err(error) = write_message(&mut protocol_out, &reply) {
+                    eprintln!("web-runtime: engine result write failed: {error}");
+                    let fallback = Message::engine_result(
+                        request_id,
+                        false,
+                        serde_json::Value::Null,
+                        Some(error.to_string()),
+                    );
+                    write_message(&mut protocol_out, &fallback)?;
+                }
             }
             Ok(Ok(Message::Shutdown { .. })) => {
                 drop(engine);
