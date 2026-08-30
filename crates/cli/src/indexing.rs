@@ -46,6 +46,28 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     // expensive while an atomic replacement is underway. Return the writer's
     // lightweight progress record before touching SQLite or walking Git.
     if writer_active {
+        let writer_lock = greppy_freshness::lock_path_for(&store_path);
+        let progress_age_seconds = background_job
+            .as_ref()
+            .and_then(|job| job.get("updated_at_unix_secs"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|updated| unix_now_secs_cli().saturating_sub(updated));
+        let progress_stalled = progress_age_seconds.is_some_and(|age| age >= 120);
+        let message = if progress_stalled {
+            let phase = background_job
+                .as_ref()
+                .and_then(|job| job.get("state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            format!(
+                "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the exact background_job PID, terminate only that process if it is no longer making progress, then rerun `greppy index`; the OS lock releases with its owner",
+                progress_age_seconds.unwrap_or(0)
+            )
+        } else if background_job.is_some() {
+            "index build in progress; inspect background_job for phase/progress, wait for completion, then retry".into()
+        } else {
+            "index writer owns the OS lock but has not published detailed progress yet; phase=starting, retry `greppy index status --json` shortly; the lock is crash-safe and releases when its owning process exits".into()
+        };
         let status = serde_json::json!({
             "command": command,
             "status": "indexing",
@@ -54,14 +76,17 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "writer_active": true,
             "root_path": effective_root,
             "store_path": store_path,
+            "writer_lock": writer_lock,
             "store_format": store_format,
             "store_bytes": store_bytes,
             "background_job": background_job,
             "background_state": "refreshing",
+            "progress_age_seconds": progress_age_seconds,
+            "progress_stalled": progress_stalled,
             "fresh": false,
             "dirty_overlay": null,
             "inference": null,
-            "message": "index build in progress; inspect background_job for phase/progress, wait for completion, then retry",
+            "message": message,
         });
         if json {
             println!(
@@ -601,7 +626,13 @@ pub(crate) fn dispatch_index(
         }
         None => find_repo_root(&target),
     };
-    if effective_root.join(".git").is_file() && target != effective_root {
+    // A linked worktree root is identified by its `.git` file, not by the
+    // spelling of its absolute path. Windows can expose the same mounted
+    // directory once as a verbatim long path and once through an 8.3 alias;
+    // comparing those strings rejects the repository root as if it were a
+    // partial subdirectory. A real subdirectory has no `.git` marker of its
+    // own and is still rejected here.
+    if effective_root.join(".git").is_file() && !target.join(".git").is_file() {
         return Err(Error::Invalid(format!(
             "linked-worktree CoW indexing requires the repository root; run `greppy index --root {}` instead of indexing only {}",
             effective_root.display(),
@@ -663,10 +694,18 @@ pub(crate) fn dispatch_index(
     };
     background_job.attach_foreground(background_job_path(&effective_root));
     background_job.write_state("preparing_base", None);
+    if background_job.is_foreground_owner() && !cli_json_output() {
+        eprintln!(
+            "greppy: index started for {} (phase=preparing_base, pid={}); progress: `greppy index status --json`",
+            effective_root.display(),
+            std::process::id()
+        );
+    }
     let _auto_linked_worktree_overlay = crate::store_cow::prepare_auto_linked_worktree_overlay(
         &effective_root,
         &greppy_core::cache::data_root(),
         embedding_args,
+        background_job.progress_path(),
     )?;
     background_job.write_state("indexing", None);
     if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {

@@ -208,7 +208,9 @@ fn passthrough_network_like_delayed_stdin_is_not_rejected_as_empty() {
     let mut child = ours.spawn().expect("spawn greppy");
     let mut stdin = child.stdin.take().expect("open child stdin");
     let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(750));
+        // A heavily scheduled local producer (for example `ps`) can take
+        // longer than the old 1.5s startup grace before writing its first row.
+        std::thread::sleep(std::time::Duration::from_millis(2_000));
         stdin.write_all(b"hallo\n").expect("write delayed stdin");
     });
     let output = child.wait_with_output().expect("collect greppy output");

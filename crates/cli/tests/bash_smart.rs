@@ -357,3 +357,57 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
         "{stderr}"
     );
 }
+
+#[test]
+fn active_index_writer_never_blocks_command_execution() {
+    let workspace = fresh_workspace("writer-independent");
+    std::fs::write(workspace.repo.join("lib.rs"), "pub fn marker() {}\n").unwrap();
+    let ready = workspace.base.join("index-writer-ready");
+    let mut index = command(&workspace)
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .args(["index", "."])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn held index writer");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ready.exists() {
+        if let Some(status) = index.try_wait().expect("poll held index writer") {
+            panic!("index writer exited before its hold point: {status}");
+        }
+        assert!(Instant::now() < deadline, "index writer never became ready");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let started = Instant::now();
+    let output = run(
+        &workspace,
+        &["bash-smart", "--", "sh", "-c", "printf ran > command-ran"],
+    );
+    let elapsed = started.elapsed();
+    let _ = index.kill();
+    let _ = index.wait();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={}",
+        text(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "bash-smart waited on the graph writer for {elapsed:?}"
+    );
+    assert_eq!(
+        std::fs::read(workspace.repo.join("command-ran")).unwrap(),
+        b"ran"
+    );
+    assert!(
+        text(&output.stderr)
+            .contains("index writer active; command execution continues without expansion storage"),
+        "stderr={}",
+        text(&output.stderr)
+    );
+}

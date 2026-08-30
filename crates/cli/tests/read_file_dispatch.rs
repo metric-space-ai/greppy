@@ -200,6 +200,9 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
 fn read_file_range_and_all_bypass_pagination() {
     let (repo, store) = fresh_workspace("range-all");
     std::fs::write(repo.join("config.json"), "a\nb\nc\nd\n").unwrap();
+    // Exact reads must not touch the graph store. A concurrent first index
+    // can be creating/migrating it, and read-file must remain deterministic.
+    std::fs::write(&store, "not a store directory").unwrap();
 
     let (code, stdout, stderr) = run(
         &repo,

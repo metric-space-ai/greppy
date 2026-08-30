@@ -15,6 +15,26 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   foreground phase, completed/total spans and ETA when available. Semantic
   search against an incomplete embedding generation now returns temporary
   exit 75 with an explicit `index status --json` retry condition.
+- First-use graph navigation starts indexing as one observable background job
+  and waits at most two seconds for publication. Large repositories therefore
+  return retryable exit 75 instead of hiding an unbounded index walk. Job state
+  is published before process launch, immutable-Base child progress is relayed
+  under the outer owner PID, and a status record with no update for two minutes
+  is marked potentially stalled with bounded recovery guidance.
+- A foreground `greppy index` now prints an immediate `preparing_base` line
+  with its PID and the exact nonblocking status command, so a cold build on a
+  large repository is never indistinguishable from a silent orphaned process.
+- `bash-smart` no longer opens writable graph-pack storage while an indexer
+  owns the workspace lock; the requested process starts immediately and only
+  optional expansion storage is skipped. Implicit grep pipelines now allow a
+  five-second producer-start window, preventing loaded but valid producers
+  such as `ps` from being misreported as missing stdin.
+- Exact `read-file --all` and `read-file --lines` operations no longer open or
+  migrate the graph store, so they remain available during concurrent first
+  indexing and cannot collide with the indexer's schema publication.
+- Linked-worktree root validation is structural on Windows and accepts the
+  equivalent long-path/8.3 spellings emitted by the OS without weakening the
+  rejection of real partial-subdirectory indexing.
 - Literal-search text rows emit lossless qualified locators accepted by
   `greppy read`; enclosing provider nodes no longer produce a short name that
   cannot be read back.

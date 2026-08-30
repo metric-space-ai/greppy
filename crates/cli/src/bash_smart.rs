@@ -183,7 +183,16 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     // straight into this directory while the child runs. The completed output
     // is never accumulated by `Command::output`, and stdout cannot block stderr
     // (or vice versa) at the kernel pipe limit.
-    let store = open_pack_store(root).ok();
+    let store = match open_pack_store(root) {
+        Ok(store) => Some(store),
+        Err(Error::Lock(_)) => {
+            eprintln!(
+                "bash-smart: index writer active; command execution continues without expansion storage"
+            );
+            None
+        }
+        Err(_) => None,
+    };
     let spool_dir = spool_dir(root)?;
     let token = spool_token();
     let stdout_path = spool_dir.join(format!("{token}.stdout"));
@@ -1179,6 +1188,15 @@ impl StoredRaw {
 }
 
 fn open_pack_store(root: Option<&str>) -> Result<greppy_store::Store> {
+    // Expansion storage is optional; executing the requested command is not.
+    // Opening a writable graph store while an indexer owns the workspace can
+    // block in SQLite migration/journal setup before the target process is
+    // even spawned. Skip the pack in that state and preserve bash semantics.
+    if workspace_writer_active(root) {
+        return Err(Error::Lock(
+            "index writer active; bash-smart expansion storage unavailable".into(),
+        ));
+    }
     let effective_root = resolve_root(root)?;
     let path = workspace_locator::store_path(&effective_root);
     if let Some(parent) = path.parent() {

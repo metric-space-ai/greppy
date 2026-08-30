@@ -2347,6 +2347,35 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     assert_eq!(status["store_exists"], true);
     assert_eq!(status["writer_active"], true);
 
+    let job_path = db.parent().unwrap().join("index.job");
+    std::fs::write(
+        &job_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "greppy.background-job.v2",
+            "kind": "index",
+            "pid": std::process::id(),
+            "updated_at_unix_secs": 1,
+            "state": "building_base_summaries"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "stalled progress is still retryable; stderr={err}"
+    );
+    let stalled: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(stalled["progress_stalled"], true);
+    assert!(
+        stalled["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("may be stalled")
+                && message.contains("terminate only that process")),
+        "stalled status needs bounded recovery guidance: {stalled}"
+    );
+    std::fs::remove_file(job_path).unwrap();
+
     std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
 
     let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
@@ -2360,11 +2389,13 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     assert_eq!(status["writer_active"], true);
     assert_eq!(status["background_state"], "refreshing");
     assert_eq!(status["background_job"], serde_json::Value::Null);
+    assert!(status["writer_lock"].as_str().is_some());
     assert!(
         status["message"]
             .as_str()
-            .is_some_and(|message| message.contains("index build in progress")),
-        "status must explain the live foreground writer: {status}"
+            .is_some_and(|message| message.contains("phase=starting")
+                && message.contains("releases when its owning process exits")),
+        "status must explain the job-record startup race and crash-safe recovery: {status}"
     );
 
     drop(live_lock);
@@ -2381,12 +2412,83 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
 
 #[cfg(unix)]
 #[test]
+fn first_use_index_is_bounded_and_reports_retryable_progress() {
+    let (repo, store, scratch) = make_repo("first-use-bounded", "first_use_marker");
+    let ready = scratch.0.join("first-use-writer-ready");
+    let ready_string = ready.to_string_lossy().into_owned();
+    let envs = [
+        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+    ];
+
+    let started = std::time::Instant::now();
+    let (code, out, err) =
+        run_with_env(&["search-symbol", "first_use_marker"], &repo, &store, &envs);
+    let elapsed = started.elapsed();
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() && std::time::Instant::now() < ready_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        ready.exists(),
+        "background index never reached its test hold point"
+    );
+
+    fn find_index_job(dir: &Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_index_job(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("index.job") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let job_path = find_index_job(&store).expect("first-use background job record");
+    let job: serde_json::Value = serde_json::from_slice(&std::fs::read(job_path).unwrap()).unwrap();
+    let pid = job["pid"].as_u64().expect("background job pid").to_string();
+    let killed = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("terminate held background index");
+    assert!(
+        killed.success(),
+        "failed to terminate background index {pid}"
+    );
+    assert_eq!(
+        code, 75,
+        "first use must be retryable; stdout={out} stderr={err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a navigation command must never wait for the full first index; elapsed={elapsed:?}"
+    );
+    assert!(
+        err.contains("first-use index started")
+            && err.contains("greppy index status --json")
+            && err.contains("healthy=true"),
+        "the refusal must provide state and exact recovery; stderr={err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn foreground_index_publishes_observable_progress_while_building() {
     let (repo, store, _scratch) = make_repo("foreground-index-progress", "progress_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
         "fixture index should succeed; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        err.contains("index started")
+            && err.contains("phase=preparing_base")
+            && err.contains("greppy index status --json"),
+        "a foreground cold index must immediately explain that it is alive and where progress is reported: {err:?}"
     );
     std::fs::write(
         repo.join("lib.rs"),

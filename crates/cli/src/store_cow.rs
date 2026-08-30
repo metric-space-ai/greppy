@@ -444,6 +444,17 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn report_base_phase(path: Option<&Path>, phase: &str) {
+    let Some(path) = path else { return };
+    let Some(mut job) = crate::read_background_job(path) else {
+        return;
+    };
+    job["state"] = serde_json::json!(phase);
+    job["updated_at_unix_secs"] = serde_json::json!(crate::unix_now_secs_cli());
+    job["last_error"] = serde_json::Value::Null;
+    let _ = crate::write_background_job(path, &job);
+}
+
 /// Prepare an immutable Base from the primary checkout and attach the current
 /// linked Git worktree as a private Delta. The primary checkout's HEAD is the
 /// repository-wide pinned Base; committed branch differences, dirty files and
@@ -452,6 +463,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
     root: &Path,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
+    progress_path: Option<&Path>,
 ) -> Result<Option<AutoLinkedWorktreeOverlay>> {
     if std::env::var(ENV_DISABLE_AUTO_LINKED_WORKTREE)
         .ok()
@@ -507,6 +519,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                         // Only the first worktree for this immutable Git tree
                         // needs a clean materialization. Every later worktree
                         // opens the hash-verified published Base directly.
+                        report_base_phase(progress_path, "preparing_base_checkout");
                         let clean = TemporaryBaseWorktree::create(
                             &primary,
                             shared_data_root,
@@ -519,6 +532,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                             &base_commit,
                             shared_data_root,
                             embedding_args,
+                            progress_path,
                         )?
                     }
                 };
@@ -681,6 +695,7 @@ pub(crate) fn prepare_base_store(
         workspace.base_commit(),
         shared_data_root,
         embedding_args,
+        None,
     )
 }
 
@@ -691,6 +706,7 @@ fn prepare_base_store_paths(
     base_commit: &str,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
+    progress_path: Option<&Path>,
 ) -> Result<PreparedBase> {
     let identity = base_identity_parts(repo_root, base_commit)?;
     let layout = BaseStoreLayout::new(shared_data_root, &identity)
@@ -743,6 +759,7 @@ fn prepare_base_store_paths(
         .map_err(|error| Error::io("create Base build data directory", error))?;
     let binary = std::env::current_exe()
         .map_err(|error| Error::io("resolve current greppy binary for Base build", error))?;
+    report_base_phase(progress_path, "building_base_graph");
     let mut command = Command::new(binary);
     command.arg("index");
     #[cfg(any(
@@ -754,7 +771,7 @@ fn prepare_base_store_paths(
         command.env(crate::ENV_TEST_FORCE_EMBED_COMPLETION, "1");
     }
     append_embedding_cli_args(&mut command, embedding_args);
-    let status = command
+    command
         .current_dir(worktree_path)
         .env("GREPPY_STORE_DIR", &staging_data)
         // A published Base is not valid until every candidate has its vector;
@@ -762,11 +779,20 @@ fn prepare_base_store_paths(
         // build to a background process outside the publication lease.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
         .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
+        .env_remove("GREPPY_BACKGROUND_JOB")
+        .env_remove("GREPPY_BACKGROUND_CAUSE")
+        .env_remove("GREPPY_BACKGROUND_KIND")
+        .env_remove("GREPPY_BACKGROUND_STARTED_AT")
+        .env_remove("GREPPY_BACKGROUND_TARGET_GENERATION")
         .env_remove(ENV_MODE)
         .env_remove(ENV_BASE_PATH)
         .env_remove(ENV_BASE_COMMIT)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::null());
+    if let Some(path) = progress_path {
+        command.env(crate::ENV_DELEGATED_BACKGROUND_JOB, path);
+    }
+    let status = command
         .status()
         .map_err(|error| Error::io("start immutable Base index build", error))?;
     if !status.success() {
@@ -803,6 +829,7 @@ fn prepare_base_store_paths(
             "injected immutable Base summary generation failure".into(),
         ));
     }
+    report_base_phase(progress_path, "building_base_summaries");
     let staged_summary_cache = build_base_summary_cache(
         worktree_path,
         &staged_graph,

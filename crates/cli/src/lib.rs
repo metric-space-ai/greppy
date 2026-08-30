@@ -169,6 +169,7 @@ const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
+const ENV_DELEGATED_BACKGROUND_JOB: &str = "GREPPY_DELEGATED_BACKGROUND_JOB";
 #[cfg(all(
     not(feature = "ci-test-assets"),
     any(debug_assertions, feature = "store-cow-release-perf")
@@ -3800,6 +3801,8 @@ fn replace_background_job_file(
 struct BackgroundJobGuard {
     path: Option<std::path::PathBuf>,
     detached: bool,
+    delegated: bool,
+    owner_pid: u32,
     cause: String,
     kind: String,
     started_at_unix_secs: u64,
@@ -3817,27 +3820,41 @@ struct BackgroundJobGuard {
 
 impl BackgroundJobGuard {
     fn from_env() -> Self {
-        let path = std::env::var_os("GREPPY_BACKGROUND_JOB").map(std::path::PathBuf::from);
-        let detached = path.is_some();
+        let direct_path = std::env::var_os("GREPPY_BACKGROUND_JOB").map(std::path::PathBuf::from);
+        let delegated_path =
+            std::env::var_os(ENV_DELEGATED_BACKGROUND_JOB).map(std::path::PathBuf::from);
+        let detached = direct_path.is_some();
+        let delegated = direct_path.is_none() && delegated_path.is_some();
+        let path = direct_path.or(delegated_path);
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
         // before the parent writes `refreshing` over it.
-        if let Some(path) = &path {
-            for _ in 0..100 {
-                if read_background_job(path)
-                    .and_then(|job| job.get("pid").and_then(serde_json::Value::as_u64))
-                    == Some(u64::from(std::process::id()))
-                {
-                    break;
+        if detached {
+            if let Some(path) = &path {
+                for _ in 0..100 {
+                    if read_background_job(path)
+                        .and_then(|job| job.get("pid").and_then(serde_json::Value::as_u64))
+                        == Some(u64::from(std::process::id()))
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         let published = path.as_deref().and_then(read_background_job);
+        let owner_pid = published
+            .as_ref()
+            .and_then(|job| job.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .unwrap_or_else(std::process::id);
         Self {
             path,
             detached,
+            delegated,
+            owner_pid,
             cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
                 .unwrap_or_else(|_| "background-refresh".into()),
             kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
@@ -3881,6 +3898,10 @@ impl BackgroundJobGuard {
         self.detached
     }
 
+    fn is_foreground_owner(&self) -> bool {
+        !self.detached && !self.delegated
+    }
+
     fn has_progress_sink(&self) -> bool {
         self.path.is_some()
     }
@@ -3890,6 +3911,7 @@ impl BackgroundJobGuard {
             return;
         }
         self.path = Some(path);
+        self.owner_pid = std::process::id();
         self.cause = "foreground-index".into();
         self.kind = "index".into();
         self.started_at_unix_secs = unix_now_secs_cli();
@@ -3957,7 +3979,7 @@ impl BackgroundJobGuard {
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
-            "pid": std::process::id(),
+            "pid": self.owner_pid,
             "started_at_unix_secs": self.started_at_unix_secs,
             "updated_at_unix_secs": now,
             "cause": self.cause,
@@ -3979,10 +4001,18 @@ impl BackgroundJobGuard {
 
     fn complete(&mut self) {
         self.complete = true;
+        if self.delegated {
+            self.write_state("base_graph_ready", None);
+            return;
+        }
         if let Some(path) = &self.path {
             let _ = std::fs::remove_file(path);
             let _ = sync_parent_dir(path);
         }
+    }
+
+    fn progress_path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
     }
 
     fn fail(&mut self, error: &Error) {
@@ -4139,6 +4169,34 @@ fn spawn_background_job(
     } else {
         (None, None, 0, None)
     };
+    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
+    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    // Publish a launch record before spawning. Otherwise a concurrent status
+    // call can observe the child-owned writer lock while background_job is
+    // still null and provide no useful progress or recovery information.
+    let mut value = serde_json::json!({
+        "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+        "kind": kind,
+        "pid": serde_json::Value::Null,
+        "started_at_unix_secs": started_at,
+        "updated_at_unix_secs": started_at,
+        "cause": cause,
+        "target_generation": target_generation,
+        "state": "launching",
+        "backend": backend,
+        "device": device,
+        "completed_spans": 0,
+        "total_spans": total_spans,
+        "progress_milli_percent": 0,
+        "rate_milli_spans_per_second": serde_json::Value::Null,
+        "eta_seconds": eta_seconds,
+        "eta_minutes": eta_minutes,
+        "eta_unix_secs": eta_unix_secs,
+        "last_error": serde_json::Value::Null,
+    });
+    if write_background_job(&job_path, &value).is_err() {
+        return false;
+    }
     let mut command = std::process::Command::new(exe);
     command
         .arg("index")
@@ -4159,30 +4217,20 @@ fn spawn_background_job(
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
-    let Ok(child) = command.spawn() else {
-        return false;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            value["state"] = serde_json::json!("failed");
+            value["last_error"] = serde_json::json!(format!("spawn background {kind}: {error}"));
+            let _ = write_background_job(&job_path, &value);
+            return false;
+        }
     };
-    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
-    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
-    let value = serde_json::json!({
-        "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
-        "kind": kind,
-        "pid": child.id(),
-        "started_at_unix_secs": started_at,
-        "updated_at_unix_secs": started_at,
-        "cause": cause,
-        "target_generation": target_generation,
-        "state": if kind == "embedding" { "starting" } else { "refreshing" },
-        "backend": backend,
-        "device": device,
-        "completed_spans": 0,
-        "total_spans": total_spans,
-        "progress_milli_percent": 0,
-        "rate_milli_spans_per_second": serde_json::Value::Null,
-        "eta_seconds": eta_seconds,
-        "eta_minutes": eta_minutes,
-        "eta_unix_secs": eta_unix_secs,
-        "last_error": serde_json::Value::Null,
+    value["pid"] = serde_json::json!(child.id());
+    value["state"] = serde_json::json!(if kind == "embedding" {
+        "starting"
+    } else {
+        "refreshing"
     });
     write_background_job(&job_path, &value).is_ok()
 }
@@ -9125,6 +9173,7 @@ fn error_exit_code(error: &Error) -> u8 {
     match error {
         Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
         Error::Invalid(_) => EXIT_USAGE,
+        Error::Lock(_) => EXIT_TEMPFAIL,
         _ => EXIT_IO,
     }
 }

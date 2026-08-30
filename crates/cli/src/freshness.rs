@@ -209,7 +209,22 @@ pub(crate) fn wait_for_active_index_refresh(root: Option<&str>) {
         match greppy_freshness::try_acquire(&store_path) {
             Ok(lock) => {
                 drop(lock);
-                eprintln!("greppy: graph refresh published; resuming query");
+                if store_path.exists() {
+                    eprintln!("greppy: graph refresh published; resuming query");
+                    return;
+                }
+                // A newly spawned first-use child publishes its job record
+                // before it acquires the writer lock. Do not confuse that
+                // short launch window with successful publication.
+                if read_background_job(&background_job_path(&effective_root)).is_some()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                eprintln!(
+                    "greppy: graph refresh has not published a snapshot yet; inspect `greppy index status --json`"
+                );
                 return;
             }
             Err(greppy_freshness::LockError::Held { .. })
@@ -602,34 +617,25 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // with NOTHING on stdout/stderr — the agent just saw an empty result and
     // a bare non-zero code, with no hint that the fix is `greppy index`.
     //
-    // Feature A (auto-index on first use): rather than erroring, build a
-    // GRAPH index (no embeddings) inline on first use so the graph nav
-    // commands (who-calls / callees / references / impact /
-    // path / brief / fan-in / fan-out / trace) Just Work on a fresh repo.
-    // Gated behind the same kill switch as the inline auto-reindex
-    // (`GREPPY_AUTO_REINDEX=0` restores the old hard error). If the
-    // inline index fails for any reason we fall back to the actionable
-    // diagnostic below. Embeddings are NOT computed here — the vector
-    // path (`context` / `semantic`) still asks for `grep index` when it
-    // needs vectors.
+    // Auto-index on first use, but never hide an unbounded repository walk
+    // inside a navigation command. Start the ordinary detached indexer and
+    // join it for at most the same two-second window used by stale queries.
+    // Small repositories still feel immediate; large repositories return a
+    // retryable result with a stable status surface instead of appearing hung.
+    // Gated behind GREPPY_AUTO_REINDEX so explicit opt-out keeps the old error.
     // (Query commands only — the grep passthrough path never reaches here,
     // so the byte-exact passthrough contract is untouched.)
     if !path.exists() {
         let shown_root = root.unwrap_or(".");
         if auto_reindex_enabled() {
-            if !cli_json_output() {
-                eprintln!("greppy: indexing {} (first use)…", effective_root.display());
+            let started = spawn_background_index(root, "first-use");
+            if started || workspace_writer_active(root) {
+                wait_for_active_index_refresh(root);
             }
-            if try_auto_index_inline(root) && path.exists() {
-                // Index built: fall through to the normal read-only open.
-            } else {
-                eprintln!(
-                    "greppy: no index for {} — run `greppy index {}` first",
-                    effective_root.display(),
-                    shown_root
-                );
-                return Err(Error::Invalid(format!(
-                    "no index for {}; run `greppy index {}` first",
+            if !path.exists() {
+                return Err(Error::Lock(format!(
+                    "first-use index {} for {}; no snapshot is ready yet; retry after `greppy index status --json` reports healthy=true (or run `greppy index {}` in the foreground)",
+                    if started { "started" } else { "is already running" },
                     effective_root.display(),
                     shown_root
                 )));
@@ -722,56 +728,6 @@ pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<grep
         workspace_locator::touch_lastused(store_dir);
     }
     Ok(store)
-}
-
-/// First use publishes the deterministic graph quickly. Semantic commands
-/// start the generation-bound embedding snapshot in the background and report
-/// progress instead of making every graph command wait for inference.
-pub(crate) fn try_auto_index_inline(root: Option<&str>) -> bool {
-    let Ok(effective_root) = resolve_root(root) else {
-        return false;
-    };
-    let Ok(project) = project_for(root) else {
-        return false;
-    };
-    let Ok(overrides) = discover_overrides_from_env() else {
-        return false;
-    };
-    let store_path = workspace_locator::store_path(&effective_root);
-    // Create the versioned store namespace and its ownership manifest before
-    // opening the DB. GC will never manage a directory without this manifest.
-    if greppy_core::cache::ensure_workspace_store(&effective_root).is_err() {
-        return false;
-    }
-    let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
-        &effective_root,
-        greppy_core::cache::LockMode::Shared,
-        false,
-    ) else {
-        return false;
-    };
-    let _lock = match greppy_freshness::try_acquire(&store_path) {
-        Ok(lock) => lock,
-        _ => return false, // another writer is active
-    };
-    if store_path.exists() {
-        return true;
-    }
-    let options = greppy_indexer::IndexOptions {
-        discover_overrides: overrides,
-        only_paths: None,
-    };
-    index_atomic_snapshot(
-        &store_path,
-        &effective_root,
-        &project,
-        None,
-        &options,
-        false,
-        None,
-    )
-    .map(|snapshot| snapshot.index.is_clean())
-    .unwrap_or(false)
 }
 
 pub(crate) fn cleanup_expired_legacy_entries(

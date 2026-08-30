@@ -155,10 +155,20 @@ First run:
 ```bash
 greppy --version
 greppy doctor --root . --json     # end-to-end index + backend health
-greppy who-calls SOME_SYMBOL --root . --json   # first query builds the index
+greppy who-calls SOME_SYMBOL --root . --json   # starts the first index if needed
 ```
 
-The index is built once per repository and reused across sessions. While
+The index is built once per repository and reused across sessions and linked
+Git worktrees through an immutable Base plus private Delta. A first graph query
+starts one background index and waits at most two seconds: small repositories
+usually answer immediately; larger ones return temporary exit 75 with the
+exact retry condition. `greppy index status --json` remains nonblocking during
+the build; an explicit foreground `greppy index` immediately prints its first
+phase, PID and that status command. Status reports Base and embedding phases,
+and marks a job whose progress
+record has not changed for two minutes as potentially stalled. Exact
+`read-file --all` and `read-file --lines` reads do not require the graph store
+and remain usable while indexing. While
 embeddings are still building, `search` prints one stable progress line such as
 `semantic index building — 3/12 spans, ETA ~9s (backend cuda)` and exits 1:
 a building semantic index is not yet a search answer, and Greppy never returns

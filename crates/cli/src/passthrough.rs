@@ -484,7 +484,7 @@ fn stdin_availability() -> StdinAvailability {
 
 #[cfg(unix)]
 fn stdin_availability_nonterminal() -> StdinAvailability {
-    const PRODUCER_STARTUP_GRACE_MS: libc::c_int = 1_500;
+    const PRODUCER_STARTUP_GRACE_MS: libc::c_int = 5_000;
     let mut descriptor = libc::pollfd {
         fd: libc::STDIN_FILENO,
         events: libc::POLLIN,

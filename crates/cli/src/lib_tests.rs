@@ -1294,12 +1294,61 @@ fn dispatch_to_code_maps_errors() {
         EXIT_USAGE
     );
     assert_eq!(
+        error_exit_code(&Error::Lock("index is still building".into())),
+        EXIT_TEMPFAIL
+    );
+    assert_eq!(
         error_exit_code(&Error::Config("configuration failure".into())),
         EXIT_IO
     );
 
     let cli = Cli::try_parse_from(["greppy"]).unwrap();
     assert_eq!(dispatch_to_code(cli), EXIT_USAGE);
+}
+
+#[test]
+fn delegated_base_index_progress_preserves_outer_job_owner() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
+    let root = test_tempdir("delegated-base-progress");
+    let job_path = root.join("index.job");
+    let outer_pid = 424_242u32;
+    write_background_job(
+        &job_path,
+        &serde_json::json!({
+            "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+            "kind": "index",
+            "pid": outer_pid,
+            "started_at_unix_secs": 1,
+            "updated_at_unix_secs": 1,
+            "cause": "foreground-index",
+            "target_generation": 1,
+            "state": "building_base_graph",
+            "completed_spans": 0,
+            "total_spans": 0
+        }),
+    )
+    .unwrap();
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
+    unsafe {
+        std::env::remove_var("GREPPY_BACKGROUND_JOB");
+        std::env::set_var(ENV_DELEGATED_BACKGROUND_JOB, &job_path);
+    }
+
+    let mut guard = BackgroundJobGuard::from_env();
+    guard.embedding_started("cpu", 10);
+    guard.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 4,
+        total_documents: 10,
+    });
+    guard.complete();
+
+    let job = read_background_job(&job_path).expect("delegated job remains for outer indexer");
+    assert_eq!(job["pid"], outer_pid);
+    assert_eq!(job["state"], "base_graph_ready");
+    assert_eq!(job["completed_spans"], 4);
+    assert_eq!(job["total_spans"], 10);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
