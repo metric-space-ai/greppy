@@ -3051,6 +3051,7 @@ fn web_screenshot_returns_inline_png_bytes() {
     )
     .expect("read");
     assert_eq!(read.status, "ok", "{read:?}");
+    let started = Instant::now();
     let shot = unix_request(
         &socket,
         &Request::new(
@@ -3061,7 +3062,12 @@ fn web_screenshot_returns_inline_png_bytes() {
         Duration::from_secs(30),
     )
     .expect("screenshot");
+    let elapsed = started.elapsed();
     assert_eq!(shot.status, "ok", "{shot:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "page.screenshot on a 1-paragraph fixture must not cost ~5s of readiness wait; elapsed={elapsed:?}"
+    );
     let b64 = shot.result.as_ref().unwrap()["png_base64"].as_str().unwrap_or("");
     assert!(b64.len() > 32, "png_base64 missing: {shot:?}");
     let digest = shot.result.as_ref().unwrap()["digest"]

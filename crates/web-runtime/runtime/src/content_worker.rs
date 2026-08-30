@@ -3196,24 +3196,22 @@ impl ContentEngine {
         webview: &WebView,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
+        // Present here, not on every notify_new_frame_ready: a per-frame
+        // present keeps the swap chain producing frames and locator
+        // actionability never sees `stable` (event_loop_stalled).
+        webview.paint();
+        self.rendering_context.present();
         let saved = Rc::new(RefCell::new(None));
         let callback = Rc::clone(&saved);
         webview.take_screenshot(None, move |result| {
             *callback.borrow_mut() = Some(result);
         });
-        let deadline = Instant::now() + ACTION_TIMEOUT;
-        while saved.borrow().is_none() {
-            if self.parent_dead() {
-                return Err(Self::parent_gone());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out capturing screenshot",
-                ));
-            }
-            self.servo.spin_event_loop();
-            thread::sleep(Duration::from_millis(1));
+        let pending = Rc::clone(&saved);
+        if !self.spin_until(ACTION_TIMEOUT, move || pending.borrow().is_some())? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out capturing screenshot",
+            ));
         }
         let image = saved
             .borrow_mut()
