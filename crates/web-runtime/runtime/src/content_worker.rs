@@ -4218,14 +4218,14 @@ pub fn run() -> io::Result<()> {
         if engine.parent_dead() {
             return Ok(());
         }
-        // Servo asked to be pumped, or a live document needs a modest idle
-        // tick. Never spin the compositor while the protocol is idle and no
-        // pages exist — that kept CPU at 100% after the supervisor died.
-        if engine.wake.take_pending() {
-            engine.servo.spin_event_loop();
-        }
+        // Protocol first. Spinning Servo before recv starved engine calls when
+        // browser.close left a wake bit with no pages and spin_event_loop
+        // blocked; the supervisor then sat in session.setProfile until the
+        // client Unix read deadline expired as EAGAIN.
         let wait = if engine.pages.is_empty() {
             Duration::from_millis(200)
+        } else if engine.wake.take_pending() {
+            Duration::ZERO
         } else {
             Duration::from_millis(10)
         };
@@ -4266,7 +4266,16 @@ pub fn run() -> io::Result<()> {
             Ok(Err(error)) => return Err(error),
             Err(RecvTimeoutError::Timeout) => {
                 if !engine.pages.is_empty() {
+                    let started = Instant::now();
                     engine.servo.spin_event_loop();
+                    let elapsed = started.elapsed();
+                    if elapsed >= Duration::from_millis(200) {
+                        eprintln!(
+                            "web-runtime: phase content-spin elapsed_ms={} pages={}",
+                            elapsed.as_millis(),
+                            engine.pages.len()
+                        );
+                    }
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),

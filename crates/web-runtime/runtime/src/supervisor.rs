@@ -377,6 +377,7 @@ pub(crate) fn route_until_script_complete_gated(
     let deadline = Instant::now() + timeout;
     let mut sidecar = 1_u64 << 62;
     let mut pending: Option<(u64, String, serde_json::Value)> = None;
+    let mut wait_point = "controller:script-complete".to_owned();
     loop {
         gate.poll_control();
         if gate.is_cancelled() {
@@ -406,7 +407,9 @@ pub(crate) fn route_until_script_complete_gated(
         if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("timed out after {timeout:?} running controller script"),
+                format!(
+                    "timed out after {timeout:?} running controller script (wait={wait_point})"
+                ),
             ));
         }
         let slice = remaining.min(Duration::from_millis(50));
@@ -423,6 +426,8 @@ pub(crate) fn route_until_script_complete_gated(
                 if let Err(message) = gate.before_call(&method, &params) {
                     return Err(io::Error::other(format!("resource_limit: {message}")));
                 }
+                wait_point = format!("content:{method}");
+                eprintln!("web-runtime: phase run-wait point={wait_point}");
                 pending = Some((request_id, method.clone(), params.clone()));
                 content.send(&Message::engine_call(
                     request_id,
@@ -438,6 +443,7 @@ pub(crate) fn route_until_script_complete_gated(
                 error,
                 ..
             }) => {
+                wait_point = "controller:engine-result".to_owned();
                 if ok {
                     if let Some((pending_id, method, params)) = pending.take() {
                         if pending_id == request_id && tally_after(&method) {
@@ -462,6 +468,7 @@ pub(crate) fn route_until_script_complete_gated(
                     pending = None;
                 }
                 controller.send(&Message::engine_result(request_id, ok, result, error))?;
+                wait_point = "controller:script-complete".to_owned();
             }
             Incoming::Controller(Message::ScriptComplete {
                 ok, result, error, ..

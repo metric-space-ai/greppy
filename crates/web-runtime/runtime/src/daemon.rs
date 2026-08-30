@@ -1186,17 +1186,44 @@ impl Daemon {
             .get(&session_id)
             .map(|session| session.profile)
             .unwrap_or(NetworkProfile::Research);
-        if let Err(error) =
-            self.engine_call("session.setProfile", json!({ "profile": profile.as_str() }))
-        {
+        let started = Instant::now();
+        let run_budget = Duration::from_millis(request.deadline_ms.max(1_000));
+        let run_deadline = started + run_budget;
+        eprintln!(
+            "web-runtime: phase run-wait point=set-profile worker=content session={} deadline_ms={}",
+            session_id,
+            run_budget.as_millis()
+        );
+        if let Err(error) = self.engine_call_timed(
+            "session.setProfile",
+            json!({ "profile": profile.as_str() }),
+            run_deadline.saturating_duration_since(Instant::now()),
+        ) {
             self.finish_session(&session_id);
+            if error.contains("timed out") {
+                let mut object = ErrorObject::new(
+                    "timeout",
+                    redact_secrets(&error),
+                    request.request_id.clone(),
+                    35,
+                    "retry with a longer deadline or a smaller script",
+                );
+                object.session_id = Some(session_id);
+                return Response::error(request, object);
+            }
             return engine_error(request, error, 34);
         }
-        let started = Instant::now();
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
         let control = Arc::clone(&self.run_control);
         let operation_id = request.request_id.clone();
+        let remaining = run_deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        eprintln!(
+            "web-runtime: phase run-wait point=send-script worker=controller remaining_ms={}",
+            remaining.as_millis()
+        );
         let outcome = {
             let controller = &mut self.controller;
             let content = &mut self.content;
@@ -1209,10 +1236,14 @@ impl Daemon {
             )) {
                 Err(error)
             } else {
+                eprintln!(
+                    "web-runtime: phase run-wait point=script-complete remaining_ms={}",
+                    remaining.as_millis()
+                );
                 crate::supervisor::route_until_script_complete_gated(
                     controller,
                     content,
-                    Duration::from_millis(request.deadline_ms.max(1_000)),
+                    remaining,
                     SessionEngineGate {
                         sessions,
                         session_id: session_key,
@@ -2079,6 +2110,15 @@ impl Daemon {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.engine_call_timed(method, params, Duration::from_secs(60))
+    }
+
+    fn engine_call_timed(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
         if !self.content.is_running() {
             self.recover_content("content worker exited")?;
             return Err(
@@ -2093,7 +2133,7 @@ impl Daemon {
             let _ = self.recover_content(&format!("content send failed: {error}"));
             return Err(error.to_string());
         }
-        match self.content.recv(Duration::from_secs(60)) {
+        match self.content.recv(timeout) {
             Ok(Message::EngineResult {
                 request_id: got,
                 ok,
@@ -2109,6 +2149,11 @@ impl Daemon {
             }
             Ok(other) => Err(format!("unexpected content message {other:?}")),
             Err(error) => {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    return Err(format!(
+                        "timed out after {timeout:?} waiting for {method}"
+                    ));
+                }
                 let message = error.to_string();
                 let _ = self.recover_content(&format!("content worker: {message}"));
                 Err(message)
