@@ -202,7 +202,18 @@ impl GreppyEnv {
         };
 
         match run_capture_held(&mut cmd, Some(timeout), attach_hold) {
-            Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
+            Ok(captured) => {
+                let mut outcome = finalize_outcome(captured, self.max_output_bytes);
+                if args.first().map(String::as_str) == Some("web")
+                    && args.get(1).map(String::as_str) == Some("screenshot")
+                {
+                    if let Some(data) = extract_png_base64(&outcome.content) {
+                        outcome.image_png_base64 = Some(data);
+                        outcome.content = "screenshot attached as image for the model".to_owned();
+                    }
+                }
+                outcome
+            }
             Err(msg) => ToolOutcome::err(msg),
         }
     }
@@ -418,6 +429,16 @@ unsafe fn libc_kill_pg(pgid: i32, sig: i32) -> i32 {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
     unsafe { killpg(pgid, sig) }
+}
+
+fn extract_png_base64(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let result = value.get("result").unwrap_or(&value);
+    result
+        .get("png_base64")
+        .and_then(|value| value.as_str())
+        .filter(|data| !data.is_empty())
+        .map(str::to_owned)
 }
 
 fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome {

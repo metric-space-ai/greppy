@@ -17,6 +17,8 @@ pub struct ToolOutcome {
     pub content: String,
     /// When `true`, the model should treat this as a failed tool call.
     pub is_error: bool,
+    /// Optional still image (PNG base64) shown to the model, not logged.
+    pub image_png_base64: Option<String>,
 }
 
 impl ToolOutcome {
@@ -25,6 +27,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: false,
+            image_png_base64: None,
         }
     }
 
@@ -33,6 +36,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: true,
+            image_png_base64: None,
         }
     }
 

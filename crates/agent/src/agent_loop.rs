@@ -436,6 +436,12 @@ verifiable and report the rest."
                         name: name.clone(),
                         outcome: outcome.clone(),
                     });
+                    if let Some(data) = outcome.image_png_base64.clone() {
+                        result_parts.push(ContentPart::Image {
+                            media_type: "image/png".to_owned(),
+                            data,
+                        });
+                    }
                     result_parts.push(ContentPart::ToolResult {
                         call_id: id,
                         content: outcome.content,
