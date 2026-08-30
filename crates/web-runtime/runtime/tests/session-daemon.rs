@@ -899,6 +899,73 @@ fn session_create_run_close_over_unix_socket() {
 }
 
 #[test]
+fn two_agents_same_run_cannot_close_each_others_session() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-lease-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_lease", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_lease",
+            "web.session.create",
+            json!({ "profile": "project", "agent_id": "agent-a" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let listed = unix_request(
+        &socket,
+        &Request::new(
+            "run_lease",
+            "web.session.list",
+            json!({ "agent_id": "agent-b" }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("list");
+    assert_eq!(listed.status, "ok", "{listed:?}");
+    let rows = listed.result.as_ref().unwrap()["sessions"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|row| row["session_id"].as_str() != Some(&session_id)),
+        "agent-b must not see agent-a session: {listed:?}"
+    );
+    let denied = unix_request(
+        &socket,
+        &Request::new(
+            "run_lease",
+            "web.session.close",
+            json!({ "session_id": session_id, "agent_id": "agent-b" }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("close denied");
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert_eq!(
+        denied.error.as_ref().unwrap().code,
+        "policy_denied",
+        "{denied:?}"
+    );
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            "run_lease",
+            "web.session.close",
+            json!({ "session_id": session_id, "agent_id": "agent-a" }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("close owner");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+}
+
+#[test]
 fn one_thousand_session_create_close_cycles() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-cycles-{}.sock", std::process::id()));

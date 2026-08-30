@@ -429,6 +429,7 @@ fn snapshot_session_rows(
                 "inflight_engine_request_id": session.inflight_engine_request_id,
                 "inflight_engine_method": session.inflight_engine_method,
                 "discarded_engine_results": session.discarded_engine_results,
+                "owner": session.owner,
                 "controller_pid": controller_pid,
                 "content_pid": content_pid,
                 "controller_generation": controller_generation,
@@ -561,6 +562,17 @@ fn accept_loop(
                         object.insert("controller_generation".into(), json!(controller_generation));
                         object.insert("content_generation".into(), json!(content_generation));
                     }
+                }
+                if let Some(agent) = request
+                    .payload
+                    .get("agent_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    sessions.retain(|row| {
+                        row.get("owner").and_then(|value| value.as_str()) == Some(agent)
+                    });
                 }
                 let _ = write_frame(
                     &mut stream,
@@ -858,6 +870,7 @@ impl Daemon {
         let parsed = NetworkProfile::parse(profile).expect("validated");
         let id = new_session_id();
         let mut session = Session::new(&id, &self.run_id, parsed);
+        session.owner = request_agent_id(request);
         if let Some(limits) = request.payload.get("limits") {
             session.limits.apply_payload(limits);
         }
@@ -933,8 +946,11 @@ impl Daemon {
     }
 
     fn session_list(&self, request: &Request) -> Response {
-        let sessions = snapshot_session_rows(&self.sessions, &self.run_control);
-        self.run_control.publish_sessions(sessions.clone());
+        let mut sessions = snapshot_session_rows(&self.sessions, &self.run_control);
+        if let Some(agent) = request_agent_id(request) {
+            sessions.retain(|row| row.get("owner").and_then(|value| value.as_str()) == Some(agent.as_str()));
+        }
+        self.run_control.publish_sessions(snapshot_session_rows(&self.sessions, &self.run_control));
         Response::ok(request, serde_json::json!({ "sessions": sessions }))
     }
 
@@ -1021,6 +1037,29 @@ impl Daemon {
                 ),
             );
         };
+        if let Some(owner) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.owner.clone())
+        {
+            let steal = request
+                .payload
+                .get("steal")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if request_agent_id(request).as_ref() != Some(&owner) && !steal {
+                return Response::error(
+                    request,
+                    ErrorObject::new(
+                        "policy_denied",
+                        "session is leased to another agent",
+                        request.request_id.clone(),
+                        36,
+                        "pass steal=true to take the lease",
+                    ),
+                );
+            }
+        }
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
                 let ephemeral = session.persistent_profile.is_none();
@@ -3266,6 +3305,17 @@ fn random_token() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+
+fn request_agent_id(request: &Request) -> Option<String> {
+    request
+        .payload
+        .get("agent_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 pub fn socket_exists(path: &Path) -> bool {

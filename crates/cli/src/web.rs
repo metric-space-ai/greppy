@@ -33,6 +33,35 @@ pub fn web_runtime_socket(run_id: &str) -> Option<PathBuf> {
         .map(|endpoint| PathBuf::from(endpoint.address()))
 }
 
+fn web_run_id() -> String {
+    if let Ok(run_id) = std::env::var("GREPPY_RUN_ID") {
+        if !run_id.is_empty() {
+            return run_id;
+        }
+    }
+    if let Ok(agent) = std::env::var("GREPPY_WEB_AGENT") {
+        let agent = agent.trim();
+        if !agent.is_empty() {
+            return format!("run_{agent}");
+        }
+    }
+    format!("run_{}", std::process::id())
+}
+
+fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Value {
+    if let Ok(agent) = std::env::var("GREPPY_WEB_AGENT") {
+        let agent = agent.trim();
+        if !agent.is_empty() {
+            if let Some(object) = payload.as_object_mut() {
+                object
+                    .entry("agent_id")
+                    .or_insert_with(|| json!(agent));
+            }
+        }
+    }
+    payload
+}
+
 pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
     struct StandaloneShutdown;
     impl Drop for StandaloneShutdown {
@@ -263,7 +292,7 @@ fn status(json: bool, root: Option<&str>) -> Result<i32> {
 
 fn runtime_run_id(root: Option<&str>) -> (String, String) {
     let run_id =
-        std::env::var("GREPPY_RUN_ID").unwrap_or_else(|_| format!("run_{}", std::process::id()));
+        web_run_id();
     let identity = match root {
         Some(root) => format!("{run_id}:{root}"),
         None => run_id.clone(),
@@ -648,6 +677,7 @@ fn rpc_on(
     }
     #[cfg(unix)]
     {
+        let payload = inject_agent_id(payload.clone());
         let mut request = Request::new(&ctx.run_id, operation, payload.clone());
         request.session_id = session_id;
         request.capability = ctx.capability.clone();
@@ -690,7 +720,7 @@ fn ensure_supervisor(
     }
     let ResolvedRuntime { dist, executable } = resolve_runtime()?;
     let run_id =
-        std::env::var("GREPPY_RUN_ID").unwrap_or_else(|_| format!("run_{}", std::process::id()));
+        web_run_id();
     #[cfg(not(unix))]
     {
         let _ = (root, dist, executable, run_id, spawn);
@@ -854,8 +884,7 @@ fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> b
 pub fn shutdown_if_running() {
     #[cfg(unix)]
     {
-        let run_id = std::env::var("GREPPY_RUN_ID")
-            .unwrap_or_else(|_| format!("run_{}", std::process::id()));
+        let run_id = web_run_id();
         let Some(capability) = crate::web_attach::current_token() else {
             return;
         };

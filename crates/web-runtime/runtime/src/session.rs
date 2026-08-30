@@ -37,6 +37,7 @@ pub struct Session {
     pub inflight_engine_method: Option<String>,
     pub discarded_engine_results: u64,
     pub persistent_profile: Option<String>,
+    pub owner: Option<String>,
 }
 
 impl Session {
@@ -63,6 +64,7 @@ impl Session {
             inflight_engine_method: None,
             discarded_engine_results: 0,
             persistent_profile: None,
+            owner: None,
         }
     }
 
