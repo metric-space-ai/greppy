@@ -3154,6 +3154,212 @@ fn web_goto_navigates_a_fixture() {
 }
 
 #[test]
+fn web_artifact_show_path_and_export_a_session_object() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body><p>artifact-export</p></body></html>");
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-artshow-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_artshow", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let went = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.goto",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("goto");
+    assert_eq!(went.status, "ok", "{went:?}");
+    let observed = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.observe",
+            json!({ "session_id": session_id, "format": "text" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("observe");
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let listed = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.artifacts",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("list");
+    assert_eq!(listed.status, "ok", "{listed:?}");
+    let digest = listed.result.as_ref().unwrap()["artifacts"][0]["digest"]["hex"]
+        .as_str()
+        .expect("digest")
+        .to_owned();
+    let shown = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.artifact.show",
+            json!({ "session_id": session_id, "id": &digest[..12] }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("show");
+    assert_eq!(shown.status, "ok", "{shown:?}");
+    assert_eq!(shown.result.as_ref().unwrap()["digest"], json!(digest));
+    let pathed = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.artifact.path",
+            json!({ "session_id": session_id, "id": digest }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("path");
+    assert_eq!(pathed.status, "ok", "{pathed:?}");
+    let path = pathed.result.as_ref().unwrap()["path"]
+        .as_str()
+        .expect("path");
+    let bytes = std::fs::read(path).expect("read object");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("artifact-export"),
+        "object bytes={:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_artshow",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn web_click_and_fill_drive_a_fixture() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><body>\
+<button id=\"go\">go</button>\
+<input id=\"name\" value=\"\">\
+<p id=\"out\">waiting</p>\
+<script>\
+document.getElementById('go').addEventListener('click', function() {\
+  document.getElementById('out').textContent = 'clicked:' + document.getElementById('name').value;\
+});\
+</script>\
+</body></html>",
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-act-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_act", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let went = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.goto",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("goto");
+    assert_eq!(went.status, "ok", "{went:?}");
+    let filled = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.fill",
+            json!({
+                "session_id": session_id,
+                "selector": { "type": "css", "value": "#name" },
+                "value": "Ada"
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("fill");
+    assert_eq!(filled.status, "ok", "{filled:?}");
+    let clicked = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.click",
+            json!({
+                "session_id": session_id,
+                "selector": { "type": "css", "value": "#go" }
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("click");
+    assert_eq!(clicked.status, "ok", "{clicked:?}");
+    let observed = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.observe",
+            json!({ "session_id": session_id, "format": "text" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("observe");
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let dumped = observed.result.as_ref().unwrap().to_string();
+    assert!(
+        dumped.contains("clicked:Ada") || dumped.contains("Ada"),
+        "expected click/fill to mutate the page, got {observed:?}"
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
 fn project_profile_can_load_a_public_http_host() {
     let socket = std::env::temp_dir().join(format!("greppy-web-egress-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);

@@ -18,9 +18,11 @@ mod chain;
 use clap::Subcommand;
 use greppy_core::error::Result;
 
+pub use act::ActCommand;
 pub use common::{shutdown_if_running, web_runtime_socket};
 pub use nav::NavCommand;
 pub use results::ResultsCommand;
+pub use see::SeeCommand;
 pub use sessions::SessionsCommand;
 
 #[derive(Debug, Subcommand)]
@@ -31,6 +33,10 @@ pub enum WebCommand {
     Results(ResultsCommand),
     #[command(flatten)]
     Nav(NavCommand),
+    #[command(flatten)]
+    Act(ActCommand),
+    #[command(flatten)]
+    See(SeeCommand),
 }
 
 pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
@@ -47,6 +53,8 @@ pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
         WebCommand::Sessions(command) => sessions::dispatch(command, root),
         WebCommand::Results(command) => results::dispatch(command, root),
         WebCommand::Nav(command) => nav::dispatch(command, root),
+        WebCommand::Act(command) => act::dispatch(command, root),
+        WebCommand::See(command) => see::dispatch(command, root),
     }
 }
 
@@ -105,6 +113,56 @@ mod tests {
             }) if url == "http://example.com/" && session == "wrs_1"
         ));
         assert!(Cli::try_parse_from(["greppy", "web", "nav", "goto", "http://example.com/"]).is_err());
+    }
+
+    #[test]
+    fn parse_web_click_is_flat_not_nested_under_act() {
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "click",
+            "css=button",
+            "--session",
+            "wrs_1",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Act(ActCommand::Click { target, opts, .. })
+            }) if target == "css=button"
+                && opts.session.as_deref() == Some("wrs_1")
+                && opts.json
+        ));
+        assert!(Cli::try_parse_from(["greppy", "web", "act", "click", "css=button"]).is_err());
+    }
+
+    #[test]
+    fn parse_web_fill_value_is_positional() {
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "fill",
+            "css=input",
+            "hello",
+            "--session",
+            "wrs_1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Act(ActCommand::Fill {
+                    target,
+                    value: Some(value),
+                    opts,
+                    ..
+                })
+            }) if target == "css=input"
+                && value == "hello"
+                && opts.session.as_deref() == Some("wrs_1")
+        ));
     }
 
     #[test]

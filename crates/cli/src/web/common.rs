@@ -449,10 +449,34 @@ pub(super) fn rpc_on(
     payload: serde_json::Value,
     session_id: Option<String>,
 ) -> Result<i32> {
+    match rpc_on_response(ctx, operation, payload, session_id) {
+        Ok(response) => emit_response(json_out, response),
+        Err(error) => emit_error(json_out, error),
+    }
+}
+
+pub(super) fn rpc_response(
+    root: Option<&str>,
+    operation: &str,
+    payload: serde_json::Value,
+    session_id: Option<String>,
+) -> std::result::Result<Response, ErrorObject> {
+    match ensure_supervisor(root, &SupervisorSpawn::default()) {
+        Ok(ctx) => rpc_on_response(&ctx, operation, payload, session_id),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn rpc_on_response(
+    ctx: &SupervisorCtx,
+    operation: &str,
+    payload: serde_json::Value,
+    session_id: Option<String>,
+) -> std::result::Result<Response, ErrorObject> {
     #[cfg(not(unix))]
     {
         let _ = (ctx, operation, payload, session_id);
-        return emit_error(json_out, unavailable("web runtime sockets require Unix"));
+        return Err(unavailable("web runtime sockets require Unix"));
     }
     #[cfg(unix)]
     {
@@ -472,19 +496,15 @@ pub(super) fn rpc_on(
         } else {
             Duration::from_secs(120)
         };
-        match greppy_web_client::unix_request(&ctx.socket, &request, wait) {
-            Ok(response) => emit_response(json_out, response),
-            Err(error) => emit_error(
-                json_out,
-                ErrorObject::new(
-                    "runtime_unavailable",
-                    error.to_string(),
-                    request.request_id,
-                    EXIT_WEB_UNAVAILABLE,
-                    "retry greppy web doctor",
-                ),
-            ),
-        }
+        greppy_web_client::unix_request(&ctx.socket, &request, wait).map_err(|error| {
+            ErrorObject::new(
+                "runtime_unavailable",
+                error.to_string(),
+                request.request_id,
+                EXIT_WEB_UNAVAILABLE,
+                "retry greppy web doctor",
+            )
+        })
     }
 }
 
@@ -901,5 +921,219 @@ pub(super) fn find_binary(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+pub(super) fn query_syntax(message: &str) -> ErrorObject {
+    ErrorObject::new(
+        "QUERY_SYNTAX",
+        message,
+        new_request_id(),
+        EXIT_WEB_INVALID,
+        "see greppy web --help",
+    )
+}
+
+/// Engine locator recipe built from a SPEC §3 target query.
+#[derive(Debug)]
+pub(super) struct ParsedTarget {
+    pub selector: serde_json::Value,
+}
+
+pub(super) fn parse_target(
+    raw: &str,
+    first: bool,
+    last: bool,
+    nth: Option<i64>,
+) -> std::result::Result<ParsedTarget, ErrorObject> {
+    let nth_count = [first, last, nth.is_some()]
+        .into_iter()
+        .filter(|flag| *flag)
+        .count();
+    if nth_count > 1 {
+        return Err(query_syntax(
+            "use only one of --first, --last, or --nth",
+        ));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(query_syntax("target query is empty"));
+    }
+    if trimmed.starts_with('@') {
+        let rest = &trimmed[1..];
+        if rest.bytes().all(|b| b.is_ascii_digit()) && !rest.is_empty() {
+            return Err(query_syntax(
+                "ref @N requires an observe snapshot that stores locator recipes",
+            ));
+        }
+        return Err(query_syntax("ref must be @ followed by digits"));
+    }
+    let mut css = None;
+    let mut xpath = None;
+    let mut text = None;
+    let mut role = None;
+    let mut name = None;
+    let mut rest = trimmed;
+    while !rest.is_empty() {
+        let (atom, next) = parse_target_atom(rest)?;
+        match atom {
+            TargetAtom::Css(value) => assign_once(&mut css, value, "css")?,
+            TargetAtom::Xpath(value) => assign_once(&mut xpath, value, "xpath")?,
+            TargetAtom::Text(value) => assign_once(&mut text, value, "text")?,
+            TargetAtom::Role(value) => assign_once(&mut role, value, "role")?,
+            TargetAtom::Name(value) => assign_once(&mut name, value, "name")?,
+        }
+        rest = next.trim_start();
+    }
+    let kinds = [css.is_some(), xpath.is_some(), text.is_some(), role.is_some()]
+        .into_iter()
+        .filter(|flag| *flag)
+        .count();
+    if kinds != 1 {
+        return Err(query_syntax(
+            "target must be one of css=, xpath=, text=, or role=",
+        ));
+    }
+    if name.is_some() && role.is_none() {
+        return Err(query_syntax("name= is only valid with role="));
+    }
+    let mut selector = if let Some(value) = css {
+        json!({ "type": "css", "value": value })
+    } else if let Some(value) = xpath {
+        json!({ "type": "xpath", "value": value })
+    } else if let Some(value) = text {
+        json!({ "type": "text", "value": value })
+    } else {
+        let mut object = serde_json::Map::new();
+        object.insert("type".into(), json!("role"));
+        object.insert("role".into(), json!(role.expect("role set")));
+        if let Some(name) = name {
+            object.insert("name".into(), json!(name));
+        }
+        serde_json::Value::Object(object)
+    };
+    if let Some(index) = if first {
+        Some(0)
+    } else if last {
+        Some(-1)
+    } else {
+        nth
+    } {
+        if let Some(object) = selector.as_object_mut() {
+            object.insert("nth".into(), json!(index));
+        }
+    }
+    Ok(ParsedTarget { selector })
+}
+
+enum TargetAtom {
+    Css(String),
+    Xpath(String),
+    Text(String),
+    Role(String),
+    Name(String),
+}
+
+fn assign_once(
+    slot: &mut Option<String>,
+    value: String,
+    label: &str,
+) -> std::result::Result<(), ErrorObject> {
+    if slot.is_some() {
+        return Err(query_syntax(&format!("{label}= specified more than once")));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn parse_target_atom(input: &str) -> std::result::Result<(TargetAtom, &str), ErrorObject> {
+    let input = input.trim_start();
+    for (prefix, ctor) in [
+        ("css=", TargetAtom::Css as fn(String) -> TargetAtom),
+        ("xpath=", TargetAtom::Xpath),
+        ("text=", TargetAtom::Text),
+        ("role=", TargetAtom::Role),
+        ("name=", TargetAtom::Name),
+    ] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            let (value, next) = parse_selector_value(rest)?;
+            if value.is_empty() {
+                return Err(query_syntax(&format!("{prefix} value is empty")));
+            }
+            return Ok((ctor(value), next));
+        }
+    }
+    if input.starts_with("text~/") || input.starts_with("name~/") {
+        return Err(query_syntax(
+            "regex targets (text~/…/, name~/…/) land with find/extract",
+        ));
+    }
+    Err(query_syntax(
+        "target must start with css=, xpath=, text=, or role=",
+    ))
+}
+
+fn parse_selector_value(input: &str) -> std::result::Result<(String, &str), ErrorObject> {
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.char_indices();
+        while let Some((index, ch)) = chars.next() {
+            match ch {
+                '\\' => match chars.next() {
+                    Some((_, escaped)) => out.push(escaped),
+                    None => return Err(query_syntax("unterminated escape in quoted target")),
+                },
+                '"' => return Ok((out, &rest[index + 1..])),
+                other => out.push(other),
+            }
+        }
+        return Err(query_syntax("unterminated quoted target"));
+    }
+    let mut out = String::new();
+    let mut chars = input.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some((_, escaped)) => out.push(escaped),
+                None => return Err(query_syntax("unterminated escape in target")),
+            },
+            c if c.is_whitespace() => return Ok((out, &input[index..])),
+            other => out.push(other),
+        }
+    }
+    Ok((out, ""))
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn parse_css_quoted_and_nth() {
+        let parsed = parse_target(r#"css="div > a""#, false, false, Some(2)).unwrap();
+        assert_eq!(parsed.selector["type"], "css");
+        assert_eq!(parsed.selector["value"], "div > a");
+        assert_eq!(parsed.selector["nth"], 2);
+    }
+
+    #[test]
+    fn parse_role_with_name() {
+        let parsed = parse_target("role=button name=Continue", false, false, None).unwrap();
+        assert_eq!(parsed.selector["type"], "role");
+        assert_eq!(parsed.selector["role"], "button");
+        assert_eq!(parsed.selector["name"], "Continue");
+    }
+
+    #[test]
+    fn parse_ref_is_query_syntax_until_observe_stores_recipes() {
+        let error = parse_target("@12", false, true, None).unwrap_err();
+        assert_eq!(error.code, "QUERY_SYNTAX");
+        assert!(error.message.contains("observe"), "{}", error.message);
+    }
+
+    #[test]
+    fn parse_rejects_combined_nth_flags() {
+        let error = parse_target("css=a", true, true, None).unwrap_err();
+        assert_eq!(error.code, "QUERY_SYNTAX");
+    }
 }
 

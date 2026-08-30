@@ -87,6 +87,53 @@ fn web_artifact_list_requires_session() {
 }
 
 #[test]
+fn web_artifact_show_path_export_are_listed() {
+    let (code, stdout, stderr) = run(&["web", "artifact", "--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    for verb in ["list", "show", "path", "export"] {
+        assert!(stdout.contains(verb), "missing {verb} in {stdout}");
+    }
+}
+
+#[test]
+fn web_artifact_show_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "artifact", "show", "abc", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_artifact_path_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "artifact", "path", "abc", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_artifact_export_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "artifact", "export", "abc", "--to", "/tmp/x"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_artifact_export_rejects_json() {
+    let (code, stdout, _stderr) = run(&[
+        "web",
+        "artifact",
+        "export",
+        "abc",
+        "--to",
+        "/tmp/x",
+        "--session",
+        "wrs_1",
+        "--json",
+    ]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("raw bytes") || stdout.contains("--json"));
+}
+
+#[test]
 fn web_result_next_requires_session() {
     let (code, stdout, _stderr) = run(&["web", "result", "next", "offset=3", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");
@@ -111,6 +158,50 @@ fn web_goto_requires_session() {
     let (code, stdout, _stderr) = run(&["web", "goto", "http://example.com/", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");
     assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_act_verbs_are_listed_flat() {
+    let (code, stdout, stderr) = run(&["web", "--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    for verb in [
+        "click", "fill", "type", "clear", "select", "check", "uncheck", "press", "hover",
+        "scroll", "upload",
+    ] {
+        assert!(stdout.contains(verb), "missing {verb} in {stdout}");
+    }
+    assert!(
+        !stdout.contains("web act"),
+        "actions must stay flat, stdout={stdout}"
+    );
+}
+
+#[test]
+fn web_click_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "click", "css=button", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_fill_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "fill", "css=input", "x", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_click_rejects_unknown_target_syntax() {
+    let (code, stdout, _stderr) = run(&[
+        "web",
+        "click",
+        "button",
+        "--session",
+        "wrs_1",
+        "--json",
+    ]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("QUERY_SYNTAX") || stdout.contains("css="));
 }
 
 #[test]

@@ -732,10 +732,22 @@ impl Daemon {
             "web.research" => self.web_research(&request),
             "web.artifacts" => self.web_artifacts(&request),
             "web.result.next" => self.web_result_next(&request),
+            "web.artifact.show" => self.web_artifact_show(&request),
+            "web.artifact.path" => self.web_artifact_path(&request),
             "web.goto" => self.web_goto(&request),
             "web.back" => self.web_history(&request, "page.goBack", "web.back"),
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
+            "web.click" => self.web_locator_method(&request, "locator.click", json!({})),
+            "web.fill" => self.web_fill(&request),
+            "web.type" => self.web_type(&request),
+            "web.check" => self.web_locator_method(&request, "locator.check", json!({})),
+            "web.uncheck" => self.web_locator_method(&request, "locator.uncheck", json!({})),
+            "web.select" => self.web_select(&request),
+            "web.hover" => self.web_locator_method(&request, "locator.hover", json!({})),
+            "web.press" => self.web_press(&request),
+            "web.scroll" => self.web_scroll(&request),
+            "web.upload" => self.web_upload(&request),
             other => Response::error(
                 &request,
                 ErrorObject::new(
@@ -2022,6 +2034,121 @@ impl Daemon {
         )
     }
 
+    fn web_artifact_show(&mut self, request: &Request) -> Response {
+        match self.find_session_artifact(request) {
+            Err(response) => response,
+            Ok((session_id, manifest)) => {
+                let path = self
+                    .store
+                    .root()
+                    .join(&manifest.object_path)
+                    .display()
+                    .to_string();
+                if manifest.is_restricted() {
+                    return match manifest.model_facing_ref() {
+                        Ok(mut facing) => {
+                            if let Some(object) = facing.as_object_mut() {
+                                object.insert("session_id".into(), json!(session_id));
+                                object.insert("absolute_path".into(), json!(path));
+                                object.insert("byte_count".into(), json!(manifest.byte_count));
+                                object.insert("media_type".into(), json!(manifest.media_type));
+                            }
+                            Response::ok(request, facing)
+                        }
+                        Err(error) => engine_error(request, error, 39),
+                    };
+                }
+                Response::ok(
+                    request,
+                    json!({
+                        "session_id": session_id,
+                        "digest": manifest.digest.hex,
+                        "byte_count": manifest.byte_count,
+                        "media_type": manifest.media_type,
+                        "producing_operation": manifest.producing_operation,
+                        "path": path,
+                        "object_path": manifest.object_path,
+                        "redaction_status": manifest.redaction_status,
+                    }),
+                )
+            }
+        }
+    }
+
+    fn web_artifact_path(&mut self, request: &Request) -> Response {
+        match self.find_session_artifact(request) {
+            Err(response) => response,
+            Ok((session_id, manifest)) => {
+                let path = self
+                    .store
+                    .root()
+                    .join(&manifest.object_path)
+                    .display()
+                    .to_string();
+                Response::ok(
+                    request,
+                    json!({
+                        "session_id": session_id,
+                        "digest": manifest.digest.hex,
+                        "path": path,
+                        "byte_count": manifest.byte_count,
+                        "media_type": manifest.media_type,
+                    }),
+                )
+            }
+        }
+    }
+
+    fn find_session_artifact(
+        &self,
+        request: &Request,
+    ) -> Result<(String, crate::artifacts::ArtifactManifest), Response> {
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone());
+        let Some(session_id) = session_id else {
+            return Err(protocol_error(request, "web.artifact requires session_id"));
+        };
+        if !self.sessions.contains_key(&session_id) {
+            return Err(missing_session(request, &session_id));
+        }
+        let Some(id) = request
+            .payload
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(protocol_error(request, "web.artifact requires id"));
+        };
+        let listed = match self.store.list_session(&session_id) {
+            Ok(list) => list,
+            Err(error) => return Err(engine_error(request, error.to_string(), 39)),
+        };
+        let id_lower = id.to_ascii_lowercase();
+        let matches: Vec<_> = listed
+            .into_iter()
+            .filter(|manifest| {
+                let hex = manifest.digest.hex.to_ascii_lowercase();
+                hex == id_lower || (id_lower.len() >= 8 && hex.starts_with(&id_lower))
+            })
+            .collect();
+        match matches.len() {
+            0 => Err(protocol_error(
+                request,
+                "artifact id does not refer to an artifact of this session",
+            )),
+            1 => Ok((session_id, matches.into_iter().next().expect("len 1"))),
+            _ => Err(protocol_error(
+                request,
+                "artifact id is ambiguous; pass a longer digest prefix",
+            )),
+        }
+    }
+
     fn web_goto(&mut self, request: &Request) -> Response {
         let Some(url) = request
             .payload
@@ -2083,6 +2210,262 @@ impl Daemon {
                     Err(error) => {
                         self.finish_session(&session_id);
                         engine_error(request, error, 34)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_locator_method(
+        &mut self,
+        request: &Request,
+        method: &str,
+        extra: serde_json::Value,
+    ) -> Response {
+        let Some(selector) = request.payload.get("selector").cloned() else {
+            return protocol_error(
+                request,
+                &format!("{} requires selector", request.operation),
+            );
+        };
+        match self.with_session_page(request, &request.operation) {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let timeout = request
+                    .payload
+                    .get("timeout")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(30_000);
+                let mut params = json!({
+                    "page": page,
+                    "selector": selector,
+                    "timeout": timeout,
+                });
+                if let Some(object) = extra.as_object() {
+                    if let Some(dst) = params.as_object_mut() {
+                        for (key, value) in object {
+                            dst.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                match self.engine_call(method, params) {
+                    Ok(_) => {
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "ok": true,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        locator_error(request, error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_fill(&mut self, request: &Request) -> Response {
+        let Some(value) = request.payload.get("value").and_then(|value| value.as_str()) else {
+            return protocol_error(request, "web.fill requires value");
+        };
+        self.web_locator_method(
+            request,
+            "locator.fill",
+            json!({ "value": value, "editable": true }),
+        )
+    }
+
+    fn web_select(&mut self, request: &Request) -> Response {
+        let Some(value) = request.payload.get("value").and_then(|value| value.as_str()) else {
+            return protocol_error(request, "web.select requires value");
+        };
+        self.web_locator_method(request, "locator.selectOption", json!({ "value": value }))
+    }
+
+    fn web_type(&mut self, request: &Request) -> Response {
+        let Some(text) = request
+            .payload
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        else {
+            return protocol_error(request, "web.type requires text");
+        };
+        let Some(selector) = request.payload.get("selector").cloned() else {
+            return protocol_error(request, "web.type requires selector");
+        };
+        match self.with_session_page(request, "web.type") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let timeout = request
+                    .payload
+                    .get("timeout")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(30_000);
+                let focus = self.engine_call(
+                    "locator.focus",
+                    json!({ "page": page, "selector": selector, "timeout": timeout }),
+                );
+                if let Err(error) = focus {
+                    self.finish_session(&session_id);
+                    return locator_error(request, error);
+                }
+                match self.engine_call(
+                    "page.keyboard.type",
+                    json!({ "page": page, "text": text }),
+                ) {
+                    Ok(_) => {
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "ok": true,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        locator_error(request, error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_press(&mut self, request: &Request) -> Response {
+        let Some(key) = request
+            .payload
+            .get("key")
+            .and_then(|value| value.as_str())
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+        else {
+            return protocol_error(request, "web.press requires key");
+        };
+        match self.with_session_page(request, "web.press") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                if let Some(selector) = request.payload.get("selector").cloned() {
+                    let timeout = request
+                        .payload
+                        .get("timeout")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(30_000);
+                    if let Err(error) = self.engine_call(
+                        "locator.focus",
+                        json!({ "page": page, "selector": selector, "timeout": timeout }),
+                    ) {
+                        self.finish_session(&session_id);
+                        return locator_error(request, error);
+                    }
+                }
+                match self.engine_call("page.keyboard.press", json!({ "page": page, "key": key })) {
+                    Ok(_) => {
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "ok": true,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        locator_error(request, error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_scroll(&mut self, request: &Request) -> Response {
+        if request.payload.get("selector").is_some() {
+            return self.web_locator_method(
+                request,
+                "locator.scrollIntoViewIfNeeded",
+                json!({}),
+            );
+        }
+        let delta_y = request
+            .payload
+            .get("delta_y")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        match self.with_session_page(request, "web.scroll") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.engine_call(
+                    "page.mouse.wheel",
+                    json!({ "page": page, "x": 0, "y": 0, "deltaX": 0, "deltaY": delta_y }),
+                ) {
+                    Ok(_) => {
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "ok": true,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        locator_error(request, error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn web_upload(&mut self, request: &Request) -> Response {
+        let Some(selector) = request.payload.get("selector").cloned() else {
+            return protocol_error(request, "web.upload requires selector");
+        };
+        let css = selector
+            .get("type")
+            .and_then(|value| value.as_str())
+            .filter(|kind| *kind == "css")
+            .and_then(|_| selector.get("value").and_then(|value| value.as_str()))
+            .map(str::to_owned);
+        let Some(css) = css else {
+            return protocol_error(request, "web.upload requires a css= TARGET");
+        };
+        let files = request
+            .payload
+            .get("files")
+            .cloned()
+            .unwrap_or(json!([]));
+        match self.with_session_page(request, "web.upload") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.engine_call(
+                    "page.setInputFiles",
+                    json!({ "page": page, "selector": css, "files": files }),
+                ) {
+                    Ok(_) => {
+                        self.finish_session(&session_id);
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "ok": true,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        locator_error(request, error)
                     }
                 }
             }
@@ -2868,6 +3251,35 @@ fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -
             request.request_id.clone(),
             exit_code,
             "retry the operation or inspect web.doctor",
+        ),
+    )
+}
+
+fn locator_error(request: &Request, message: impl Into<String>) -> Response {
+    let message = redact_secrets(&message.into());
+    let (code, next_action) = if message.contains("strict mode") {
+        (
+            "AMBIGUOUS_TARGET",
+            "add --first, --nth N, or narrow the query",
+        )
+    } else if message.contains("timed out") && message.contains("failed_check=attached") {
+        ("NO_MATCH", "observe the page and use a narrower target")
+    } else if message.contains("timed out") {
+        ("TIMEOUT", "wait for the target to become actionable")
+    } else {
+        (
+            "engine_error",
+            "retry the operation or inspect web.doctor",
+        )
+    };
+    Response::error(
+        request,
+        ErrorObject::new(
+            code,
+            message,
+            request.request_id.clone(),
+            34,
+            next_action,
         ),
     )
 }

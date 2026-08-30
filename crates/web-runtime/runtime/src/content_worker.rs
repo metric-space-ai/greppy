@@ -3297,6 +3297,25 @@ function greppyResolveIn(root, selector) {
   if (selector.type === 'css') {
     return greppyQueryAll(root === document ? document : root, selector.value);
   }
+  if (selector.type === 'xpath') {
+    try {
+      const ctx = root === document ? document : root;
+      const result = document.evaluate(
+        selector.value,
+        ctx,
+        null,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+        null
+      );
+      const nodes = [];
+      for (let i = 0; i < result.snapshotLength; i++) {
+        nodes.push(result.snapshotItem(i));
+      }
+      return nodes;
+    } catch (error) {
+      return [];
+    }
+  }
   if (selector.type === 'label') {
     const labels = greppyQueryAll(root === document ? document : root, 'label');
     const match = labels.find((label) => (label.textContent || '').trim() === selector.name);
