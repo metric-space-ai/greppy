@@ -1,4 +1,4 @@
-import { chromium, selectors } from "playwright";
+import { chromium, selectors, errors, Debugger, Credentials, Logger, WebError } from "playwright";
 
 async function expectUnsupported(label, fn) {
   let failed = false;
@@ -93,4 +93,12 @@ await expectUnsupported("ConsoleMessage.args", () => messages[0].args());
 await expectUnsupported("ConsoleMessage.location", () => messages[0].location());
 await expectUnsupported("ConsoleMessage.timestamp", () => messages[0].timestamp());
 await expectUnsupported("ConsoleMessage.worker", () => messages[0].worker());
+await expectUnsupported("Debugger.requestPause", () => Debugger.requestPause());
+await expectUnsupported("Credentials.create", () => Credentials.create());
+await expectUnsupported("Logger.log", () => Logger.log("x"));
+await expectUnsupported("WebError.error", () => WebError.error());
+await expectUnsupported("BrowserContext.credentials.create", () => context.credentials.create());
+await expectUnsupported("BrowserContext.debugger.requestPause", () => context.debugger.requestPause());
+await expectUnsupported("Browser.logger.log", () => browser.logger.log("x"));
+await expectUnsupported("errors.WebError", () => errors.WebError());
 await browser.close();

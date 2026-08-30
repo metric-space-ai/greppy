@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
-# Replace dest binaries with those from a source dist, keeping the previous
-# three images under dest/previous for rollback. Dest must already be a
+# Replace dest/bin/web-runtime from a source dist, keeping the previous
+# copy under dest/previous/web-runtime for rollback. Dest must already be a
 # stamped web-runtime dist. Builds a complete staging tree then swaps so a
 # later missing member cannot leave dest half-upgraded.
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
@@ -19,11 +19,11 @@ staging_cleanup() {
 trap staging_cleanup EXIT
 mkdir -p "$staging/previous"
 web_runtime_check_owned_real_dir "$staging/previous"
-for bin in web-runtime-supervisor web-controller-worker web-content-worker; do
+for bin in web-runtime; do
   web_runtime_copy_regular_file "$dest/bin/$bin" "$staging/previous/$bin"
   web_runtime_copy_regular_file "$src/bin/$bin" "$staging/bin/$bin"
 done
-for member in SHA256SUMS sbom.json provenance.json README.txt UNSIGNED LICENSE .greppy-web-runtime-dist; do
+for member in SHA256SUMS sbom.json provenance.json README.txt UNSIGNED LICENSE coverage-manifest.json benchmark-receipt.json size-receipt.json .greppy-web-runtime-dist; do
   if [ -L "$src/$member" ]; then
     web_runtime_die "refusing symlink source member: $src/$member"
   fi

@@ -26,6 +26,20 @@ if ((await child.getByText("frame-ok").count()) < 1) {
 if ((await child.getByRole("button").count()) < 1) {
   throw new Error("child getByRole");
 }
+await child.evaluate(() => {
+  window.__childTap = [];
+  const el = document.querySelector("button");
+  el.addEventListener("touchstart", () => window.__childTap.push("touchstart"));
+  el.addEventListener("touchend", () => window.__childTap.push("touchend"));
+});
+await child.tap("button");
+const childTap = await child.evaluate(() => window.__childTap.slice());
+if (!childTap.includes("touchstart")) {
+  throw new Error("child Frame.tap produced no touchstart: " + JSON.stringify(childTap));
+}
+if (!childTap.includes("touchend")) {
+  throw new Error("child Frame.tap produced no touchend: " + JSON.stringify(childTap));
+}
 await child.waitForSelector("#in");
 const main = page.mainFrame();
 if (main.isDetached()) throw new Error("main isDetached");
@@ -170,4 +184,5 @@ if (!child.isDetached()) throw new Error("child Frame.isDetached after remove");
 expectUnsupported("child frameLocator", () => child.frameLocator("iframe"));
 expectUnsupported("child waitForNavigation", () => child.waitForNavigation());
 expectUnsupported("nested FrameLocator.frameLocator", () => page.frameLocator("iframe").frameLocator("iframe"));
+expectUnsupported("locator nested frameLocator", () => page.locator("iframe").frameLocator("iframe"));
 await browser.close();

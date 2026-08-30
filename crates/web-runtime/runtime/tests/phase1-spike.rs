@@ -30,11 +30,7 @@ fn serve_fixture(html: &'static str) -> String {
 fn unchanged_playwright_script_controls_servo_across_process_boundary() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/spike.mjs");
     let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
-    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime-supervisor"))
-        .arg("--controller-worker")
-        .arg(env!("CARGO_BIN_EXE_web-controller-worker"))
-        .arg("--content-worker")
-        .arg(env!("CARGO_BIN_EXE_web-content-worker"))
+    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
         .arg("--script")
         .arg(&script)
         .arg("--fixture-url")
@@ -62,11 +58,7 @@ fn unchanged_playwright_script_controls_servo_across_process_boundary() {
 fn supervisor_reuses_workers_for_two_scripts() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/spike.mjs");
     let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
-    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime-supervisor"))
-        .arg("--controller-worker")
-        .arg(env!("CARGO_BIN_EXE_web-controller-worker"))
-        .arg("--content-worker")
-        .arg(env!("CARGO_BIN_EXE_web-content-worker"))
+    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
         .arg("--script")
         .arg(&script)
         .arg("--script")

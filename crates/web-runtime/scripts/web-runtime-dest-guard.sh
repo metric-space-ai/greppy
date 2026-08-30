@@ -203,18 +203,17 @@ web_runtime_known_members() {
     "sbom.json" \
     "provenance.json" \
     "LICENSE" \
+    "coverage-manifest.json" \
+    "benchmark-receipt.json" \
+    "size-receipt.json" \
     "SIGNING_RECEIPT" \
     "SIGNING_SKIPPED" \
     "SIGNING_STATUS" \
     "NOTARIZATION_RECEIPT" \
     "NOTARIZATION_SKIPPED" \
     "NOTARIZED_UNSIGNED" \
-    "bin/web-runtime-supervisor" \
-    "bin/web-controller-worker" \
-    "bin/web-content-worker" \
-    "previous/web-runtime-supervisor" \
-    "previous/web-controller-worker" \
-    "previous/web-content-worker"
+    "bin/web-runtime" \
+    "previous/web-runtime"
 }
 
 web_runtime_member_dirs() {
@@ -266,22 +265,32 @@ web_runtime_is_owned_dist() {
   [ -L "$iod_dest/provenance.json" ] && return 1
   [ -f "$iod_dest/provenance.json" ] || return 1
   grep -q 'greppy.web-runtime.package.v1' "$iod_dest/provenance.json" || return 1
-  for bin in web-runtime-supervisor web-controller-worker web-content-worker; do
-    [ -L "$iod_dest/bin/$bin" ] && return 1
-    [ -f "$iod_dest/bin/$bin" ] || return 1
-  done
+  [ -L "$iod_dest/bin/web-runtime" ] && return 1
+  [ -f "$iod_dest/bin/web-runtime" ] || return 1
   for name in $(ls -A "$iod_dest"); do
     case "$name" in
-      .greppy-web-runtime-dist | README.txt | UNSIGNED | SHA256SUMS | sbom.json | provenance.json | LICENSE | SIGNING_RECEIPT | SIGNING_SKIPPED | SIGNING_STATUS | NOTARIZATION_RECEIPT | NOTARIZATION_SKIPPED | NOTARIZED_UNSIGNED | bin | previous) ;;
+      .greppy-web-runtime-dist | README.txt | UNSIGNED | SHA256SUMS | sbom.json | provenance.json | LICENSE | coverage-manifest.json | benchmark-receipt.json | size-receipt.json | SIGNING_RECEIPT | SIGNING_SKIPPED | SIGNING_STATUS | NOTARIZATION_RECEIPT | NOTARIZATION_SKIPPED | NOTARIZED_UNSIGNED | bin | previous) ;;
       *) return 1 ;;
     esac
   done
   for name in $(ls -A "$iod_dest/bin"); do
     case "$name" in
-      web-runtime-supervisor | web-controller-worker | web-content-worker) ;;
+      web-runtime) ;;
       *) return 1 ;;
     esac
   done
+  if [ -d "$iod_dest/previous" ]; then
+    for name in $(ls -A "$iod_dest/previous"); do
+      case "$name" in
+        web-runtime) ;;
+        *) return 1 ;;
+      esac
+    done
+    if [ -e "$iod_dest/previous/web-runtime" ] || [ -L "$iod_dest/previous/web-runtime" ]; then
+      [ -L "$iod_dest/previous/web-runtime" ] && return 1
+      [ -f "$iod_dest/previous/web-runtime" ] || return 1
+    fi
+  fi
   return 0
 }
 
@@ -539,6 +548,58 @@ web_runtime_uninstall_owned_dist() {
 }
 
 
+# Content payload hashed at package/sign time. Stamp, previous/, SHA256SUMS
+# itself, and post-sign receipts are excluded: stamp is rewritten on install,
+# previous/ is an install-local snapshot, and signing receipts are evidence
+# about the payload.
+web_runtime_hashed_members() {
+  printf '%s\n' \
+    "bin/web-runtime" \
+    "README.txt" \
+    "UNSIGNED" \
+    "sbom.json" \
+    "provenance.json" \
+    "LICENSE" \
+    "coverage-manifest.json" \
+    "benchmark-receipt.json" \
+    "size-receipt.json"
+}
+
+web_runtime_write_sha256sums() {
+  ws_root=$1
+  if [ -L "$ws_root" ] || [ -L "$ws_root/bin" ] || [ -L "$ws_root/SHA256SUMS" ]; then
+    web_runtime_die "refusing symlink SHA256SUMS root: $ws_root"
+  fi
+  web_runtime_check_owned_real_dir "$ws_root"
+  web_runtime_check_owned_real_dir "$ws_root/bin"
+  ws_files=
+  ws_have_bin=0
+  for member in $(web_runtime_hashed_members); do
+    ws_path="$ws_root/$member"
+    if [ -L "$ws_path" ]; then
+      web_runtime_die "refusing symlink hashed member: $ws_path"
+    fi
+    if [ -f "$ws_path" ]; then
+      ws_files="$ws_files $member"
+      if [ "$member" = "bin/web-runtime" ]; then
+        ws_have_bin=1
+      fi
+    fi
+  done
+  if [ "$ws_have_bin" != 1 ]; then
+    web_runtime_die "missing bin/web-runtime for SHA256SUMS"
+  fi
+  (
+    CDPATH= cd -- "$ws_root" || exit 1
+    # shellcheck disable=SC2086
+    if command -v shasum >/dev/null; then
+      shasum -a 256 $ws_files > SHA256SUMS
+    else
+      sha256sum $ws_files > SHA256SUMS
+    fi
+  ) || web_runtime_die "failed to write SHA256SUMS for $ws_root"
+}
+
 web_runtime_verify_sha256sums() {
   vs_root=$1
   if [ -L "$vs_root" ] || [ -L "$vs_root/SHA256SUMS" ] || [ -L "$vs_root/bin" ]; then
@@ -551,16 +612,30 @@ web_runtime_verify_sha256sums() {
     web_runtime_die "missing bin directory for SHA256SUMS verify"
   fi
   vs_listed=$(awk '{print $NF}' "$vs_root/SHA256SUMS" | LC_ALL=C sort)
-  vs_expected=$(printf '%s\n' web-content-worker web-controller-worker web-runtime-supervisor)
-  if [ "$vs_listed" != "$vs_expected" ]; then
-    web_runtime_die "SHA256SUMS must list exactly the three runtime images"
+  for member in $(web_runtime_hashed_members); do
+    vs_path="$vs_root/$member"
+    if [ -L "$vs_path" ]; then
+      web_runtime_die "refusing symlink hashed member: $vs_path"
+    fi
+  done
+  vs_present=$(
+    for member in $(web_runtime_hashed_members); do
+      if [ -f "$vs_root/$member" ]; then
+        printf '%s\n' "$member"
+      fi
+    done | LC_ALL=C sort
+  )
+  if [ "$vs_listed" != "$vs_present" ]; then
+    web_runtime_die "SHA256SUMS is incomplete or lists unexpected members"
   fi
+  printf '%s\n' "$vs_listed" | grep -qx 'bin/web-runtime' ||
+    web_runtime_die "SHA256SUMS missing bin/web-runtime"
   (
-    CDPATH= cd -- "$vs_root/bin" || exit 1
+    CDPATH= cd -- "$vs_root" || exit 1
     if command -v shasum >/dev/null; then
-      shasum -a 256 -c ../SHA256SUMS
+      shasum -a 256 -c SHA256SUMS
     else
-      sha256sum -c ../SHA256SUMS
+      sha256sum -c SHA256SUMS
     fi
   ) || web_runtime_die "SHA256SUMS verification failed for $vs_root"
 }

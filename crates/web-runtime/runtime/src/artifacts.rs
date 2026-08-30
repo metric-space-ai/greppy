@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,27 @@ pub struct ArtifactManifest {
 pub struct DigestFields {
     pub algorithm: String,
     pub hex: String,
+}
+
+impl ArtifactManifest {
+    /// True when model-facing payloads must not include raw object bytes.
+    pub fn is_restricted(&self) -> bool {
+        self.sensitive || self.credential_labeled
+    }
+
+    /// Compact model-facing reference. Never includes object bytes, full_text, or html.
+    /// Fail-closed: an empty digest is not success.
+    pub fn model_facing_ref(&self) -> Result<serde_json::Value, String> {
+        if self.digest.hex.is_empty() {
+            return Err("artifact digest missing".to_owned());
+        }
+        Ok(serde_json::json!({
+            "digest": self.digest.hex,
+            "path": self.object_path,
+            "label": self.producing_operation,
+            "redaction_status": self.redaction_status,
+        }))
+    }
 }
 
 pub struct ArtifactStore {
@@ -126,6 +147,26 @@ pub fn hex_sha256(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Stream a file through SHA-256 without slurping it into memory.
+pub fn hex_sha256_file(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::with_capacity(256 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn rfc3339_now() -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -153,5 +194,79 @@ mod tests {
         let listed = store.list_session("wrs_1").unwrap();
         assert_eq!(listed.len(), 1);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_digest_matches_in_memory_digest_for_multi_buffer_payload() {
+        let root = std::env::temp_dir().join(format!("greppy-sha-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("blob.bin");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(hex_sha256_file(&path).unwrap(), hex_sha256(&bytes));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sensitive_model_facing_ref_omits_raw_bytes_and_keeps_digest_path_label() {
+        let root = std::env::temp_dir().join(format!("greppy-art-sens-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::new(root.clone()).unwrap();
+        let secret = b"SUPER_SECRET_TOKEN_value=hunter2";
+        let manifest = store
+            .put(
+                secret,
+                "text/plain",
+                "wrs_sens",
+                "run",
+                "web.read",
+                true,
+            )
+            .unwrap();
+        assert!(manifest.is_restricted());
+        assert_eq!(manifest.redaction_status, "redacted_for_model");
+        let facing = manifest.model_facing_ref().unwrap();
+        let dumped = facing.to_string();
+        assert!(
+            !dumped.contains("SUPER_SECRET_TOKEN"),
+            "sensitive bytes leaked into model-facing payload: {dumped}"
+        );
+        assert!(
+            !dumped.contains("hunter2"),
+            "sensitive bytes leaked into model-facing payload: {dumped}"
+        );
+        assert_eq!(facing["digest"], manifest.digest.hex);
+        assert_eq!(facing["path"], manifest.object_path);
+        assert_eq!(facing["label"], manifest.producing_operation);
+        assert_eq!(facing["redaction_status"], "redacted_for_model");
+        assert!(facing.get("bytes").is_none());
+        assert!(facing.get("full_text").is_none());
+        assert!(facing.get("html").is_none());
+        assert!(facing.get("text").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_facing_ref_fails_closed_without_digest() {
+        let manifest = ArtifactManifest {
+            contract: "greppy.web-runtime.artifact-manifest.v1".to_owned(),
+            digest: DigestFields {
+                algorithm: "sha256".to_owned(),
+                hex: String::new(),
+            },
+            byte_count: 3,
+            media_type: "text/plain".to_owned(),
+            producing_operation: "web.read".to_owned(),
+            session_id: "wrs_1".to_owned(),
+            run_id: "run".to_owned(),
+            timestamp: "0.000Z".to_owned(),
+            redaction_status: "redacted_for_model".to_owned(),
+            sensitive: true,
+            credential_labeled: true,
+            object_path: "objects/sha256/missing".to_owned(),
+        };
+        let err = manifest.model_facing_ref().unwrap_err();
+        assert!(err.contains("digest"), "{err}");
     }
 }

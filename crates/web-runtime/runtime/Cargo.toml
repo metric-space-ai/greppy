@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [features]
-default = []
+default = ["controller-runtime", "content-runtime"]
 controller-runtime = ["dep:deno_core", "dep:deno_error", "dep:tokio"]
 content-runtime = ["dep:servo", "dep:dpi", "dep:png", "dep:http"]
 
@@ -27,18 +27,9 @@ http = { version = "1", optional = true }
 libc = "0.2"
 
 [[bin]]
-name = "web-runtime-supervisor"
-path = "src/bin/web-runtime-supervisor.rs"
-
-[[bin]]
-name = "web-controller-worker"
-path = "src/bin/web-controller-worker.rs"
-required-features = ["controller-runtime"]
-
-[[bin]]
-name = "web-content-worker"
-path = "src/bin/web-content-worker.rs"
-required-features = ["content-runtime"]
+name = "web-runtime"
+path = "src/bin/web-runtime.rs"
+required-features = ["controller-runtime", "content-runtime"]
 
 [[test]]
 name = "process-boundary"

@@ -10,7 +10,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 root="$(web_runtime_repo_root)"
 dest="$(web_runtime_validate_dest_shape "${1:-$root/target/web-runtime-dist}")"
 "$SCRIPT_DIR/package-web-runtime.sh" "$dest"
-bins="web-runtime-supervisor web-controller-worker web-content-worker"
+bins="web-runtime"
 receipt="$dest/SIGNING_RECEIPT"
 skip="$dest/SIGNING_SKIPPED"
 entitlements="$root/crates/web-runtime/scripts/entitlements.plist"
@@ -40,4 +40,7 @@ else
   fi
 fi
 "$root/crates/web-runtime/scripts/notarize-web-runtime.sh" "$dest"
+# codesign mutates the linked image and UNSIGNED/SIGNING_* membership; rewrite
+# payload hashes after that mutation so install/upgrade can still verify.
+web_runtime_write_sha256sums "$dest"
 echo "sign-web-runtime: done ($dest)"

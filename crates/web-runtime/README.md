@@ -53,35 +53,39 @@ Of 830 `v8::` mangled symbols defined in SpiderMonkey `*irregexp*` objects, **on
 
 A second, larger overlap is **ICU 77** (`icu_77` / `_77`): about 10k shared global names between `libjs_static.a` and `librusty_v8.a`. That is not this destructor crash. Do not apply a 10k-symbol hide/rename without mapping that category and re-validating both engines.
 
-### Failed experiment (do not repeat)
+### Tracked localization pipeline (not a vendor path patch)
 
-Localizing only the two SpiderMonkey Isolate destructor symbols in `target/.../libjs_static.a` via `phase1-probe/build.rs` is **not** a fix. After that rebuild, `Deinitialize` still `bl`s `0x104b1184c` (the SpiderMonkey destructor). The README must not claim that localization made V8 keep the correct destructor. Mutating sibling `mozjs_sys` archives under `target/` is also non-hermetic and cache-corrupting; that `build.rs` was removed.
+Do **not** commit or depend on `vendor/mozjs_sys`. Apple `ld -r -unexported_symbol` localizes every irregexp global and breaks Servo; do not repeat that.
 
-### Blocker
+`crates/web-runtime/build-support/localize_js_static.rs` is the deterministic pipeline:
 
-`mozjs_sys 140.14.0-0` links a **prebuilt** `libjs_static.a` (GitHub release tarball) unless `MOZJS_FROM_SOURCE` is set. There is no hermetic in-tree way to namespace irregexp without vendoring `mozjs_sys` and rebuilding SpiderMonkey from source. A scoped source fix is to wrap the irregexp V8 fork (`namespace v8 { namespace internal`) so at least `Isolate` and `PrintF` no longer share mangled names with Deno’s V8. That is a SpiderMonkey rebuild, not a probe-only patch.
+- macOS: patch `Unified_cpp_js_src_irregexp0.o` inside `libjs_static.a` **and** `libmozjs_sys-*.rlib` (rustc links the rlib members, not only the `.a`): same-length rename `v8::internal` → `sm::internal` for Isolate D1/D2 and PrintF, then clear Mach-O `N_PEXT`. nmedit localization still coalesces with V8 private-extern destructors on ld64.
+- Linux: `objcopy --localize-symbols`
+- Windows: explicit unsatisfied gate (build fails)
+- defined-symbol intersection against `librusty_v8.a`: any non-ICU overlap fails the build; ICU 77 coalescing is counted and permitted; mixed ICU versions fail
+
+`crates/web-runtime/scripts/check-engine-symbol-overlap.sh` is the same gate for CI after a build.
+
+One-binary completion still requires `phase1-probe` construct-and-drop (`deno-only`, `servo-only`, both orders, `stress`) plus a packaged `web-runtime` session using only that executable.
 
 ### Implemented process-boundary checkpoint
 
-The `runtime` workspace member now proves the process-boundary lifecycle with three separately linked executables, verified as Mach-O images on macOS:
+The production web-runtime distribution packages **exactly one** linked executable, `bin/web-runtime`. Supervisor, controller, and content roles are isolated as processes of that same image via `--internal-role`; they are not separately packaged binaries.
 
-- `web-runtime-supervisor` links neither engine;
-- `web-controller-worker` links `deno_core`/V8, constructs a `JsRuntime`, executes a JavaScript startup probe, and holds it until shutdown;
-- `web-content-worker` links Servo/mozjs, constructs Servo, and holds it until shutdown.
+The combined-engine crash documented above still applies: this is **not** a one-process / one-binary completion claim. V8 and Servo/mozjs must not be constructed in the same address space.
 
-The supervisor starts both workers through explicit executable paths, validates their role and protocol version, requests shutdown, and requires a normal zero exit after each runtime has been dropped. Supervisor-side message waits and graceful process reaping have 30-second deadlines. Drop guards kill and reap the current single-PID workers on failure; there is no `process::exit`, `mem::forget`, intentional leak, or crash masking.
+The supervisor starts controller and content workers as `web-runtime --internal-role …`, validates their role and protocol version, requests shutdown, and requires a normal zero exit after each runtime has been dropped. Supervisor-side message waits and graceful process reaping have 30-second deadlines. Drop guards kill and reap the current single-PID workers on failure; there is no `process::exit`, `mem::forget`, intentional leak, or crash masking.
 
 Verified checkpoint evidence:
 
 - 15 protocol, worker, and supervisor unit tests pass;
-- the real process-boundary integration smoke passes with both engines constructed and normally dropped;
-- isolated symbol inspection confirms the supervisor contains neither engine, the controller contains V8 but no Servo/mozjs, and the content worker contains Servo/mozjs but no `deno_core`/`rusty_v8`.
+- the real process-boundary integration smoke passes with both engines constructed and normally dropped in isolated processes.
 
 This proves only dependency, framing, process isolation, and lifecycle viability. It is not a Playwright compatibility claim by itself.
 
 ### Phase 1 vertical spike (verified locally)
 
-The same three processes now execute the guide's unchanged Playwright script:
+The same three `--internal-role` processes now execute the guide's unchanged Playwright script:
 
 ```javascript
 import { chromium } from "playwright";
@@ -108,7 +112,7 @@ greppy bash-smart -- cargo test --manifest-path crates/web-runtime/Cargo.toml -p
 
 ### Client/supervisor daemon (verified locally)
 
-`web-runtime-supervisor --socket PATH --run-id ID` accepts length-delimited `greppy.web-runtime.v1` requests on a Unix socket. `web.session.create`, `web.run` (script text in the payload, not argv), and `web.session.close` were verified by `tests/session-daemon.rs` (exit 0). The Greppy parent talks to that socket through `crates/web-client` and does not link either engine.
+`web-runtime --socket PATH --run-id ID` accepts length-delimited `greppy.web-runtime.v1` requests on a Unix socket. `web.session.create`, `web.run` (script text in the payload, not argv), and `web.session.close` were verified by `tests/session-daemon.rs` (exit 0). The Greppy parent talks to that socket through `crates/web-client` and does not link either engine.
 
 Verified CLI wiring (CI sentinel models, no engine binaries):
 
@@ -116,7 +120,7 @@ Verified CLI wiring (CI sentinel models, no engine binaries):
 CI=true greppy bash-smart -- cargo test -p greppy --features ci-test-assets --test web_cli -- --nocapture
 ```
 
-`web` is a real subcommand (not grep passthrough). `greppy web status --json` exits 31 when the runtime images are missing. `greppy web run` requires `--session`.
+`web` is a real subcommand (not grep passthrough). `greppy web status --json` exits 31 when the web-runtime executable is missing. `greppy web run` requires `--session`.
 
 ### Alternative one-process experiment
 

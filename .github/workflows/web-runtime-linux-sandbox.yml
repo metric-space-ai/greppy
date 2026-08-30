@@ -1,0 +1,40 @@
+name: web-runtime Linux sandbox
+
+# Focused gate: Landlock live deny + same-image fexecve on ubuntu-latest.
+# Does not build Servo/V8. Does not replace codesign, Windows CI, or soak.
+# Live evidence is the job log on ubuntu-latest, not a macOS host.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-runtime-linux-sandbox-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  GREPPY_REQUIRE_LIVE_LANDLOCK: "1"
+
+jobs:
+  landlock-fexecve:
+    name: Landlock + fexecve (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: "1.95.0"
+
+      - name: Run Linux sandbox and fexecve gates
+        run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh

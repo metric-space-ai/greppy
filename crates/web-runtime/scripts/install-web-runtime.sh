@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-# Install a packaged three-image dist into another dest-guarded staging
+# Install a packaged one-image dist into another dest-guarded staging
 # directory. Copies land in a sibling staging directory and swap into dest
 # only when the result is a complete stamped dist. Never rm -rf.
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
@@ -17,15 +17,16 @@ staging_cleanup() {
 }
 trap staging_cleanup EXIT
 for member in \
-  bin/web-runtime-supervisor \
-  bin/web-controller-worker \
-  bin/web-content-worker \
+  bin/web-runtime \
   README.txt \
   UNSIGNED \
   SHA256SUMS \
   sbom.json \
   provenance.json \
   LICENSE \
+  coverage-manifest.json \
+  benchmark-receipt.json \
+  size-receipt.json \
   .greppy-web-runtime-dist
 do
   if [ -L "$src/$member" ]; then

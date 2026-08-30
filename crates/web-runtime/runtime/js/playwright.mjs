@@ -7,8 +7,47 @@ class TimeoutError extends Error {
   }
 }
 
+function sleepMs(ms) {
+  return ops.op_sleep_ms(Math.max(0, Number(ms) || 0));
+}
+
+function timeoutAfter(ms, label) {
+  return sleepMs(ms).then(() => {
+    throw new TimeoutError(label);
+  });
+}
+
+function throwObjectDisposed(kind) {
+  const error = new Error("object_disposed: " + kind + " has been closed");
+  error.code = "object_disposed";
+  error.name = "TargetClosedError";
+  throw error;
+}
+
+const disposedPages = new Set();
+const disposedContexts = new Set();
+const disposedBrowsers = new Set();
+
 function engineCall(method, params) {
-  const result = ops.op_engine_call(method, params ?? {});
+  const payload = params ? Object.assign({}, params) : {};
+  if (
+    method !== "page.close" &&
+    method !== "page.isClosed" &&
+    payload.page &&
+    disposedPages.has(payload.page)
+  ) {
+    throwObjectDisposed("Page");
+  }
+  if (method !== "context.close" && payload.context && disposedContexts.has(payload.context)) {
+    throwObjectDisposed("BrowserContext");
+  }
+  if (method !== "browser.close" && payload.browser && disposedBrowsers.has(payload.browser)) {
+    throwObjectDisposed("Browser");
+  }
+  if (payload.timeout == null) {
+    payload.timeout = 30_000;
+  }
+  const result = ops.op_engine_call(method, payload);
   if (result && typeof result.then === "function") {
     return result.then(
       (value) => value,
@@ -16,6 +55,12 @@ function engineCall(method, params) {
         const message = String(error && error.message ? error.message : error);
         if (message.includes("timed out") || message.includes("timeout")) {
           throw new TimeoutError(message);
+        }
+        if (message.includes("object_disposed")) {
+          const disposed = new Error(message);
+          disposed.code = "object_disposed";
+          disposed.name = "TargetClosedError";
+          throw disposed;
         }
         throw error;
       },
@@ -25,10 +70,14 @@ function engineCall(method, params) {
 }
 
 function locatorParams(locator, extra) {
+  if (locator._page && locator._page._closed) {
+    throwObjectDisposed("Page");
+  }
   const params = {
     page: locator._page._id,
     selector: locator._selector,
     timeout: locator._page._timeout || 30_000,
+    generation: locator._page._generation || 1,
   };
   if (extra) {
     for (const key of Object.keys(extra)) {
@@ -244,21 +293,119 @@ function bytesFromFulfillBody(body) {
   return encodeUtf8(String(body));
 }
 
-function serializeEvaluate(pageFunction, arg) {
-  if (typeof pageFunction === "function") {
-    const source = pageFunction.toString();
-    if (arg === undefined) {
-      return `(${source})()`;
-    }
-    return `(${source})(${JSON.stringify(arg)})`;
+function deserializeValue(wire, refs) {
+  refs = refs || {};
+  if (wire === null || typeof wire !== "object") {
+    return wire;
   }
-  return String(pageFunction);
+  if (wire.v === "undefined") return undefined;
+  if (wire.v === "null") return null;
+  if (wire.v === "NaN") return NaN;
+  if (wire.v === "Infinity") return Infinity;
+  if (wire.v === "-Infinity") return -Infinity;
+  if (wire.v === "-0") return -0;
+  if (Object.prototype.hasOwnProperty.call(wire, "b")) return wire.b;
+  if (Object.prototype.hasOwnProperty.call(wire, "n")) return wire.n;
+  if (Object.prototype.hasOwnProperty.call(wire, "s")) return wire.s;
+  if (Object.prototype.hasOwnProperty.call(wire, "bi")) return BigInt(wire.bi);
+  if (Object.prototype.hasOwnProperty.call(wire, "d")) return new Date(wire.d);
+  if (Object.prototype.hasOwnProperty.call(wire, "u")) return new URL(wire.u);
+  if (wire.r) return new RegExp(wire.r.p, wire.r.f);
+  if (wire.e) {
+    var err = new Error(wire.e.m);
+    err.name = wire.e.n;
+    err.stack = wire.e.s;
+    return err;
+  }
+  if (wire.a) {
+    var arr = [];
+    for (var i = 0; i < wire.a.length; i++) {
+      arr.push(deserializeValue(wire.a[i], refs));
+    }
+    return arr;
+  }
+  if (wire.o) {
+    var obj = {};
+    for (var j = 0; j < wire.o.length; j++) {
+      obj[wire.o[j].k] = deserializeValue(wire.o[j].v, refs);
+    }
+    return obj;
+  }
+  return wire;
+}
+
+function serializeValue(value, seen) {
+  seen = seen || [];
+  if (value === undefined) return { v: "undefined" };
+  if (value === null) return { v: "null" };
+  if (typeof value === "boolean") return { b: value };
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return { v: "NaN" };
+    if (value === Infinity) return { v: "Infinity" };
+    if (value === -Infinity) return { v: "-Infinity" };
+    if (Object.is(value, -0)) return { v: "-0" };
+    return { n: value };
+  }
+  if (typeof value === "string") return { s: value };
+  if (typeof value === "bigint") return { bi: value.toString() };
+  if (typeof value === "function") {
+    throw new Error("cannot serialize function evaluate argument");
+  }
+  if (typeof value === "object") {
+    for (var s = 0; s < seen.length; s++) {
+      if (seen[s] === value) {
+        throw new Error("cannot serialize cyclic evaluate argument");
+      }
+    }
+    seen = seen.concat([value]);
+    if (value instanceof Date) return { d: value.toISOString() };
+    if (typeof URL !== "undefined" && value instanceof URL) return { u: value.toString() };
+    if (value instanceof RegExp) return { r: { p: value.source, f: value.flags } };
+    if (value instanceof Error) return { e: { m: value.message, n: value.name, s: String(value.stack || "") } };
+    if (Array.isArray(value)) {
+      var a = [];
+      for (var i = 0; i < value.length; i++) {
+        a.push(serializeValue(value[i], seen));
+      }
+      return { a: a };
+    }
+    var o = [];
+    var keys = Object.keys(value);
+    for (var k = 0; k < keys.length; k++) {
+      o.push({ k: keys[k], v: serializeValue(value[keys[k]], seen) });
+    }
+    return { o: o };
+  }
+  throw new Error("cannot serialize evaluate argument");
+}
+
+function serializeEvaluate(pageFunction, arg) {
+  var source = typeof pageFunction === "function" ? pageFunction.toString() : String(pageFunction);
+  if (arguments.length < 2) {
+    return "(" + source + ")()";
+  }
+  var payload = JSON.stringify(serializeValue(arg));
+  return "(function(){ var d = " + deserializeValue.toString() + "; return (" + source + ")(d(" + payload + ")); })()";
+}
+
+function decodeEvaluateResult(result) {
+  if (result && Object.prototype.hasOwnProperty.call(result, "serialized")) {
+    return deserializeValue(result.serialized);
+  }
+  return result ? result.value : undefined;
+}
+
+function serializeWaitForFunction(pageFunction, arg, hasArg) {
+  return hasArg
+    ? serializeEvaluate(pageFunction, arg)
+    : serializeEvaluate(pageFunction);
 }
 
 class FileChooser {
   constructor(page, record) {
     this._page = page;
     this._multiple = !!(record && record.multiple);
+    return withUnsupported(this, "FileChooser");
   }
 
   isMultiple() {
@@ -284,6 +431,7 @@ class Dialog {
   constructor(page, record) {
     this._page = page;
     this._record = record || { type: "alert", message: "", defaultValue: "" };
+    return withUnsupported(this, "Dialog");
   }
 
   type() {
@@ -407,15 +555,18 @@ class Locator {
 
   async waitForFunction(pageFunction, arg, options) {
     refuseLocatorOptions("Locator.waitForFunction", options, ["timeout"]);
-    const deadline = Date.now() + ((options && options.timeout) || this._page._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const value = await this.evaluate(pageFunction, arg);
-      if (value) {
-        return value;
-      }
-      ops.op_sleep_ms(20);
-    }
-    throw new TimeoutError("timeout: Locator.waitForFunction");
+    const source = serializeWaitForFunction(
+      pageFunction,
+      arg,
+      arguments.length >= 2,
+    );
+    const result = await engineCall("page.waitForFunction", {
+      page: this._page._id,
+      generation: this._page._generation || 1,
+      source,
+      timeout: (options && options.timeout) || this._page._timeout || 30_000,
+    });
+    return decodeEvaluateResult(result);
   }
 
   async check(options) {
@@ -537,28 +688,40 @@ class Locator {
     const fn =
       typeof pageFunction === "function" ? pageFunction.toString() : String(pageFunction);
     const source =
-      arg === undefined
+      arguments.length < 2
         ? fn
-        : "function(el) { return (" + fn + ")(el, " + JSON.stringify(arg) + "); }";
+        : "function(el) { var d = " +
+          deserializeValue.toString() +
+          "; return (" +
+          fn +
+          ")(el, d(" +
+          JSON.stringify(serializeValue(arg)) +
+          ")); }";
     const result = await engineCall("locator.evaluate", {
       ...locatorParams(this, { timeout }),
       source,
     });
-    return result.value;
+    return decodeEvaluateResult(result);
   }
 
   async evaluateAll(pageFunction, arg) {
     const fn =
       typeof pageFunction === "function" ? pageFunction.toString() : String(pageFunction);
     const source =
-      arg === undefined
+      arguments.length < 2
         ? fn
-        : "function(els) { return (" + fn + ")(els, " + JSON.stringify(arg) + "); }";
+        : "function(els) { var d = " +
+          deserializeValue.toString() +
+          "; return (" +
+          fn +
+          ")(els, d(" +
+          JSON.stringify(serializeValue(arg)) +
+          ")); }";
     const result = await engineCall("locator.evaluateAll", {
       ...locatorParams(this),
       source,
     });
-    return result.value;
+    return decodeEvaluateResult(result);
   }
 
   async dblclick(options) {
@@ -814,6 +977,9 @@ class Locator {
     if (!this._selector || this._selector.type !== "css" || !this._selector.value) {
       throwUnsupported("Locator.frameLocator.nonCss");
     }
+    if (/(?:^|[\s>+~])iframe(?:$|[\s.:#[,>+~])/i.test(" " + this._selector.value)) {
+      throwUnsupported("Locator.frameLocator.nested");
+    }
     const index = this._selector.nth == null ? null : this._selector.nth;
     return new FrameLocator(this._page, this._selector.value + " " + selector, index);
   }
@@ -970,13 +1136,19 @@ class Frame {
 
   async evaluate(pageFunction, arg) {
     if (this._id === "main") {
-      return this._page.evaluate(pageFunction, arg);
+      return arguments.length < 2
+        ? this._page.evaluate(pageFunction)
+        : this._page.evaluate(pageFunction, arg);
     }
+    const source =
+      arguments.length < 2
+        ? serializeEvaluate(pageFunction)
+        : serializeEvaluate(pageFunction, arg);
     return engineCall("page.frameEvaluate", {
       page: this._page._id,
       index: Number(this._id),
-      source: serializeEvaluate(pageFunction, arg),
-    }).then((result) => result.value);
+      source,
+    }).then((result) => decodeEvaluateResult(result));
   }
 
   url() {
@@ -1090,15 +1262,15 @@ class Frame {
     const timeout = (options && options.timeout) || this._page._timeout || 30_000;
     if (this._id !== "main") {
       const wantComplete = state == null || state === "load";
-      const deadline = Date.now() + timeout;
-      while (Date.now() < deadline) {
-        const ready = await this.evaluate(() => document.readyState);
-        if (ready === "complete" || (!wantComplete && ready === "interactive")) {
-          return;
-        }
-        ops.op_sleep_ms(20);
-      }
-      throw new TimeoutError("timeout: Frame.waitForLoadState");
+      await this.waitForFunction(
+        (complete) => {
+          const ready = document.readyState;
+          return ready === "complete" || (!complete && ready === "interactive");
+        },
+        wantComplete,
+        { timeout },
+      );
+      return;
     }
     return this._page.waitForLoadState(state);
   }
@@ -1271,15 +1443,27 @@ class Frame {
 
   async waitForFunction(pageFunction, arg, options) {
     refuseLocatorOptions("Frame.waitForFunction", options, ["timeout"]);
-    const deadline = Date.now() + ((options && options.timeout) || this._page._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const value = await this.evaluate(pageFunction, arg);
-      if (value) {
-        return value;
-      }
-      ops.op_sleep_ms(20);
-    }
-    throw new TimeoutError("timeout: Frame.waitForFunction");
+    const source = serializeWaitForFunction(
+      pageFunction,
+      arg,
+      arguments.length >= 2,
+    );
+    const timeout = (options && options.timeout) || this._page._timeout || 30_000;
+    const result = this._isMain()
+      ? await engineCall("page.waitForFunction", {
+          page: this._page._id,
+          generation: this._page._generation || 1,
+          source,
+          timeout,
+        })
+      : await engineCall("page.frameWaitForFunction", {
+          page: this._page._id,
+          generation: this._page._generation || 1,
+          index: Number(this._id),
+          source,
+          timeout,
+        });
+    return decodeEvaluateResult(result);
   }
 
   async waitForURL(pattern, options) {
@@ -1288,17 +1472,14 @@ class Frame {
       return unsupported("Frame.waitForURL.pattern")();
     }
     const needle = String(pattern);
-    const deadline = Date.now() + ((options && options.timeout) || this._page._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const url = this._isMain()
-        ? await this._page.url()
-        : await this.evaluate(() => String(location.href));
-      if (String(url).includes(needle)) {
-        return url;
-      }
-      ops.op_sleep_ms(20);
-    }
-    throw new TimeoutError("timeout: Frame.waitForURL " + needle);
+    await this.waitForFunction(
+      (expected) => String(location.href).includes(expected),
+      needle,
+      options,
+    );
+    return this._isMain()
+      ? await this._page.url()
+      : await this.evaluate(() => String(location.href));
   }
 
   waitForNavigation() {
@@ -1332,8 +1513,9 @@ class Frame {
 }
 
 class Page {
-  constructor(id) {
+  constructor(id, generation) {
     this._id = id;
+    this._generation = generation || 1;
     this._closed = false;
     this._timeout = 30_000;
     this._context = null;
@@ -1345,6 +1527,7 @@ class Page {
     this._popupWaiters = [];
     this._pendingPopups = [];
     this._openerId = null;
+    this._extraHeaders = {};
     this._navWaiters = [];
     this._consoleWaiters = [];
     this._pendingConsole = [];
@@ -1640,15 +1823,18 @@ class Page {
 
   async waitForFunction(pageFunction, arg, options) {
     refuseLocatorOptions("Page.waitForFunction", options, ["timeout"]);
-    const deadline = Date.now() + ((options && options.timeout) || this._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const value = await this.evaluate(pageFunction, arg);
-      if (value) {
-        return value;
-      }
-      ops.op_sleep_ms(20);
-    }
-    throw new TimeoutError("timeout: waitForFunction");
+    const source = serializeWaitForFunction(
+      pageFunction,
+      arg,
+      arguments.length >= 2,
+    );
+    const result = await engineCall("page.waitForFunction", {
+      page: this._id,
+      generation: this._generation || 1,
+      source,
+      timeout: (options && options.timeout) || this._timeout || 30_000,
+    });
+    return decodeEvaluateResult(result);
   }
 
   async waitForURL(pattern, options) {
@@ -1657,15 +1843,12 @@ class Page {
       return unsupported("Page.waitForURL.pattern")();
     }
     const needle = String(pattern);
-    const deadline = Date.now() + ((options && options.timeout) || this._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const url = await this.url();
-      if (String(url).includes(needle)) {
-        return url;
-      }
-      ops.op_sleep_ms(20);
-    }
-    throw new TimeoutError("timeout: waitForURL " + needle);
+    await this.waitForFunction(
+      (expected) => String(location.href).includes(expected),
+      needle,
+      options,
+    );
+    return this.url();
   }
 
   async waitForRequest(pattern, options) {
@@ -1674,37 +1857,32 @@ class Page {
       return unsupported("Page.waitForRequest.pattern")();
     }
     const needle = String(pattern);
-    const deadline = Date.now() + ((options && options.timeout) || this._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const result = await engineCall("page.requests", { page: this._id });
-      const records = result.requests || [];
-      const hit = records.find((rec) => String(rec.url).includes(needle));
-      if (hit) {
-        return this._requestFromRecord(hit, records);
-      }
-      ops.op_sleep_ms(20);
-    }
-    throw new TimeoutError("timeout: waitForRequest " + needle);
+    const timeout = (options && options.timeout) || this._timeout || 30_000;
+    const result = await engineCall("page.waitForRequest", {
+      page: this._id,
+      needle,
+      timeout,
+    });
+    return this._requestFromRecord(result.request, [result.request]);
   }
 
   async waitForResponse(pattern) {
     const needle = String(pattern);
-    const deadline = Date.now() + (this._timeout || 30_000);
-    while (Date.now() < deadline) {
-      const result = await engineCall("page.responses", { page: this._id });
-      const hit = (result.responses || []).find((rec) => String(rec.url).includes(needle));
-      if (hit) {
-        return this._responseFromRecord(hit);
+    const timeout = this._timeout || 30_000;
+    try {
+      const result = await engineCall("page.waitForResponse", {
+        page: this._id,
+        needle,
+        timeout,
+      });
+      return this._responseFromRecord(result.response);
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      if (message.includes("timeout") || message.includes("timed out")) {
+        return unsupported("Page.waitForResponse.unintercepted")();
       }
-      const request = (await engineCall("page.requests", { page: this._id })).requests || [];
-      const reqHit = request.find((rec) => String(rec.url).includes(needle));
-      if (reqHit) {
-        // Non-intercepted loads have no recorded Servo response body/status.
-        break;
-      }
-      ops.op_sleep_ms(20);
+      throw error;
     }
-    return unsupported("Page.waitForResponse.unintercepted")();
   }
 
   async goto(url, options) {
@@ -1865,14 +2043,25 @@ class Page {
   }
 
   async _dispatchNetworkUntilSettled() {
-    const deadline = Date.now() + 2000;
-    while (Date.now() < deadline) {
-      const count = await this._dispatchNetwork(false);
-      if (count > 0) {
-        await this._dispatchNetwork(true);
-        return;
+    const already = await this._dispatchNetwork(true);
+    if (already) {
+      return;
+    }
+    try {
+      await engineCall("page.waitForRequest", {
+        page: this._id,
+        needle: "",
+        timeout: 2000,
+      });
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      if (
+        !(error instanceof TimeoutError) &&
+        !message.includes("timeout") &&
+        !message.includes("timed out")
+      ) {
+        throw error;
       }
-      ops.op_sleep_ms(20);
     }
     await this._dispatchNetwork(true);
   }
@@ -1927,15 +2116,23 @@ class Page {
   }
 
   async evaluate(pageFunction, arg) {
+    if (this._closed) {
+      throwObjectDisposed("Page");
+    }
+    const source =
+      arguments.length < 2
+        ? serializeEvaluate(pageFunction)
+        : serializeEvaluate(pageFunction, arg);
     const result = await engineCall("page.evaluate", {
       page: this._id,
-      source: serializeEvaluate(pageFunction, arg),
+      generation: this._generation || 1,
+      source,
     });
     await this._flushPopups();
     await this._dispatchConsole();
     await this._dispatchDialogs();
     await this._dispatchFrames();
-    return result.value;
+    return decodeEvaluateResult(result);
   }
 
   async _dispatchConsole() {
@@ -2107,7 +2304,7 @@ class Page {
   }
 
   async waitForTimeout(ms) {
-    ops.op_sleep_ms(Math.max(0, Number(ms) || 0));
+    await sleepMs(Math.max(0, Number(ms) || 0));
   }
 
   async waitForLoadState(state, options) {
@@ -2119,11 +2316,15 @@ class Page {
     await engineCall("page.waitForLoadState", { page: this._id, timeout });
   }
 
-  waitForNavigation() {
+  waitForNavigation(options) {
+    const timeout = (options && options.timeout) || this._timeout || 30_000;
     this._navWaiters = this._navWaiters || [];
-    return new Promise((resolve) => {
-      this._navWaiters.push(resolve);
-    });
+    return Promise.race([
+      new Promise((resolve) => {
+        this._navWaiters.push(resolve);
+      }),
+      timeoutAfter(timeout, "timeout: waitForNavigation"),
+    ]);
   }
 
   async _flushNavigation() {
@@ -2138,7 +2339,10 @@ class Page {
   }
 
   async frames() {
-    const result = await engineCall("page.frames", { page: this._id });
+    const result = await engineCall("page.frames", {
+      page: this._id,
+      timeout: this._timeout || 30_000,
+    });
     const children = (result.frames || []).map((info) => new Frame(this, info));
     this._childFrameIds = new Set(
       children.map((frame) => (frame.name() ? "name:" + frame.name() : "id:" + String(frame._id))),
@@ -2182,9 +2386,17 @@ class Page {
   }
 
   async close() {
-    await engineCall("page.close", { page: this._id });
-    this._closed = true;
-    this._emit("close", this);
+    if (this._closed) {
+      return;
+    }
+    try {
+      await engineCall("page.close", { page: this._id, generation: this._generation || 1 });
+    } finally {
+      this._closed = true;
+      this._generation = (this._generation || 1) + 1;
+      disposedPages.add(this._id);
+      this._emit("close", this);
+    }
   }
 
   async isClosed() {
@@ -2198,18 +2410,13 @@ class Page {
       return this._waitForDialog();
     }
     if (event === "filechooser") {
-      const deadline = Date.now() + (this._timeout || 30_000);
-      while (Date.now() < deadline) {
-        const result = await engineCall("page.fileChoosers", { page: this._id, consume: true });
-        const rec = (result.choosers || [])[0];
-        if (rec) {
-          const chooser = new FileChooser(this, rec);
-          this._emit("filechooser", chooser);
-          return chooser;
-        }
-        ops.op_sleep_ms(20);
-      }
-      throw new TimeoutError("timeout: waitForEvent filechooser");
+      const result = await engineCall("page.waitForFileChooser", {
+        page: this._id,
+        timeout: this._timeout || 30_000,
+      });
+      const chooser = new FileChooser(this, result.chooser);
+      this._emit("filechooser", chooser);
+      return chooser;
     }
     if (event === "popup" || event === "page") {
       return this._waitForPopup();
@@ -2218,46 +2425,50 @@ class Page {
       return this._waitForConsole();
     }
     if (event === "download") {
-      const deadline = Date.now() + (this._timeout || 30_000);
-      while (Date.now() < deadline) {
-        const result = await engineCall("page.downloads", { page: this._id });
-        const rec = (result.downloads || [])[0];
-        if (rec) {
-          const download = this._downloadFromRecord(rec);
-          this._emit("download", download);
-          return download;
-        }
-        ops.op_sleep_ms(20);
-      }
-      throw new TimeoutError("timeout: waitForEvent download");
+      const result = await engineCall("page.waitForDownload", {
+        page: this._id,
+        timeout: this._timeout || 30_000,
+      });
+      const download = this._downloadFromRecord(result.download);
+      this._emit("download", download);
+      return download;
     }
     if (event === "request") {
-      return this.waitForRequest("");
+      const pending = new Promise((resolve) => this.once("request", (payload) => resolve(payload)));
+      await this._dispatchNetwork(true);
+      const records = await this.requests();
+      if (records.length) {
+        return records[0];
+      }
+      return Promise.race([
+        pending,
+        timeoutAfter(this._timeout || 30_000, "timeout: waitForEvent request"),
+      ]);
     }
     if (event === "response") {
       return this.waitForResponse("");
     }
     if (event === "pageerror") {
+      await this._dispatchConsole();
       const errors = await this.pageErrors();
       if (errors.length) return errors[0];
-      const deadline = Date.now() + (this._timeout || 30_000);
-      while (Date.now() < deadline) {
-        const next = await this.pageErrors();
-        if (next.length) return next[0];
-        ops.op_sleep_ms(20);
-      }
-      return unsupported("Page.waitForEvent.pageerror.empty")();
+      return Promise.race([
+        new Promise((resolve) => this.once("pageerror", (payload) => resolve(payload))),
+        timeoutAfter(this._timeout || 30_000, "timeout: waitForEvent pageerror"),
+      ]);
     }
     if (event === "close") {
       if (this._closed) return this;
-      return new Promise((resolve) => {
-        this.once("close", () => resolve(this));
-      });
+      return Promise.race([
+        new Promise((resolve) => this.once("close", () => resolve(this))),
+        timeoutAfter(this._timeout || 30_000, "timeout: waitForEvent close"),
+      ]);
     }
     if (event === "load" || event === "domcontentloaded") {
-      return new Promise((resolve) => {
-        this.once(event, () => resolve(this));
-      });
+      return Promise.race([
+        new Promise((resolve) => this.once(event, () => resolve(this))),
+        timeoutAfter(this._timeout || 30_000, "timeout: waitForEvent " + event),
+      ]);
     }
     if (
       event === "frameattached" ||
@@ -2266,9 +2477,16 @@ class Page {
       event === "requestfailed" ||
       event === "requestfinished"
     ) {
-      return new Promise((resolve) => {
-        this.once(event, (payload) => resolve(payload));
-      });
+      const pending = new Promise((resolve) => this.once(event, (payload) => resolve(payload)));
+      if (event.startsWith("frame")) {
+        await this._dispatchFrames();
+      } else {
+        await this._dispatchNetwork(true);
+      }
+      return Promise.race([
+        pending,
+        timeoutAfter(this._timeout || 30_000, "timeout: waitForEvent " + event),
+      ]);
     }
     return unsupported(`Page.waitForEvent.${event}`)();
   }
@@ -2448,9 +2666,15 @@ class Page {
   }
 
   async setExtraHTTPHeaders(headers) {
+    this._extraHeaders = headers || {};
+    const merged = Object.assign(
+      {},
+      (this._context && this._context._extraHeaders) || {},
+      this._extraHeaders,
+    );
     await engineCall("page.setExtraHTTPHeaders", {
       page: this._id,
-      headers: headers || {},
+      headers: merged,
     });
   }
 
@@ -2463,8 +2687,17 @@ class Page {
       {
         abort: () =>
           engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "abort" }),
-        continue: () =>
-          engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "continue" }),
+        continue: (options = {}) => {
+          if (options.url != null || options.method != null || options.postData != null) {
+            return unsupported("Route.continue.overrides")();
+          }
+          return engineCall("page.addRoute", {
+            page: this._id,
+            pattern: String(url),
+            action: "continue",
+            headers: options.headers || {},
+          });
+        },
         fulfill: (options = {}) =>
           engineCall("page.addRoute", {
             page: this._id,
@@ -2524,8 +2757,9 @@ class Page {
 }
 
 class BrowserContext {
-  constructor(id) {
+  constructor(id, generation) {
     this._id = id;
+    this._generation = generation || 1;
     this._pages = [];
     this._browser = null;
     this._pendingRoutes = [];
@@ -2553,6 +2787,8 @@ class BrowserContext {
       "Clock",
     );
     this.request = withUnsupported({}, "APIRequestContext");
+    this.credentials = withUnsupported({}, "Credentials");
+    this.debugger = withUnsupported({}, "Debugger");
     return withUnsupported(this, "BrowserContext");
   }
 
@@ -2561,11 +2797,17 @@ class BrowserContext {
   }
 
   async newPage(options) {
+    if (this._closed) {
+      throwObjectDisposed("BrowserContext");
+    }
     if (options != null) {
       refuseLocatorOptions("BrowserContext.newPage", options, ["extraHTTPHeaders"]);
     }
-    const result = await engineCall("context.newPage", { context: this._id });
-    const page = new Page(result.page);
+    const result = await engineCall("context.newPage", {
+      context: this._id,
+      generation: this._generation || 1,
+    });
+    const page = new Page(result.page, result.generation);
     page._context = this;
     this._lastPage = result.page;
     this._pages = this._pages || [];
@@ -2573,13 +2815,15 @@ class BrowserContext {
     for (const pending of this._pendingRoutes || []) {
       await page.route(pending.url, pending.handler);
     }
-    const headers = Object.assign(
+    page._extraHeaders = Object.assign(
       {},
-      this._extraHeaders || {},
       (options && options.extraHTTPHeaders) || {},
     );
-    if (Object.keys(headers).length) {
-      await page.setExtraHTTPHeaders(headers);
+    if (
+      Object.keys(this._extraHeaders || {}).length ||
+      Object.keys(page._extraHeaders).length
+    ) {
+      await page.setExtraHTTPHeaders(page._extraHeaders);
     }
     for (const source of this._initScripts || []) {
       await engineCall("page.addInitScript", { page: page._id, source });
@@ -2779,11 +3023,16 @@ class BrowserContext {
   }
 
   async close() {
+    if (this._closed) {
+      return;
+    }
     for (const page of this.pages()) {
       await page.close();
     }
     this._pages = [];
     this._closed = true;
+    this._generation = (this._generation || 1) + 1;
+    disposedContexts.add(this._id);
     if (this._browser && Array.isArray(this._browser._contexts)) {
       this._browser._contexts = this._browser._contexts.filter((context) => context !== this);
     }
@@ -2813,7 +3062,7 @@ class BrowserContext {
   async setExtraHTTPHeaders(headers) {
     this._extraHeaders = headers || {};
     for (const page of this.pages()) {
-      await page.setExtraHTTPHeaders(this._extraHeaders);
+      await page.setExtraHTTPHeaders(page._extraHeaders || {});
     }
   }
 
@@ -2880,22 +3129,30 @@ class BrowserContext {
 }
 
 class Browser {
-  constructor(id) {
+  constructor(id, generation) {
     this._id = id;
+    this._generation = generation || 1;
     this._contexts = [];
     this._connected = true;
     this._handlers = {};
+    this.logger = withUnsupported({}, "Logger");
     return withUnsupported(this, "Browser");
   }
 
   async newContext(options) {
+    if (!this._connected) {
+      throwObjectDisposed("Browser");
+    }
     const storageState = options && options.storageState;
     const extraHTTPHeaders = options && options.extraHTTPHeaders;
     if (options != null) {
       refuseLocatorOptions("Browser.newContext", options, ["storageState", "extraHTTPHeaders"]);
     }
-    const result = await engineCall("browser.newContext", { browser: this._id });
-    const context = new BrowserContext(result.context);
+    const result = await engineCall("browser.newContext", {
+      browser: this._id,
+      generation: this._generation || 1,
+    });
+    const context = new BrowserContext(result.context, result.generation);
     context._browser = this;
     this._contexts.push(context);
     if (storageState) {
@@ -2934,6 +3191,8 @@ class Browser {
     }
     const wasConnected = this._connected;
     this._connected = false;
+    this._generation = (this._generation || 1) + 1;
+    disposedBrowsers.add(this._id);
     if (wasConnected) {
       this._emit("disconnected");
     }
@@ -3018,7 +3277,7 @@ const chromium = withUnsupported(
         return unsupported("BrowserType.launch.options")();
       }
       const result = await engineCall("chromium.launch", {});
-      return new Browser(result.browser);
+      return new Browser(result.browser, result.generation);
     },
     name() {
       return "chromium";
@@ -3065,7 +3324,12 @@ const selectors = withUnsupported(
 );
 const errors = withUnsupported({ TimeoutError }, "errors");
 
-export { chromium, firefox, webkit, selectors, errors, TimeoutError };
+const Debugger = withUnsupported({}, "Debugger");
+const Credentials = withUnsupported({}, "Credentials");
+const Logger = withUnsupported({}, "Logger");
+const WebError = withUnsupported({}, "WebError");
+
+export { chromium, firefox, webkit, selectors, errors, TimeoutError, Debugger, Credentials, Logger, WebError };
 export const request = withUnsupported({}, "APIRequest");
 export const devices = withUnsupported({}, "devices");
-export default { chromium, firefox, webkit, request, selectors, devices, errors };
+export default { chromium, firefox, webkit, request, selectors, devices, errors, Debugger, Credentials, Logger, WebError };

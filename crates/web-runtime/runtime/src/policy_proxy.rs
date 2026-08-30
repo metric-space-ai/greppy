@@ -1,14 +1,18 @@
 //! Connect-time HTTP/HTTPS proxy that dials only policy-pinned SocketAddrs.
 
-use crate::policy::{pin_connect_addr, SharedProfile};
+use crate::policy::{decide_host_literal, pin_connect_addr_with, SharedProfile, UrlDecision};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use url::Url;
 
 const HEADER_LIMIT: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) type ConnectResolve =
+    Arc<dyn Fn(&str, u16) -> Result<Vec<SocketAddr>, &'static str> + Send + Sync>;
 
 pub struct PolicyProxy {
     addr: SocketAddr,
@@ -17,12 +21,19 @@ pub struct PolicyProxy {
 
 impl PolicyProxy {
     pub fn spawn(profile: SharedProfile) -> io::Result<Self> {
+        Self::spawn_with_resolve(profile, Arc::new(crate::policy::default_resolve))
+    }
+
+    pub(crate) fn spawn_with_resolve(
+        profile: SharedProfile,
+        resolve: ConnectResolve,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let thread_profile = profile.clone();
         thread::Builder::new()
             .name("greppy-policy-proxy".into())
-            .spawn(move || accept_loop(listener, thread_profile))?;
+            .spawn(move || accept_loop(listener, thread_profile, resolve))?;
         Ok(Self {
             addr,
             _profile: profile,
@@ -38,35 +49,56 @@ impl PolicyProxy {
     }
 }
 
-fn accept_loop(listener: TcpListener, profile: SharedProfile) {
+fn accept_loop(listener: TcpListener, profile: SharedProfile, resolve: ConnectResolve) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let profile = profile.clone();
+        let resolve = Arc::clone(&resolve);
         let _ = thread::Builder::new()
             .name("greppy-policy-proxy-conn".into())
             .spawn(move || {
-                let _ = handle_client(stream, profile);
+                let _ = handle_client(stream, profile, resolve);
             });
     }
 }
 
-fn handle_client(mut client: TcpStream, profile: SharedProfile) -> io::Result<()> {
+fn handle_client(
+    mut client: TcpStream,
+    profile: SharedProfile,
+    resolve: ConnectResolve,
+) -> io::Result<()> {
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(30)));
-    let (head, rest) = read_headers(&mut client)?;
-    let first = head.lines().next().unwrap_or("");
-    let mut parts = first.split_whitespace();
-    let method = parts.next().unwrap_or("").to_ascii_uppercase();
-    let target = parts.next().unwrap_or("");
-    if method == "CONNECT" {
-        return handle_connect(client, profile, target);
+    loop {
+        let (head, rest) = match read_headers(&mut client) {
+            Ok(pair) => pair,
+            Err(_) => return Ok(()),
+        };
+        if head.trim().is_empty() {
+            return Ok(());
+        }
+        let first = head.lines().next().unwrap_or("");
+        let mut parts = first.split_whitespace();
+        let method = parts.next().unwrap_or("").to_ascii_uppercase();
+        let target = parts.next().unwrap_or("").to_owned();
+        if method == "CONNECT" {
+            return handle_connect(client, profile, resolve, &target);
+        }
+        let keep = handle_forward(&mut client, &profile, &resolve, &head, rest, &target)?;
+        if !keep {
+            return Ok(());
+        }
     }
-    handle_forward(client, profile, &head, rest, target)
 }
 
-fn handle_connect(mut client: TcpStream, profile: SharedProfile, target: &str) -> io::Result<()> {
+fn handle_connect(
+    mut client: TcpStream,
+    profile: SharedProfile,
+    resolve: ConnectResolve,
+    target: &str,
+) -> io::Result<()> {
     let (host, port) = split_host_port(target, 443);
-    match pin_connect_addr(profile.get(), &host, port) {
+    match pin_connect_addr_with(profile.get(), &host, port, |h, p| resolve(h, p)) {
         Ok(addr) => {
             let server = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
@@ -82,28 +114,35 @@ fn handle_connect(mut client: TcpStream, profile: SharedProfile, target: &str) -
 }
 
 fn handle_forward(
-    mut client: TcpStream,
-    profile: SharedProfile,
+    client: &mut TcpStream,
+    profile: &SharedProfile,
+    resolve: &ConnectResolve,
     head: &str,
     rest: Vec<u8>,
     target: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let (host, port, path) = match parse_http_target(target, head) {
         Some(parsed) => parsed,
         None => {
             client.write_all(
                 b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )?;
-            return Ok(());
+            return Ok(false);
         }
     };
-    let addr = match pin_connect_addr(profile.get(), &host, port) {
+    if host_header_forbidden(profile.get(), head) {
+        client.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(false);
+    }
+    let addr = match pin_connect_addr_with(profile.get(), &host, port, |h, p| resolve(h, p)) {
         Ok(addr) => addr,
         Err(_) => {
             client.write_all(
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )?;
-            return Ok(());
+            return Ok(false);
         }
     };
     let mut server = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
@@ -135,7 +174,35 @@ fn handle_forward(
         }
     }
     let _ = server.shutdown(std::net::Shutdown::Write);
-    io::copy(&mut server, &mut client).map(|_| ())
+    io::copy(&mut server, client).map(|_| ())?;
+    Ok(!connection_close(head))
+}
+
+fn connection_close(head: &str) -> bool {
+    head.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("connection:") && lower.contains("close")
+    })
+}
+
+fn host_header_value(head: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("host:")
+            .map(|value| value.trim().to_owned())
+    })
+}
+
+fn host_header_forbidden(profile: crate::policy::NetworkProfile, head: &str) -> bool {
+    let Some(hostport) = host_header_value(head) else {
+        return false;
+    };
+    let (host, _) = split_host_port(&hostport, 80);
+    matches!(
+        decide_host_literal(profile, &host),
+        UrlDecision::Deny { .. }
+    )
 }
 
 fn parse_http_target(target: &str, head: &str) -> Option<(String, u16, String)> {
@@ -292,6 +359,71 @@ mod tests {
         (status, text)
     }
 
+    fn proxy_connect(proxy: &PolicyProxy, hostport: &str) -> u16 {
+        let mut stream = TcpStream::connect(proxy.addr()).unwrap();
+        let req = format!("CONNECT {hostport} HTTP/1.1\r\nHost: {hostport}\r\n\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 256];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn read_one_http_response(stream: &mut TcpStream) -> (u16, String) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 512];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(idx) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..idx + 4]).into_owned();
+                        let mut need = remaining_body_length(&head);
+                        let have = buf.len().saturating_sub(idx + 4);
+                        need = need.saturating_sub(have);
+                        while need > 0 {
+                            match stream.read(&mut tmp) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    need = need.saturating_sub(n);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, text)
+    }
+
     #[test]
     fn project_proxy_pins_loopback_http() {
         let origin = serve_once(b"pinned-ok");
@@ -342,5 +474,193 @@ mod tests {
         assert!(!body.contains("should-not-see"), "{body}");
         let (status, _) = proxy_get(&proxy, "http://169.254.169.254/latest");
         assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn proxy_does_not_follow_redirect_to_metadata_and_denies_the_next_hop() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0_u8; 2048];
+                let _ = stream.read(&mut buf);
+                let extra = "Location: http://169.254.169.254/latest/meta-data/\r\n";
+                let header = format!(
+                    "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n{extra}Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+            }
+        });
+        let proxy = PolicyProxy::spawn(SharedProfile::new(NetworkProfile::Project)).unwrap();
+        let (status, body) = proxy_get(&proxy, &format!("http://{addr}/jump"));
+        assert_eq!(status, 302, "{body}");
+        assert!(
+            body.to_ascii_lowercase().contains("location:")
+                && body.contains("169.254.169.254"),
+            "proxy must surface the hop, not fetch it: {body:?}"
+        );
+        let (status, hop) = proxy_get(&proxy, "http://169.254.169.254/latest/meta-data/");
+        assert_eq!(status, 403, "{hop}");
+        assert!(!hop.to_ascii_lowercase().contains("ami-id"), "{hop}");
+    }
+
+    #[test]
+    fn proxy_denies_later_lookup_that_rebinds_to_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let origin = serve_once(b"first-hop");
+        let fixture: std::net::SocketAddr = origin
+            .trim_start_matches("http://")
+            .trim_end_matches("/pin")
+            .parse()
+            .unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let resolve = {
+            let lookups = Arc::clone(&lookups);
+            Arc::new(move |host: &str, port: u16| {
+                if host != "flip.test" {
+                    return crate::policy::default_resolve(host, port);
+                }
+                let n = lookups.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(vec![std::net::SocketAddr::new(fixture.ip(), fixture.port())])
+                } else {
+                    Ok(vec!["169.254.169.254:80".parse().unwrap()])
+                }
+            }) as ConnectResolve
+        };
+        let proxy = PolicyProxy::spawn_with_resolve(
+            SharedProfile::new(NetworkProfile::Project),
+            resolve,
+        )
+        .unwrap();
+        let (status, body) = proxy_get(&proxy, "http://flip.test/pin");
+        assert_eq!(status, 200, "first lookup must pin the fixture: {body}");
+        assert!(body.contains("first-hop"), "{body}");
+        let (status, hop) = proxy_get(&proxy, "http://flip.test/pin");
+        assert_eq!(status, 403, "rebound metadata lookup must be denied: {hop}");
+        assert!(!hop.contains("first-hop"), "{hop}");
+        assert!(lookups.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn proxy_denies_metadata_hostname_connect_without_dns() {
+        let resolve: ConnectResolve = Arc::new(|host, _| {
+            panic!("must not resolve metadata hostname {host}");
+        });
+        let proxy = PolicyProxy::spawn_with_resolve(
+            SharedProfile::new(NetworkProfile::Project),
+            resolve,
+        )
+        .unwrap();
+        let status = proxy_connect(&proxy, "metadata.google.internal:80");
+        assert_eq!(status, 403, "metadata hostname CONNECT must fail closed");
+    }
+
+    #[test]
+    fn proxy_denies_https_connect_after_rebind_to_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fixture = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let resolve = {
+            let lookups = Arc::clone(&lookups);
+            Arc::new(move |host: &str, port: u16| {
+                if host != "flip.test" {
+                    return crate::policy::default_resolve(host, port);
+                }
+                let n = lookups.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(vec![fixture])
+                } else {
+                    Ok(vec!["169.254.169.254:443".parse().unwrap()])
+                }
+            }) as ConnectResolve
+        };
+        let proxy = PolicyProxy::spawn_with_resolve(
+            SharedProfile::new(NetworkProfile::Project),
+            resolve,
+        )
+        .unwrap();
+        let first = proxy_connect(&proxy, "flip.test:443");
+        assert_eq!(first, 200, "first CONNECT must pin the fixture");
+        let second = proxy_connect(&proxy, "flip.test:443");
+        assert_eq!(second, 403, "rebound CONNECT must be denied");
+        assert!(lookups.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn proxy_denies_metadata_host_header_on_allowed_url() {
+        let resolve: ConnectResolve = Arc::new(|host, _| {
+            panic!("must not resolve when Host header is metadata: {host}");
+        });
+        let proxy = PolicyProxy::spawn_with_resolve(
+            SharedProfile::new(NetworkProfile::Project),
+            resolve,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(proxy.addr()).unwrap();
+        stream
+            .write_all(
+                b"GET http://example.test/pin HTTP/1.1\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert_eq!(status, 403, "{text}");
+    }
+
+    #[test]
+    fn proxy_repins_keep_alive_http_and_denies_rebind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let origin = serve_once(b"first-hop");
+        let fixture: std::net::SocketAddr = origin
+            .trim_start_matches("http://")
+            .trim_end_matches("/pin")
+            .parse()
+            .unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let resolve = {
+            let lookups = Arc::clone(&lookups);
+            Arc::new(move |host: &str, port: u16| {
+                if host != "flip.test" {
+                    return crate::policy::default_resolve(host, port);
+                }
+                let n = lookups.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(vec![std::net::SocketAddr::new(fixture.ip(), fixture.port())])
+                } else {
+                    Ok(vec!["169.254.169.254:80".parse().unwrap()])
+                }
+            }) as ConnectResolve
+        };
+        let proxy = PolicyProxy::spawn_with_resolve(
+            SharedProfile::new(NetworkProfile::Project),
+            resolve,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(proxy.addr()).unwrap();
+        stream
+            .write_all(b"GET http://flip.test/pin HTTP/1.1\r\nHost: flip.test\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
+        let (status, body) = read_one_http_response(&mut stream);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("first-hop"), "{body}");
+        stream
+            .write_all(b"GET http://flip.test/pin HTTP/1.1\r\nHost: flip.test\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let (status, hop) = read_one_http_response(&mut stream);
+        assert_eq!(status, 403, "keep-alive rebind must re-pin and deny: {hop}");
+        assert!(!hop.contains("first-hop"), "{hop}");
+        assert!(lookups.load(Ordering::SeqCst) >= 2);
     }
 }

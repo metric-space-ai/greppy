@@ -2,3 +2,12 @@
 members = ["phase1-probe", "runtime"]
 default-members = ["runtime"]
 resolver = "2"
+
+# Debug sha2 of the ~400MiB web-runtime image otherwise dominates worker spawn.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[patch.crates-io]
+servo = { path = "vendor/servo" }
+servo-embedder-traits = { path = "vendor/servo-embedder-traits" }
+servo-net = { path = "vendor/servo-net" }

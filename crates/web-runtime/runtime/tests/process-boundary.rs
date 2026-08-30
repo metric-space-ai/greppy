@@ -3,11 +3,7 @@ use std::process::Command;
 
 #[test]
 fn supervisor_runs_both_runtime_workers_across_process_boundaries() {
-    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime-supervisor"))
-        .arg("--controller-worker")
-        .arg(env!("CARGO_BIN_EXE_web-controller-worker"))
-        .arg("--content-worker")
-        .arg(env!("CARGO_BIN_EXE_web-content-worker"))
+    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
         .output()
         .expect("supervisor must launch");
 
@@ -37,40 +33,97 @@ fn binary_contains(path: &str, needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-#[test]
-fn three_runtime_images_do_not_colink_engines() {
-    let supervisor = env!("CARGO_BIN_EXE_web-runtime-supervisor");
-    let controller = env!("CARGO_BIN_EXE_web-controller-worker");
-    let content = env!("CARGO_BIN_EXE_web-content-worker");
-    assert_ne!(supervisor, controller);
-    assert_ne!(supervisor, content);
-    assert_ne!(controller, content);
+fn worker_role_rejects_capability_secret_in_argv_for(role: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
+        .args(["--internal-role", role, "--capability", "secret-token"])
+        .output()
+        .expect("spawn argv-capability worker");
+    assert!(
+        !output.status.success(),
+        "{role} accepted argv capability: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        err.contains("argv") || err.contains("capability"),
+        "{role} unexpected rejection text: {err}"
+    );
+}
 
+#[test]
+fn worker_role_rejects_capability_secret_in_argv() {
+    worker_role_rejects_capability_secret_in_argv_for("controller");
+    worker_role_rejects_capability_secret_in_argv_for("content");
+}
+
+#[test]
+fn worker_role_rejects_missing_inherited_capability_fd() {
+    for role in ["controller", "content"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
+            .args(["--internal-role", role])
+            .output()
+            .expect("spawn worker without capability fd");
+        assert!(
+            !output.status.success(),
+            "{role} started without inherited capability FD: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let err = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            err.contains("missing inherited capability FD") || err.contains("capability"),
+            "{role} unexpected rejection text: {err}"
+        );
+    }
+}
+
+#[test]
+fn packaged_or_cargo_web_runtime_is_the_only_runtime_bin_name() {
+    let runtime = PathBuf::from(env!("CARGO_BIN_EXE_web-runtime"));
+    assert_eq!(
+        runtime.file_name().and_then(|name| name.to_str()),
+        Some("web-runtime")
+    );
+}
+
+#[test]
+fn one_runtime_image_contains_supervisor_controller_and_content() {
+    let runtime = env!("CARGO_BIN_EXE_web-runtime");
     let servo_marker = b"SoftwareRenderingContext";
     let v8_marker = b"op_engine_call";
     assert!(
-        !binary_contains(supervisor, servo_marker),
-        "supervisor must not contain Servo software renderer types"
+        binary_contains(runtime, v8_marker),
+        "web-runtime must contain the V8 controller op"
     );
     assert!(
-        !binary_contains(supervisor, v8_marker),
-        "supervisor must not contain the V8 controller op"
+        binary_contains(runtime, servo_marker),
+        "web-runtime must contain Servo software renderer types"
+    );
+}
+
+#[test]
+fn internal_role_is_hidden_from_ordinary_invocation() {
+    let runtime = env!("CARGO_BIN_EXE_web-runtime");
+    let help = Command::new(runtime).arg("--help").output().expect("help");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
     );
     assert!(
-        binary_contains(controller, v8_marker),
-        "controller worker must contain op_engine_call"
-    );
-    assert!(
-        !binary_contains(controller, servo_marker),
-        "controller worker must not contain Servo software renderer types"
-    );
-    assert!(
-        binary_contains(content, servo_marker),
-        "content worker must contain SoftwareRenderingContext"
-    );
-    assert!(
-        !binary_contains(content, v8_marker),
-        "content worker must not contain the V8 controller op"
+        !text.contains("--internal-role controller")
+            && !text.contains("--internal-role content")
+            && !text.to_ascii_lowercase().contains("usage:"),
+        "--internal-role must stay hidden from ordinary CLI help: {text}"
     );
 }
 

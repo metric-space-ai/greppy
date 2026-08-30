@@ -5750,8 +5750,6 @@ dependencies = [
 [[package]]
 name = "servo"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e15df72165ca15b3945970c6870c4b7367be116ded058fda4f41190b265b8"
 dependencies = [
  "accesskit",
  "arboard",
@@ -6116,8 +6114,6 @@ dependencies = [
 [[package]]
 name = "servo-embedder-traits"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "262b40ba0b2c8266ef9df8326e81b4aecdac77365dfffdbd26aa9c6b76f2c001"
 dependencies = [
  "accesskit",
  "bitflags 2.13.1",
@@ -6587,8 +6583,6 @@ dependencies = [
 [[package]]
 name = "servo-net"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64afa122aa4c8b0344eca816dc19dc93837e5a71af4c3087fa6e1a88aa651ae3"
 dependencies = [
  "async-compression",
  "async-recursion",

@@ -6,23 +6,253 @@ use crate::protocol::{Message, WorkerKind};
 use crate::session::{Session, SessionState};
 use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
-    new_session_id, serve_connection, ErrorObject, Handshake, Request, Response, SCHEMA,
+    new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn isolated_id(value: &str) -> Result<&str, String> {
+    if value.is_empty()
+        || value.len() > 80
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("session/request id is not an isolated path component".to_owned());
+    }
+    Ok(value)
+}
+
+fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<PathBuf, String> {
+    Ok(std::env::temp_dir()
+        .join("greppy-web-runtime")
+        .join(isolated_id(run_id)?)
+        .join("sessions")
+        .join(isolated_id(session_id)?)
+        .join("script-root")
+        .join(isolated_id(request_id)?))
+}
+
+fn remove_script_stage(run_id: &str, session_id: &str, request_id: Option<&str>) {
+    let Ok(run_id) = isolated_id(run_id) else {
+        return;
+    };
+    let Ok(session_id) = isolated_id(session_id) else {
+        return;
+    };
+    let mut path = std::env::temp_dir()
+        .join("greppy-web-runtime")
+        .join(run_id)
+        .join("sessions")
+        .join(session_id)
+        .join("script-root");
+    if let Some(request_id) = request_id {
+        let Ok(request_id) = isolated_id(request_id) else {
+            return;
+        };
+        path.push(request_id);
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
+struct ScriptStageGuard {
+    run_id: String,
+    session_id: String,
+    request_id: String,
+}
+
+impl Drop for ScriptStageGuard {
+    fn drop(&mut self) {
+        remove_script_stage(&self.run_id, &self.session_id, Some(&self.request_id));
+    }
+}
+
+fn refuse_unbounded_script_root(root: &Path) -> Result<(), String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize script root: {error}"))?;
+    if root == Path::new("/") {
+        return Err("script root cannot be filesystem root".to_owned());
+    }
+    const FORBIDDEN: &[&str] = &[
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/root",
+        "/System",
+        "/Library",
+        "/Users",
+        "/home",
+        "/var",
+        "/private/var",
+        "/private/etc",
+        "/tmp",
+        "/private/tmp",
+    ];
+    if FORBIDDEN.iter().any(|prefix| root == Path::new(prefix)) {
+        return Err(format!(
+            "script root cannot be a system directory: {}",
+            root.display()
+        ));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && root == Path::new(&home) {
+            return Err("script root cannot be the home directory".to_owned());
+        }
+    }
+    if root.components().count() < 4 {
+        return Err("script root is too shallow to grant".to_owned());
+    }
+    Ok(())
+}
+
+fn path_is_within_root(root: &Path, candidate: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(candidate) = candidate.canonicalize() else {
+        return false;
+    };
+    candidate.starts_with(root)
+}
+fn stage_script_for_controller(
+    script_file: &str,
+    run_id: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Result<String, String> {
+    let src = Path::new(script_file)
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize script file: {error}"))?;
+    if !src.is_file() {
+        return Err("script_file is not a file".to_owned());
+    }
+    let root = src
+        .parent()
+        .ok_or_else(|| "script file has no parent directory".to_owned())?;
+    refuse_unbounded_script_root(root)?;
+    let dest = script_stage_dir(run_id, session_id, request_id)?;
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| "script file name missing".to_owned())?;
+    let staged = dest.join(file_name);
+    let staged_result = (|| {
+        std::fs::create_dir_all(&dest)
+            .map_err(|error| format!("cannot stage script root: {error}"))?;
+        copy_granted_modules(root, root, &dest, &mut 0, &mut 0)?;
+        if !staged.is_file() {
+            std::fs::copy(&src, &staged)
+                .map_err(|error| format!("cannot stage script file: {error}"))?;
+        }
+        let dest_canon = dest
+            .canonicalize()
+            .map_err(|error| format!("cannot canonicalize staged root: {error}"))?;
+        let staged_canon = staged
+            .canonicalize()
+            .map_err(|error| format!("cannot canonicalize staged script: {error}"))?;
+        if !path_is_within_root(&dest_canon, &staged_canon) {
+            return Err("staged script escaped isolated temp path".to_owned());
+        }
+        Ok(staged.to_string_lossy().into_owned())
+    })();
+    if staged_result.is_err() {
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+    staged_result
+}
+
+fn copy_granted_modules(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    files: &mut u32,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    const MAX_FILES: u32 = 128;
+    const MAX_BYTES: u64 = 4 * 1024 * 1024;
+    let from_canon = from
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize script walk: {error}"))?;
+    if !path_is_within_root(root, &from_canon) {
+        return Err("script walk escaped granted root".to_owned());
+    }
+    std::fs::create_dir_all(to).map_err(|error| format!("cannot stage script dir: {error}"))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|error| format!("cannot read script root: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read script root: {error}"))?;
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if name_text.starts_with('.') || name_text == ".." || name_text.contains('/') {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot stat script root: {error}"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let dest = to.join(&name);
+        if dest.parent() != Some(to) {
+            return Err("staged path escaped destination directory".to_owned());
+        }
+        if file_type.is_dir() {
+            copy_granted_modules(root, &entry.path(), &dest, files, bytes)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let canonical = match entry.path().canonicalize() {
+            Ok(path) => path,
+            Err(_) => {
+                return Err("cannot canonicalize granted module".to_owned());
+            }
+        };
+        if !path_is_within_root(root, &canonical) {
+            return Err("granted module escaped script root".to_owned());
+        }
+        let ext = canonical
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        if !matches!(ext, "mjs" | "js" | "cjs" | "json") {
+            continue;
+        }
+        let meta = std::fs::metadata(&canonical)
+            .map_err(|error| format!("cannot stat granted module: {error}"))?;
+        *files = files.saturating_add(1);
+        *bytes = bytes.saturating_add(meta.len());
+        if *files > MAX_FILES || *bytes > MAX_BYTES {
+            return Err("granted script root exceeds module copy budget".to_owned());
+        }
+        std::fs::copy(&canonical, &dest)
+            .map_err(|error| format!("cannot stage granted module: {error}"))?;
+    }
+    Ok(())
+}
 
 pub struct DaemonConfig {
     pub socket: PathBuf,
     pub run_id: String,
-    pub controller_worker: PathBuf,
-    pub content_worker: PathBuf,
     pub fixture_url: Option<String>,
+    pub search_endpoint: Option<String>,
+    pub idle_ttl: Duration,
 }
 
 pub fn serve(config: DaemonConfig) -> io::Result<()> {
@@ -30,22 +260,290 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let _ = std::fs::remove_file(&config.socket);
+    #[allow(fn_to_numeric_cast)]
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            crate::supervisor::handle_supervisor_sigterm as *const () as libc::sighandler_t,
+        );
+    }
+    let started = Instant::now();
+    match crate::supervisor::warmup_parent_image() {
+        Ok(hash) => eprintln!(
+            "web-runtime: phase parent-image elapsed_ms={}",
+            hash.as_millis()
+        ),
+        Err(error) => eprintln!("web-runtime: phase parent-image error={error}"),
+    }
+    eprintln!(
+        "web-runtime: phase start-workers socket={}",
+        config.socket.display()
+    );
     let mut daemon = Daemon::start(config)?;
+    eprintln!(
+        "web-runtime: phase bind-socket socket={}",
+        daemon.socket.display()
+    );
     let listener = UnixListener::bind(&daemon.socket)?;
     let mut permissions = std::fs::metadata(&daemon.socket)?.permissions();
     permissions.set_mode(0o600);
     std::fs::set_permissions(&daemon.socket, permissions)?;
-    // A closed probe connection or a single malformed client must not take
-    // down the supervisor; leftover-worker flakes showed up as "socket never
-    // created" when this loop exited.
+    eprintln!("web-runtime: phase listening");
+    eprintln!(
+        "web-runtime: phase request-ready elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
+    let control = Arc::clone(&daemon.run_control);
+    let attach = daemon.attach_capability.clone();
+    thread::Builder::new()
+        .name("web-runtime-accept".into())
+        .spawn(move || accept_loop(listener, tx, control, attach))
+        .map_err(io::Error::other)?;
+    loop {
+        let (mut stream, request) = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(pair) => pair,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if daemon.exiting {
+                    break;
+                }
+                daemon.reap_idle_sessions();
+                daemon
+                    .run_control
+                    .publish_sessions(snapshot_session_rows(&daemon.sessions, &daemon.run_control));
+                if daemon.should_idle_exit() {
+                    daemon.idle_exit();
+                    break;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let response = daemon.handle(request);
+        let _ = write_frame(&mut stream, &response);
+        if daemon.exiting {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn capability_matches(expected: &str, provided: &str) -> bool {
+    if expected.is_empty() || provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0_u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+struct LateEngineResult {
+    session_id: String,
+    target_request_id: String,
+    engine_request_id: u64,
+    ok: bool,
+    error: Option<String>,
+}
+
+struct RunControl {
+    busy: std::sync::Mutex<Option<(String, String)>>,
+    cancel_target: std::sync::Mutex<Option<(String, String)>>,
+    completed: std::sync::Mutex<HashSet<(String, String)>>,
+    heartbeats: std::sync::Mutex<Vec<String>>,
+    session_rows: std::sync::Mutex<Vec<serde_json::Value>>,
+    late_engine_result: std::sync::Mutex<Option<LateEngineResult>>,
+    controller_pid: AtomicU32,
+    content_pid: AtomicU32,
+    controller_generation: AtomicU64,
+    content_generation: AtomicU64,
+}
+
+impl RunControl {
+    fn new() -> Self {
+        Self {
+            busy: std::sync::Mutex::new(None),
+            cancel_target: std::sync::Mutex::new(None),
+            completed: std::sync::Mutex::new(HashSet::new()),
+            heartbeats: std::sync::Mutex::new(Vec::new()),
+            session_rows: std::sync::Mutex::new(Vec::new()),
+            late_engine_result: std::sync::Mutex::new(None),
+            controller_pid: AtomicU32::new(0),
+            content_pid: AtomicU32::new(0),
+            controller_generation: AtomicU64::new(1),
+            content_generation: AtomicU64::new(1),
+        }
+    }
+
+    fn publish_sessions(&self, rows: Vec<serde_json::Value>) {
+        *self.session_rows.lock().unwrap_or_else(|e| e.into_inner()) = rows;
+    }
+}
+
+fn snapshot_session_rows(
+    sessions: &HashMap<String, Session>,
+    control: &RunControl,
+) -> Vec<serde_json::Value> {
+    let controller_pid = control.controller_pid.load(Ordering::Relaxed);
+    let content_pid = control.content_pid.load(Ordering::Relaxed);
+    let controller_generation = control.controller_generation.load(Ordering::Relaxed);
+    let content_generation = control.content_generation.load(Ordering::Relaxed);
+    sessions
+        .values()
+        .map(|session| {
+            serde_json::json!({
+                "session_id": session.id,
+                "state": format!("{:?}", session.state).to_lowercase(),
+                "run_id": session.run_id,
+                "operation_id": session.operation_id,
+                "heartbeat_age_ms": session.last_heartbeat.elapsed().as_millis() as u64,
+                "inflight_engine_request_id": session.inflight_engine_request_id,
+                "inflight_engine_method": session.inflight_engine_method,
+                "controller_pid": controller_pid,
+                "content_pid": content_pid,
+                "controller_generation": controller_generation,
+                "content_generation": content_generation,
+            })
+        })
+        .collect()
+}
+
+fn accept_loop(
+    listener: UnixListener,
+    tx: mpsc::Sender<(UnixStream, Request)>,
+    control: Arc<RunControl>,
+    attach: String,
+) {
     for connection in listener.incoming() {
-        let stream = match connection {
+        let mut stream = match connection {
             Ok(stream) => stream,
             Err(_) => continue,
         };
-        let _ = serve_connection(stream, |request| daemon.handle(request));
+        let request: Request = match read_frame(&mut stream) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        if !capability_matches(&attach, &request.capability) {
+            let error = ErrorObject::new(
+                "session_not_owned",
+                "attach capability does not match this supervisor",
+                request.request_id.clone(),
+                32,
+                "use the parent-issued attach token from the inherited channel",
+            );
+            let _ = write_frame(&mut stream, &Response::error(&request, error));
+            continue;
+        }
+        match request.operation.as_str() {
+            "cancel" | "web.cancel" => {
+                let session_id = request
+                    .payload
+                    .get("session_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| request.session_id.clone())
+                    .unwrap_or_default();
+                let target = request
+                    .payload
+                    .get("target_request_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if session_id.is_empty() || target.is_empty() {
+                    let error = ErrorObject::new(
+                        "protocol_violation",
+                        "web.cancel requires session_id and target_request_id",
+                        request.request_id.clone(),
+                        30,
+                        "pass session_id and target_request_id",
+                    );
+                    let _ = write_frame(&mut stream, &Response::error(&request, error));
+                    continue;
+                }
+                let pair = (session_id, target);
+                let completed = control.completed.lock().unwrap_or_else(|e| e.into_inner());
+                if completed.contains(&pair) {
+                    drop(completed);
+                    let _ = write_frame(
+                        &mut stream,
+                        &Response::ok(
+                            &request,
+                            json!({ "cancelled": false, "reason": "already_completed" }),
+                        ),
+                    );
+                    continue;
+                }
+                drop(completed);
+                let busy = control.busy.lock().unwrap_or_else(|e| e.into_inner());
+                if busy.as_ref() != Some(&pair) {
+                    drop(busy);
+                    let _ = write_frame(
+                        &mut stream,
+                        &Response::ok(
+                            &request,
+                            json!({ "cancelled": false, "reason": "no_match" }),
+                        ),
+                    );
+                    continue;
+                }
+                drop(busy);
+                *control
+                    .cancel_target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(pair);
+                let _ = write_frame(
+                    &mut stream,
+                    &Response::ok(&request, json!({ "cancelled": true })),
+                );
+            }
+            "heartbeat" | "web.heartbeat" => {
+                if let Some(session_id) = request
+                    .payload
+                    .get("session_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| request.session_id.clone())
+                {
+                    control
+                        .heartbeats
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(session_id);
+                }
+                let _ = write_frame(&mut stream, &Response::ok(&request, json!({ "ok": true })));
+            }
+            "web.session.list" | "session.list" => {
+                let mut sessions = control
+                    .session_rows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let controller_pid = control.controller_pid.load(Ordering::Relaxed);
+                let content_pid = control.content_pid.load(Ordering::Relaxed);
+                let controller_generation = control.controller_generation.load(Ordering::Relaxed);
+                let content_generation = control.content_generation.load(Ordering::Relaxed);
+                for row in &mut sessions {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("controller_pid".into(), json!(controller_pid));
+                        object.insert("content_pid".into(), json!(content_pid));
+                        object.insert("controller_generation".into(), json!(controller_generation));
+                        object.insert("content_generation".into(), json!(content_generation));
+                    }
+                }
+                let _ = write_frame(
+                    &mut stream,
+                    &Response::ok(&request, json!({ "sessions": sessions })),
+                );
+            }
+            _ => {
+                if tx.send((stream, request)).is_err() {
+                    return;
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 struct Daemon {
@@ -53,52 +551,96 @@ struct Daemon {
     run_id: String,
     fixture_url: String,
     search_endpoint: Option<String>,
+    ever_had_session: bool,
     store: ArtifactStore,
-    controller_worker: PathBuf,
-    content_worker: PathBuf,
     controller: WorkerProcess,
     content: WorkerProcess,
     sessions: HashMap<String, Session>,
+    profile_locks: HashMap<String, crate::profile_lock::ProfileLock>,
     next_engine_id: AtomicU64,
     last_crash: Option<String>,
     crash_receipts: Vec<serde_json::Value>,
     last_request: Instant,
+    idle_ttl: Duration,
+    exiting: bool,
+    attach_capability: String,
+    run_control: Arc<RunControl>,
 }
 
 impl Daemon {
     fn start(config: DaemonConfig) -> io::Result<Self> {
-        let mut controller = WorkerProcess::spawn(
-            &config.controller_worker,
-            WorkerKind::Controller,
-            random_token()?,
-        )?;
-        controller.handshake()?;
-        let mut content =
-            WorkerProcess::spawn(&config.content_worker, WorkerKind::Content, random_token()?)?;
-        content.handshake()?;
+        let attach_capability = crate::worker::take_parent_attach_token().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "supervisor requires inherited attach token on fd 4",
+            )
+        })?;
+        // Controller (V8) and content (Servo) init independently. Sequential handshake
+        // of the 400MB image exceeded the 30s socket wait and panicked wait_for_accepting
+        // before bind, leaving in-flight process-group leaders reparented to PID 1.
+        let controller_token = random_token()?;
+        let content_token = random_token()?;
+        eprintln!("web-runtime: phase spawn-controller");
+        let controller_thread = thread::Builder::new()
+            .name("web-spawn-controller".into())
+            .spawn(move || {
+                let mut worker = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
+                eprintln!("web-runtime: phase handshake-controller");
+                worker.handshake()?;
+                eprintln!("web-runtime: phase controller-ready");
+                Ok::<_, io::Error>(worker)
+            })
+            .map_err(io::Error::other)?;
+        eprintln!("web-runtime: phase spawn-content");
+        let content_thread = thread::Builder::new()
+            .name("web-spawn-content".into())
+            .spawn(move || {
+                let mut worker = WorkerProcess::spawn(WorkerKind::Content, content_token)?;
+                eprintln!("web-runtime: phase handshake-content");
+                worker.handshake()?;
+                eprintln!("web-runtime: phase content-ready");
+                Ok::<_, io::Error>(worker)
+            })
+            .map_err(io::Error::other)?;
+        let controller = controller_thread
+            .join()
+            .map_err(|_| io::Error::other("controller spawn thread panicked"))??;
+        let content = content_thread
+            .join()
+            .map_err(|_| io::Error::other("content spawn thread panicked"))??;
+        eprintln!("web-runtime: phase workers-ready");
         let data_root = data_root(&config.run_id);
+        let run_control = Arc::new(RunControl::new());
+        run_control
+            .controller_pid
+            .store(controller.pid(), Ordering::Relaxed);
+        run_control
+            .content_pid
+            .store(content.pid(), Ordering::Relaxed);
         Ok(Self {
             socket: config.socket,
             run_id: config.run_id.clone(),
             fixture_url: config.fixture_url.unwrap_or_default(),
-            search_endpoint: std::env::var("GREPPY_WEB_SEARCH_ENDPOINT").ok(),
+            search_endpoint: config.search_endpoint,
             store: ArtifactStore::new(data_root)?,
-            controller_worker: config.controller_worker,
-            content_worker: config.content_worker,
+            ever_had_session: false,
             controller,
             content,
             sessions: HashMap::new(),
+            profile_locks: HashMap::new(),
             next_engine_id: AtomicU64::new(1),
             last_crash: None,
             crash_receipts: Vec::new(),
             last_request: Instant::now(),
+            idle_ttl: config.idle_ttl,
+            exiting: false,
+            attach_capability,
+            run_control,
         })
     }
 
     fn handle(&mut self, request: Request) -> Response {
         self.last_request = Instant::now();
-        self.reap_idle_sessions();
-        self.ensure_workers();
         if request.schema != SCHEMA {
             return Response::error(
                 &request,
@@ -122,12 +664,27 @@ impl Daemon {
             error.session_id = request.session_id.clone();
             return Response::error(&request, error);
         }
+        if request.operation != "web.shutdown" {
+            self.reap_idle_sessions();
+            // session.close after a timed-out web.run must not spawn replacement
+            // workers: handshake of the 400MB image overruns the client read timeout
+            // and those process-group leaders reparent to PID 1 when Drop kills us.
+            // web.doctor is image/handshake only and must not recover engines.
+            if request.operation != "web.session.close"
+                && request.operation != "web.doctor"
+                && request.operation != "handshake"
+            {
+                self.ensure_workers();
+            }
+        }
         match request.operation.as_str() {
             "handshake" => self.handshake(&request),
-            "web.status" | "web.doctor" => self.status(&request),
+            "web.status" => self.status(&request),
+            "web.doctor" => self.doctor(&request),
             "web.session.create" => self.session_create(&request),
             "web.session.list" => self.session_list(&request),
             "web.session.close" => self.session_close(&request),
+            "web.shutdown" => self.shutdown(&request),
             "web.run" => self.web_run(&request),
             "web.observe" => self.web_observe(&request),
             "web.screenshot" => self.web_screenshot(&request),
@@ -155,33 +712,32 @@ impl Daemon {
                 "label": "experimental web-runtime spike",
             }),
         );
-        response.handshake = Some(Handshake {
-            protocol_version: SCHEMA.to_owned(),
-            runtime_build_id: "web-runtime-0.1.0".to_owned(),
-            playwright_compatibility_version: "1.62.1".to_owned(),
-            servo_revision: "77fccacc1f1fdce10498d50173aafaa09d02879e".to_owned(),
-            v8_revision: "deno_core-0.410.0".to_owned(),
-            platform: std::env::consts::OS.to_owned(),
-            architecture: std::env::consts::ARCH.to_owned(),
-            supported_capabilities: vec![
-                "chromium.launch".into(),
-                "session".into(),
-                "web.run".into(),
-                "web.observe".into(),
-                "web.screenshot".into(),
-                "web.read".into(),
-                "web.search".into(),
-                "web.research".into(),
-                "web.artifacts".into(),
-                "page.route".into(),
-                "page.frames".into(),
-                "page.setInputFiles".into(),
-            ],
-            compatibility_coverage_level: "unverified".to_owned(),
-            max_message_bytes: greppy_web_client::MAX_FRAME_BYTES as u64,
-            max_artifact_bytes: greppy_web_client::MAX_FRAME_BYTES as u64,
-        });
+        response.handshake = Some(Handshake::runtime_facts());
         response
+    }
+
+    fn doctor(&self, request: &Request) -> Response {
+        let handshake = Handshake::runtime_facts();
+        let executable = std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string());
+        Response::ok(
+            request,
+            json!({
+                "executable": executable,
+                "protocol_version": handshake.protocol_version,
+                "runtime_build_id": handshake.runtime_build_id,
+                "playwright_compatibility_version": handshake.playwright_compatibility_version,
+                "servo_revision": handshake.servo_revision,
+                "v8_revision": handshake.v8_revision,
+                "platform": handshake.platform,
+                "architecture": handshake.architecture,
+                "supported_capabilities": handshake.supported_capabilities,
+                "compatibility_coverage_level": handshake.compatibility_coverage_level,
+                "max_message_bytes": handshake.max_message_bytes,
+                "max_artifact_bytes": handshake.max_artifact_bytes,
+            }),
+        )
     }
 
     fn status(&mut self, request: &Request) -> Response {
@@ -274,6 +830,9 @@ impl Daemon {
         let parsed = NetworkProfile::parse(profile).expect("validated");
         let id = new_session_id();
         let mut session = Session::new(&id, &self.run_id, parsed);
+        if let Some(limits) = request.payload.get("limits") {
+            session.limits.apply_payload(limits);
+        }
         if session.transition(SessionState::Ready).is_err() {
             return Response::error(
                 request,
@@ -286,8 +845,55 @@ impl Daemon {
                 ),
             );
         }
+        let profile_lock = match request
+            .payload
+            .get("persistent_profile")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(name) => match self.acquire_persistent_profile(name) {
+                Ok(lock) => {
+                    session.persistent_profile = Some(name.to_owned());
+                    Some(lock)
+                }
+                Err(error) => {
+                    let code = if error.contains("held by live") {
+                        "profile_in_use"
+                    } else {
+                        "protocol_violation"
+                    };
+                    let exit = if code == "profile_in_use" { 38 } else { 30 };
+                    return Response::error(
+                        request,
+                        ErrorObject::new(
+                            code,
+                            error,
+                            request.request_id.clone(),
+                            exit,
+                            "close the other session that owns this persistent profile",
+                        ),
+                    );
+                }
+            },
+            None => None,
+        };
         self.sessions.insert(id.clone(), session);
-        self.journal(&id, "session.ready", json!({ "profile": profile }));
+        if let Some(lock) = profile_lock {
+            self.profile_locks.insert(id.clone(), lock);
+        }
+        self.ever_had_session = true;
+        self.run_control
+            .publish_sessions(snapshot_session_rows(&self.sessions, &self.run_control));
+        self.journal(
+            &id,
+            &request.request_id,
+            "session.ready",
+            json!({ "profile": profile }),
+        );
+        if let Some(created) = self.sessions.get(&id) {
+            self.persist_session_snapshot(created, json!({ "event": "session.ready" }));
+        }
         Response::ok(
             request,
             json!({
@@ -299,18 +905,73 @@ impl Daemon {
     }
 
     fn session_list(&self, request: &Request) -> Response {
-        let sessions: Vec<_> = self
-            .sessions
-            .values()
-            .map(|session| {
-                serde_json::json!({
-                    "session_id": session.id,
-                    "state": format!("{:?}", session.state).to_lowercase(),
-                    "run_id": session.run_id,
-                })
-            })
-            .collect();
+        let sessions = snapshot_session_rows(&self.sessions, &self.run_control);
+        self.run_control.publish_sessions(sessions.clone());
         Response::ok(request, serde_json::json!({ "sessions": sessions }))
+    }
+
+    fn acquire_persistent_profile(
+        &self,
+        name: &str,
+    ) -> Result<crate::profile_lock::ProfileLock, String> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Err(
+                "persistent_profile must be a short [A-Za-z0-9_-] name under the run store".into(),
+            );
+        }
+        let dir = self.store.root().join("profiles").join(name);
+        crate::profile_lock::ProfileLock::acquire(&dir).map_err(|error| error.to_string())
+    }
+    fn shutdown(&mut self, request: &Request) -> Response {
+        eprintln!("web-runtime: phase shutdown-begin");
+        self.exiting = true;
+        self.sessions.clear();
+        self.profile_locks.clear();
+        eprintln!("web-runtime: phase shutdown-controller-eof");
+        self.controller.shutdown_or_kill();
+        eprintln!("web-runtime: phase shutdown-content-reap");
+        self.content.shutdown_or_kill();
+        eprintln!("web-runtime: phase shutdown-accept-break");
+        self.journal(
+            "runtime",
+            &request.request_id,
+            "runtime.shutdown",
+            json!({}),
+        );
+        Response::ok(request, json!({ "shutdown": true }))
+    }
+
+    fn drain_late_engine_results(&mut self, session_id: &str, operation_id: &str) {
+        let late = self
+            .run_control
+            .late_engine_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(late) = late else {
+            return;
+        };
+        if late.session_id != session_id || late.target_request_id != operation_id {
+            return;
+        }
+        self.journal(
+            session_id,
+            operation_id,
+            "late.engine_result",
+            json!({
+                "discarded": true,
+                "kind": "EngineResult",
+                "engine_request_id": late.engine_request_id,
+                "ok": late.ok,
+                "session_id": late.session_id,
+                "target_request_id": late.target_request_id,
+            }),
+        );
     }
 
     fn session_close(&mut self, request: &Request) -> Response {
@@ -334,12 +995,26 @@ impl Daemon {
         };
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
+                let ephemeral = session.persistent_profile.is_none();
+                let _ = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
                 if let Some(page) = session.page_id.take() {
-                    let _ = self.engine_call("page.close", json!({ "page": page }));
+                    if self.content.is_running() {
+                        let _ = self.engine_call("page.close", json!({ "page": page }));
+                    }
                 }
                 let _ = session.transition(SessionState::Closed);
-                self.journal(&session_id, "session.closed", json!({}));
+                self.run_control
+                    .publish_sessions(snapshot_session_rows(&self.sessions, &self.run_control));
+                self.journal(
+                    &session_id,
+                    &request.request_id,
+                    "session.closed",
+                    json!({}),
+                );
+                if ephemeral {
+                    self.remove_ephemeral_session_dir(&session_id);
+                }
                 Response::ok(
                     request,
                     serde_json::json!({ "session_id": session_id, "state": "closed" }),
@@ -403,6 +1078,26 @@ impl Daemon {
                 );
             }
         }
+        *self
+            .run_control
+            .busy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((session_id.clone(), request.request_id.clone()));
+        self.run_control
+            .controller_pid
+            .store(self.controller.pid(), Ordering::Relaxed);
+        self.run_control
+            .content_pid
+            .store(self.content.pid(), Ordering::Relaxed);
+        self.run_control
+            .publish_sessions(snapshot_session_rows(&self.sessions, &self.run_control));
+        self.journal(
+            &session_id,
+            &request.request_id,
+            "run.started",
+            json!({ "operation": "web.run" }),
+        );
         let source = request
             .payload
             .get("script_text")
@@ -413,24 +1108,50 @@ impl Daemon {
             .get("script_file")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let (specifier, source) = match (source, file) {
-            (Some(text), _) => ("greppy:stdin".to_owned(), text),
-            (None, Some(path)) => match std::fs::read_to_string(&path) {
-                Ok(text) => (path, text),
-                Err(error) => {
-                    self.finish_session(&session_id);
-                    return Response::error(
-                        request,
-                        ErrorObject::new(
-                            "protocol_violation",
-                            format!("cannot read script file: {error}"),
-                            request.request_id.clone(),
-                            30,
-                            "pass a readable --script-file",
-                        ),
-                    );
+        let (specifier, source) = match (file, source) {
+            (Some(path), maybe_text) => {
+                let text = match maybe_text {
+                    Some(text) => text,
+                    None => match std::fs::read_to_string(&path) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            self.finish_session(&session_id);
+                            return Response::error(
+                                request,
+                                ErrorObject::new(
+                                    "protocol_violation",
+                                    format!("cannot read script file: {error}"),
+                                    request.request_id.clone(),
+                                    30,
+                                    "pass a readable --script-file",
+                                ),
+                            );
+                        }
+                    },
+                };
+                match stage_script_for_controller(
+                    &path,
+                    &self.run_id,
+                    &session_id,
+                    &request.request_id,
+                ) {
+                    Ok(staged) => (staged, text),
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        return Response::error(
+                            request,
+                            ErrorObject::new(
+                                "protocol_violation",
+                                error,
+                                request.request_id.clone(),
+                                30,
+                                "pass a readable --script-file inside a bounded script root",
+                            ),
+                        );
+                    }
                 }
-            },
+            }
+            (None, Some(text)) => ("greppy:stdin".to_owned(), text),
             (None, None) => {
                 self.finish_session(&session_id);
                 return Response::error(
@@ -444,6 +1165,15 @@ impl Daemon {
                     ),
                 );
             }
+        };
+        let _stage_guard = if specifier != "greppy:stdin" {
+            Some(ScriptStageGuard {
+                run_id: self.run_id.clone(),
+                session_id: session_id.clone(),
+                request_id: request.request_id.clone(),
+            })
+        } else {
+            None
         };
         if !self.controller.is_running() {
             if let Err(error) = self.recover_controller("controller worker exited") {
@@ -465,6 +1195,8 @@ impl Daemon {
         let started = Instant::now();
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
+        let control = Arc::clone(&self.run_control);
+        let operation_id = request.request_id.clone();
         let outcome = {
             let controller = &mut self.controller;
             let content = &mut self.content;
@@ -486,6 +1218,8 @@ impl Daemon {
                         session_id: session_key,
                         content_pid,
                         controller_pid,
+                        operation_id: operation_id.clone(),
+                        control: Arc::clone(&control),
                     },
                 )
             }
@@ -495,6 +1229,23 @@ impl Daemon {
             .get(&session_id)
             .map(|session| (session.network_bytes, session.peak_rss_bytes))
             .unwrap_or((0, 0));
+        let run_event = match &outcome {
+            Ok(()) => "run.completed",
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.to_string().contains("timed out") =>
+            {
+                "run.timeout"
+            }
+            Err(error) if error.to_string().contains("cancelled") => "run.cancelled",
+            Err(_) => "run.failed",
+        };
+        self.journal(&session_id, &request.request_id, run_event, json!({}));
+        remove_script_stage(&self.run_id, &session_id, Some(&request.request_id));
+        let had_inflight_engine = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.inflight_engine_request_id);
         self.finish_session(&session_id);
         match outcome {
             Ok(()) => {
@@ -511,6 +1262,130 @@ impl Daemon {
             }
             Err(error) => {
                 let message = error.to_string();
+                if message.contains("cancelled") {
+                    let pair = (session_id.clone(), operation_id.clone());
+                    control
+                        .completed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(pair.clone());
+                    {
+                        let mut cancel_target = control
+                            .cancel_target
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if cancel_target.as_ref() == Some(&pair) {
+                            *cancel_target = None;
+                        }
+                    }
+                    {
+                        let mut busy = control.busy.lock().unwrap_or_else(|e| e.into_inner());
+                        if busy.as_ref() == Some(&pair) {
+                            *busy = None;
+                        }
+                    }
+                    self.drain_late_engine_results(&session_id, &operation_id);
+                    if had_inflight_engine.is_some() {
+                        match self.respawn_content_after_cancel("cancelled content isolate") {
+                            Ok((pid_before, pid_after, generation)) => {
+                                self.journal(
+                                    &session_id,
+                                    &operation_id,
+                                    "worker.respawn",
+                                    json!({
+                                        "worker": "content",
+                                        "pid_before": pid_before,
+                                        "pid_after": pid_after,
+                                        "generation": generation,
+                                    }),
+                                );
+                            }
+                            Err(error) => {
+                                let mut object = ErrorObject::new(
+                                    "worker_unavailable",
+                                    error,
+                                    request.request_id.clone(),
+                                    38,
+                                    "retry greppy web run",
+                                );
+                                object.session_id = Some(session_id.clone());
+                                return Response::error(request, object);
+                            }
+                        }
+                    }
+                    let controller_pid_before = self.controller.pid();
+                    if let Err(error) = self.recover_controller("cancelled controller isolate") {
+                        let mut object = ErrorObject::new(
+                            "worker_unavailable",
+                            error,
+                            request.request_id.clone(),
+                            38,
+                            "retry greppy web run",
+                        );
+                        object.session_id = Some(session_id.clone());
+                        return Response::error(request, object);
+                    }
+                    self.journal(
+                        &session_id,
+                        &operation_id,
+                        "worker.respawn",
+                        json!({
+                            "worker": "controller",
+                            "pid_before": controller_pid_before,
+                            "pid_after": self.controller.pid(),
+                            "generation": self
+                                .run_control
+                                .controller_generation
+                                .load(Ordering::Relaxed),
+                        }),
+                    );
+                    self.run_control
+                        .publish_sessions(snapshot_session_rows(&self.sessions, &self.run_control));
+                    let mut object = ErrorObject::new(
+                        "cancelled",
+                        "web.run was cancelled",
+                        request.request_id.clone(),
+                        35,
+                        "retry the script or send a new web.run",
+                    );
+                    object.session_id = Some(session_id.clone());
+                    return Response::error(request, object);
+                }
+                if error.kind() == io::ErrorKind::TimedOut || message.contains("timed out") {
+                    self.controller.kill_tree();
+                    self.content.kill_tree();
+                    // Do not recover here. Spawn+handshake of replacement workers can
+                    // exceed the client unix read slack; Drop then SIGKILLs the supervisor
+                    // while those process-group leaders reparent to PID 1.
+                    let mut object = ErrorObject::new(
+                        "timeout",
+                        redact_secrets(&message),
+                        request.request_id.clone(),
+                        35,
+                        "retry with a longer deadline or a smaller script",
+                    );
+                    object.session_id = Some(session_id.clone());
+                    let mut response = Response::error(request, object);
+                    if let Ok(manifest) = self.store.put(
+                        format!(
+                            "{{\"partial\":true,\"reason\":\"timeout\",\"session_id\":\"{session_id}\"}}"
+                        )
+                        .as_bytes(),
+                        "application/json",
+                        &session_id,
+                        &self.run_id,
+                        "web.run.timeout",
+                        false,
+                    ) {
+                        if let Ok(value) = serde_json::to_value(&manifest) {
+                            response.artifacts.push(value);
+                        }
+                    }
+                    response.metrics.wall_ms = started.elapsed().as_millis() as u64;
+                    response.metrics.network_bytes = network_bytes;
+                    response.metrics.peak_rss_bytes = peak_rss;
+                    return response;
+                }
                 if let Some(limit) = message.strip_prefix("resource_limit: ") {
                     let mut response = limit_error(request, limit);
                     if let Some(error) = response.error.as_mut() {
@@ -521,9 +1396,10 @@ impl Daemon {
                     response.metrics.peak_rss_bytes = peak_rss;
                     return response;
                 }
+                let safe: String = redact_secrets(&message).chars().take(512).collect();
                 let mut object = ErrorObject::new(
                     "controller_exception",
-                    message,
+                    safe,
                     request.request_id.clone(),
                     33,
                     "inspect the controller script and retry",
@@ -546,14 +1422,93 @@ impl Daemon {
             Ok((session_id, page)) => {
                 match self.engine_call("page.observe", json!({ "page": page })) {
                     Ok(mut tree) => {
-                        self.finish_session(&session_id);
                         if let Some(object) = tree.as_object_mut() {
+                            if let Some(url) = object.get("url").and_then(|value| value.as_str()) {
+                                let redacted = redact_secrets(url);
+                                object.insert("url".into(), json!(redacted));
+                            }
                             object.insert(
                                 "untrusted_content_boundary".into(),
                                 json!("UNTRUSTED_PAGE_CONTENT"),
                             );
                         }
-                        Response::ok(request, tree)
+                        let format = request
+                            .payload
+                            .get("format")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("agent-tree");
+                        match format {
+                            "text" => {
+                                let text = tree
+                                    .get("text")
+                                    .and_then(|value| value.as_str())
+                                    .or_else(|| tree.get("title").and_then(|value| value.as_str()))
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let stored = self.store_bytes(
+                                    request,
+                                    &session_id,
+                                    text.as_bytes(),
+                                    "text/plain",
+                                    "web.observe",
+                                    false,
+                                );
+                                self.finish_session(&session_id);
+                                match stored {
+                                    Ok(manifest) => match model_facing_observe_payload(
+                                        "text",
+                                        "text",
+                                        &text,
+                                        &manifest,
+                                    ) {
+                                        Ok(payload) => Response::ok(request, payload),
+                                        Err(error) => engine_error(request, error, 39),
+                                    },
+                                    Err(response) => response,
+                                }
+                            }
+                            "html" => {
+                                match self.engine_call("page.content", json!({ "page": page })) {
+                                    Ok(value) => match Self::html_from_page_content(&value) {
+                                        Ok(html) => {
+                                            let stored = self.store_bytes(
+                                                request,
+                                                &session_id,
+                                                html.as_bytes(),
+                                                "text/html",
+                                                "web.observe",
+                                                false,
+                                            );
+                                            self.finish_session(&session_id);
+                                            match stored {
+                                                Ok(manifest) => match model_facing_observe_payload(
+                                                    "html",
+                                                    "html",
+                                                    &html,
+                                                    &manifest,
+                                                ) {
+                                                    Ok(payload) => Response::ok(request, payload),
+                                                    Err(error) => engine_error(request, error, 39),
+                                                },
+                                                Err(response) => response,
+                                            }
+                                        }
+                                        Err(error) => {
+                                            self.finish_session(&session_id);
+                                            engine_error(request, error, 34)
+                                        }
+                                    },
+                                    Err(error) => {
+                                        self.finish_session(&session_id);
+                                        engine_error(request, error, 34)
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.finish_session(&session_id);
+                                Response::ok(request, tree)
+                            }
+                        }
                     }
                     Err(error) => {
                         self.finish_session(&session_id);
@@ -648,6 +1603,36 @@ impl Daemon {
         }
     }
 
+    pub(crate) fn host_matches_domain(href: &str, domain: &str) -> bool {
+        let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            return true;
+        }
+        let host = href
+            .split("://")
+            .nth(1)
+            .unwrap_or(href)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        host == domain || host.ends_with(&format!(".{domain}"))
+    }
+
+    pub(crate) fn html_from_page_content(value: &serde_json::Value) -> Result<String, String> {
+        value
+            .get("html")
+            .and_then(|html| html.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| "page.content missing html".to_owned())
+    }
     fn web_search(&mut self, request: &Request) -> Response {
         let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.search requires query");
@@ -670,7 +1655,23 @@ impl Daemon {
                             .and_then(|tree| tree.get("links").cloned())
                             .and_then(|value| value.as_array().cloned())
                             .unwrap_or_default();
-                        let results: Vec<_> = links.into_iter().take(limit).collect();
+                        let domain = request
+                            .payload
+                            .get("domain")
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        let results: Vec<_> = links
+                            .into_iter()
+                            .filter(|link| match domain {
+                                Some(domain) => link
+                                    .get("href")
+                                    .and_then(|value| value.as_str())
+                                    .is_some_and(|href| Self::host_matches_domain(href, domain)),
+                                None => true,
+                            })
+                            .take(limit)
+                            .collect();
                         source["classification"] = json!("aggregator");
                         self.finish_session(&session_id);
                         Response::ok(
@@ -696,12 +1697,22 @@ impl Daemon {
         let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.research requires query");
         };
-        let max_sources = request
+        let depth = request
+            .payload
+            .get("depth")
+            .and_then(|v| v.as_str())
+            .unwrap_or("standard");
+        let requested = request
             .payload
             .get("max_sources")
             .and_then(|v| v.as_u64())
             .unwrap_or(3)
             .clamp(1, 8) as usize;
+        let max_sources = match depth {
+            "shallow" => 1,
+            "deep" => requested.max(6).min(8),
+            _ => requested,
+        };
         let search = self.web_search(request);
         if search.status != "ok" {
             return search;
@@ -774,7 +1785,7 @@ impl Daemon {
                 "omitted": omitted,
                 "omitted_reasons": omitted_reasons,
                 "evidence": snippets,
-                "sources": admitted.into_iter().map(model_facing_source).collect::<Vec<_>>(),
+                "sources": admitted,
                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
                 "continuation_token": continuation,
             }),
@@ -996,22 +2007,29 @@ impl Daemon {
             &request.operation,
             false,
         )?;
-        Ok(model_facing_source(json!({
-            "requested_url": url,
-            "final_url": tree.get("url"),
-            "redirect_chain": redirect_chain(url, tree.get("url"), recorded.get("requests")),
-            "retrieved_at": stored.timestamp,
-            "title": title,
-            "media_type": "text/html",
-            "text": text,
-            "digest": stored.digest.hex,
-            "artifact_digest": stored.digest.hex,
-            "http_status": http_status,
-            "classification": "original",
-            "session_id": session_id,
-            "operation_id": request.request_id,
-            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
-        })))
+        model_facing_source(
+            json!({
+                "requested_url": redact_secrets(url),
+                "final_url": tree.get("url").and_then(|value| value.as_str()).map(redact_secrets),
+                "redirect_chain": redirect_chain(url, tree.get("url"), recorded.get("requests"))
+                    .into_iter()
+                    .map(|hop| redact_secrets(&hop))
+                    .collect::<Vec<_>>(),
+                "retrieved_at": stored.timestamp,
+                "title": title,
+                "media_type": "text/html",
+                "text": text,
+                "digest": stored.digest.hex,
+                "artifact_digest": stored.digest.hex,
+                "http_status": http_status,
+                "classification": "original",
+                "session_id": session_id,
+                "operation_id": request.request_id,
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+            }),
+            &stored,
+        )
+        .map_err(|error| engine_error(request, error, 39))
     }
 
     fn store_bytes(
@@ -1134,7 +2152,8 @@ impl Daemon {
     }
 
     fn record_crash(&mut self, worker: &str, reason: &str, recovered: bool) {
-        self.last_crash = Some(reason.to_owned());
+        let reason = redact_secrets(reason);
+        self.last_crash = Some(reason.clone());
         let recovered_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
@@ -1156,24 +2175,31 @@ impl Daemon {
                 return Err(error.to_string());
             }
         };
-        let mut controller =
-            match WorkerProcess::spawn(&self.controller_worker, WorkerKind::Controller, token) {
-                Ok(controller) => controller,
-                Err(error) => {
-                    self.record_crash("controller", reason, false);
-                    return Err(error.to_string());
-                }
-            };
+        let mut controller = match WorkerProcess::spawn(WorkerKind::Controller, token) {
+            Ok(controller) => controller,
+            Err(error) => {
+                self.record_crash("controller", reason, false);
+                return Err(error.to_string());
+            }
+        };
         if let Err(error) = controller.handshake() {
             self.record_crash("controller", reason, false);
             return Err(error.to_string());
         }
+        self.controller.kill_tree();
         self.controller = controller;
+        self.run_control
+            .controller_pid
+            .store(self.controller.pid(), Ordering::Relaxed);
+        self.run_control
+            .controller_generation
+            .fetch_add(1, Ordering::Relaxed);
         self.record_crash("controller", reason, true);
         Ok(())
     }
 
-    fn recover_content(&mut self, reason: &str) -> Result<(), String> {
+    fn replace_content_worker(&mut self, reason: &str) -> Result<(u32, u32, u64), String> {
+        let pid_before = self.content.pid();
         let token = match random_token() {
             Ok(token) => token,
             Err(error) => {
@@ -1181,20 +2207,42 @@ impl Daemon {
                 return Err(error.to_string());
             }
         };
-        let mut content =
-            match WorkerProcess::spawn(&self.content_worker, WorkerKind::Content, token) {
-                Ok(content) => content,
-                Err(error) => {
-                    self.record_crash("content", reason, false);
-                    return Err(error.to_string());
-                }
-            };
+        let mut content = match WorkerProcess::spawn(WorkerKind::Content, token) {
+            Ok(content) => content,
+            Err(error) => {
+                self.record_crash("content", reason, false);
+                return Err(error.to_string());
+            }
+        };
         if let Err(error) = content.handshake() {
             self.record_crash("content", reason, false);
             return Err(error.to_string());
         }
+        self.content.kill_tree();
         self.content = content;
+        self.run_control
+            .content_pid
+            .store(self.content.pid(), Ordering::Relaxed);
+        let generation = self
+            .run_control
+            .content_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         self.record_crash("content", reason, true);
+        Ok((pid_before, self.content.pid(), generation))
+    }
+
+    fn respawn_content_after_cancel(&mut self, reason: &str) -> Result<(u32, u32, u64), String> {
+        let ids = self.replace_content_worker(reason)?;
+        for session in self.sessions.values_mut() {
+            session.page_id = None;
+            session.pages = 0;
+        }
+        Ok(ids)
+    }
+
+    fn recover_content(&mut self, reason: &str) -> Result<(), String> {
+        self.replace_content_worker(reason)?;
         let mut failed = Vec::new();
         for session in self.sessions.values_mut() {
             session.page_id = None;
@@ -1203,18 +2251,59 @@ impl Daemon {
                 && session.state != SessionState::Closing
                 && session.state != SessionState::Closed
             {
+                let request_id = session.operation_id.clone().unwrap_or_default();
                 let _ = session.transition(SessionState::Failed);
-                failed.push(session.id.clone());
+                failed.push((session.id.clone(), request_id));
             }
         }
-        for session_id in failed {
-            self.journal(&session_id, "session.failed", json!({ "reason": reason }));
+        for (session_id, request_id) in failed {
+            self.journal(
+                &session_id,
+                &request_id,
+                "session.failed",
+                json!({ "reason": redact_secrets(reason) }),
+            );
+            if let Some(session) = self.sessions.get(&session_id) {
+                self.persist_session_snapshot(
+                    session,
+                    json!({ "event": "session.failed", "reason": redact_secrets(reason) }),
+                );
+            }
         }
-        self.journal("runtime", "content.recovered", json!({ "reason": reason }));
+        self.journal(
+            "runtime",
+            "",
+            "content.recovered",
+            json!({ "reason": redact_secrets(reason) }),
+        );
         Ok(())
     }
 
-    fn journal(&self, session_id: &str, event: &str, extra: serde_json::Value) {
+    fn persist_session_snapshot(&self, session: &Session, extra: serde_json::Value) {
+        let path = self
+            .store
+            .root()
+            .join("sessions")
+            .join(&session.id)
+            .join("session.json");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = json!({
+            "session_id": session.id,
+            "run_id": session.run_id,
+            "state": format!("{:?}", session.state).to_lowercase(),
+            "profile": session.profile.as_str(),
+            "persistent_profile": session.persistent_profile,
+            "ephemeral": session.persistent_profile.is_none(),
+            "extra": extra,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&body) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    fn journal(&self, session_id: &str, request_id: &str, event: &str, extra: serde_json::Value) {
         let path = self
             .store
             .root()
@@ -1224,12 +2313,7 @@ impl Daemon {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let line = json!({
-            "event": event,
-            "session_id": session_id,
-            "run_id": self.run_id,
-            "extra": extra,
-        });
+        let line = journal_line(event, session_id, &self.run_id, request_id, extra);
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1238,6 +2322,34 @@ impl Daemon {
             use std::io::Write;
             let _ = writeln!(file, "{line}");
         }
+    }
+
+    fn remove_ephemeral_session_dir(&self, session_id: &str) {
+        remove_script_stage(&self.run_id, session_id, None);
+        let path = self.store.root().join("sessions").join(session_id);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn should_idle_exit(&self) -> bool {
+        self.ever_had_session
+            && self.sessions.is_empty()
+            && self.last_request.elapsed() >= self.idle_ttl
+    }
+
+    fn idle_exit(&mut self) {
+        eprintln!("web-runtime: phase idle-exit");
+        self.exiting = true;
+        self.sessions.clear();
+        self.profile_locks.clear();
+        self.controller.shutdown_or_kill();
+        self.content.shutdown_or_kill();
+        let _ = std::fs::remove_file(&self.socket);
+        self.journal(
+            "runtime",
+            "",
+            "runtime.idle_exit",
+            json!({ "idle_ttl_ms": self.idle_ttl.as_millis() as u64 }),
+        );
     }
 
     fn reap_idle_sessions(&mut self) {
@@ -1253,11 +2365,28 @@ impl Daemon {
             .collect();
         for session_id in stale {
             if let Some(mut session) = self.sessions.remove(&session_id) {
+                let ephemeral = session.persistent_profile.is_none();
+                let _ = self.profile_locks.remove(&session_id);
                 if let Some(page) = session.page_id.take() {
                     let _ = self.engine_call("page.close", json!({ "page": page }));
                 }
+                if ephemeral {
+                    self.remove_ephemeral_session_dir(&session_id);
+                }
             }
         }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.exiting {
+            return;
+        }
+        eprintln!("web-runtime: phase supervisor-drop");
+        self.exiting = true;
+        self.controller.shutdown_or_kill();
+        self.content.shutdown_or_kill();
     }
 }
 
@@ -1369,7 +2498,58 @@ fn limit_error(request: &Request, message: impl Into<String>) -> Response {
 
 const MODEL_TEXT_CHARS: usize = 4096;
 
-fn model_facing_source(mut source: serde_json::Value) -> serde_json::Value {
+fn model_facing_observe_payload(
+    format: &str,
+    content_key: &str,
+    content: &str,
+    manifest: &crate::artifacts::ArtifactManifest,
+) -> Result<serde_json::Value, String> {
+    if manifest.is_restricted() {
+        let mut facing = manifest.model_facing_ref()?;
+        if let Some(object) = facing.as_object_mut() {
+            object.insert("format".into(), json!(format));
+            object.insert(
+                "untrusted_content_boundary".into(),
+                json!("UNTRUSTED_PAGE_CONTENT"),
+            );
+        }
+        return Ok(facing);
+    }
+    Ok(json!({
+        "format": format,
+        content_key: content,
+        "digest": manifest.digest.hex,
+        "path": manifest.object_path,
+        "label": manifest.producing_operation,
+        "redaction_status": manifest.redaction_status,
+        "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+    }))
+}
+
+fn model_facing_source(
+    mut source: serde_json::Value,
+    manifest: &crate::artifacts::ArtifactManifest,
+) -> Result<serde_json::Value, String> {
+    let restricted = manifest.is_restricted();
+    if restricted {
+        let facing = manifest.model_facing_ref()?;
+        if let Some(object) = source.as_object_mut() {
+            object.remove("text");
+            object.remove("html");
+            object.remove("bytes");
+            object.remove("full_text");
+            object.remove("png_base64");
+            object.insert("digest".into(), facing["digest"].clone());
+            object.insert("path".into(), facing["path"].clone());
+            object.insert("label".into(), facing["label"].clone());
+            object.insert(
+                "redaction_status".into(),
+                facing["redaction_status"].clone(),
+            );
+            object.insert("text_truncated".into(), json!(false));
+        }
+        return Ok(source);
+    }
     if let Some(text) = source
         .get("text")
         .and_then(|value| value.as_str())
@@ -1377,18 +2557,52 @@ fn model_facing_source(mut source: serde_json::Value) -> serde_json::Value {
     {
         let truncated = text.chars().count() > MODEL_TEXT_CHARS;
         let snippet: String = text.chars().take(MODEL_TEXT_CHARS).collect();
+        if truncated {
+            let digest_ok = source
+                .get("digest")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .is_some()
+                || !manifest.digest.hex.is_empty();
+            if !digest_ok {
+                return Err("artifact digest missing".to_owned());
+            }
+        }
         if let Some(object) = source.as_object_mut() {
             object.insert("text".into(), json!(snippet));
             object.insert("text_truncated".into(), json!(truncated));
             if truncated {
                 object.insert("full_text".into(), json!("artifact"));
             }
+            object.insert("digest".into(), json!(manifest.digest.hex));
+            object.insert("path".into(), json!(manifest.object_path));
+            object.insert("label".into(), json!(manifest.producing_operation));
+            object.insert(
+                "redaction_status".into(),
+                json!(manifest.redaction_status),
+            );
         }
     }
-    source
+    Ok(source)
 }
 
-fn redact_secrets(input: &str) -> String {
+fn journal_line(
+    event: &str,
+    session_id: &str,
+    run_id: &str,
+    request_id: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "event": event,
+        "session_id": session_id,
+        "run_id": run_id,
+        "request_id": request_id,
+        "extra": extra,
+    })
+}
+
+pub(crate) fn redact_secrets(input: &str) -> String {
     let mut out = input.to_owned();
     if let Some(scheme) = out.find("://") {
         let rest_at = scheme + 3;
@@ -1400,7 +2614,17 @@ fn redact_secrets(input: &str) -> String {
             }
         }
     }
-    for key in ["password", "token", "secret", "authorization"] {
+    for key in [
+        "password",
+        "token",
+        "secret",
+        "authorization",
+        "cookie",
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "id_token",
+    ] {
         let needle = format!("{key}=");
         let mut search_from = 0;
         let lower = out.to_ascii_lowercase();
@@ -1414,7 +2638,124 @@ fn redact_secrets(input: &str) -> String {
             search_from = start + 4;
         }
     }
+    redact_labeled_secrets(&mut out);
     out
+}
+
+fn redact_labeled_secrets(out: &mut String) {
+    let labels = [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+        "bearer ",
+    ];
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let mut hit: Option<(usize, usize)> = None;
+        for label in labels {
+            let mut search_from = 0;
+            while let Some(rel) = lower[search_from..].find(label) {
+                let start = search_from + rel + label.len();
+                let start = start
+                    + out[start..]
+                        .chars()
+                        .take_while(|ch| ch.is_whitespace())
+                        .map(char::len_utf8)
+                        .sum::<usize>();
+                let rest_of_line = label.contains("cookie") || label.contains("authorization");
+                let end = out[start..]
+                    .find(|ch: char| {
+                        if rest_of_line {
+                            matches!(ch, '\n' | '\r' | '"')
+                        } else {
+                            matches!(ch, ' ' | '"' | '\'' | '\n' | '\r' | '&' | ',')
+                        }
+                    })
+                    .map(|idx| start + idx)
+                    .unwrap_or(out.len());
+                if end > start && out[start..end] != *"****" {
+                    hit = Some((start, end));
+                    break;
+                }
+                search_from = start.max(search_from + label.len());
+            }
+            if hit.is_some() {
+                break;
+            }
+        }
+        match hit {
+            Some((start, end)) => out.replace_range(start..end, "****"),
+            None => break,
+        }
+    }
+}
+
+fn sensitive_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-csrf-token"
+    )
+}
+
+fn sensitive_object_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "password"
+            | "token"
+            | "secret"
+            | "authorization"
+            | "cookie"
+            | "cookies"
+            | "credential"
+            | "api_key"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+    )
+}
+
+pub(crate) fn redact_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => json!(redact_secrets(&text)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_json).collect())
+        }
+        serde_json::Value::Object(mut map) => {
+            if let (Some(serde_json::Value::String(name)), Some(serde_json::Value::String(value))) =
+                (map.get("name").cloned(), map.get("value").cloned())
+            {
+                let redacted = if sensitive_header_name(&name) {
+                    "****".to_owned()
+                } else {
+                    redact_secrets(&value)
+                };
+                map.insert("value".into(), json!(redacted));
+            }
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                if key == "value" && map.get("name").and_then(|item| item.as_str()).is_some() {
+                    continue;
+                }
+                if let Some(child) = map.remove(&key) {
+                    let redacted = if sensitive_object_key(&key) {
+                        json!("****")
+                    } else {
+                        redact_json(child)
+                    };
+                    map.insert(key, redacted);
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other,
+    }
 }
 
 fn redirect_chain(
@@ -1557,10 +2898,74 @@ struct SessionEngineGate<'a> {
     session_id: String,
     content_pid: u32,
     controller_pid: u32,
+    operation_id: String,
+    control: Arc<RunControl>,
 }
 
 impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.control
+            .cancel_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|pair| pair.0 == self.session_id && pair.1 == self.operation_id)
+    }
+
+    fn poll_control(&mut self) {
+        let mut beats = self
+            .control
+            .heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for session_id in beats.drain(..) {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.last_heartbeat = Instant::now();
+            }
+        }
+        drop(beats);
+        self.control
+            .publish_sessions(snapshot_session_rows(self.sessions, &self.control));
+    }
+
+    fn note_inflight_engine(&mut self, request_id: u64, method: &str) {
+        if let Some(session) = self.sessions.get_mut(&self.session_id) {
+            session.inflight_engine_request_id = Some(request_id);
+            session.inflight_engine_method = Some(method.to_owned());
+        }
+        self.control
+            .publish_sessions(snapshot_session_rows(self.sessions, &self.control));
+    }
+
+    fn note_discarded_engine_result(&mut self, request_id: u64, ok: bool, error: Option<String>) {
+        *self
+            .control
+            .late_engine_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(LateEngineResult {
+            session_id: self.session_id.clone(),
+            target_request_id: self.operation_id.clone(),
+            engine_request_id: request_id,
+            ok,
+            error,
+        });
+        if let Some(session) = self.sessions.get_mut(&self.session_id) {
+            session.inflight_engine_request_id = None;
+            session.inflight_engine_method = None;
+        }
+    }
+
+    fn inflight_engine_id(&self) -> Option<u64> {
+        self.sessions
+            .get(&self.session_id)
+            .and_then(|session| session.inflight_engine_request_id)
+    }
+
     fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String> {
+        self.poll_control();
+        if self.is_cancelled() {
+            return Err("cancelled".into());
+        }
         gate_session_engine(
             self.sessions,
             &self.session_id,
@@ -1658,6 +3063,105 @@ pub fn socket_exists(path: &Path) -> bool {
 }
 
 #[cfg(test)]
+mod script_stage_tests {
+    use super::{
+        copy_granted_modules, isolated_id, path_is_within_root, refuse_unbounded_script_root,
+        remove_script_stage, script_stage_dir, stage_script_for_controller,
+    };
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
+    fn unique_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join("greppy-stage-unit")
+            .join("bounded")
+            .join(format!("r{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn isolated_id_rejects_path_escape() {
+        assert!(isolated_id("wrs_abc").is_ok());
+        assert!(isolated_id("../etc").is_err());
+        assert!(isolated_id("a/b").is_err());
+        assert!(isolated_id("").is_err());
+    }
+
+    #[test]
+    fn refuse_unbounded_script_root_rejects_system_and_home() {
+        assert!(refuse_unbounded_script_root(Path::new("/")).is_err());
+        if Path::new("/etc").exists() {
+            assert!(refuse_unbounded_script_root(Path::new("/etc")).is_err());
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if Path::new(&home).exists() {
+                assert!(refuse_unbounded_script_root(Path::new(&home)).is_err());
+            }
+        }
+        let root = unique_root("refuse");
+        assert!(
+            refuse_unbounded_script_root(&root).is_ok(),
+            "{}",
+            root.display()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_uses_isolated_temp_and_skips_symlink_escape() {
+        let root = unique_root("stage");
+        fs::write(root.join("entry.mjs"), "export const n = 1;\n").unwrap();
+        fs::write(root.join("helper.mjs"), "export const n = 2;\n").unwrap();
+        let secret = root.join("secret.mjs");
+        let _ = fs::remove_file(&secret);
+        symlink("/etc/passwd", &secret).unwrap();
+
+        let staged = stage_script_for_controller(
+            root.join("entry.mjs").to_str().unwrap(),
+            "run_stage",
+            "wrs_stage1",
+            "wrq_stage1",
+        )
+        .expect("stage");
+        let staged = PathBuf::from(staged);
+        let expected = script_stage_dir("run_stage", "wrs_stage1", "wrq_stage1").unwrap();
+        assert!(
+            path_is_within_root(&expected, &staged.canonicalize().unwrap()),
+            "{}",
+            staged.display()
+        );
+        assert!(expected.join("helper.mjs").is_file());
+        assert!(
+            !expected.join("secret.mjs").exists(),
+            "symlink escape must not be staged"
+        );
+        remove_script_stage("run_stage", "wrs_stage1", Some("wrq_stage1"));
+        assert!(!expected.exists(), "per-request stage must be cleaned up");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_granted_modules_fails_closed_on_walk_escape() {
+        let root = unique_root("walk");
+        let outside = std::env::temp_dir()
+            .join("greppy-stage-unit")
+            .join("outside")
+            .join(format!("r{}", std::process::id()));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escape.mjs"), "export const n = 0;\n").unwrap();
+        let dest = unique_root("walk-dest");
+        let err = copy_granted_modules(&root, &outside, &dest, &mut 0, &mut 0).unwrap_err();
+        assert!(err.contains("escaped granted root"), "{err}");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+        let _ = fs::remove_dir_all(dest);
+    }
+}
+#[cfg(test)]
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
@@ -1718,15 +3222,178 @@ mod redirect_chain_tests {
     }
 
     #[test]
+    fn redact_secrets_masks_authorization_cookie_and_bearer() {
+        for sample in [
+            "Authorization: Bearer s3cret",
+            "Cookie: session=s3cret; theme=dark",
+            "Set-Cookie: id=s3cret; HttpOnly",
+            "proxy-authorization: Basic s3cret",
+            "token leaked as Bearer s3cret in log",
+            "https://example.test/?access_token=s3cret",
+        ] {
+            let masked = super::redact_secrets(sample);
+            assert!(!masked.contains("s3cret"), "{sample} -> {masked}");
+        }
+    }
+
+    #[test]
+    fn redact_json_masks_header_objects_and_credential_keys() {
+        let masked = super::redact_json(json!({
+            "requests": [{
+                "url": "https://alice:s3cret@example.test/",
+                "headers": [
+                    {"name": "Authorization", "value": "Bearer s3cret"},
+                    {"name": "Accept", "value": "text/html"}
+                ]
+            }],
+            "cookies": [{"value": "s3cret"}]
+        }));
+        let dumped = masked.to_string();
+        assert!(!dumped.contains("s3cret"), "{dumped}");
+        assert!(dumped.contains("Accept"), "{dumped}");
+        assert!(dumped.contains("text/html"), "{dumped}");
+    }
+
+    #[test]
+    fn journal_line_includes_request_id_for_correlation() {
+        let line = super::journal_line(
+            "session.ready",
+            "wrs_1",
+            "run_x",
+            "wrq_9",
+            json!({ "profile": "project" }),
+        );
+        assert_eq!(line["event"], "session.ready");
+        assert_eq!(line["session_id"], "wrs_1");
+        assert_eq!(line["run_id"], "run_x");
+        assert_eq!(line["request_id"], "wrq_9");
+        assert_eq!(line["extra"]["profile"], "project");
+    }
+
+    fn sample_manifest(sensitive: bool, digest_hex: &str) -> crate::artifacts::ArtifactManifest {
+        crate::artifacts::ArtifactManifest {
+            contract: "greppy.web-runtime.artifact-manifest.v1".to_owned(),
+            digest: crate::artifacts::DigestFields {
+                algorithm: "sha256".to_owned(),
+                hex: digest_hex.to_owned(),
+            },
+            byte_count: 12,
+            media_type: "text/plain".to_owned(),
+            producing_operation: "web.read".to_owned(),
+            session_id: "wrs_1".to_owned(),
+            run_id: "run".to_owned(),
+            timestamp: "0.000Z".to_owned(),
+            redaction_status: if sensitive {
+                "redacted_for_model".to_owned()
+            } else {
+                "not_redacted".to_owned()
+            },
+            sensitive,
+            credential_labeled: sensitive,
+            object_path: format!("objects/sha256/{digest_hex}"),
+        }
+    }
+
+    #[test]
     fn model_facing_source_truncates_long_text() {
         let long = "x".repeat(5000);
-        let compact = super::model_facing_source(json!({
-            "text": long,
-            "digest": "abc"
-        }));
+        let manifest = sample_manifest(false, "abc");
+        let compact = super::model_facing_source(
+            json!({
+                "text": long,
+                "digest": "abc"
+            }),
+            &manifest,
+        )
+        .unwrap();
         assert_eq!(compact["text_truncated"], true);
         assert_eq!(compact["text"].as_str().unwrap().chars().count(), 4096);
         assert_eq!(compact["full_text"], "artifact");
         assert_eq!(compact["digest"], "abc");
+        assert_eq!(compact["path"], "objects/sha256/abc");
+        assert_eq!(compact["label"], "web.read");
+        assert_eq!(compact["redaction_status"], "not_redacted");
+    }
+
+    #[test]
+    fn model_facing_source_omits_sensitive_bytes_from_payload() {
+        let secret = "SUPER_SECRET_TOKEN_value=hunter2";
+        let digest = crate::artifacts::hex_sha256(secret.as_bytes());
+        let manifest = sample_manifest(true, &digest);
+        let compact = super::model_facing_source(
+            json!({
+                "text": secret,
+                "html": format!("<p>{secret}</p>"),
+                "full_text": secret,
+                "bytes": secret,
+                "digest": digest,
+                "title": "ok",
+            }),
+            &manifest,
+        )
+        .unwrap();
+        let dumped = compact.to_string();
+        assert!(
+            !dumped.contains("SUPER_SECRET_TOKEN"),
+            "sensitive bytes leaked into model-facing payload: {dumped}"
+        );
+        assert!(
+            !dumped.contains("hunter2"),
+            "sensitive bytes leaked into model-facing payload: {dumped}"
+        );
+        assert!(compact.get("text").is_none(), "{compact:?}");
+        assert!(compact.get("html").is_none(), "{compact:?}");
+        assert!(compact.get("full_text").is_none(), "{compact:?}");
+        assert!(compact.get("bytes").is_none(), "{compact:?}");
+        assert_eq!(compact["digest"], digest);
+        assert_eq!(compact["path"], format!("objects/sha256/{digest}"));
+        assert_eq!(compact["label"], "web.read");
+        assert_eq!(compact["redaction_status"], "redacted_for_model");
+        assert_eq!(compact["title"], "ok");
+    }
+
+    #[test]
+    fn model_facing_observe_payload_omits_sensitive_html() {
+        let secret = "observe-secret-cookie=s3cret";
+        let digest = crate::artifacts::hex_sha256(secret.as_bytes());
+        let manifest = sample_manifest(true, &digest);
+        let payload =
+            super::model_facing_observe_payload("html", "html", secret, &manifest).unwrap();
+        let dumped = payload.to_string();
+        assert!(!dumped.contains("s3cret"), "{dumped}");
+        assert!(!dumped.contains("observe-secret-cookie"), "{dumped}");
+        assert!(payload.get("html").is_none(), "{payload:?}");
+        assert_eq!(payload["format"], "html");
+        assert_eq!(payload["digest"], digest);
+        assert_eq!(payload["path"], format!("objects/sha256/{digest}"));
+        assert_eq!(payload["label"], "web.read");
+        assert_eq!(payload["redaction_status"], "redacted_for_model");
+    }
+
+    #[test]
+    fn model_facing_source_fails_closed_without_digest_when_sensitive() {
+        let manifest = sample_manifest(true, "");
+        let err = super::model_facing_source(
+            json!({ "text": "secret", "digest": "" }),
+            &manifest,
+        )
+        .unwrap_err();
+        assert!(err.contains("digest"), "{err}");
+    }
+
+    #[test]
+    fn html_from_page_content_rejects_missing_html() {
+        assert_eq!(
+            super::Daemon::html_from_page_content(&json!({"html": "<p>ok</p>"})).unwrap(),
+            "<p>ok</p>"
+        );
+        assert_eq!(
+            super::Daemon::html_from_page_content(&json!({})).unwrap_err(),
+            "page.content missing html"
+        );
+        assert_eq!(
+            super::Daemon::html_from_page_content(&json!({"html": null})).unwrap_err(),
+            "page.content missing html"
+        );
     }
 }

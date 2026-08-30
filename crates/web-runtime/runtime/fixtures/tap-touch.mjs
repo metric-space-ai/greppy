@@ -41,4 +41,29 @@ await expectTouch("page.tap");
 const box = await page.locator("#t").boundingBox();
 await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
 await expectTouch("touchscreen.tap");
+
+await page.setContent(`<!DOCTYPE html><html><body>
+<iframe name="child" srcdoc="<button id='t' style='width:80px;height:40px'>Tap</button>"></iframe>
+</body></html>`);
+const child = await page.frame({ name: "child" });
+if (!child) throw new Error("missing child frame for tap");
+await child.waitForSelector("#t");
+await child.evaluate(() => {
+  window.__seq = [];
+  const el = document.getElementById("t");
+  el.addEventListener("touchstart", (event) => {
+    window.__seq.push("touchstart:" + ((event.touches && event.touches.length) || 0));
+  });
+  el.addEventListener("touchend", () => {
+    window.__seq.push("touchend");
+  });
+});
+await child.tap("#t");
+const childSeq = await child.evaluate(() => window.__seq.slice());
+if (!childSeq.some((item) => String(item).startsWith("touchstart"))) {
+  throw new Error("child Frame.tap produced no touchstart: " + JSON.stringify(childSeq));
+}
+if (!childSeq.includes("touchend")) {
+  throw new Error("child Frame.tap produced no touchend: " + JSON.stringify(childSeq));
+}
 await browser.close();

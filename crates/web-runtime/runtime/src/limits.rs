@@ -28,60 +28,51 @@ impl SessionLimits {
             limits.max_artifact_bytes = 4 * 1024 * 1024;
             limits.idle_ttl = Duration::from_secs(2 * 60);
         }
-        limits.apply_overrides(|name| std::env::var(name).ok());
         limits
     }
 
-    fn apply_overrides(&mut self, get: impl Fn(&str) -> Option<String>) {
-        if let Some(value) = get("GREPPY_WEB_IDLE_TTL_MS").and_then(|ms| ms.parse::<u64>().ok()) {
-            self.idle_ttl = Duration::from_millis(value.clamp(20, 3_600_000));
+    pub(crate) fn apply_payload(&mut self, payload: &serde_json::Value) {
+        let Some(object) = payload.as_object() else {
+            return;
+        };
+        if let Some(value) = object.get("max_pages").and_then(|v| v.as_u64()) {
+            self.max_pages = value as u32;
         }
-        if let Some(value) = get("GREPPY_WEB_MAX_PAGES").and_then(|pages| pages.parse::<u32>().ok())
-        {
-            self.max_pages = value;
+        if let Some(value) = object.get("max_contexts").and_then(|v| v.as_u64()) {
+            self.max_contexts = value as u32;
         }
-        if let Some(value) = get("GREPPY_WEB_MAX_CONTEXTS").and_then(|v| v.parse::<u32>().ok()) {
-            self.max_contexts = value;
-        }
-        if let Some(value) = get("GREPPY_WEB_MAX_REQUESTS").and_then(|v| v.parse::<u64>().ok()) {
+        if let Some(value) = object.get("max_requests").and_then(|v| v.as_u64()) {
             self.max_requests = value;
         }
-        if let Some(value) = get("GREPPY_WEB_MAX_CONSOLE_BYTES").and_then(|v| v.parse::<u64>().ok())
-        {
-            self.max_console_bytes = value;
-        }
-        if let Some(value) =
-            get("GREPPY_WEB_MAX_DOWNLOAD_BYTES").and_then(|v| v.parse::<u64>().ok())
-        {
-            self.max_download_bytes = value;
-        }
-        if let Some(value) = get("GREPPY_WEB_CONTENT_RSS_BYTES").and_then(|v| v.parse::<u64>().ok())
-        {
-            self.content_rss_bytes = value;
-        }
-        if let Some(value) =
-            get("GREPPY_WEB_CONTROLLER_MEMORY_BYTES").and_then(|v| v.parse::<u64>().ok())
-        {
-            self.controller_heap_bytes = value;
-        }
-        if let Some(value) = get("GREPPY_WEB_CONTENT_CPU_MS").and_then(|v| v.parse::<u64>().ok()) {
-            self.content_cpu_time = Duration::from_millis(value);
-        }
-        if let Some(value) = get("GREPPY_WEB_CONTROLLER_CPU_MS").and_then(|v| v.parse::<u64>().ok())
-        {
-            self.controller_cpu_time = Duration::from_millis(value);
-        }
-        if let Some(value) = get("GREPPY_WEB_MAX_NETWORK_BYTES").and_then(|v| v.parse::<u64>().ok())
-        {
+        if let Some(value) = object.get("max_network_bytes").and_then(|v| v.as_u64()) {
             self.max_network_bytes = value;
         }
-        if let Some(value) =
-            get("GREPPY_WEB_MAX_ARTIFACT_BYTES").and_then(|v| v.parse::<u64>().ok())
-        {
+        if let Some(value) = object.get("max_download_bytes").and_then(|v| v.as_u64()) {
+            self.max_download_bytes = value;
+        }
+        if let Some(value) = object.get("max_artifact_bytes").and_then(|v| v.as_u64()) {
             self.max_artifact_bytes = value;
         }
-        if let Some(value) = get("GREPPY_WEB_WALL_MS").and_then(|v| v.parse::<u64>().ok()) {
+        if let Some(value) = object.get("max_console_bytes").and_then(|v| v.as_u64()) {
+            self.max_console_bytes = value;
+        }
+        if let Some(value) = object.get("content_rss_bytes").and_then(|v| v.as_u64()) {
+            self.content_rss_bytes = value;
+        }
+        if let Some(value) = object.get("controller_heap_bytes").and_then(|v| v.as_u64()) {
+            self.controller_heap_bytes = value;
+        }
+        if let Some(value) = object.get("idle_ttl_ms").and_then(|v| v.as_u64()) {
+            self.idle_ttl = Duration::from_millis(value.clamp(20, 3_600_000));
+        }
+        if let Some(value) = object.get("wall_ms").and_then(|v| v.as_u64()) {
             self.wall_time = Duration::from_millis(value.clamp(20, 3_600_000));
+        }
+        if let Some(value) = object.get("content_cpu_ms").and_then(|v| v.as_u64()) {
+            self.content_cpu_time = Duration::from_millis(value);
+        }
+        if let Some(value) = object.get("controller_cpu_ms").and_then(|v| v.as_u64()) {
+            self.controller_cpu_time = Duration::from_millis(value);
         }
     }
 
@@ -298,37 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_clamp_idle_and_wall_and_ignore_garbage() {
-        let mut limits = SessionLimits::default();
-        let idle = limits.idle_ttl;
-        let pages = limits.max_pages;
-        limits.apply_overrides(|name| match name {
-            "GREPPY_WEB_IDLE_TTL_MS" => Some("5".into()),
-            "GREPPY_WEB_WALL_MS" => Some("9999999".into()),
-            "GREPPY_WEB_MAX_PAGES" => Some("not-a-number".into()),
-            _ => None,
-        });
-        assert_eq!(limits.idle_ttl, Duration::from_millis(20));
-        assert_eq!(limits.wall_time, Duration::from_millis(3_600_000));
-        assert_eq!(limits.max_pages, pages);
-        assert_eq!(idle, Duration::from_secs(5 * 60));
-    }
-
-    #[test]
-    fn env_overrides_research_profile_caps() {
-        let mut limits = SessionLimits {
-            max_pages: 8,
-            max_network_bytes: 8 * 1024 * 1024,
-            ..SessionLimits::default()
-        };
-        limits.apply_overrides(|name| match name {
-            "GREPPY_WEB_MAX_PAGES" => Some("2".into()),
-            "GREPPY_WEB_MAX_NETWORK_BYTES" => Some("100".into()),
-            _ => None,
-        });
-        assert_eq!(limits.max_pages, 2);
-        assert_eq!(limits.max_network_bytes, 100);
-        assert!(limits.check_pages(3).is_err());
-        assert!(limits.check_network_bytes(0, 101).is_err());
+    fn payload_limits_override_profile_without_env() {
+        let mut limits = SessionLimits::for_profile("project");
+        limits.apply_payload(&serde_json::json!({
+            "max_pages": 0,
+            "idle_ttl_ms": 50
+        }));
+        assert_eq!(limits.max_pages, 0);
+        assert_eq!(limits.idle_ttl, Duration::from_millis(50));
+        assert!(limits.check_pages(1).is_err());
     }
 }

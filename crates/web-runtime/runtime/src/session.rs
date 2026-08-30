@@ -33,6 +33,9 @@ pub struct Session {
     pub console_bytes: u64,
     pub peak_rss_bytes: u64,
     pub started: Instant,
+    pub inflight_engine_request_id: Option<u64>,
+    pub inflight_engine_method: Option<String>,
+    pub persistent_profile: Option<String>,
 }
 
 impl Session {
@@ -55,6 +58,9 @@ impl Session {
             console_bytes: 0,
             peak_rss_bytes: 0,
             started: Instant::now(),
+            inflight_engine_request_id: None,
+            inflight_engine_method: None,
+            persistent_profile: None,
         }
     }
 
@@ -80,6 +86,8 @@ impl Session {
         }
         if next != SessionState::Busy {
             self.operation_id = None;
+            self.inflight_engine_request_id = None;
+            self.inflight_engine_method = None;
         }
         self.state = next;
         self.last_heartbeat = Instant::now();

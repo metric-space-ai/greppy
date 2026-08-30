@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
-use greppy_web_client::{unix_request, Request, SCHEMA};
+use greppy_web_client::{unix_request as raw_unix_request, Request, SCHEMA};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -11,14 +11,56 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use web_runtime::worker::give_child_attach_token;
 
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
-const SOCKET_WAIT: Duration = Duration::from_secs(60);
+const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
+const SOCKET_WAIT: Duration = Duration::from_secs(30);
+const SOCKET_LIVE_WAIT: Duration = Duration::from_secs(60);
 const PROCESS_GROUP_WAIT: Duration = Duration::from_secs(15);
 
+fn attach_tokens() -> &'static Mutex<HashMap<PathBuf, String>> {
+    static TOKENS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_attach_token(socket: &Path, token: String) {
+    attach_tokens()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(socket.to_path_buf(), token);
+}
+
+fn unix_request(
+    socket: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<greppy_web_client::Response, greppy_web_client::UnixClientError> {
+    let mut request = request.clone();
+    if request.capability.is_empty() {
+        if let Some(token) = attach_tokens()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(socket)
+            .cloned()
+        {
+            request.capability = token;
+        }
+    }
+    raw_unix_request(socket, &request, timeout)
+}
 fn supervisor_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn harness_escalated() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+fn take_harness_escalation() -> bool {
+    harness_escalated().swap(false, Ordering::SeqCst)
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
@@ -43,7 +85,7 @@ fn wait_for_accepting(path: &Path, timeout: Duration, mut child: Option<&mut Chi
     }
     let pid = child.as_ref().map(|child| child.id());
     panic!(
-        "supervisor socket {} was not accepting connections within {timeout:?} (pid {pid:?})",
+        "supervisor socket {} was not accepting connections within {timeout:?} (pid {pid:?}); blocked before UnixListener::bind (Daemon::start controller/content spawn+handshake)",
         path.display()
     );
 }
@@ -103,6 +145,62 @@ fn wait_pids_gone(pids: &[u32], timeout: Duration) {
     }
 }
 
+fn reap_supervisor_tree(root: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut seen: HashSet<u32> = HashSet::new();
+    loop {
+        for pid in descendant_pids(root) {
+            seen.insert(pid);
+        }
+        for pid in seen.iter().copied() {
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{pid}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let descendants = descendant_pids(root);
+        for pid in &descendants {
+            seen.insert(*pid);
+        }
+        let leftover: Vec<u32> = seen.iter().copied().filter(|pid| pid_alive(*pid)).collect();
+        if leftover.is_empty() && descendants.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            for pid in &leftover {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{pid}")])
+                    .status();
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            thread::sleep(Duration::from_millis(50));
+            let leftover: Vec<u32> = seen
+                .iter()
+                .copied()
+                .filter(|pid| pid_alive(*pid))
+                .chain(descendant_pids(root))
+                .collect();
+            let mut leftover = leftover;
+            leftover.sort_unstable();
+            leftover.dedup();
+            leftover.retain(|pid| pid_alive(*pid));
+            if leftover.is_empty() {
+                return;
+            }
+            panic!("supervisor worker pids still alive: {leftover:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_process_group_gone(pgid: u32, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -140,18 +238,22 @@ impl Drop for Deadline {
 }
 
 fn arm_deadline(label: &'static str) -> Deadline {
+    arm_deadline_after(label, TEST_DEADLINE)
+}
+
+fn arm_deadline_after(label: &'static str, timeout: Duration) -> Deadline {
     let done = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&done);
     thread::spawn(move || {
         let start = Instant::now();
-        while start.elapsed() < TEST_DEADLINE {
+        while start.elapsed() < timeout {
             if flag.load(Ordering::Relaxed) {
                 return;
             }
             thread::sleep(Duration::from_millis(50));
         }
         if !flag.load(Ordering::Relaxed) {
-            eprintln!("session-daemon {label} exceeded {TEST_DEADLINE:?}");
+            eprintln!("session-daemon {label} exceeded {timeout:?}");
             std::process::abort();
         }
     });
@@ -161,6 +263,7 @@ fn arm_deadline(label: &'static str) -> Deadline {
 struct Supervisor {
     child: Child,
     socket: PathBuf,
+    run_id: String,
     _deadline: Deadline,
     kill_group: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -169,38 +272,40 @@ struct Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         let pid = self.child.id();
-        let mut tracked = descendant_pids(pid);
-        tracked.push(pid);
-        if self.kill_group {
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
-                .status();
-            for extra in &tracked {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &extra.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+        eprintln!("web-runtime: phase harness-drop pid={pid}");
+        if self.kill_group && self.socket.exists() {
+            let _ = unix_request(
+                &self.socket,
+                &Request::new(&self.run_id, "web.shutdown", json!({})),
+                Duration::from_secs(2),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut reaped = false;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if self.kill_group {
-            wait_pids_gone(&tracked, PROCESS_GROUP_WAIT);
-            wait_process_group_gone(pid, Duration::from_secs(2));
+        if !reaped {
+            harness_escalated().store(true, Ordering::SeqCst);
+            eprintln!("web-runtime: phase harness-drop ESCALATION pid={pid}");
+            let _ = self.child.kill();
+            let _ = self.child.try_wait();
         }
+        eprintln!("web-runtime: phase harness-drop done pid={pid} reaped={reaped}");
         let _ = std::fs::remove_file(&self.socket);
     }
 }
 
 impl Supervisor {
     fn spawn(socket: &Path, run_id: &str, extra: impl FnOnce(&mut Command)) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_web-runtime-supervisor"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_web-runtime"));
         command
-            .arg("--controller-worker")
-            .arg(env!("CARGO_BIN_EXE_web-controller-worker"))
-            .arg("--content-worker")
-            .arg(env!("CARGO_BIN_EXE_web-content-worker"))
             .arg("--socket")
             .arg(socket)
             .arg("--run-id")
@@ -210,11 +315,26 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
-        Self::finish_spawn(socket, command)
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE)
+    }
+
+    fn spawn_leak(socket: &Path, run_id: &str, extra: impl FnOnce(&mut Command)) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_web-runtime"));
+        command
+            .arg("--socket")
+            .arg(socket)
+            .arg("--run-id")
+            .arg(run_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        extra(&mut command);
+        Self::finish_spawn(socket, run_id, command, LEAK_TEST_DEADLINE)
     }
 
     fn spawn_from_dist(socket: &Path, run_id: &str, dist: &Path) -> Self {
-        let mut command = Command::new(dist.join("bin").join("web-runtime-supervisor"));
+        let mut command = Command::new(dist.join("bin").join("web-runtime"));
         command
             .arg("--dist")
             .arg(dist)
@@ -226,22 +346,42 @@ impl Supervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .process_group(0);
-        Self::finish_spawn(socket, command)
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE)
     }
 
-    fn finish_spawn(socket: &Path, mut command: Command) -> Self {
+    fn finish_spawn(
+        socket: &Path,
+        run_id: &str,
+        mut command: Command,
+        deadline: Duration,
+    ) -> Self {
         let lock = supervisor_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let mut bytes = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| {
+                use std::io::Read;
+                file.read_exact(&mut bytes)
+            })
+            .expect("urandom");
+        let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let _pass = give_child_attach_token(&mut command, &token).expect("inherit attach token fd");
+        register_attach_token(socket, token);
         let child = command.spawn().expect("spawn supervisor daemon");
         let mut supervisor = Self {
             child,
             socket: socket.to_path_buf(),
-            _deadline: arm_deadline("supervisor"),
+            run_id: run_id.to_owned(),
+            _deadline: arm_deadline_after("supervisor", deadline),
             kill_group: true,
             _lock: lock,
         };
-        wait_for_accepting(&supervisor.socket, SOCKET_WAIT, Some(&mut supervisor.child));
+        wait_for_accepting(
+            &supervisor.socket,
+            SOCKET_LIVE_WAIT,
+            Some(&mut supervisor.child),
+        );
         supervisor
     }
 
@@ -249,6 +389,20 @@ impl Supervisor {
         self.kill_group = false;
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    fn wait_exited(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) if Instant::now() >= deadline => {
+                    panic!("supervisor did not idle-exit within {timeout:?}");
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("wait supervisor: {error}"),
+            }
+        }
     }
 }
 
@@ -276,10 +430,90 @@ fn pid_alive(pid: u32) -> bool {
 
 fn worker_comm(pid: u32) -> String {
     let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .args(["-p", &pid.to_string(), "-o", "args="])
         .output()
         .expect("ps");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn content_worker_pid(parent: u32) -> Option<u32> {
+    child_pids(parent).into_iter().find(|pid| {
+        let args = worker_comm(*pid);
+        args.contains("--internal-role content")
+    })
+}
+
+fn rss_bytes(pid: u32) -> u64 {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "rss="])
+        .output()
+        .expect("ps rss");
+    let kb: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    kb.saturating_mul(1024)
+}
+
+fn tree_rss_bytes(pid: u32) -> u64 {
+    let mut pids = descendant_pids(pid);
+    pids.push(pid);
+    pids.into_iter().map(rss_bytes).sum()
+}
+
+fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
+    let self_pid = std::process::id();
+    let exe = env!("CARGO_BIN_EXE_web-runtime");
+    let mut found = Vec::new();
+    for pattern in [exe, "internal-role", "run_cliparent", "cliparent"] {
+        let output = Command::new("pgrep")
+            .args(["-lf", pattern])
+            .output()
+            .expect("pgrep leftovers");
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.contains("pgrep") {
+                continue;
+            }
+            let Some((pid_text, args)) = line.split_once(' ') else {
+                continue;
+            };
+            let Ok(pid) = pid_text.trim().parse::<u32>() else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            found.push((pid, args.trim().to_owned()));
+        }
+    }
+    found.sort_by_key(|(pid, _)| *pid);
+    found.dedup_by_key(|(pid, _)| *pid);
+    found
+}
+
+fn assert_no_leftover_web_runtime_processes() {
+    thread::sleep(Duration::from_millis(100));
+    let leftover = leftover_web_runtime_processes();
+    let escalated = take_harness_escalation();
+    assert!(
+        leftover.is_empty(),
+        "leftover web-runtime/internal-role/cliparent processes: {leftover:?}"
+    );
+    assert!(
+        !escalated,
+        "harness escalated to SIGKILL; graceful web.shutdown is the success path"
+    );
+}
+
+fn cpu_percent(pid: u32) -> f64 {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "%cpu="])
+        .output()
+        .expect("ps cpu");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(100.0)
 }
 
 fn serve_fixture(html: &'static str) -> String {
@@ -348,6 +582,62 @@ fn run_playwright_source(
             run_id,
             "web.session.create",
             json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(60),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut payload = json!({
+        "session_id": session_id,
+        "script_source": if script_file.is_some() { "file" } else { "inline" },
+        "script_text": source,
+    });
+    if let Some(path) = script_file {
+        payload["script_file"] = json!(path.display().to_string());
+    }
+    let mut run = Request::new(run_id, "web.run", payload);
+    run.deadline_ms = deadline.as_millis() as u64;
+    let ran = match unix_request(socket, &run, deadline + Duration::from_secs(5)) {
+        Ok(ran) => ran,
+        Err(error) => {
+            let _ = unix_request(
+                socket,
+                &Request::new(run_id, "web.shutdown", json!({})),
+                Duration::from_secs(5),
+            );
+            panic!("web.run: {error}");
+        }
+    };
+    let _ = unix_request(
+        socket,
+        &Request::new(
+            run_id,
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+    ran
+}
+
+fn run_playwright_source_with_limits(
+    socket: &Path,
+    run_id: &str,
+    source: &str,
+    script_file: Option<&Path>,
+    deadline: Duration,
+    limits: serde_json::Value,
+) -> greppy_web_client::Response {
+    let created = unix_request(
+        socket,
+        &Request::new(
+            run_id,
+            "web.session.create",
+            json!({ "profile": "project", "limits": limits }),
         ),
         Duration::from_secs(10),
     )
@@ -463,8 +753,10 @@ fn one_thousand_session_create_close_cycles() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-cycles-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_cycles", |_| {});
+    let guard = Supervisor::spawn(&socket, "run_cycles", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
+    let mut baseline_rss = 0_u64;
+    let mut live = HashSet::new();
 
     for i in 0..1000 {
         let created = unix_request(
@@ -485,6 +777,10 @@ fn one_thousand_session_create_close_cycles() {
             .and_then(|value| value.as_str())
             .expect("session_id")
             .to_owned();
+        assert!(
+            live.insert(session_id.clone()),
+            "duplicate session_id at create {i}: {session_id}"
+        );
         let closed = unix_request(
             &socket,
             &Request::new(
@@ -496,7 +792,22 @@ fn one_thousand_session_create_close_cycles() {
         )
         .unwrap_or_else(|error| panic!("close {i}: {error}"));
         assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
+        assert!(
+            live.remove(&session_id),
+            "close {i} removed unknown session {session_id}"
+        );
+        if i == 19 {
+            baseline_rss = tree_rss_bytes(guard.child.id());
+            assert!(
+                baseline_rss > 0,
+                "expected supervisor process-tree RSS after warmup"
+            );
+        }
     }
+    assert!(
+        live.is_empty(),
+        "create/close pairing left live sessions: {live:?}"
+    );
 
     let listed = unix_request(
         &socket,
@@ -516,6 +827,12 @@ fn one_thousand_session_create_close_cycles() {
         sessions.is_empty(),
         "sessions leaked after 1000 close cycles: {sessions:?}"
     );
+    let after = tree_rss_bytes(guard.child.id());
+    let growth = after.saturating_sub(baseline_rss);
+    assert!(
+        growth <= 128 * 1024 * 1024,
+        "process-tree RSS grew {growth} bytes over 1000 session cycles (baseline {baseline_rss}, after {after})"
+    );
 }
 
 #[test]
@@ -526,7 +843,8 @@ fn observe_read_search_research_screenshot_and_policy() {
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_research", |command| {
         command
-            .env("GREPPY_WEB_SEARCH_ENDPOINT", format!("{origin}/search"))
+            .arg("--search-endpoint")
+            .arg(format!("{origin}/search"))
             .env(
                 "GREPPY_STORE_DIR",
                 std::env::temp_dir().join(format!("greppy-store-{}", std::process::id())),
@@ -742,6 +1060,10 @@ fn workers_do_not_inherit_secret_environment() {
             !environ.contains(CANARY),
             "worker {pid} inherited secret key: {environ}"
         );
+        assert!(
+            !environ.contains("DYLD_LIBRARY_PATH=") && !environ.contains("LD_LIBRARY_PATH="),
+            "worker {pid} inherited dylib search path: {environ}"
+        );
     }
     std::env::remove_var(CANARY);
 }
@@ -786,25 +1108,41 @@ fn content_worker_exits_after_supervisor_is_killed() {
 fn content_worker_crash_is_recovered_without_hanging() {
     let socket = std::env::temp_dir().join(format!("greppy-web-crash-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let supervisor = Supervisor::spawn(&socket, "run_crash", |_| {});
+    let store = std::env::temp_dir().join(format!("greppy-store-crash-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&store);
+    let supervisor = Supervisor::spawn(&socket, "run_crash", |command| {
+        command.env("GREPPY_STORE_DIR", &store);
+    });
     wait_for_socket(&socket, Duration::from_secs(30));
     let parent = supervisor.child.id();
-    let created = unix_request(
-        &socket,
-        &Request::new(
-            "run_crash",
-            "web.session.create",
-            json!({ "profile": "project" }),
-        ),
-        Duration::from_secs(10),
-    )
-    .expect("create");
+    let create_req = Request::new(
+        "run_crash",
+        "web.session.create",
+        json!({ "profile": "project" }),
+    );
+    let created = unix_request(&socket, &create_req, Duration::from_secs(10)).expect("create");
     assert_eq!(created.status, "ok", "{created:?}");
+    let crashed_session_early = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let journal_path = store
+        .join("web-runtime")
+        .join("run_crash")
+        .join("sessions")
+        .join(crashed_session_early)
+        .join("journal.jsonl");
+    let journal = std::fs::read_to_string(&journal_path).unwrap_or_default();
+    assert!(
+        journal.contains(&create_req.request_id),
+        "journal must correlate request_id {}: {journal}",
+        create_req.request_id
+    );
+    assert!(
+        journal.contains("session.ready"),
+        "journal missing session.ready: {journal}"
+    );
 
-    let content = child_pids(parent)
-        .into_iter()
-        .find(|pid| worker_comm(*pid).contains("web-content"))
-        .expect("content worker pid");
+    let content = content_worker_pid(parent).expect("content worker pid");
     assert!(Command::new("kill")
         .args(["-KILL", &content.to_string()])
         .status()
@@ -854,6 +1192,25 @@ fn content_worker_crash_is_recovered_without_hanging() {
         }),
         "expected typed content crash receipt: {status:?}"
     );
+    let crashed_session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let snapshot = store
+        .join("web-runtime")
+        .join("run_crash")
+        .join("sessions")
+        .join(crashed_session)
+        .join("session.json");
+    assert!(
+        snapshot.exists(),
+        "crash recovery must write {}",
+        snapshot.display()
+    );
+    let snapshot_body = std::fs::read_to_string(&snapshot).unwrap();
+    assert!(
+        snapshot_body.contains("failed") || snapshot_body.contains("ready"),
+        "session.json {snapshot_body}"
+    );
 
     let created_again = unix_request(
         &socket,
@@ -866,6 +1223,188 @@ fn content_worker_crash_is_recovered_without_hanging() {
     )
     .expect("create after recover");
     assert_eq!(created_again.status, "ok", "{created_again:?}");
+}
+
+#[test]
+fn greppy_cli_parent_survives_content_worker_kill() {
+    let greppy = std::env::var_os("GREPPY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("target/debug/greppy"));
+    assert!(
+        greppy.is_file(),
+        "missing {}; build with CI=true cargo build -p greppy --features ci-test-assets",
+        greppy.display()
+    );
+    let runtime = PathBuf::from(env!("CARGO_BIN_EXE_web-runtime"));
+    let run_id = format!("run_cliparent_{}", std::process::id());
+    let _shutdown = CliparentShutdown {
+        run_id: run_id.clone(),
+    };
+    let store = std::env::temp_dir().join(format!("greppy-store-cliparent-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&store);
+    let create = Command::new(&greppy)
+        .args(["web", "session", "create", "--profile", "project", "--json"])
+        .env("GREPPY_WEB_RUNTIME", &runtime)
+        .env("GREPPY_RUN_ID", &run_id)
+        .env("GREPPY_STORE_DIR", &store)
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .output()
+        .expect("greppy web session create");
+    let stdout = String::from_utf8_lossy(&create.stdout);
+    assert!(
+        create.status.success() || stdout.contains("session_id"),
+        "create failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let session_id = stdout
+        .split("\"session_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("session_id in create stdout")
+        .to_owned();
+    let mut child = Command::new(&greppy)
+        .args([
+            "web",
+            "run",
+            "--session",
+            &session_id,
+            "--script-stdin",
+            "--json",
+            "--timeout",
+            "20",
+        ])
+        .env("GREPPY_WEB_RUNTIME", &runtime)
+        .env("GREPPY_RUN_ID", &run_id)
+        .env("GREPPY_STORE_DIR", &store)
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("greppy web run");
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(
+                b"import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.waitForTimeout(15_000);\nawait browser.close();\n",
+            )
+            .unwrap();
+    }
+    drop(child.stdin.take());
+    let deadline_pid = Instant::now() + Duration::from_secs(12);
+    let (parent, socket) = loop {
+        if let Some(found) = web_runtime_supervisor_for_run(&run_id) {
+            break found;
+        }
+        if Instant::now() >= deadline_pid {
+            let _ = child.kill();
+            panic!("detached web-runtime supervisor not found for {run_id}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    if let Some(content) = content_worker_pid(parent) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &content.to_string()])
+            .status();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                panic!("greppy parent did not exit after content kill");
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut stdout);
+    }
+    assert!(
+        status.code().is_some(),
+        "greppy parent must not die by signal, got {status}"
+    );
+    let code = status.code().unwrap();
+    assert_ne!(code, 0, "run should fail after content kill");
+    assert!(
+        matches!(code, 31 | 33 | 35 | 38)
+            || stdout.contains("engine_error")
+            || stdout.contains("runtime_unavailable")
+            || stdout.contains("controller_exception")
+            || stdout.contains("timeout"),
+        "expected typed web error after content kill, got {code} stdout={stdout}"
+    );
+    let stopped = unix_request(
+        &socket,
+        &Request::new(&run_id, "web.shutdown", json!({})),
+        Duration::from_secs(10),
+    )
+    .expect("web.shutdown");
+    assert_eq!(
+        stopped.status, "ok",
+        "supervisor must stop via web.shutdown, not SIGKILL: {stopped:?}"
+    );
+    let gone = Instant::now() + Duration::from_secs(10);
+    while pid_alive(parent) && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !pid_alive(parent),
+        "supervisor pid {parent} still alive after web.shutdown"
+    );
+    assert!(
+        web_runtime_supervisor_for_run(&run_id).is_none(),
+        "detached web-runtime for {run_id} leaked after shutdown"
+    );
+}
+
+struct CliparentShutdown {
+    run_id: String,
+}
+
+impl Drop for CliparentShutdown {
+    fn drop(&mut self) {
+        let Some((pid, socket)) = web_runtime_supervisor_for_run(&self.run_id) else {
+            return;
+        };
+        let _ = unix_request(
+            &socket,
+            &Request::new(&self.run_id, "web.shutdown", json!({})),
+            Duration::from_secs(5),
+        );
+        let gone = Instant::now() + Duration::from_secs(10);
+        while pid_alive(pid) && Instant::now() < gone {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn web_runtime_supervisor_for_run(run_id: &str) -> Option<(u32, PathBuf)> {
+    let output = Command::new("ps")
+        .args(["-ax", "-o", "pid=,args="])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            if line.contains("web-runtime") && line.contains(run_id) && line.contains("--socket") {
+                let pid = line.split_whitespace().next()?.parse().ok()?;
+                let socket = line
+                    .split_whitespace()
+                    .skip_while(|part| *part != "--socket")
+                    .nth(1)
+                    .map(PathBuf::from)?;
+                Some((pid, socket))
+            } else {
+                None
+            }
+        })
 }
 
 #[test]
@@ -1043,8 +1582,14 @@ fn one_thousand_session_create_run_close_cycles() {
     let _ = std::fs::remove_file(&socket);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/launch-only.mjs");
     let source = std::fs::read_to_string(&script).unwrap();
-    let _guard = Supervisor::spawn(&socket, "run_1000", |_| {});
+    let _ = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _guard = Supervisor::spawn_leak(&socket, "run_1000", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
+    let started = Instant::now();
     for i in 0..1000 {
         let created = unix_request(
             &socket,
@@ -1072,7 +1617,7 @@ fn one_thousand_session_create_run_close_cycles() {
             }),
         );
         run.deadline_ms = 10_000;
-        let ran = unix_request(&socket, &run, Duration::from_secs(10))
+        let ran = unix_request(&socket, &run, Duration::from_secs(15))
             .unwrap_or_else(|error| panic!("run {i}: {error}"));
         assert_eq!(ran.status, "ok", "run {i}: {ran:?}");
         let closed = unix_request(
@@ -1086,11 +1631,14 @@ fn one_thousand_session_create_run_close_cycles() {
         )
         .unwrap_or_else(|error| panic!("close {i}: {error}"));
         assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
+        if i % 50 == 0 {
+            eprintln!("web-runtime: leak-cycle {i}/1000 elapsed_ms={}", started.elapsed().as_millis());
+        }
     }
 }
 
 #[test]
-fn local_package_contains_three_images() {
+fn local_package_contains_exactly_one_runtime_executable() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("scripts")
@@ -1102,15 +1650,30 @@ fn local_package_contains_three_images() {
         .status()
         .expect("package script");
     assert!(status.success(), "packager failed: {status}");
-    for name in [
+    let bin = dest.join("bin");
+    assert!(
+        bin.join("web-runtime").exists(),
+        "missing web-runtime in {}",
+        dest.display()
+    );
+    let bin_names: Vec<_> = std::fs::read_dir(&bin)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        bin_names,
+        [std::ffi::OsString::from("web-runtime")],
+        "dist bin must contain exactly one runtime executable, found {bin_names:?}"
+    );
+    for forbidden in [
         "web-runtime-supervisor",
         "web-controller-worker",
         "web-content-worker",
+        "phase1-probe",
     ] {
         assert!(
-            dest.join("bin").join(name).exists(),
-            "missing {name} in {}",
-            dest.display()
+            !bin.join(forbidden).exists(),
+            "dist must not contain {forbidden}"
         );
     }
     assert!(dest.join("SHA256SUMS").exists());
@@ -1123,36 +1686,41 @@ fn local_package_contains_three_images() {
         stamp.contains("greppy.web-runtime.package.v1"),
         "stamp {stamp}"
     );
-    assert!(!dest.join("bin").join("phase1-probe").exists());
-    let mut hashes = Vec::new();
-    for name in [
-        "web-runtime-supervisor",
-        "web-controller-worker",
-        "web-content-worker",
-    ] {
-        let bytes = std::fs::read(dest.join("bin").join(name)).expect(name);
-        hashes.push(web_runtime::artifacts::hex_sha256(&bytes));
-    }
-    assert_eq!(hashes.len(), 3);
-    assert_ne!(
-        hashes[0], hashes[1],
-        "supervisor and controller must be distinct images"
-    );
-    assert_ne!(
-        hashes[0], hashes[2],
-        "supervisor and content must be distinct images"
-    );
-    assert_ne!(
-        hashes[1], hashes[2],
-        "controller and content must be distinct images"
-    );
-    let sums = std::fs::read_to_string(dest.join("SHA256SUMS")).expect("SHA256SUMS");
-    for digest in &hashes {
-        assert!(sums.contains(digest), "SHA256SUMS missing {digest}");
-    }
+    let bytes = std::fs::read(bin.join("web-runtime")).expect("web-runtime");
+    assert_sha256sums_complete(&dest);
     let sbom: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dest.join("sbom.json")).unwrap()).unwrap();
-    assert_eq!(sbom["components"].as_array().unwrap().len(), 3);
+    assert_eq!(sbom["components"].as_array().unwrap().len(), 1);
+    let provenance: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dest.join("provenance.json")).unwrap())
+            .unwrap();
+    assert_eq!(provenance["images"].as_array().unwrap().len(), 1);
+    assert!(dest.join("coverage-manifest.json").exists());
+    let coverage: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dest.join("coverage-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        coverage["entries"].as_array().map(Vec::len),
+        Some(1354),
+        "coverage-manifest.json must contain the frozen public-surface inventory"
+    );
+    let size_receipt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dest.join("size-receipt.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        size_receipt["installed_bytes"].as_u64().unwrap(),
+        bytes.len() as u64
+    );
+    assert_eq!(size_receipt["chromium_playwright_delta"], "unclaimed");
+    let bench: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dest.join("benchmark-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        bench["metrics"]["installed_bytes"].as_u64().unwrap(),
+        bytes.len() as u64
+    );
     let sign = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("scripts")
@@ -1187,6 +1755,39 @@ fn local_package_contains_three_images() {
     assert!(status.success(), "uninstall failed: {status}");
     assert!(!dest.exists(), "uninstall left {dest:?}");
     let _ = std::fs::remove_dir_all(&signed);
+}
+
+#[test]
+fn package_owned_dist_is_idempotent() {
+    let pid = std::process::id();
+    let dest = std::env::temp_dir().join(format!("greppy-web-dist-idem-{pid}"));
+    let _ = std::fs::remove_dir_all(&dest);
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_eq!(code, 0, "first package: stdout={stdout} stderr={stderr}");
+    assert_sha256sums_complete(&dest);
+    let first = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
+    let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
+    assert_eq!(code, 0, "second package: stdout={stdout} stderr={stderr}");
+    assert_sha256sums_complete(&dest);
+    let second = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
+    assert_eq!(
+        first, second,
+        "repackage mutated the one runtime executable"
+    );
+    let bin_names: Vec<_> = std::fs::read_dir(dest.join("bin"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        bin_names,
+        [std::ffi::OsString::from("web-runtime")],
+        "repackage must keep exactly one runtime executable"
+    );
+    let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&dest));
+    assert_eq!(
+        code, 0,
+        "uninstall idempotent dist: stdout={stdout} stderr={stderr}"
+    );
 }
 
 fn package_script() -> PathBuf {
@@ -1224,19 +1825,77 @@ fn rollback_script() -> PathBuf {
         .join("rollback-web-runtime.sh")
 }
 
-fn runtime_bin_names() -> [&'static str; 3] {
-    [
-        "web-runtime-supervisor",
-        "web-controller-worker",
-        "web-content-worker",
+fn runtime_bin_names() -> [&'static str; 1] {
+    ["web-runtime"]
+}
+
+fn hashed_dist_members() -> &'static [&'static str] {
+    &[
+        "bin/web-runtime",
+        "README.txt",
+        "UNSIGNED",
+        "sbom.json",
+        "provenance.json",
+        "LICENSE",
+        "coverage-manifest.json",
+        "benchmark-receipt.json",
+        "size-receipt.json",
     ]
 }
 
-fn rewrite_sha256sums(dist: &Path) {
-    let bins = runtime_bin_names().join(" ");
+fn assert_sha256sums_complete(dist: &Path) {
+    let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("SHA256SUMS");
+    let listed: Vec<&str> = sums
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split_whitespace().last().expect("SHA256SUMS path"))
+        .collect();
+    assert!(
+        listed.contains(&"bin/web-runtime"),
+        "SHA256SUMS missing bin/web-runtime: {sums}"
+    );
+    let present: Vec<&str> = hashed_dist_members()
+        .iter()
+        .copied()
+        .filter(|member| dist.join(member).is_file())
+        .collect();
+    assert_eq!(
+        listed.len(),
+        present.len(),
+        "SHA256SUMS member count mismatch listed={listed:?} present={present:?} sums={sums}"
+    );
+    for member in present {
+        assert!(
+            listed.contains(&member),
+            "SHA256SUMS missing {member}: {sums}"
+        );
+    }
     let status = Command::new("sh")
         .arg("-c")
-        .arg(format!("cd bin && shasum -a 256 {bins} > ../SHA256SUMS"))
+        .arg("shasum -a 256 -c SHA256SUMS")
+        .current_dir(dist)
+        .status()
+        .expect("shasum -c SHA256SUMS");
+    assert!(
+        status.success(),
+        "SHA256SUMS verification failed for {}",
+        dist.display()
+    );
+}
+
+fn rewrite_sha256sums(dist: &Path) {
+    let files: Vec<&str> = hashed_dist_members()
+        .iter()
+        .copied()
+        .filter(|member| dist.join(member).is_file())
+        .collect();
+    assert!(
+        files.contains(&"bin/web-runtime"),
+        "cannot rewrite SHA256SUMS without bin/web-runtime"
+    );
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("shasum -a 256 {} > SHA256SUMS", files.join(" ")))
         .current_dir(dist)
         .status()
         .expect("rewrite SHA256SUMS");
@@ -1397,50 +2056,73 @@ fn install_upgrade_rollback_roundtrip() {
     assert!(packaged.join("LICENSE").exists(), "package LICENSE");
     let (code, stdout, stderr) = run_script_args(&install_script(), &[&packaged, &installed]);
     assert_eq!(code, 0, "install: stdout={stdout} stderr={stderr}");
-    for name in [
-        "web-runtime-supervisor",
-        "web-controller-worker",
-        "web-content-worker",
+    assert!(
+        installed.join("bin").join("web-runtime").exists(),
+        "install missing web-runtime"
+    );
+    for receipt in [
+        "coverage-manifest.json",
+        "size-receipt.json",
+        "benchmark-receipt.json",
+        "LICENSE",
     ] {
         assert!(
-            installed.join("bin").join(name).exists(),
-            "install missing {name}"
+            installed.join(receipt).exists(),
+            "install missing {receipt}"
         );
     }
-    let original = std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
+    assert_sha256sums_complete(&installed);
+    let installed_bins: Vec<_> = std::fs::read_dir(installed.join("bin"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        installed_bins,
+        [std::ffi::OsString::from("web-runtime")],
+        "installed dist must contain exactly one runtime executable"
+    );
+    let original = std::fs::read(installed.join("bin").join("web-runtime")).unwrap();
     let marker = b"greppy-web-runtime-upgrade-marker";
     let mut upgraded_bytes = original.clone();
     upgraded_bytes.extend_from_slice(marker);
-    std::fs::write(
-        packaged.join("bin").join("web-runtime-supervisor"),
-        &upgraded_bytes,
-    )
-    .unwrap();
+    std::fs::write(packaged.join("bin").join("web-runtime"), &upgraded_bytes).unwrap();
     rewrite_sha256sums(&packaged);
     let (code, stdout, stderr) = run_script_args(&upgrade_script(), &[&packaged, &installed]);
     assert_eq!(code, 0, "upgrade: stdout={stdout} stderr={stderr}");
-    let after_upgrade =
-        std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after_upgrade = std::fs::read(installed.join("bin").join("web-runtime")).unwrap();
     assert_eq!(after_upgrade, upgraded_bytes, "upgrade did not copy source");
-    let previous =
-        std::fs::read(installed.join("previous").join("web-runtime-supervisor")).unwrap();
+    let previous = std::fs::read(installed.join("previous").join("web-runtime")).unwrap();
     assert_eq!(
         previous, original,
         "upgrade did not snapshot previous image"
     );
     let (code, stdout, stderr) = run_script(&rollback_script(), Some(&installed));
     assert_eq!(code, 0, "rollback: stdout={stdout} stderr={stderr}");
-    let after_rollback =
-        std::fs::read(installed.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after_rollback = std::fs::read(installed.join("bin").join("web-runtime")).unwrap();
     assert_eq!(
         after_rollback, original,
         "rollback did not restore previous"
     );
-    let sums = std::fs::read_to_string(installed.join("SHA256SUMS")).unwrap();
-    let restored_digest = web_runtime::artifacts::hex_sha256(&after_rollback);
-    assert!(
-        sums.contains(&restored_digest),
-        "rollback SHA256SUMS must match restored supervisor, sums={sums}"
+    assert_sha256sums_complete(&installed);
+    for receipt in [
+        "coverage-manifest.json",
+        "size-receipt.json",
+        "benchmark-receipt.json",
+        "LICENSE",
+    ] {
+        assert!(
+            installed.join(receipt).exists(),
+            "rollback dropped {receipt}"
+        );
+    }
+    let size_receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(installed.join("size-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        size_receipt["installed_bytes"].as_u64().unwrap(),
+        after_rollback.len() as u64,
+        "rollback size-receipt must match restored image"
     );
     let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&installed));
     assert_eq!(
@@ -1520,14 +2202,14 @@ fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
     let previous = dest.join("previous");
     std::os::unix::fs::symlink(&canary, &previous).unwrap();
     assert!(previous.is_symlink(), "previous must be a parent symlink");
-    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let original = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     let (code, stdout, stderr) = run_script_args(&upgrade_script(), &[&src, &dest]);
     assert_ne!(
         code, 0,
         "upgrade through previous symlink: stdout={stdout} stderr={stderr}"
     );
     assert_canary_bins(&canary);
-    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     assert_eq!(
         after, original,
         "upgrade mutated dest through previous symlink"
@@ -1554,14 +2236,13 @@ fn packaging_refuses_later_member_symlink_without_partial_erase() {
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
     assert_eq!(code, 0, "seed package: stdout={stdout} stderr={stderr}");
     std::fs::create_dir_all(&canary).unwrap();
-    let canary_file = canary.join("content-canary");
-    std::fs::write(&canary_file, "keep-content").unwrap();
-    let content = dest.join("bin").join("web-content-worker");
-    std::fs::remove_file(&content).unwrap();
-    std::os::unix::fs::symlink(&canary_file, &content).unwrap();
+    let canary_file = canary.join("runtime-canary");
+    std::fs::write(&canary_file, "keep-runtime").unwrap();
+    let runtime = dest.join("bin").join("web-runtime");
+    std::fs::remove_file(&runtime).unwrap();
+    std::os::unix::fs::symlink(&canary_file, &runtime).unwrap();
     let stamp = dest.join(".greppy-web-runtime-dist");
-    let supervisor = dest.join("bin").join("web-runtime-supervisor");
-    assert!(stamp.exists() && supervisor.exists());
+    assert!(stamp.exists() && runtime.is_symlink());
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
     assert_ne!(
         code, 0,
@@ -1572,12 +2253,12 @@ fn packaging_refuses_later_member_symlink_without_partial_erase() {
         "package deleted stamp before refusing later member"
     );
     assert!(
-        supervisor.exists(),
+        runtime.is_symlink(),
         "package deleted earlier bin before refusing later member"
     );
     assert_eq!(
         std::fs::read_to_string(&canary_file).unwrap(),
-        "keep-content"
+        "keep-runtime"
     );
     let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&dest));
     assert_ne!(
@@ -1588,12 +2269,12 @@ fn packaging_refuses_later_member_symlink_without_partial_erase() {
         stamp.exists(),
         "uninstall deleted stamp before refusing later member"
     );
-    assert!(supervisor.exists(), "uninstall deleted earlier bin");
+    assert!(runtime.is_symlink(), "uninstall deleted earlier bin");
     assert_eq!(
         std::fs::read_to_string(&canary_file).unwrap(),
-        "keep-content"
+        "keep-runtime"
     );
-    std::fs::remove_file(&content).unwrap();
+    std::fs::remove_file(&runtime).unwrap();
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
 }
@@ -1609,14 +2290,14 @@ fn install_does_not_mutate_dest_when_source_is_incomplete() {
     assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
     let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
     assert_eq!(code, 0, "first install: stdout={stdout} stderr={stderr}");
-    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
-    std::fs::remove_file(src.join("bin").join("web-content-worker")).unwrap();
+    let original = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
+    std::fs::remove_file(src.join("bin").join("web-runtime")).unwrap();
     let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
     assert_ne!(
         code, 0,
         "install incomplete source: stdout={stdout} stderr={stderr}"
     );
-    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     assert_eq!(after, original, "incomplete install mutated dest");
     for name in runtime_bin_names() {
         assert!(
@@ -2637,8 +3318,513 @@ fn keyboard_down_and_up_are_separate_events() {
 }
 
 #[test]
+fn evaluate_serializes_special_values_not_json_null() {
+    run_named_fixture("evaluate-arg.mjs", "run_evalarg");
+}
+
+#[test]
+fn closed_page_and_browser_throw_object_disposed() {
+    run_named_fixture("object-disposed.mjs", "run_objdisp");
+}
+
+#[test]
 fn frames_content_frame_and_describe() {
     run_named_fixture("frames.mjs", "run_frames2");
+}
+
+#[test]
+fn wait_for_event_load_after_completed_load_waits_for_future_event() {
+    let started = Instant::now();
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-wfe-load-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_wfeload", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+page.setDefaultTimeout(2_000);
+await page.setContent("<!DOCTYPE html><html><body><p>loaded</p></body></html>");
+const t0 = Date.now();
+let resolved = false;
+try {
+  await page.waitForEvent("load");
+  resolved = true;
+} catch (error) {
+  if (!String(error && error.message).includes("timeout")) throw error;
+}
+if (resolved) throw new Error("waitForEvent load resolved from a prior load");
+const elapsed = Date.now() - t0;
+if (elapsed < 1500) throw new Error("waitForEvent load returned too quickly " + elapsed);
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_wfeload",
+        source,
+        None,
+        Duration::from_secs(20),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_wfeload", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes();
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(40),
+        "waitForEvent load after completed load hung for {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn wait_for_event_frameattached_times_out_instead_of_hanging() {
+    let started = Instant::now();
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-wfe-hang-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_wfehang", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+page.setDefaultTimeout(2_000);
+await page.setContent("<!DOCTYPE html><html><body><p>no-iframe</p></body></html>");
+await page.waitForEvent("frameattached");
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_wfehang",
+        source,
+        None,
+        Duration::from_secs(15),
+    );
+    let elapsed = started.elapsed();
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_wfehang", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes();
+    assert!(
+        elapsed < Duration::from_secs(40),
+        "waitForEvent frameattached hung for {elapsed:?}"
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    let dumped = format!("{ran:?}");
+    assert!(
+        dumped.contains("timeout") || dumped.contains("TimeoutError"),
+        "expected bounded TimeoutError, got {dumped}"
+    );
+}
+
+#[test]
+fn graceful_shutdown_reaps_workers_without_harness_escalation() {
+    let started = Instant::now();
+    let socket = std::env::temp_dir().join(format!("greppy-web-raii-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_raii", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let stopped = unix_request(
+        &socket,
+        &Request::new("run_raii", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("web.shutdown");
+    assert_eq!(stopped.status, "ok", "{stopped:?}");
+    drop(guard);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "graceful shutdown hung for {elapsed:?}"
+    );
+    assert_no_leftover_web_runtime_processes();
+}
+
+#[test]
+fn attach_capability_rejects_missing_wrong_and_endpoint_only() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-cap-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_cap", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    assert!(
+        std::fs::read_to_string(socket.with_extension("capability")).is_err(),
+        "attach token must not be stored next to the socket"
+    );
+    let mut missing = Request::new("run_cap", "web.status", json!({}));
+    missing.capability = String::new();
+    let denied = raw_unix_request(&socket, &missing, Duration::from_secs(5)).expect("missing cap");
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert_eq!(
+        denied.error.as_ref().map(|e| e.code.as_str()),
+        Some("session_not_owned"),
+        "{denied:?}"
+    );
+    let mut wrong = Request::new("run_cap", "web.status", json!({}));
+    wrong.capability = "0".repeat(32);
+    let denied = raw_unix_request(&socket, &wrong, Duration::from_secs(5)).expect("wrong cap");
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert_eq!(
+        denied.error.as_ref().map(|e| e.code.as_str()),
+        Some("session_not_owned"),
+        "{denied:?}"
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes();
+}
+
+#[test]
+fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-cancel-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let store =
+        std::env::temp_dir().join(format!("greppy-web-cancel-store-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&store);
+    let store_for_spawn = store.clone();
+    let guard = Supervisor::spawn(&socket, "run_cancel", move |command| {
+        command.env("GREPPY_STORE_DIR", store_for_spawn);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create other");
+    let other_id = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let socket_for_run = socket.clone();
+    let session_for_run = session_id.clone();
+    let published = Arc::new(Mutex::new(None::<String>));
+    let published_for_run = Arc::clone(&published);
+    let run_thread = thread::spawn(move || {
+        let mut run = Request::new(
+            "run_cancel",
+            "web.run",
+            json!({
+                "session_id": session_for_run,
+                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.evaluate(() => new Promise(() => {}));\nawait browser.close();\n"
+            }),
+        );
+        run.deadline_ms = 30_000;
+        *published_for_run.lock().unwrap() = Some(run.request_id.clone());
+        unix_request(&socket_for_run, &run, Duration::from_secs(40))
+    });
+    let target = loop {
+        if let Some(id) = published.lock().unwrap().clone() {
+            break id;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut inflight_id = None;
+    let mut content_pid_before = 0_u64;
+    let mut content_generation_before = 0_u64;
+    let mut controller_pid_before = 0_u64;
+    let mut controller_generation_before = 0_u64;
+    let barrier = Instant::now() + Duration::from_secs(20);
+    loop {
+        let listed = unix_request(
+            &socket,
+            &Request::new("run_cancel", "web.session.list", json!({})),
+            Duration::from_secs(5),
+        )
+        .expect("poll inflight");
+        let rows = listed.result.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["session_id"] == session_id)
+            .expect("session");
+        if row["state"] == "busy"
+            && row["inflight_engine_method"] == "page.evaluate"
+            && row["inflight_engine_request_id"].as_u64().is_some()
+        {
+            inflight_id = row["inflight_engine_request_id"].as_u64();
+            content_pid_before = row["content_pid"].as_u64().unwrap_or(0);
+            content_generation_before = row["content_generation"].as_u64().unwrap_or(0);
+            controller_pid_before = row["controller_pid"].as_u64().unwrap_or(0);
+            controller_generation_before = row["controller_generation"].as_u64().unwrap_or(0);
+            break;
+        }
+        if Instant::now() >= barrier {
+            panic!("page.evaluate engine call was not published: {row:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let inflight_id = inflight_id.expect("inflight engine id");
+    let wrong_session = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.cancel",
+            json!({
+                "session_id": other_id,
+                "target_request_id": target
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("wrong-session cancel");
+    assert_eq!(wrong_session.status, "ok", "{wrong_session:?}");
+    assert_eq!(
+        wrong_session
+            .result
+            .as_ref()
+            .and_then(|value| value.get("cancelled")),
+        Some(&json!(false)),
+        "{wrong_session:?}"
+    );
+    let wrong_id = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.cancel",
+            json!({
+                "session_id": session_id,
+                "target_request_id": "wrq_not_the_run"
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("wrong-id cancel");
+    assert_eq!(wrong_id.status, "ok", "{wrong_id:?}");
+    assert_eq!(
+        wrong_id
+            .result
+            .as_ref()
+            .and_then(|value| value.get("cancelled")),
+        Some(&json!(false)),
+        "{wrong_id:?}"
+    );
+    let beat = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.heartbeat",
+            json!({ "seq": 1, "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("heartbeat");
+    assert_eq!(beat.status, "ok", "{beat:?}");
+    let heartbeat_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let listed = unix_request(
+            &socket,
+            &Request::new("run_cancel", "web.session.list", json!({})),
+            Duration::from_secs(5),
+        )
+        .expect("list after heartbeat");
+        let rows = listed.result.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap();
+        let busy = rows
+            .iter()
+            .find(|row| row["session_id"] == session_id)
+            .expect("busy session");
+        assert_eq!(busy["state"], "busy", "{busy:?}");
+        let age = busy["heartbeat_age_ms"].as_u64().unwrap();
+        if age < 500 {
+            break;
+        }
+        if Instant::now() >= heartbeat_deadline {
+            panic!("heartbeat did not refresh busy session, age_ms={age}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let cancelled = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.cancel",
+            json!({
+                "session_id": session_id,
+                "target_request_id": target
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("target cancel");
+    assert_eq!(cancelled.status, "ok", "{cancelled:?}");
+    assert_eq!(
+        cancelled
+            .result
+            .as_ref()
+            .and_then(|value| value.get("cancelled")),
+        Some(&json!(true)),
+        "{cancelled:?}"
+    );
+    let ran = run_thread.join().expect("join").expect("web.run");
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(
+        ran.error.as_ref().map(|e| e.code.as_str()),
+        Some("cancelled"),
+        "{ran:?}"
+    );
+    assert_eq!(ran.error.as_ref().map(|e| e.exit_code), Some(35), "{ran:?}");
+    let again = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.cancel",
+            json!({
+                "session_id": session_id,
+                "target_request_id": target
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("second cancel");
+    assert_eq!(again.status, "ok", "{again:?}");
+    assert_eq!(
+        again
+            .result
+            .as_ref()
+            .and_then(|value| value.get("cancelled")),
+        Some(&json!(false)),
+        "{again:?}"
+    );
+    let journal = store
+        .join("web-runtime")
+        .join("run_cancel")
+        .join("sessions")
+        .join(&session_id)
+        .join("journal.jsonl");
+    let journal_text = std::fs::read_to_string(&journal).unwrap_or_default();
+    assert!(
+        journal_text.contains("worker.respawn"),
+        "cancel must journal worker.respawn, text={journal_text}"
+    );
+    assert!(
+        journal_text.contains("\"worker\":\"content\"")
+            || journal_text.contains("\"worker\": \"content\""),
+        "respawn evidence must name the content worker, text={journal_text}"
+    );
+    assert!(
+        journal_text.contains("\"worker\":\"controller\"")
+            || journal_text.contains("\"worker\": \"controller\""),
+        "respawn evidence must name the controller isolate, text={journal_text}"
+    );
+    assert!(
+        journal_text.contains("pid_before") && journal_text.contains("pid_after"),
+        "respawn evidence must include old/new pid, text={journal_text}"
+    );
+    assert!(
+        journal_text.contains("run.cancelled"),
+        "cancel must journal run.cancelled, text={journal_text}"
+    );
+    let late = journal_text.contains("late.engine_result");
+    if late {
+        assert!(
+            journal_text.contains("\"kind\":\"EngineResult\"")
+                || journal_text.contains("\"kind\": \"EngineResult\""),
+            "late journal must be a typed EngineResult, text={journal_text}"
+        );
+        assert!(
+            journal_text.contains(&format!("\"engine_request_id\":{inflight_id}"))
+                || journal_text.contains(&format!("\"engine_request_id\": {inflight_id}")),
+            "journal must correlate engine_request_id {inflight_id}, text={journal_text}"
+        );
+    } else {
+        assert!(
+            !late,
+            "killed engine {inflight_id} must not fabricate late.engine_result, text={journal_text}"
+        );
+    }
+    assert!(
+        !journal_text.contains("EngineCall {"),
+        "must not journal Debug protocol dumps, text={journal_text}"
+    );
+    let listed = unix_request(
+        &socket,
+        &Request::new("run_cancel", "web.session.list", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("list after cancel");
+    let rows = listed.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .unwrap();
+    let content_pid_after = rows[0]["content_pid"].as_u64().unwrap_or(0);
+    let content_generation_after = rows[0]["content_generation"].as_u64().unwrap_or(0);
+    let controller_pid_after = rows[0]["controller_pid"].as_u64().unwrap_or(0);
+    let controller_generation_after = rows[0]["controller_generation"].as_u64().unwrap_or(0);
+    assert_ne!(
+        content_pid_after, content_pid_before,
+        "content worker must be respawned, before={content_pid_before} after={content_pid_after}"
+    );
+    assert!(
+        content_generation_after > content_generation_before,
+        "content generation must increase, before={content_generation_before} after={content_generation_after}"
+    );
+    assert_ne!(
+        controller_pid_after, controller_pid_before,
+        "controller isolate must be respawned, before={controller_pid_before} after={controller_pid_after}"
+    );
+    assert!(
+        controller_generation_after > controller_generation_before,
+        "controller generation must increase, before={controller_generation_before} after={controller_generation_after}"
+    );
+    let follow = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.run",
+            json!({
+                "session_id": other_id,
+                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto(\"about:blank\");\nawait page.evaluate(() => document.readyState);\nawait browser.close();\n"
+            }),
+        ),
+        Duration::from_secs(40),
+    )
+    .expect("follow-up web.run");
+    assert_eq!(
+        follow.status, "ok",
+        "worker must remain usable after cancel: {follow:?}"
+    );
+    assert_eq!(
+        follow
+            .result
+            .as_ref()
+            .and_then(|value| value.get("completed")),
+        Some(&json!(true)),
+        "{follow:?}"
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes();
+}
+
+#[test]
+fn worker_sandbox_denies_host_secret_paths() {
+    run_named_fixture("sandbox-deny-secrets.mjs", "run_sbox");
 }
 
 #[test]
@@ -2649,6 +3835,252 @@ fn fail_closed_clock_coverage_request_and_handles() {
 #[test]
 fn locator_strict_mode_rejects_ambiguous_click() {
     run_named_fixture("strict-mode.mjs", "run_strict");
+}
+
+#[test]
+fn persistent_profile_lock_is_exclusive_until_owner_closes() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-plock-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_plock", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let first = unix_request(
+        &socket,
+        &Request::new(
+            "run_plock",
+            "web.session.create",
+            json!({ "profile": "project", "persistent_profile": "alice" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("first create");
+    assert_eq!(first.status, "ok", "{first:?}");
+    let first_id = first.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = unix_request(
+        &socket,
+        &Request::new(
+            "run_plock",
+            "web.session.create",
+            json!({ "profile": "project", "persistent_profile": "alice" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("second create");
+    assert_eq!(second.status, "error", "{second:?}");
+    assert_eq!(
+        second.error.as_ref().map(|error| error.code.as_str()),
+        Some("profile_in_use"),
+        "{second:?}"
+    );
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            "run_plock",
+            "web.session.close",
+            json!({ "session_id": first_id }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("close owner");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    let third = unix_request(
+        &socket,
+        &Request::new(
+            "run_plock",
+            "web.session.create",
+            json!({ "profile": "project", "persistent_profile": "alice" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("reacquire");
+    assert_eq!(third.status, "ok", "{third:?}");
+}
+
+#[test]
+fn screenshot_payload_output_does_not_write_outside_artifact_store() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-shotout-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let forbidden = std::env::temp_dir().join(format!(
+        "greppy-web-daemon-must-not-write-{}.png",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&forbidden);
+    let store =
+        std::env::temp_dir().join(format!("greppy-web-shotout-store-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&store);
+    let store_for_spawn = store.clone();
+    let _guard = Supervisor::spawn(&socket, "run_shotout", move |command| {
+        command.env("GREPPY_STORE_DIR", store_for_spawn);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_shotout",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>shot-output</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_shotout",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(20),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    let shot = unix_request(
+        &socket,
+        &Request::new(
+            "run_shotout",
+            "web.screenshot",
+            json!({
+                "session_id": session_id,
+                "output": forbidden.display().to_string()
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("screenshot");
+    assert_eq!(shot.status, "ok", "{shot:?}");
+    assert!(
+        shot.result.as_ref().unwrap()["digest"]
+            .as_str()
+            .unwrap()
+            .len()
+            == 64,
+        "{shot:?}"
+    );
+    assert!(
+        shot.result.as_ref().unwrap()["object_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("objects/sha256/"),
+        "{shot:?}"
+    );
+    assert!(
+        !forbidden.exists(),
+        "daemon must not write payload.output {}",
+        forbidden.display()
+    );
+    let object_path = shot.result.as_ref().unwrap()["object_path"]
+        .as_str()
+        .unwrap();
+    let stored = store
+        .join("web-runtime")
+        .join("run_shotout")
+        .join(object_path);
+    assert!(
+        stored.is_file(),
+        "artifact must land in the store: {}",
+        stored.display()
+    );
+}
+
+#[test]
+fn observe_html_engine_error_is_typed_not_empty_success() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-obshtml-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_obshtml", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_obshtml",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<html><body><p>observe-html</p></body></html>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_obshtml",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(20),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    let html_ok = unix_request(
+        &socket,
+        &Request::new(
+            "run_obshtml",
+            "web.observe",
+            json!({ "session_id": session_id, "format": "html" }),
+        ),
+        Duration::from_secs(20),
+    )
+    .expect("observe html ok");
+    assert_eq!(html_ok.status, "ok", "{html_ok:?}");
+    let html = html_ok.result.as_ref().unwrap()["html"]
+        .as_str()
+        .unwrap_or("");
+    assert!(html.contains("observe-html"), "{html_ok:?}");
+    let throwing = serve_fixture(
+        r#"<!DOCTYPE html><html><head><script>
+Object.defineProperty(document.documentElement, "outerHTML", {
+  configurable: true,
+  get: function () { throw new Error("outerHTML boom"); }
+});
+</script></head><body><p>observe-html-throw</p></body></html>"#,
+    );
+    let loaded = unix_request(
+        &socket,
+        &Request::new(
+            "run_obshtml",
+            "web.read",
+            json!({ "session_id": session_id, "url": throwing }),
+        ),
+        Duration::from_secs(20),
+    )
+    .expect("read throwing page");
+    assert_eq!(loaded.status, "ok", "{loaded:?}");
+    let html_err = unix_request(
+        &socket,
+        &Request::new(
+            "run_obshtml",
+            "web.observe",
+            json!({ "session_id": session_id, "format": "html" }),
+        ),
+        Duration::from_secs(20),
+    )
+    .expect("observe html after outerHTML throw");
+    assert_eq!(html_err.status, "error", "{html_err:?}");
+    assert_eq!(
+        html_err.error.as_ref().map(|error| error.code.as_str()),
+        Some("engine_error"),
+        "{html_err:?}"
+    );
+    assert!(
+        html_err
+            .result
+            .as_ref()
+            .and_then(|value| value.get("html"))
+            .is_none(),
+        "page.content EngineCall error must not be empty-success html: {html_err:?}"
+    );
 }
 
 #[test]
@@ -2669,6 +4101,31 @@ fn selectors_set_test_id_attribute_and_timeout_error() {
 #[test]
 fn controller_module_policy_denies_host_filesystem() {
     run_named_fixture("controller-module-policy.mjs", "run_modpol");
+}
+
+#[test]
+fn relative_esm_inside_script_root_is_granted() {
+    run_named_fixture("relative-mod.mjs", "run_relmod");
+}
+
+#[test]
+fn cjs_require_playwright_is_granted_and_fs_is_denied() {
+    run_named_fixture("cjs-playwright.cjs", "run_cjspw");
+}
+
+#[test]
+fn relative_import_outside_script_root_is_denied() {
+    run_named_fixture("relative-mod-escape.mjs", "run_relesc");
+}
+
+#[test]
+fn json_module_inside_script_root_is_granted() {
+    run_named_fixture("json-mod.mjs", "run_jsonmod");
+}
+
+#[test]
+fn json_module_outside_script_root_is_denied() {
+    run_named_fixture("json-mod-escape.mjs", "run_jsonesc");
 }
 
 #[test]
@@ -2703,15 +4160,19 @@ fn web_run_deadline_is_enforced_externally() {
     run.deadline_ms = 1500;
     let ran = unix_request(&socket, &run, Duration::from_secs(10)).expect("run");
     assert_eq!(ran.status, "error", "{ran:?}");
-    let message = ran
-        .error
-        .as_ref()
-        .map(|e| e.message.clone())
-        .unwrap_or_default();
+    assert_eq!(
+        ran.error.as_ref().map(|e| e.code.as_str()),
+        Some("timeout"),
+        "expected timeout code, got {ran:?}"
+    );
+    assert_eq!(
+        ran.error.as_ref().map(|e| e.exit_code),
+        Some(35),
+        "timeout must be exit 35, got {ran:?}"
+    );
     assert!(
-        message.contains("timed out")
-            || ran.error.as_ref().map(|e| e.code.as_str()) == Some("timeout"),
-        "expected deadline timeout, got {ran:?}"
+        !ran.artifacts.is_empty(),
+        "timeout must attach a partial artifact, got {ran:?}"
     );
 }
 
@@ -2746,16 +4207,14 @@ fn idle_supervisor_workers_are_not_cpu_hot() {
 fn max_pages_limit_is_enforced_by_supervisor() {
     let socket = std::env::temp_dir().join(format!("greppy-web-maxpg-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_maxpg", |command| {
-        command.env("GREPPY_WEB_MAX_PAGES", "0");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_maxpg", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_maxpg",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "max_pages": 0 } }),
         ),
         Duration::from_secs(10),
     )
@@ -2780,20 +4239,165 @@ fn max_pages_limit_is_enforced_by_supervisor() {
 }
 
 #[test]
+fn session_create_typed_limits_are_enforced_without_env() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-tylim-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_tylim", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_tylim",
+            "web.session.create",
+            json!({ "profile": "project", "limits": { "max_pages": 0 } }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p>typed-limit</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_tylim",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
+    assert_eq!(read.status, "error", "{read:?}");
+    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+}
+
+#[test]
+fn ephemeral_session_dir_is_deleted_on_clean_close() {
+    let pid = std::process::id();
+    let run_id = format!("run_ephemclose-{pid}");
+    let socket = std::env::temp_dir().join(format!("greppy-web-ephemclose-{pid}.sock"));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, &run_id, |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            &run_id,
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session_dir = std::env::temp_dir()
+        .join("greppy-web-runtime")
+        .join("web-runtime")
+        .join(&run_id)
+        .join("sessions")
+        .join(&session_id);
+    assert!(
+        session_dir.join("session.json").is_file(),
+        "expected session snapshot at {}",
+        session_dir.display()
+    );
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            &run_id,
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("close");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    assert!(
+        !session_dir.exists(),
+        "ephemeral session dir survived clean close: {}",
+        session_dir.display()
+    );
+}
+
+#[test]
+fn persistent_session_dir_is_retained_on_clean_close() {
+    let pid = std::process::id();
+    let run_id = format!("run_persistclose-{pid}");
+    let profile = format!("keepme{pid}");
+    let socket = std::env::temp_dir().join(format!("greppy-web-persistclose-{pid}.sock"));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, &run_id, |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            &run_id,
+            "web.session.create",
+            json!({ "profile": "project", "persistent_profile": profile }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session_dir = std::env::temp_dir()
+        .join("greppy-web-runtime")
+        .join("web-runtime")
+        .join(&run_id)
+        .join("sessions")
+        .join(&session_id);
+    let snapshot = session_dir.join("session.json");
+    assert!(
+        snapshot.is_file(),
+        "expected persistent session snapshot at {}",
+        snapshot.display()
+    );
+    let body = std::fs::read_to_string(&snapshot).unwrap();
+    assert!(
+        body.contains("\"ephemeral\": false") && body.contains(&profile),
+        "snapshot must record non-ephemeral persistent_profile, got {body}"
+    );
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            &run_id,
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("close");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    assert!(
+        snapshot.is_file(),
+        "persistent session dir must be retained after clean close: {}",
+        snapshot.display()
+    );
+}
+
+#[test]
 fn max_contexts_limit_is_enforced_by_supervisor() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-maxctx-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_maxctx", |command| {
-        command.env("GREPPY_WEB_MAX_CONTEXTS", "0");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_maxctx", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_maxctx",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "max_contexts": 0 } }),
         ),
         Duration::from_secs(10),
     )
@@ -2830,16 +4434,14 @@ fn max_requests_limit_is_enforced_on_read() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-maxreq-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_maxreq", |command| {
-        command.env("GREPPY_WEB_MAX_REQUESTS", "0");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_maxreq", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_maxreq",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "max_requests": 0 } }),
         ),
         Duration::from_secs(10),
     )
@@ -2876,7 +4478,7 @@ fn content_rss_limit_is_enforced_by_supervisor() {
     let socket = std::env::temp_dir().join(format!("greppy-web-rss-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_rss", |command| {
-        command.env("GREPPY_WEB_CONTENT_RSS_BYTES", "1");
+        let _ = command;
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
@@ -2884,7 +4486,7 @@ fn content_rss_limit_is_enforced_by_supervisor() {
         &Request::new(
             "run_rss",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "content_rss_bytes": 1 } }),
         ),
         Duration::from_secs(10),
     )
@@ -2961,36 +4563,83 @@ fn web_read_metrics_include_network_and_rss() {
 fn idle_sessions_are_reaped() {
     let socket = std::env::temp_dir().join(format!("greppy-web-reap-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_reap", |command| {
-        command.env("GREPPY_WEB_IDLE_TTL_MS", "80");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_reap", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_reap",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "idle_ttl_ms": 80 } }),
         ),
         Duration::from_secs(10),
     )
     .expect("create");
     assert_eq!(created.status, "ok");
-    thread::sleep(Duration::from_millis(250));
-    let listed = unix_request(
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    let sessions = loop {
+        let listed = unix_request(
+            &socket,
+            &Request::new("run_reap", "web.session.list", json!({})),
+            Duration::from_secs(5),
+        )
+        .expect("list");
+        let sessions = listed.result.as_ref().unwrap()["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if sessions.is_empty() {
+            break sessions;
+        }
+        if Instant::now() >= reap_deadline {
+            panic!("idle session should have been reaped: {sessions:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn supervisor_exits_after_typed_idle_ttl() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-idle-exit-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let mut guard = Supervisor::spawn(&socket, "run_idleex", |command| {
+        command.arg("--idle-ttl-ms").arg("80");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
         &socket,
-        &Request::new("run_reap", "web.session.list", json!({})),
+        &Request::new(
+            "run_idleex",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            "run_idleex",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
         Duration::from_secs(5),
     )
-    .expect("list");
-    let sessions = listed.result.as_ref().unwrap()["sessions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    .expect("close");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    let status = guard.wait_exited(Duration::from_secs(2));
     assert!(
-        sessions.is_empty(),
-        "idle session should have been reaped: {sessions:?}"
+        status.success(),
+        "supervisor idle-exit must be success, got {status}"
     );
+    assert_no_leftover_web_runtime_processes();
 }
 
 #[test]
@@ -3034,6 +4683,28 @@ fn policy_errors_redact_url_credentials() {
         "secret leaked in policy error: {dumped}"
     );
     assert_eq!(read.error.as_ref().unwrap().code, "policy_denied");
+}
+
+#[test]
+fn controller_exception_redacts_authorization_secrets() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-exredact-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_exredact", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_exredact",
+        "throw new Error(\"Authorization: Bearer s3cret\");\n",
+        None,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    let dumped = format!("{ran:?}");
+    assert!(
+        !dumped.contains("s3cret"),
+        "secret leaked in controller_exception: {dumped}"
+    );
 }
 
 #[test]
@@ -3122,10 +4793,11 @@ fn web_doctor_reports_process_health() {
     )
     .expect("doctor");
     assert_eq!(doctor.status, "ok", "{doctor:?}");
-    assert_eq!(
-        doctor.result.as_ref().unwrap()["process_health"]["healthy"],
-        true
-    );
+    let result = doctor.result.as_ref().unwrap();
+    assert_eq!(result["protocol_version"], SCHEMA);
+    assert_eq!(result["playwright_compatibility_version"], "1.62.1");
+    assert!(result.get("process_health").is_none(), "{result}");
+    assert!(result.get("controller_alive").is_none(), "{result}");
 }
 
 #[test]
@@ -3136,6 +4808,11 @@ fn locator_screenshot_is_clipped_png() {
 #[test]
 fn tap_dispatches_touch_events() {
     run_named_fixture("tap-touch.mjs", "run_tap");
+}
+
+#[test]
+fn set_viewport_size_is_unsupported() {
+    run_named_fixture("viewport.mjs", "run_vp");
 }
 
 #[test]
@@ -3166,39 +4843,237 @@ fn locator_filter_has_text_and_scroll() {
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
 
+fn read_http_request_head(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut data = Vec::new();
+    let mut buf = [0_u8; 512];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.windows(4).any(|window| window == b"\r\n\r\n") || data.len() > 16_384 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&data).into_owned()
+}
+
+struct TlsHeaderOrigin {
+    addr: std::net::SocketAddr,
+    child: Option<std::process::Child>,
+    _dir: tempfile_tls_dir::TempDir,
+}
+
+mod tempfile_tls_dir {
+    pub struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        pub fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greppy-web-hdr-tls-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("tls temp dir");
+            Self(path)
+        }
+        pub fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+impl Drop for TlsHeaderOrigin {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+    let dir = tempfile_tls_dir::TempDir::new();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let generated = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .args([
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+        ])
+        .output()
+        .expect("openssl");
+    assert!(
+        generated.status.success(),
+        "openssl cert: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extra-headers-origin.py");
+    assert!(
+        script.is_file(),
+        "missing TLS origin fixture {}",
+        script.display()
+    );
+    assert!(cert.is_file() && key.is_file(), "tls certs missing");
+    let mut child = std::process::Command::new("python3")
+        .arg("-u")
+        .arg(&script)
+        .arg(&cert)
+        .arg(&key)
+        .arg("127.0.0.1")
+        .arg("0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("python3 tls origin");
+    use std::io::BufRead;
+    use std::io::BufReader;
+    let stdout = child.stdout.take().expect("tls stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let ready = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(ready) => ready,
+        Err(_) => {
+            let status = child.try_wait();
+            panic!("tls origin did not become ready, python={status:?}");
+        }
+    };
+    assert!(ready.contains("ready"), "tls origin: {ready:?}");
+    let port: u16 = ready
+        .split_whitespace()
+        .nth(2)
+        .and_then(|p| p.parse().ok())
+        .expect("tls origin port");
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    TlsHeaderOrigin {
+        addr,
+        child: Some(child),
+        _dir: dir,
+    }
+}
+
+
+
 #[test]
 fn extra_http_headers_are_sent_on_goto() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::io::Write;
+    use std::net::{Shutdown, TcpListener};
+    // Fault the 400MB debug image into the page cache before the 60s
+    // accept wait. That wait is for worker handshake, not dyld/I-O of a
+    // freshly linked binary.
+    let _ = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind headers");
     let address = listener.local_addr().expect("addr");
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut buffer = [0_u8; 4096];
-            let n = stream.read(&mut buffer).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
-            let body = if req.contains("x-greppy-test: yes") {
+            let raw = read_http_request_head(&mut stream);
+            let first = raw.lines().next().unwrap_or("").to_owned();
+            let req = raw.to_ascii_lowercase();
+            let path = first.split_whitespace().nth(1).unwrap_or("/");
+            let tagged = req.contains("x-greppy-test: yes");
+            let has_ctx = req.contains("x-greppy-ctx: yes");
+            if path.starts_with("/jump") {
+                let loc = format!("http://{address}/landed");
+                let header = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.shutdown(Shutdown::Write);
+                continue;
+            }
+            if path.starts_with("/sub.js") {
+                let body = if tagged {
+                    "window.__greppySub='ok';"
+                } else {
+                    "window.__greppySub='missing';"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.shutdown(Shutdown::Write);
+                continue;
+            }
+            let marker = if tagged {
                 "HEADER_OK"
             } else {
                 "HEADER_MISSING"
             };
+            let ctx = if has_ctx {
+                "<span id=ctx>CTX_OK</span>"
+            } else {
+                ""
+            };
+            let body = format!(
+                "<!DOCTYPE html><html><body>{marker}{ctx}<script src=\"/sub.js\"></script></body></html>"
+            );
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(body.as_bytes());
+            let _ = stream.shutdown(Shutdown::Write);
         }
     });
+
     let origin = format!("http://{address}/");
+    let https = spawn_tls_header_origin();
+    let https_origin = format!("https://{}/", https.addr);
     let socket = std::env::temp_dir().join(format!("greppy-web-hdr-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_hdr", |command| {
-        command.arg("--fixture-url").arg(&origin);
+        command
+            .arg("--fixture-url")
+            .arg(&origin)
+            .env("GREPPY_WEB_TEST_IGNORE_CERTS", "1");
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let (path, source) = fixture_source("extra-headers.mjs");
+    let source = format!(
+        "globalThis.httpsUrl = {};\n{source}",
+        serde_json::to_string(&https_origin).expect("https url")
+    );
     let ran = run_playwright_source(
         &socket,
         "run_hdr",
@@ -3207,13 +5082,89 @@ fn extra_http_headers_are_sent_on_goto() {
         Duration::from_secs(60),
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
+    drop(https);
+}
+
+#[test]
+fn route_continue_sends_extra_headers_on_http_and_https() {
+    use std::io::Write;
+    use std::net::{Shutdown, TcpListener};
+    let _ = Command::new(env!("CARGO_BIN_EXE_web-runtime"))
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind continue");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let raw = read_http_request_head(&mut stream);
+            let first = raw.lines().next().unwrap_or("").to_owned();
+            let req = raw.to_ascii_lowercase();
+            let path = first.split_whitespace().nth(1).unwrap_or("/");
+            let tagged = req.contains("x-greppy-test: yes");
+            if path.contains("/sub.js") {
+                let body = if tagged {
+                    "window.__greppySub='ok';"
+                } else {
+                    "window.__greppySub='missing';"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.shutdown(Shutdown::Write);
+                continue;
+            }
+            let marker = if tagged { "HEADER_OK" } else { "HEADER_MISSING" };
+            let body = format!(
+                "<!DOCTYPE html><html><body>{marker}<script src=\"/sub.js\"></script></body></html>"
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    });
+    let origin = format!("http://{address}/");
+    let https = spawn_tls_header_origin();
+    let https_origin = format!("https://{}/", https.addr);
+    let socket = std::env::temp_dir().join(format!("greppy-web-rcont-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_rcont", |command| {
+        command
+            .arg("--fixture-url")
+            .arg(&origin)
+            .env("GREPPY_WEB_TEST_IGNORE_CERTS", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("route-continue.mjs");
+    let source = format!(
+        "globalThis.httpsUrl = {};\n{source}",
+        serde_json::to_string(&https_origin).expect("https url")
+    );
+    let ran = run_playwright_source(
+        &socket,
+        "run_rcont",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    drop(https);
 }
 
 fn run_named_fixture(name: &str, run_id: &str) {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-{run_id}-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, run_id, |_| {});
+    let guard = Supervisor::spawn(&socket, run_id, |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let (path, source) = fixture_source(name);
     let ran = run_playwright_source(
@@ -3223,6 +5174,13 @@ fn run_named_fixture(name: &str, run_id: &str) {
         Some(&path),
         Duration::from_secs(60),
     );
+    let _ = unix_request(
+        &socket,
+        &Request::new(run_id, "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes();
     assert_eq!(ran.status, "ok", "{name}: {ran:?}");
 }
 
@@ -3244,6 +5202,11 @@ fn console_messages_are_captured_from_page_evaluate() {
 #[test]
 fn hydrated_spa_wait_for_function_sees_async_dom_update() {
     run_named_fixture("spa-hydrate.mjs", "run_spa");
+}
+
+#[test]
+fn wait_for_function_preserves_value_error_and_ignores_forged_nonce() {
+    run_named_fixture("wait-for-function-value.mjs", "run_wff_value");
 }
 #[test]
 fn frame_locator_queries_same_origin_iframe_document() {
@@ -3290,7 +5253,7 @@ fn max_console_bytes_limit_is_enforced_from_recorded_logs() {
         std::env::temp_dir().join(format!("greppy-web-maxcon-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_maxcon", |command| {
-        command.env("GREPPY_WEB_MAX_CONSOLE_BYTES", "8");
+        let _ = command;
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let source = r#"
@@ -3300,7 +5263,14 @@ const page = await browser.newPage();
 await page.evaluate(() => console.log("abcdefghijklmnop"));
 await browser.close();
 "#;
-    let ran = run_playwright_source(&socket, "run_maxcon", source, None, Duration::from_secs(40));
+    let ran = run_playwright_source_with_limits(
+        &socket,
+        "run_maxcon",
+        source,
+        None,
+        Duration::from_secs(40),
+        json!({ "max_console_bytes": 8 }),
+    );
     assert_eq!(ran.status, "error", "{ran:?}");
     assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit");
     assert!(
@@ -3319,10 +5289,7 @@ fn max_download_bytes_limit_is_enforced_from_recorded_bodies() {
     let socket = std::env::temp_dir().join(format!("greppy-web-maxdl-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_maxdl", |command| {
-        command
-            .env("GREPPY_WEB_MAX_DOWNLOAD_BYTES", "1")
-            .arg("--fixture-url")
-            .arg(&origin);
+        command.arg("--fixture-url").arg(&origin);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let source = r#"
@@ -3340,7 +5307,14 @@ await page.goto(fixtureUrl);
 await page.evaluate((url) => fetch(url), fixtureUrl + "data.bin");
 await browser.close();
 "#;
-    let ran = run_playwright_source(&socket, "run_maxdl", source, None, Duration::from_secs(40));
+    let ran = run_playwright_source_with_limits(
+        &socket,
+        "run_maxdl",
+        source,
+        None,
+        Duration::from_secs(40),
+        json!({ "max_download_bytes": 1 }),
+    );
     assert_eq!(ran.status, "error", "{ran:?}");
     assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit");
     assert!(
@@ -3358,7 +5332,7 @@ fn content_cpu_limit_is_enforced_by_supervisor() {
     let socket = std::env::temp_dir().join(format!("greppy-web-cpu-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_cpu", |command| {
-        command.env("GREPPY_WEB_CONTENT_CPU_MS", "1");
+        let _ = command;
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
@@ -3366,7 +5340,7 @@ fn content_cpu_limit_is_enforced_by_supervisor() {
         &Request::new(
             "run_cpu",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "content_cpu_ms": 1 } }),
         ),
         Duration::from_secs(10),
     )
@@ -3405,10 +5379,10 @@ fn install_refuses_mutated_bin_and_leaves_dest_unmutated() {
     assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
     let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
     assert_eq!(code, 0, "first install: stdout={stdout} stderr={stderr}");
-    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let original = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     let mut mutated = original.clone();
     mutated.extend_from_slice(b"mutated-bin-bytes");
-    std::fs::write(src.join("bin").join("web-runtime-supervisor"), &mutated).unwrap();
+    std::fs::write(src.join("bin").join("web-runtime"), &mutated).unwrap();
     let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
     assert_ne!(
         code, 0,
@@ -3418,7 +5392,7 @@ fn install_refuses_mutated_bin_and_leaves_dest_unmutated() {
         stderr.contains("SHA256SUMS") || stdout.contains("SHA256SUMS"),
         "expected SHA256SUMS failure, stdout={stdout} stderr={stderr}"
     );
-    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     assert_eq!(after, original, "mutated install replaced dest supervisor");
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
@@ -3430,7 +5404,7 @@ fn max_network_bytes_limit_is_enforced_on_read() {
         std::env::temp_dir().join(format!("greppy-web-maxnet-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_maxnet", |command| {
-        command.env("GREPPY_WEB_MAX_NETWORK_BYTES", "1");
+        let _ = command;
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
@@ -3438,7 +5412,7 @@ fn max_network_bytes_limit_is_enforced_on_read() {
         &Request::new(
             "run_maxnet",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "max_network_bytes": 1 } }),
         ),
         Duration::from_secs(10),
     )
@@ -3480,16 +5454,14 @@ fn max_artifact_bytes_limit_is_enforced_on_read() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-maxart-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_maxart", |command| {
-        command.env("GREPPY_WEB_MAX_ARTIFACT_BYTES", "8");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_maxart", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_maxart",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "max_artifact_bytes": 8 } }),
         ),
         Duration::from_secs(10),
     )
@@ -3547,16 +5519,14 @@ fn hover_reload_check_and_history_accept_timeout_options() {
 fn wall_time_limit_is_enforced_by_supervisor() {
     let socket = std::env::temp_dir().join(format!("greppy-web-wall-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_wall", |command| {
-        command.env("GREPPY_WEB_WALL_MS", "20");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_wall", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_wall",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "wall_ms": 20 } }),
         ),
         Duration::from_secs(10),
     )
@@ -3596,11 +5566,11 @@ fn install_refuses_incomplete_sha256sums_and_leaves_dest_unmutated() {
     assert_eq!(code, 0, "src package: stdout={stdout} stderr={stderr}");
     let (code, stdout, stderr) = run_script_args(&install_script(), &[&src, &dest]);
     assert_eq!(code, 0, "first install: stdout={stdout} stderr={stderr}");
-    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let original = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     let sums = std::fs::read_to_string(src.join("SHA256SUMS")).unwrap();
     let trimmed: String = sums
         .lines()
-        .filter(|line| !line.contains("web-content-worker"))
+        .filter(|line| !line.contains("web-runtime"))
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(src.join("SHA256SUMS"), trimmed + "\n").unwrap();
@@ -3613,7 +5583,7 @@ fn install_refuses_incomplete_sha256sums_and_leaves_dest_unmutated() {
         stderr.contains("SHA256SUMS") || stdout.contains("SHA256SUMS"),
         "expected SHA256SUMS completeness failure, stdout={stdout} stderr={stderr}"
     );
-    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     assert_eq!(after, original, "incomplete sums install mutated dest");
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
@@ -3624,16 +5594,14 @@ fn controller_memory_limit_is_enforced_by_supervisor() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-ctlmem-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_ctlmem", |command| {
-        command.env("GREPPY_WEB_CONTROLLER_MEMORY_BYTES", "1");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_ctlmem", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_ctlmem",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "controller_heap_bytes": 1 } }),
         ),
         Duration::from_secs(10),
     )
@@ -3670,16 +5638,14 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-ctlcpu-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_ctlcpu", |command| {
-        command.env("GREPPY_WEB_CONTROLLER_CPU_MS", "1");
-    });
+    let _guard = Supervisor::spawn(&socket, "run_ctlcpu", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
         &Request::new(
             "run_ctlcpu",
             "web.session.create",
-            json!({ "profile": "project" }),
+            json!({ "profile": "project", "limits": { "controller_cpu_ms": 1 } }),
         ),
         Duration::from_secs(10),
     )
@@ -3711,12 +5677,26 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
 fn supervisor_starts_from_stamped_dist_without_worker_flags() {
     let pid = std::process::id();
     let dist = std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}"));
+    let installed = std::env::temp_dir().join(format!("greppy-web-dist-runinst-{pid}"));
     let _ = std::fs::remove_dir_all(&dist);
+    let _ = std::fs::remove_dir_all(&installed);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dist));
     assert_eq!(code, 0, "package dist: stdout={stdout} stderr={stderr}");
+    assert_sha256sums_complete(&dist);
+    let bin = dist.join("bin");
+    let bin_names: Vec<_> = std::fs::read_dir(&bin)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        bin_names,
+        [std::ffi::OsString::from("web-runtime")],
+        "packaged dist must contain exactly one runtime executable, found {bin_names:?}"
+    );
     let socket = std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}.sock"));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn_from_dist(&socket, "run_distimg", &dist);
+    let started = Instant::now();
+    let guard = Supervisor::spawn_from_dist(&socket, "run_distimg", &dist);
     wait_for_socket(&socket, Duration::from_secs(30));
     let created = unix_request(
         &socket,
@@ -3729,7 +5709,116 @@ fn supervisor_starts_from_stamped_dist_without_worker_flags() {
     )
     .expect("create");
     assert_eq!(created.status, "ok", "{created:?}");
-    let _ = std::fs::remove_dir_all(&dist);
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let origin = serve_fixture("<p id=\"ok\">one-binary</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_distimg",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    let cold_start_to_first_page_ms = started.elapsed().as_millis() as u64;
+    assert!(
+        cold_start_to_first_page_ms > 0,
+        "cold start must be a measured duration"
+    );
+    let peak_rss_bytes = tree_rss_bytes(guard.child.id());
+    assert!(peak_rss_bytes > 0, "packaged session RSS must be sampled");
+    thread::sleep(Duration::from_millis(1500));
+    let mut idle_cpu_percent = cpu_percent(guard.child.id());
+    for worker in descendant_pids(guard.child.id()) {
+        idle_cpu_percent = idle_cpu_percent.max(cpu_percent(worker));
+    }
+    assert!(
+        idle_cpu_percent < 25.0,
+        "idle packaged workers cpu {idle_cpu_percent}"
+    );
+    let doctor = unix_request(
+        &socket,
+        &Request::new("run_distimg", "web.doctor", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("doctor");
+    assert_eq!(doctor.status, "ok", "{doctor:?}");
+    let doctor_result = doctor.result.as_ref().unwrap();
+    assert_eq!(doctor_result["protocol_version"], SCHEMA);
+    assert!(
+        doctor_result.get("process_health").is_none(),
+        "{doctor_result}"
+    );
+    let status = unix_request(
+        &socket,
+        &Request::new("run_distimg", "web.status", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("status");
+    assert_eq!(status.status, "ok", "{status:?}");
+    assert_eq!(status.result.as_ref().unwrap()["inventory_entries"], 1354);
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            "run_distimg",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("close");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    drop(guard);
+    let receipt_path = dist.join("benchmark-receipt.json");
+    let mut bench: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let installed_bytes = std::fs::metadata(bin.join("web-runtime")).unwrap().len();
+    bench["installed_bytes"] = json!(installed_bytes);
+    bench["session_metrics"] = json!("measured");
+    bench["metrics"]["installed_bytes"] = json!(installed_bytes);
+    bench["metrics"]["cold_start_to_first_page_ms"] = json!(cold_start_to_first_page_ms);
+    bench["metrics"]["peak_rss_bytes"] = json!(peak_rss_bytes);
+    bench["metrics"]["idle_cpu_percent"] = json!(idle_cpu_percent);
+    bench["note"] = json!(
+        "Session metrics measured against this packaged image. Not a Playwright+Chromium comparison."
+    );
+    std::fs::write(&receipt_path, serde_json::to_vec_pretty(&bench).unwrap()).unwrap();
+    rewrite_sha256sums(&dist);
+    assert_sha256sums_complete(&dist);
+    let measured: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(measured["session_metrics"], "measured");
+    assert!(
+        measured["metrics"]["cold_start_to_first_page_ms"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(measured["metrics"]["peak_rss_bytes"].as_u64().unwrap() > 0);
+    assert!(measured["metrics"]["idle_cpu_percent"].as_f64().is_some());
+    let (code, stdout, stderr) = run_script_args(&install_script(), &[&dist, &installed]);
+    assert_eq!(
+        code, 0,
+        "install measured dist: stdout={stdout} stderr={stderr}"
+    );
+    assert_sha256sums_complete(&installed);
+    let installed_bench: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(installed.join("benchmark-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed_bench["session_metrics"], "measured");
+    let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&installed));
+    assert_eq!(
+        code, 0,
+        "uninstall measured: stdout={stdout} stderr={stderr}"
+    );
+    let (code, stdout, stderr) = run_script(&uninstall_script(), Some(&dist));
+    assert_eq!(code, 0, "uninstall dist: stdout={stdout} stderr={stderr}");
 }
 
 #[test]
@@ -3739,14 +5828,14 @@ fn package_refuses_dest_with_unknown_extra_member() {
     let _ = std::fs::remove_dir_all(&dest);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
     assert_eq!(code, 0, "seed package: stdout={stdout} stderr={stderr}");
-    let original = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let original = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     std::fs::write(dest.join("notes.txt"), "not part of the dist").unwrap();
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
     assert_ne!(
         code, 0,
         "package extra member: stdout={stdout} stderr={stderr}"
     );
-    let after = std::fs::read(dest.join("bin").join("web-runtime-supervisor")).unwrap();
+    let after = std::fs::read(dest.join("bin").join("web-runtime")).unwrap();
     assert_eq!(after, original, "extra-member package mutated dest");
     assert!(
         dest.join("notes.txt").exists(),

@@ -117,7 +117,7 @@ pub fn decide_ip(profile: NetworkProfile, ip: IpAddr) -> UrlDecision {
     UrlDecision::Allow
 }
 
-fn decide_host_literal(profile: NetworkProfile, host: &str) -> UrlDecision {
+pub(crate) fn decide_host_literal(profile: NetworkProfile, host: &str) -> UrlDecision {
     if is_metadata_host(host) {
         return UrlDecision::Deny {
             reason: "cloud metadata endpoint denied",
@@ -139,11 +139,12 @@ fn decide_host_literal(profile: NetworkProfile, host: &str) -> UrlDecision {
     UrlDecision::Allow
 }
 
-fn decide_resolved_hostname(profile: NetworkProfile, host: &str) -> UrlDecision {
-    match pin_connect_addr(profile, host, 80) {
-        Ok(_) => UrlDecision::Allow,
-        Err(reason) => UrlDecision::Deny { reason },
-    }
+fn decide_resolved_hostname(_profile: NetworkProfile, _host: &str) -> UrlDecision {
+    // Navigation-time DNS is not a pin. PolicyProxy re-resolves and pins every
+    // CONNECT/forward hop; treating a lookup here as lasting allow is a
+    // DNS-rebinding TOCTOU. Literal metadata/LAN/loopback hosts are already
+    // denied by decide_host_literal before this is reached.
+    UrlDecision::Allow
 }
 
 /// Resolve `host` and pick a SocketAddr that is allowed *and* is the address
@@ -156,7 +157,7 @@ pub fn pin_connect_addr(
     pin_connect_addr_with(profile, host, port, default_resolve)
 }
 
-fn default_resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
+pub(crate) fn default_resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
     (host, port)
         .to_socket_addrs()
         .map(|iter| iter.collect())
@@ -178,6 +179,10 @@ pub fn pin_connect_addr_with(
     }
     if host.eq_ignore_ascii_case("localhost") {
         return pin_connect_addr_with(profile, "127.0.0.1", port, resolve);
+    }
+    match decide_host_literal(profile, host) {
+        UrlDecision::Deny { reason } => return Err(reason),
+        UrlDecision::Allow => {}
     }
     let addrs = resolve(host, port)?;
     if addrs.is_empty() {
@@ -473,5 +478,36 @@ mod tests {
             ),)
             .is_err()
         );
+    }
+
+    #[test]
+    fn pin_connect_addr_rechecks_every_lookup_against_later_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let public: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        let meta: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let lookups = AtomicUsize::new(0);
+        let resolve = |_: &str, _: u16| match lookups.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(vec![public]),
+            _ => Ok(vec![meta]),
+        };
+        let first = pin_connect_addr_with(NetworkProfile::Research, "flip.test", 80, resolve)
+            .expect("first public answer must pin");
+        assert_eq!(first, public);
+        assert!(
+            pin_connect_addr_with(NetworkProfile::Research, "flip.test", 80, resolve).is_err(),
+            "second lookup that rebinds to metadata must be denied"
+        );
+        assert!(lookups.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn pin_connect_denies_metadata_hostname_without_dns() {
+        let err = pin_connect_addr_with(
+            NetworkProfile::Project,
+            "metadata.google.internal",
+            80,
+            |host, _| panic!("must not resolve metadata hostname {host}"),
+        );
+        assert!(err.is_err(), "{err:?}");
     }
 }

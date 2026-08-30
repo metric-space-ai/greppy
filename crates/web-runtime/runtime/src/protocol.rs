@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProtocolSchema {
@@ -24,6 +24,7 @@ pub enum Message {
         schema: ProtocolSchema,
         version: u32,
         worker: WorkerKind,
+        capability: String,
     },
     Ready {
         schema: ProtocolSchema,
@@ -71,11 +72,12 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn hello(worker: WorkerKind) -> Self {
+    pub fn hello(worker: WorkerKind, capability: impl Into<String>) -> Self {
         Self::Hello {
             schema: ProtocolSchema::WorkerV1,
             version: PROTOCOL_VERSION,
             worker,
+            capability: capability.into(),
         }
     }
 
@@ -209,6 +211,40 @@ pub fn write_message<W: Write>(writer: &mut W, message: &Message) -> io::Result<
     writer.flush()
 }
 
+/// Millisecond timeout from a JSON/V8 number. Integers and finite
+/// non-negative floats are accepted (floats truncated toward zero).
+/// Missing, non-numeric, negative, NaN, and infinite values yield
+/// `default_ms`. The result is clamped to `[min_ms, max_ms]`.
+pub fn timeout_ms_from_json(
+    timeout: Option<&serde_json::Value>,
+    default_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+) -> u64 {
+    let parsed = match timeout {
+        Some(serde_json::Value::Number(number)) => json_number_as_u64(number),
+        _ => None,
+    };
+    parsed.unwrap_or(default_ms).clamp(min_ms, max_ms)
+}
+
+fn json_number_as_u64(number: &serde_json::Number) -> Option<u64> {
+    if let Some(ms) = number.as_u64() {
+        return Some(ms);
+    }
+    if let Some(ms) = number.as_i64() {
+        return u64::try_from(ms).ok();
+    }
+    let ms = number.as_f64()?;
+    if !ms.is_finite() || ms < 0.0 {
+        return None;
+    }
+    if ms >= u64::MAX as f64 {
+        return Some(u64::MAX);
+    }
+    Some(ms.trunc() as u64)
+}
+
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -223,7 +259,8 @@ fn validate_fields(value: &serde_json::Value) -> io::Result<()> {
         .ok_or_else(|| invalid_data("protocol message requires a string type field"))?;
 
     let allowed_fields: &[&str] = match message_type {
-        "Hello" | "Ready" | "ShutdownAck" => &["type", "schema", "version", "worker"],
+        "Hello" => &["type", "schema", "version", "worker", "capability"],
+        "Ready" | "ShutdownAck" => &["type", "schema", "version", "worker"],
         "Shutdown" => &["type", "schema", "version"],
         "RunScript" => &[
             "type",
@@ -272,9 +309,13 @@ mod tests {
     #[test]
     fn writes_big_endian_length_and_exact_json() {
         let mut bytes = Vec::new();
-        write_message(&mut bytes, &Message::hello(WorkerKind::Controller)).unwrap();
+        write_message(
+            &mut bytes,
+            &Message::hello(WorkerKind::Controller, "test-token"),
+        )
+        .unwrap();
 
-        let expected_json = br#"{"type":"Hello","schema":"greppy.web-runtime.worker.v1","version":1,"worker":"Controller"}"#;
+        let expected_json = br#"{"type":"Hello","schema":"greppy.web-runtime.worker.v1","version":2,"worker":"Controller","capability":"test-token"}"#;
         assert_eq!(
             &bytes[..4],
             &(expected_json.len() as u32).to_be_bytes(),
@@ -286,7 +327,7 @@ mod tests {
     #[test]
     fn round_trips_every_message() {
         let messages = [
-            Message::hello(WorkerKind::Controller),
+            Message::hello(WorkerKind::Controller, "test-token"),
             Message::ready(WorkerKind::Content),
             Message::shutdown(),
             Message::shutdown_ack(WorkerKind::Controller),
@@ -330,7 +371,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_json_fields() {
-        let json = br#"{"type":"Shutdown","schema":"greppy.web-runtime.worker.v1","version":1,"extra":true}"#;
+        let json = br#"{"type":"Shutdown","schema":"greppy.web-runtime.worker.v1","version":2,"extra":true}"#;
         let frame = frame(json);
 
         let error = read_message(&mut Cursor::new(frame)).unwrap_err();
@@ -373,16 +414,104 @@ mod tests {
 
     #[test]
     fn rejects_a_wrong_schema() {
-        let json = br#"{"type":"Shutdown","schema":"wrong","version":1}"#;
+        let json = br#"{"type":"Shutdown","schema":"wrong","version":2}"#;
         let error = read_message(&mut Cursor::new(frame(json))).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn rejects_a_wrong_version() {
-        let json = br#"{"type":"Shutdown","schema":"greppy.web-runtime.worker.v1","version":2}"#;
+        let json = br#"{"type":"Shutdown","schema":"greppy.web-runtime.worker.v1","version":1}"#;
         let error = read_message(&mut Cursor::new(frame(json))).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn timeout_params(timeout: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "timeout": timeout })
+    }
+
+    fn parse_timeout(timeout: Option<&serde_json::Value>) -> u64 {
+        timeout_ms_from_json(timeout, 30_000, 1, 120_000)
+    }
+
+    #[test]
+    fn timeout_ms_from_json_accepts_integer() {
+        let params = timeout_params(serde_json::json!(250));
+        assert_eq!(parse_timeout(params.get("timeout")), 250);
+        assert_eq!(
+            params.get("timeout").and_then(serde_json::Value::as_u64),
+            Some(250)
+        );
+    }
+
+    #[test]
+    fn timeout_ms_from_json_accepts_f64_that_as_u64_rejects() {
+        let number = serde_json::Number::from_f64(250.0).expect("finite");
+        let timeout = serde_json::Value::Number(number);
+        assert_eq!(
+            timeout.as_u64(),
+            None,
+            "precondition: V8-shaped f64 250.0 is not as_u64"
+        );
+        assert_eq!(parse_timeout(Some(&timeout)), 250);
+        let truncated =
+            serde_json::Value::Number(serde_json::Number::from_f64(250.9).expect("finite"));
+        assert_eq!(parse_timeout(Some(&truncated)), 250);
+    }
+
+    #[test]
+    fn timeout_ms_from_json_invalid_uses_default() {
+        assert_eq!(parse_timeout(None), 30_000);
+        assert_eq!(parse_timeout(Some(&serde_json::Value::Null)), 30_000);
+        assert_eq!(parse_timeout(Some(&serde_json::json!("250"))), 30_000);
+        assert_eq!(parse_timeout(Some(&serde_json::json!(true))), 30_000);
+        assert_eq!(parse_timeout(Some(&serde_json::json!(-1))), 30_000);
+        let negative =
+            serde_json::Value::Number(serde_json::Number::from_f64(-5.0).expect("finite"));
+        assert_eq!(parse_timeout(Some(&negative)), 30_000);
+        let inf = serde_json::Number::from_f64(f64::INFINITY);
+        assert!(inf.is_none(), "serde_json rejects non-finite numbers");
+    }
+
+    #[test]
+    fn timeout_ms_from_json_clamps_to_bounds() {
+        assert_eq!(
+            timeout_ms_from_json(Some(&serde_json::json!(0)), 30_000, 1, 120_000),
+            1
+        );
+        assert_eq!(
+            timeout_ms_from_json(Some(&serde_json::json!(1_000_000)), 30_000, 1, 120_000),
+            120_000
+        );
+        let tiny = serde_json::Value::Number(serde_json::Number::from_f64(0.4).expect("finite"));
+        assert_eq!(timeout_ms_from_json(Some(&tiny), 30_000, 20, 120_000), 20);
+    }
+
+    #[test]
+    fn engine_call_f64_timeout_survives_protocol_roundtrip() {
+        let timeout =
+            serde_json::Value::Number(serde_json::Number::from_f64(250.0).expect("finite"));
+        let params = serde_json::json!({
+            "page": "page-1",
+            "source": "false",
+            "timeout": timeout,
+        });
+        let mut bytes = Vec::new();
+        write_message(
+            &mut bytes,
+            &Message::engine_call(9, "page.waitForFunction".to_owned(), params),
+        )
+        .unwrap();
+        match read_message(&mut Cursor::new(bytes)).unwrap() {
+            Message::EngineCall { params, .. } => {
+                assert_eq!(
+                    parse_timeout(params.get("timeout")),
+                    250,
+                    "f64 timeout must survive engine-call framing"
+                );
+            }
+            other => panic!("expected EngineCall, got {other:?}"),
+        }
     }
 
     fn frame(payload: &[u8]) -> Vec<u8> {

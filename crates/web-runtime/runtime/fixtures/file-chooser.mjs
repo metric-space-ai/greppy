@@ -3,13 +3,18 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
-await context.tracing.start();
 await page.setContent(
   "<!DOCTYPE html><html><body><input id='f' type='file'></body></html>",
 );
 await page.setInputFiles("#f", ["FILE_PATH"]);
-const trace = await context.tracing.stop();
-if (!trace.file_paths || trace.file_paths.length < 1) {
-  throw new Error("expected stored file paths, got " + JSON.stringify(trace));
+const got = await page.evaluate(() => {
+  const el = document.getElementById("f");
+  return {
+    count: el && el.files ? el.files.length : -1,
+    name: el && el.files && el.files[0] ? el.files[0].name : "",
+  };
+});
+if (got.count < 1 || got.name !== "sample.txt") {
+  throw new Error("expected stored input files, got " + JSON.stringify(got));
 }
 await browser.close();

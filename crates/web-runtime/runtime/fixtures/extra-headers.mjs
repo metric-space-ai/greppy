@@ -1,5 +1,10 @@
 import { chromium } from "playwright";
 
+const httpsUrl = globalThis.httpsUrl || "";
+if (!httpsUrl) {
+  throw new Error("httpsUrl is required for the extra-header HTTPS matrix");
+}
+
 async function expectUnsupported(label, fn) {
   let failed = false;
   try {
@@ -59,6 +64,21 @@ const text = (await page.locator("body").innerText()).trim();
 if (text !== "HEADER_OK") {
   throw new Error("expected HEADER_OK from extra headers, got " + JSON.stringify(text));
 }
+await page.waitForFunction(() => window.__greppySub === "ok", null, { timeout: 15_000 });
+const isolated = await browser.newContext();
+const isoPage = await isolated.newPage();
+await isoPage.goto(fixtureUrl, { timeout: 15_000 });
+const isoText = (await isoPage.locator("body").innerText()).trim();
+if (isoText !== "HEADER_MISSING") {
+  throw new Error("plain context must not inherit extra headers, got " + JSON.stringify(isoText));
+}
+await isolated.close();
+await page.goto(fixtureUrl + "jump", { timeout: 15_000 });
+const redirected = (await page.locator("body").innerText()).trim();
+if (redirected !== "HEADER_OK") {
+  throw new Error("redirect extra headers, got " + JSON.stringify(redirected));
+}
+await page.waitForFunction(() => window.__greppySub === "ok", null, { timeout: 15_000 });
 const url = await page.waitForURL("http");
 if (!String(url).includes("http")) throw new Error("waitForURL " + url);
 const frameUrl = await page.mainFrame().waitForURL("http");
@@ -182,6 +202,37 @@ await expectUnsupported("newPage viewport", () =>
   ctxPageHeaders.newPage({ viewport: { width: 800, height: 600 } }),
 );
 await ctxPageHeaders.close();
+const ctxPrec = await browser.newContext({
+  extraHTTPHeaders: { "x-greppy-test": "context", "x-greppy-ctx": "yes" },
+});
+const pPrec = await ctxPrec.newPage();
+await pPrec.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
+await pPrec.goto(fixtureUrl, { timeout: 15_000 });
+if ((await pPrec.locator("body").innerText()).trim().indexOf("HEADER_OK") < 0) {
+  throw new Error("page extra headers must override context");
+}
+if ((await pPrec.locator("#ctx").innerText()).trim() !== "CTX_OK") {
+  throw new Error("context extra headers must still be sent when not overridden");
+}
+await ctxPrec.close();
+await page.setExtraHTTPHeaders({ "x-greppy-test": "yes" });
+await page.goto(httpsUrl, { timeout: 15_000 });
+if ((await page.locator("body").innerText()).trim().indexOf("HEADER_OK") < 0) {
+  throw new Error("https extra headers, got " + JSON.stringify(await page.locator("body").innerText()));
+}
+await page.waitForFunction(() => window.__greppySub === "ok", null, { timeout: 15_000 });
+const httpsIso = await browser.newContext();
+const httpsIsoPage = await httpsIso.newPage();
+await httpsIsoPage.goto(httpsUrl, { timeout: 15_000 });
+if ((await httpsIsoPage.locator("body").innerText()).trim().indexOf("HEADER_MISSING") < 0) {
+  throw new Error("https isolation must not inherit extra headers");
+}
+await httpsIso.close();
+await page.goto(httpsUrl + "jump", { timeout: 15_000 });
+if ((await page.locator("body").innerText()).trim().indexOf("HEADER_OK") < 0) {
+  throw new Error("https redirect extra headers");
+}
+await page.waitForFunction(() => window.__greppySub === "ok", null, { timeout: 15_000 });
 let paused = false;
 try {
   await page.pause();
