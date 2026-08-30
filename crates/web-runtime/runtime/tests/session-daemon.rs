@@ -3064,6 +3064,34 @@ fn web_screenshot_returns_inline_png_bytes() {
     assert_eq!(shot.status, "ok", "{shot:?}");
     let b64 = shot.result.as_ref().unwrap()["png_base64"].as_str().unwrap_or("");
     assert!(b64.len() > 32, "png_base64 missing: {shot:?}");
+    let digest = shot.result.as_ref().unwrap()["digest"]
+        .as_str()
+        .expect("screenshot digest");
+    let next = unix_request(
+        &socket,
+        &Request::new(
+            "run_pngb64",
+            "web.result.next",
+            json!({
+                "session_id": session_id,
+                "cursor": format!("sha256:{digest}:0"),
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("result.next");
+    assert_eq!(next.status, "ok", "{next:?}");
+    let chunk = next.result.as_ref().unwrap();
+    assert_eq!(chunk["digest"], json!(digest));
+    assert_eq!(
+        chunk["artifact"]["digest"],
+        json!(digest),
+        "screenshots are restricted; result.next must return the artifact handle, not png bytes: {next:?}"
+    );
+    assert!(
+        chunk.get("bytes_base64").is_none(),
+        "restricted screenshot must not leak png bytes through result.next: {next:?}"
+    );
     let _ = unix_request(
         &socket,
         &Request::new(

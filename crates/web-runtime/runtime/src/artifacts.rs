@@ -117,6 +117,16 @@ impl ArtifactStore {
         Ok(manifest)
     }
 
+    pub fn read_object(&self, digest_hex: &str) -> io::Result<Vec<u8>> {
+        if digest_hex.len() != 64 || !digest_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact digest is not sha256 hex",
+            ));
+        }
+        fs::read(self.root.join("objects").join("sha256").join(digest_hex))
+    }
+
     pub fn list_session(&self, session_id: &str) -> io::Result<Vec<ArtifactManifest>> {
         let dir = self
             .root
@@ -193,6 +203,17 @@ mod tests {
         assert_eq!(first.byte_count, 5);
         let listed = store.list_session("wrs_1").unwrap();
         assert_eq!(listed.len(), 1);
+        assert_eq!(store.read_object(&first.digest.hex).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_object_rejects_non_hex_digest() {
+        let root = std::env::temp_dir().join(format!("greppy-art-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::new(root.clone()).unwrap();
+        assert!(store.read_object("../objects").is_err());
+        assert!(store.read_object(&"ab".repeat(32)).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

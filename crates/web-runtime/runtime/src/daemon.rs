@@ -731,6 +731,7 @@ impl Daemon {
             "web.search" => self.web_search(&request),
             "web.research" => self.web_research(&request),
             "web.artifacts" => self.web_artifacts(&request),
+            "web.result.next" => self.web_result_next(&request),
             other => Response::error(
                 &request,
                 ErrorObject::new(
@@ -1670,6 +1671,10 @@ impl Daemon {
                                 });
                                 if let Some(b64) = result.get("png_base64").cloned() {
                                     payload["png_base64"] = b64;
+                                } else {
+                                    payload["truncated"] = json!(true);
+                                    payload["cursor"] =
+                                        json!(format!("sha256:{}:0", manifest.digest.hex));
                                 }
                                 let mut response = Response::ok(request, payload);
                                 response
@@ -1928,6 +1933,89 @@ impl Daemon {
             ),
             Err(error) => engine_error(request, error.to_string(), 39),
         }
+    }
+
+    fn web_result_next(&mut self, request: &Request) -> Response {
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone());
+        let Some(session_id) = session_id else {
+            return protocol_error(request, "web.result.next requires session_id");
+        };
+        if !self.sessions.contains_key(&session_id) {
+            return missing_session(request, &session_id);
+        }
+        let Some(cursor) = request.payload.get("cursor").and_then(|v| v.as_str()) else {
+            return protocol_error(request, "web.result.next requires cursor");
+        };
+        let (digest, offset) = match parse_result_cursor(cursor) {
+            Ok(parsed) => parsed,
+            Err(error) => return protocol_error(request, &error),
+        };
+        let listed = match self.store.list_session(&session_id) {
+            Ok(list) => list,
+            Err(error) => return engine_error(request, error.to_string(), 39),
+        };
+        let Some(manifest) = listed
+            .iter()
+            .find(|row| row.digest.hex.eq_ignore_ascii_case(&digest))
+        else {
+            return protocol_error(
+                request,
+                "cursor does not refer to an artifact of this session",
+            );
+        };
+        if manifest.is_restricted() {
+            return match manifest.model_facing_ref() {
+                Ok(facing) => Response::ok(
+                    request,
+                    json!({
+                        "session_id": session_id,
+                        "truncated": false,
+                        "cursor": serde_json::Value::Null,
+                        "digest": manifest.digest.hex,
+                        "byte_count": 0,
+                        "offset": offset,
+                        "media_type": manifest.media_type,
+                        "artifact": facing,
+                        "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                    }),
+                ),
+                Err(error) => engine_error(request, error, 39),
+            };
+        }
+        let bytes = match self.store.read_object(&digest) {
+            Ok(bytes) => bytes,
+            Err(error) => return engine_error(request, error.to_string(), 39),
+        };
+        if offset > bytes.len() {
+            return protocol_error(request, "cursor offset is past the artifact");
+        }
+        let chunk = &bytes[offset..bytes.len().min(offset + RESULT_NEXT_CHUNK)];
+        let next_offset = offset + chunk.len();
+        let truncated = next_offset < bytes.len();
+        let next_cursor = if truncated {
+            json!(format!("sha256:{digest}:{next_offset}"))
+        } else {
+            serde_json::Value::Null
+        };
+        Response::ok(
+            request,
+            json!({
+                "session_id": session_id,
+                "truncated": truncated,
+                "cursor": next_cursor,
+                "digest": manifest.digest.hex,
+                "byte_count": chunk.len(),
+                "offset": offset,
+                "media_type": manifest.media_type,
+                "bytes_base64": encode_base64(chunk),
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+            }),
+        )
     }
 
     fn with_session_page(
@@ -2561,6 +2649,48 @@ fn urlencoding(value: &str) -> String {
             }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+const RESULT_NEXT_CHUNK: usize = 64 * 1024;
+
+fn parse_result_cursor(cursor: &str) -> Result<(String, usize), String> {
+    let rest = cursor
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "cursor must start with sha256:".to_owned())?;
+    let (digest, offset) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| "cursor missing offset".to_owned())?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("cursor digest is not sha256 hex".to_owned());
+    }
+    let offset: usize = offset
+        .parse()
+        .map_err(|_| "cursor offset is not a number".to_owned())?;
+    Ok((digest.to_ascii_lowercase(), offset))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = chunk.get(1).copied().unwrap_or(0) as u32;
+        let c = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (a << 16) | (b << 8) | c;
+        out.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
         }
     }
     out
@@ -3370,6 +3500,17 @@ mod script_stage_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn parse_result_cursor_reads_digest_and_offset() {
+        let digest = "ab".repeat(32);
+        let (got, offset) = super::parse_result_cursor(&format!("sha256:{digest}:12")).unwrap();
+        assert_eq!(got, digest);
+        assert_eq!(offset, 12);
+        assert!(super::parse_result_cursor("offset=12").is_err());
+        assert!(super::parse_result_cursor("sha256:short:0").is_err());
+        assert!(super::parse_result_cursor(&format!("sha256:{digest}:x")).is_err());
     }
 
     #[test]
