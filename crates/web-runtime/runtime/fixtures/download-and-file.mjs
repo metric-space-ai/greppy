@@ -50,7 +50,7 @@ if (download.suggestedFilename() !== "data.bin") {
 if (download.page() !== page && download.page()._id !== page._id) {
   throw new Error("download.page is not the creating page");
 }
-const dest = "/tmp/greppy-web-dl-" + Date.now() + ".bin";
+const dest = "greppy-web-dl-" + Date.now() + ".bin";
 await download.saveAs(dest);
 const saved = await download.path();
 if (saved !== dest) throw new Error("path after saveAs " + saved);
