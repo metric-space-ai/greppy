@@ -5,6 +5,40 @@ use std::io::{self, Read, Write};
 pub const CAPABILITY_FD: i32 = 3;
 /// Parent-issued client/supervisor attach token. Not derivable from the socket path.
 pub const ATTACH_TOKEN_FD: i32 = 4;
+/// Bidirectional framed protocol socket. stdin/stdout are a log channel, not the frame channel.
+pub const PROTOCOL_FD: i32 = 5;
+
+/// Take the inherited protocol socket. The original FD is owned by the writer;
+/// the reader is a `dup` so both ends can be used independently.
+#[cfg(unix)]
+pub fn take_protocol_channel() -> io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if unsafe { libc::fcntl(PROTOCOL_FD, libc::F_GETFD) } < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing inherited protocol FD",
+        ));
+    }
+    let reader_fd = unsafe { libc::dup(PROTOCOL_FD) };
+    if reader_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        libc::fcntl(reader_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(PROTOCOL_FD, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let reader = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(reader_fd) });
+    let writer = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(PROTOCOL_FD) });
+    Ok((reader, writer))
+}
+
+#[cfg(not(unix))]
+pub fn take_protocol_channel() -> io::Result<(std::fs::File, std::fs::File)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "inherited protocol FD requires Unix",
+    ))
+}
 
 #[cfg(unix)]
 pub struct AttachTokenPass {
@@ -391,7 +425,7 @@ pub fn pin_supervisor_image() -> io::Result<PinnedSupervisorImage> {
 
 /// Pin `current_exe` / `/proc/self/exe` and bind `command` so the child is
 /// executed from that pin. Call after argv/env/stdio and after FD-installing
-/// `pre_exec` hooks (capability FD 3, attach token FD 4): on Linux the last
+/// `pre_exec` hooks (capability FD 3, attach token FD 4, protocol FD 5): on Linux the last
 /// `pre_exec` is `fexecve` of the pinned FD and does not return.
 ///
 /// Capability secrets stay on inherited FD 3; this does not put tokens in argv.
@@ -444,7 +478,7 @@ impl PinnedSupervisorImage {
     /// Bind `command` so spawn executes this pin.
     ///
     /// Linux: last `pre_exec` is `fexecve` of a dup of this FD. Must run after
-    /// capability/attach `pre_exec` so FD 3/4 are installed first.
+    /// capability/attach/protocol `pre_exec` so FD 3/4/5 are installed first.
     ///
     /// macOS: no-op. Spawn stays path-based (`Command::new` path). Residual
     /// TOCTOU is documented, not claimed closed. Darwin `fexecve` is EXTERNAL.

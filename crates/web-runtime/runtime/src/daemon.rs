@@ -319,7 +319,25 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let response = daemon.handle(request);
+        let operation = request.operation.clone();
+        let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            daemon.handle(request.clone())
+        })) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("web-runtime: phase handle-panic operation={operation}");
+                Response::error(
+                    &request,
+                    ErrorObject::new(
+                        "engine_error",
+                        format!("supervisor panicked while handling {operation}"),
+                        request.request_id.clone(),
+                        38,
+                        "retry greppy web run",
+                    ),
+                )
+            }
+        };
         let _ = write_frame(&mut stream, &response);
         if daemon.exiting {
             break;
@@ -355,6 +373,7 @@ struct RunControl {
     heartbeats: std::sync::Mutex<Vec<String>>,
     session_rows: std::sync::Mutex<Vec<serde_json::Value>>,
     late_engine_result: std::sync::Mutex<Option<LateEngineResult>>,
+    discarded_engine_results: AtomicU64,
     controller_pid: AtomicU32,
     content_pid: AtomicU32,
     controller_generation: AtomicU64,
@@ -370,6 +389,7 @@ impl RunControl {
             heartbeats: std::sync::Mutex::new(Vec::new()),
             session_rows: std::sync::Mutex::new(Vec::new()),
             late_engine_result: std::sync::Mutex::new(None),
+            discarded_engine_results: AtomicU64::new(0),
             controller_pid: AtomicU32::new(0),
             content_pid: AtomicU32::new(0),
             controller_generation: AtomicU64::new(1),
@@ -401,6 +421,7 @@ fn snapshot_session_rows(
                 "heartbeat_age_ms": session.last_heartbeat.elapsed().as_millis() as u64,
                 "inflight_engine_request_id": session.inflight_engine_request_id,
                 "inflight_engine_method": session.inflight_engine_method,
+                "discarded_engine_results": session.discarded_engine_results,
                 "controller_pid": controller_pid,
                 "content_pid": content_pid,
                 "controller_generation": controller_generation,
@@ -421,6 +442,8 @@ fn accept_loop(
             Ok(stream) => stream,
             Err(_) => continue,
         };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
         let request: Request = match read_frame(&mut stream) {
             Ok(request) => request,
             Err(_) => continue,
@@ -804,6 +827,7 @@ impl Daemon {
                     "contracts/web-runtime/receipts/oracle-content.json"
                 ],
                 "inventory_entries": 1354,
+                "discarded_engine_results": self.run_control.discarded_engine_results.load(Ordering::Relaxed),
                 "compatibility_coverage_level_note": "schema implemented is not Chromium oracle behavior; oracle receipts are scoped cases only",
             }),
         )
@@ -1229,11 +1253,14 @@ impl Daemon {
             let content = &mut self.content;
             let sessions = &mut self.sessions;
             let session_key = session_id.clone();
-            if let Err(error) = controller.send(&crate::protocol::Message::run_script(
-                specifier.clone(),
-                source,
-                self.fixture_url.clone(),
-            )) {
+            if let Err(error) = controller.send_timeout(
+                &crate::protocol::Message::run_script(
+                    specifier.clone(),
+                    source,
+                    self.fixture_url.clone(),
+                ),
+                remaining,
+            ) {
                 Err(error)
             } else {
                 eprintln!(
@@ -1261,7 +1288,7 @@ impl Daemon {
             .map(|session| (session.network_bytes, session.peak_rss_bytes))
             .unwrap_or((0, 0));
         let run_event = match &outcome {
-            Ok(()) => "run.completed",
+            Ok(_) => "run.completed",
             Err(error)
                 if error.kind() == io::ErrorKind::TimedOut
                     || error.to_string().contains("timed out") =>
@@ -1279,10 +1306,18 @@ impl Daemon {
             .and_then(|session| session.inflight_engine_request_id);
         self.finish_session(&session_id);
         match outcome {
-            Ok(()) => {
+            Ok(result) => {
+                let stdout = result
+                    .get("stdout")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 let mut response = Response::ok(
                     request,
-                    serde_json::json!({ "session_id": session_id, "completed": true }),
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "completed": true,
+                        "stdout": stdout,
+                    }),
                 );
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
@@ -1383,8 +1418,8 @@ impl Daemon {
                     return Response::error(request, object);
                 }
                 if error.kind() == io::ErrorKind::TimedOut || message.contains("timed out") {
-                    self.controller.kill_tree();
-                    self.content.kill_tree();
+                    self.controller.kill_tree_now();
+                    self.content.kill_tree_now();
                     // Do not recover here. Spawn+handshake of replacement workers can
                     // exceed the client unix read slack; Drop then SIGKILLs the supervisor
                     // while those process-group leaders reparent to PID 1.
@@ -2126,37 +2161,65 @@ impl Daemon {
             );
         }
         let request_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) =
-            self.content
-                .send(&Message::engine_call(request_id, method.to_owned(), params))
-        {
+        let stale = self.content.discard_stale_engine_results();
+        if stale > 0 {
+            self.run_control
+                .discarded_engine_results
+                .fetch_add(stale, Ordering::Relaxed);
+        }
+        if let Err(error) = self.content.send_timeout(
+            &Message::engine_call(request_id, method.to_owned(), params),
+            timeout,
+        ) {
             let _ = self.recover_content(&format!("content send failed: {error}"));
             return Err(error.to_string());
         }
-        match self.content.recv(timeout) {
-            Ok(Message::EngineResult {
-                request_id: got,
-                ok,
-                result,
-                error,
-                ..
-            }) if got == request_id => {
-                if ok {
-                    Ok(result)
-                } else {
-                    Err(error.unwrap_or_else(|| "engine call failed".to_owned()))
-                }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {method}"
+                ));
             }
-            Ok(other) => Err(format!("unexpected content message {other:?}")),
-            Err(error) => {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    return Err(format!(
-                        "timed out after {timeout:?} waiting for {method}"
-                    ));
+            match self.content.recv(remaining) {
+                Ok(Message::EngineResult {
+                    request_id: got,
+                    ok,
+                    result,
+                    error,
+                    ..
+                }) if got == request_id => {
+                    return if ok {
+                        Ok(result)
+                    } else {
+                        Err(error.unwrap_or_else(|| "engine call failed".to_owned()))
+                    };
                 }
-                let message = error.to_string();
-                let _ = self.recover_content(&format!("content worker: {message}"));
-                Err(message)
+                Ok(Message::EngineResult {
+                    request_id: got,
+                    ok,
+                    error,
+                    ..
+                }) => {
+                    self.run_control
+                        .discarded_engine_results
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "web-runtime: discarded unmatched EngineResult id={got} want={request_id} ok={ok} err={error:?}"
+                    );
+                }
+                Ok(other) => return Err(format!("unexpected content message {other:?}")),
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        return Err(format!(
+                            "timed out after {timeout:?} waiting for {method}"
+                        ));
+                    }
+                    let message = error.to_string();
+                    let _ = self.recover_content(&format!("content worker: {message}"));
+                    return Err(message);
+                }
             }
         }
     }
@@ -2983,6 +3046,9 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
     }
 
     fn note_discarded_engine_result(&mut self, request_id: u64, ok: bool, error: Option<String>) {
+        self.control
+            .discarded_engine_results
+            .fetch_add(1, Ordering::Relaxed);
         *self
             .control
             .late_engine_result
@@ -2997,6 +3063,19 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
         if let Some(session) = self.sessions.get_mut(&self.session_id) {
             session.inflight_engine_request_id = None;
             session.inflight_engine_method = None;
+            session.discarded_engine_results = session.discarded_engine_results.saturating_add(1);
+        }
+    }
+
+    fn note_discarded_count(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.control
+            .discarded_engine_results
+            .fetch_add(n, Ordering::Relaxed);
+        if let Some(session) = self.sessions.get_mut(&self.session_id) {
+            session.discarded_engine_results = session.discarded_engine_results.saturating_add(n);
         }
     }
 

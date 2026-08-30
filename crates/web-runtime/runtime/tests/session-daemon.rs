@@ -1433,6 +1433,7 @@ fn web_status_reports_observability_fields() {
         "last_crash",
         "unsupported_capability_count",
         "conformance_receipt_id",
+        "discarded_engine_results",
     ] {
         assert!(
             result.get(key).is_some(),
@@ -1617,7 +1618,7 @@ fn one_thousand_session_create_run_close_cycles() {
             }),
         );
         run.deadline_ms = 10_000;
-        let ran = unix_request(&socket, &run, Duration::from_secs(15))
+        let ran = unix_request(&socket, &run, Duration::from_secs(10))
             .unwrap_or_else(|error| panic!("run {i}: {error}"));
         assert_eq!(ran.status, "ok", "run {i}: {ran:?}");
         let closed = unix_request(
@@ -2592,6 +2593,137 @@ fn native_alert_does_not_corrupt_protocol() {
             .unwrap_or("")
             .contains("frame length")
             == false
+    );
+}
+
+#[test]
+fn script_console_log_does_not_corrupt_protocol() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-conlog-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let (path, source) = fixture_source("console-log-stdout.mjs");
+    let _guard = Supervisor::spawn(&socket, "run_conlog", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_conlog",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    let error = ran
+        .error
+        .as_ref()
+        .map(|error| error.message.as_str())
+        .unwrap_or("");
+    assert!(
+        !error.contains("frame length"),
+        "console.log must not corrupt the worker frame channel: {ran:?}"
+    );
+    let stdout = ran
+        .result
+        .as_ref()
+        .and_then(|value| value.get("stdout"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    assert!(
+        stdout.contains("frame-channel-probe"),
+        "script console.log must be returned as stdout, got {stdout:?} in {ran:?}"
+    );
+}
+
+#[test]
+fn stale_engine_result_is_discarded_across_runs() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body>stale-engine</body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-stale-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_stale", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_stale",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto(fixtureUrl);
+const url = await page.url();
+if (!String(url).includes("127.0.0.1")) {
+  throw new Error("unexpected url " + url);
+}
+await browser.close();
+"#;
+    let mut first = Request::new(
+        "run_stale",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "inline",
+            "script_text": first_source,
+        }),
+    );
+    first.deadline_ms = 60_000;
+    let first_ran = unix_request(&socket, &first, Duration::from_secs(60)).expect("first run");
+    assert_eq!(first_ran.status, "ok", "{first_ran:?}");
+    let second_source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+await browser.close();
+"#;
+    let mut second = Request::new(
+        "run_stale",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "inline",
+            "script_text": second_source,
+        }),
+    );
+    second.deadline_ms = 60_000;
+    let second_ran = unix_request(&socket, &second, Duration::from_secs(60)).expect("second run");
+    assert_eq!(second_ran.status, "ok", "{second_ran:?}");
+    let error = second_ran
+        .error
+        .as_ref()
+        .map(|error| error.message.as_str())
+        .unwrap_or("");
+    assert!(
+        !error.contains("unexpected content message"),
+        "late EngineResult from the first run must not poison the second: {second_ran:?}"
+    );
+    let status = unix_request(
+        &socket,
+        &Request::new("run_stale", "web.status", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("status");
+    assert_eq!(status.status, "ok", "{status:?}");
+    assert!(
+        status.result.as_ref().unwrap().get("discarded_engine_results").is_some(),
+        "web.status must expose discarded_engine_results: {status:?}"
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_stale",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
     );
 }
 

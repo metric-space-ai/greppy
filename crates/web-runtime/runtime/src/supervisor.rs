@@ -1,5 +1,5 @@
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
-use crate::protocol::{read_message, write_message, Message, WorkerKind};
+use crate::protocol::{read_message, Message, WorkerKind, MAX_FRAME_BYTES};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -9,11 +9,14 @@ fn emit_line(line: &str) {
     let _ = io::stdout().flush();
 }
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const STDOUT_LOG_CAP: usize = 256 * 1024;
 
 const OWNED_WORKER_SLOTS: usize = 8;
 static OWNED_WORKER_PGIDS: [AtomicU32; OWNED_WORKER_SLOTS] =
@@ -56,6 +59,7 @@ const SCRIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const WORKER_EOF_WAIT: Duration = Duration::from_secs(2);
 const WORKER_REAP_WAIT: Duration = Duration::from_secs(2);
+const TIMEOUT_REAP_WAIT: Duration = Duration::from_millis(100);
 const READER_JOIN_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Eq, PartialEq)]
@@ -315,7 +319,7 @@ fn run_script(
         emit_line("web_runtime.local_origin_grant=project");
     }
     controller.send(&Message::run_script(specifier, source, fixture_url))?;
-    route_until_script_complete(controller, content, SCRIPT_TIMEOUT)
+    route_until_script_complete(controller, content, SCRIPT_TIMEOUT).map(|_| ())
 }
 
 fn fixture_url_grants_project_loopback(fixture_url: &str) -> bool {
@@ -347,6 +351,9 @@ pub(crate) trait EngineGate {
     fn note_discarded_engine_result(&mut self, request_id: u64, ok: bool, error: Option<String>) {
         let _ = (request_id, ok, error);
     }
+    fn note_discarded_count(&mut self, n: u64) {
+        let _ = n;
+    }
     fn inflight_engine_id(&self) -> Option<u64> {
         None
     }
@@ -364,7 +371,7 @@ pub(crate) fn route_until_script_complete(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
     timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<serde_json::Value> {
     route_until_script_complete_gated(controller, content, timeout, AllowAllGate)
 }
 
@@ -373,11 +380,16 @@ pub(crate) fn route_until_script_complete_gated(
     content: &mut WorkerProcess,
     timeout: Duration,
     mut gate: impl EngineGate,
-) -> io::Result<()> {
+) -> io::Result<serde_json::Value> {
     let deadline = Instant::now() + timeout;
     let mut sidecar = 1_u64 << 62;
     let mut pending: Option<(u64, String, serde_json::Value)> = None;
     let mut wait_point = "controller:script-complete".to_owned();
+    let stale = content.discard_stale_engine_results();
+    if stale > 0 {
+        eprintln!("web-runtime: drained {stale} stale content messages before script routing");
+        gate.note_discarded_count(stale);
+    }
     loop {
         gate.poll_control();
         if gate.is_cancelled() {
@@ -405,6 +417,7 @@ pub(crate) fn route_until_script_complete_gated(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            eprintln!("web-runtime: phase run-timeout wait={wait_point}");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -429,11 +442,10 @@ pub(crate) fn route_until_script_complete_gated(
                 wait_point = format!("content:{method}");
                 eprintln!("web-runtime: phase run-wait point={wait_point}");
                 pending = Some((request_id, method.clone(), params.clone()));
-                content.send(&Message::engine_call(
-                    request_id,
-                    method.clone(),
-                    params,
-                ))?;
+                content.send_timeout(
+                    &Message::engine_call(request_id, method.clone(), params),
+                    remaining,
+                )?;
                 gate.note_inflight_engine(request_id, &method);
             }
             Incoming::Content(Message::EngineResult {
@@ -443,7 +455,16 @@ pub(crate) fn route_until_script_complete_gated(
                 error,
                 ..
             }) => {
-                wait_point = "controller:engine-result".to_owned();
+                let matches_pending = pending
+                    .as_ref()
+                    .is_some_and(|(pending_id, _, _)| *pending_id == request_id);
+                if !matches_pending {
+                    gate.note_discarded_engine_result(request_id, ok, error);
+                    eprintln!(
+                        "web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
+                    );
+                    continue;
+                }
                 if ok {
                     if let Some((pending_id, method, params)) = pending.take() {
                         if pending_id == request_id && tally_after(&method) {
@@ -467,7 +488,10 @@ pub(crate) fn route_until_script_complete_gated(
                 } else {
                     pending = None;
                 }
-                controller.send(&Message::engine_result(request_id, ok, result, error))?;
+                controller.send_timeout(
+                    &Message::engine_result(request_id, ok, result, error),
+                    remaining,
+                )?;
                 wait_point = "controller:script-complete".to_owned();
             }
             Incoming::Controller(Message::ScriptComplete {
@@ -479,7 +503,7 @@ pub(crate) fn route_until_script_complete_gated(
                         error.unwrap_or_else(|| result.to_string())
                     )));
                 }
-                return Ok(());
+                return Ok(result);
             }
             Incoming::Controller(message) => {
                 return Err(io::Error::new(
@@ -572,22 +596,39 @@ fn sidecar_engine_call(
     content
         .send(&Message::engine_call(request_id, method.to_owned(), params))
         .map_err(|error| error.to_string())?;
-    match content.recv(timeout) {
-        Ok(Message::EngineResult {
-            request_id: got,
-            ok,
-            result,
-            error,
-            ..
-        }) if got == request_id => {
-            if ok {
-                Ok(result)
-            } else {
-                Err(error.unwrap_or_else(|| format!("{method} sidecar failed")))
-            }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("timed out after {timeout:?} waiting for {method} sidecar"));
         }
-        Ok(other) => Err(format!("unexpected sidecar message {other:?}")),
-        Err(error) => Err(error.to_string()),
+        match content.recv(remaining) {
+            Ok(Message::EngineResult {
+                request_id: got,
+                ok,
+                result,
+                error,
+                ..
+            }) if got == request_id => {
+                return if ok {
+                    Ok(result)
+                } else {
+                    Err(error.unwrap_or_else(|| format!("{method} sidecar failed")))
+                };
+            }
+            Ok(Message::EngineResult {
+                request_id: got,
+                ok,
+                error,
+                ..
+            }) => {
+                eprintln!(
+                    "web-runtime: discarded unmatched sidecar EngineResult id={got} want={request_id} ok={ok} err={error:?}"
+                );
+            }
+            Ok(other) => return Err(format!("unexpected sidecar message {other:?}")),
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
@@ -633,13 +674,62 @@ fn recv_any(
     }
 }
 
+#[cfg(unix)]
+fn poll_writable(fd: i32, timeout: Duration) -> io::Result<()> {
+    let mut fds = [libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    }];
+    let ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+        if n > 0 {
+            if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "worker protocol socket is not writable",
+                ));
+            }
+            return Ok(());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {timeout:?} writing worker protocol"),
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn write_all_timeout(
+    writer: &mut BufWriter<File>,
+    bytes: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        poll_writable(writer.get_mut().as_raw_fd(), timeout)?;
+    }
+    writer.write_all(bytes)?;
+    writer.flush()
+}
+
 pub(crate) struct WorkerProcess {
     worker: WorkerKind,
     capability: String,
     child: Child,
-    input: Option<BufWriter<ChildStdin>>,
+    input: Option<BufWriter<File>>,
     messages: Receiver<io::Result<Message>>,
     reader_thread: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
+    stdout_log: Arc<Mutex<Vec<u8>>>,
+    stdout_drain: Option<JoinHandle<()>>,
     reaped: bool,
 }
 
@@ -702,36 +792,60 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        let mut cap = [0; 2];
+        if unsafe { libc::pipe(cap.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let cap_read = unsafe { OwnedFd::from_raw_fd(cap[0]) };
+        let cap_write = unsafe { OwnedFd::from_raw_fd(cap[1]) };
         unsafe {
-            libc::fcntl(read.as_raw_fd(), libc::F_SETFD, 0);
-            libc::fcntl(write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(cap_read.as_raw_fd(), libc::F_SETFD, 0);
+            libc::fcntl(cap_write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let read_fd = read.into_raw_fd();
-        let mut write = std::fs::File::from(write);
+        let cap_read_fd = cap_read.into_raw_fd();
+        let mut cap_write = std::fs::File::from(cap_write);
+
+        let mut proto = [0; 2];
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, proto.as_mut_ptr()) } != 0
+        {
+            unsafe {
+                libc::close(cap_read_fd);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        let proto_child = unsafe { OwnedFd::from_raw_fd(proto[0]) };
+        let proto_parent = unsafe { OwnedFd::from_raw_fd(proto[1]) };
+        unsafe {
+            libc::fcntl(proto_child.as_raw_fd(), libc::F_SETFD, 0);
+            libc::fcntl(proto_parent.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let proto_child_fd = proto_child.into_raw_fd();
+        let proto_parent_fd = proto_parent.into_raw_fd();
+
         let mut command = Command::new(&path);
         command
             .arg("--internal-role")
             .arg(role)
             .env_clear()
             .envs(inherited_worker_env())
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         command.process_group(0);
         let sandbox_exe = path.clone();
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(read_fd, crate::worker::CAPABILITY_FD) < 0 {
+                if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if read_fd != crate::worker::CAPABILITY_FD {
-                    libc::close(read_fd);
+                if cap_read_fd != crate::worker::CAPABILITY_FD {
+                    libc::close(cap_read_fd);
+                }
+                if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if proto_child_fd != crate::worker::PROTOCOL_FD {
+                    libc::close(proto_child_fd);
                 }
                 let _ = sandbox_exe;
                 Ok(())
@@ -742,7 +856,9 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
         let _ = parent_image()?;
         let mut child = command.spawn().map_err(|error| {
             unsafe {
-                libc::close(read_fd);
+                libc::close(cap_read_fd);
+                libc::close(proto_child_fd);
+                libc::close(proto_parent_fd);
             }
             io::Error::new(
                 error.kind(),
@@ -753,30 +869,62 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             )
         })?;
         unsafe {
-            libc::close(read_fd);
+            libc::close(cap_read_fd);
+            libc::close(proto_child_fd);
         }
         use std::io::Write as _;
-        write.write_all(capability.as_bytes())?;
-        write.write_all(b"\n")?;
-        drop(write);
+        cap_write.write_all(capability.as_bytes())?;
+        cap_write.write_all(b"\n")?;
+        drop(cap_write);
         image.prove_child_or_kill(&mut child)?;
         if let Err(error) = prove_same_executable(child.id()) {
+            unsafe {
+                libc::close(proto_parent_fd);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
 
-        let input = child.stdin.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin was not piped")
-        })?;
-        let output = child.stdout.take().ok_or_else(|| {
+        let proto_read_fd = unsafe { libc::dup(proto_parent_fd) };
+        if proto_read_fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(proto_parent_fd);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        unsafe {
+            libc::fcntl(proto_read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let protocol_write = File::from(unsafe { OwnedFd::from_raw_fd(proto_parent_fd) });
+        let protocol_read = File::from(unsafe { OwnedFd::from_raw_fd(proto_read_fd) });
+        let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdout was not piped")
         })?;
+        let stdout_log = Arc::new(Mutex::new(Vec::new()));
+        let drain_buf = Arc::clone(&stdout_log);
+        let stdout_drain = match thread::Builder::new()
+            .name(format!("web-runtime-{worker:?}-stdout-drain"))
+            .spawn(move || drain_worker_stdout(stdout, drain_buf))
+        {
+            Ok(stdout_drain) => stdout_drain,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn {worker:?} stdout drain: {error}"),
+                ));
+            }
+        };
         let (message_sender, messages) = mpsc::channel();
         let reader_thread = match thread::Builder::new()
             .name(format!("web-runtime-{worker:?}-protocol-reader"))
             .spawn(move || {
-                let mut output = BufReader::new(output);
+                let mut output = BufReader::new(protocol_read);
                 loop {
                     match read_message(&mut output) {
                         Ok(message) => {
@@ -807,11 +955,31 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             worker,
             capability,
             child,
-            input: Some(BufWriter::new(input)),
+            input: Some(BufWriter::new(protocol_write)),
             messages,
             reader_thread: Some(reader_thread),
+            stdout_log,
+            stdout_drain: Some(stdout_drain),
             reaped: false,
         })
+}
+
+fn drain_worker_stdout(mut stdout: std::process::ChildStdout, log: Arc<Mutex<Vec<u8>>>) {
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                let mut log = log.lock().unwrap_or_else(|error| error.into_inner());
+                if log.len() < STDOUT_LOG_CAP {
+                    let take = n.min(STDOUT_LOG_CAP - log.len());
+                    log.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 
@@ -1183,6 +1351,14 @@ impl WorkerProcess {
     }
 
     pub(crate) fn kill_tree(&mut self) {
+        self.kill_tree_wait(WORKER_REAP_WAIT, READER_JOIN_WAIT);
+    }
+
+    pub(crate) fn kill_tree_now(&mut self) {
+        self.kill_tree_wait(TIMEOUT_REAP_WAIT, Duration::from_millis(50));
+    }
+
+    fn kill_tree_wait(&mut self, reap_wait: Duration, reader_wait: Duration) {
         let pid = self.child.id();
         eprintln!(
             "web-runtime: phase {:?}-reap start pid={pid}",
@@ -1190,7 +1366,7 @@ impl WorkerProcess {
         );
         unregister_owned_worker(pid);
         kill_process_tree(pid);
-        let deadline = Instant::now() + WORKER_REAP_WAIT;
+        let deadline = Instant::now() + reap_wait;
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => break,
@@ -1205,7 +1381,7 @@ impl WorkerProcess {
         }
         self.reaped = true;
         self.input.take();
-        self.join_reader_bounded(READER_JOIN_WAIT);
+        self.join_reader_bounded(reader_wait);
         eprintln!("web-runtime: phase {:?}-reap done pid={pid}", self.worker);
     }
 
@@ -1242,10 +1418,45 @@ impl WorkerProcess {
     }
 
     pub(crate) fn send(&mut self, message: &Message) -> io::Result<()> {
+        self.send_timeout(message, PROCESS_TIMEOUT)
+    }
+
+    pub(crate) fn send_timeout(
+        &mut self,
+        message: &Message,
+        timeout: Duration,
+    ) -> io::Result<()> {
         let input = self.input.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin is already closed")
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker protocol socket is already closed",
+            )
         })?;
-        write_message(input, message)
+        let payload = serde_json::to_vec(message).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cannot encode protocol JSON: {error}"),
+            )
+        })?;
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "encoded frame length {} exceeds {MAX_FRAME_BYTES}-byte limit",
+                    payload.len()
+                ),
+            ));
+        }
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded frame length does not fit in u32",
+            )
+        })?;
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        write_all_timeout(input, &frame, timeout)
     }
 
     fn expect(&mut self, expected: Message) -> io::Result<()> {
@@ -1303,6 +1514,14 @@ impl WorkerProcess {
     }
 
     fn join_reader_bounded(&mut self, timeout: Duration) {
+        if let Some(drain) = self.stdout_drain.take() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = drain.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(timeout);
+        }
         let Some(reader) = self.reader_thread.take() else {
             return;
         };
@@ -1317,6 +1536,43 @@ impl WorkerProcess {
                 self.worker
             );
         }
+    }
+
+    pub(crate) fn discard_stale_engine_results(&mut self) -> u64 {
+        let mut discarded = 0;
+        loop {
+            match self.messages.try_recv() {
+                Ok(Ok(Message::EngineResult {
+                    request_id,
+                    ok,
+                    error,
+                    ..
+                })) => {
+                    discarded += 1;
+                    eprintln!(
+                        "web-runtime: discarded stale EngineResult id={request_id} ok={ok} err={error:?}"
+                    );
+                }
+                Ok(Ok(other)) => {
+                    discarded += 1;
+                    eprintln!("web-runtime: discarded leftover content message {other:?}");
+                }
+                Ok(Err(error)) => {
+                    eprintln!("web-runtime: discarded leftover content read error {error}");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        discarded
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stdout_snapshot(&self) -> Vec<u8> {
+        self.stdout_log
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 }
 

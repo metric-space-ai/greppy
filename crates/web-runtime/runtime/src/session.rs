@@ -35,6 +35,7 @@ pub struct Session {
     pub started: Instant,
     pub inflight_engine_request_id: Option<u64>,
     pub inflight_engine_method: Option<String>,
+    pub discarded_engine_results: u64,
     pub persistent_profile: Option<String>,
 }
 
@@ -60,6 +61,7 @@ impl Session {
             started: Instant::now(),
             inflight_engine_request_id: None,
             inflight_engine_method: None,
+            discarded_engine_results: 0,
             persistent_profile: None,
         }
     }

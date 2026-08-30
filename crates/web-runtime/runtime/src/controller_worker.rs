@@ -1,5 +1,6 @@
 use crate::protocol::{read_message, timeout_ms_from_json, write_message, Message, WorkerKind};
 use crate::worker::require_worker_auth;
+use std::fs::File;
 use deno_core::error::CoreError;
 use deno_core::url::Url;
 use deno_core::{
@@ -28,12 +29,13 @@ const ENGINE_RPC_HEADROOM_MS: u64 = 250;
 #[derive(Clone)]
 struct EngineBridge {
     next_id: Arc<AtomicU64>,
-    stdout: Arc<Mutex<io::Stdout>>,
+    stdout: Arc<Mutex<File>>,
+    script_stdout: Arc<Mutex<Vec<String>>>,
     pending: Arc<
         Mutex<
             HashMap<
                 u64,
-                deno_core::futures::channel::oneshot::Sender<Result<serde_json::Value, String>>,
+                tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
             >,
         >,
     >,
@@ -182,7 +184,7 @@ async fn op_engine_call(
         let state = state.borrow();
         let bridge = state.borrow::<EngineBridge>();
         let request_id = bridge.next_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = deno_core::futures::channel::oneshot::channel();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         bridge
             .pending
             .lock()
@@ -222,9 +224,20 @@ async fn op_engine_call(
     }
 }
 
+#[op2(fast)]
+fn op_capture_stdout(state: Rc<RefCell<OpState>>, #[string] line: String) {
+    let state = state.borrow();
+    let bridge = state.borrow::<EngineBridge>();
+    bridge
+        .script_stdout
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(line);
+}
+
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);
@@ -246,11 +259,14 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
     )?;
-    let stdout = Arc::new(Mutex::new(io::stdout()));
+    let (mut protocol_in, protocol_out) = crate::worker::take_protocol_channel()?;
+    let stdout = Arc::new(Mutex::new(protocol_out));
     let pending = Arc::new(Mutex::new(HashMap::new()));
+    let script_stdout = Arc::new(Mutex::new(Vec::new()));
     let bridge = EngineBridge {
         next_id: Arc::new(AtomicU64::new(1)),
         stdout: Arc::clone(&stdout),
+        script_stdout: Arc::clone(&script_stdout),
         pending: Arc::clone(&pending),
     };
     let mut runtime = new_js_runtime(bridge.clone(), None);
@@ -258,11 +274,10 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
         .execute_script("<web-controller-worker>", "1 + 1")
         .map_err(|error| io::Error::other(format!("JavaScript startup probe failed: {error}")))?;
     install_process_env_allow_list(&mut runtime)?;
+    install_console_capture(&mut runtime)?;
 
     {
-        let stdin = io::stdin();
-        let mut stdin = stdin.lock();
-        match read_message(&mut stdin)? {
+        match read_message(&mut protocol_in)? {
             Message::Hello {
                 worker: WorkerKind::Controller,
                 capability: hello_capability,
@@ -284,7 +299,7 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     thread::Builder::new()
         .name("web-controller-protocol-reader".to_owned())
         .spawn(move || {
-            let mut stdin = io::stdin();
+            let mut stdin = protocol_in;
             loop {
                 match read_message(&mut stdin) {
                     Ok(Message::EngineResult {
@@ -353,6 +368,12 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                 drop(runtime);
                 runtime = new_js_runtime(bridge.clone(), granted_script_root(&specifier));
                 install_process_env_allow_list(&mut runtime)?;
+                install_console_capture(&mut runtime)?;
+                bridge
+                    .script_stdout
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
                 let result = run_script(
                     &tokio_runtime,
                     &mut runtime,
@@ -360,15 +381,21 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     source,
                     fixture_url,
                 );
+                let captured = bridge
+                    .script_stdout
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .join("\n");
+                let payload = serde_json::json!({ "stdout": captured });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
                     Ok(()) => write_message(
                         &mut *stdout,
-                        &Message::script_complete(true, serde_json::Value::Null, None),
+                        &Message::script_complete(true, payload, None),
                     )?,
                     Err(error) => write_message(
                         &mut *stdout,
-                        &Message::script_complete(false, serde_json::Value::Null, Some(error)),
+                        &Message::script_complete(false, payload, Some(error)),
                     )?,
                 }
             }
@@ -399,6 +426,39 @@ fn install_process_env_allow_list(runtime: &mut JsRuntime) -> io::Result<()> {
             "globalThis.process = Object.freeze({ env: Object.freeze({ NODE_ENV: \"production\" }) });",
         )
         .map_err(|error| io::Error::other(format!("process.env allow-list failed: {error}")))?;
+    Ok(())
+}
+
+fn install_console_capture(runtime: &mut JsRuntime) -> io::Result<()> {
+    runtime
+        .execute_script(
+            "<greppy-console-capture>",
+            r#"
+(function () {
+  const ops = Deno.core.ops;
+  const capture = (args) => {
+    const line = Array.prototype.map.call(args, (value) => {
+      if (typeof value === "string") return value;
+      try { return JSON.stringify(value); } catch (_error) { return String(value); }
+    }).join(" ");
+    try { ops.op_capture_stdout(line); } catch (_error) {}
+  };
+  const wrap = (method) => {
+    const original = console[method].bind(console);
+    console[method] = function () {
+      capture(arguments);
+      return original.apply(console, arguments);
+    };
+  };
+  wrap("log");
+  wrap("info");
+  wrap("warn");
+  wrap("error");
+  wrap("debug");
+})();
+"#,
+        )
+        .map_err(|error| io::Error::other(format!("console capture hook failed: {error}")))?;
     Ok(())
 }
 

@@ -4138,39 +4138,16 @@ fn is_parent_eof(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(unix)]
-fn steal_protocol_stdout() -> io::Result<std::fs::File> {
-    use std::os::fd::{AsFd, AsRawFd};
-    let protocol = std::io::stdout().as_fd().try_clone_to_owned()?;
-    let err = std::io::stderr().as_raw_fd();
-    let rc = unsafe { libc::dup2(err, libc::STDOUT_FILENO) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(std::fs::File::from(protocol))
-}
-
-#[cfg(not(unix))]
-fn steal_protocol_stdout() -> io::Result<std::fs::File> {
-    // Best-effort: keep stdout as the protocol stream on non-Unix.
-    use std::os::fd::AsFd;
-    Ok(std::fs::File::from(
-        std::io::stdout().as_fd().try_clone_to_owned()?,
-    ))
-}
-
 pub fn run() -> io::Result<()> {
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
     )?;
-    let mut protocol_out = steal_protocol_stdout()?;
+    let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
     let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    match read_message(&mut stdin)? {
+    match read_message(&mut protocol_in)? {
         Message::Hello {
             worker: WorkerKind::Content,
             capability: hello_capability,
@@ -4183,7 +4160,6 @@ pub fn run() -> io::Result<()> {
             ));
         }
     }
-    drop(stdin);
     write_message(&mut protocol_out, &Message::ready(WorkerKind::Content))?;
 
     let (tx, rx) = mpsc::channel();
@@ -4191,7 +4167,7 @@ pub fn run() -> io::Result<()> {
     thread::Builder::new()
         .name("web-content-protocol-reader".to_owned())
         .spawn(move || {
-            let mut stdin = io::stdin();
+            let mut stdin = protocol_in;
             loop {
                 match read_message(&mut stdin) {
                     Ok(message) => {
