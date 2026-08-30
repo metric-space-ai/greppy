@@ -1127,6 +1127,64 @@ fn image_digest_cache_path(_path: &Path, meta: &std::fs::Metadata) -> PathBuf {
 }
 
 #[cfg(unix)]
+fn digest_from_sha256sums(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let hex = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if hex.len() == 64
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            && (name == "web-runtime"
+                || name == "bin/web-runtime"
+                || name.ends_with("/web-runtime"))
+        {
+            return Some(hex.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn prefill_digest_cache_from_dist(exe: &Path, meta: &std::fs::Metadata) {
+    let Some(parent) = exe.parent() else {
+        return;
+    };
+    for sums in [parent.join("SHA256SUMS"), parent.join("..").join("SHA256SUMS")] {
+        let Ok(text) = fs::read_to_string(&sums) else {
+            continue;
+        };
+        if let Some(digest) = digest_from_sha256sums(&text) {
+            store_image_digest_cache(exe, meta, &digest);
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reap_stale_image_digest_caches(keep: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let needle = format!("-{}-", keep.ino());
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("greppy-web-image-") || !name.ends_with(".sha256") {
+            continue;
+        }
+        if name.contains(&needle) {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+#[cfg(unix)]
 fn load_image_digest_cache(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
     let cached = fs::read_to_string(image_digest_cache_path(path, meta)).ok()?;
     let digest = cached.trim().to_owned();
@@ -1148,6 +1206,8 @@ fn observe_image(path: &Path, digest: bool) -> io::Result<ImageId> {
     let path = fs::canonicalize(path)?;
     let meta = fs::metadata(&path)?;
     let sha256 = if digest {
+        reap_stale_image_digest_caches(&meta);
+        prefill_digest_cache_from_dist(&path, &meta);
         if let Some(cached) = load_image_digest_cache(&path, &meta) {
             eprintln!("web-runtime: phase parent-image cache-hit");
             cached
@@ -1603,6 +1663,16 @@ impl Drop for WorkerProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_from_sha256sums_reads_bin_web_runtime() {
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  bin/web-runtime\n";
+        assert_eq!(
+            digest_from_sha256sums(text).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(digest_from_sha256sums("not-a-sum\n"), None);
+    }
 
     #[test]
     fn loopback_fixture_url_grants_project_profile() {

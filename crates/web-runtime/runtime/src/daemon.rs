@@ -268,6 +268,29 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         );
     }
     let started = Instant::now();
+    let attach = crate::worker::take_parent_attach_token().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "supervisor requires inherited attach token on fd 4",
+        )
+    })?;
+    eprintln!(
+        "web-runtime: phase bind-socket socket={}",
+        config.socket.display()
+    );
+    let listener = UnixListener::bind(&config.socket)?;
+    let mut permissions = std::fs::metadata(&config.socket)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&config.socket, permissions)?;
+    eprintln!("web-runtime: phase listening");
+    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
+    let early_control = Arc::new(RunControl::new());
+    let accept_attach = attach.clone();
+    let accept_control = Arc::clone(&early_control);
+    thread::Builder::new()
+        .name("web-runtime-accept".into())
+        .spawn(move || accept_loop(listener, tx, accept_control, accept_attach))
+        .map_err(io::Error::other)?;
     match crate::supervisor::warmup_parent_image() {
         Ok(hash) => eprintln!(
             "web-runtime: phase parent-image elapsed_ms={}",
@@ -279,27 +302,11 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         "web-runtime: phase start-workers socket={}",
         config.socket.display()
     );
-    let mut daemon = Daemon::start(config)?;
-    eprintln!(
-        "web-runtime: phase bind-socket socket={}",
-        daemon.socket.display()
-    );
-    let listener = UnixListener::bind(&daemon.socket)?;
-    let mut permissions = std::fs::metadata(&daemon.socket)?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(&daemon.socket, permissions)?;
-    eprintln!("web-runtime: phase listening");
+    let mut daemon = Daemon::start(config, attach, Arc::clone(&early_control))?;
     eprintln!(
         "web-runtime: phase request-ready elapsed_ms={}",
         started.elapsed().as_millis()
     );
-    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
-    let control = Arc::clone(&daemon.run_control);
-    let attach = daemon.attach_capability.clone();
-    thread::Builder::new()
-        .name("web-runtime-accept".into())
-        .spawn(move || accept_loop(listener, tx, control, attach))
-        .map_err(io::Error::other)?;
     loop {
         let (mut stream, request) = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(pair) => pair,
@@ -591,13 +598,11 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(config: DaemonConfig) -> io::Result<Self> {
-        let attach_capability = crate::worker::take_parent_attach_token().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "supervisor requires inherited attach token on fd 4",
-            )
-        })?;
+    fn start(
+        config: DaemonConfig,
+        attach_capability: String,
+        run_control: Arc<RunControl>,
+    ) -> io::Result<Self> {
         // Controller (V8) and content (Servo) init independently. Sequential handshake
         // of the 400MB image exceeded the 30s socket wait and panicked wait_for_accepting
         // before bind, leaving in-flight process-group leaders reparented to PID 1.
@@ -633,7 +638,6 @@ impl Daemon {
             .map_err(|_| io::Error::other("content spawn thread panicked"))??;
         eprintln!("web-runtime: phase workers-ready");
         let data_root = data_root(&config.run_id);
-        let run_control = Arc::new(RunControl::new());
         run_control
             .controller_pid
             .store(controller.pid(), Ordering::Relaxed);
