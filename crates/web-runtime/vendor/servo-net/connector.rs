@@ -607,9 +607,28 @@ impl std::fmt::Display for ConnectionError {
 
 impl std::error::Error for ConnectionError {}
 
-#[derive(Clone)]
+fn ensure_explicit_port(dest: Destination) -> Destination {
+    let default = match dest.scheme_str() {
+        Some("http") => 80u16,
+        Some("https") => 443,
+        _ => return dest,
+    };
+    let Some(auth) = dest.authority() else {
+        return dest;
+    };
+    if auth.port_u16().is_some() {
+        return dest;
+    }
+    let Ok(authority) = Authority::from_maybe_shared(format!("{}:{default}", auth.host())) else {
+        return dest;
+    };
+    let mut parts = dest.clone().into_parts();
+    parts.authority = Some(authority);
+    Destination::from_parts(parts).unwrap_or(dest)
+}
 /// A proxy connector. This will automatically open a proxy connection if the uri matches the proxy uri.
 /// Also respects 'no_proxy'.
+#[derive(Clone)]
 pub struct ProxyConnector {
     /// A client without proxy for `no_proxy` matches.
     client: ServoHttpConnector,
@@ -644,6 +663,7 @@ impl Service<Destination> for ProxyConnector {
     }
 
     fn call(&mut self, req: Destination) -> Self::Future {
+        let req = ensure_explicit_port(req);
         match self.matcher.intercept(&req) {
             Some(intercept) => {
                 let mut tunnel = Tunnel::new(intercept.uri().clone(), self.client.clone());

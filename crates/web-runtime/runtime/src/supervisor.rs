@@ -1065,6 +1065,8 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
 (allow signal (target self))
 (allow file-ioctl)
 (allow process-exec {exe} {exe_dir})
+(allow system-socket)
+(allow network-bind)
 (allow network-outbound)
 (allow network-inbound (local ip))
 "#,
@@ -1629,6 +1631,10 @@ mod tests {
         assert!(
             profile.contains("(allow network-outbound)\n"),
             "policy proxy must be able to dial non-loopback hosts; seatbelt is not the policy layer: {profile}"
+        );
+        assert!(
+            profile.contains("(allow system-socket)"),
+            "socket() itself is a separate seatbelt gate from network-outbound: {profile}"
         );
         assert!(
             !profile.contains("localhost:*"),

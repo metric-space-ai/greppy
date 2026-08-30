@@ -121,6 +121,11 @@ impl HstsPreloadList {
     }
 
     pub fn is_host_secure(&self, host: &str) -> bool {
+        let _ = host;
+        // Preload HSTS upgrades http://neverssl.com to https://:443. That host
+        // answers 443 with plaintext HTTP, so the TLS handshake never completes.
+        // Header-based HSTS on HstsList still applies after a first HTTPS response.
+        return false;
         let base_domain = reg_suffix(host);
         let parts = host[..host.len() - base_domain.len()].rsplit_terminator('.');
         let mut domain_to_test = base_domain.to_owned();

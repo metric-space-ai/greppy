@@ -2873,8 +2873,16 @@ const url = page.url();
 if (typeof url !== "string" || !url.includes("neverssl.com")) {
   throw new Error("expected neverssl.com, got " + url);
 }
-if (!resp || typeof resp.status !== "function" || resp.status() < 200) {
-  throw new Error("goto failed: " + (resp && resp.status && resp.status()));
+if (!resp || typeof resp.status !== "function" || resp.status() !== 200) {
+  throw new Error("goto status " + (resp && resp.status && resp.status()));
+}
+const html = await page.content();
+if (html.length < 1000) {
+  throw new Error("document too small (" + html.length + "): " + html);
+}
+const text = await page.evaluate(() => (document.body && document.body.innerText) || "");
+if (text.includes("Could not load the requested page")) {
+  throw new Error("servo error page: " + text.slice(0, 120));
 }
 await browser.close();
 "#;

@@ -1,6 +1,6 @@
 //! Connect-time HTTP/HTTPS proxy that dials only policy-pinned SocketAddrs.
 
-use crate::policy::{decide_host_literal, pin_connect_addr_with, SharedProfile, UrlDecision};
+use crate::policy::{allowed_connect_addrs, decide_host_literal, SharedProfile, UrlDecision};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -9,7 +9,33 @@ use std::time::Duration;
 use url::Url;
 
 const HEADER_LIMIT: usize = 64 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn connect_allowed(
+    profile: crate::policy::NetworkProfile,
+    host: &str,
+    port: u16,
+    resolve: &ConnectResolve,
+) -> io::Result<TcpStream> {
+    let mut addrs = allowed_connect_addrs(profile, host, port, |h, p| resolve(h, p))
+        .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))?;
+    addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
+    let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no allowed address");
+    for addr in addrs {
+        eprintln!("web-runtime: policy-proxy dial {host}:{port} -> {addr}");
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                eprintln!("web-runtime: policy-proxy connected {addr}");
+                return Ok(stream);
+            }
+            Err(error) => {
+                eprintln!("web-runtime: policy-proxy dial {addr} failed: {error}");
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
+}
 
 pub(crate) type ConnectResolve =
     Arc<dyn Fn(&str, u16) -> Result<Vec<SocketAddr>, &'static str> + Send + Sync>;
@@ -97,19 +123,20 @@ fn handle_connect(
     resolve: ConnectResolve,
     target: &str,
 ) -> io::Result<()> {
-    let (host, port) = split_host_port(target, 443);
-    match pin_connect_addr_with(profile.get(), &host, port, |h, p| resolve(h, p)) {
-        Ok(addr) => {
-            let server = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    eprintln!("web-runtime: policy-proxy CONNECT target={target}");
+    let (host, port) = split_host_port(target, 80);
+    match connect_allowed(profile.get(), &host, port, &resolve) {
+        Ok(server) => {
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
             splice(client, server)
         }
-        Err(_) => {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             client.write_all(
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )?;
             Ok(())
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -136,16 +163,16 @@ fn handle_forward(
         )?;
         return Ok(false);
     }
-    let addr = match pin_connect_addr_with(profile.get(), &host, port, |h, p| resolve(h, p)) {
-        Ok(addr) => addr,
-        Err(_) => {
+    let mut server = match connect_allowed(profile.get(), &host, port, resolve) {
+        Ok(server) => server,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             client.write_all(
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )?;
             return Ok(false);
         }
+        Err(error) => return Err(error),
     };
-    let mut server = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     let mut rewritten = rewrite_request_line(head, &path);
     if !rewritten.contains("\r\nHost:") && !rewritten.to_ascii_lowercase().contains("\r\nhost:") {
         let host_header = if port == 80 {

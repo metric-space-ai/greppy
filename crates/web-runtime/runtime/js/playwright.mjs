@@ -1898,9 +1898,9 @@ class Page {
       this._emitLoad();
       return this._responseFromRecord({
         url: this._url,
-        status: result.status == null ? 200 : Number(result.status),
-        statusText: result.statusText || (Number(result.status) < 400 ? "OK" : ""),
-        ok: result.ok == null ? Number(result.status || 200) < 400 : !!result.ok,
+        status: result.status == null ? 0 : Number(result.status),
+        statusText: result.statusText || "",
+        ok: result.ok == null ? false : !!result.ok,
         headers: result.headers || {},
       });
     } catch (error) {

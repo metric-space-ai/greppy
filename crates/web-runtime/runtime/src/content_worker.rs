@@ -853,6 +853,7 @@ impl ContentEngine {
         preferences.network_http_proxy_uri = proxy.uri();
         preferences.network_https_proxy_uri = proxy.uri();
         preferences.network_http_no_proxy = String::new();
+        preferences.network_enforce_tls_enabled = false;
         let wake = WakeFlag::new();
         let servo = ServoBuilder::default()
             .preferences(preferences)
@@ -1700,24 +1701,48 @@ impl ContentEngine {
                         .and_then(|value| value.as_str())
                         .is_some_and(|recorded_url| recorded_url == final_url)
                 });
-                let status = matched
+                let http = url.scheme() == "http" || url.scheme() == "https";
+                let recorded_status = matched
                     .and_then(|row| row.get("status"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(200);
+                    .and_then(|value| value.as_u64());
                 let status_text = matched
                     .and_then(|row| row.get("statusText"))
                     .and_then(|value| value.as_str())
-                    .unwrap_or(if status < 400 { "OK" } else { "" })
+                    .unwrap_or("")
                     .to_owned();
                 let headers = matched
                     .and_then(|row| row.get("headers"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 drop(recorded);
+                let text = match self.evaluate(
+                    webview.clone(),
+                    "(document.body && document.body.innerText) || \"\"",
+                ) {
+                    Ok(JSValue::String(text)) => text,
+                    _ => String::new(),
+                };
+                if text.contains("Could not load the requested page") {
+                    return Err(io::Error::other(format!("navigation failed: {text}")));
+                }
+                let html = match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
+                    Ok(JSValue::String(html)) => html,
+                    _ => String::new(),
+                };
+                if http && recorded_status.is_none() && html.len() < 500 {
+                    return Err(io::Error::other(format!(
+                        "navigation failed: no HTTP response for {url}"
+                    )));
+                }
+                let status = recorded_status.unwrap_or(200);
                 Ok(json!({
                     "url": final_url,
                     "status": status,
-                    "statusText": status_text,
+                    "statusText": if status_text.is_empty() && status < 400 {
+                        "OK".to_owned()
+                    } else {
+                        status_text
+                    },
                     "ok": status < 400,
                     "headers": headers,
                 }))

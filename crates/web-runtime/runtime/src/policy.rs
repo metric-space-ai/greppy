@@ -164,21 +164,21 @@ pub(crate) fn default_resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, 
         .map_err(|_| "DNS resolution failed")
 }
 
-pub fn pin_connect_addr_with(
+pub fn allowed_connect_addrs(
     profile: NetworkProfile,
     host: &str,
     port: u16,
     resolve: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, &'static str>,
-) -> Result<SocketAddr, &'static str> {
+) -> Result<Vec<SocketAddr>, &'static str> {
     let host = host.trim_matches(|ch| ch == '[' || ch == ']');
     if let Ok(ip) = host.parse::<IpAddr>() {
         return match decide_ip(profile, ip) {
-            UrlDecision::Allow => Ok(SocketAddr::new(ip, port)),
+            UrlDecision::Allow => Ok(vec![SocketAddr::new(ip, port)]),
             UrlDecision::Deny { reason } => Err(reason),
         };
     }
     if host.eq_ignore_ascii_case("localhost") {
-        return pin_connect_addr_with(profile, "127.0.0.1", port, resolve);
+        return allowed_connect_addrs(profile, "127.0.0.1", port, resolve);
     }
     match decide_host_literal(profile, host) {
         UrlDecision::Deny { reason } => return Err(reason),
@@ -188,21 +188,33 @@ pub fn pin_connect_addr_with(
     if addrs.is_empty() {
         return Err("DNS resolution failed");
     }
-    let mut first_allowed = None;
+    let mut allowed = Vec::new();
     for addr in addrs {
         match decide_ip(profile, addr.ip()) {
             UrlDecision::Deny {
                 reason: "cloud metadata endpoint denied",
             } => return Err("cloud metadata endpoint denied"),
             UrlDecision::Deny { .. } => {}
-            UrlDecision::Allow => {
-                if first_allowed.is_none() {
-                    first_allowed = Some(addr);
-                }
-            }
+            UrlDecision::Allow => allowed.push(addr),
         }
     }
-    first_allowed.ok_or("LAN and non-public endpoints denied")
+    if allowed.is_empty() {
+        Err("LAN and non-public endpoints denied")
+    } else {
+        Ok(allowed)
+    }
+}
+
+pub fn pin_connect_addr_with(
+    profile: NetworkProfile,
+    host: &str,
+    port: u16,
+    resolve: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, &'static str>,
+) -> Result<SocketAddr, &'static str> {
+    allowed_connect_addrs(profile, host, port, resolve)?
+        .into_iter()
+        .next()
+        .ok_or("LAN and non-public endpoints denied")
 }
 
 fn is_metadata_host(host: &str) -> bool {
