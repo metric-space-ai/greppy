@@ -48,6 +48,30 @@ fn web_status_json_is_unavailable_without_runtime_bins() {
 }
 
 #[test]
+fn web_runtime_is_a_subcommand() {
+    let (code, stdout, stderr) = run(&["web", "--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stdout.contains("runtime"),
+        "web --help must list runtime, stdout={stdout}"
+    );
+}
+
+#[test]
+fn web_runtime_status_does_not_spawn_and_reports_not_running() {
+    let started = Instant::now();
+    let (code, stdout, stderr) = run(&["web", "runtime", "status", "--json"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "runtime status must not hash/spawn the engine, elapsed={:?}",
+        started.elapsed()
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("\"running\":false") || stdout.contains("\"running\": false"));
+    assert!(stdout.contains("greppy.web-runtime.v1"));
+}
+
+#[test]
 fn web_run_requires_session() {
     let (code, stdout, _stderr) = run(&["web", "run", "--script-file", "x.js", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");

@@ -211,10 +211,68 @@ pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
             json!({ "session_id": session, "seq": seq.unwrap_or(1) }),
             session,
         ),
+        WebCommand::Runtime { command } => match command {
+            WebRuntimeCommand::Status { json } => runtime_status(json, root),
+            WebRuntimeCommand::Stop { json } => runtime_stop(json, root),
+            WebRuntimeCommand::Restart { json } => runtime_restart(json, root),
+        },
     }
 }
 
 fn status(json: bool, root: Option<&str>) -> Result<i32> {
+    match ensure_supervisor(root, &SupervisorSpawn::default()) {
+        Ok(ctx) => rpc_on(&ctx, json, "web.status", json!({}), None),
+        Err(error) => emit_error(json, error),
+    }
+}
+
+fn runtime_run_id(root: Option<&str>) -> (String, String) {
+    let run_id =
+        std::env::var("GREPPY_RUN_ID").unwrap_or_else(|_| format!("run_{}", std::process::id()));
+    let identity = match root {
+        Some(root) => format!("{run_id}:{root}"),
+        None => run_id.clone(),
+    };
+    (run_id, identity)
+}
+
+fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
+    let (run_id, identity) = runtime_run_id(root);
+    let Some(socket) = web_runtime_socket(&identity) else {
+        return emit_error(json, unavailable("cannot allocate web-runtime socket"));
+    };
+    let running = socket_connected(&socket);
+    let owned = match crate::web_attach::current_token() {
+        Some(capability) if running => socket_is_live(&socket, &run_id, &capability),
+        _ => false,
+    };
+    let payload = json!({
+        "schema": SCHEMA,
+        "status": "ok",
+        "result": {
+            "running": running,
+            "owned": owned,
+            "run_id": run_id,
+            "socket": socket,
+        }
+    });
+    emit_web(json, &payload)?;
+    Ok(0)
+}
+
+fn runtime_stop(json: bool, root: Option<&str>) -> Result<i32> {
+    shutdown_if_running();
+    runtime_status(json, root)
+}
+
+fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
+    if let Err(error) = crate::web_attach::claim_persistent_parent() {
+        return emit_error(
+            json,
+            unavailable(&format!("failed to claim runtime owner: {error}")),
+        );
+    }
+    shutdown_if_running();
     match ensure_supervisor(root, &SupervisorSpawn::default()) {
         Ok(ctx) => rpc_on(&ctx, json, "web.status", json!({}), None),
         Err(error) => emit_error(json, error),

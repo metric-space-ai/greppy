@@ -865,6 +865,11 @@ pub enum WebCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Long-lived runtime owner: status, stop, restart.
+    Runtime {
+        #[command(subcommand)]
+        command: WebRuntimeCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -881,6 +886,25 @@ pub enum WebSessionCommand {
     },
     Close {
         session: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebRuntimeCommand {
+    /// Report whether the owner is running. Does not spawn.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shut down the owner if this process holds the attach token.
+    Stop {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restart the owner and leave it running.
+    Restart {
         #[arg(long)]
         json: bool,
     },
