@@ -979,6 +979,14 @@ fn observe_read_search_research_screenshot_and_policy() {
             .unwrap()
             > 0
     );
+    assert!(
+        shot.result.as_ref().unwrap()["png_base64"]
+            .as_str()
+            .unwrap_or("")
+            .len()
+            > 32,
+        "screenshot must return png bytes for the model: {shot:?}"
+    );
 
     let artifacts = unix_request(
         &socket,
@@ -2779,6 +2787,94 @@ await browser.close();
 }
 
 #[test]
+fn web_screenshot_returns_inline_png_bytes() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body><p>shot</p></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-pngb64-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_pngb64", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_pngb64",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_pngb64",
+            "web.read",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+    let shot = unix_request(
+        &socket,
+        &Request::new(
+            "run_pngb64",
+            "web.screenshot",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("screenshot");
+    assert_eq!(shot.status, "ok", "{shot:?}");
+    let b64 = shot.result.as_ref().unwrap()["png_base64"].as_str().unwrap_or("");
+    assert!(b64.len() > 32, "png_base64 missing: {shot:?}");
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_pngb64",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn project_profile_can_load_a_public_http_host() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-egress-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_egress", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const resp = await page.goto("http://neverssl.com/");
+const url = page.url();
+if (typeof url !== "string" || !url.includes("neverssl.com")) {
+  throw new Error("expected neverssl.com, got " + url);
+}
+if (!resp || typeof resp.status !== "function" || resp.status() < 200) {
+  throw new Error("goto failed: " + (resp && resp.status && resp.status()));
+}
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_egress",
+        source,
+        None,
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
 fn default_viewport_is_playwright_1280x720_and_can_be_overridden() {
     let fixture = serve_fixture("<!DOCTYPE html><html><body>viewport</body></html>");
     let socket = std::env::temp_dir().join(format!("greppy-web-vp-{}.sock", std::process::id()));
@@ -4175,6 +4271,14 @@ fn screenshot_payload_output_does_not_write_outside_artifact_store() {
             .len()
             == 64,
         "{shot:?}"
+    );
+    assert!(
+        shot.result.as_ref().unwrap()["png_base64"]
+            .as_str()
+            .unwrap_or("")
+            .len()
+            > 32,
+        "model-visible png_base64 missing: {shot:?}"
     );
     assert!(
         shot.result.as_ref().unwrap()["object_path"]

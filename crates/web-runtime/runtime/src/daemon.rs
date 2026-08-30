@@ -1620,6 +1620,8 @@ impl Daemon {
                                         "digest": manifest.digest.hex,
                                         "byte_count": manifest.byte_count,
                                         "object_path": manifest.object_path,
+                                        "png_base64": b64,
+                                        "media_type": "image/png",
                                     }),
                                 );
                                 response
