@@ -260,6 +260,93 @@ fn arm_deadline_after(label: &'static str, timeout: Duration) -> Deadline {
     Deadline(done)
 }
 
+#[derive(Debug)]
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn at(path: PathBuf) -> Self {
+        reap_orphaned_greppy_web_temps();
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        Self { path }
+    }
+}
+
+impl std::ops::Deref for TempDirGuard {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDirGuard {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempDirGuard {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn reap_orphaned_greppy_web_temps() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let self_pid = std::process::id();
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("greppy-web-") {
+                continue;
+            }
+            let stem = name.trim_end_matches(".sock");
+            let Some(pid_text) = stem.rsplit('-').next() else {
+                continue;
+            };
+            let Ok(pid) = pid_text.parse::<u32>() else {
+                continue;
+            };
+            if pid == self_pid || pid_alive(pid) {
+                continue;
+            }
+            let path = entry.path();
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+    });
+}
+
+
+#[test]
+fn temp_dir_guard_removes_dist_on_drop() {
+    let path;
+    {
+        let dest = TempDirGuard::at(std::env::temp_dir().join(format!(
+            "greppy-web-dist-drop-{}",
+            std::process::id()
+        )));
+        path = dest.to_path_buf();
+        std::fs::create_dir_all(&*dest).unwrap();
+        std::fs::write(dest.join("marker"), b"x").unwrap();
+        assert!(path.exists(), "{}", path.display());
+    }
+    assert!(!path.exists(), "drop must remove {}", path.display());
+}
+
 struct Supervisor {
     child: Child,
     socket: PathBuf,
@@ -355,6 +442,7 @@ impl Supervisor {
         mut command: Command,
         deadline: Duration,
     ) -> Self {
+        reap_orphaned_greppy_web_temps();
         let lock = supervisor_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1685,7 +1773,7 @@ fn local_package_contains_exactly_one_runtime_executable() {
         .join("..")
         .join("scripts")
         .join("package-web-runtime.sh");
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-{}", std::process::id()));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-{}", std::process::id())));
     let status = Command::new("sh")
         .arg(&script)
         .arg(&dest)
@@ -1802,7 +1890,7 @@ fn local_package_contains_exactly_one_runtime_executable() {
 #[test]
 fn package_owned_dist_is_idempotent() {
     let pid = std::process::id();
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-idem-{pid}"));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-idem-{pid}")));
     let _ = std::fs::remove_dir_all(&dest);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
     assert_eq!(code, 0, "first package: stdout={stdout} stderr={stderr}");
@@ -2043,7 +2131,7 @@ fn package_and_uninstall_refuse_hostile_destinations() {
     );
 
     let pid = std::process::id();
-    let canary_dir = std::env::temp_dir().join(format!("greppy-web-dist-canary-{pid}"));
+    let canary_dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-canary-{pid}")));
     let _ = std::fs::remove_dir_all(&canary_dir);
     std::fs::create_dir_all(&canary_dir).unwrap();
     let canary = canary_dir.join("DO_NOT_DELETE");
@@ -2065,8 +2153,8 @@ fn package_and_uninstall_refuse_hostile_destinations() {
     );
     std::fs::remove_dir_all(&canary_dir).unwrap();
 
-    let real = std::env::temp_dir().join(format!("greppy-web-dist-real-{pid}"));
-    let link = std::env::temp_dir().join(format!("greppy-web-dist-link-{pid}"));
+    let real = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-real-{pid}")));
+    let link = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-link-{pid}")));
     let _ = std::fs::remove_dir_all(&real);
     let _ = std::fs::remove_file(&link);
     std::fs::create_dir_all(&real).unwrap();
@@ -2086,8 +2174,8 @@ fn package_and_uninstall_refuse_hostile_destinations() {
 #[test]
 fn install_upgrade_rollback_roundtrip() {
     let pid = std::process::id();
-    let packaged = std::env::temp_dir().join(format!("greppy-web-dist-pkg-{pid}"));
-    let installed = std::env::temp_dir().join(format!("greppy-web-dist-inst-{pid}"));
+    let packaged = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-pkg-{pid}")));
+    let installed = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-inst-{pid}")));
     let _ = std::fs::remove_dir_all(&packaged);
     let _ = std::fs::remove_dir_all(&installed);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&packaged));
@@ -2193,8 +2281,8 @@ fn install_upgrade_rollback_refuse_hostile_destinations() {
 #[test]
 fn package_refuses_bin_directory_symlink_and_preserves_canaries() {
     let pid = std::process::id();
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-binsym-{pid}"));
-    let canary = std::env::temp_dir().join(format!("greppy-web-canary-bins-{pid}"));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-binsym-{pid}")));
+    let canary = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-bins-{pid}")));
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
@@ -2230,9 +2318,9 @@ fn package_refuses_bin_directory_symlink_and_preserves_canaries() {
 #[test]
 fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
     let pid = std::process::id();
-    let src = std::env::temp_dir().join(format!("greppy-web-dist-prevsrc-{pid}"));
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-prevdst-{pid}"));
-    let canary = std::env::temp_dir().join(format!("greppy-web-canary-prev-{pid}"));
+    let src = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-prevsrc-{pid}")));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-prevdst-{pid}")));
+    let canary = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-prev-{pid}")));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
@@ -2271,8 +2359,8 @@ fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
 #[test]
 fn packaging_refuses_later_member_symlink_without_partial_erase() {
     let pid = std::process::id();
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-late-{pid}"));
-    let canary = std::env::temp_dir().join(format!("greppy-web-canary-late-{pid}"));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-late-{pid}")));
+    let canary = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-late-{pid}")));
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
@@ -2324,8 +2412,8 @@ fn packaging_refuses_later_member_symlink_without_partial_erase() {
 #[test]
 fn install_does_not_mutate_dest_when_source_is_incomplete() {
     let pid = std::process::id();
-    let src = std::env::temp_dir().join(format!("greppy-web-dist-badsrc-{pid}"));
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-keep-{pid}"));
+    let src = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-badsrc-{pid}")));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-keep-{pid}")));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
@@ -2506,7 +2594,7 @@ fn download_is_recorded_from_fulfilled_binary() {
 fn file_chooser_accepts_set_input_files() {
     // Component evidence only: worker-visible path storage. Compatibility
     // requires file_chooser_populates_dom_filelist_and_change_events.
-    let dir = std::env::temp_dir().join(format!("greppy-web-upload-{}", std::process::id()));
+    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-upload-{}", std::process::id())));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("sample.txt");
     std::fs::write(&file, b"upload-bytes").unwrap();
@@ -2549,7 +2637,7 @@ fn file_chooser_accepts_set_input_files() {
 
 #[test]
 fn file_chooser_populates_dom_filelist_and_change_events() {
-    let dir = std::env::temp_dir().join(format!("greppy-web-upload-dom-{}", std::process::id()));
+    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-upload-dom-{}", std::process::id())));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("sample.txt");
     std::fs::write(&file, b"upload-bytes").unwrap();
@@ -5794,8 +5882,8 @@ fn content_cpu_limit_is_enforced_by_supervisor() {
 #[test]
 fn install_refuses_mutated_bin_and_leaves_dest_unmutated() {
     let pid = std::process::id();
-    let src = std::env::temp_dir().join(format!("greppy-web-dist-mutsrc-{pid}"));
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-mutdst-{pid}"));
+    let src = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-mutsrc-{pid}")));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-mutdst-{pid}")));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
@@ -5981,8 +6069,8 @@ fn wall_time_limit_is_enforced_by_supervisor() {
 #[test]
 fn install_refuses_incomplete_sha256sums_and_leaves_dest_unmutated() {
     let pid = std::process::id();
-    let src = std::env::temp_dir().join(format!("greppy-web-dist-sumsrc-{pid}"));
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-sumdst-{pid}"));
+    let src = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-sumsrc-{pid}")));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-sumdst-{pid}")));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&src));
@@ -6099,8 +6187,8 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
 #[test]
 fn supervisor_starts_from_stamped_dist_without_worker_flags() {
     let pid = std::process::id();
-    let dist = std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}"));
-    let installed = std::env::temp_dir().join(format!("greppy-web-dist-runinst-{pid}"));
+    let dist = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}")));
+    let installed = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-runinst-{pid}")));
     let _ = std::fs::remove_dir_all(&dist);
     let _ = std::fs::remove_dir_all(&installed);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dist));
@@ -6247,7 +6335,7 @@ fn supervisor_starts_from_stamped_dist_without_worker_flags() {
 #[test]
 fn package_refuses_dest_with_unknown_extra_member() {
     let pid = std::process::id();
-    let dest = std::env::temp_dir().join(format!("greppy-web-dist-extra-{pid}"));
+    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-extra-{pid}")));
     let _ = std::fs::remove_dir_all(&dest);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
     assert_eq!(code, 0, "seed package: stdout={stdout} stderr={stderr}");
