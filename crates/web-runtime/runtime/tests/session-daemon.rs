@@ -436,6 +436,14 @@ fn worker_comm(pid: u32) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+fn process_comm(pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .expect("ps comm");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 fn content_worker_pid(parent: u32) -> Option<u32> {
     child_pids(parent).into_iter().find(|pid| {
         let args = worker_comm(*pid);
@@ -481,6 +489,17 @@ fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
                 continue;
             };
             if pid == self_pid {
+                continue;
+            }
+            // pgrep -lf matches any command line that mentions the binary path,
+            // including zsh -c copy scripts and workers from other worktrees.
+            let comm = process_comm(pid);
+            let is_runtime = comm == "web-runtime" || comm.ends_with("/web-runtime");
+            let is_cliparent = comm.contains("cliparent") || args.contains("run_cliparent");
+            if !is_runtime && !is_cliparent {
+                continue;
+            }
+            if is_runtime && !args.contains(exe) {
                 continue;
             }
             found.push((pid, args.trim().to_owned()));
