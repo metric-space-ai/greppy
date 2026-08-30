@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
-## [Unreleased]
+## [0.3.4] — 2026-08-30
 
 ### Portable Chunk-CoW agent workspaces (0.3.4)
 
@@ -91,6 +91,12 @@ The Windows conformance gate remains fail-closed: official unchanged WinFsp
 them. No Windows release is eligible until the provider substrate satisfies
 the same hard-link semantics as Linux and macOS; the test is neither skipped
 nor emulated with a full file copy.
+
+`index status` now distinguishes an active foreground or first-use index build
+from a missing index before the first atomic snapshot is published. It reports
+`status=indexing`, `writer_active=true`, actionable wait guidance, and temporary
+exit 75 instead of the contradictory `no_index` response that told agents to
+start a second indexer.
 
 ## [0.3.3] — 2026-08-25
 

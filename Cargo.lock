@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "greppy"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "clap",
  "greppy-agent",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-agent"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "blake3",
  "filetime",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "sha2",
  "thiserror 1.0.69",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-discover"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "ignore",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-edit"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "greppy-parser",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-embed-native"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "block2",
  "bytemuck",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-freshness"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "greppy-discover",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-indexer"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "greppy-discover",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-parser"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "bca-tree-sitter-tcl",
  "codebook-tree-sitter-latex",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-passthrough"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "greppy-freshness",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-qwen35-native"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-embed-native",
  "rayon",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-resolver"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "greppy-parser",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-search"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "greppy-embed-native",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-store"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-core",
  "rusqlite",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-workspace-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "blake3",
  "rusqlite",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-workspace-ffi"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "greppy-workspace-core",
  "serde_json",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-workspace-provider"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "cc",
  "clap",

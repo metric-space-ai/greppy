@@ -2261,6 +2261,50 @@ fn held_lock_makes_second_index_exit_75_without_writing() {
     drop(live_lock);
 }
 
+#[cfg(unix)]
+#[test]
+fn status_reports_active_writer_before_first_snapshot_is_published() {
+    let (repo, store, _scratch) = make_repo("active-first-index", "active_index_marker");
+
+    let (code, _out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "fixture index should succeed; stderr={err}");
+
+    let db = find_graph_db(&store).expect("fixture graph.db must exist");
+    let hash = db.parent().unwrap().file_name().unwrap().to_string_lossy();
+    let lock_path = store.join("locks").join(format!("workspace-{hash}.writer"));
+    std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
+    let live_lock = hold_exclusive_lock(&lock_path);
+
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(code, 75, "an active first index is temporary; stderr={err}");
+    assert!(err.is_empty(), "JSON status should not write stderr: {err}");
+    let status: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
+    assert_eq!(status["status"], "indexing");
+    assert_eq!(status["healthy"], false);
+    assert_eq!(status["store_exists"], false);
+    assert_eq!(status["writer_active"], true);
+    assert_eq!(status["background_state"], "refreshing");
+    assert_eq!(status["background_job"], serde_json::Value::Null);
+    assert!(
+        status["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("index build in progress")),
+        "status must explain the live foreground writer: {status}"
+    );
+
+    drop(live_lock);
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(
+        code, 1,
+        "without a writer the missing store is no_index; stderr={err}"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
+    assert_eq!(status["status"], "no_index");
+    assert_eq!(status["writer_active"], false);
+}
+
 #[test]
 fn r3_old_lock_contents_without_os_lock_are_harmless() {
     let (repo, store, _scratch) = make_repo("r3-stale-lock", "stale_lock_marker");

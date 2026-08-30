@@ -56,11 +56,22 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
 
     if !store_path.exists() {
         let store_cow = crate::store_cow::diagnostics_without_store(&effective_root, &store_path);
+        let status_label = if writer_active {
+            "indexing"
+        } else {
+            "no_index"
+        };
+        let message = if writer_active {
+            "index build in progress; wait for it to finish, then retry"
+        } else {
+            "no active index; run greppy index first"
+        };
         let status = serde_json::json!({
             "command": command,
-            "status": "no_index",
+            "status": status_label,
             "healthy": false,
             "store_exists": false,
+            "writer_active": writer_active,
             "root_path": effective_root,
             "store_path": store_path,
             "store_format": store_format,
@@ -79,7 +90,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "dirty_overlay": dirty_overlay.to_json(),
             "inference": inference_diagnostics,
             "store_cow": store_cow,
-            "message": "no active index; run greppy index first",
+            "message": message,
         });
         if json {
             println!(
@@ -88,7 +99,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
                     .map_err(|e| Error::Invalid(format!("serialize {command} JSON: {e}")))?
             );
         } else {
-            println!("status: no_index");
+            println!("status: {status_label}");
             println!("root: {}", effective_root.display());
             println!("store: {}", store_path.display());
             println!(
@@ -101,7 +112,11 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             if let Some(reason) = store_cow["fallback_reason"].as_str() {
                 println!("store_fallback: {reason}");
             }
-            println!("message: run `greppy index {}` first", root.unwrap_or("."));
+            if writer_active {
+                println!("message: {message}");
+            } else {
+                println!("message: run `greppy index {}` first", root.unwrap_or("."));
+            }
             if let Some(inference) = &inference {
                 print_inference_registry(inference);
             }
@@ -121,7 +136,11 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
                 );
             }
         }
-        return Ok(1);
+        return Ok(if writer_active {
+            EXIT_TEMPFAIL as i32
+        } else {
+            1
+        });
     }
 
     let store = match crate::store_cow::overlay_spec(&effective_root)? {
