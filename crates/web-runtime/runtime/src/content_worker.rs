@@ -1725,11 +1725,15 @@ impl ContentEngine {
                 if text.contains("Could not load the requested page") {
                     return Err(io::Error::other(format!("navigation failed: {text}")));
                 }
-                let html = match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
-                    Ok(JSValue::String(html)) => html,
-                    _ => String::new(),
-                };
-                if http && recorded_status.is_none() && html.len() < 500 {
+                let html =
+                    match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
+                        Ok(JSValue::String(html)) => html,
+                        _ => String::new(),
+                    };
+                // CONNECT-tunneled fetches often never match last_responses, so a
+                // missing recorded status is not proof of failure. The Servo error
+                // shell is already rejected above; accept a rendered document.
+                if http && recorded_status.is_none() && text.trim().is_empty() && html.len() < 500 {
                     return Err(io::Error::other(format!(
                         "navigation failed: no HTTP response for {url}"
                     )));

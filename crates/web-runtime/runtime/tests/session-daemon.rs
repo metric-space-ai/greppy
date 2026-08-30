@@ -2897,6 +2897,34 @@ await browser.close();
 }
 
 #[test]
+fn web_run_reports_content_cpu_after_navigation() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body><p>cpu</p></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-cpumet-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_cpumet", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto(fixtureUrl);
+const text = await page.evaluate(() => (document.body && document.body.innerText) || "");
+if (!text.includes("cpu")) {
+  throw new Error("missing cpu marker: " + text);
+}
+await browser.close();
+"#;
+    let ran = run_playwright_source(&socket, "run_cpumet", source, None, Duration::from_secs(60));
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        ran.metrics.content_cpu_ms > 0,
+        "content_cpu_ms should count this run, got {ran:?}"
+    );
+}
+
+#[test]
 fn default_viewport_is_playwright_1280x720_and_can_be_overridden() {
     let fixture = serve_fixture("<!DOCTYPE html><html><body>viewport</body></html>");
     let socket = std::env::temp_dir().join(format!("greppy-web-vp-{}.sock", std::process::id()));

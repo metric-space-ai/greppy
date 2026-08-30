@@ -1239,6 +1239,8 @@ impl Daemon {
         }
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
+        let content_cpu_baseline_ns = sample_cpu_ns(content_pid);
+        let controller_cpu_baseline_ns = sample_cpu_ns(controller_pid);
         let control = Arc::clone(&self.run_control);
         let operation_id = request.request_id.clone();
         let remaining = run_deadline
@@ -1276,6 +1278,8 @@ impl Daemon {
                         session_id: session_key,
                         content_pid,
                         controller_pid,
+                        content_cpu_baseline_ns,
+                        controller_cpu_baseline_ns,
                         operation_id: operation_id.clone(),
                         control: Arc::clone(&control),
                     },
@@ -1322,8 +1326,10 @@ impl Daemon {
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
-                response.metrics.content_cpu_ms = sample_cpu_ms(content_pid);
-                response.metrics.controller_cpu_ms = sample_cpu_ms(controller_pid);
+                response.metrics.content_cpu_ms =
+                    cpu_ms_since(content_pid, content_cpu_baseline_ns);
+                response.metrics.controller_cpu_ms =
+                    cpu_ms_since(controller_pid, controller_cpu_baseline_ns);
                 response
             }
             Err(error) => {
@@ -1418,6 +1424,9 @@ impl Daemon {
                     return Response::error(request, object);
                 }
                 if error.kind() == io::ErrorKind::TimedOut || message.contains("timed out") {
+                    let content_cpu_ms = cpu_ms_since(content_pid, content_cpu_baseline_ns);
+                    let controller_cpu_ms =
+                        cpu_ms_since(controller_pid, controller_cpu_baseline_ns);
                     self.controller.kill_tree_now();
                     self.content.kill_tree_now();
                     // Do not recover here. Spawn+handshake of replacement workers can
@@ -1450,6 +1459,8 @@ impl Daemon {
                     response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                     response.metrics.network_bytes = network_bytes;
                     response.metrics.peak_rss_bytes = peak_rss;
+                    response.metrics.content_cpu_ms = content_cpu_ms;
+                    response.metrics.controller_cpu_ms = controller_cpu_ms;
                     return response;
                 }
                 if let Some(limit) = message.strip_prefix("resource_limit: ") {
@@ -1460,6 +1471,10 @@ impl Daemon {
                     response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                     response.metrics.network_bytes = network_bytes;
                     response.metrics.peak_rss_bytes = peak_rss;
+                    response.metrics.content_cpu_ms =
+                        cpu_ms_since(content_pid, content_cpu_baseline_ns);
+                    response.metrics.controller_cpu_ms =
+                        cpu_ms_since(controller_pid, controller_cpu_baseline_ns);
                     return response;
                 }
                 let safe: String = redact_secrets(&message).chars().take(512).collect();
@@ -1522,10 +1537,7 @@ impl Daemon {
                                 self.finish_session(&session_id);
                                 match stored {
                                     Ok(manifest) => match model_facing_observe_payload(
-                                        "text",
-                                        "text",
-                                        &text,
-                                        &manifest,
+                                        "text", "text", &text, &manifest,
                                     ) {
                                         Ok(payload) => Response::ok(request, payload),
                                         Err(error) => engine_error(request, error, 39),
@@ -1548,10 +1560,7 @@ impl Daemon {
                                             self.finish_session(&session_id);
                                             match stored {
                                                 Ok(manifest) => match model_facing_observe_payload(
-                                                    "html",
-                                                    "html",
-                                                    &html,
-                                                    &manifest,
+                                                    "html", "html", &html, &manifest,
                                                 ) {
                                                     Ok(payload) => Response::ok(request, payload),
                                                     Err(error) => engine_error(request, error, 39),
@@ -2180,9 +2189,7 @@ impl Daemon {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for {method}"
-                ));
+                return Err(format!("timed out after {timeout:?} waiting for {method}"));
             }
             match self.content.recv(remaining) {
                 Ok(Message::EngineResult {
@@ -2214,9 +2221,7 @@ impl Daemon {
                 Ok(other) => return Err(format!("unexpected content message {other:?}")),
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
-                        return Err(format!(
-                            "timed out after {timeout:?} waiting for {method}"
-                        ));
+                        return Err(format!("timed out after {timeout:?} waiting for {method}"));
                     }
                     let message = error.to_string();
                     let _ = self.recover_content(&format!("content worker: {message}"));
@@ -2687,10 +2692,7 @@ fn model_facing_source(
             object.insert("digest".into(), json!(manifest.digest.hex));
             object.insert("path".into(), json!(manifest.object_path));
             object.insert("label".into(), json!(manifest.producing_operation));
-            object.insert(
-                "redaction_status".into(),
-                json!(manifest.redaction_status),
-            );
+            object.insert("redaction_status".into(), json!(manifest.redaction_status));
         }
     }
     Ok(source)
@@ -2914,13 +2916,87 @@ fn sample_rss_bytes(pid: u32) -> u64 {
 }
 
 fn sample_cpu_ms(pid: u32) -> u64 {
+    sample_cpu_ns(pid) / 1_000_000
+}
+
+fn cpu_ms_since(pid: u32, baseline_ns: u64) -> u64 {
+    sample_cpu_ns(pid).saturating_sub(baseline_ns) / 1_000_000
+}
+
+fn sample_cpu_ns(pid: u32) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(ns) = sample_cpu_ns_rusage(pid) {
+            if ns > 0 {
+                return ns;
+            }
+        }
+    }
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "time="])
         .output();
     let Ok(output) = output else {
         return 0;
     };
-    parse_ps_time(String::from_utf8_lossy(&output.stdout).trim())
+    parse_ps_time(String::from_utf8_lossy(&output.stdout).trim()).saturating_mul(1_000_000)
+}
+
+#[cfg(target_os = "macos")]
+fn mach_timebase() -> (u64, u64) {
+    static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        #[repr(C)]
+        struct MachTimebaseInfo {
+            numer: u32,
+            denom: u32,
+        }
+        extern "C" {
+            fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+        }
+        let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+        let rc = unsafe { mach_timebase_info(&mut info) };
+        if rc != 0 || info.denom == 0 {
+            (1, 1)
+        } else {
+            (u64::from(info.numer), u64::from(info.denom))
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn mach_ticks_to_ns(ticks: u64) -> u64 {
+    let (numer, denom) = mach_timebase();
+    (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
+}
+
+#[cfg(target_os = "macos")]
+fn sample_cpu_ns_rusage(pid: u32) -> Option<u64> {
+    #[repr(C)]
+    struct RusageInfoV0 {
+        ri_uuid: [u8; 16],
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+    }
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    const RUSAGE_INFO_V0: i32 = 0;
+    let mut info = std::mem::MaybeUninit::<RusageInfoV0>::uninit();
+    let rc = unsafe { proc_pid_rusage(pid as i32, RUSAGE_INFO_V0, info.as_mut_ptr().cast()) };
+    if rc != 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let ticks = info.ri_user_time.saturating_add(info.ri_system_time);
+    Some(mach_ticks_to_ns(ticks))
 }
 
 fn parse_ps_time(text: &str) -> u64 {
@@ -2952,6 +3028,8 @@ fn gate_session_engine(
     session_id: &str,
     content_pid: u32,
     controller_pid: u32,
+    content_cpu_baseline_ns: u64,
+    controller_cpu_baseline_ns: u64,
     method: &str,
     _params: &serde_json::Value,
 ) -> Result<(), String> {
@@ -2966,12 +3044,12 @@ fn gate_session_engine(
         .limits
         .check_controller_memory(sample_rss_bytes(controller_pid))?;
     session.limits.check_cpu_time(
-        Duration::from_millis(sample_cpu_ms(content_pid)),
+        Duration::from_millis(cpu_ms_since(content_pid, content_cpu_baseline_ns)),
         session.limits.content_cpu_time,
         "content",
     )?;
     session.limits.check_cpu_time(
-        Duration::from_millis(sample_cpu_ms(controller_pid)),
+        Duration::from_millis(cpu_ms_since(controller_pid, controller_cpu_baseline_ns)),
         session.limits.controller_cpu_time,
         "controller",
     )?;
@@ -3008,6 +3086,8 @@ struct SessionEngineGate<'a> {
     session_id: String,
     content_pid: u32,
     controller_pid: u32,
+    content_cpu_baseline_ns: u64,
+    controller_cpu_baseline_ns: u64,
     operation_id: String,
     control: Arc<RunControl>,
 }
@@ -3095,6 +3175,8 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
             &self.session_id,
             self.content_pid,
             self.controller_pid,
+            self.content_cpu_baseline_ns,
+            self.controller_cpu_baseline_ns,
             method,
             params,
         )
@@ -3294,7 +3376,27 @@ mod redirect_chain_tests {
     fn parse_ps_time_minutes_and_seconds() {
         assert_eq!(super::parse_ps_time("0:01.50"), 1500);
         assert_eq!(super::parse_ps_time("1:00.00"), 60_000);
+        assert_eq!(super::parse_ps_time("0:00.15"), 150);
+        assert_eq!(super::parse_ps_time("2:26.50"), 146_500);
+        assert_eq!(super::parse_ps_time("1:02:03"), 3_723_000);
         assert_eq!(super::parse_ps_time(""), 0);
+    }
+
+    #[test]
+    fn sample_cpu_ms_sees_this_process() {
+        let start = std::time::Instant::now();
+        let mut acc = 0_u64;
+        while start.elapsed() < std::time::Duration::from_millis(30) {
+            acc = acc.wrapping_add((0..10_000).sum());
+        }
+        std::hint::black_box(acc);
+        let ns = super::sample_cpu_ns(std::process::id());
+        assert!(
+            ns > 1_000_000,
+            "this process should have >1ms CPU after a 30ms spin, got {ns} ns"
+        );
+        let ms = super::sample_cpu_ms(std::process::id());
+        assert!(ms > 0, "this process should have nonzero CPU, got {ms}");
     }
 
     #[test]
@@ -3497,11 +3599,8 @@ mod redirect_chain_tests {
     #[test]
     fn model_facing_source_fails_closed_without_digest_when_sensitive() {
         let manifest = sample_manifest(true, "");
-        let err = super::model_facing_source(
-            json!({ "text": "secret", "digest": "" }),
-            &manifest,
-        )
-        .unwrap_err();
+        let err = super::model_facing_source(json!({ "text": "secret", "digest": "" }), &manifest)
+            .unwrap_err();
         assert!(err.contains("digest"), "{err}");
     }
 
