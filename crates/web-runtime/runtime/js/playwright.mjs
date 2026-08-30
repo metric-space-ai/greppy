@@ -1517,6 +1517,7 @@ class Page {
     this._id = id;
     this._generation = generation || 1;
     this._closed = false;
+    this._url = "about:blank";
     this._timeout = 30_000;
     this._context = null;
     this._handlers = {};
@@ -1889,12 +1890,19 @@ class Page {
     const timeout = navigationTimeout(this._timeout, options, "Page.goto");
     try {
       const result = await engineCall("page.goto", { page: this._id, url, timeout });
+      this._url = result.url || String(url);
       await this._flushPopups();
       await this._flushNavigation();
       await this._dispatchNetworkUntilSettled();
       await this._dispatchFrames();
       this._emitLoad();
-      return result;
+      return this._responseFromRecord({
+        url: this._url,
+        status: result.status == null ? 200 : Number(result.status),
+        statusText: result.statusText || (Number(result.status) < 400 ? "OK" : ""),
+        ok: result.ok == null ? Number(result.status || 200) < 400 : !!result.ok,
+        headers: result.headers || {},
+      });
     } catch (error) {
       await this._dispatchNetworkUntilSettled();
       throw error;
@@ -2249,9 +2257,8 @@ class Page {
     });
   }
 
-  async url() {
-    const result = await engineCall("page.url", { page: this._id });
-    return result.url;
+  url() {
+    return this._url || "about:blank";
   }
 
   async title() {
@@ -2329,8 +2336,11 @@ class Page {
 
   async _flushNavigation() {
     const result = await engineCall("page.url", { page: this._id });
+    if (result && result.url) {
+      this._url = result.url;
+    }
     while (this._navWaiters.length) {
-      this._navWaiters.shift()({ url: () => result.url });
+      this._navWaiters.shift()({ url: () => this._url });
     }
   }
 
@@ -2746,8 +2756,13 @@ class Page {
     await engineCall("page.addInitScript", { page: this._id, source });
   }
 
-  async setViewportSize() {
-    return unsupported("Page.setViewportSize")();
+  async setViewportSize(size) {
+    const width = Number(size && size.width) || 0;
+    const height = Number(size && size.height) || 0;
+    if (width < 1 || height < 1) {
+      throw new Error("Page.setViewportSize requires width and height");
+    }
+    await engineCall("page.setViewportSize", { page: this._id, width, height });
   }
 
   async viewportSize() {

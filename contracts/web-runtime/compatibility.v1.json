@@ -40,8 +40,8 @@
   "parser_complete": false,
   "entry_count": 1354,
   "status_counts": {
-    "implemented": 347,
-    "unsupported": 501,
+    "implemented": 348,
+    "unsupported": 500,
     "unverified": 506
   },
   "entries": [
@@ -1212,12 +1212,15 @@
       "symbol": "Page.setViewportSize",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "passing",
+      "behavior": "unverified",
+      "tests": [
+        "default_viewport_is_playwright_1280x720_and_can_be_overridden"
+      ],
       "known_differences": [
-        "Recording a size without resizing the 800x600 software renderer is not compatibility. Calls MUST fail with unsupported_playwright_operation."
+        "default size is Playwright's 1280x720 software renderer; setViewportSize resizes the WebView",
+        "not Chromium layout-viewport / device-scale compatibility"
       ]
     },
     {
@@ -1345,8 +1348,8 @@
         "mouse-init-viewport"
       ],
       "known_differences": [
-        "returns last setViewportSize, default 800x600, not layout viewport",
-        "returns the software renderer size 800x600; setViewportSize is unsupported"
+        "returns last setViewportSize, default 1280x720, not Chromium layout viewport",
+        "software renderer default is 1280x720 to match Playwright Chromium"
       ]
     },
     {
@@ -16662,8 +16665,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 836,
-    "unsupported": 501,
+    "unverified": 837,
+    "unsupported": 500,
     "passing": 17
   }
 }

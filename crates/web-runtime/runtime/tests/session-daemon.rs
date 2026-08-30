@@ -1442,7 +1442,7 @@ fn web_status_reports_observability_fields() {
     }
     assert_eq!(result["playwright_compatibility_version"], "1.62.1");
     assert_eq!(result["inventory_entries"], 1354);
-    assert_eq!(result["unsupported_capability_count"], 501);
+    assert_eq!(result["unsupported_capability_count"], 500);
     assert_eq!(result["process_health"]["healthy"], true);
     assert_eq!(result["session_counts"]["total"], 0);
 }
@@ -2725,6 +2725,86 @@ await browser.close();
         ),
         Duration::from_secs(5),
     );
+}
+
+#[test]
+fn page_url_is_sync_string_and_goto_returns_response_status() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body><p class=\"p\">Lokal</p></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-urlstat-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_urlstat", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const resp = await page.goto(fixtureUrl);
+if (typeof page.url !== "function") {
+  throw new Error("page.url missing");
+}
+const url = page.url();
+if (typeof url !== "string") {
+  throw new Error("page.url() must be a string, got " + typeof url + " " + url);
+}
+if (!url.includes("127.0.0.1")) {
+  throw new Error("unexpected url " + url);
+}
+if (!resp || typeof resp.status !== "function") {
+  throw new Error("goto must return Response with status()");
+}
+if (resp.status() !== 200) {
+  throw new Error("expected status 200, got " + resp.status());
+}
+if (typeof resp.ok !== "function" || resp.ok() !== true) {
+  throw new Error("expected ok() true");
+}
+if (typeof resp.url !== "function" || !String(resp.url()).includes("127.0.0.1")) {
+  throw new Error("expected response.url()");
+}
+if (typeof resp.headers !== "function") {
+  throw new Error("expected response.headers()");
+}
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_urlstat",
+        source,
+        None,
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn default_viewport_is_playwright_1280x720_and_can_be_overridden() {
+    let fixture = serve_fixture("<!DOCTYPE html><html><body>viewport</body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-web-vp-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_vp", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto(fixtureUrl);
+const initial = await page.viewportSize();
+if (!initial || initial.width !== 1280 || initial.height !== 720) {
+  throw new Error("default viewport " + JSON.stringify(initial));
+}
+await page.setViewportSize({ width: 1024, height: 768 });
+const next = await page.viewportSize();
+if (!next || next.width !== 1024 || next.height !== 768) {
+  throw new Error("overridden viewport " + JSON.stringify(next));
+}
+await browser.close();
+"#;
+    let ran = run_playwright_source(&socket, "run_vp", source, None, Duration::from_secs(60));
+    assert_eq!(ran.status, "ok", "{ran:?}");
 }
 
 #[test]

@@ -359,7 +359,7 @@ impl Delegate {
             dialog_action: RefCell::new(DialogAction::Accept),
             prompt_text: RefCell::new(None),
             init_scripts: RefCell::new(Vec::new()),
-            viewport: RefCell::new((800, 600)),
+            viewport: RefCell::new((1280, 720)),
             extra_headers: RefCell::new(Vec::new()),
             last_console: RefCell::new(Vec::new()),
             profile,
@@ -838,8 +838,8 @@ impl ContentEngine {
     fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
-                width: 800,
-                height: 600,
+                width: 1280,
+                height: 720,
             })
             .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
         );
@@ -1690,9 +1690,37 @@ impl ContentEngine {
                 // budget without observing script start.
                 self.servo.spin_event_loop();
                 self.run_init_scripts(&page_id)?;
-                Ok(
-                    json!({ "url": webview.url().map(|u| u.to_string()).unwrap_or_else(|| url.to_string()) }),
-                )
+                let final_url = webview
+                    .url()
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| url.to_string());
+                let recorded = delegate.last_responses.borrow();
+                let matched = recorded.iter().rev().find(|row| {
+                    row.get("url")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|recorded_url| recorded_url == final_url)
+                });
+                let status = matched
+                    .and_then(|row| row.get("status"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(200);
+                let status_text = matched
+                    .and_then(|row| row.get("statusText"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(if status < 400 { "OK" } else { "" })
+                    .to_owned();
+                let headers = matched
+                    .and_then(|row| row.get("headers"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                drop(recorded);
+                Ok(json!({
+                    "url": final_url,
+                    "status": status,
+                    "statusText": status_text,
+                    "ok": status < 400,
+                    "headers": headers,
+                }))
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -2869,10 +2897,24 @@ impl ContentEngine {
                     .push(source);
                 Ok(json!({}))
             }
-            "page.setViewportSize" => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unsupported_playwright_operation: page.setViewportSize",
-            )),
+            "page.setViewportSize" => {
+                let page_id = required_str(&params, "page")?;
+                let width = params
+                    .get("width")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+                    .max(1) as u32;
+                let height = params
+                    .get("height")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+                    .max(1) as u32;
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                webview.resize(PhysicalSize { width, height });
+                *delegate.viewport.borrow_mut() = (width, height);
+                self.servo.spin_event_loop();
+                Ok(json!({ "width": width, "height": height }))
+            }
             "page.viewportSize" => {
                 let page_id = required_str(&params, "page")?;
                 let (width, height) = *self.page(&page_id)?.1.viewport.borrow();
