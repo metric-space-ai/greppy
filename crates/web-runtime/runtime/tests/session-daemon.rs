@@ -5146,6 +5146,44 @@ fn viewport_reports_playwright_default_and_set_size_applies() {
 }
 
 #[test]
+fn rdfa_prefix_and_json_script_do_not_abort_the_document() {
+    let origin = serve_fixture(include_str!("../fixtures/rdfa-json-script.html"));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-rdfa-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_rdfa", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const response = await page.goto(fixtureUrl);
+if (!response || typeof response.ok !== "function" || !response.ok()) {
+  throw new Error("goto failed");
+}
+const html = await page.content();
+if (html.length < 200) {
+  throw new Error("document collapsed to " + html.length + " bytes: " + html);
+}
+const marker = await page.evaluate(
+  () => (document.getElementById("marker") || {}).textContent || "",
+);
+if (marker.trim() !== "europa-body-ok") {
+  throw new Error("marker missing, html=" + html);
+}
+const headKids = await page.evaluate(() => document.head.children.length);
+if (headKids < 3) {
+  throw new Error("head children " + headKids + " html=" + html);
+}
+await browser.close();
+"#;
+    let ran = run_playwright_source(&socket, "run_rdfa", source, None, Duration::from_secs(60));
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
 fn mouse_wheel_dispatches_wheel_events() {
     run_named_fixture("mouse-wheel.mjs", "run_wheel");
 }
