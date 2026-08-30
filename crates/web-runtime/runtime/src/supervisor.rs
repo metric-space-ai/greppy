@@ -998,7 +998,29 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
         fn sandbox_free_error(errorbuf: *mut c_char);
     }
     let exe_dir = exe.parent().unwrap_or(exe);
-    let profile = format!(
+    let profile = macos_sandbox_profile(exe, exe_dir, tmp);
+    let profile = CString::new(profile)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut errorbuf: *mut c_char = std::ptr::null_mut();
+    let rc = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
+    if rc != 0 {
+        let message = if errorbuf.is_null() {
+            "sandbox_init failed".to_owned()
+        } else {
+            let text = unsafe { std::ffi::CStr::from_ptr(errorbuf) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { sandbox_free_error(errorbuf) };
+            text
+        };
+        return Err(io::Error::other(format!("worker sandbox: {message}")));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
+    format!(
         r#"(version 1)
 (deny default)
 (allow file-read-metadata)
@@ -1019,6 +1041,10 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
   (subpath "/private/var/folders")
   (subpath "/private/tmp")
   (subpath "/tmp")
+  (literal "/etc/resolv.conf")
+  (literal "/etc/hosts")
+  (literal "/private/etc/resolv.conf")
+  (literal "/private/etc/hosts")
 )
 (allow file-write*
   {tmp}
@@ -1035,30 +1061,13 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
 (allow signal (target self))
 (allow file-ioctl)
 (allow process-exec {exe} {exe_dir})
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound)
+(allow network-inbound (local ip))
 "#,
         exe = sbpl_subpath(exe),
         exe_dir = sbpl_subpath(exe_dir),
         tmp = sbpl_subpath(tmp),
-    );
-    let profile = CString::new(profile)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let mut errorbuf: *mut c_char = std::ptr::null_mut();
-    let rc = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
-    if rc != 0 {
-        let message = if errorbuf.is_null() {
-            "sandbox_init failed".to_owned()
-        } else {
-            let text = unsafe { std::ffi::CStr::from_ptr(errorbuf) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { sandbox_free_error(errorbuf) };
-            text
-        };
-        return Err(io::Error::other(format!("worker sandbox: {message}")));
-    }
-    Ok(())
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1606,6 +1615,24 @@ mod tests {
         assert!(
             err.to_string().contains("refusing to start unsandboxed"),
             "{err}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_worker_sandbox_allows_public_network_outbound() {
+        let profile = macos_sandbox_profile(Path::new("/tmp/exe"), Path::new("/tmp"), Path::new("/tmp"));
+        assert!(
+            profile.contains("(allow network-outbound)\n"),
+            "policy proxy must be able to dial non-loopback hosts; seatbelt is not the policy layer: {profile}"
+        );
+        assert!(
+            !profile.contains("localhost:*"),
+            "localhost-only outbound was the 003 connect failure: {profile}"
+        );
+        assert!(
+            profile.contains("/etc/resolv.conf"),
+            "DNS needs resolv.conf: {profile}"
         );
     }
 
