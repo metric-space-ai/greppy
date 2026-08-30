@@ -908,43 +908,334 @@ pub(crate) fn edit_op_delete(located: &Located) -> EditedContent {
     edit_splice(&located.content, &mut edits)
 }
 
-/// The compiler or linter for the touched files, when the workspace declares
-/// one. No tests: a test run is too long for a single edit call.
+#[derive(Debug)]
+struct EditVerifier {
+    label: String,
+    program: std::path::PathBuf,
+    args: Vec<std::ffi::OsString>,
+    cwd: std::path::PathBuf,
+}
+
+fn edit_nearest_package_root(
+    root_path: &std::path::Path,
+    file: &str,
+) -> Option<std::path::PathBuf> {
+    let root = root_path.canonicalize().ok()?;
+    let mut directory = root_path.join(file).parent()?.to_path_buf();
+    loop {
+        if directory.join("package.json").is_file() {
+            return Some(directory);
+        }
+        if directory == root || !directory.pop() || !directory.starts_with(&root) {
+            break;
+        }
+    }
+    root_path
+        .join("package.json")
+        .is_file()
+        .then(|| root_path.to_path_buf())
+}
+
+fn edit_local_typescript_compiler(package_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bin = package_root.join("node_modules").join(".bin");
+    [bin.join("tsc"), bin.join("tsc.cmd")]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn edit_verifiers(
+    root_path: &std::path::Path,
+    files: &[String],
+) -> (Vec<EditVerifier>, Option<String>) {
+    let extensions = files
+        .iter()
+        .filter_map(|file| std::path::Path::new(file).extension()?.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let has_typescript = extensions
+        .iter()
+        .any(|extension| matches!(extension.as_str(), "ts" | "tsx" | "mts" | "cts"));
+    if has_typescript {
+        let Some(package_root) = files
+            .iter()
+            .find_map(|file| edit_nearest_package_root(root_path, file))
+        else {
+            return (
+                Vec::new(),
+                Some("verify: skipped — no package.json owns the touched TypeScript file".into()),
+            );
+        };
+        let Some(tsc) = edit_local_typescript_compiler(&package_root) else {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "verify: skipped — no local TypeScript compiler at {}; install dependencies first (network downloads are never started by --verify)",
+                    package_root.display()
+                )),
+            );
+        };
+        return (
+            vec![EditVerifier {
+                label: "local TypeScript check".into(),
+                program: tsc,
+                args: ["--noEmit", "--pretty", "false", "--incremental", "false"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+                cwd: package_root,
+            }],
+            None,
+        );
+    }
+
+    let javascript = files
+        .iter()
+        .filter(|file| {
+            std::path::Path::new(file)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "js" | "mjs" | "cjs"))
+        })
+        .map(|file| EditVerifier {
+            label: format!("JavaScript syntax check for {file}"),
+            program: std::path::PathBuf::from("node"),
+            args: vec!["--check".into(), file.into()],
+            cwd: root_path.to_path_buf(),
+        })
+        .collect::<Vec<_>>();
+    if !javascript.is_empty() {
+        return (javascript, None);
+    }
+
+    if (extensions.iter().any(|extension| extension == "rs")
+        || files
+            .iter()
+            .any(|file| file == "Cargo.toml" || file == "Cargo.lock"))
+        && root_path.join("Cargo.toml").is_file()
+    {
+        return (
+            vec![EditVerifier {
+                label: "Rust workspace check".into(),
+                program: "cargo".into(),
+                args: ["check", "--message-format", "short", "--quiet"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+                cwd: root_path.to_path_buf(),
+            }],
+            None,
+        );
+    }
+    if extensions.iter().any(|extension| extension == "go") && root_path.join("go.mod").is_file() {
+        return (
+            vec![EditVerifier {
+                label: "Go workspace build".into(),
+                program: "go".into(),
+                args: vec!["build".into(), "./...".into()],
+                cwd: root_path.to_path_buf(),
+            }],
+            None,
+        );
+    }
+    let python_files = files
+        .iter()
+        .filter(|file| file.ends_with(".py"))
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    if !python_files.is_empty() {
+        let mut args = vec!["-m".into(), "py_compile".into()];
+        args.extend(python_files);
+        return (
+            vec![EditVerifier {
+                label: "Python syntax check".into(),
+                program: "python3".into(),
+                args,
+                cwd: root_path.to_path_buf(),
+            }],
+            None,
+        );
+    }
+    (
+        Vec::new(),
+        Some("verify: skipped — no bounded verifier is declared for the touched file type".into()),
+    )
+}
+
+fn edit_verify_timeout() -> std::time::Duration {
+    let seconds = std::env::var("GREPPY_EDIT_VERIFY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60);
+    std::time::Duration::from_secs(seconds)
+}
+
+fn edit_kill_verifier_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The verifier owns a process group (configured below). Killing only
+        // its shell leaves `sleep`, compilers, or package-manager children
+        // alive with inherited descriptors, so callers using captured output
+        // still hang until those descendants exit.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> Vec<String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let prefix = std::env::temp_dir().join(format!("greppy-verify-{}-{nonce}", std::process::id()));
+    let stdout_path = prefix.with_extension("stdout");
+    let stderr_path = prefix.with_extension("stderr");
+    let stdout = match std::fs::File::create(&stdout_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "verify: unavailable — cannot capture stdout: {error}"
+            )]
+        }
+    };
+    let stderr = match std::fs::File::create(&stderr_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            return vec![format!(
+                "verify: unavailable — cannot capture stderr: {error}"
+            )];
+        }
+    };
+    let command = std::iter::once(verifier.program.as_os_str())
+        .chain(verifier.args.iter().map(std::ffi::OsString::as_os_str))
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "verify: running {} — {} (timeout {}s)",
+        verifier.label,
+        command,
+        timeout.as_secs()
+    );
+    let mut process = std::process::Command::new(&verifier.program);
+    process
+        .args(&verifier.args)
+        .current_dir(&verifier.cwd)
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            let message = format!("verify: unavailable — cannot start {command}: {error}");
+            eprintln!("{message}");
+            return vec![message];
+        }
+    };
+    let started = std::time::Instant::now();
+    let mut next_progress = std::time::Duration::from_secs(10);
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), false),
+            Ok(None) if started.elapsed() >= timeout => {
+                edit_kill_verifier_tree(&mut child);
+                break (child.wait().ok(), true);
+            }
+            Ok(None) => {
+                if started.elapsed() >= next_progress {
+                    eprintln!(
+                        "verify: still running {} ({}s elapsed)",
+                        verifier.label,
+                        started.elapsed().as_secs()
+                    );
+                    next_progress += std::time::Duration::from_secs(10);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                edit_kill_verifier_tree(&mut child);
+                let _ = child.wait();
+                let message = format!("verify: failed to observe {command}: {error}");
+                eprintln!("{message}");
+                break (None, false);
+            }
+        }
+    };
+    let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    if timed_out {
+        let message = format!(
+            "verify: timed out after {}s — edit remains applied; run `{command}` directly to continue",
+            timeout.as_secs()
+        );
+        eprintln!("{message}");
+        return vec![message];
+    }
+    let Some(status) = status else {
+        return vec![format!("verify: failed — no exit status from {command}")];
+    };
+    if status.success() {
+        let message = format!("verify: passed — {}", verifier.label);
+        eprintln!("{message}");
+        return vec![message];
+    }
+    let mut diagnostics = vec![format!(
+        "verify: failed (exit {}) — {}",
+        status
+            .code()
+            .map_or_else(|| "signal".into(), |code| code.to_string()),
+        verifier.label
+    )];
+    diagnostics.extend(
+        stderr
+            .lines()
+            .chain(stdout.lines())
+            .filter(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered.contains("error") || lowered.contains("warning")
+            })
+            .take(50)
+            .map(str::to_string),
+    );
+    eprintln!("{}", diagnostics[0]);
+    diagnostics
+}
+
+/// The compiler or linter for the touched file type, when the workspace has a
+/// local one. Verification is observable and bounded; it never downloads a
+/// tool and never silently switches to an unrelated language's workspace.
 pub(crate) fn edit_verify_diagnostics(
     root_path: &std::path::Path,
     files: &[String],
 ) -> Vec<String> {
-    let mut argv: Option<Vec<&str>> = None;
-    if root_path.join("Cargo.toml").is_file() {
-        argv = Some(vec![
-            "cargo",
-            "check",
-            "--message-format",
-            "short",
-            "--quiet",
-        ]);
-    } else if root_path.join("go.mod").is_file() {
-        argv = Some(vec!["go", "build", "./..."]);
-    } else if files.iter().any(|file| file.ends_with(".py"))
-        && root_path.join("pyproject.toml").is_file()
-    {
-        argv = Some(vec!["python3", "-m", "compileall", "-q", "."]);
+    let (verifiers, skipped) = edit_verifiers(root_path, files);
+    if let Some(message) = skipped {
+        eprintln!("{message}");
+        return vec![message];
     }
-    let Some(argv) = argv else {
-        return Vec::new();
-    };
-    let Ok(output) = std::process::Command::new(argv[0])
-        .args(&argv[1..])
-        .current_dir(root_path)
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter(|line| line.contains("error") || line.contains("warning"))
-        .take(50)
-        .map(str::to_string)
+    let timeout = edit_verify_timeout();
+    verifiers
+        .iter()
+        .flat_map(|verifier| edit_run_verifier(verifier, timeout))
         .collect()
 }
 

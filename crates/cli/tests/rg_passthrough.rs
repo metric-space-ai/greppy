@@ -127,7 +127,7 @@ fn rg_without_path_returns_guidance_on_idle_stdin() {
     let stdin = child.stdin.take().expect("open child stdin");
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || send.send(child.wait_with_output()).unwrap());
-    let output = match receive.recv_timeout(std::time::Duration::from_secs(15)) {
+    let output = match receive.recv_timeout(std::time::Duration::from_secs(45)) {
         Ok(output) => output.expect("collect greppy output"),
         Err(_) => {
             drop(stdin);

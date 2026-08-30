@@ -313,6 +313,191 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
 }
 
 #[test]
+fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let first = scratch.path().join("feature-one");
+    let second = scratch.path().join("feature-two");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/base.rs"),
+        "pub fn shared_base_symbol() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        primary.join("src/change.rs"),
+        "pub fn original_symbol() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(
+        &primary,
+        &["config", "user.email", "linked-cow@test.invalid"],
+    );
+    git(&primary, &["config", "user.name", "Linked Store CoW"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-one",
+            first.to_str().unwrap(),
+        ],
+    );
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-two",
+            second.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        first.join("src/change.rs"),
+        "pub fn feature_one_symbol() -> i32 { 11 }\n",
+    )
+    .unwrap();
+    git(&first, &["add", "src/change.rs"]);
+    git(&first, &["commit", "-q", "-m", "feature one"]);
+    std::fs::write(
+        second.join("src/change.rs"),
+        "pub fn feature_two_symbol() -> i32 { 22 }\n",
+    )
+    .unwrap();
+    git(&second, &["add", "src/change.rs"]);
+    git(&second, &["commit", "-q", "-m", "feature two"]);
+
+    let (first_code, first_stdout, first_stderr) = run(&first, &store, &["index", "."], None);
+    assert_eq!(
+        first_code, 0,
+        "first linked index failed\nstdout={first_stdout}\nstderr={first_stderr}"
+    );
+    assert!(
+        first_stdout.contains("indexed Delta generation")
+            && !first_stdout.contains("indexed 2 files"),
+        "linked worktree must publish only a Delta: {first_stdout}"
+    );
+    assert!(
+        first_stderr.contains("linked worktree uses shared Base")
+            && first_stderr.contains("(created)"),
+        "first linked worktree must create one shared Base: {first_stderr}"
+    );
+    let first_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(first_status["healthy"], true, "{first_status:#}");
+    assert_eq!(first_status["fresh"], true, "{first_status:#}");
+    assert_eq!(first_status["stats"]["files"], 2, "{first_status:#}");
+    assert_eq!(first_status["store_cow"]["mode"], "overlay");
+    assert_eq!(first_status["store_cow"]["base_complete"], true);
+    assert_eq!(first_status["store_cow"]["dirty_file_count"], 1);
+    let shared_identity = first_status["store_cow"]["base_identity"]
+        .as_str()
+        .expect("first Base identity")
+        .to_string();
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "shared_base_symbol"],
+        None,
+    )
+    .contains("shared_base_symbol"));
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "feature_one_symbol"],
+        None,
+    )
+    .contains("feature_one_symbol"));
+
+    let (second_code, second_stdout, second_stderr) = run_with_env(
+        &second,
+        &store,
+        &["index", "."],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(
+        second_code, 0,
+        "second linked index failed\nstdout={second_stdout}\nstderr={second_stderr}"
+    );
+    assert!(second_stdout.contains("indexed Delta generation"));
+    assert!(
+        second_stderr.contains("linked worktree uses shared Base")
+            && second_stderr.contains("(reused)"),
+        "second linked worktree must reuse the existing Base: {second_stderr}"
+    );
+    let second_status = query_json_raw(&second, &store, &["index", "status"], None);
+    assert_eq!(second_status["healthy"], true, "{second_status:#}");
+    assert_eq!(second_status["stats"]["files"], 2, "{second_status:#}");
+    assert_eq!(second_status["store_cow"]["base_identity"], shared_identity);
+    assert_eq!(second_status["store_cow"]["dirty_file_count"], 1);
+    assert!(query_text(
+        &second,
+        &store,
+        &["search-symbol", "feature_two_symbol"],
+        None,
+    )
+    .contains("feature_two_symbol"));
+
+    // The first process's environment is gone. A fresh query still composes
+    // its Base+Delta from the binding persisted in its private graph.
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "feature_one_symbol"],
+        None,
+    )
+    .contains("feature_one_symbol"));
+
+    // A later primary-branch commit must not invalidate every existing
+    // worktree's pinned Base. Refreshing this Delta reuses its persisted
+    // binding and performs no second temporary clean checkout.
+    std::fs::write(
+        primary.join("src/later.rs"),
+        "pub fn later_primary_symbol() -> i32 { 33 }\n",
+    )
+    .unwrap();
+    git(&primary, &["add", "src/later.rs"]);
+    git(&primary, &["commit", "-q", "-m", "advance primary"]);
+    std::fs::write(
+        first.join("src/untracked.rs"),
+        "pub fn first_untracked_symbol() -> i32 { 44 }\n",
+    )
+    .unwrap();
+    let (refresh_code, refresh_stdout, refresh_stderr) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(
+        refresh_code, 0,
+        "pinned Delta refresh failed\nstdout={refresh_stdout}\nstderr={refresh_stderr}"
+    );
+    assert!(refresh_stderr.contains("(reused)"), "{refresh_stderr}");
+    let refreshed_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(
+        refreshed_status["store_cow"]["base_identity"],
+        shared_identity
+    );
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "first_untracked_symbol"],
+        None,
+    )
+    .contains("first_untracked_symbol"));
+}
+
+#[test]
 fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_files() {
     let scratch = tempfile::tempdir().unwrap();
     let repo = scratch.path().join("repo");

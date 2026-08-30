@@ -1024,11 +1024,14 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 0,
-        "read must wait for the edit-owned refresh; stderr={err}\nstdout={out}"
+        "read must observe the published refresh; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("graph refresh already running") && err.contains("ETA unavailable"),
-        "lock wait must be explicit to the caller; stderr={err:?}"
+        err.contains("graph refresh already running")
+            && err.contains("waiting up to 2s")
+            && (err.contains("graph refresh published")
+                || err.contains("greppy index status --json")),
+        "the bounded lock wait and its recovery must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));

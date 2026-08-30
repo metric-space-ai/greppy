@@ -42,7 +42,7 @@ pub(crate) fn grep_passthrough_args(argv: &[OsString]) -> &[OsString] {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StdinDemand<'a> {
     None,
-    Always(Option<&'a OsStr>),
+    Explicit(Option<&'a OsStr>),
     WhenNonTerminal(Option<&'a OsStr>),
     Unknown,
 }
@@ -258,11 +258,10 @@ pub(crate) fn grep_stdin_demand(args: &[OsString]) -> StdinDemand<'_> {
         };
         (Some(*pattern), files)
     };
-    if pattern_from_stdin
-        || files.iter().any(|file| *file == "-")
-        || (files.is_empty() && !recursive)
-    {
-        StdinDemand::Always(pattern)
+    if pattern_from_stdin || files.iter().any(|file| *file == "-") {
+        StdinDemand::Explicit(pattern)
+    } else if files.is_empty() && !recursive {
+        StdinDemand::WhenNonTerminal(pattern)
     } else {
         StdinDemand::None
     }
@@ -459,7 +458,7 @@ pub(crate) fn rg_stdin_demand(args: &[OsString]) -> StdinDemand<'_> {
         (Some(*pattern), paths)
     };
     if pattern_from_stdin || paths.iter().any(|path| *path == "-") {
-        StdinDemand::Always(pattern)
+        StdinDemand::Explicit(pattern)
     } else if paths.is_empty() {
         StdinDemand::WhenNonTerminal(pattern)
     } else {
@@ -472,6 +471,7 @@ enum StdinAvailability {
     Terminal,
     Data,
     Empty,
+    IdleTimeout,
     Unknown,
 }
 
@@ -484,7 +484,7 @@ fn stdin_availability() -> StdinAvailability {
 
 #[cfg(unix)]
 fn stdin_availability_nonterminal() -> StdinAvailability {
-    const PRODUCER_STARTUP_GRACE_MS: libc::c_int = 250;
+    const PRODUCER_STARTUP_GRACE_MS: libc::c_int = 1_500;
     let mut descriptor = libc::pollfd {
         fd: libc::STDIN_FILENO,
         events: libc::POLLIN,
@@ -498,7 +498,7 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
         return StdinAvailability::Unknown;
     }
     if ready == 0 {
-        return StdinAvailability::Empty;
+        return StdinAvailability::IdleTimeout;
     }
     let mut bytes: libc::c_int = 0;
     // FIONREAD distinguishes buffered bytes from EOF without consuming the
@@ -525,7 +525,7 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
 fn stdin_availability_nonterminal() -> StdinAvailability {
     use std::os::windows::io::AsRawHandle;
     let handle = std::io::stdin().as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
     loop {
         let mut bytes = 0u32;
         // PeekNamedPipe measures buffered bytes without consuming them,
@@ -555,7 +555,7 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
             return StdinAvailability::Data;
         }
         if std::time::Instant::now() >= deadline {
-            return StdinAvailability::Empty;
+            return StdinAvailability::IdleTimeout;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -571,23 +571,19 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
 pub(crate) fn missing_stdin_message(demand: StdinDemand<'_>, tool: &str) -> Option<String> {
     let pattern = match (demand, stdin_availability()) {
         (StdinDemand::None | StdinDemand::Unknown, _) => return None,
+        (StdinDemand::Explicit(_), _) => return None,
         (StdinDemand::WhenNonTerminal(_), StdinAvailability::Terminal) => return None,
-        (
-            StdinDemand::Always(pattern) | StdinDemand::WhenNonTerminal(pattern),
-            StdinAvailability::Data,
-        ) => {
+        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::Data) => {
             let _ = pattern;
             return None;
         }
-        (
-            StdinDemand::Always(pattern) | StdinDemand::WhenNonTerminal(pattern),
-            StdinAvailability::Empty | StdinAvailability::Terminal,
-        ) => pattern,
+        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::Empty) => pattern,
+        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::IdleTimeout) => pattern,
         (_, StdinAvailability::Unknown) => return None,
     };
 
     let mut message = format!(
-        "status: missing_input\nmessage: {tool} needs a file/path argument or data on stdin; stdin has no data\nnext: pass a file/path, or pipe data into this command"
+        "status: missing_input\nmessage: {tool} needs a file/path argument or data on stdin; stdin has no data after waiting for a producer\nnext: pass a file/path, pipe data into this command, or add `-` as the path to wait for a slow producer"
     );
     if let Some(pattern) = pattern {
         let path = std::path::Path::new(pattern);
@@ -613,7 +609,7 @@ mod tests {
     fn grep_input_demand_tracks_patterns_files_and_stdin_operands() {
         assert!(matches!(
             grep_stdin_demand(&os(&["needle"])),
-            StdinDemand::Always(Some(pattern)) if pattern == "needle"
+            StdinDemand::WhenNonTerminal(Some(pattern)) if pattern == "needle"
         ));
         assert_eq!(
             grep_stdin_demand(&os(&["needle", "file.rs"])),
@@ -621,7 +617,7 @@ mod tests {
         );
         assert!(matches!(
             grep_stdin_demand(&os(&["-ne", "needle"])),
-            StdinDemand::Always(None)
+            StdinDemand::WhenNonTerminal(None)
         ));
         assert_eq!(
             grep_stdin_demand(&os(&["-ne", "needle", "file.rs"])),
@@ -633,11 +629,11 @@ mod tests {
         );
         assert!(matches!(
             grep_stdin_demand(&os(&["-f", "-", "file.rs"])),
-            StdinDemand::Always(None)
+            StdinDemand::Explicit(None)
         ));
         assert!(matches!(
             grep_stdin_demand(&os(&["needle", "file.rs", "-"])),
-            StdinDemand::Always(Some(pattern)) if pattern == "needle"
+            StdinDemand::Explicit(Some(pattern)) if pattern == "needle"
         ));
         assert_eq!(grep_stdin_demand(&os(&["-R", "needle"])), StdinDemand::None);
         assert_eq!(
@@ -667,7 +663,7 @@ mod tests {
         ));
         assert!(matches!(
             rg_stdin_demand(&os(&["needle", "-"])),
-            StdinDemand::Always(Some(pattern)) if pattern == "needle"
+            StdinDemand::Explicit(Some(pattern)) if pattern == "needle"
         ));
         assert_eq!(rg_stdin_demand(&os(&["--files"])), StdinDemand::None);
     }

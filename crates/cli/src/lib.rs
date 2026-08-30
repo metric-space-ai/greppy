@@ -3799,6 +3799,7 @@ fn replace_background_job_file(
 
 struct BackgroundJobGuard {
     path: Option<std::path::PathBuf>,
+    detached: bool,
     cause: String,
     kind: String,
     started_at_unix_secs: u64,
@@ -3817,6 +3818,7 @@ struct BackgroundJobGuard {
 impl BackgroundJobGuard {
     fn from_env() -> Self {
         let path = std::env::var_os("GREPPY_BACKGROUND_JOB").map(std::path::PathBuf::from);
+        let detached = path.is_some();
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
@@ -3835,6 +3837,7 @@ impl BackgroundJobGuard {
         let published = path.as_deref().and_then(read_background_job);
         Self {
             path,
+            detached,
             cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
                 .unwrap_or_else(|_| "background-refresh".into()),
             kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
@@ -3875,7 +3878,22 @@ impl BackgroundJobGuard {
     }
 
     fn is_background(&self) -> bool {
+        self.detached
+    }
+
+    fn has_progress_sink(&self) -> bool {
         self.path.is_some()
+    }
+
+    fn attach_foreground(&mut self, path: std::path::PathBuf) {
+        if self.path.is_some() {
+            return;
+        }
+        self.path = Some(path);
+        self.cause = "foreground-index".into();
+        self.kind = "index".into();
+        self.started_at_unix_secs = unix_now_secs_cli();
+        self.write_state("starting", None);
     }
 
     fn embedding_loading(&mut self) {

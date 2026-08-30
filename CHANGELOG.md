@@ -4,6 +4,28 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [0.3.4] — 2026-08-30
 
+### Worktree indexing and agent feedback fixes
+
+- Ordinary linked Git worktrees now share one immutable, Git-tree-bound Base
+  index and publish only their committed/dirty private Delta. The binding is
+  persisted per worktree, stays pinned when the primary checkout advances,
+  and later worktrees reuse a verified Base without another checkout or full
+  repository walk.
+- `index status` is lock-free while an index writer is active and reports the
+  foreground phase, completed/total spans and ETA when available. Semantic
+  search against an incomplete embedding generation now returns temporary
+  exit 75 with an explicit `index status --json` retry condition.
+- Literal-search text rows emit lossless qualified locators accepted by
+  `greppy read`; enclosing provider nodes no longer produce a short name that
+  cannot be read back.
+- Edit verification selects a local verifier for the touched language instead
+  of an unrelated root manifest, streams start/still-running/final state,
+  never downloads a checker, and terminates the verifier process tree at a
+  bounded timeout with an actionable direct command.
+- Grep/rg passthrough tolerates realistically delayed pipeline producers. An
+  explicit `-` remains the unbounded, byte-exact contract for slow producers,
+  while an idle implicit stdin still fails with bounded recovery guidance.
+
 ### Portable Chunk-CoW agent workspaces (0.3.4)
 
 `greppy -p` now has one fail-closed workspace path on macOS ARM64, Linux

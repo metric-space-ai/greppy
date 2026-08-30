@@ -195,19 +195,63 @@ pub(crate) fn maybe_reindex_stale(
 }
 
 /// An edit-owned or background indexer may already be building the exact fresh
-/// snapshot this query needs. Wait for that writer to publish instead of
-/// immediately returning an empty `refreshing` result. The OS lock has no stale
-/// owner: process exit releases it, so this cannot wait on an abandoned PID.
+/// snapshot this query needs. Give a short refresh a chance to publish, but
+/// never strand a noninteractive caller behind a large repository build.
 pub(crate) fn wait_for_active_index_refresh(root: Option<&str>) {
     let Ok(effective_root) = resolve_root(root) else {
         return;
     };
     let store_path = workspace_locator::store_path(&effective_root);
-    eprintln!(
-        "greppy: graph refresh already running; waiting for fresh snapshot (ETA unavailable)"
-    );
-    if let Ok(lock) = greppy_freshness::acquire(&store_path) {
-        drop(lock);
+    let wait = std::time::Duration::from_secs(2);
+    eprintln!("greppy: graph refresh already running; waiting up to 2s for a fresh snapshot");
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match greppy_freshness::try_acquire(&store_path) {
+            Ok(lock) => {
+                drop(lock);
+                eprintln!("greppy: graph refresh published; resuming query");
+                return;
+            }
+            Err(greppy_freshness::LockError::Held { .. })
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(greppy_freshness::LockError::Held { .. }) => {
+                let job = read_background_job(&background_job_path(&effective_root));
+                let phase = job
+                    .as_ref()
+                    .and_then(|value| value.get("state"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let completed = job
+                    .as_ref()
+                    .and_then(|value| value.get("completed_spans"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let total = job
+                    .as_ref()
+                    .and_then(|value| value.get("total_spans"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let eta = job
+                    .as_ref()
+                    .and_then(|value| value.get("eta_seconds"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                eprintln!(
+                    "greppy: graph refresh still active — phase={phase}, completed={completed}/{total}, eta_seconds={eta}; returning temporary failure instead of waiting indefinitely; retry after `greppy index status --json` reports healthy=true"
+                );
+                return;
+            }
+            Err(greppy_freshness::LockError::Io { context, source }) => {
+                eprintln!(
+                    "greppy: cannot observe graph refresh ({context}: {source}); returning temporary failure; inspect `greppy index status --json`"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -485,6 +529,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             embedding_cfg.as_ref(),
             &options,
             false,
+            None,
         )
         .map(|code| code == 0)
         .unwrap_or(false)
@@ -525,7 +570,8 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
     }
-    if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment()? {
+    if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment(&effective_root)?
+    {
         greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
             Error::io(
                 format!(

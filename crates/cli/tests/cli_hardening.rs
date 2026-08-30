@@ -433,6 +433,57 @@ fn search_pattern_json_reports_exact_counts_and_truncation_metadata() {
     );
 }
 
+#[test]
+fn search_pattern_text_emits_a_readable_qualified_locator() {
+    let (root, _scratch) = fresh_dir("search-pattern-readable-locator");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/ElectronDialog.ts"),
+        r#"export const make = () => ({
+  async showOpenDialog() {
+    return pickFolder({ title: "locator_roundtrip_marker" });
+  },
+});
+
+function pickFolder(options: { title: string }) {
+  return options.title;
+}
+"#,
+    )
+    .unwrap();
+    let store = root.join("store");
+
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index should succeed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(
+        &["search-pattern", "locator_roundtrip_marker"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "search-pattern should find the TypeScript body; stderr={err}\nstdout={out}"
+    );
+    let locator = out
+        .lines()
+        .find_map(|line| line.split_once("  ").map(|(_, locator)| locator.trim()))
+        .filter(|locator| locator.contains("::"))
+        .unwrap_or_else(|| panic!("text result must include a qualified read locator: {out:?}"));
+
+    let (code, read_out, read_err) = run(&["read", locator], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "the exact locator emitted by search-pattern must be accepted by read; locator={locator:?}; stderr={read_err}; stdout={read_out}"
+    );
+    assert!(
+        read_out.contains("locator_roundtrip_marker"),
+        "read must return the enclosing source for the hit; locator={locator:?}; stdout={read_out}"
+    );
+}
+
 /// Small drift is atomically reindexed, while the current search-pattern request
 /// uses the live filesystem rather than the already-open old snapshot.
 #[test]
@@ -718,13 +769,17 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
         &store,
     );
     assert_eq!(
-        code, 1,
+        code, 75,
         "an incomplete semantic generation must be retryable; stdout={out} stderr={err}"
     );
     assert!(err.is_empty(), "JSON status must stay on stdout: {err:?}");
     let value: serde_json::Value = serde_json::from_str(&out).expect("semantic progress JSON");
     assert_eq!(value["status"], "indexing");
     assert_eq!(value["retryable"], true);
+    assert_eq!(value["exit_code"], 75);
+    assert!(value["retry_when"]
+        .as_str()
+        .is_some_and(|message| message.contains("embedding_complete=true")));
     assert!(value["retry_after_seconds"].as_u64().is_some());
     assert!(value["hits"].as_array().unwrap().is_empty());
     assert!(
@@ -795,9 +850,14 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
         &repo,
         &store,
     );
-    assert_eq!(code, 1, "partial vectors must remain hidden; stderr={err}");
+    assert_eq!(
+        code, 75,
+        "partial vectors must remain hidden and retryable; stderr={err}"
+    );
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["status"], "indexing");
+    assert_eq!(value["retryable"], true);
+    assert_eq!(value["exit_code"], 75);
     assert!(value["hits"].as_array().unwrap().is_empty());
 }
 
@@ -2151,7 +2211,7 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
     let first_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let pid = first_job["pid"].as_u64().expect("background pid") as u32;
-    assert_eq!(first_job["state"], "refreshing");
+    assert_eq!(first_job["state"], "indexing");
 
     let (code, out, err) = run_with_env(
         &[
@@ -2272,8 +2332,22 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     let db = find_graph_db(&store).expect("fixture graph.db must exist");
     let hash = db.parent().unwrap().file_name().unwrap().to_string_lossy();
     let lock_path = store.join("locks").join(format!("workspace-{hash}.writer"));
-    std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
     let live_lock = hold_exclusive_lock(&lock_path);
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(code, 75, "an active refresh is temporary; stderr={err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "status must not open/check the previous graph while its writer is active"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
+    assert_eq!(status["status"], "indexing");
+    assert_eq!(status["store_exists"], true);
+    assert_eq!(status["writer_active"], true);
+
+    std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
 
     let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(code, 75, "an active first index is temporary; stderr={err}");
@@ -2303,6 +2377,78 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
     assert_eq!(status["status"], "no_index");
     assert_eq!(status["writer_active"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_index_publishes_observable_progress_while_building() {
+    let (repo, store, _scratch) = make_repo("foreground-index-progress", "progress_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "fixture index should succeed; stderr={err}\nstdout={out}"
+    );
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn refreshed_progress_marker() -> i32 { 8 }\n",
+    )
+    .unwrap();
+    let _writer = hold_index_before_publish(&repo, &store, "foreground-progress");
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "an in-progress foreground index is retryable; stderr={err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "status must remain lock-free while reporting foreground progress"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
+    assert_eq!(status["status"], "indexing");
+    assert_eq!(status["writer_active"], true);
+    assert_eq!(status["background_job"]["cause"], "foreground-index");
+    assert_eq!(status["background_job"]["state"], "indexing");
+    assert!(status["background_job"]["pid"].as_u64().is_some());
+    assert!(
+        status["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("progress")),
+        "status must direct the caller to the published progress record: {status}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn query_wait_for_active_refresh_is_bounded_and_actionable() {
+    let (repo, store, _scratch) = make_repo("bounded-query-refresh", "old_refresh_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "fixture index should succeed; stderr={err}\nstdout={out}"
+    );
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn new_refresh_marker() -> i32 { 9 }\n",
+    )
+    .unwrap();
+    let _writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&["search-symbol", "old_refresh_marker"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "refresh contention is temporary; stdout={out}\nstderr={err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "query must not wait for the held writer indefinitely"
+    );
+    assert!(err.contains("waiting up to 2s"), "stderr={err}");
+    assert!(err.contains("phase=indexing"), "stderr={err}");
+    assert!(err.contains("greppy index status --json"), "stderr={err}");
 }
 
 #[test]

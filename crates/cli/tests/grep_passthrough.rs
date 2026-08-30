@@ -199,6 +199,46 @@ fn passthrough_delayed_stdin_data_is_still_forwarded_byte_exactly() {
 }
 
 #[test]
+fn passthrough_network_like_delayed_stdin_is_not_rejected_as_empty() {
+    let mut ours = greppy_command("network-delayed-stdin");
+    ours.arg("hallo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ours.spawn().expect("spawn greppy");
+    let mut stdin = child.stdin.take().expect("open child stdin");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        stdin.write_all(b"hallo\n").expect("write delayed stdin");
+    });
+    let output = child.wait_with_output().expect("collect greppy output");
+    writer.join().expect("join delayed writer");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"hallo\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn passthrough_explicit_stdin_waits_beyond_implicit_startup_grace() {
+    let mut ours = greppy_command("explicit-slow-stdin");
+    ours.args(["hallo", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ours.spawn().expect("spawn greppy");
+    let mut stdin = child.stdin.take().expect("open child stdin");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2_000));
+        stdin.write_all(b"hallo\n").expect("write slow stdin");
+    });
+    let output = child.wait_with_output().expect("collect greppy output");
+    writer.join().expect("join delayed writer");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"hallo\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn passthrough_idle_stdin_pipe_returns_guidance_instead_of_hanging() {
     let root = unique_tempdir("idle-stdin");
     std::fs::create_dir(root.join("edit-src")).unwrap();
@@ -217,7 +257,7 @@ fn passthrough_idle_stdin_pipe_returns_guidance_instead_of_hanging() {
         let stdin = child.stdin.take().expect("open child stdin");
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || send.send(child.wait_with_output()).unwrap());
-        let output = match receive.recv_timeout(std::time::Duration::from_secs(15)) {
+        let output = match receive.recv_timeout(std::time::Duration::from_secs(45)) {
             Ok(output) => output.expect("collect greppy output"),
             Err(_) => {
                 drop(stdin);
