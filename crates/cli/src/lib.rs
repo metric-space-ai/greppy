@@ -4217,6 +4217,23 @@ fn spawn_background_job(
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
+    // The first-use caller is intentionally allowed to return after a bounded
+    // join. Put the indexer in its own process group/session class so shell and
+    // agent runners that clean up the caller's process group do not kill the
+    // cache build they were explicitly told to continue in the background.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {

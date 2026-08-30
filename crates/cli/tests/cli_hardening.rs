@@ -2450,7 +2450,14 @@ fn first_use_index_is_bounded_and_reports_retryable_progress() {
     }
     let job_path = find_index_job(&store).expect("first-use background job record");
     let job: serde_json::Value = serde_json::from_slice(&std::fs::read(job_path).unwrap()).unwrap();
-    let pid = job["pid"].as_u64().expect("background job pid").to_string();
+    let pid_value = job["pid"].as_u64().expect("background job pid");
+    let pid = pid_value.to_string();
+    let pid_i32 = i32::try_from(pid_value).expect("background job pid fits pid_t");
+    assert_eq!(
+        unsafe { libc::getpgid(pid_i32) },
+        pid_i32,
+        "first-use index must own a process group independent of its short-lived caller"
+    );
     let killed = Command::new("kill")
         .args(["-TERM", &pid])
         .status()
