@@ -72,6 +72,28 @@ fn web_runtime_status_does_not_spawn_and_reports_not_running() {
 }
 
 #[test]
+fn web_artifact_and_result_are_subcommands() {
+    let (code, stdout, stderr) = run(&["web", "--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("artifact"), "stdout={stdout}");
+    assert!(stdout.contains("result"), "stdout={stdout}");
+}
+
+#[test]
+fn web_artifact_list_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "artifact", "list", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
+fn web_result_next_requires_session() {
+    let (code, stdout, _stderr) = run(&["web", "result", "next", "offset=3", "--json"]);
+    assert_eq!(code, 30, "stdout={stdout}");
+    assert!(stdout.contains("session"));
+}
+
+#[test]
 fn web_run_requires_session() {
     let (code, stdout, _stderr) = run(&["web", "run", "--script-file", "x.js", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");

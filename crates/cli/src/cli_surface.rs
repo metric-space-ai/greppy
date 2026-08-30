@@ -870,6 +870,16 @@ pub enum WebCommand {
         #[command(subcommand)]
         command: WebRuntimeCommand,
     },
+    /// Artifacts produced by a session (`artifact list` is the prompt verb).
+    Artifact {
+        #[command(subcommand)]
+        command: WebArtifactCommand,
+    },
+    /// Continue a truncated result.
+    Result {
+        #[command(subcommand)]
+        command: WebResultCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -905,6 +915,29 @@ pub enum WebRuntimeCommand {
     },
     /// Restart the owner and leave it running.
     Restart {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebArtifactCommand {
+    /// List artifacts for a session.
+    List {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebResultCommand {
+    /// Fetch the rest of a truncated result.
+    Next {
+        cursor: String,
+        #[arg(long)]
+        session: Option<String>,
         #[arg(long)]
         json: bool,
     },

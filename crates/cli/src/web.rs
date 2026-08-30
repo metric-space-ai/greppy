@@ -216,6 +216,41 @@ pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
             WebRuntimeCommand::Stop { json } => runtime_stop(json, root),
             WebRuntimeCommand::Restart { json } => runtime_restart(json, root),
         },
+        WebCommand::Artifact { command } => match command {
+            WebArtifactCommand::List { session, json } => {
+                let Some(session) = session else {
+                    return emit_error(json, invalid("web artifact list requires --session SESSION"));
+                };
+                rpc(
+                    root,
+                    json,
+                    "web.artifacts",
+                    json!({ "session_id": session }),
+                    Some(session),
+                )
+            }
+        },
+        WebCommand::Result { command } => match command {
+            WebResultCommand::Next {
+                cursor,
+                session,
+                json,
+            } => {
+                let Some(session) = session else {
+                    return emit_error(json, invalid("web result next requires --session SESSION"));
+                };
+                if cursor.trim().is_empty() {
+                    return emit_error(json, invalid("web result next requires a cursor"));
+                }
+                rpc(
+                    root,
+                    json,
+                    "web.result.next",
+                    json!({ "session_id": session, "cursor": cursor }),
+                    Some(session),
+                )
+            }
+        },
     }
 }
 
