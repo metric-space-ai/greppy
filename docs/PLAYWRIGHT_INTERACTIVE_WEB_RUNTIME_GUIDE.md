@@ -239,74 +239,58 @@ JavaScript replacement during the first implementation track.
 
 ### 6.2 Process model
 
-The web runtime MUST run as **three separate processes**, which are **three
-separately linked images** (three Mach-O or ELF binaries). Do not collapse
-these roles into one linked image that re-executes itself with role flags.
+The web runtime MUST run as **three separate OS processes** of **exactly one
+linked executable** (`web-runtime`). Preserve process isolation by having the
+supervisor spawn `current_exe()` with a hidden `--internal-role
+controller|content` selector. Child processes MUST execute the same on-disk
+binary path. Do not ship separately linked worker images.
 
-1. `web-runtime-supervisor`: owns sessions, policy, resource limits, and
-   evidence. It uses **neither** JavaScript engine (no `deno_core` / V8, no
-   Servo / mozjs / SpiderMonkey).
-2. `web-controller-worker`: `deno_core` / V8 only. Executes controller-realm
-   Playwright automation JavaScript.
-3. `web-content-worker`: Servo / mozjs / SpiderMonkey only. Hosts the page
-   realm, DOM, layout, network, and input.
+1. Supervisor role (default): owns sessions, policy, resource limits, and
+   evidence. It MUST NOT construct either JavaScript engine.
+2. Controller role (`--internal-role controller`): `deno_core` / V8 only.
+   Executes controller-realm Playwright automation JavaScript.
+3. Content role (`--internal-role content`): Servo / mozjs / SpiderMonkey only.
+   Hosts the page realm, DOM, layout, network, and input.
 
-Authority levels (the Greppy parent is not a fourth web-runtime binary):
+Authority levels (the Greppy parent is not a second web-runtime binary):
 
 1. Greppy parent: owns the model loop and user-visible completion. It MUST NOT
    link either web engine.
-2. `web-runtime-supervisor`: as above.
-3. Workers: `web-controller-worker` and `web-content-worker`, each a narrower,
-   separately linked image.
+2. `web-runtime` supervisor process: as above.
+3. `web-runtime` worker processes: controller and content roles of the same
+   on-disk executable.
 
-**Distributable artifact versus linked image.** A *distributable* is a product
-or package; it MAY contain multiple binaries. A *linked image* is a single
-Mach-O or ELF that is linked together. The collision below is about one linked
-image, not about one distributable. One optional install package that contains
-the three binaries is allowed. One Mach-O / ELF that contains both engines is
-not.
+**Distributable artifact versus process.** A *distributable* is a product or
+package and MUST contain exactly one runtime executable. OS-process isolation
+is provided by re-exec of that executable, not by extra Mach-O / ELF images.
+Packaging, install, upgrade, rollback, checksums, SBOM, and provenance MUST
+converge on that single executable.
 
-**Same-Mach-O collision (proven negative).** Linking V8 (`deno_core`) and
-SpiderMonkey/mozjs (Servo) into one linked image has been proven to collide.
-Keep `crates/web-runtime/phase1-probe` as the documented **negative
-regression** of that collision: it can compile and link both engines into one
-macOS executable, then SIGSEGV because ld64 coalesces overlapping
-`v8::internal` symbols (SpiderMonkey irregexp is a V8 fork). `phase1-probe` is
-not a working in-process runtime, not Phase 1 completion, and not Playwright
-compatibility.
+**Same-process collision (proven unless localized).** Linking V8 (`deno_core`)
+and SpiderMonkey/mozjs (Servo) into one image historically SIGSEGV'd because
+ld64 coalesces overlapping `v8::internal` symbols (SpiderMonkey irregexp is a
+V8 fork). Keep `crates/web-runtime/phase1-probe` as the oracle: both engines
+must construct and drop in one image before claiming the one-binary stack is
+complete. V8 and Servo MUST still not be constructed in the same process.
 
-A single-binary "re-exec with hidden role flags" design would put both engines
-in one linked image and recreates that collision. It is not the process model.
-
-The lifecycle checkpoint currently invokes the separate binaries with explicit
-worker paths and communicates over framed stdin/stdout pipes:
+The production contract is hidden role re-exec plus capability tokens:
 
 ```text
-web-runtime-supervisor \
-  --controller-worker <path> \
-  --content-worker <path>
+web-runtime --socket <path> --run-id <id>
+web-runtime --internal-role controller --capability <token>
+web-runtime --internal-role content --capability <token>
 ```
 
-The following hidden invocations and capability tokens are the **production
-contract and are not implemented by the lifecycle checkpoint**:
-
-```text
-web-runtime-supervisor --socket <path> --run-id <id>
-web-controller-worker --capability <token>
-web-content-worker --capability <token>
-```
-
-Those names MUST be hidden from ordinary CLI help. Every supervisor or worker
+`--internal-role` MUST be hidden from ordinary CLI help. Every worker
 invocation MUST require an unguessable, short-lived capability issued by its
 parent. A random process MUST NOT be able to attach to an existing session by
 guessing a socket path or session ID.
 
 **Packaging.** The isolated workspace at `crates/web-runtime` contains the
-`runtime` package, which produces the three role binaries so integration tests
-can use Cargo-provided `CARGO_BIN_EXE_<name>` paths. The sibling
-`phase1-probe` package is the negative same-image regression and MUST remain
-separate from the isolated runtime package. `phase1-probe` is not a shipped
-role.
+`runtime` package, which produces the single `web-runtime` executable so
+integration tests can use `CARGO_BIN_EXE_web-runtime`. The sibling
+`phase1-probe` package is the co-link oracle and MUST remain separate from the
+shipped runtime package. `phase1-probe` is not a shipped role.
 
 ### 6.3 Lifecycle
 
@@ -335,7 +319,7 @@ The recommended source layout is:
 
 ```text
 crates/web-runtime/            # isolated Cargo workspace
-  runtime/                     # one package; three separately linked role binaries
+  runtime/                     # one package; one linked web-runtime executable
     src/protocol.rs
     src/supervisor.rs
     src/worker.rs
@@ -405,19 +389,16 @@ Greppy CLI or agent crates. `playwright-compat` depends on engine traits, not
 Servo concrete types. The supervisor selects the concrete engine adapter.
 
 Servo (`mozjs` / SpiderMonkey) and V8 (`deno_core`) MUST be build-isolated from
-Greppy's normal fast edit/test cycle where Cargo permits it, and MUST NOT be
-linked into the same Mach-O or ELF (see §6.2). The ordinary `greppy` CLI MUST
-NOT link either engine; it contains only the versioned IPC client and
-lifecycle manager.
+Greppy's normal fast edit/test cycle where Cargo permits it. They MAY share
+one linked `web-runtime` image (see §6.2) but MUST NOT be constructed in the
+same process. The ordinary `greppy` CLI MUST NOT link either engine; it
+contains only the versioned IPC client and lifecycle manager.
 
-A single optional *distributable* MAY package the three separately linked
-images (`web-runtime-supervisor`, `web-controller-worker`,
-`web-content-worker`). That is one product/package, not one linked image. Those
-three binaries SHOULD be produced by the single Cargo package
-`crates/web-runtime/runtime` so integration tests can use Cargo-provided
-`CARGO_BIN_EXE_<name>` paths. Keep `crates/web-runtime/phase1-probe` as a
-separate sibling package and negative same-Mach-O collision regression; it is
-not a shipped role, not Phase 1 completion, and not a Playwright deliverable.
+A *distributable* MUST package exactly one runtime executable (`web-runtime`).
+That binary is produced by `crates/web-runtime/runtime`. Keep
+`crates/web-runtime/phase1-probe` as a separate sibling package and co-link
+oracle; it is not a shipped role, not Phase 1 completion, and not a Playwright
+deliverable.
 
 ## 8. CLI contract
 
@@ -1105,20 +1086,18 @@ const value = await page.evaluate(() => document.title);
 await browser.close();
 ```
 
-The positive spike MUST use the production process boundary from §6.2:
-`web-runtime-supervisor`, `web-controller-worker`, and `web-content-worker`
-are three separately linked images. The supervisor links neither engine, the
-controller image links V8 only, and the content image links Servo/mozjs only.
-The existing `phase1-probe` proves the negative same-Mach-O collision and MUST
-remain a negative regression; compiling or crashing that probe is not this
-Phase 1 deliverable and cannot satisfy the gate.
+The positive spike MUST use the production process boundary from §6.2: one
+`web-runtime` executable, three OS processes selected with `--internal-role`.
+The supervisor process MUST NOT construct either engine; the controller
+process constructs V8 only; the content process constructs Servo/mozjs only.
+`phase1-probe` remains the co-link oracle and is not this Phase 1 deliverable.
 
 Gate:
 
 - no source rewriting;
 - no prohibited runtime dependency;
-- the unchanged script completes through all three separately linked runtime
-  images, with no same-image engine co-linking or same-binary re-exec design;
+- the unchanged script completes through the one-binary, three-process
+  runtime, with engines constructed only in their role processes;
 - deterministic pass on macOS and Linux target CI;
 - process isolation and cleanup pass;
 - measured size/RSS rationale passes;
@@ -1204,8 +1183,8 @@ without exceeding Greppy output budgets.
 
 Deliver:
 
-- installers or one optional runtime distributable containing the three
-  separately linked runtime images;
+- installers or one optional runtime distributable containing the single
+  `web-runtime` executable;
 - per-image and distributable signatures, SBOM, and provenance;
 - upgrade and rollback path;
 - compatibility receipt;
@@ -1265,11 +1244,11 @@ Nightly or scheduled lanes SHOULD run:
 
 ## 23. Release and supply chain
 
-The release MAY be one optional distributable artifact, but that artifact
-MUST contain three separately linked runtime images. It MUST NOT replace them
-with one linked image that selects or re-executes roles. The distributable is
-the installation and versioning boundary; each contained Mach-O or ELF remains
-an independently linked security and engine-isolation boundary.
+The release MAY be one optional distributable artifact, and that artifact
+MUST contain exactly one runtime executable. OS-process isolation is provided
+by `--internal-role` re-exec of that same on-disk binary. The distributable is
+the installation and versioning boundary; V8 and Servo MUST still be
+constructed only in their role processes.
 
 Release artifacts MUST include:
 
@@ -1373,10 +1352,10 @@ tests, generated manifests, receipts, or inspected runtime state.
 | Servo lacks required automation hooks | Critical | Phase-0 gap inventory; upstream narrow APIs; stop if fork size becomes unbounded. |
 | Playwright behavior is larger than its schema | Critical | Differential behavioral corpus; port applicable upstream tests; no schema-only claims. |
 | Node compatibility expands without bound | High | Versioned safe builtin allow-list; separate `@playwright/test` track; no arbitrary npm claim. |
-| V8 and Servo inflate build/install size | High | One optional distributable containing three separately linked runtime images; registered aggregate and per-image size/RSS gates; isolated build lanes. |
-| V8 and Servo collide in one linked image | Critical | Never co-link the engines or use a same-binary re-exec design; retain `phase1-probe` as the negative regression; execute the positive path through three separately linked images. |
-| Controller or page escapes sandbox | Critical | Separate linked worker images, an engine-free supervisor, OS sandbox, capability IPC, hostile tests, and security review. |
-| Runtime packaging or signing is incomplete | High | Verify the one-distributable/three-image layout, per-image and package signatures, SBOM, provenance, install, upgrade, rollback, and uninstall in release CI. |
+| V8 and Servo inflate build/install size | High | One optional distributable containing the single `web-runtime` executable; registered size/RSS gates; isolated build lanes. |
+| V8 and Servo collide in one process | Critical | Co-link into one `web-runtime` image only after `phase1-probe` construct-and-drop succeeds; never construct both engines in one process; isolate roles via `--internal-role` re-exec of the same on-disk binary. |
+| Controller or page escapes sandbox | Critical | Three OS processes of one executable, supervisor that does not construct engines, OS sandbox, capability IPC, hostile tests, and security review. |
+| Runtime packaging or signing is incomplete | High | Verify the one-executable dist layout, signatures, SBOM, provenance, install, upgrade, rollback, and uninstall in release CI. |
 | Playwright releases drift rapidly | High | Pin one version; automated schema diff; explicit compatibility upgrade releases. |
 | Event ordering creates flaky automation | High | Single causal event journal; deterministic fixtures; race and replay tests. |
 | Auto-waiting busy-polls | Medium | Event-driven waiting; idle CPU gate; polling only as bounded fallback. |
@@ -1392,17 +1371,16 @@ below is true:
 
 ### Architecture
 
-- [ ] Supervisor, controller, and content roles run as three separately linked
-  images; no linked image contains both V8 and Servo/mozjs.
-- [ ] The supervisor links neither JavaScript engine; controller JavaScript
-  runs only in the V8 worker image and page JavaScript only in the
-  Servo/mozjs worker image.
+- [ ] Supervisor, controller, and content roles run as three OS processes of
+  one linked `web-runtime` executable selected with `--internal-role`.
+- [ ] The supervisor process does not construct either JavaScript engine;
+  controller JavaScript runs only in the V8 role process and page JavaScript
+  only in the Servo/mozjs role process.
 - [ ] Greppy parent survives worker crashes and forced termination.
 - [ ] Runtime is one optional, versioned distributable and installation
-  boundary containing those three images, not one linked or re-executed
-  binary.
-- [ ] `phase1-probe` remains a passing negative collision regression and is
-  neither shipped nor counted as positive runtime completion.
+  boundary containing exactly one runtime executable.
+- [ ] `phase1-probe` remains the co-link oracle and is neither shipped nor
+  counted as positive runtime completion.
 - [ ] No prohibited production runtime dependency is present.
 - [ ] Crate boundaries match the approved dependency direction.
 
@@ -1453,8 +1431,7 @@ below is true:
 - [ ] Supported platform matrix passes.
 - [ ] Reproducible build and dependency verification pass.
 - [ ] Release packaging tests verify that the distributable installs exactly
-  the three separately linked runtime images and no same-binary role re-exec
-  path.
+  one runtime executable and can complete an end-to-end session using only it.
 - [ ] SBOM, licenses, per-image and distributable signatures, and provenance
   exist and verify on every claimed platform.
 - [ ] Conformance and benchmark receipts are attached.

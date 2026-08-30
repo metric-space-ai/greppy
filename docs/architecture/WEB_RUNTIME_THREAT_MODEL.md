@@ -1,8 +1,14 @@
 # Greppy Web Runtime Threat Model
 
-Contract revision: 2026-08-26
-Phase: 0 plus experimental lifecycle checkpoint
-Status: every mitigation in this document is a contract requirement. Only the three-image process boundary and bounded worker lifecycle have an experimental implementation; capabilities, OS sandboxing, parent integration, policy, artifacts, and the remaining controls are not implemented. Phase 0 records the threats so later phases cannot treat missing controls as optional.
+Contract revision: 2026-08-29
+Phase: `experimental web-runtime spike` (not a production security-review pass)
+Status: this document is binding. In-tree tests on macOS now prove attach via
+inherited FD 4, `sandbox_init` deny-default workers, credential redaction,
+the event journal, profile locks, `object_disposed`, nested-frame fail-closed,
+typed `SessionLimits`, content-addressed artifacts, and research/project
+policy. Remaining OPEN/EXTERNAL holes are named below without euphemism. This
+checkpoint does **not** authorize a production claim or a Playwright-compatible
+label.
 
 This threat model is binding for the Playwright interactive web runtime described in `docs/PLAYWRIGHT_INTERACTIVE_WEB_RUNTIME_GUIDE.md` sections 5, 10.2, 14.2, 16, 17, and 26. It does not authorize a production claim, a Playwright-compatible label, or a security-review pass.
 
@@ -67,37 +73,35 @@ Four authority levels, in decreasing trust:
 3. Controller worker: Playwright automation JavaScript. Untrusted.
 4. Content worker and the network: page origin. Untrusted.
 
-Controller V8 and page content MUST NOT run in the Greppy parent process. A random process MUST NOT attach to an existing session by guessing a socket path or session ID. The supervisor, controller, and content roles MUST be three separately linked images (`web-runtime-supervisor`, `web-controller-worker`, and `web-content-worker`), hidden from ordinary CLI help and protected by unguessable, short-lived parent-issued capabilities. A single distributable MAY contain all three images, but no linked image may contain both engines or re-execute itself to select among these roles.
+Controller V8 and page content MUST NOT run in the Greppy parent process. A random process MUST NOT attach to an existing session by guessing a socket path or session ID. The supervisor, controller, and content roles MUST be three OS processes of one linked executable (`web-runtime`), selected with a hidden `--internal-role supervisor|controller|content` flag. The supervisor MUST spawn `current_exe()` so children execute the same on-disk binary path. Roles are hidden from ordinary CLI help and protected by unguessable, short-lived parent-issued capabilities. Packaging, install, upgrade, rollback, checksums, SBOM, and provenance MUST converge on that single executable. V8 and Servo MUST NOT be constructed in the same process even though they share one linked image.
 
 ## 5. STRIDE analysis
 
-Each subsection states the threat, the specified mitigation, and the Phase 0 implementation state. Specified is not implemented unless the experimental lifecycle checkpoint is named explicitly.
+Each subsection states the threat, the specified mitigation, the in-tree proof
+(exact test names), and any remaining OPEN or EXTERNAL hole. Specified is not
+production-ready. Proven on macOS is not proven on every platform.
 
 ### 5.1 Controller capability policy (guide §16.1, §10.2)
 
-Spoofing. A controller script or a local process presents itself as the supervisor client, reuses a leftover socket, or forges a session ID. Specified mitigation: parent-issued capability tokens, run-owned sessions, refuse attach without the current run capability. Phase 0: unimplemented. Open critical risk if shipped without it.
+Spoofing. A controller script or a local process presents itself as the supervisor client, reuses a leftover socket, or forges a session ID. Specified mitigation: parent-issued capability tokens, run-owned sessions, refuse attach without the current run capability. Implemented: attach is inherited FD 4 (`ATTACH_TOKEN_FD`) plus an unguessable token; the socket path alone is insufficient; the capability file must not sit next to the socket (`attach_capability_rejects_missing_wrong_and_endpoint_only`, `wrong_run_id_is_session_not_owned`). Workers reject argv secrets and missing inherited FDs (`worker_role_rejects_capability_secret_in_argv`, `worker_role_rejects_missing_inherited_capability_fd`, `rejects_capability_secret_in_argv`, `concurrent_unrelated_children_do_not_inherit_attach_token_fd`). OPEN residual: no Windows named-pipe workers; Linux/Windows named-pipe attach is not implemented as a production matrix pass.
 
-Tampering. The script rewrites `playwright`, loads unexpected modules, uses prototype pollution against generated bindings, or writes outside the artifact root. Specified mitigation: deterministic module resolution, virtual `playwright` only, registered Node builtin allow-list, `fs` virtualized to granted roots, unknown-field rejection on generated protocol types. Phase 0: unimplemented.
+Tampering. The script rewrites `playwright`, loads unexpected modules, uses prototype pollution against generated bindings, or writes outside the artifact root. Specified mitigation: deterministic module resolution, virtual `playwright` only, registered Node builtin allow-list, `fs` virtualized to granted roots, unknown-field rejection on generated protocol types. Implemented: controller module policy denies `node:fs`, `file://` imports, and `node:child_process`; `process.env` is an allow-list that does not leak parent env (`controller_module_policy_denies_host_filesystem`). Screenshots cannot escape the artifact store (`screenshot_payload_output_does_not_write_outside_artifact_store`). Unsupported Playwright surface fails closed (`fail_closed_clock_coverage_request_and_handles`, `getby_options_and_context_page_events_fail_closed`). OPEN residual: this is not a complete hostile-controller corpus; prototype-pollution and unknown-field rejection of the generated protocol are not a security-review pass.
 
-Repudiation. A hostile script performs a click or download and the journal cannot say which operation did it. Specified mitigation: every operation has one correlation ID across client, supervisor, controller, engine, and artifacts; session transitions are journaled. Phase 0: unimplemented.
+Repudiation. A hostile script performs a click or download and the journal cannot say which operation did it. Specified mitigation: every operation has one correlation ID across client, supervisor, controller, engine, and artifacts; session transitions are journaled. Implemented: `journal_line_includes_request_id_for_correlation`; cancel/respawn evidence is journaled with worker name and pids (`cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session`). OPEN residual: the journal is not a replay-complete causal store, and no 8h soak has been run (EXTERNAL).
 
-Information disclosure. `process.env` exposes parent secrets; console, exceptions, or `page.evaluate` results echo cookies; stack traces include script source that the operator did not intend to log. Specified mitigation: env allow-list, never the Greppy parent environment; bounded console capture; errors MUST NOT contain secrets, cookies, authorization headers, script source, or page credentials by default. Phase 0: unimplemented.
+Information disclosure. `process.env` exposes parent secrets; console, exceptions, or `page.evaluate` results echo cookies; stack traces include script source that the operator did not intend to log. Specified mitigation: env allow-list, never the Greppy parent environment; bounded console capture; errors MUST NOT contain secrets, cookies, authorization headers, script source, or page credentials by default. Implemented: `workers_do_not_inherit_secret_environment`, `controller_module_policy_denies_host_filesystem`, `redact_secrets_masks_userinfo_and_password_query`, `redact_secrets_masks_authorization_cookie_and_bearer`, `redact_json_masks_header_objects_and_credential_keys`, `policy_errors_redact_url_credentials`, `controller_exception_redacts_authorization_secrets`. OPEN residual: redaction is pattern-based, not a credential-type system; it is not a substitute for human security review (EXTERNAL).
 
-Denial of service. Infinite loops, runaway timers, unbounded `page.evaluate` payloads, or heap growth pin CPU and memory. Specified mitigation: controller heap and CPU budgets, payload limits before allocation, isolate termination, timeout kills the entire worker process tree. Enforcement MUST be outside the worker. Phase 0: unimplemented.
+Denial of service. Infinite loops, runaway timers, unbounded `page.evaluate` payloads, or heap growth pin CPU and memory. Specified mitigation: controller heap and CPU budgets, payload limits before allocation, isolate termination, timeout kills the entire worker process tree. Enforcement MUST be outside the worker. Implemented: typed `SessionLimits` (`research_profile_is_tighter_than_default`, `payload_limits_override_profile_without_env`, `session_create_typed_limits_are_enforced_without_env`, `web_run_deadline_is_enforced_externally`, plus supervisor enforcement of wall time, CPU, heap/RSS, pages, contexts, requests, network/download/artifact/console bytes). OPEN residual: 8h soak unclaimed (EXTERNAL).
 
-Elevation of privilege. Native addons, FFI, `child_process`, raw sockets, or unrestricted filesystem imports escape into the host. Specified mitigation: those capabilities are denied by default; `child_process` MUST remain unavailable in production; network imports, arbitrary npm, and native addons are denied. Phase 0: unimplemented. This is a critical open risk until hostile-controller tests exist.
+Elevation of privilege. Native addons, FFI, `child_process`, raw sockets, or unrestricted filesystem imports escape into the host. Specified mitigation: those capabilities are denied by default; `child_process` MUST remain unavailable in production; network imports, arbitrary npm, and native addons are denied. Implemented on macOS: deny-default `sandbox_init` plus module policy (`worker_sandbox_denies_host_secret_paths`, `controller_module_policy_denies_host_filesystem`). OPEN: Linux Landlock+seccomp is implemented in-tree and wired into `apply_worker_sandbox` via `linux_sandbox.rs` (`landlock_denies_path_outside_allow_list`, `apply_fails_closed_when_tmp_is_missing`, `apply_is_unsupported_off_linux`); live enforce is Linux-only — a macOS host does not execute Landlock. Prior non-macOS/non-Linux state remains fail-closed refuse (`non_macos_worker_sandbox_refuses_unsandboxed_start`). Windows has no OS sandbox and refuses unsandboxed start. This remains a critical risk until Linux enforcement is a production matrix pass, Windows has an OS sandbox, and a hostile-controller corpus exists. Arbitrary npm is still denied and unsupported.
 
 ### 5.2 Page network, SSRF, redirect rebinding, DNS rebinding, cloud metadata (guide §16.2)
 
 Applies to both `research` and `project` profiles. Policy is applied at DNS resolution and every redirect hop.
 
-Spoofing / tampering of destination. A page or a `web read` URL uses DNS rebinding, IPv4-mapped IPv6, a redirect from a public host to `169.254.169.254`, CGNAT, RFC1918, loopback, or link-local. Specified mitigation: resolve and re-check every hop; deny loopback, link-local, RFC1918, CGNAT, cloud metadata, multicast, and IPv4-mapped equivalents on the research profile; project profile may allow only loopback origins selected from the current project task and MUST record every local-origin grant; arbitrary LAN and cloud metadata remain denied. Phase 0: unimplemented. Open critical risk.
+Spoofing / tampering of destination. A page or a `web read` URL uses DNS rebinding, IPv4-mapped IPv6, a redirect from a public host to `169.254.169.254`, CGNAT, RFC1918, loopback, or link-local. Specified mitigation: resolve and re-check every hop; deny loopback, link-local, RFC1918, CGNAT, cloud metadata, multicast, and IPv4-mapped equivalents on the research profile; project profile may allow only loopback origins selected from the current project task and MUST record every local-origin grant; arbitrary LAN and cloud metadata remain denied. Implemented: `research_profile_denies_cloud_metadata`, `playwright_goto_denies_cloud_metadata`, `goto_redirect_to_metadata_is_denied`, `research_denies_loopback_project_allows`, `both_profiles_deny_lan`, `both_profiles_deny_metadata`, `research_denies_mapped_loopback_and_link_local`, `pin_connect_addr_rechecks_every_lookup_against_later_metadata`, `proxy_does_not_follow_redirect_to_metadata_and_denies_the_next_hop`, `proxy_denies_later_lookup_that_rebinds_to_metadata`, `proxy_denies_https_connect_after_rebind_to_metadata`, `proxy_denies_metadata_host_header_on_allowed_url`, `proxy_repins_keep_alive_http_and_denies_rebind`. OPEN residual: not a substitute for human security review (EXTERNAL) or a full redirect-rebinding corpus on every platform.
 
-Information disclosure. SSRF reads cloud metadata, workspace-bound development servers, or sibling-run sockets, then returns them as research evidence. Specified mitigation: same hop checks; bounded response and download sizes; explicit allow-list for exceptions; evidence records requested URL, final URL, and redirect chain. Phase 0: unimplemented.
-
-Denial of service. Unbounded downloads, slowloris origins, or redirect loops. Specified mitigation: session `max_network_bytes`, `max_download_bytes`, deadlines, and hop limits. Phase 0: unimplemented.
-
-Elevation. Request interception/fulfillment in a later phase MUST NOT become a way to speak arbitrary sockets from the controller. Fulfillment is engine-mediated and still subject to the same DNS/redirect policy.
+Information disclosure. SSRF reads cloud metadata, workspace-bound development servers, or sibling-run sockets, then returns them as research evidence. Specified mitigation: same hop-by-hop policy; research is public HTTP/HTTPS only. Implemented by the tests above. OPEN residual: project-profile loopback grants are recorded, not a LAN allow-list.
 
 Profile difference, not a weakening:
 
@@ -106,43 +110,52 @@ Profile difference, not a weakening:
 
 ### 5.3 Credential injection and redaction (guide §16.3)
 
-Spoofing. A script reads model-provider environment variables and uses them as site passwords. Specified mitigation: credentials enter only through a typed capability store or explicit session grant; they MUST NOT be inherited from model-provider environment variables. Phase 0: unimplemented. Open critical risk.
+Spoofing. A script reads model-provider environment variables and uses them as site passwords. Specified mitigation: credentials enter only through a typed capability store or explicit session grant; they MUST NOT be inherited from model-provider environment variables. Implemented: `workers_do_not_inherit_secret_environment`, `controller_module_policy_denies_host_filesystem`. OPEN residual: a typed credential-grant store is not a security-review pass; do not treat env-deny as credential injection.
 
-Information disclosure. Screenshots, traces, request headers, HAR, error messages, or model-facing snippets include `Authorization`, `Cookie`, or form passwords. Specified mitigation: redaction layer before model visibility; raw credential-bearing artifacts marked sensitive and operator-only. Phase 0: unimplemented.
+Information disclosure. Screenshots, traces, request headers, HAR, error messages, or model-facing snippets include `Authorization`, `Cookie`, or form passwords. Specified mitigation: redaction layer before model visibility; raw credential-bearing artifacts marked sensitive and operator-only. Implemented: `redact_secrets_masks_userinfo_and_password_query`, `redact_secrets_masks_authorization_cookie_and_bearer`, `redact_json_masks_header_objects_and_credential_keys`, `policy_errors_redact_url_credentials`, `controller_exception_redacts_authorization_secrets`. Artifact manifests carry `redaction_status`, `sensitive`, and `credential_labeled` (`stores_bytes_once_and_lists_manifests`). OPEN residual: pattern redaction misses secrets that do not look like the labeled set. Human review EXTERNAL.
 
-Tampering. Storage-state export writes cookies for origins that were never granted, or includes credentials that Playwright storage-state semantics cannot represent. Specified mitigation: export requires an explicit path and MUST exclude those credentials. Phase 0: unimplemented.
+Tampering. Storage-state export writes cookies for origins that were never granted, or includes credentials that Playwright storage-state semantics cannot represent. Specified mitigation: export requires an explicit path and MUST exclude those credentials. Partial: `cookies_storage_state_includes_local_storage_origin` exercises storage-state shape. OPEN residual: origin-grant exclusion on export is not a reviewed control.
 
 ### 5.4 Browser isolation and profile locks (guide §16.4)
 
-Spoofing / elevation. Two runs share a profile directory and steal cookies. Specified mitigation: research sessions use a fresh context by default; persistent profiles are opt-in, path-scoped, and locked against concurrent writers. Phase 0: unimplemented.
+Spoofing / elevation. Two runs share a profile directory and steal cookies. Specified mitigation: research sessions use a fresh context by default; persistent profiles are opt-in, path-scoped, and locked against concurrent writers. Implemented: `persistent_profile_lock_is_exclusive_until_owner_closes`, `live_lock_is_exclusive_stale_lock_is_recovered`.
 
-Tampering. Crash recovery deletes a live owner lock and hands the profile to a new worker. Specified mitigation: profile locks MUST be recovered safely after a crash without deleting a live owner lock. Phase 0: unimplemented.
+Tampering. Crash recovery deletes a live owner lock and hands the profile to a new worker. Specified mitigation: profile locks MUST be recovered safely after a crash without deleting a live owner lock. Implemented: `live_lock_is_exclusive_stale_lock_is_recovered`.
 
-Information disclosure. Profiles, downloads, traces, or cookies persist outside the run-scoped data root. Specified mitigation: forbidden without an explicit user request; ephemeral sessions are deleted on clean close. Phase 0: unimplemented. Open critical risk (`Profiles leak credentials` in the risk register).
+Information disclosure. Profiles, downloads, traces, or cookies persist outside the run-scoped data root. Specified mitigation: forbidden without an explicit user request; ephemeral sessions are deleted on clean close. Implemented: `ephemeral_session_dir_is_deleted_on_clean_close`, `persistent_session_dir_is_retained_on_clean_close`. OPEN residual: 8h leak-and-soak unclaimed (EXTERNAL). Profiles still leak if an operator opts into a persistent path and the process is killed before Drop; that is an operator-granted residual, not a waived finding.
 
 ### 5.5 Process isolation
 
 Controller and page MUST NOT run in the Greppy parent. If they do, a V8 or Servo memory-safety defect, or a simple infinite loop, takes down the agent and inherits parent credentials.
 
-Specified mitigation: three separately linked runtime images: an engine-free supervisor, a V8-only controller worker, and a Servo/mozjs-only content worker. A single distributable MAY package those images, but a same-binary re-exec design is forbidden because it recreates the proven same-Mach-O engine collision. Each process requires a parent-issued capability; the parent survives worker crashes and forced termination; timeout termination kills the entire worker process tree and returns a typed partial-artifact result. `phase1-probe` remains only the negative collision regression. The positive three-image lifecycle boundary is implemented and smoke-tested as an experimental checkpoint, but parent-issued capabilities, OS sandboxing, process-tree enforcement, typed partial artifacts, and Greppy-parent integration remain unimplemented. Open critical risk (`Controller or page escapes sandbox`).
+Specified mitigation: three OS processes of one linked `web-runtime` executable, selected with hidden `--internal-role`. The supervisor process MUST NOT construct either engine; controller constructs V8 only; content constructs Servo/mozjs only. Children MUST execute the same on-disk binary as the supervisor. Each process requires a parent-issued capability; the parent survives worker crashes and forced termination; timeout termination kills the entire worker process tree and returns a typed partial-artifact result. `phase1-probe` remains the co-link oracle.
+
+Implemented: `supervisor_runs_both_runtime_workers_across_process_boundaries`, `one_runtime_image_contains_supervisor_controller_and_content`, `internal_role_is_hidden_from_ordinary_invocation`, `greppy_cli_crate_does_not_depend_on_javascript_engines`, `greppy_cli_parent_survives_content_worker_kill`, `content_worker_exits_after_supervisor_is_killed`, `content_worker_crash_is_recovered_without_hanging`, `graceful_shutdown_reaps_workers_without_harness_escalation`, `closed_page_and_browser_throw_object_disposed`, `object_disposed_error_names_the_kind`. Nested frames fail closed (`frames_content_frame_and_describe` via `fixtures/frames.mjs`: nested `childFrames`, nested `FrameLocator.frameLocator`, and `locator.frameLocator` throw `unsupported_playwright_operation`). Same-image identity is sampled (`current_process_matches_its_own_image_identity`, `in_place_rewrite_is_detected_without_claiming_inode_equals_bytes`). macOS workers install deny-default `sandbox_init` (`worker_sandbox_denies_host_secret_paths`).
+
+OPEN:
+
+- Linux Landlock+seccomp is implemented in-tree (`linux_sandbox.rs`, wired from `apply_worker_sandbox`); live enforce is Linux-only — a macOS host does not execute it. Off-Linux unit coverage is the unsupported stub (`apply_is_unsupported_off_linux`). Non-macOS/non-Linux still fail-closed refuse (`non_macos_worker_sandbox_refuses_unsandboxed_start`). Windows: no OS sandbox.
+- Residual macOS fexecve/TOCTOU on path-based spawn. `fexecve` is Linux; macOS spawn is path-based and needs codesign over mapped pages. The image-id cache does not prove those bytes were the bytes exec'd (`in_place_rewrite_is_detected_without_claiming_inode_equals_bytes`). EXTERNAL.
+- No Windows named-pipe workers.
+- Controller or page can still escape if the OS sandbox is absent or bypassed. That finding is not waived.
 
 ### 5.6 Prompt-injection fencing for research outputs (guide §14.2)
 
 Page text that says "ignore previous instructions" or "exfiltrate the API key" MUST NOT become system or developer instructions.
 
-Specified mitigation: every admitted source carries provenance (URLs, timestamps, digests, classification); tool results wrap extracted content in an explicit untrusted-content boundary; model-facing output is a compact answer pack; full snapshots stay in the artifact store. Phase 0: unimplemented. Open high risk (`Research pages inject instructions`).
+Specified mitigation: every admitted source carries provenance (URLs, timestamps, digests, classification); tool results wrap extracted content in an explicit untrusted-content boundary; model-facing output is a compact answer pack; full snapshots stay in the artifact store. Implemented: `prompt_injection_is_fenced_as_untrusted_page_content` (`untrusted_content_boundary=UNTRUSTED_PAGE_CONTENT`), `model_facing_source_truncates_long_text`, `large_read_is_truncated_and_artifact_backed`. OPEN residual: this is a label-and-truncate fence, not a prompt-injection defense that has been independently reviewed. Human security review EXTERNAL. High risk (`Research pages inject instructions`) remains open as a review finding.
 
 ### 5.7 Resource exhaustion (guide §17)
 
 A worker cannot be the authority for its own memory or deadline. Session limits (wall time, controller CPU, content CPU, controller heap, content RSS, max pages, contexts, requests, network bytes, download bytes, artifact bytes, console bytes) are typed and enforced in the supervisor.
 
-Specified mitigation: external enforcement; kill process tree on timeout; typed partial artifacts; soak and leak tests later. Phase 0: unimplemented. Open high risk if the supervisor is skipped during the spike.
+Specified mitigation: external enforcement; kill process tree on timeout; typed partial artifacts; soak and leak tests later. Implemented: typed `SessionLimits` struct and supervisor enforcement (`research_profile_is_tighter_than_default`, `artifact_limit_rejects_overflow`, `context_and_request_limits_reject_overflow`, `console_download_and_cpu_limits_reject_overflow`, `payload_limits_override_profile_without_env`, `session_create_typed_limits_are_enforced_without_env`, `max_pages_limit_is_enforced_by_supervisor`, `max_contexts_limit_is_enforced_by_supervisor`, `max_requests_limit_is_enforced_on_read`, `content_rss_limit_is_enforced_by_supervisor`, `wall_time_limit_is_enforced_by_supervisor`, `controller_memory_limit_is_enforced_by_supervisor`, `controller_cpu_limit_is_enforced_by_supervisor`, `content_cpu_limit_is_enforced_by_supervisor`, `max_console_bytes_limit_is_enforced_from_recorded_logs`, `max_download_bytes_limit_is_enforced_from_recorded_bodies`, `max_network_bytes_limit_is_enforced_on_read`, `max_artifact_bytes_limit_is_enforced_on_read`, `web_run_deadline_is_enforced_externally`). OPEN residual: 8h soak unclaimed (EXTERNAL). Idle CPU is gated (`idle_supervisor_workers_are_not_cpu_hot`) but not a 30% RSS comparison.
 
 ### 5.8 Artifact integrity and sensitive artifact access (guide §15)
 
-Tampering. A worker overwrites `objects/sha256/<digest>` with a colliding name or a truncated file. Specified mitigation: content-addressed store; manifests bind digest, byte count, media type, producing operation, session, timestamp, and redaction status; crash recovery validates manifests. Phase 0: unimplemented.
+Tampering. A worker overwrites `objects/sha256/<digest>` with a colliding name or a truncated file. Specified mitigation: content-addressed store; manifests bind digest, byte count, media type, producing operation, session, timestamp, and redaction status; crash recovery validates manifests. Implemented: `stores_bytes_once_and_lists_manifests`, `file_digest_matches_in_memory_digest_for_multi_buffer_payload`, `screenshot_payload_output_does_not_write_outside_artifact_store`. OPEN residual: crash-recovery validation of truncated objects is not a soak-proven gate.
 
-Information disclosure. Model output includes unredacted traces. Specified mitigation: sensitive flag, credential label, operator-only path, redaction_status in the manifest schema. Phase 0: unimplemented.
+Information disclosure. Model output includes unredacted traces. Specified mitigation: sensitive flag, credential label, operator-only path, redaction_status in the manifest schema. Implemented in schema and redaction tests above.
 
 Integrity failure is a terminal class `artifact_integrity` mapped to exit code 39.
 
@@ -150,64 +163,78 @@ Integrity failure is a terminal class `artifact_integrity` mapped to exit code 3
 
 A supervisor or browser worker that survives `greppy` exit becomes an untracked daemon with leftover profiles.
 
-Specified mitigation: parent-owned capability, heartbeat, idle TTL when no live session, Greppy agent shutdown closes all run-owned sessions and terminates workers, leak-and-soak CI, absolute benchmark gate that no session or worker survives verified cleanup. Phase 0: unimplemented. Open high risk.
+Specified mitigation: parent-owned capability, heartbeat, idle TTL when no live session, Greppy agent shutdown closes all run-owned sessions and terminates workers, leak-and-soak CI, absolute benchmark gate that no session or worker survives verified cleanup. Implemented: `cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session`, `idle_sessions_are_reaped`, `supervisor_exits_after_typed_idle_ttl`, `content_worker_exits_after_supervisor_is_killed`, `graceful_shutdown_reaps_workers_without_harness_escalation`. OPEN residual: 8h soak unclaimed (EXTERNAL). No proof the runtime cannot outlive a multi-hour agent run.
 
-## 6. Mitigations specified versus unimplemented
+## 6. Mitigations specified versus in-tree proof
 
-The following are specified now. Only the row explicitly marked as an experimental lifecycle checkpoint has an implementation; later phases MUST implement the remaining controls rather than re-derive policy.
+The following are specified now. Rows with test names are implemented in the
+`experimental web-runtime spike` (macOS in-tree proof unless noted). Rows
+marked OPEN or EXTERNAL are holes. Later phases MUST close those holes rather
+than re-derive policy. No critical or high finding is waived.
 
-| Mitigation | Specified in | Implemented in Phase 0 |
+| Mitigation | Specified in | In-tree proof |
 |---|---|---|
-| Parent-issued unguessable capabilities | §6.2, this document | No |
-| Three separately linked runtime images; neither engine in parent or supervisor; no same-binary re-exec | §5, §6.2 | Experimental lifecycle checkpoint only; not packaged, signed, sandboxed, or parent-integrated |
-| Module allow-list, no npm, no FFI, no child_process | §10.2, §16.1 | No |
-| Env allow-list | §10.2, §16.1 | No |
-| Virtualized fs roots | §10.2, §16.1 | No |
-| DNS and redirect-hop policy for research and project | §16.2 | No |
-| Typed credential grants and redaction | §16.3 | No |
-| Fresh research contexts and profile locks | §16.4 | No |
-| External session limits | §17 | No |
-| Untrusted-content fencing | §14.2 | No |
-| Content-addressed artifacts with manifests | §15 | No |
-| Heartbeat, TTL, run cleanup | §6.3, §19 | No |
-| Hostile controller and SSRF tests | §20.3, §22 | No |
+| Parent-issued unguessable capabilities; attach is inherited FD 4, not the socket path | §6.2, this document | `attach_capability_rejects_missing_wrong_and_endpoint_only`, `wrong_run_id_is_session_not_owned`, `worker_role_rejects_capability_secret_in_argv`, `worker_role_rejects_missing_inherited_capability_fd`, `concurrent_unrelated_children_do_not_inherit_attach_token_fd` |
+| One linked `web-runtime` executable; three OS-process roles via `--internal-role`; neither engine constructed in parent or supervisor | §5, §6.2 | `supervisor_runs_both_runtime_workers_across_process_boundaries`, `one_runtime_image_contains_supervisor_controller_and_content`, `internal_role_is_hidden_from_ordinary_invocation`, `greppy_cli_crate_does_not_depend_on_javascript_engines`. Not packaged/signed as a production dist (EXTERNAL). |
+| macOS deny-default worker `sandbox_init` | §16, this document | `worker_sandbox_denies_host_secret_paths` |
+| Linux Landlock+seccomp | §16, this document | Implemented in-tree (`linux_sandbox.rs`, wired from `apply_worker_sandbox`: `landlock_denies_path_outside_allow_list`, `apply_fails_closed_when_tmp_is_missing`, `apply_is_unsupported_off_linux`). OPEN residual: live enforce is Linux-only — a macOS host does not execute Landlock. Non-macOS/non-Linux fail-closed refuse (`non_macos_worker_sandbox_refuses_unsandboxed_start`). Windows: no OS sandbox. |
+| Residual macOS fexecve/TOCTOU on path-based spawn | this document | OPEN / EXTERNAL. `in_place_rewrite_is_detected_without_claiming_inode_equals_bytes` detects rewrite after snapshot; it does not close the exec TOCTOU. `fexecve` is Linux; macOS needs codesign. |
+| Windows named-pipe workers | this document | OPEN. No Windows named-pipe workers; attach remains Unix FD 4 (`ATTACH_TOKEN_FD`) on the platforms that have proof. |
+| Module allow-list, no npm, no FFI, no `child_process` | §10.2, §16.1 | `controller_module_policy_denies_host_filesystem` (`node:fs`, `file://`, `node:child_process` denied). Arbitrary npm remains unsupported. |
+| Env allow-list | §10.2, §16.1 | `workers_do_not_inherit_secret_environment`, `controller_module_policy_denies_host_filesystem` |
+| Virtualized fs roots / artifact confinement | §10.2, §16.1 | `screenshot_payload_output_does_not_write_outside_artifact_store`, `controller_module_policy_denies_host_filesystem` |
+| DNS and redirect-hop policy for research and project | §16.2 | `research_profile_denies_cloud_metadata`, `goto_redirect_to_metadata_is_denied`, `both_profiles_deny_lan`, `both_profiles_deny_metadata`, `pin_connect_addr_rechecks_every_lookup_against_later_metadata`, `proxy_denies_later_lookup_that_rebinds_to_metadata` |
+| Typed credential grants and redaction | §16.3 | Redaction: `redact_secrets_masks_userinfo_and_password_query`, `redact_secrets_masks_authorization_cookie_and_bearer`, `redact_json_masks_header_objects_and_credential_keys`, `policy_errors_redact_url_credentials`, `controller_exception_redacts_authorization_secrets`. Typed grant store: not a review pass. |
+| Fresh research contexts and profile locks | §16.4 | `persistent_profile_lock_is_exclusive_until_owner_closes`, `live_lock_is_exclusive_stale_lock_is_recovered`, `ephemeral_session_dir_is_deleted_on_clean_close` |
+| `object_disposed` on closed page/browser | this document | `object_disposed_error_names_the_kind`, `closed_page_and_browser_throw_object_disposed` |
+| Nested frames fail-closed | this document | `frames_content_frame_and_describe` (`fixtures/frames.mjs`) |
+| Unsupported Playwright surface fail-closed | this document | `fail_closed_clock_coverage_request_and_handles`, `getby_options_and_context_page_events_fail_closed` |
+| External typed `SessionLimits` | §17 | `research_profile_is_tighter_than_default`, `payload_limits_override_profile_without_env`, `session_create_typed_limits_are_enforced_without_env`, plus the supervisor `*_limit_is_enforced_*` tests listed in §5.7 |
+| Untrusted-content fencing | §14.2 | `prompt_injection_is_fenced_as_untrusted_page_content`, `model_facing_source_truncates_long_text`. Label-and-truncate only. |
+| Content-addressed artifacts with manifests | §15 | `stores_bytes_once_and_lists_manifests`, `file_digest_matches_in_memory_digest_for_multi_buffer_payload`, `screenshot_payload_output_does_not_write_outside_artifact_store` |
+| Heartbeat, TTL, run cleanup | §6.3, §19 | `cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session`, `idle_sessions_are_reaped`, `supervisor_exits_after_typed_idle_ttl`, `graceful_shutdown_reaps_workers_without_harness_escalation`. 8h soak: EXTERNAL. |
+| Event journal with request correlation | this document | `journal_line_includes_request_id_for_correlation`, `cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session` |
+| Hostile controller and SSRF tests | §20.3, §22 | Partial: module-policy, sandbox-deny, metadata/rebinding tests above. Not a hostile-controller corpus. Not a human security review. |
+| Distributable signing / notary | packaging scripts | OPEN / EXTERNAL. Unsigned unless `GREPPY_CODESIGN_IDENTITY` is set; ad-hoc/skip is recorded, not production-signed. Notary is a separate handoff. |
+| 8h soak; 20 independent third-party Playwright scripts; 30% size/RSS vs Playwright+Chromium | §26, DoD | OPEN / EXTERNAL. Unclaimed. In-tree `twenty_independent_playwright_scripts` is twenty **repo fixtures**, not independent third-party scripts. `size-receipt.json` records `chromium_playwright_delta: unclaimed`. |
+| Human security review | this document | OPEN / EXTERNAL. No review has been performed. In-tree tests are not a review. |
 
 No critical or high finding is waived.
 
 ## 7. Residual risks from the guide §26 register
 
-These remain open Phase-0 tracked risks. Severity is taken from the register. They are not residual-after-mitigation; apart from the explicitly identified lifecycle checkpoint, the mitigations are not yet built.
+Severity is taken from the register. In-tree tests change tracking, not
+severity. They do not convert this spike into a production runtime.
 
-| Risk | Severity | Phase 0 tracking |
+| Risk | Severity | Tracking |
 |---|---|---|
-| Servo lacks required automation hooks | Critical | Open. `docs/architecture/SERVO_EMBEDDING_GAPS.md` inventories required hooks as unverified against crate 0.5.0 source because the crate was not present locally. Stop if fork size becomes unbounded. |
-| Playwright behavior is larger than its schema | Critical | Open. Coverage inventory exists with schema/source/behavior set to unverified or unsupported. No schema-only claim is permitted. |
-| Node compatibility expands without bound | High | Open. Safe builtin allow-list is specified, not implemented. No arbitrary npm claim. |
-| V8 and Servo inflate build/install size | High | Open. One optional distributable containing three separately linked images is specified; aggregate and per-image benchmarks are registered, not measured. |
-| V8 and Servo collide in one linked image | Critical | Proven negative. `phase1-probe` demonstrates the same-Mach-O collision. The three-image lifecycle checkpoint is implemented and smoke-tested; production packaging, signing, and sandboxing remain open. |
-| Controller or page escapes sandbox | Critical | Open. Three separately linked runtime images and an engine-free supervisor exist as an experimental checkpoint, but capabilities, OS sandboxing, parent integration, and hostile tests are not implemented. |
-| Runtime packaging or signing is incomplete | High | Open. No release-CI receipt proves the one-distributable/three-image layout, per-image and package signatures, SBOM, provenance, installation, upgrade, rollback, or uninstall. |
-| Playwright releases drift rapidly | High | Open. Baseline pinned at 1.62.1 in the dependency lock. |
-| Event ordering creates flaky automation | High | Open. Causal journal specified, not implemented. |
-| Auto-waiting busy-polls | Medium | Open. Idle CPU gate registered, not measured. |
-| Profiles leak credentials | Critical | Open. Run-scoped profiles specified, not implemented. |
-| Runtime outlives agent run | High | Open. Cleanup gate registered, not measured. |
-| Research pages inject instructions | High | Open. Fencing specified, not implemented. |
-| Compatibility is overstated | Critical | Open. Machine-readable coverage manifest exists; every claimed entry is unverified or unsupported. Release naming MUST use experimental / prototype / partial labels until gates pass. |
+| Servo lacks required automation hooks | Critical | OPEN. `docs/architecture/SERVO_EMBEDDING_GAPS.md` inventories required hooks as unverified against crate 0.5.0 source because the crate was not present locally. Stop if fork size becomes unbounded. |
+| Playwright behavior is larger than its schema | Critical | OPEN. Coverage inventory exists with schema/source/behavior set to unverified or unsupported. No schema-only claim is permitted. This spike is not Playwright-compatible. |
+| Node compatibility expands without bound | High | OPEN. `controller_module_policy_denies_host_filesystem` denies `node:fs` / `node:child_process` / `file://`. That is a deny, not a Node compatibility claim. No arbitrary npm. |
+| V8 and Servo inflate build/install size | High | OPEN / EXTERNAL. Packaged executable size is measured; 30% size/RSS vs Playwright+Chromium is unclaimed. |
+| V8 and Servo collide in one process | Critical | Proven unless localized. `phase1-probe` is the co-link oracle. Roles MUST remain separate OS processes of the same on-disk binary; both engines MUST NOT be constructed in one process (`supervisor_runs_both_runtime_workers_across_process_boundaries`). Production packaging, signing, and Linux/Windows sandboxing remain open. |
+| Controller or page escapes sandbox | Critical | OPEN. macOS `sandbox_init` is live (`worker_sandbox_denies_host_secret_paths`). Linux Landlock+seccomp is implemented in-tree (`linux_sandbox.rs`, wired from `apply_worker_sandbox`); live enforce is Linux-only — a macOS host does not execute it. Windows: fail-closed refuse, no OS sandbox. Residual macOS fexecve/TOCTOU is EXTERNAL. No Windows named-pipe workers. Hostile-controller corpus incomplete. |
+| Runtime packaging or signing is incomplete | High | OPEN / EXTERNAL. Unsigned dist without `GREPPY_CODESIGN_IDENTITY` / notary. Ad-hoc signatures are not production signatures. |
+| Playwright releases drift rapidly | High | OPEN. Baseline pinned at 1.62.1 in the dependency lock. Not a compatibility claim. |
+| Event ordering creates flaky automation | High | Partial. Journal exists (`journal_line_includes_request_id_for_correlation`). Not a replay-complete causal store. |
+| Auto-waiting busy-polls | Medium | Partial. `idle_supervisor_workers_are_not_cpu_hot`. Idle CPU vs Playwright+Chromium unclaimed. |
+| Profiles leak credentials | Critical | Partial. Locks and ephemeral delete proven (`persistent_profile_lock_is_exclusive_until_owner_closes`, `live_lock_is_exclusive_stale_lock_is_recovered`, `ephemeral_session_dir_is_deleted_on_clean_close`). 8h soak unclaimed (EXTERNAL). |
+| Runtime outlives agent run | High | Partial. Heartbeat/TTL/reap proven. 8h soak unclaimed (EXTERNAL). |
+| Research pages inject instructions | High | Partial. `prompt_injection_is_fenced_as_untrusted_page_content` is a label-and-truncate fence. Human review EXTERNAL. |
+| Compatibility is overstated | Critical | OPEN. Machine-readable coverage manifest exists; claimed entries remain unverified or unsupported. Release naming MUST keep `experimental web-runtime spike` / prototype / partial until gates pass. Do not claim Playwright compatibility. |
 
-## 8. Open Phase-0 tracked risks that MUST block a production label
+## 8. Open tracked risks that MUST block a production label
 
-The following remain unresolved critical or high findings. They MAY NOT be converted to a pass by prose, a demo script, or type coverage:
+The following remain unresolved critical or high findings. They MAY NOT be converted to a pass by prose, a demo script, type coverage, or the macOS in-tree tests above:
 
-1. The experimental process boundary lacks production capabilities, OS sandboxing, parent-owned lifecycle, and hostile isolation tests.
-2. No SSRF/rebinding enforcement.
-3. No credential redaction path.
-4. No evidence that Servo 0.5.0 exposes the required embedding hooks (crate source not inspected; see the gaps document).
-5. No conformance corpus execution; compatibility entries are unverified or unsupported.
-6. No proof the runtime cannot outlive the agent run.
-7. No prompt-injection fencing tests.
-8. No release-CI proof that the three required linked images are packaged,
-   signed, verified, installed, upgraded, rolled back, and removed as one
-   distributable.
+1. Linux Landlock+seccomp is implemented in-tree (`linux_sandbox.rs`, wired from `apply_worker_sandbox`), but live enforce is Linux-only — a macOS host does not execute it. Windows has no OS sandbox (fail-closed refuse).
+2. Residual macOS fexecve/TOCTOU on path-based spawn. `fexecve` is Linux; macOS needs codesign. EXTERNAL.
+3. No human security review. EXTERNAL.
+4. Unsigned dist without `GREPPY_CODESIGN_IDENTITY` / notary. EXTERNAL.
+5. No Windows named-pipe workers.
+6. 8h soak, 20 independent third-party scripts, and 30% size/RSS vs Playwright+Chromium are unclaimed. EXTERNAL. (`twenty_independent_playwright_scripts` is not that gate.)
+7. No evidence that Servo 0.5.0 exposes the required embedding hooks (crate source not inspected; see the gaps document).
+8. No conformance corpus execution; compatibility entries are unverified or unsupported. This is not Playwright-compatible.
+9. Nested-frame, `object_disposed`, attach, redaction, journal, profile-lock, artifact-store, SSRF/policy, and `SessionLimits` tests prove those controls on macOS. They do not close (1)–(8).
 
-Phase 1 may proceed only as an `experimental web-runtime spike`, through the three separately linked images required above, and only if it does not silently replace this architecture with official Playwright, CDP, an external browser, or the CTOX web stack. The negative `phase1-probe` is not Phase 1 completion. Even a successful positive spike leaves packaging and signing as unproven Phase 7 release gates.
+Work may proceed only as an `experimental web-runtime spike`, through the one-binary three-process model required above, and only if it does not silently replace this architecture with official Playwright, CDP, an external browser, or the CTOX web stack. `phase1-probe` is not spike completion. A successful spike still leaves packaging, signing, Linux-only Landlock enforce, macOS fexecve/TOCTOU, Windows named-pipe workers, soak, third-party scripts, size/RSS, and human security review as unproven gates. None of those absences is a pass.
