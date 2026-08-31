@@ -947,6 +947,28 @@ impl ContentEngine {
         }
     }
 
+    /// How far a navigation must get before `goto` returns.
+    ///
+    /// Playwright lets the caller choose; the runtime used to wait for the
+    /// full load in every case. On a page whose sub-resource never finishes,
+    /// `readyState` stays `loading` forever, so `goto` timed out on a document
+    /// that was parsed, titled and fully readable -- three pages of the pinned
+    /// corpus fail exactly this way.
+    fn load_committed_for(
+        &self,
+        webview: &WebView,
+        last_js: &mut Instant,
+        until: WaitUntil,
+    ) -> bool {
+        match (webview.load_status(), until) {
+            (LoadStatus::Complete, _) => true,
+            // The document is parsed: the DOM is there and can be read, which
+            // is exactly what `domcontentloaded` promises.
+            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded) => true,
+            _ => self.load_committed(webview, last_js),
+        }
+    }
+
     fn load_committed(&self, webview: &WebView, last_js: &mut Instant) -> bool {
         match webview.load_status() {
             LoadStatus::Complete => true,
@@ -971,6 +993,16 @@ impl ContentEngine {
         &self,
         webview: &WebView,
         timeout: Duration,
+        url_settled: impl FnMut() -> bool,
+    ) -> io::Result<bool> {
+        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, url_settled)
+    }
+
+    fn spin_until_loaded_until(
+        &self,
+        webview: &WebView,
+        timeout: Duration,
+        until: WaitUntil,
         mut url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
@@ -981,13 +1013,13 @@ impl ContentEngine {
                 return Err(Self::parent_gone());
             }
             trace.note(webview, &mut url_settled);
-            if url_settled() && self.load_committed(webview, &mut last_js) {
+            if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
                 return Ok(true);
             }
             self.servo.spin_event_loop();
             trace.note(webview, &mut url_settled);
-            if url_settled() && self.load_committed(webview, &mut last_js) {
+            if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
                 return Ok(true);
             }
@@ -1738,7 +1770,8 @@ impl ContentEngine {
                 let loading = webview.clone();
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
-                if !self.spin_until_loaded(&loading, call_timeout(&params), || {
+                let until = WaitUntil::from_params(&params);
+                if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || {
                     denied.denied_navigation.borrow().is_some()
                         || loading.url().is_some_and(|current| {
                             urls_match(&current, &expected)
@@ -4729,6 +4762,24 @@ pub fn run() -> io::Result<()> {
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+/// The navigation milestone a caller waits for. `networkidle` and `commit`
+/// map onto the two we can actually observe: idle behaves like a full load,
+/// commit like a parsed document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WaitUntil {
+    Load,
+    DomContentLoaded,
+}
+
+impl WaitUntil {
+    fn from_params(params: &serde_json::Value) -> Self {
+        match params.get("waitUntil").and_then(|value| value.as_str()) {
+            Some("domcontentloaded") | Some("commit") => Self::DomContentLoaded,
+            _ => Self::Load,
         }
     }
 }
