@@ -105,10 +105,18 @@ pub(super) fn forget_current_session(root: Option<&str>) {
     let _ = std::fs::write(&path, "{}\n");
 }
 
-/// Did the runtime reject the request because the session is unknown?
+/// Did the runtime reject the request because the remembered session is
+/// unusable — either gone, or wedged in a terminal state?
+///
+/// A session that failed once stays failed: every later call answers
+/// `illegal session transition Failed -> Busy`. From the caller's side that is
+/// the same situation as a session that no longer exists, and the same cure
+/// applies — forget it and open a new one. Without this a single failed
+/// operation poisons every command that follows.
 pub(super) fn is_missing_session(error: &ErrorObject) -> bool {
     error.code == "session_not_found"
-        || error.message.contains("was not found") && error.message.contains("session")
+        || (error.message.contains("was not found") && error.message.contains("session"))
+        || error.message.contains("illegal session transition")
 }
 
 pub(super) fn read_current_scope(root: Option<&str>) -> CurrentScope {
@@ -600,7 +608,25 @@ pub(super) fn rpc_with_spawn(
     spawn: SupervisorSpawn,
 ) -> Result<i32> {
     match ensure_supervisor(root, &spawn) {
-        Ok(ctx) => rpc_on(&ctx, json_out, operation, payload, session_id),
+        Ok(ctx) => match rpc_on_response(&ctx, operation, payload, session_id) {
+            Ok(response) => {
+                // A remembered session that turns out to be gone or wedged
+                // would otherwise poison every later command too. Forgetting
+                // it here means this call still reports the failure honestly
+                // and the next one starts clean, without the caller having to
+                // know that a state file exists.
+                if response.error.as_ref().is_some_and(is_missing_session) {
+                    forget_current_session(root);
+                }
+                emit_response(json_out, response)
+            }
+            Err(error) => {
+                if is_missing_session(&error) {
+                    forget_current_session(root);
+                }
+                emit_error(json_out, error)
+            }
+        },
         Err(error) => emit_error(json_out, error),
     }
 }
