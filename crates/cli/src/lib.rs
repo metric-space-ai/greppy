@@ -4005,7 +4005,13 @@ impl BackgroundJobGuard {
         };
         let progress_unit = match self.progress_phase {
             Some("embedding") => Some("spans"),
-            Some("classifying_files" | "extracting_files" | "writing_graph") => Some("files"),
+            Some("classifying_files" | "extracting_files" | "writing_graph" | "building_files") => {
+                Some("files")
+            }
+            Some("building_folders") => Some("folders"),
+            Some("resolving_edges" | "writing_resolved_edges" | "writing_structure_edges") => {
+                Some("edges")
+            }
             Some(_) => Some("steps"),
             None => None,
         };

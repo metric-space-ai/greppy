@@ -869,15 +869,12 @@ fn prepare_base_store_paths(
     #[cfg(debug_assertions)]
     if std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some() {
         return Err(Error::Invalid(
-            "injected immutable Base summary generation failure".into(),
+            "injected immutable Base summary cache publication failure".into(),
         ));
     }
-    report_base_phase(progress_path, "building_base_summaries");
-    let staged_summary_cache = build_base_summary_cache(
-        worktree_path,
-        &staged_graph,
-        &identity.summary_model_and_prompt_version,
-    )?;
+    report_base_phase(progress_path, "initializing_base_summary_cache");
+    let staged_summary_cache =
+        build_base_summary_cache(&staged_graph, &identity.summary_model_and_prompt_version)?;
     validate_base_summary_cache(
         worktree_path,
         &staged_graph,
@@ -1052,11 +1049,7 @@ fn prepared_base_with_reader(
     })
 }
 
-fn build_base_summary_cache(
-    root: &Path,
-    graph_path: &Path,
-    expected_model_key: &str,
-) -> Result<PathBuf> {
+fn build_base_summary_cache(graph_path: &Path, expected_model_key: &str) -> Result<PathBuf> {
     let summary_dir = graph_path
         .parent()
         .ok_or_else(|| Error::Invalid("staged Base graph has no parent".into()))?
@@ -1088,29 +1081,16 @@ fn build_base_summary_cache(
             "Base summary model identity changed during publication".into(),
         ));
     }
-    let expected = expected_base_summary_spans(root, graph_path)?;
-    for (file_path, start_line, source, _) in &expected {
-        crate::summarize_source_cached(
-            &config,
-            &model_key,
-            Some(&cache),
-            None,
-            file_path,
-            source,
-            true,
-        )
-        .ok_or_else(|| {
-            Error::Invalid(format!(
-                "Base summary generation failed for {file_path}:{start_line}"
-            ))
-        })?;
-    }
-    let actual = cache.count()? as usize;
-    if actual != expected.len() {
-        return Err(Error::Invalid(format!(
-            "Base summary cache is incomplete: expected {} entries, found {actual}",
-            expected.len()
-        )));
+    // Summaries are derived navigation output, not graph correctness data.
+    // Eagerly generating one summary for every definition made a cold Base
+    // take hours and allowed a transient summary daemon failure to discard an
+    // otherwise complete graph and embedding generation. Publish a verified
+    // empty cache bound to the model identity; navigation fills the private
+    // workspace cache lazily on an actual summary request.
+    if cache.count()? != 0 {
+        return Err(Error::Invalid(
+            "new Base summary cache unexpectedly contains entries".into(),
+        ));
     }
     drop(cache);
     Ok(summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE))
@@ -1189,10 +1169,17 @@ fn validate_base_summary_cache(
         }
         return Ok(());
     }
+    // An empty Base summary cache is the intentional lazy-summary contract.
+    // The manifest still authenticates the empty SQLite file and the Base
+    // identity still pins the model/prompt generation. Non-empty legacy or
+    // externally warmed caches are validated below for bounded completeness.
+    if actual == 0 {
+        return Ok(());
+    }
     let expected = expected_base_summary_spans(root, graph_path)?;
-    if actual != expected.len() {
+    if actual > expected.len() {
         return Err(Error::Invalid(format!(
-            "Base summary cache is incomplete: expected {} entries, found {actual}",
+            "Base summary cache has more entries than the visible graph: maximum {}, found {actual}",
             expected.len()
         )));
     }

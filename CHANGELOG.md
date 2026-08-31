@@ -16,12 +16,23 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   search against an incomplete embedding generation now returns temporary
   exit 75 with an explicit `index status --json` retry condition.
 - Cold graph builds publish real discovery, extraction, graph-write and
-  structural phases with phase-local file/step counts. Active work is no
-  longer mislabeled as stalled at zero percent. A linked worktree waiting on
+  structural phases with phase-local file/folder/edge counts. Structural
+  edges are committed in one transaction instead of one transaction per
+  edge, removing the multi-minute structural tail on large repositories.
+  Active work is no longer mislabeled as stalled at zero percent. Cold model
+  loading uses its own bounded stall threshold rather than the ordinary
+  two-minute graph threshold. A linked worktree waiting on
   another immutable-Base publisher now stops after a bounded five seconds
   with exit 75, the exact builder-lock path and retry guidance instead of
   blocking silently in `flock` under the stale `preparing_base_checkout`
   phase.
+- Immutable-Base publication no longer synchronously generates thousands of
+  derived text summaries. The fully validated graph and embeddings publish
+  immediately with a model-bound empty summary cache; requested summaries are
+  generated lazily in the private workspace cache. A busy summary daemon can
+  therefore no longer discard an otherwise healthy Base, and genuine Base
+  failures persist their exact terminal error in `index status --json` instead
+  of the generic `background index exited before successful publication`.
 - First-use graph navigation starts indexing as one observable background job
   and waits at most two seconds for publication. Large repositories therefore
   return retryable exit 75 instead of hiding an unbounded index walk. Job state

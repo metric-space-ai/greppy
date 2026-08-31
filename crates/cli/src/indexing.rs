@@ -6,6 +6,19 @@
 
 use super::*;
 
+fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
+    match phase {
+        // Loading the embedded models includes mapping and validating large
+        // assets. It is bounded by the inference path, but 120 seconds is too
+        // short on a cold macOS host and produced a false stall diagnosis.
+        Some("loading_model") => 600,
+        // Base identity/model hashing and checkout validation can precede the
+        // delegated graph worker. Keep this bounded, but allow cold disks.
+        Some("preparing_base") => 300,
+        _ => 120,
+    }
+}
+
 pub(crate) fn dispatch_index_status(json: bool, root: Option<&str>) -> Result<i32> {
     dispatch_index_health("index-status", json, root)
 }
@@ -52,13 +65,15 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             .and_then(|job| job.get("updated_at_unix_secs"))
             .and_then(serde_json::Value::as_u64)
             .map(|updated| unix_now_secs_cli().saturating_sub(updated));
-        let progress_stalled = progress_age_seconds.is_some_and(|age| age >= 120);
+        let phase = background_job
+            .as_ref()
+            .and_then(|job| job.get("state"))
+            .and_then(serde_json::Value::as_str);
+        let stall_threshold_seconds = progress_stall_threshold_seconds(phase);
+        let progress_stalled =
+            progress_age_seconds.is_some_and(|age| age >= stall_threshold_seconds);
         let message = if progress_stalled {
-            let phase = background_job
-                .as_ref()
-                .and_then(|job| job.get("state"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
+            let phase = phase.unwrap_or("unknown");
             format!(
                 "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the exact background_job PID, terminate only that process if it is no longer making progress, then rerun `greppy index`; the OS lock releases with its owner",
                 progress_age_seconds.unwrap_or(0)
@@ -82,6 +97,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "background_job": background_job,
             "background_state": "refreshing",
             "progress_age_seconds": progress_age_seconds,
+            "progress_stall_threshold_seconds": stall_threshold_seconds,
             "progress_stalled": progress_stalled,
             "fresh": false,
             "dirty_overlay": null,
@@ -701,12 +717,18 @@ pub(crate) fn dispatch_index(
             std::process::id()
         );
     }
-    let _auto_linked_worktree_overlay = crate::store_cow::prepare_auto_linked_worktree_overlay(
+    let _auto_linked_worktree_overlay = match crate::store_cow::prepare_auto_linked_worktree_overlay(
         &effective_root,
         &greppy_core::cache::data_root(),
         embedding_args,
         background_job.progress_path(),
-    )?;
+    ) {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            background_job.fail(&error);
+            return Err(error);
+        }
+    };
     background_job.write_state("indexing", None);
     if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {
         let result = index_overlay_snapshot(
@@ -1190,4 +1212,23 @@ pub(crate) fn index_embeddings_into_temp_store(
         )
         .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
     Ok(EmbeddingBuildOutcome::Complete(embedding_report))
+}
+
+#[cfg(test)]
+mod progress_status_tests {
+    use super::progress_stall_threshold_seconds;
+
+    #[test]
+    fn cold_model_and_base_preparation_use_phase_specific_stall_thresholds() {
+        assert_eq!(progress_stall_threshold_seconds(Some("loading_model")), 600);
+        assert_eq!(
+            progress_stall_threshold_seconds(Some("preparing_base")),
+            300
+        );
+        assert_eq!(
+            progress_stall_threshold_seconds(Some("extracting_files")),
+            120
+        );
+        assert_eq!(progress_stall_threshold_seconds(None), 120);
+    }
 }

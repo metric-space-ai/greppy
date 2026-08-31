@@ -411,8 +411,13 @@ pub fn index_with_options_and_progress(
         // FK-cascade removed (or whose resolution could have flipped),
         // instead of the whole project's raw edges.
         progress(IndexBuildProgress::new("resolving_edges", 0, 1));
-        report.edges_extracted =
-            resolve_edges_incremental(store, project_name, &changed_files, &def_fp_before)?;
+        report.edges_extracted = resolve_edges_incremental(
+            store,
+            project_name,
+            &changed_files,
+            &def_fp_before,
+            progress,
+        )?;
         progress(IndexBuildProgress::new("resolving_edges", 1, 1));
     } else {
         let profile = std::env::var("GREPPY_PROFILE").is_ok();
@@ -441,9 +446,8 @@ pub fn index_with_options_and_progress(
             eprintln!("[profile] load_all_raw_edges {:?}", t.elapsed());
         }
         let t = std::time::Instant::now();
-        progress(IndexBuildProgress::new("resolving_edges", 0, 1));
-        report.edges_extracted = resolve_and_persist_edges(store, project_name, &raw_edges)?;
-        progress(IndexBuildProgress::new("resolving_edges", 1, 1));
+        report.edges_extracted =
+            resolve_and_persist_edges_with_progress(store, project_name, &raw_edges, progress)?;
         if profile {
             eprintln!("[profile] resolve_and_persist_edges {:?}", t.elapsed());
         }
@@ -456,8 +460,14 @@ pub fn index_with_options_and_progress(
     // File→DEFINES targets are resolvable. Node/edge upserts make it
     // idempotent across incremental re-indexes; a deleted file's File node is
     // removed by the per-file node cascade in `run_incremental`.
-    progress(IndexBuildProgress::new("building_structure", 0, 1));
-    structural::build_structural(store, project_name, &entries)?;
+    structural::build_structural(
+        store,
+        project_name,
+        &entries,
+        &mut |phase, completed, total| {
+            progress(IndexBuildProgress::new(phase, completed, total));
+        },
+    )?;
 
     // `require`/`import`→File IMPORTS. A path-style import
     // (Ruby `require 'record'`, Clojure `(:require ..)`, Elm/Erlang/Zig/Dart
@@ -468,8 +478,9 @@ pub fn index_with_options_and_progress(
     // maps to exactly one File basename stem, link the importer's Module node
     // to that File. Symbol-resolving imports (rust/python/java — already at
     // parity) are re-checked and skipped, so nothing is double-counted.
+    progress(IndexBuildProgress::new("resolving_file_imports", 0, 1));
     resolve_file_imports(store, project_name)?;
-    progress(IndexBuildProgress::new("building_structure", 1, 1));
+    progress(IndexBuildProgress::new("resolving_file_imports", 1, 1));
 
     record_control_skips(store, project_name, &controlled_entries.skipped, generation)?;
 
@@ -1397,6 +1408,15 @@ fn resolve_and_persist_edges(
     project: &str,
     edges: &[ExtractedEdge],
 ) -> Result<usize> {
+    resolve_and_persist_edges_with_progress(store, project, edges, &mut |_| {})
+}
+
+fn resolve_and_persist_edges_with_progress(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
     let mut index = GraphIndex::load(store, project)?;
@@ -1410,10 +1430,18 @@ fn resolve_and_persist_edges(
     // IMPORTS edge and a reference edge never share endpoints, so no
     // edge's resolution is affected by the reordering.
     let mut resolved: Vec<NewEdge> = Vec::with_capacity(edges.len());
+    let mut examined = 0usize;
+    progress(IndexBuildProgress::new("resolving_edges", 0, edges.len()));
 
     // PASS 1 — IMPORTS. Record each resolved target into the index so the
     // reference pass can read a file's imports back.
     for edge in edges.iter().filter(|e| e.edge_type == "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            edges.len(),
+        ));
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
@@ -1448,6 +1476,12 @@ fn resolve_and_persist_edges(
 
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
     for edge in edges.iter().filter(|e| e.edge_type != "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            edges.len(),
+        ));
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
@@ -1494,6 +1528,7 @@ fn resolve_and_persist_edges(
     // Persist every resolved edge in a SINGLE transaction (was: one
     // transaction per edge). Determinism is unchanged — the edge order is
     // the same IMPORTS-then-references order resolved above.
+    progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     if store.is_overlay() {
         let logical = resolved
             .iter()
@@ -1525,6 +1560,7 @@ fn resolve_and_persist_edges(
     } else {
         insert_edges_batched(store, &resolved)?;
     }
+    progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     Ok(resolved.len())
 }
 
@@ -1845,6 +1881,7 @@ fn resolve_edges_incremental(
     project: &str,
     changed_files: &std::collections::HashSet<String>,
     def_fp_before: &std::collections::BTreeSet<String>,
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<usize> {
     // No file changed → nothing cascaded, graph already complete. O(1).
     if changed_files.is_empty() {
@@ -1858,7 +1895,7 @@ fn resolve_edges_incremental(
     if store.is_overlay() {
         let raw_edges = load_all_raw_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges(store, project, &raw_edges);
+        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
     }
 
     // Did a changed file alter the resolvable definition set? If so, an
@@ -1882,7 +1919,7 @@ fn resolve_edges_incremental(
             .map_err(sqlite_err)?;
         let raw_edges = load_all_raw_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges(store, project, &raw_edges);
+        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
     }
 
     // ── Pure body edit(s): def set unchanged. Re-resolve only the cascaded
@@ -1898,6 +1935,8 @@ fn resolve_edges_incremental(
     // Load the whole raw-edge set once (a single indexed read; no per-edge
     // resolution). We then resolve ONLY the candidate subset.
     let all_raw = load_all_raw_edges(store, project)?;
+    let mut examined = 0usize;
+    progress(IndexBuildProgress::new("resolving_edges", 0, all_raw.len()));
 
     let owned_by_changed = |e: &ExtractedEdge| changed_files.contains(source_file_of(e));
     let names_changed_def = |e: &ExtractedEdge| edge_references_name(e, &changed_def_names);
@@ -1919,6 +1958,12 @@ fn resolve_edges_incremental(
     }
     let mut resolved: Vec<NewEdge> = Vec::new();
     for edge in all_raw.iter().filter(|e| e.edge_type == "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            all_raw.len(),
+        ));
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
@@ -1961,6 +2006,12 @@ fn resolve_edges_incremental(
 
     // PASS 2 — reference edges. Resolve only candidates.
     for edge in all_raw.iter().filter(|e| e.edge_type != "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            all_raw.len(),
+        ));
         if !is_candidate(edge) {
             continue;
         }
@@ -1996,7 +2047,9 @@ fn resolve_edges_incremental(
         resolved.push(new_edge(project, src_id, target_id, edge));
     }
 
+    progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     insert_edges_batched(store, &resolved)?;
+    progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     // The total live edge count = the survivors PHASE A kept + what we just
     // re-inserted (the `ON CONFLICT` upsert means a re-inserted row that
     // happened to survive is not double-counted by the COUNT).

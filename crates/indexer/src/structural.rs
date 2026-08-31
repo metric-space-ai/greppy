@@ -164,10 +164,13 @@ fn folder_qn(project: &str, rel_dir: &str) -> String {
 /// Idempotent: nodes are upserted on `(project, qualified_name)` and edges on
 /// `(source_id, target_id, edge_type)`, so a re-index that re-creates the same
 /// spine is a no-op on counts.
+/// Build the structural spine while reporting completed units from the
+/// genuinely long-running folder, file and edge phases.
 pub(crate) fn build_structural(
     store: &mut Store,
     project: &str,
     entries: &[InventoryEntry],
+    progress: &mut dyn FnMut(&'static str, usize, usize),
 ) -> Result<()> {
     // ── Project node ────────────────────────────────────────────────
     // label="Project", name = qn = project_name, no file path.
@@ -201,7 +204,8 @@ pub(crate) fn build_structural(
 
     // Insert Folder nodes; remember their ids by rel_dir for edge wiring.
     let mut folder_id: HashMap<String, i64> = HashMap::new();
-    for dir in &dirs {
+    progress("building_folders", 0, dirs.len());
+    for (index, dir) in dirs.iter().enumerate() {
         let id = store.insert_node(&NewNode {
             project: project.to_string(),
             label: "Folder".into(),
@@ -213,6 +217,7 @@ pub(crate) fn build_structural(
             properties: serde_json::json!({}),
         })?;
         folder_id.insert(dir.clone(), id);
+        progress("building_folders", index + 1, dirs.len());
     }
 
     // CONTAINS_FOLDER: parent(dir) → dir. The parent is the enclosing
@@ -240,7 +245,8 @@ pub(crate) fn build_structural(
     // Track the qnames we (re)create this run so the cleanup pass below can
     // drop structural nodes left behind by a now-deleted file/folder.
     let mut valid_files: BTreeSet<String> = BTreeSet::new();
-    for entry in entries {
+    progress("building_files", 0, entries.len());
+    for (index, entry) in entries.iter().enumerate() {
         let rel = norm(&entry.rel_path);
         let qn = file_qn(project, &rel);
         valid_files.insert(qn.clone());
@@ -288,13 +294,15 @@ pub(crate) fn build_structural(
                 properties: serde_json::json!({}),
             });
         }
+        progress("building_files", index + 1, entries.len());
     }
 
-    // Persist every structural edge. `insert_edge` upserts on the unique
-    // (source, target, type) triple, so re-indexing is idempotent.
-    for e in &edges {
-        store.insert_edge(e)?;
-    }
+    // Persist the structural edges in one transaction. Besides being
+    // atomic, this avoids opening one SQLite transaction per edge on large
+    // repositories.
+    progress("writing_structure_edges", 0, edges.len());
+    super::insert_edges_batched(store, &edges)?;
+    progress("writing_structure_edges", edges.len(), edges.len());
 
     // ── Incremental cleanup (review finding P1: stale spine) ─────────
     // Node upserts add/refresh but never REMOVE, so a file or directory
@@ -373,14 +381,14 @@ mod tests {
         let p = "proj";
         let mut store = store_with_project(p);
 
-        build_structural(&mut store, p, &[entry("a/x.rs")]).unwrap();
+        build_structural(&mut store, p, &[entry("a/x.rs")], &mut |_, _, _| {}).unwrap();
         assert_eq!(names(&store, p, "File"), vec!["a/x.rs".to_string()]);
         assert_eq!(names(&store, p, "Folder"), vec!["a".to_string()]);
 
         // x.rs deleted, y.rs added in a different folder. The `a` folder is now
         // empty and must disappear; `a/x.rs` must disappear; `b` + `b/y.rs`
         // must appear. The Project node is always kept.
-        build_structural(&mut store, p, &[entry("b/y.rs")]).unwrap();
+        build_structural(&mut store, p, &[entry("b/y.rs")], &mut |_, _, _| {}).unwrap();
         assert_eq!(names(&store, p, "File"), vec!["b/y.rs".to_string()]);
         assert_eq!(names(&store, p, "Folder"), vec!["b".to_string()]);
         assert_eq!(store.count_nodes_by_label(p, "Project").unwrap(), 1);
@@ -392,14 +400,26 @@ mod tests {
     fn identical_reindex_preserves_spine_ids() {
         let p = "proj";
         let mut store = store_with_project(p);
-        build_structural(&mut store, p, &[entry("src/a.rs"), entry("src/b.rs")]).unwrap();
+        build_structural(
+            &mut store,
+            p,
+            &[entry("src/a.rs"), entry("src/b.rs")],
+            &mut |_, _, _| {},
+        )
+        .unwrap();
         let before: Vec<i64> = store
             .list_nodes_by_label(p, "File", usize::MAX)
             .unwrap()
             .into_iter()
             .map(|n| n.id)
             .collect();
-        build_structural(&mut store, p, &[entry("src/a.rs"), entry("src/b.rs")]).unwrap();
+        build_structural(
+            &mut store,
+            p,
+            &[entry("src/a.rs"), entry("src/b.rs")],
+            &mut |_, _, _| {},
+        )
+        .unwrap();
         let after: Vec<i64> = store
             .list_nodes_by_label(p, "File", usize::MAX)
             .unwrap()
