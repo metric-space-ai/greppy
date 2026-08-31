@@ -1359,6 +1359,27 @@ impl Daemon {
             .get(&session_id)
             .map(|session| (session.network_bytes, session.peak_rss_bytes))
             .unwrap_or((0, 0));
+        // Prefer the proxy's real relay counter over the session's fixed
+        // 4096-per-navigation accounting stub. Skip the ask when the run
+        // timed out or was cancelled: the content worker is hung or about to
+        // be killed, and even the short bound below would stall the reply.
+        let run_settled = match &outcome {
+            Ok(_) => true,
+            Err(error) => {
+                let message = error.to_string();
+                error.kind() != io::ErrorKind::TimedOut
+                    && !message.contains("timed out")
+                    && !message.contains("cancelled")
+            }
+        };
+        let network_bytes = if run_settled {
+            self.engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                .ok()
+                .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
+                .unwrap_or(network_bytes)
+        } else {
+            network_bytes
+        };
         let run_event = match &outcome {
             Ok(_) => "run.completed",
             Err(error)

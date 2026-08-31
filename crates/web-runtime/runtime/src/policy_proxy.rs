@@ -3,6 +3,7 @@
 use crate::policy::{allowed_connect_addrs, decide_host_literal, SharedProfile, UrlDecision};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -43,6 +44,7 @@ pub(crate) type ConnectResolve =
 pub struct PolicyProxy {
     addr: SocketAddr,
     _profile: SharedProfile,
+    transferred: Arc<AtomicU64>,
 }
 
 impl PolicyProxy {
@@ -57,12 +59,15 @@ impl PolicyProxy {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let thread_profile = profile.clone();
+        let transferred = Arc::new(AtomicU64::new(0));
+        let thread_transferred = Arc::clone(&transferred);
         thread::Builder::new()
             .name("greppy-policy-proxy".into())
-            .spawn(move || accept_loop(listener, thread_profile, resolve))?;
+            .spawn(move || accept_loop(listener, thread_profile, resolve, thread_transferred))?;
         Ok(Self {
             addr,
             _profile: profile,
+            transferred,
         })
     }
 
@@ -73,17 +78,53 @@ impl PolicyProxy {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// Total bytes relayed through the proxy in both directions since spawn.
+    ///
+    /// Every engine request is forced through this proxy, so this is the
+    /// engine's real network volume — unlike the fixed 4096-byte accounting
+    /// stub the session budget uses.
+    pub fn bytes_transferred(&self) -> u64 {
+        self.transferred.load(Ordering::Relaxed)
+    }
 }
 
-fn accept_loop(listener: TcpListener, profile: SharedProfile, resolve: ConnectResolve) {
+/// Copy `reader` to `writer`, adding every relayed byte onto `counter`.
+fn copy_counted(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    counter: &AtomicU64,
+) -> io::Result<u64> {
+    let mut buf = [0_u8; 16 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        writer.write_all(&buf[..n])?;
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+        total += n as u64;
+    }
+}
+
+fn accept_loop(
+    listener: TcpListener,
+    profile: SharedProfile,
+    resolve: ConnectResolve,
+    transferred: Arc<AtomicU64>,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let profile = profile.clone();
         let resolve = Arc::clone(&resolve);
+        let transferred = Arc::clone(&transferred);
         let _ = thread::Builder::new()
             .name("greppy-policy-proxy-conn".into())
             .spawn(move || {
-                let _ = handle_client(stream, profile, resolve);
+                let _ = handle_client(stream, profile, resolve, transferred);
             });
     }
 }
@@ -92,6 +133,7 @@ fn handle_client(
     mut client: TcpStream,
     profile: SharedProfile,
     resolve: ConnectResolve,
+    transferred: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(30)));
@@ -108,9 +150,10 @@ fn handle_client(
         let method = parts.next().unwrap_or("").to_ascii_uppercase();
         let target = parts.next().unwrap_or("").to_owned();
         if method == "CONNECT" {
-            return handle_connect(client, profile, resolve, &target);
+            return handle_connect(client, profile, resolve, &target, &transferred);
         }
-        let keep = handle_forward(&mut client, &profile, &resolve, &head, rest, &target)?;
+        let keep =
+            handle_forward(&mut client, &profile, &resolve, &head, rest, &target, &transferred)?;
         if !keep {
             return Ok(());
         }
@@ -122,13 +165,14 @@ fn handle_connect(
     profile: SharedProfile,
     resolve: ConnectResolve,
     target: &str,
+    transferred: &Arc<AtomicU64>,
 ) -> io::Result<()> {
     eprintln!("web-runtime: policy-proxy CONNECT target={target}");
     let (host, port) = split_host_port(target, 80);
     match connect_allowed(profile.get(), &host, port, &resolve) {
         Ok(server) => {
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-            splice(client, server)
+            splice(client, server, Arc::clone(transferred))
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             client.write_all(
@@ -147,6 +191,7 @@ fn handle_forward(
     head: &str,
     rest: Vec<u8>,
     target: &str,
+    transferred: &AtomicU64,
 ) -> io::Result<bool> {
     let (host, port, path) = match parse_http_target(target, head) {
         Some(parsed) => parsed,
@@ -186,6 +231,7 @@ fn handle_forward(
     }
     server.write_all(rewritten.as_bytes())?;
     server.write_all(&rest)?;
+    transferred.fetch_add((rewritten.len() + rest.len()) as u64, Ordering::Relaxed);
     let extra = remaining_body_length(head).saturating_sub(rest.len());
     if extra > 0 {
         let mut buf = vec![0_u8; extra.min(HEADER_LIMIT)];
@@ -197,11 +243,12 @@ fn handle_forward(
                 break;
             }
             server.write_all(&buf[..n])?;
+            transferred.fetch_add(n as u64, Ordering::Relaxed);
             left -= n;
         }
     }
     let _ = server.shutdown(std::net::Shutdown::Write);
-    io::copy(&mut server, client).map(|_| ())?;
+    copy_counted(&mut server, client, transferred).map(|_| ())?;
     Ok(!connection_close(head))
 }
 
@@ -333,13 +380,14 @@ fn read_headers(stream: &mut TcpStream) -> io::Result<(String, Vec<u8>)> {
     ))
 }
 
-fn splice(mut a: TcpStream, mut b: TcpStream) -> io::Result<()> {
+fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io::Result<()> {
     let _ = a.set_nodelay(true);
     let _ = b.set_nodelay(true);
     let mut a_read = a.try_clone()?;
     let mut b_write = b.try_clone()?;
-    let up = thread::spawn(move || io::copy(&mut a_read, &mut b_write));
-    let down = io::copy(&mut b, &mut a);
+    let up_counter = Arc::clone(&transferred);
+    let up = thread::spawn(move || copy_counted(&mut a_read, &mut b_write, &up_counter));
+    let down = copy_counted(&mut b, &mut a, &transferred);
     let _ = up.join();
     down.map(|_| ())
 }

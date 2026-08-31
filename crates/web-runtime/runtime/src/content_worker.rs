@@ -1709,6 +1709,13 @@ impl ContentEngine {
                 self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
+            "session.networkBytes" => {
+                // Real bytes relayed through the policy proxy, both
+                // directions — the metric behind web.run's network_bytes,
+                // which previously reported a fixed 4096-per-navigation
+                // accounting stub.
+                Ok(json!({ "bytes": self._proxy.bytes_transferred() }))
+            }
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
