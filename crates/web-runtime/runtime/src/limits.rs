@@ -216,7 +216,12 @@ impl Default for SessionLimits {
             // A limit that a normal news site clears by a rounding error is
             // not protecting anything, it is only turning working pages into
             // failures. 1 GiB still stops a runaway document.
-            content_rss_bytes: 1024 * 1024 * 1024,
+            // 2 GiB. One mirrored news page needs 1.25 GB, and a desktop
+            // browser routinely uses more; the ceiling is there to stop a
+            // runaway document, not to fail ordinary pages. That 1.25 GB is
+            // itself high for a news article is worth its own look -- but it
+            // is a memory-efficiency question, not a reason to reject the page.
+            content_rss_bytes: 2 * 1024 * 1024 * 1024,
             max_pages: 16,
             max_contexts: 8,
             max_requests: 256,
