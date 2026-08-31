@@ -114,6 +114,9 @@ fn text_check(accessor: &str, pattern: &str) -> std::result::Result<String, Stri
         if !flags.chars().all(|f| "imsu".contains(f)) {
             return Err(format!("unsupported regex flags `{flags}`"));
         }
+        // Compile here so a malformed pattern is a usage error rather than a
+        // JavaScript exception surfacing from inside the page.
+        regex::Regex::new(re).map_err(|error| format!("invalid regex: {error}"))?;
         format!(
             "new RegExp({}, {}).test(String({accessor}))",
             serde_json::Value::String(re.to_owned()),

@@ -145,6 +145,28 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             if wanted.is_empty() {
                 return emit_error(json, invalid("web extract: --fields must name at least one field"));
             }
+            // `attr:` without a name silently produced a column of nulls; an
+            // unknown field did the same. Both read as "the page has nothing
+            // there", which is a different statement from "you asked wrong".
+            const FIELDS: [&str; 6] = ["text", "href", "value", "id", "tag", "checked"];
+            for field in &wanted {
+                if let Some(name) = field.strip_prefix("attr:") {
+                    if name.trim().is_empty() {
+                        return emit_error(
+                            json,
+                            invalid("web extract: `attr:` needs an attribute name"),
+                        );
+                    }
+                } else if !FIELDS.contains(field) {
+                    return emit_error(
+                        json,
+                        invalid(&format!(
+                            "web extract: unknown field `{field}`; expected one of {} or attr:NAME",
+                            FIELDS.join(", ")
+                        )),
+                    );
+                }
+            }
             let list = serde_json::Value::String(wanted.join(",")).to_string();
             let body = format!(
                 "var want = {list}.split(','); \
