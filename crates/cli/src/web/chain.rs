@@ -432,6 +432,23 @@ fn run_chain(
         // runtime lifetime for the whole chain.
         let code = super::dispatch_inner(command, root)?;
         ran += 1;
+        // A typed record after every step, so a reader can attribute the
+        // output above it to a specific step instead of guessing from
+        // position. Without this a chain prints a stream of payloads and one
+        // summary, and nothing says which payload belonged to which command.
+        emit_web(
+            json_out,
+            &json!({
+                "schema": "greppy.web-runtime.v1",
+                "kind": "step",
+                "operation": "web.do.step",
+                "status": if code == 0 { "ok" } else { "error" },
+                "step": index + 1,
+                "steps_total": parsed.len(),
+                "argv": parsed[index],
+                "exit_code": code,
+            }),
+        )?;
         if code != 0 {
             failed += 1;
             last_code = code;
