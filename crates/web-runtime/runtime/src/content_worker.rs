@@ -1861,20 +1861,26 @@ impl ContentEngine {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 drop(recorded);
+                // A failed probe means UNKNOWN, never "empty": on a page
+                // whose script thread is still busy (a 7.6MB spec mid-parse)
+                // these evaluates time out, and treating that as an empty
+                // document declared a 98s successful navigation failed.
                 let text = match self.evaluate(
                     webview.clone(),
                     "(document.body && document.body.innerText) || \"\"",
                 ) {
-                    Ok(JSValue::String(text)) => text,
-                    _ => String::new(),
+                    Ok(JSValue::String(text)) => Some(text),
+                    _ => None,
                 };
-                if text.contains("Could not load the requested page") {
-                    return Err(io::Error::other(format!("navigation failed: {text}")));
+                if let Some(text) = &text {
+                    if text.contains("Could not load the requested page") {
+                        return Err(io::Error::other(format!("navigation failed: {text}")));
+                    }
                 }
                 let html =
                     match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
-                        Ok(JSValue::String(html)) => html,
-                        _ => String::new(),
+                        Ok(JSValue::String(html)) => Some(html),
+                        _ => None,
                     };
                 // CONNECT-tunneled fetches often never match last_responses, so a
                 // missing recorded status is not proof of failure. The Servo error
@@ -1889,14 +1895,14 @@ impl ContentEngine {
                     webview.clone(),
                     "document.querySelectorAll('*:not(html):not(head):not(body)').length",
                 ) {
-                    Ok(JSValue::Number(count)) => count as u64,
-                    _ => 0,
+                    Ok(JSValue::Number(count)) => Some(count as u64),
+                    _ => None,
                 };
                 if http
                     && recorded_status.is_none()
-                    && text.trim().is_empty()
-                    && html.len() < 500
-                    && rendered_elements == 0
+                    && text.as_deref().is_some_and(|t| t.trim().is_empty())
+                    && html.as_deref().is_some_and(|h| h.len() < 500)
+                    && rendered_elements == Some(0)
                 {
                     return Err(io::Error::other(format!(
                         "navigation failed: no HTTP response for {url}"
