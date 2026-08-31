@@ -40,7 +40,7 @@ impl Drop for SlowOp<'_> {
     fn drop(&mut self) {
         let ms = self.started.elapsed().as_millis();
         if ms >= 200 {
-            if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: slow-op {} {ms}ms", self.method); }
+            if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: slow-op {} {ms}ms", self.method); } }
         }
     }
 }
@@ -1832,10 +1832,9 @@ impl ContentEngine {
                 if let (Some(started), Some(loaded), Some(painted)) =
                     (goto_started, loaded_ms, painted_ms)
                 {
-                    eprintln!(
-                        "web-runtime: goto-trace loaded_ms={loaded} painted_ms={painted} init_ms={} url={url}",
+                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: goto-trace loaded_ms={loaded} painted_ms={painted} init_ms={} url={url}",
                         started.elapsed().as_millis(),
-                    );
+                    ); }
                 }
                 let final_url = webview
                     .url()
@@ -3748,14 +3747,13 @@ impl NavTrace {
 
     fn finish(&mut self, webview: &WebView) {
         let Some(started) = self.started else { return };
-        eprintln!(
-            "web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
             self.settled_ms,
             self.head_parsed_ms,
             self.complete_ms,
             started.elapsed().as_millis(),
             webview.url().map(|u| u.to_string()),
-        );
+        ); }
     }
 }
 
@@ -4780,7 +4778,7 @@ pub fn run() -> io::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis();
-                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: call-trace recv method={method} at_ms={now}"); }
+                    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: call-trace recv method={method} at_ms={now}"); } }
                     Instant::now()
                 });
                 let reply = match engine.handle(&method, params) {
@@ -4793,14 +4791,13 @@ pub fn run() -> io::Result<()> {
                     ),
                 };
                 if let Some(started) = call_started {
-                    eprintln!(
-                        "web-runtime: call-trace method={method} handle_ms={}",
+                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: call-trace method={method} handle_ms={}",
                         started.elapsed().as_millis()
-                    );
+                    ); }
                 }
                 engine.wake.wake();
                 if let Err(error) = write_message(&mut protocol_out, &reply) {
-                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: engine result write failed: {error}"); }
+                    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: engine result write failed: {error}"); } }
                     let fallback = Message::engine_result(
                         request_id,
                         false,
@@ -4832,11 +4829,10 @@ pub fn run() -> io::Result<()> {
                     engine.servo.spin_event_loop();
                     let elapsed = started.elapsed();
                     if elapsed >= Duration::from_millis(200) {
-                        eprintln!(
-                            "web-runtime: phase content-spin elapsed_ms={} pages={}",
+                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-spin elapsed_ms={} pages={}",
                             elapsed.as_millis(),
                             engine.pages.len()
-                        );
+                        ); }
                     }
                 }
             }

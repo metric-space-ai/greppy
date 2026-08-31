@@ -274,15 +274,14 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             "supervisor requires inherited attach token on fd 4",
         )
     })?;
-    eprintln!(
-        "web-runtime: phase bind-socket socket={}",
+    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase bind-socket socket={}",
         config.socket.display()
-    );
+    ); }
     let listener = UnixListener::bind(&config.socket)?;
     let mut permissions = std::fs::metadata(&config.socket)?.permissions();
     permissions.set_mode(0o600);
     std::fs::set_permissions(&config.socket, permissions)?;
-    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase listening"); }
+    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase listening"); } }
     let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
     let early_control = Arc::new(RunControl::new());
     let accept_attach = attach.clone();
@@ -292,10 +291,11 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         .spawn(move || accept_loop(listener, tx, accept_control, accept_attach))
         .map_err(io::Error::other)?;
     match crate::supervisor::warmup_parent_image() {
-        Ok(hash) => eprintln!(
-            "web-runtime: phase parent-image elapsed_ms={}",
-            hash.as_millis()
-        ),
+        Ok(hash) => {
+            if crate::supervisor::phase_trace_enabled() {
+                eprintln!("web-runtime: phase parent-image elapsed_ms={}", hash.as_millis());
+            }
+        }
         Err(error) => {
             if crate::supervisor::phase_trace_enabled() {
                 eprintln!("web-runtime: phase parent-image error={error}");
@@ -303,16 +303,14 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         }
     }
     if crate::supervisor::phase_trace_enabled() {
-        eprintln!(
-            "web-runtime: phase start-workers socket={}",
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase start-workers socket={}",
             config.socket.display()
-        );
+        ); }
     }
     let mut daemon = Daemon::start(config, attach, Arc::clone(&early_control))?;
-    eprintln!(
-        "web-runtime: phase request-ready elapsed_ms={}",
+    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase request-ready elapsed_ms={}",
         started.elapsed().as_millis()
-    );
+    ); }
     loop {
         let (mut stream, request) = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(pair) => pair,
@@ -338,7 +336,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         })) {
             Ok(response) => response,
             Err(_) => {
-                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handle-panic operation={operation}"); }
+                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handle-panic operation={operation}"); } }
                 Response::error(
                     &request,
                     ErrorObject::new(
@@ -626,25 +624,25 @@ impl Daemon {
         // before bind, leaving in-flight process-group leaders reparented to PID 1.
         let controller_token = random_token()?;
         let content_token = random_token()?;
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); } }
         let controller_thread = thread::Builder::new()
             .name("web-spawn-controller".into())
             .spawn(move || {
                 let mut worker = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
-                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); }
+                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); } }
                 worker.handshake()?;
-                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); }
+                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); } }
                 Ok::<_, io::Error>(worker)
             })
             .map_err(io::Error::other)?;
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-content"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-content"); } }
         let content_thread = thread::Builder::new()
             .name("web-spawn-content".into())
             .spawn(move || {
                 let mut worker = WorkerProcess::spawn(WorkerKind::Content, content_token)?;
-                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); }
+                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); } }
                 worker.handshake()?;
-                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); }
+                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); } }
                 Ok::<_, io::Error>(worker)
             })
             .map_err(io::Error::other)?;
@@ -654,7 +652,7 @@ impl Daemon {
         let content = content_thread
             .join()
             .map_err(|_| io::Error::other("content spawn thread panicked"))??;
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase workers-ready"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase workers-ready"); } }
         let data_root = data_root(&config.run_id);
         run_control
             .controller_pid
@@ -1051,15 +1049,15 @@ impl Daemon {
         crate::profile_lock::ProfileLock::acquire(&dir).map_err(|error| error.to_string())
     }
     fn shutdown(&mut self, request: &Request) -> Response {
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-begin"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-begin"); } }
         self.exiting = true;
         self.sessions.clear();
         self.profile_locks.clear();
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-controller-eof"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-controller-eof"); } }
         self.controller.shutdown_or_kill();
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-content-reap"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-content-reap"); } }
         self.content.shutdown_or_kill();
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-accept-break"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-accept-break"); } }
         self.journal(
             "runtime",
             &request.request_id,
@@ -1335,11 +1333,10 @@ impl Daemon {
         let started = Instant::now();
         let run_budget = Duration::from_millis(request.deadline_ms.max(1_000));
         let run_deadline = started + run_budget;
-        eprintln!(
-            "web-runtime: phase run-wait point=set-profile worker=content session={} deadline_ms={}",
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase run-wait point=set-profile worker=content session={} deadline_ms={}",
             session_id,
             run_budget.as_millis()
-        );
+        ); }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
             json!({ "profile": profile.as_str() }),
@@ -1368,10 +1365,9 @@ impl Daemon {
         let remaining = run_deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
-        eprintln!(
-            "web-runtime: phase run-wait point=send-script worker=controller remaining_ms={}",
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase run-wait point=send-script worker=controller remaining_ms={}",
             remaining.as_millis()
-        );
+        ); }
         let outcome = {
             let controller = &mut self.controller;
             let content = &mut self.content;
@@ -1387,10 +1383,9 @@ impl Daemon {
             ) {
                 Err(error)
             } else {
-                eprintln!(
-                    "web-runtime: phase run-wait point=script-complete remaining_ms={}",
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase run-wait point=script-complete remaining_ms={}",
                     remaining.as_millis()
-                );
+                ); }
                 crate::supervisor::route_until_script_complete_gated(
                     controller,
                     content,
@@ -3181,9 +3176,8 @@ impl Daemon {
                     self.run_control
                         .discarded_engine_results
                         .fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "web-runtime: discarded unmatched EngineResult id={got} want={request_id} ok={ok} err={error:?}"
-                    );
+                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: discarded unmatched EngineResult id={got} want={request_id} ok={ok} err={error:?}"
+                    ); }
                 }
                 Ok(other) => return Err(format!("unexpected content message {other:?}")),
                 Err(error) => {
@@ -3419,7 +3413,7 @@ impl Daemon {
     }
 
     fn idle_exit(&mut self) {
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase idle-exit"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase idle-exit"); } }
         self.exiting = true;
         self.sessions.clear();
         self.profile_locks.clear();
@@ -3465,7 +3459,7 @@ impl Drop for Daemon {
         if self.exiting {
             return;
         }
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase supervisor-drop"); }
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase supervisor-drop"); } }
         self.exiting = true;
         self.controller.shutdown_or_kill();
         self.content.shutdown_or_kill();

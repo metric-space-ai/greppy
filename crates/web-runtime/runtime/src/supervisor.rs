@@ -500,9 +500,8 @@ pub(crate) fn route_until_script_complete_gated(
                 }) => {
                     let Some((method, params)) = pending.remove(&request_id) else {
                         gate.note_discarded_engine_result(request_id, ok, error);
-                        eprintln!(
-                            "web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
-                        );
+                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
+                        ); }
                         continue;
                     };
                     if ok && tally_after(&method) {
@@ -1481,10 +1480,9 @@ impl WorkerProcess {
 
     fn kill_tree_wait(&mut self, reap_wait: Duration, reader_wait: Duration) {
         let pid = self.child.id();
-        eprintln!(
-            "web-runtime: phase {:?}-reap start pid={pid}",
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-reap start pid={pid}",
             self.worker
-        );
+        ); }
         unregister_owned_worker(pid);
         kill_process_tree(pid);
         let deadline = Instant::now() + reap_wait;
@@ -1508,10 +1506,9 @@ impl WorkerProcess {
 
     pub(crate) fn shutdown_or_kill(&mut self) {
         let pid = self.child.id();
-        eprintln!(
-            "web-runtime: phase {:?}-eof start pid={pid}",
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof start pid={pid}",
             self.worker
-        );
+        ); }
         if self.send(&Message::shutdown()).is_ok() {
             let deadline = Instant::now() + WORKER_EOF_WAIT;
             while Instant::now() < deadline {
@@ -1520,10 +1517,9 @@ impl WorkerProcess {
                         self.reaped = true;
                         self.input.take();
                         self.join_reader_bounded(READER_JOIN_WAIT);
-                        eprintln!(
-                            "web-runtime: phase {:?}-eof done pid={pid}",
+                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof done pid={pid}",
                             self.worker
-                        );
+                        ); }
                         return;
                     }
                     Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
@@ -1652,10 +1648,9 @@ impl WorkerProcess {
             let _ = tx.send(());
         });
         if rx.recv_timeout(timeout).is_err() {
-            eprintln!(
-                "web-runtime: phase {:?}-reader-join timeout",
+            if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-reader-join timeout",
                 self.worker
-            );
+            ); }
         }
     }
 
@@ -1670,9 +1665,8 @@ impl WorkerProcess {
                     ..
                 })) => {
                     discarded += 1;
-                    eprintln!(
-                        "web-runtime: discarded stale EngineResult id={request_id} ok={ok} err={error:?}"
-                    );
+                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: discarded stale EngineResult id={request_id} ok={ok} err={error:?}"
+                    ); }
                 }
                 Ok(Ok(other)) => {
                     discarded += 1;
