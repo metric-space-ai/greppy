@@ -279,6 +279,17 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             if paths.is_empty() {
                 return emit_error(opts.json, invalid("web upload requires PATH..."));
             }
+            // The worker may only read its own temp directory, so a caller's
+            // file is rejected wherever it actually lives. The CLI runs with
+            // the caller's permissions and the worker does not, so staging
+            // belongs here: copy the file into the allowed area and hand over
+            // the copy. The sandbox rule stays exactly as strict.
+            let paths = match stage_uploads(&paths) {
+                Ok(staged) => staged,
+                Err(message) => {
+                    return emit_error(opts.json, invalid(&format!("web upload: {message}")))
+                }
+            };
             locator_rpc(
                 root,
                 opts.json,
@@ -374,4 +385,54 @@ fn fill_value(
         }
         Ok(text)
     }
+}
+
+/// Copy files into the directory the content worker is allowed to read.
+///
+/// Returns the staged paths. A file that is already inside the area is passed
+/// through untouched, so repeated uploads do not pile up copies.
+fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>, String> {
+    /// Refuse anything unreasonably large before it is copied twice.
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let area = std::env::temp_dir().join("greppy-web-runtime").join("uploads");
+    let mut staged = Vec::with_capacity(paths.len());
+    for path in paths {
+        let source = std::path::Path::new(path);
+        let meta = source
+            .metadata()
+            .map_err(|error| format!("cannot read {path}: {error}"))?;
+        if !meta.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        if meta.len() > MAX_BYTES {
+            return Err(format!(
+                "{path} is {} bytes; the limit is {MAX_BYTES}",
+                meta.len()
+            ));
+        }
+        let canonical = source
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve {path}: {error}"))?;
+        if canonical.starts_with(&area) {
+            staged.push(canonical.display().to_string());
+            continue;
+        }
+        std::fs::create_dir_all(&area)
+            .map_err(|error| format!("cannot create {}: {error}", area.display()))?;
+        let name = canonical
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "upload".to_owned());
+        // Keep the original name so the page sees what the caller meant, but
+        // scope the directory per process so two uploads of different files
+        // with the same name do not collide.
+        let dir = area.join(format!("p{}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        let target = dir.join(&name);
+        std::fs::copy(&canonical, &target)
+            .map_err(|error| format!("cannot stage {path}: {error}"))?;
+        staged.push(target.display().to_string());
+    }
+    Ok(staged)
 }
