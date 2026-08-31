@@ -1899,10 +1899,17 @@ class Page {
     try {
       const result = await engineCall("page.goto", { page: this._id, url, timeout });
       this._url = result.url || String(url);
-      await this._flushPopups();
-      await this._flushNavigation();
-      await this._dispatchNetworkUntilSettled();
-      await this._dispatchFrames();
+      // Issue the post-navigation state syncs concurrently: the engine
+      // handles queued calls back-to-back, so five sequential round trips
+      // (popups, url, requests, responses, frames) collapse into roughly one
+      // hop of latency. Under system load the hops dominated whole-page
+      // timings (nav-trace: 7.4s of an 11.5s run was hop latency).
+      await Promise.all([
+        this._flushPopups(),
+        this._flushNavigation(),
+        this._dispatchNetworkUntilSettled(),
+        this._dispatchFrames(),
+      ]);
       this._emitLoad();
       return this._responseFromRecord({
         url: this._url,
@@ -2024,8 +2031,12 @@ class Page {
   }
 
   async _dispatchNetwork(settle) {
-    const result = await engineCall("page.requests", { page: this._id });
-    const responses = ((await engineCall("page.responses", { page: this._id })).responses || []);
+    // Independent reads; fetch both in one hop instead of two.
+    const [result, responsesResult] = await Promise.all([
+      engineCall("page.requests", { page: this._id }),
+      engineCall("page.responses", { page: this._id }),
+    ]);
+    const responses = responsesResult.responses || [];
     const requests = result.requests || [];
     this._emittedNetwork = this._emittedNetwork || new Set();
     for (let index = 0; index < requests.length; index++) {
