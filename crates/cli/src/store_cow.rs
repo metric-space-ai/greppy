@@ -29,6 +29,17 @@ pub(crate) struct OverlaySpec {
     pub visibility: VisibilityIndex,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OverlayFreshnessProof {
+    Fresh {
+        total_inventory: usize,
+    },
+    Stale {
+        changed_paths: Vec<String>,
+        reason: String,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedBase {
     pub graph_path: PathBuf,
@@ -168,6 +179,230 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
         )));
     }
     Ok(Some((base_path, base_commit)))
+}
+
+/// Prove freshness from the immutable Base plus the small private Delta.
+///
+/// A Store-CoW query must not re-walk and stat/hash the complete repository:
+/// the published Base already binds an exact Git tree and the Delta binding
+/// persists the paths hidden from that Base. We still fail closed. The fast
+/// proof verifies the published Base bytes, its tree and project identity,
+/// compares the persisted visibility with live Git, and validates the current
+/// contents of every dirty path against the private Delta. Any shape we do not
+/// understand returns `None` so the ordinary full-inventory check remains the
+/// fallback.
+pub(crate) fn overlay_freshness_proof(
+    root: &Path,
+    store: &greppy_store::Store,
+    project: &str,
+) -> Result<Option<OverlayFreshnessProof>> {
+    if !store.is_overlay() {
+        return Ok(None);
+    }
+    let Some((base_path, base_commit)) = overlay_environment(root)? else {
+        return Ok(None);
+    };
+    let Some(cached) = cached_visibility(root, &base_commit) else {
+        return Ok(None);
+    };
+    let cached = cached?;
+    let live = visibility_against(root, &base_commit)?;
+    if cached != live {
+        let mut changed = cached
+            .dirty_paths()
+            .chain(cached.deleted_paths())
+            .chain(live.dirty_paths())
+            .chain(live.deleted_paths())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        changed.sort();
+        changed.dedup();
+        return Ok(Some(OverlayFreshnessProof::Stale {
+            changed_paths: changed,
+            reason: "live Git changes differ from the indexed Store-CoW Delta".into(),
+        }));
+    }
+
+    let attached = store.overlay_base_path().ok_or_else(|| {
+        Error::Invalid("Store reports overlay mode without an attached Base".into())
+    })?;
+    if !paths_resolve_equal(attached, &base_path) {
+        return Err(Error::Invalid(format!(
+            "attached Base {} differs from bound Base {}",
+            attached.display(),
+            base_path.display()
+        )));
+    }
+    let manifest = verified_manifest_for_graph(&base_path)
+        .map_err(|error| Error::io("verify immutable Store-CoW Base", error))?;
+    let tree_expr = format!("{base_commit}^{{tree}}");
+    let live_base_tree = git_output(root, &["rev-parse", &tree_expr])?;
+    if live_base_tree != manifest.identity.base_tree_oid {
+        return Err(Error::Invalid(format!(
+            "Store-CoW Base tree mismatch: binding {live_base_tree}, manifest {}",
+            manifest.identity.base_tree_oid
+        )));
+    }
+    if manifest.identity.store_schema_version != greppy_store::migrate::CURRENT_VERSION
+        || manifest.identity.indexer_version != greppy_core::INDEXER_VERSION_BASE
+        || manifest.identity.parser_and_extractor_versions
+            != format!("greppy-parser/extractor-{}", env!("CARGO_PKG_VERSION"))
+    {
+        return Ok(None);
+    }
+
+    let base_project_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM greppy_base.projects WHERE name = ?1",
+            [project],
+            |row| row.get(0),
+        )
+        .map_err(|error| Error::Store(format!("verify Store-CoW Base project: {error}")))?;
+    if base_project_count != 1 {
+        return Err(Error::Invalid(format!(
+            "Store-CoW Base project mismatch: expected exactly `{project}`"
+        )));
+    }
+    let root_string = root.to_string_lossy();
+    let Some(workspace) = store
+        .get_workspace_state(&root_string)
+        .map_err(|error| Error::Store(format!("read Store-CoW workspace state: {error}")))?
+    else {
+        return Ok(None);
+    };
+    if workspace.schema_version != greppy_store::migrate::CURRENT_VERSION
+        || workspace.indexer_version != greppy_core::INDEXER_VERSION_BASE
+        || workspace.graph_generation == 0
+    {
+        return Ok(None);
+    }
+
+    let dirty = cached
+        .dirty_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    let deleted = cached
+        .deleted_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    for rel_path in &deleted {
+        match std::fs::symlink_metadata(root.join(rel_path)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Ok(Some(OverlayFreshnessProof::Stale {
+                    changed_paths: vec![(*rel_path).to_owned()],
+                    reason: "a path recorded as deleted exists again".into(),
+                }));
+            }
+            Err(error) => {
+                return Err(Error::io(
+                    format!("stat deleted Store-CoW path {rel_path}"),
+                    error,
+                ));
+            }
+        }
+    }
+
+    let identities = store
+        .list_file_identities(project)
+        .map_err(|error| Error::Store(format!("read Store-CoW file identities: {error}")))?;
+    for rel_path in &dirty {
+        if !persisted_delta_path_matches(root, store, project, rel_path, &identities)? {
+            return Ok(Some(OverlayFreshnessProof::Stale {
+                changed_paths: vec![(*rel_path).to_owned()],
+                reason: "a Store-CoW Delta path changed after it was indexed".into(),
+            }));
+        }
+    }
+
+    let mut private_paths = std::collections::BTreeSet::new();
+    for query in [
+        "SELECT rel_path FROM main.file_state",
+        "SELECT rel_path FROM main.index_skips",
+        "SELECT file_path FROM main.nodes WHERE file_path <> ''",
+        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
+        "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
+        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
+    ] {
+        let mut statement = store
+            .conn()
+            .prepare(query)
+            .map_err(|error| Error::Store(format!("inspect Store-CoW Delta paths: {error}")))?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| Error::Store(format!("query Store-CoW Delta paths: {error}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| Error::Store(format!("read Store-CoW Delta paths: {error}")))?;
+        private_paths.extend(paths);
+    }
+    if let Some(unbound) = private_paths
+        .iter()
+        .find(|path| !dirty.contains(path.as_str()))
+    {
+        return Err(Error::Invalid(format!(
+            "private Store-CoW row `{unbound}` is absent from the Delta visibility manifest"
+        )));
+    }
+
+    let total_inventory = store
+        .file_count(project)
+        .map_err(|error| Error::Store(format!("count Store-CoW inventory: {error}")))?;
+    let total_inventory = usize::try_from(total_inventory)
+        .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
+    Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+}
+
+fn persisted_delta_path_matches(
+    root: &Path,
+    store: &greppy_store::Store,
+    project: &str,
+    rel_path: &str,
+    identities: &std::collections::HashMap<String, greppy_store::FileIdentity>,
+) -> Result<bool> {
+    let path = root.join(rel_path);
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| Error::io(format!("stat Store-CoW Delta path {rel_path}"), error))?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let current = greppy_discover::stable_metadata(&metadata);
+    if let Some(state) = store
+        .get_file_state(project, rel_path)
+        .map_err(|error| Error::Store(format!("read Store-CoW file state: {error}")))?
+    {
+        let identity = identities.get(rel_path);
+        let stat_matches = state.size >= 0
+            && state.size as u64 == current.size
+            && current.mtime_ns == Some(state.mtime_ns)
+            && identity.is_some_and(|identity| {
+                identity.ctime_ns == current.ctime_ns && identity.file_id == current.file_id
+            });
+        if stat_matches {
+            return Ok(true);
+        }
+        if current.size > greppy_freshness::incremental::MAX_FILE_SIZE_BYTES {
+            return Ok(false);
+        }
+        let (bytes, _) = greppy_discover::read_stable_file(&path)
+            .map_err(|error| Error::io(format!("read Store-CoW Delta path {rel_path}"), error))?;
+        return Ok(greppy_store::file_state::sha256_hex(&bytes) == state.sha256);
+    }
+    if let Some(skip) = store
+        .get_index_skip(project, rel_path)
+        .map_err(|error| Error::Store(format!("read Store-CoW skip state: {error}")))?
+    {
+        return Ok(skip.size >= 0
+            && skip.size as u64 == current.size
+            && current.mtime_ns == Some(skip.mtime_ns)
+            && skip.ctime_ns == current.ctime_ns
+            && skip.file_id == current.file_id);
+    }
+    Ok(false)
+}
+
+fn paths_resolve_equal(left: &Path, right: &Path) -> bool {
+    left == right
+        || left.canonicalize().ok() == right.canonicalize().ok()
+        || left == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
 }
 
 fn cached_visibility(root: &Path, base_commit: &str) -> Option<Result<VisibilityIndex>> {

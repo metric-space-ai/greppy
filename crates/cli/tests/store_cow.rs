@@ -232,7 +232,10 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
         base_tree_oid: git(&base_repo, &["rev-parse", "HEAD^{tree}"]),
         store_schema_version: greppy_store::migrate::CURRENT_VERSION,
         indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
-        parser_and_extractor_versions: "fixture-parser-v1".into(),
+        parser_and_extractor_versions: format!(
+            "greppy-parser/extractor-{}",
+            env!("CARGO_PKG_VERSION")
+        ),
         summary_model_and_prompt_version: "fixture-summary-v1".into(),
         embedding_model: "fixture-embedding-v1".into(),
         embedding_prompt_version: "fixture-prompt-v1".into(),
@@ -803,6 +806,61 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
             .unwrap();
         assert_eq!(count, 0, "exact revert must empty Delta table {table}");
     }
+
+    let (clean_code, clean_out, clean_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        clean_code, 0,
+        "clean overlay status failed\nstdout={clean_out}\nstderr={clean_err}"
+    );
+    let clean_status: serde_json::Value = serde_json::from_str(&clean_out).unwrap();
+    assert_eq!(clean_status["healthy"], true, "{clean_status:#}");
+    assert_eq!(
+        clean_status["freshness"]["source"], "verified_store_cow_overlay",
+        "{clean_status:#}"
+    );
+    assert_eq!(clean_status["freshness"]["total_inventory"], 4);
+
+    // Live Git visibility is an exact cheap invalidation oracle: adding a
+    // dirty path after publication must downgrade immediately, without a
+    // redundant full repository walk. After indexing that one path, the same
+    // proof validates only its private Delta content and becomes healthy.
+    std::fs::write(
+        repo.join("src/clean.rs"),
+        "pub fn clean_after_status_edit() -> i32 { 31 }\n",
+    )
+    .unwrap();
+    let (drift_code, drift_out, drift_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        drift_code, 73,
+        "dirty overlay status must fail closed\nstdout={drift_out}\nstderr={drift_err}"
+    );
+    let drift_status: serde_json::Value = serde_json::from_str(&drift_out).unwrap();
+    assert_eq!(
+        drift_status["freshness"]["source"], "verified_store_cow_overlay",
+        "{drift_status:#}"
+    );
+    assert_eq!(
+        drift_status["freshness"]["changed_paths"],
+        serde_json::json!(["src/clean.rs"]),
+        "{drift_status:#}"
+    );
+
+    index(&repo, &delta_store, overlay);
+    let (indexed_code, indexed_out, indexed_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        indexed_code, 0,
+        "indexed dirty overlay status failed\nstdout={indexed_out}\nstderr={indexed_err}"
+    );
+    let indexed_status: serde_json::Value = serde_json::from_str(&indexed_out).unwrap();
+    assert_eq!(indexed_status["healthy"], true, "{indexed_status:#}");
+    assert_eq!(
+        indexed_status["freshness"]["source"], "verified_store_cow_overlay",
+        "{indexed_status:#}"
+    );
+    assert_eq!(indexed_status["store_cow"]["dirty_file_count"], 1);
 }
 
 fn timed_query(

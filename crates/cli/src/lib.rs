@@ -3498,6 +3498,68 @@ fn nav_freshness_json(
             });
         }
     };
+    if discover_scope == "default" {
+        match crate::store_cow::overlay_freshness_proof(&root_path, store, project) {
+            Ok(Some(crate::store_cow::OverlayFreshnessProof::Fresh { total_inventory })) => {
+                return serde_json::json!({
+                    "fresh": true,
+                    "state": "fresh",
+                    "reasons": [],
+                    "elapsed_ms": 0,
+                    "stale_file_count": 0,
+                    "changed_paths": [],
+                    "total_inventory": total_inventory,
+                    "ttl_hit": false,
+                    "source": "verified_store_cow_overlay",
+                    "discover_scope": discover_scope,
+                    "discover_scope_env": {
+                        "include": ENV_DISCOVER_INCLUDE,
+                        "exclude": ENV_DISCOVER_EXCLUDE,
+                    },
+                });
+            }
+            Ok(Some(crate::store_cow::OverlayFreshnessProof::Stale {
+                changed_paths,
+                reason,
+            })) => {
+                return serde_json::json!({
+                    "fresh": false,
+                    "state": "drift",
+                    "reasons": [reason],
+                    "elapsed_ms": 0,
+                    "stale_file_count": changed_paths.len(),
+                    "changed_paths": changed_paths,
+                    "total_inventory": null,
+                    "ttl_hit": false,
+                    "source": "verified_store_cow_overlay",
+                    "discover_scope": discover_scope,
+                    "discover_scope_env": {
+                        "include": ENV_DISCOVER_INCLUDE,
+                        "exclude": ENV_DISCOVER_EXCLUDE,
+                    },
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return serde_json::json!({
+                    "fresh": false,
+                    "state": "unknown",
+                    "reasons": [format!("Store-CoW freshness proof failed: {error}")],
+                    "elapsed_ms": 0,
+                    "stale_file_count": null,
+                    "changed_paths": null,
+                    "total_inventory": null,
+                    "ttl_hit": false,
+                    "source": "verified_store_cow_overlay",
+                    "discover_scope": discover_scope,
+                    "discover_scope_env": {
+                        "include": ENV_DISCOVER_INCLUDE,
+                        "exclude": ENV_DISCOVER_EXCLUDE,
+                    },
+                });
+            }
+        }
+    }
     match greppy_freshness::check_files_report_with_overrides(
         store,
         &root_path,
