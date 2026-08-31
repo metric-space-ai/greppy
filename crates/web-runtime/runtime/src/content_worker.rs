@@ -1723,6 +1723,7 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 delegate.denied_navigation.replace(None);
                 let previous = webview.url();
+                let goto_started = NavTrace::enabled().then(Instant::now);
                 // Extra headers ride WebResourceLoad::continue_with_headers in
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
                 // top-level navigation only and has stalled at HeadParsed.
@@ -1762,6 +1763,7 @@ impl ContentEngine {
                         ));
                     }
                 }
+                let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
                 webview.paint();
                 self.servo.spin_event_loop();
                 // Complete is the load signal. Subresource scripts are waited
@@ -1769,7 +1771,16 @@ impl ContentEngine {
                 // wall-clock sleep after every goto burned the 60s script
                 // budget without observing script start.
                 self.servo.spin_event_loop();
+                let painted_ms = goto_started.map(|t| t.elapsed().as_millis());
                 self.run_init_scripts(&page_id)?;
+                if let (Some(started), Some(loaded), Some(painted)) =
+                    (goto_started, loaded_ms, painted_ms)
+                {
+                    eprintln!(
+                        "web-runtime: goto-trace loaded_ms={loaded} painted_ms={painted} init_ms={} url={url}",
+                        started.elapsed().as_millis(),
+                    );
+                }
                 let final_url = webview
                     .url()
                     .map(|u| u.to_string())
@@ -4610,6 +4621,14 @@ pub fn run() -> io::Result<()> {
                 params,
                 ..
             })) => {
+                let call_started = NavTrace::enabled().then(|| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    eprintln!("web-runtime: call-trace recv method={method} at_ms={now}");
+                    Instant::now()
+                });
                 let reply = match engine.handle(&method, params) {
                     Ok(result) => Message::engine_result(request_id, true, result, None),
                     Err(error) => Message::engine_result(
@@ -4619,6 +4638,12 @@ pub fn run() -> io::Result<()> {
                         Some(error.to_string()),
                     ),
                 };
+                if let Some(started) = call_started {
+                    eprintln!(
+                        "web-runtime: call-trace method={method} handle_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
                 engine.wake.wake();
                 if let Err(error) = write_message(&mut protocol_out, &reply) {
                     eprintln!("web-runtime: engine result write failed: {error}");

@@ -197,18 +197,38 @@ async fn op_engine_call(
             Arc::clone(&bridge.pending),
         )
     };
+    let trace = std::env::var_os("GREPPY_WEB_TRACE_NAV").is_some();
+    let sys_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    };
+    if trace {
+        eprintln!(
+            "web-runtime: call-trace send method={method} at_ms={}",
+            sys_ms()
+        );
+    }
     {
         let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
         write_message(
             &mut *stdout,
-            &Message::engine_call(request_id, method, params),
+            &Message::engine_call(request_id, method.clone(), params),
         )
         .map_err(|error| JsErrorBox::generic(error.to_string()))?;
     }
     let watchdog_ms = timeout_ms
         .saturating_add(ENGINE_RPC_HEADROOM_MS)
         .min(180_000);
-    match tokio::time::timeout(Duration::from_millis(watchdog_ms), receiver).await {
+    let outcome = tokio::time::timeout(Duration::from_millis(watchdog_ms), receiver).await;
+    if trace {
+        eprintln!(
+            "web-runtime: call-trace done method={method} at_ms={}",
+            sys_ms()
+        );
+    }
+    match outcome {
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(error))) => Err(JsErrorBox::generic(error)),
         Ok(Err(_)) => Err(JsErrorBox::generic("engine call was cancelled")),
