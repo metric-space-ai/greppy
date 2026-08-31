@@ -723,6 +723,17 @@ impl Daemon {
         let dispatch_started = Instant::now();
         let content_before = sample_cpu_ms(self.content.pid());
         let controller_before = sample_cpu_ms(self.controller.pid());
+        // The engine keeps a running total of bytes relayed through the policy
+        // proxy. Sampling it around the dispatch turns that into the traffic
+        // this one operation caused; the session field it used to report was
+        // never incremented, which is why a 60 MB page showed 4096 bytes.
+        let touches_page = request.operation.starts_with("web.")
+            && request.operation != "web.status"
+            && request.operation != "web.doctor";
+        let bytes_before = touches_page
+            .then(|| self.engine_call("session.networkBytes", json!({})).ok())
+            .flatten()
+            .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
         let mut response = self.dispatch_operation(request);
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
@@ -737,6 +748,17 @@ impl Daemon {
         if response.metrics.controller_cpu_ms == 0 {
             response.metrics.controller_cpu_ms =
                 sample_cpu_ms(self.controller.pid()).saturating_sub(controller_before);
+        }
+        if response.metrics.network_bytes == 0 {
+            if let Some(before) = bytes_before {
+                if let Some(after) = self
+                    .engine_call("session.networkBytes", json!({}))
+                    .ok()
+                    .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
+                {
+                    response.metrics.network_bytes = after.saturating_sub(before);
+                }
+            }
         }
         response
     }
