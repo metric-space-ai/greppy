@@ -391,8 +391,12 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // prompt is the contract, and
     // browser_section_names_only_existing_web_subcommands is the work list
     // that fails until the last of those subcommands exists. Owner decision.
+    // Owner-approved 2026-08-31: the browser block moved out of the shipped
+    // prompt into assets/prompts/web-beta.md, so the web runtime can ship as
+    // beta without the default prompt advertising a surface that is still
+    // moving. AGENTS.md keeps a four-line pointer and nothing else.
     const APPROVED_SHA256: &str =
-        "355c2fbdbf67ac94b4ea1bab27c739d3d5916afc69ba074b7023a67e81d0838b";
+        "cbb60d37642425ce6396929dc6d5054a4efb62efebdd055100bfffe42086cdaa";
 
     let text = prompt();
     let digest = {
@@ -544,10 +548,24 @@ fn web_subcommands_from_help() -> std::collections::BTreeSet<String> {
     out
 }
 
+/// The beta prompt block. It is not part of the shipped system prompt -- the
+/// browser surface is still moving -- but it is still a promise to whoever
+/// appends it, so it gets the same guard.
+fn beta_web_prompt() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/prompts/web-beta.md")
+        .canonicalize()
+        .ok()?;
+    std::fs::read_to_string(path).ok()
+}
+
 #[test]
 fn browser_section_names_only_existing_web_subcommands() {
-    let text = prompt();
-    if !text.contains("BROWSER:") {
+    // The browser block lives in the beta prompt; AGENTS.md only points at it.
+    let Some(text) = beta_web_prompt() else {
+        return; // beta prompt not present; nothing to guard
+    };
+    if !text.contains("BROWSER") {
         return; // section not written yet; nothing to guard
     }
     let named = web_subcommands_named_in(&text);
@@ -559,7 +577,7 @@ fn browser_section_names_only_existing_web_subcommands() {
     let invented: Vec<_> = named.difference(&real).cloned().collect();
     assert!(
         invented.is_empty(),
-        "BROWSER work list — {} of {} advertised commands are still missing.\n\
+        "BROWSER beta work list — {} of {} advertised commands are still missing.\n\
          \n\
          missing: {invented:?}\n\
          \n\
