@@ -3,6 +3,7 @@ use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
     read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
 };
+use crate::web_api_shims::shim_source;
 use crate::worker::require_worker_auth;
 use dpi::PhysicalSize;
 use serde_json::json;
@@ -11,8 +12,8 @@ use servo::{
     InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType,
-    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
-    WheelDelta, WheelEvent, WheelMode,
+    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -342,6 +343,10 @@ struct Delegate {
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
     wake: WakeFlag,
+    /// Auxiliary webviews (popups) do not inherit the parent's user content
+    /// manager; without threading it through here a popup would miss the Web
+    /// API shims and die on the very ReferenceError they exist to prevent.
+    user_content: Rc<UserContentManager>,
 }
 
 impl Delegate {
@@ -349,6 +354,7 @@ impl Delegate {
         rendering_context: Rc<dyn RenderingContext>,
         profile: SharedProfile,
         wake: WakeFlag,
+        user_content: Rc<UserContentManager>,
     ) -> Self {
         Self {
             new_frame_ready: RefCell::new(false),
@@ -372,6 +378,7 @@ impl Delegate {
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
             wake,
+            user_content,
         }
     }
 
@@ -449,7 +456,9 @@ impl WebViewDelegate for Delegate {
                 Rc::clone(&self.rendering_context),
                 self.profile.clone(),
                 self.wake.clone(),
+                Rc::clone(&self.user_content),
             )))
+            .user_content_manager(Rc::clone(&self.user_content))
             .build();
         child.show();
         self.popups.borrow_mut().push((child, parent));
@@ -833,6 +842,9 @@ struct ContentEngine {
     parent_alive: Arc<AtomicBool>,
     wake: WakeFlag,
     profile: SharedProfile,
+    /// Carries the Web API shims. Shared by every page, so a shim reaches
+    /// frames and popups too, not just the tab the agent drove.
+    user_content: Rc<UserContentManager>,
     _proxy: PolicyProxy,
 }
 
@@ -851,16 +863,14 @@ impl ContentEngine {
 
         let profile = SharedProfile::new(NetworkProfile::Research);
         let proxy = PolicyProxy::spawn(profile.clone())?;
-        let mut preferences = Preferences::default();
-        preferences.network_http_proxy_uri = proxy.uri();
-        preferences.network_https_proxy_uri = proxy.uri();
-        preferences.network_http_no_proxy = String::new();
-        preferences.network_enforce_tls_enabled = false;
+        let preferences = engine_preferences(&proxy.uri());
         let wake = WakeFlag::new();
         let servo = ServoBuilder::default()
             .preferences(preferences)
             .event_loop_waker(Box::new(wake.clone()))
             .build();
+        let user_content = Rc::new(UserContentManager::new(&servo));
+        user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
         Ok(Self {
             servo,
             rendering_context,
@@ -873,6 +883,7 @@ impl ContentEngine {
             parent_alive,
             wake,
             profile,
+            user_content,
             _proxy: proxy,
         })
     }
@@ -1661,9 +1672,11 @@ impl ContentEngine {
                     Rc::clone(&self.rendering_context),
                     self.profile.clone(),
                     self.wake.clone(),
+                    Rc::clone(&self.user_content),
                 ));
                 let webview = WebViewBuilder::new(&self.servo, Rc::clone(&self.rendering_context))
                     .delegate(delegate.clone())
+                    .user_content_manager(Rc::clone(&self.user_content))
                     .build();
                 webview.show();
                 webview.focus();
@@ -2792,6 +2805,7 @@ impl ContentEngine {
                         Rc::clone(&self.rendering_context),
                         self.profile.clone(),
                         self.wake.clone(),
+                        Rc::clone(&self.user_content),
                     ));
                     delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(
@@ -3508,6 +3522,22 @@ fn fill_script(selector: &serde_json::Value, value: &str) -> String {
     )
 }
 
+/// Engine preferences for a content worker reachable only through `proxy_uri`.
+///
+/// Servo ships several DOM features switched off by preference. Leaving
+/// `IntersectionObserver` off is not a neutral default here: every modern
+/// framework touches it during hydration, and the resulting `ReferenceError`
+/// takes the whole page down rather than degrading one feature.
+fn engine_preferences(proxy_uri: &str) -> Preferences {
+    let mut preferences = Preferences::default();
+    preferences.network_http_proxy_uri = proxy_uri.to_owned();
+    preferences.network_https_proxy_uri = proxy_uri.to_owned();
+    preferences.network_http_no_proxy = String::new();
+    preferences.network_enforce_tls_enabled = false;
+    preferences.dom_intersection_observer_enabled = true;
+    preferences
+}
+
 fn hover_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
     let point = WebViewPoint::Device(DevicePoint::new(
         (x + width / 2.0) as f32,
@@ -3753,6 +3783,16 @@ mod serialize_tests {
             .unwrap()["serialized"]["o"][0]["k"],
             json!("answer")
         );
+    }
+
+    #[test]
+    fn engine_enables_intersection_observer_and_pins_the_proxy() {
+        let preferences = engine_preferences("http://127.0.0.1:4242");
+        // Off by default in Servo; every modern framework dies without it.
+        assert!(preferences.dom_intersection_observer_enabled);
+        assert_eq!(preferences.network_http_proxy_uri, "http://127.0.0.1:4242");
+        assert_eq!(preferences.network_https_proxy_uri, "http://127.0.0.1:4242");
+        assert!(preferences.network_http_no_proxy.is_empty());
     }
 
     #[test]

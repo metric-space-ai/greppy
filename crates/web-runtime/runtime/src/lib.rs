@@ -13,4 +13,6 @@ pub mod policy_proxy;
 pub mod protocol;
 pub mod session;
 pub mod supervisor;
+#[cfg(feature = "content-runtime")]
+pub mod web_api_shims;
 pub mod worker;
