@@ -1835,6 +1835,7 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
+                    || self.servo.spin_event_loop(),
                 );
                 self.servo.spin_event_loop();
                 if let Some(selector) = params
@@ -1879,6 +1880,7 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
+                    || self.servo.spin_event_loop(),
                 );
                 self.servo.spin_event_loop();
                 click_at(
@@ -1887,6 +1889,7 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
+                    || self.servo.spin_event_loop(),
                 );
                 self.servo.spin_event_loop();
                 let _ = self.locator_eval(
@@ -1906,6 +1909,7 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
+                    || self.servo.spin_event_loop(),
                 );
                 self.servo.spin_event_loop();
                 let selector = params
@@ -2128,8 +2132,13 @@ impl ContentEngine {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
                 let (webview, _) = self.page(&page_id)?.clone();
+                // Setting `.checked` alone changes state without telling the
+                // page (finding 019): frameworks listen on `change`, so a
+                // silent toggle looks successful and never reaches the app.
+                // Playwright treats an already-matching state as a no-op, so
+                // events fire only on an actual transition.
                 let source = format!(
-                    "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); nodes[0].checked = checked; return true; }})({selector}, {checked})"
+                    "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.checked !== checked) {{ el.checked = checked; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {checked})"
                 );
                 self.evaluate(webview, &source)?;
                 Ok(json!({}))
@@ -2143,8 +2152,10 @@ impl ContentEngine {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
                 let (webview, _) = self.page(&page_id)?.clone();
+                // Same rule as check: a selection the page never hears about
+                // is worse than a failure (finding 019).
                 let source = format!(
-                    "(function(selector, value) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); nodes[0].value = value; return true; }})({selector}, {})",
+                    "(function(selector, value) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.value !== value) {{ el.value = value; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {})",
                     serde_json::to_string(&value).map_err(io::Error::other)?
                 );
                 self.evaluate(webview, &source)?;
@@ -3023,7 +3034,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
-                click_at(&webview, x, y, 0.0, 0.0);
+                click_at(&webview, x, y, 0.0, 0.0, || self.servo.spin_event_loop());
                 self.servo.spin_event_loop();
                 Ok(json!({}))
             }
@@ -3566,8 +3577,23 @@ fn tap_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
     )));
 }
 
-fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
+/// Synthesize a left click at the centre of a box.
+///
+/// `spin` must drive the engine's event loop; it is called between the move,
+/// the press and the release. Delivering all three in one batch leaves the
+/// hit test unresolved and no `click` event reaches the DOM at all — a
+/// document-level capture listener sees nothing, while `hover` alone works.
+/// The drag path already spins between press and release for the same reason.
+fn click_at(
+    webview: &WebView,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    mut spin: impl FnMut(),
+) {
     hover_at(webview, x, y, width, height);
+    spin();
     let point = WebViewPoint::Device(DevicePoint::new(
         (x + width / 2.0) as f32,
         (y + height / 2.0) as f32,
@@ -3577,11 +3603,13 @@ fn click_at(webview: &WebView, x: f64, y: f64, width: f64, height: f64) {
         MouseButton::Left,
         point,
     )));
+    spin();
     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
         MouseButtonAction::Up,
         MouseButton::Left,
         point,
     )));
+    spin();
 }
 
 fn load_status_allows_navigation(status: LoadStatus, ready_state: Option<&str>) -> bool {
