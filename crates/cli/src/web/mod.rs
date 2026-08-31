@@ -23,6 +23,7 @@ pub use common::{shutdown_if_running, web_runtime_socket};
 pub use nav::NavCommand;
 pub use results::ResultsCommand;
 pub use chain::ChainCommand;
+pub use diagnose::DiagnoseCommand;
 pub use expect::ExpectCommand;
 pub use runtimes::RuntimesCommand;
 pub use see::SeeCommand;
@@ -46,6 +47,8 @@ pub enum WebCommand {
     Runtimes(RuntimesCommand),
     #[command(flatten)]
     Expect(ExpectCommand),
+    #[command(flatten)]
+    Diagnose(DiagnoseCommand),
 }
 
 pub fn dispatch(command: WebCommand, root: Option<&str>) -> Result<i32> {
@@ -76,6 +79,7 @@ pub(super) fn dispatch_inner(command: WebCommand, root: Option<&str>) -> Result<
         WebCommand::Chain(command) => chain::dispatch(command, root),
         WebCommand::Runtimes(command) => runtimes::dispatch(command, root),
         WebCommand::Expect(command) => expect::dispatch(command, root),
+        WebCommand::Diagnose(command) => diagnose::dispatch(command, root),
     }
 }
 

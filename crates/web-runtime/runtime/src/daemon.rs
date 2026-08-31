@@ -739,6 +739,9 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
+            "web.console" => self.web_records(&request, "console"),
+            "web.network" => self.web_records(&request, "network"),
+            "web.events" => self.web_records(&request, "all"),
             "web.click" => self.web_locator_method(&request, "locator.click", json!({})),
             "web.fill" => self.web_fill(&request),
             "web.type" => self.web_type(&request),
@@ -2197,6 +2200,66 @@ impl Daemon {
                     engine_error(request, error, 34)
                 }
             },
+        }
+    }
+
+    /// Return what the page recorded: console messages, network requests, or
+    /// both merged into one time-ordered stream.
+    ///
+    /// The content worker already keeps both lists per page; this only lifts
+    /// them to the protocol so a caller can ask without writing a script.
+    /// Records come from the page and are therefore untrusted.
+    fn web_records(&mut self, request: &Request, kind: &str) -> Response {
+        match self.with_session_page(request, "web.records") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let mut console = json!([]);
+                let mut requests = json!([]);
+                if kind != "network" {
+                    match self.engine_call("page.consoleMessages", json!({ "page": page })) {
+                        Ok(value) => {
+                            console = value.get("messages").cloned().unwrap_or(json!([]));
+                        }
+                        Err(error) => {
+                            self.finish_session(&session_id);
+                            return engine_error(request, error, 34);
+                        }
+                    }
+                }
+                if kind != "console" {
+                    match self.engine_call("page.requests", json!({ "page": page })) {
+                        Ok(value) => {
+                            requests = value
+                                .get("requests")
+                                .cloned()
+                                .unwrap_or_else(|| value.clone());
+                        }
+                        Err(error) => {
+                            self.finish_session(&session_id);
+                            return engine_error(request, error, 34);
+                        }
+                    }
+                }
+                self.finish_session(&session_id);
+                let counts = json!({
+                    "console": console.as_array().map(Vec::len).unwrap_or(0),
+                    "requests": requests.as_array().map(Vec::len).unwrap_or(0),
+                });
+                let mut result = json!({
+                    "session_id": session_id,
+                    "counts": counts,
+                    "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                });
+                if let Some(object) = result.as_object_mut() {
+                    if kind != "network" {
+                        object.insert("console".into(), console);
+                    }
+                    if kind != "console" {
+                        object.insert("requests".into(), requests);
+                    }
+                }
+                Response::ok(request, result)
+            }
         }
     }
 
