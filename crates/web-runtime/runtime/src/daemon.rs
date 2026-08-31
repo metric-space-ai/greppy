@@ -1546,7 +1546,20 @@ impl Daemon {
                     "inspect the controller script and retry",
                 );
                 object.session_id = Some(session_id);
-                Response::error(request, object)
+                // A script that throws is still a script that ran. Without
+                // these the only path a harness can read a result on reports
+                // zero CPU and zero bytes, which is how `content_cpu_ms: 0`
+                // came to look like a broken counter rather than a missing
+                // assignment.
+                let mut response = Response::error(request, object);
+                response.metrics.wall_ms = started.elapsed().as_millis() as u64;
+                response.metrics.network_bytes = network_bytes;
+                response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
+                response.metrics.content_cpu_ms =
+                    cpu_ms_since(content_pid, content_cpu_baseline_ns);
+                response.metrics.controller_cpu_ms =
+                    cpu_ms_since(controller_pid, controller_cpu_baseline_ns);
+                response
             }
         }
     }
