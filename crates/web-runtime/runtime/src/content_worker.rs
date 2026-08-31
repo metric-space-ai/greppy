@@ -1803,6 +1803,12 @@ impl ContentEngine {
                         ));
                     }
                 }
+                // Hypothese 11 (Fund 023): die Navigation nimmt dem View den
+                // Zustand, den die Eingabezustellung braucht. show() wurde beim
+                // Anlegen gerufen, nach load() aber nie wieder.
+                webview.show();
+                webview.focus();
+                self.servo.spin_event_loop();
                 let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
                 webview.paint();
                 self.servo.spin_event_loop();
