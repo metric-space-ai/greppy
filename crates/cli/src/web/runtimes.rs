@@ -178,6 +178,10 @@ fn pw(
                         .next()
                         .and_then(std::result::Result::ok)
                         .unwrap_or(json!(null));
+                    // Carry the runtime's measurements through. Unpacking the
+                    // result must not cost the caller the numbers that came
+                    // with it -- they are the only view of what the snippet
+                    // actually spent.
                     emit_web(
                         json_out,
                         &json!({
@@ -185,6 +189,7 @@ fn pw(
                             "status": "ok",
                             "operation": "web.pw",
                             "result": { "value": value },
+                            "metrics": response.metrics,
                         }),
                     )?;
                     Ok(0)
