@@ -1811,9 +1811,14 @@ impl ContentEngine {
                 // Hypothese 11 (Fund 023): die Navigation nimmt dem View den
                 // Zustand, den die Eingabezustellung braucht. show() wurde beim
                 // Anlegen gerufen, nach load() aber nie wieder.
+                // show() lief nur beim Anlegen; ohne Wiederholung nach der
+                // Navigation stellt Servo keine synthetische Eingabe mehr zu
+                // (Fund 023). Kein zusaetzlicher spin_event_loop hier: ein
+                // Extra-Umlauf mitten in der Navigation bringt die
+                // Ereignisreihenfolge durcheinander -- Touch verlor dabei sein
+                // touchend.
                 webview.show();
                 webview.focus();
-                self.servo.spin_event_loop();
                 let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
                 webview.paint();
                 self.servo.spin_event_loop();
