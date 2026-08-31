@@ -19,11 +19,16 @@ staging_cleanup() {
 trap staging_cleanup EXIT
 bin=web-runtime
 found=
+# Release first. A debug build exists on every developer machine, so
+# searching debug first meant a release would ship the unoptimised binary
+# whenever someone had built for tests -- 406 MB instead of 178 MB, and
+# measurably slower on every page. The receipt records which profile was
+# packed, so an accidental debug dist is at least visible after the fact.
 for candidate in \
-  "$root/crates/web-runtime/target/debug/$bin" \
   "$root/crates/web-runtime/target/release/$bin" \
-  "$root/target/debug/$bin" \
-  "$root/target/release/$bin"
+  "$root/target/release/$bin" \
+  "$root/crates/web-runtime/target/debug/$bin" \
+  "$root/target/debug/$bin"
 do
   if [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
     web_runtime_copy_regular_file "$candidate" "$staging/bin/$bin"
