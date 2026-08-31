@@ -975,15 +975,20 @@ impl ContentEngine {
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
         let mut last_js = Instant::now() - Duration::from_millis(200);
+        let mut trace = NavTrace::begin();
         loop {
             if self.parent_dead() {
                 return Err(Self::parent_gone());
             }
+            trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed(webview, &mut last_js) {
+                trace.finish(webview);
                 return Ok(true);
             }
             self.servo.spin_event_loop();
+            trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed(webview, &mut last_js) {
+                trace.finish(webview);
                 return Ok(true);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3531,6 +3536,62 @@ fn fill_script(selector: &serde_json::Value, value: &str) -> String {
           return true;
         }})({selector}, {value})"
     )
+}
+
+/// Per-navigation phase timing, printed to stderr when `GREPPY_WEB_TRACE_NAV`
+/// is set. Off by default: this exists to attribute the fixed per-navigation
+/// overhead (finding 020) to a phase — url-settled, HeadParsed, Complete —
+/// not to run in production.
+struct NavTrace {
+    started: Option<Instant>,
+    settled_ms: Option<u128>,
+    head_parsed_ms: Option<u128>,
+    complete_ms: Option<u128>,
+}
+
+impl NavTrace {
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("GREPPY_WEB_TRACE_NAV").is_some())
+    }
+
+    fn begin() -> Self {
+        Self {
+            started: Self::enabled().then(Instant::now),
+            settled_ms: None,
+            head_parsed_ms: None,
+            complete_ms: None,
+        }
+    }
+
+    fn note(&mut self, webview: &WebView, url_settled: &mut impl FnMut() -> bool) {
+        let Some(started) = self.started else { return };
+        let elapsed = started.elapsed().as_millis();
+        if self.settled_ms.is_none() && url_settled() {
+            self.settled_ms = Some(elapsed);
+        }
+        match webview.load_status() {
+            LoadStatus::HeadParsed if self.head_parsed_ms.is_none() => {
+                self.head_parsed_ms = Some(elapsed);
+            }
+            LoadStatus::Complete if self.complete_ms.is_none() => {
+                self.complete_ms = Some(elapsed);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&mut self, webview: &WebView) {
+        let Some(started) = self.started else { return };
+        eprintln!(
+            "web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
+            self.settled_ms,
+            self.head_parsed_ms,
+            self.complete_ms,
+            started.elapsed().as_millis(),
+            webview.url().map(|u| u.to_string()),
+        );
+    }
 }
 
 /// Engine preferences for a content worker reachable only through `proxy_uri`.
