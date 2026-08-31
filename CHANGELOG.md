@@ -43,6 +43,10 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   rebuild inside `read`, `who-calls`, or another query. Vector-backed and large
   stores start one observable background refresh and return bounded retry
   guidance; small graph-only edits retain fast inline healing.
+- `bash-smart` now emits a liveness heartbeat after 15 seconds of silent child
+  execution and once per minute thereafter, including the direct child PID and
+  elapsed time, so active `cargo`, `rustfmt`, and test runs are not mistaken for
+  dead wrappers while their output is being compactly captured.
 - Background first-use indexers run in an independent OS process group (and a
   detached no-window class on Windows), so an agent runner can return the
   bounded retry response without its process cleanup killing the cache build.

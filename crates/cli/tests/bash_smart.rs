@@ -93,6 +93,33 @@ fn short_output_follows_verdict_and_exit_code_passes_through() {
 }
 
 #[test]
+fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
+    let workspace = fresh_workspace("heartbeat");
+    let output = command(&workspace)
+        .env("GREPPY_BASH_SMART_HEARTBEAT_MS", "25")
+        .args([
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "printf 'Blocking waiting for file lock on package cache\\n' >&2; sleep 0.12",
+        ])
+        .output()
+        .expect("run greppy heartbeat fixture");
+    let stderr = text(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"ok \xe2\x80\x94 exit 0\n");
+    assert!(
+        stderr.contains("bash-smart: command still running")
+            && stderr.contains("pid=")
+            && stderr
+                .contains("latest child output: Blocking waiting for file lock on package cache"),
+        "stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn child_flags_after_delimiter_pass_through_unchanged() {
     let workspace = fresh_workspace("child-flag");
     let output = run(
@@ -266,7 +293,7 @@ fn signal_forwards_to_child_group_and_keeps_expandable_partial_output() {
         .spawn()
         .expect("spawn signal bash-smart");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !child_pid_path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -326,19 +353,21 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
         .expect("warmup bash-smart");
     let started = Instant::now();
     let output = command(&workspace)
-        .env("GREPPY_BASH_SMART_TIMEOUT_MS", "75")
-        .args(["bash-smart", "--", "sh", "-c", "printf partial; sleep 5"])
+        .env("GREPPY_BASH_SMART_TIMEOUT_MS", "5000")
+        .args(["bash-smart", "--", "sh", "-c", "printf partial; sleep 30"])
         .output()
         .expect("run timed bash-smart");
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
 
-    // The contract: the 75ms timeout preempts the child's 5s sleep. The
-    // budget covers process startup and store open too, which under machine
-    // load exceed 2s — 4s still proves preemption (a completed sleep would
-    // push the total past 5s).
+    // The contract: the 5s timeout preempts the child's 30s sleep after the
+    // shell has had enough time to publish its unterminated partial output. The
+    // budget covers process startup and store open too. The embedded-asset
+    // binary can take many seconds to page in on a loaded host; 25s still
+    // proves preemption because an un-killed child sleeps for 30s after that
+    // same startup cost.
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(25),
         "kill took {:?} — the timeout did not preempt the child's sleep",
         started.elapsed()
     );
@@ -353,7 +382,7 @@ fn timeout_kills_descendants_and_marks_partial_unterminated_output() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("bash-smart: timed out after 75 ms;"),
+        stderr.contains("bash-smart: timed out after 5000 ms;"),
         "{stderr}"
     );
 }

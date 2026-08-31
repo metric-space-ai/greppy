@@ -4,7 +4,7 @@
 
 use super::*;
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(unix)]
@@ -23,6 +23,8 @@ const NOVELTY_DISTANCE_FLOOR: f32 = 0.12;
 const PACK_SCHEMA_VERSION: u64 = 1;
 const PACK_HEAD_BYTES: u64 = 32 * 1024 * 1024;
 const PACK_TAIL_BYTES: u64 = 32 * 1024 * 1024;
+const INITIAL_HEARTBEAT_MS: u64 = 15_000;
+const HEARTBEAT_INTERVAL_MS: u64 = 60_000;
 #[cfg(unix)]
 const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -45,6 +47,26 @@ static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
 });
+
+fn heartbeat_tail(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(std::io::SeekFrom::Start(len.saturating_sub(4096)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut shown: String = line.chars().take(240).collect();
+    if line.chars().count() > 240 {
+        shown.push('…');
+    }
+    Some(shown)
+}
 
 #[cfg(unix)]
 static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -235,6 +257,14 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|value| *value > 0);
+    let heartbeat_override_ms = std::env::var("GREPPY_BASH_SMART_HEARTBEAT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    let heartbeat_interval =
+        std::time::Duration::from_millis(heartbeat_override_ms.unwrap_or(HEARTBEAT_INTERVAL_MS));
+    let mut next_heartbeat =
+        std::time::Duration::from_millis(heartbeat_override_ms.unwrap_or(INITIAL_HEARTBEAT_MS));
     let started = std::time::Instant::now();
     let mut timed_out = false;
     let mut forwarded_signal = None;
@@ -248,6 +278,25 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                let elapsed = started.elapsed();
+                if elapsed >= next_heartbeat {
+                    let latest =
+                        heartbeat_tail(&stderr_path).or_else(|| heartbeat_tail(&stdout_path));
+                    if let Some(latest) = latest {
+                        eprintln!(
+                            "bash-smart: command still running — pid={}, elapsed={}s; latest child output: {latest}",
+                            child.id(),
+                            elapsed.as_secs()
+                        );
+                    } else {
+                        eprintln!(
+                            "bash-smart: command still running — pid={}, elapsed={}s; child output is being captured and will be summarized on exit",
+                            child.id(),
+                            elapsed.as_secs()
+                        );
+                    }
+                    next_heartbeat = next_heartbeat.saturating_add(heartbeat_interval);
+                }
                 if timeout_ms.is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) {
                     timed_out = true;
                     kill_child_tree(&mut child);
