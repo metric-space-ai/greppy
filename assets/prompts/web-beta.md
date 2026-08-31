@@ -16,14 +16,15 @@ Chain consecutive actions when the next steps and targets are already known.
 Stop at decision points, inspect the returned state, then start a new chain.
 Do not guess through an unknown page state just to keep one chain.
 
-  greppy web do 'open URL :: click TARGET :: wait COND'   one chain, one session
+  greppy web do open URL :: click TARGET :: wait COND   one chain, one session
   greppy web open URL                     session + tab, navigate, observe
   greppy web goto URL                     navigate the current tab
   greppy web back                         history back
   greppy web forward                      history forward
   greppy web reload                       reload the current tab
 
-SEE — every actionable node gets a ref @N:
+SEE — QUERY is css=..., xpath=..., text=..., text~/RE/i, role=..., id=..., tag=...
+A bare argument is a CSS selector:
   greppy web observe QUERY                the page as an agent tree
   greppy web find QUERY                   resolve a query to nodes
   greppy web match QUERY                  filter JSONL records from stdin
@@ -36,7 +37,7 @@ SEE — every actionable node gets a ref @N:
   greppy web network QUERY                requests, status, sizes
   greppy web trace start                  begin a Playwright trace
 
-ACT — TARGET is @N, css=..., xpath=..., text~/RE/i, role=... name~/RE/i:
+ACT — TARGET is css=..., xpath=..., text~/RE/i, role=... name~/RE/i:
   greppy web click TARGET                 click; --expect binds a download,
                                           popup, dialog or response to it
   greppy web fill TARGET VALUE            set a field; --from-env for secrets

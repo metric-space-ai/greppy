@@ -1767,6 +1767,24 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 delegate.denied_navigation.replace(None);
                 let previous = webview.url();
+                // Navigating to the URL the page already shows leaves `url`
+                // unchanged, so a URL comparison cannot tell the new document
+                // from the old one: the settle check below passed on the spot,
+                // at the old document's `Complete`, and the query that followed
+                // ran against a document being torn down. The same page then
+                // answered 2, then 0, then 2 (Fund 028). Stamp the outgoing
+                // document instead -- a fresh one never carries the stamp.
+                let same_url = previous
+                    .as_ref()
+                    .is_some_and(|old| urls_match(old, &url));
+                let stamped = same_url
+                    && self
+                        .evaluate_until(
+                            webview.clone(),
+                            "window.__greppyNavStamp = 1; true",
+                            Duration::from_millis(150),
+                        )
+                        .is_ok();
                 let goto_started = NavTrace::enabled().then(Instant::now);
                 // Extra headers ride WebResourceLoad::continue_with_headers in
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
@@ -1776,12 +1794,32 @@ impl ContentEngine {
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
                 let until = WaitUntil::from_params(&params);
+                let engine = &*self;
+                let mut last_stamp = Instant::now() - Duration::from_millis(200);
                 if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || {
-                    denied.denied_navigation.borrow().is_some()
-                        || loading.url().is_some_and(|current| {
-                            urls_match(&current, &expected)
-                                || previous.as_ref().is_some_and(|old| current != *old)
-                        })
+                    if denied.denied_navigation.borrow().is_some() {
+                        return true;
+                    }
+                    let url_settled = loading.url().is_some_and(|current| {
+                        urls_match(&current, &expected)
+                            || previous.as_ref().is_some_and(|old| current != *old)
+                    });
+                    if !url_settled || !stamped {
+                        return url_settled;
+                    }
+                    // Poll at the same 25ms cadence the readyState probe uses.
+                    if last_stamp.elapsed() < Duration::from_millis(25) {
+                        return false;
+                    }
+                    last_stamp = Instant::now();
+                    matches!(
+                        engine.evaluate_until(
+                            loading.clone(),
+                            "typeof window.__greppyNavStamp === 'undefined'",
+                            Duration::from_millis(150),
+                        ),
+                        Ok(JSValue::Boolean(true))
+                    )
                 })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
