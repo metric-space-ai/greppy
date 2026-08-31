@@ -23,7 +23,12 @@ pub struct Session {
     pub last_heartbeat: Instant,
     pub profile: NetworkProfile,
     pub limits: SessionLimits,
+    /// The page every operation without an explicit target acts on.
     pub page_id: Option<String>,
+    /// Every page this session holds open, oldest first. `page_id` names the
+    /// active one; a session with several tabs keeps them all here so a
+    /// caller can switch without losing the others.
+    pub tabs: Vec<String>,
     pub pages: u32,
     pub contexts: u32,
     pub requests: u64,
@@ -51,6 +56,7 @@ impl Session {
             profile,
             limits: SessionLimits::for_profile(profile.as_str()),
             page_id: None,
+            tabs: Vec::new(),
             pages: 0,
             contexts: 0,
             requests: 0,

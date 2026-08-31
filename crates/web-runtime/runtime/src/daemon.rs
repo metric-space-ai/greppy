@@ -739,6 +739,10 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
+            "web.tab.new" => self.web_tab(&request, "new"),
+            "web.tab.list" => self.web_tab(&request, "list"),
+            "web.tab.switch" => self.web_tab(&request, "switch"),
+            "web.tab.close" => self.web_tab(&request, "close"),
             "web.console" => self.web_records(&request, "console"),
             "web.network" => self.web_records(&request, "network"),
             "web.events" => self.web_records(&request, "all"),
@@ -2200,6 +2204,120 @@ impl Daemon {
                     engine_error(request, error, 34)
                 }
             },
+        }
+    }
+
+
+    /// Tabs are pages inside one session: a `web.tab` call adds, lists,
+    /// switches or closes a page while the session's cookies and storage stay
+    /// shared. `session.page_id` names the active one; `session.tabs` keeps
+    /// the rest so switching does not lose them.
+    fn web_tab(&mut self, request: &Request, action: &str) -> Response {
+        match self.with_session_page(request, "web.tab") {
+            Err(response) => response,
+            Ok((session_id, active)) => {
+                let target = request
+                    .payload
+                    .get("tab")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+                // Sessions created before tabs existed carry an active page
+                // that is not in the list yet; adopt it rather than losing it.
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    if !session.tabs.contains(&active) {
+                        session.tabs.push(active.clone());
+                    }
+                }
+                let result = match action {
+                    "new" => match self.engine_call("context.newPage", json!({})) {
+                        Ok(value) => match value.get("page").and_then(|v| v.as_str()) {
+                            Some(page) => {
+                                let page = page.to_owned();
+                                if let Some(session) = self.sessions.get_mut(&session_id) {
+                                    session.tabs.push(page.clone());
+                                    session.page_id = Some(page.clone());
+                                    session.pages = session.tabs.len() as u32;
+                                }
+                                Ok(json!({ "tab": page, "active": true }))
+                            }
+                            None => Err("engine returned no page id".to_owned()),
+                        },
+                        Err(error) => Err(error),
+                    },
+                    "switch" => match target {
+                        None => Err("web.tab switch requires a tab id".to_owned()),
+                        Some(tab) => {
+                            let known = self
+                                .sessions
+                                .get(&session_id)
+                                .map(|session| session.tabs.contains(&tab))
+                                .unwrap_or(false);
+                            if !known {
+                                Err(format!("no tab {tab} in this session"))
+                            } else {
+                                if let Some(session) = self.sessions.get_mut(&session_id) {
+                                    session.page_id = Some(tab.clone());
+                                }
+                                Ok(json!({ "tab": tab, "active": true }))
+                            }
+                        }
+                    },
+                    "close" => {
+                        let tab = target.unwrap_or_else(|| active.clone());
+                        let remaining = {
+                            let session = self.sessions.get_mut(&session_id);
+                            match session {
+                                None => Vec::new(),
+                                Some(session) => {
+                                    session.tabs.retain(|id| id != &tab);
+                                    session.pages = session.tabs.len() as u32;
+                                    if session.page_id.as_deref() == Some(tab.as_str()) {
+                                        session.page_id = session.tabs.last().cloned();
+                                    }
+                                    session.tabs.clone()
+                                }
+                            }
+                        };
+                        // Closing the last tab would leave the session without
+                        // a page; the next operation recreates one on demand.
+                        let _ = self.engine_call("page.close", json!({ "page": tab }));
+                        Ok(json!({ "closed": tab, "tabs": remaining }))
+                    }
+                    _ => {
+                        let (tabs, active_id) = self
+                            .sessions
+                            .get(&session_id)
+                            .map(|session| (session.tabs.clone(), session.page_id.clone()))
+                            .unwrap_or_default();
+                        let rows: Vec<serde_json::Value> = tabs
+                            .iter()
+                            .map(|id| {
+                                let url = self
+                                    .engine_call("page.url", json!({ "page": id }))
+                                    .ok()
+                                    .and_then(|v| v.get("url").cloned())
+                                    .unwrap_or(json!(""));
+                                json!({
+                                    "tab": id,
+                                    "active": Some(id.clone()) == active_id,
+                                    "url": url,
+                                })
+                            })
+                            .collect();
+                        Ok(json!({ "tabs": rows, "count": rows.len() }))
+                    }
+                };
+                self.finish_session(&session_id);
+                match result {
+                    Ok(mut value) => {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("session_id".into(), json!(session_id));
+                        }
+                        Response::ok(request, value)
+                    }
+                    Err(message) => engine_error(request, message, 34),
+                }
+            }
         }
     }
 
