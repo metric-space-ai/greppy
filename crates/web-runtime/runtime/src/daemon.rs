@@ -282,7 +282,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     let mut permissions = std::fs::metadata(&config.socket)?.permissions();
     permissions.set_mode(0o600);
     std::fs::set_permissions(&config.socket, permissions)?;
-    eprintln!("web-runtime: phase listening");
+    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase listening"); }
     let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
     let early_control = Arc::new(RunControl::new());
     let accept_attach = attach.clone();
@@ -296,12 +296,18 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             "web-runtime: phase parent-image elapsed_ms={}",
             hash.as_millis()
         ),
-        Err(error) => eprintln!("web-runtime: phase parent-image error={error}"),
+        Err(error) => {
+            if crate::supervisor::phase_trace_enabled() {
+                eprintln!("web-runtime: phase parent-image error={error}");
+            }
+        }
     }
-    eprintln!(
-        "web-runtime: phase start-workers socket={}",
-        config.socket.display()
-    );
+    if crate::supervisor::phase_trace_enabled() {
+        eprintln!(
+            "web-runtime: phase start-workers socket={}",
+            config.socket.display()
+        );
+    }
     let mut daemon = Daemon::start(config, attach, Arc::clone(&early_control))?;
     eprintln!(
         "web-runtime: phase request-ready elapsed_ms={}",
@@ -332,7 +338,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         })) {
             Ok(response) => response,
             Err(_) => {
-                eprintln!("web-runtime: phase handle-panic operation={operation}");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handle-panic operation={operation}"); }
                 Response::error(
                     &request,
                     ErrorObject::new(
@@ -620,25 +626,25 @@ impl Daemon {
         // before bind, leaving in-flight process-group leaders reparented to PID 1.
         let controller_token = random_token()?;
         let content_token = random_token()?;
-        eprintln!("web-runtime: phase spawn-controller");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); }
         let controller_thread = thread::Builder::new()
             .name("web-spawn-controller".into())
             .spawn(move || {
                 let mut worker = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
-                eprintln!("web-runtime: phase handshake-controller");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); }
                 worker.handshake()?;
-                eprintln!("web-runtime: phase controller-ready");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); }
                 Ok::<_, io::Error>(worker)
             })
             .map_err(io::Error::other)?;
-        eprintln!("web-runtime: phase spawn-content");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-content"); }
         let content_thread = thread::Builder::new()
             .name("web-spawn-content".into())
             .spawn(move || {
                 let mut worker = WorkerProcess::spawn(WorkerKind::Content, content_token)?;
-                eprintln!("web-runtime: phase handshake-content");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); }
                 worker.handshake()?;
-                eprintln!("web-runtime: phase content-ready");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); }
                 Ok::<_, io::Error>(worker)
             })
             .map_err(io::Error::other)?;
@@ -648,7 +654,7 @@ impl Daemon {
         let content = content_thread
             .join()
             .map_err(|_| io::Error::other("content spawn thread panicked"))??;
-        eprintln!("web-runtime: phase workers-ready");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase workers-ready"); }
         let data_root = data_root(&config.run_id);
         run_control
             .controller_pid
@@ -1045,15 +1051,15 @@ impl Daemon {
         crate::profile_lock::ProfileLock::acquire(&dir).map_err(|error| error.to_string())
     }
     fn shutdown(&mut self, request: &Request) -> Response {
-        eprintln!("web-runtime: phase shutdown-begin");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-begin"); }
         self.exiting = true;
         self.sessions.clear();
         self.profile_locks.clear();
-        eprintln!("web-runtime: phase shutdown-controller-eof");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-controller-eof"); }
         self.controller.shutdown_or_kill();
-        eprintln!("web-runtime: phase shutdown-content-reap");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-content-reap"); }
         self.content.shutdown_or_kill();
-        eprintln!("web-runtime: phase shutdown-accept-break");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-accept-break"); }
         self.journal(
             "runtime",
             &request.request_id,
@@ -3413,7 +3419,7 @@ impl Daemon {
     }
 
     fn idle_exit(&mut self) {
-        eprintln!("web-runtime: phase idle-exit");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase idle-exit"); }
         self.exiting = true;
         self.sessions.clear();
         self.profile_locks.clear();
@@ -3459,7 +3465,7 @@ impl Drop for Daemon {
         if self.exiting {
             return;
         }
-        eprintln!("web-runtime: phase supervisor-drop");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase supervisor-drop"); }
         self.exiting = true;
         self.controller.shutdown_or_kill();
         self.content.shutdown_or_kill();

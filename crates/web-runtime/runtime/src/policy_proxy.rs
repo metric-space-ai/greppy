@@ -23,14 +23,14 @@ fn connect_allowed(
     addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
     let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no allowed address");
     for addr in addrs {
-        eprintln!("web-runtime: policy-proxy dial {host}:{port} -> {addr}");
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy dial {host}:{port} -> {addr}"); }
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(stream) => {
-                eprintln!("web-runtime: policy-proxy connected {addr}");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy connected {addr}"); }
                 return Ok(stream);
             }
             Err(error) => {
-                eprintln!("web-runtime: policy-proxy dial {addr} failed: {error}");
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy dial {addr} failed: {error}"); }
                 last_error = error;
             }
         }
@@ -167,7 +167,7 @@ fn handle_connect(
     target: &str,
     transferred: &Arc<AtomicU64>,
 ) -> io::Result<()> {
-    eprintln!("web-runtime: policy-proxy CONNECT target={target}");
+    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy CONNECT target={target}"); }
     let (host, port) = split_host_port(target, 80);
     match connect_allowed(profile.get(), &host, port, &resolve) {
         Ok(server) => {

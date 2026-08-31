@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// runtime -- the flag is process-wide and something retries failed writes. So
 /// the cure is to not write them: diagnostics nobody reads should not exist in
 /// normal operation. `GREPPY_WEB_TRACE_PHASE=1` brings them back.
-fn phase_trace_enabled() -> bool {
+pub(crate) fn phase_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GREPPY_WEB_TRACE_PHASE").is_some())
 }

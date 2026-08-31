@@ -40,7 +40,7 @@ impl Drop for SlowOp<'_> {
     fn drop(&mut self) {
         let ms = self.started.elapsed().as_millis();
         if ms >= 200 {
-            eprintln!("web-runtime: slow-op {} {ms}ms", self.method);
+            if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: slow-op {} {ms}ms", self.method); }
         }
     }
 }
@@ -4780,7 +4780,7 @@ pub fn run() -> io::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis();
-                    eprintln!("web-runtime: call-trace recv method={method} at_ms={now}");
+                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: call-trace recv method={method} at_ms={now}"); }
                     Instant::now()
                 });
                 let reply = match engine.handle(&method, params) {
@@ -4800,7 +4800,7 @@ pub fn run() -> io::Result<()> {
                 }
                 engine.wake.wake();
                 if let Err(error) = write_message(&mut protocol_out, &reply) {
-                    eprintln!("web-runtime: engine result write failed: {error}");
+                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: engine result write failed: {error}"); }
                     let fallback = Message::engine_result(
                         request_id,
                         false,
