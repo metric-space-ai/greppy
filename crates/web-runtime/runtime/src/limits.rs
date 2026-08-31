@@ -211,7 +211,12 @@ impl Default for SessionLimits {
             controller_cpu_time: Duration::from_secs(30),
             content_cpu_time: Duration::from_secs(30),
             controller_heap_bytes: 256 * 1024 * 1024,
-            content_rss_bytes: 512 * 1024 * 1024,
+            // Three real pages of the pinned corpus failed at 536.9 MB
+            // against a 536.87 MB ceiling -- under a tenth of a percent over.
+            // A limit that a normal news site clears by a rounding error is
+            // not protecting anything, it is only turning working pages into
+            // failures. 1 GiB still stops a runaway document.
+            content_rss_bytes: 1024 * 1024 * 1024,
             max_pages: 16,
             max_contexts: 8,
             max_requests: 256,
