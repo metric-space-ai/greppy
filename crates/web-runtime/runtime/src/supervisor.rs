@@ -758,6 +758,9 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
         "GREPPY_WEB_TEST_IGNORE_CERTS",
+        // Opt-in navigation phase tracing (finding 020); read by the content
+        // worker, harmless to leak, and useless if scrubbed here.
+        "GREPPY_WEB_TRACE_NAV",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))

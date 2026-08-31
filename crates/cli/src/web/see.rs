@@ -27,11 +27,186 @@ pub enum SeeCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Locate nodes in the current page.
+    ///
+    ///   greppy web find 'css=#btn'
+    ///   greppy web find 'role=button'
+    ///   greppy web find 'text~/save|apply/i'
+    Find {
+        /// Node query: css=, xpath=, text=, text~/re/, role=, id=, tag=.
+        /// A bare argument is read as a CSS selector.
+        query: String,
+        /// Return only the first match.
+        #[arg(long)]
+        first: bool,
+        /// Cap the number of returned nodes.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pull values out of matching nodes.
+    ///
+    ///   greppy web extract 'css=a.lnk' --fields text,href
+    Extract {
+        /// Node query, same grammar as `find`.
+        query: String,
+        /// Comma-separated fields: text, href, value, id, tag, attr:NAME.
+        #[arg(long, default_value = "text")]
+        fields: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Describe one node in detail.
+    Inspect {
+        /// Node query, same grammar as `find`.
+        query: String,
+        /// Include every attribute.
+        #[arg(long)]
+        attrs: bool,
+        /// Include the node's outer HTML.
+        #[arg(long)]
+        html: bool,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read document markup.
+    Dom {
+        #[command(subcommand)]
+        command: DomCommand,
+    },
 }
 
-pub(super) fn dispatch(command: SeeCommand, _root: Option<&str>) -> Result<i32> {
+#[derive(Debug, Subcommand)]
+pub enum DomCommand {
+    /// Outer HTML of the document, or of the nodes a query matches.
+    Html {
+        /// Optional node query; omit for the whole document.
+        query: Option<String>,
+        /// Cap the returned markup per node.
+        #[arg(long, default_value_t = 20000)]
+        limit: usize,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Node, element and text counts for the document.
+    Stats {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
     match command {
         SeeCommand::Match { query, count, json } => run_match(&query, count, json),
+        SeeCommand::Find {
+            query,
+            first,
+            limit,
+            session,
+            json,
+        } => {
+            let take = if first { 1 } else { limit };
+            let body = format!(
+                "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) \
+                 {{ return describe(e, false); }}) }};"
+            );
+            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+        }
+        SeeCommand::Extract {
+            query,
+            fields,
+            limit,
+            session,
+            json,
+        } => {
+            let wanted: Vec<&str> = fields.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+            if wanted.is_empty() {
+                return emit_error(json, invalid("web extract: --fields must name at least one field"));
+            }
+            let list = serde_json::Value::String(wanted.join(",")).to_string();
+            let body = format!(
+                "var want = {list}.split(','); \
+                 return {{ count: nodes.length, rows: nodes.slice(0, {limit}).map(function(e) {{ \
+                   var row = {{}}; \
+                   want.forEach(function(f) {{ \
+                     if (f.indexOf('attr:') === 0) row[f] = e.getAttribute(f.slice(5)); \
+                     else if (f === 'text') row.text = String(e.textContent == null ? '' : e.textContent).replace(/\\s+/g, ' ').trim(); \
+                     else if (f === 'tag') row.tag = e.tagName.toLowerCase(); \
+                     else if (f === 'id') row.id = e.id || null; \
+                     else row[f] = e[f] === undefined ? null : e[f]; \
+                   }}); \
+                   return row; \
+                 }}) }};"
+            );
+            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+        }
+        SeeCommand::Inspect {
+            query,
+            attrs,
+            html,
+            session,
+            json,
+        } => {
+            let with_html = if html {
+                "if (nodes.length) out.html = nodes[0].outerHTML.slice(0, 20000);"
+            } else {
+                ""
+            };
+            let body = format!(
+                "if (!nodes.length) return {{ count: 0, node: null }}; \
+                 var out = {{ count: nodes.length, node: describe(nodes[0], {attrs}) }}; \
+                 {with_html} return out;"
+            );
+            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+        }
+        SeeCommand::Dom { command } => match command {
+            DomCommand::Html {
+                query,
+                limit,
+                session,
+                json,
+            } => match query {
+                None => {
+                    let source = format!(
+                        "(function(){{ var h = document.documentElement.outerHTML; \
+                         return {{ bytes: h.length, truncated: h.length > {limit}, \
+                         html: h.slice(0, {limit}) }}; }})()"
+                    );
+                    super::runtimes::evaluate(root, json, session, &source)
+                }
+                Some(query) => {
+                    let body = format!(
+                        "return {{ count: nodes.length, html: nodes.map(function(e) \
+                         {{ return e.outerHTML.slice(0, {limit}); }}) }};"
+                    );
+                    super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+                }
+            },
+            DomCommand::Stats { session, json } => {
+                let source = "(function(){ return { \
+                     elements: document.querySelectorAll('*').length, \
+                     links: document.querySelectorAll('a[href]').length, \
+                     images: document.querySelectorAll('img').length, \
+                     inputs: document.querySelectorAll('input,select,textarea').length, \
+                     scripts: document.querySelectorAll('script').length, \
+                     bytes: document.documentElement.outerHTML.length, \
+                     title: document.title, readyState: document.readyState }; })()";
+                super::runtimes::evaluate(root, json, session, source)
+            }
+        },
     }
 }
 
@@ -345,4 +520,99 @@ mod tests {
         assert!(matched("visible=true", json!({ "visible": true })));
         assert!(matched("visible>=1", json!({ "visible": true })));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Node queries: find / extract / inspect / dom
+//
+// All four are questions about the live document, so all four are one
+// `web.evaluate` with a generated snippet instead of four engine operations.
+// The resolver below is shared by every one of them.
+// ---------------------------------------------------------------------------
+
+/// JavaScript that turns one query term into a node list.
+///
+/// Supported forms, matching the CLI query grammar:
+///   css=SELECTOR   xpath=EXPR   text=EXACT   text~/re/flags
+///   role=NAME      id=NAME      tag=NAME
+/// A bare argument is treated as a CSS selector, which is what a caller who
+/// types `#btn` means.
+pub(super) const RESOLVER_JS: &str = r#"
+(function(q) {
+  function esc(s) { return String(s).replace(/"/g, '\\"'); }
+  var m = /^([a-z]+)(=|~)([\s\S]*)$/.exec(q);
+  var kind = m ? m[1] : "css";
+  var op = m ? m[2] : "=";
+  var val = m ? m[3] : q;
+  var all = Array.prototype.slice.call(document.querySelectorAll("*"));
+  function norm(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
+  function reOf(v) {
+    var r = /^\/([\s\S]*)\/([imsu]*)$/.exec(v);
+    return r ? new RegExp(r[1], r[2]) : new RegExp(v);
+  }
+  if (kind === "css") return Array.prototype.slice.call(document.querySelectorAll(val));
+  if (kind === "xpath") {
+    var out = [], it = document.evaluate(val, document, null, 5, null), n;
+    while ((n = it.iterateNext())) out.push(n);
+    return out;
+  }
+  if (kind === "id") return Array.prototype.slice.call(document.querySelectorAll(String.fromCharCode(35) + val));
+  if (kind === "tag") return Array.prototype.slice.call(document.getElementsByTagName(val));
+  if (kind === "role") {
+    return all.filter(function (e) {
+      var r = e.getAttribute("role");
+      if (r) return r === val;
+      var t = e.tagName.toLowerCase();
+      if (val === "button") return t === "button" || (t === "input" && /^(button|submit|reset)$/.test(e.type || ""));
+      if (val === "link") return t === "a" && e.hasAttribute("href");
+      if (val === "textbox") return t === "textarea" || (t === "input" && !/^(button|submit|reset|checkbox|radio|file)$/.test(e.type || ""));
+      if (val === "checkbox") return t === "input" && e.type === "checkbox";
+      if (val === "heading") return /^h[1-6]$/.test(t);
+      return false;
+    });
+  }
+  if (kind === "text") {
+    if (op === "~") { var re = reOf(val); return all.filter(function (e) { return re.test(norm(e.textContent)); }); }
+    return all.filter(function (e) { return norm(e.textContent) === norm(val); });
+  }
+  return [];
+})
+"#;
+
+/// Serialize one node the way `find` and `inspect` report it.
+pub(super) const DESCRIBE_JS: &str = r#"
+(function(e, withAttrs) {
+  var r = e.getBoundingClientRect();
+  var out = {
+    tag: e.tagName.toLowerCase(),
+    id: e.id || null,
+    text: String(e.textContent == null ? "" : e.textContent).replace(/\s+/g, " ").trim().slice(0, 120),
+    visible: !!(r.width || r.height) && getComputedStyle(e).visibility !== "hidden" && getComputedStyle(e).display !== "none",
+    box: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }
+  };
+  if (e.value !== undefined) out.value = e.value;
+  if (e.checked !== undefined) out.checked = e.checked;
+  if (e.disabled !== undefined) out.disabled = e.disabled;
+  if (e.href) out.href = e.href;
+  if (withAttrs) {
+    out.attrs = {};
+    for (var i = 0; i < e.attributes.length; i++) out.attrs[e.attributes[i].name] = e.attributes[i].value;
+  }
+  return out;
+})
+"#;
+
+/// Build the expression for a query-based command.
+pub(super) fn query_expression_pub(query: &str, body: &str) -> String {
+    query_expression(query, body)
+}
+
+fn query_expression(query: &str, body: &str) -> String {
+    // The query is embedded as a JSON string so quotes and backslashes in a
+    // regex survive intact.
+    let literal = serde_json::Value::String(query.to_owned()).to_string();
+    format!(
+        "(function(){{ var resolve = {RESOLVER_JS}; var describe = {DESCRIBE_JS}; \
+         var nodes = resolve({literal}); {body} }})()"
+    )
 }

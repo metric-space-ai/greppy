@@ -738,6 +738,7 @@ impl Daemon {
             "web.back" => self.web_history(&request, "page.goBack", "web.back"),
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
+            "web.evaluate" => self.web_evaluate(&request),
             "web.click" => self.web_locator_method(&request, "locator.click", json!({})),
             "web.fill" => self.web_fill(&request),
             "web.type" => self.web_type(&request),
@@ -2196,6 +2197,97 @@ impl Daemon {
                     engine_error(request, error, 34)
                 }
             },
+        }
+    }
+
+    /// Turn the engine's tagged value encoding into plain JSON.
+    ///
+    /// The content worker serializes JavaScript values structurally —
+    /// `{"o":[{"k":…,"v":…}]}` for objects, `{"b":…}`, `{"n":…}`, `{"s":…}`,
+    /// `{"a":[…]}`, and `{"v":"null"|"undefined"|"NaN"|…}` for the rest. That
+    /// shape is right for round-tripping but unusable for a caller who just
+    /// wants the value, so `web.evaluate` hands back plain JSON and keeps the
+    /// tagged form alongside it for anything that needs the distinction
+    /// between `null` and `undefined`.
+    fn plain_value(tagged: &serde_json::Value) -> serde_json::Value {
+        if let Some(entries) = tagged.get("o").and_then(|value| value.as_array()) {
+            let mut object = serde_json::Map::new();
+            for entry in entries {
+                let Some(key) = entry.get("k").and_then(|key| key.as_str()) else {
+                    continue;
+                };
+                let value = entry.get("v").map(Self::plain_value).unwrap_or(json!(null));
+                object.insert(key.to_owned(), value);
+            }
+            return serde_json::Value::Object(object);
+        }
+        if let Some(items) = tagged.get("a").and_then(|value| value.as_array()) {
+            return serde_json::Value::Array(items.iter().map(Self::plain_value).collect());
+        }
+        for key in ["b", "n", "s"] {
+            if let Some(value) = tagged.get(key) {
+                return value.clone();
+            }
+        }
+        match tagged.get("v").and_then(|value| value.as_str()) {
+            // `undefined`, `NaN` and the infinities have no JSON spelling.
+            // Reporting them as null loses information the caller may need,
+            // so they stay as their engine name in string form.
+            Some("null") | None => json!(null),
+            Some(other) => json!(other),
+        }
+    }
+
+    /// Evaluate an expression in the page and return its serialized value.
+    ///
+    /// This is the primitive `find`, `extract`, `inspect`, `dom`, `wait` and
+    /// `assert` are built on: each of them is a query over the live document,
+    /// and one evaluation operation serves all of them instead of six
+    /// near-identical engine calls.
+    ///
+    /// The returned value comes from the page and is therefore untrusted, so
+    /// it carries the same boundary marker as `web.observe`.
+    fn web_evaluate(&mut self, request: &Request) -> Response {
+        let source = request
+            .payload
+            .get("source")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        let Some(source) = source else {
+            return Response::error(
+                request,
+                ErrorObject::new(
+                    "protocol_violation",
+                    "web.evaluate requires a source expression",
+                    request.request_id.clone(),
+                    30,
+                    "pass params.source",
+                ),
+            );
+        };
+        match self.with_session_page(request, "web.evaluate") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                match self.engine_call("page.evaluate", json!({ "page": page, "source": source })) {
+                    Ok(value) => {
+                        self.finish_session(&session_id);
+                        let tagged = value.get("serialized").cloned().unwrap_or(json!(null));
+                        Response::ok(
+                            request,
+                            json!({
+                                "session_id": session_id,
+                                "value": Self::plain_value(&tagged),
+                                "serialized": tagged,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        self.finish_session(&session_id);
+                        engine_error(request, error, 34)
+                    }
+                }
+            }
         }
     }
 
