@@ -3262,28 +3262,45 @@ impl ContentEngine {
         webview: &WebView,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
-        // Present here, not on every notify_new_frame_ready: a per-frame
-        // present keeps the swap chain producing frames and locator
-        // actionability never sees `stable` (event_loop_stalled).
+        // An agent's screenshot means "what does the page look like NOW".
+        // Servo's WebView::take_screenshot answers a different question -
+        // "what does the page look like once it is finished" - because its
+        // readiness machine waits for load, every image, and every web font
+        // (reftest semantics). On a page that keeps streaming assets that
+        // moment never comes and the agent gets a timeout instead of a
+        // picture; Chromium happily screenshots mid-load. So paint and read
+        // the framebuffer directly.
+        //
+        // Read BEFORE present: read_to_image reads the back buffer, which
+        // holds the freshly painted frame until present swaps it away. The
+        // present afterwards keeps the swap chain producing frames so
+        // locator actionability never sees `stable` (event_loop_stalled).
         webview.paint();
+        let size = self.rendering_context.size2d();
+        let rect = servo::DeviceIntRect::from_size(servo::DeviceIntSize::new(
+            size.width as i32,
+            size.height as i32,
+        ));
+        // `read_to_image` returns None only when nothing has rendered yet
+        // (a page that has not produced its first frame). Give that first
+        // frame a short window instead of the old 30s readiness wait.
+        let mut image = self.rendering_context.read_to_image(rect);
         self.rendering_context.present();
-        let saved = Rc::new(RefCell::new(None));
-        let callback = Rc::clone(&saved);
-        webview.take_screenshot(None, move |result| {
-            *callback.borrow_mut() = Some(result);
-        });
-        let pending = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || pending.borrow().is_some())? {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out capturing screenshot",
-            ));
+        if image.is_none() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while image.is_none() && Instant::now() < deadline {
+                self.servo.spin_event_loop();
+                webview.paint();
+                image = self.rendering_context.read_to_image(rect);
+                self.rendering_context.present();
+            }
         }
-        let image = saved
-            .borrow_mut()
-            .take()
-            .expect("screenshot completed")
-            .map_err(|error| io::Error::other(format!("screenshot failed: {error:?}")))?;
+        let image = image.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out capturing screenshot: no frame rendered",
+            )
+        })?;
         let image = match clip {
             Some((x, y, w, h)) => crop_rgba(&image, x, y, w, h),
             None => image,
