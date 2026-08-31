@@ -118,6 +118,9 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             session,
             json,
         } => {
+            if let Err(message) = validate_query(&query) {
+                return emit_error(json, invalid(&format!("web find: {message}")));
+            }
             let take = if first { 1 } else { limit };
             let body = format!(
                 "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) \
@@ -132,6 +135,12 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             session,
             json,
         } => {
+            if let Err(message) = validate_query(&query) {
+                return emit_error(json, invalid(&format!("web extract: {message}")));
+            }
+            if let Err(message) = validate_query(&query) {
+                return emit_error(json, invalid(&format!("web extract: {message}")));
+            }
             let wanted: Vec<&str> = fields.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
             if wanted.is_empty() {
                 return emit_error(json, invalid("web extract: --fields must name at least one field"));
@@ -160,6 +169,12 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             session,
             json,
         } => {
+            if let Err(message) = validate_query(&query) {
+                return emit_error(json, invalid(&format!("web inspect: {message}")));
+            }
+            if let Err(message) = validate_query(&query) {
+                return emit_error(json, invalid(&format!("web inspect: {message}")));
+            }
             let with_html = if html {
                 "if (nodes.length) out.html = nodes[0].outerHTML.slice(0, 20000);"
             } else {
@@ -188,6 +203,9 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                     super::runtimes::evaluate(root, json, session, &source)
                 }
                 Some(query) => {
+                    if let Err(message) = validate_query(&query) {
+                        return emit_error(json, invalid(&format!("web dom html: {message}")));
+                    }
                     let body = format!(
                         "return {{ count: nodes.length, html: nodes.map(function(e) \
                          {{ return e.outerHTML.slice(0, {limit}); }}) }};"
@@ -601,6 +619,55 @@ pub(super) const DESCRIBE_JS: &str = r#"
   return out;
 })
 "#;
+
+/// Check a node query before it reaches the page.
+///
+/// Three failures used to surface as engine noise or, worse, as an empty
+/// result: an empty query, a malformed regex, and an unknown kind. The last
+/// is the dangerous one — a caller reads `count: 0` as "the page has no such
+/// element" when in truth the query was never understood.
+pub(super) fn validate_query(query: &str) -> std::result::Result<(), String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err("empty query; expected css=, xpath=, text=, role=, id= or tag=".into());
+    }
+    const KINDS: [&str; 6] = ["css", "xpath", "text", "role", "id", "tag"];
+    let Some(split) = trimmed.find(['=', '~']) else {
+        // No operator at all: treated as a CSS selector, which is what a
+        // caller who typed `#btn` means.
+        return Ok(());
+    };
+    let (kind, rest) = trimmed.split_at(split);
+    let op = &rest[..1];
+    let value = &rest[1..];
+    if !kind.is_empty() && !KINDS.contains(&kind) {
+        return Err(format!(
+            "unknown query kind `{kind}`; expected one of {}",
+            KINDS.join(", ")
+        ));
+    }
+    if op == "~" {
+        if kind != "text" {
+            return Err(format!("`~` needs a text query, not `{kind}`"));
+        }
+        let body = value
+            .strip_prefix('/')
+            .ok_or("regex must be written ~/pattern/flags")?;
+        let close = body
+            .rfind('/')
+            .ok_or("regex must be written ~/pattern/flags")?;
+        let (pattern, flags) = body.split_at(close);
+        for flag in flags[1..].chars() {
+            if !"imsu".contains(flag) {
+                return Err(format!("unsupported regex flag `{flag}`"));
+            }
+        }
+        // Compile here so a malformed pattern is a usage error rather than a
+        // JavaScript exception from inside the page.
+        Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?;
+    }
+    Ok(())
+}
 
 /// Build the expression for a query-based command.
 pub(super) fn query_expression_pub(query: &str, body: &str) -> String {
