@@ -2152,7 +2152,19 @@ impl ContentEngine {
                         .max(1.0) as u32;
                     Some((x, y, width, height))
                 });
-                let png = self.screenshot_png(&webview, clip)?;
+                // renderComplete: the agent explicitly asks for the finished
+                // rendering — Servo's readiness machine (load fired, every
+                // image and web font in) instead of the instant framebuffer.
+                // The default answers "what does the page look like NOW".
+                let png = if params
+                    .get("renderComplete")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    self.screenshot_png_render_complete(&webview, clip)?
+                } else {
+                    self.screenshot_png(&webview, clip)?
+                };
                 screenshot_engine_result(&png)
             }
             "locator.count" => {
@@ -3306,6 +3318,39 @@ impl ContentEngine {
         }
     }
 
+    /// Screenshot after the page's rendering is COMPLETE — the opt-in behind
+    /// `renderComplete`. Drives Servo's readiness machine, which waits for
+    /// the load event, every image, and every web font before capturing.
+    /// This is the right tool when the agent wants "how does it look
+    /// finished"; the default [`Self::screenshot_png`] answers "how does it
+    /// look now" and never blocks on a page that keeps streaming assets.
+    fn screenshot_png_render_complete(
+        &self,
+        webview: &WebView,
+        clip: Option<(u32, u32, u32, u32)>,
+    ) -> io::Result<Vec<u8>> {
+        webview.paint();
+        self.rendering_context.present();
+        let saved = Rc::new(RefCell::new(None));
+        let callback = Rc::clone(&saved);
+        webview.take_screenshot(None, move |result| {
+            *callback.borrow_mut() = Some(result);
+        });
+        let pending = Rc::clone(&saved);
+        if !self.spin_until(ACTION_TIMEOUT, move || pending.borrow().is_some())? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for complete rendering; retry without renderComplete for an instant screenshot",
+            ));
+        }
+        let image = saved
+            .borrow_mut()
+            .take()
+            .expect("screenshot completed")
+            .map_err(|error| io::Error::other(format!("screenshot failed: {error:?}")))?;
+        encode_screenshot_png(image, clip)
+    }
+
     fn screenshot_png(
         &self,
         webview: &WebView,
@@ -3350,24 +3395,31 @@ impl ContentEngine {
                 "timed out capturing screenshot: no frame rendered",
             )
         })?;
-        let image = match clip {
-            Some((x, y, w, h)) => crop_rgba(&image, x, y, w, h),
-            None => image,
-        };
-        let mut out = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut out, image.width(), image.height());
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder
-                .write_header()
-                .map_err(|error| io::Error::other(format!("png header: {error}")))?;
-            writer
-                .write_image_data(image.as_raw())
-                .map_err(|error| io::Error::other(format!("png data: {error}")))?;
-        }
-        Ok(out)
+        encode_screenshot_png(image, clip)
     }
+}
+
+fn encode_screenshot_png(
+    image: RgbaImage,
+    clip: Option<(u32, u32, u32, u32)>,
+) -> io::Result<Vec<u8>> {
+    let image = match clip {
+        Some((x, y, w, h)) => crop_rgba(&image, x, y, w, h),
+        None => image,
+    };
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, image.width(), image.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| io::Error::other(format!("png header: {error}")))?;
+        writer
+            .write_image_data(image.as_raw())
+            .map_err(|error| io::Error::other(format!("png data: {error}")))?;
+    }
+    Ok(out)
 }
 
 fn crop_rgba(image: &RgbaImage, x: u32, y: u32, width: u32, height: u32) -> RgbaImage {
