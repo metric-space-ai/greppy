@@ -647,6 +647,12 @@ fn recv_any(
     timeout: Duration,
 ) -> io::Result<Incoming> {
     let deadline = Instant::now() + timeout;
+    // This loop sits on BOTH directions of every engine call. A fixed
+    // REAP_POLL_INTERVAL nap here charged each call ~10ms in and ~10ms out;
+    // at ~17 calls per script that fixed tax was most of the ~500ms
+    // per-navigation overhead (finding 020). Poll finely at first, back off
+    // to 1ms so an idle 50ms slice stays cheap.
+    let mut idle_polls: u32 = 0;
     loop {
         match controller.messages.try_recv() {
             Ok(message) => return Ok(Incoming::Controller(message?)),
@@ -674,7 +680,13 @@ fn recv_any(
                 "timed out waiting for worker protocol traffic",
             ));
         }
-        thread::sleep(REAP_POLL_INTERVAL);
+        idle_polls = idle_polls.saturating_add(1);
+        let nap = if idle_polls < 20 {
+            Duration::from_micros(100)
+        } else {
+            Duration::from_millis(1)
+        };
+        thread::sleep(nap);
     }
 }
 
