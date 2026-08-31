@@ -2694,12 +2694,37 @@ impl Daemon {
                     json!({ "page": page, "x": 0, "y": 0, "deltaX": 0, "deltaY": delta_y }),
                 ) {
                     Ok(_) => {
+                        // The wheel event reaches the DOM, so listeners fire,
+                        // but in Servo the viewport is moved by the compositor
+                        // rather than by the event. Without this the caller
+                        // gets `ok` and a page that never moved. Report where
+                        // the viewport actually ended up so a scroll that hit
+                        // the bottom is visible rather than silently ignored.
+                        let scrolled = self
+                            .engine_call(
+                                "page.evaluate",
+                                json!({
+                                    "page": page,
+                                    "source": format!(
+                                        "(function(){{ window.scrollBy(0, {delta_y}); \
+                                         return window.scrollY; }})()"
+                                    ),
+                                }),
+                            )
+                            .ok()
+                            .map(|value| {
+                                Self::plain_value(
+                                    &value.get("serialized").cloned().unwrap_or(json!(null)),
+                                )
+                            })
+                            .unwrap_or(json!(null));
                         self.finish_session(&session_id);
                         Response::ok(
                             request,
                             json!({
                                 "session_id": session_id,
                                 "ok": true,
+                                "scroll_y": scrolled,
                                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
                             }),
                         )
