@@ -366,6 +366,16 @@ impl BaseStoreLayout {
         Ok(lock.map(|lock| BaseBuilderLease { _lock: lock }))
     }
 
+    /// Exact advisory-lock path used to serialize immutable Base publishers.
+    /// Exposed for fail-closed diagnostics; ownership still comes exclusively
+    /// from [`Self::acquire_builder`].
+    pub fn builder_lock_path(&self) -> io::Result<PathBuf> {
+        Ok(self
+            .data_root
+            .join("locks")
+            .join(self.lifecycle_lock_name()?))
+    }
+
     /// Hold this shared lease for the complete lifetime of an agent using the
     /// Base. GC and rebuild use the exclusive builder lease, so a live Base
     /// cannot be reclaimed beneath attached read-only stores.

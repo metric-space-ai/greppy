@@ -164,9 +164,13 @@ starts one background index and waits at most two seconds: small repositories
 usually answer immediately; larger ones return temporary exit 75 with the
 exact retry condition. `greppy index status --json` remains nonblocking during
 the build; an explicit foreground `greppy index` immediately prints its first
-phase, PID and that status command. Status reports Base and embedding phases,
-and marks a job whose progress
-record has not changed for two minutes as potentially stalled. Exact
+phase, PID and that status command. Status reports Base, discovery, extraction,
+graph-write, structural and embedding phases with a `progress_unit` plus
+phase-local completed/total values. It marks a job whose real progress record
+has not changed for two minutes as potentially stalled. If another linked
+worktree already owns the immutable-Base builder lock, `index` waits at most
+five seconds and returns temporary exit 75 with the exact lock path and retry
+guidance instead of blocking behind that builder. Exact
 `read-file --all` and `read-file --lines` reads do not require the graph store
 and remain usable while indexing. While
 embeddings are still building, `search` prints one stable progress line such as

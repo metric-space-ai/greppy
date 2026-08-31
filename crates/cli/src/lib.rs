@@ -3815,6 +3815,7 @@ struct BackgroundJobGuard {
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
+    progress_phase: Option<&'static str>,
     complete: bool,
 }
 
@@ -3890,6 +3891,7 @@ impl BackgroundJobGuard {
             rate_milli_documents_per_second: None,
             embedding_started: None,
             last_progress_write: None,
+            progress_phase: None,
             complete: false,
         }
     }
@@ -3928,10 +3930,35 @@ impl BackgroundJobGuard {
         self.total_documents = total_documents;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
+        self.progress_phase = Some("embedding");
         self.rate_milli_documents_per_second = None;
         self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
         self.write_state("embedding", None);
         self.last_progress_write = Some(now);
+    }
+
+    fn indexing_progress(&mut self, progress: greppy_indexer::IndexBuildProgress) {
+        let phase_changed = self.progress_phase != Some(progress.phase);
+        self.progress_phase = Some(progress.phase);
+        self.completed_documents = progress.completed_files;
+        self.total_documents = progress.total_files;
+        self.backend = None;
+        self.device = None;
+        self.eta_seconds = None;
+        self.rate_milli_documents_per_second = None;
+        self.embedding_started = None;
+
+        let now = std::time::Instant::now();
+        let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
+        let publish = phase_changed
+            || finished
+            || self.last_progress_write.is_none_or(|last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(500)
+            });
+        if publish {
+            self.write_state(progress.phase, None);
+            self.last_progress_write = Some(now);
+        }
     }
 
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
@@ -3976,6 +4003,12 @@ impl BackgroundJobGuard {
                 .checked_div(self.total_documents)
                 .unwrap_or(0)
         };
+        let progress_unit = match self.progress_phase {
+            Some("embedding") => Some("spans"),
+            Some("classifying_files" | "extracting_files" | "writing_graph") => Some("files"),
+            Some(_) => Some("steps"),
+            None => None,
+        };
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
@@ -3990,6 +4023,7 @@ impl BackgroundJobGuard {
             "completed_spans": self.completed_documents,
             "total_spans": self.total_documents,
             "progress_milli_percent": progress_milli_percent,
+            "progress_unit": progress_unit,
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
             "eta_seconds": self.eta_seconds,
             "eta_minutes": eta_minutes,

@@ -186,6 +186,29 @@ pub struct IndexReport {
     pub files_skipped_by_time_budget: usize,
 }
 
+/// Observable progress for the non-embedding part of an index build.
+///
+/// The CLI persists these events in the background-job record so a large
+/// repository cannot look stalled while files are actively being parsed or
+/// written into the graph. Counts are phase-local: a new phase starts at zero
+/// and completes at `total_files`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBuildProgress {
+    pub phase: &'static str,
+    pub completed_files: usize,
+    pub total_files: usize,
+}
+
+impl IndexBuildProgress {
+    fn new(phase: &'static str, completed_files: usize, total_files: usize) -> Self {
+        Self {
+            phase,
+            completed_files,
+            total_files,
+        }
+    }
+}
+
 impl IndexReport {
     pub fn is_clean(&self) -> bool {
         self.files_unreadable == 0
@@ -227,6 +250,21 @@ pub fn index_with_options(
     project_name: &str,
     options: &IndexOptions,
 ) -> Result<IndexReport> {
+    index_with_options_and_progress(store, root, project_name, options, &mut |_| {})
+}
+
+/// Run the indexer with explicit discovery options and report real work as it
+/// completes. The callback is invoked serially, including when extraction is
+/// parallel, so callers do not need synchronization around their progress
+/// sink.
+pub fn index_with_options_and_progress(
+    store: &mut Store,
+    root: &Path,
+    project_name: &str,
+    options: &IndexOptions,
+    progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<IndexReport> {
+    progress(IndexBuildProgress::new("discovering_files", 0, 0));
     let abs_root = greppy_discover::detect_repo_root(root)?;
     let discovered_entries = greppy_discover::walk_with_policy_and_overrides(
         &abs_root,
@@ -241,6 +279,11 @@ pub fn index_with_options(
     } else {
         discovered_entries
     };
+    progress(IndexBuildProgress::new(
+        "classifying_files",
+        0,
+        all_entries.len(),
+    ));
 
     let mut report = IndexReport {
         project: project_name.to_string(),
@@ -361,13 +404,16 @@ pub fn index_with_options(
             generation,
             worker_count,
             &mut report,
+            progress,
         )?;
 
         // PHASE B (incremental). Re-resolve only the edges that PHASE A's
         // FK-cascade removed (or whose resolution could have flipped),
         // instead of the whole project's raw edges.
+        progress(IndexBuildProgress::new("resolving_edges", 0, 1));
         report.edges_extracted =
             resolve_edges_incremental(store, project_name, &changed_files, &def_fp_before)?;
+        progress(IndexBuildProgress::new("resolving_edges", 1, 1));
     } else {
         let profile = std::env::var("GREPPY_PROFILE").is_ok();
         let t = std::time::Instant::now();
@@ -378,6 +424,7 @@ pub fn index_with_options(
             generation,
             worker_count,
             &mut report,
+            progress,
         )?;
         if profile {
             eprintln!(
@@ -394,7 +441,9 @@ pub fn index_with_options(
             eprintln!("[profile] load_all_raw_edges {:?}", t.elapsed());
         }
         let t = std::time::Instant::now();
+        progress(IndexBuildProgress::new("resolving_edges", 0, 1));
         report.edges_extracted = resolve_and_persist_edges(store, project_name, &raw_edges)?;
+        progress(IndexBuildProgress::new("resolving_edges", 1, 1));
         if profile {
             eprintln!("[profile] resolve_and_persist_edges {:?}", t.elapsed());
         }
@@ -407,6 +456,7 @@ pub fn index_with_options(
     // File→DEFINES targets are resolvable. Node/edge upserts make it
     // idempotent across incremental re-indexes; a deleted file's File node is
     // removed by the per-file node cascade in `run_incremental`.
+    progress(IndexBuildProgress::new("building_structure", 0, 1));
     structural::build_structural(store, project_name, &entries)?;
 
     // `require`/`import`→File IMPORTS. A path-style import
@@ -419,6 +469,7 @@ pub fn index_with_options(
     // to that File. Symbol-resolving imports (rust/python/java — already at
     // parity) are re-checked and skipped, so nothing is double-counted.
     resolve_file_imports(store, project_name)?;
+    progress(IndexBuildProgress::new("building_structure", 1, 1));
 
     record_control_skips(store, project_name, &controlled_entries.skipped, generation)?;
 
@@ -429,6 +480,7 @@ pub fn index_with_options(
     sync_provider_states(store, project_name, &all_entries, generation)?;
 
     report.graph_generation = generation;
+    progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
 }
 
@@ -455,12 +507,18 @@ fn run_full(
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<()> {
     let max_size = max_file_size_bytes();
 
     // ── Classification (serial, cheap stat only) ────────────────────
     let mut supported: Vec<(usize, &InventoryEntry, Language)> = Vec::new();
     for (idx, entry) in entries.iter().enumerate() {
+        progress(IndexBuildProgress::new(
+            "classifying_files",
+            idx,
+            entries.len(),
+        ));
         let lang = greppy_parser::language_for_path(&entry.abs_path);
         if !lang.is_supported() {
             report.files_unsupported_language += 1;
@@ -498,11 +556,24 @@ fn run_full(
         }
         supported.push((idx, entry, lang));
     }
+    progress(IndexBuildProgress::new(
+        "classifying_files",
+        entries.len(),
+        entries.len(),
+    ));
 
     // ── PHASE A1 — parallel extract (CPU-bound, no store) ───────────
     let profile = std::env::var("GREPPY_PROFILE").is_ok();
     let t_a1 = std::time::Instant::now();
-    let (extractions, throttled) = parallel_extract(&supported, worker_count);
+    let mut extraction_progress = |completed, total| {
+        progress(IndexBuildProgress::new(
+            "extracting_files",
+            completed,
+            total,
+        ));
+    };
+    let (extractions, throttled) =
+        parallel_extract(&supported, worker_count, &mut extraction_progress);
     report.throttled_for_memory = throttled;
     if profile {
         eprintln!(
@@ -517,7 +588,13 @@ fn run_full(
     // after the loop (see insert_file_content_batch) — content-FTS was the
     // dominant cold-index cost and one-commit-per-file was much of it.
     let mut content_batch: Vec<(String, Vec<greppy_store::ContentRow>)> = Vec::new();
-    for outcome in extractions {
+    let extraction_count = extractions.len();
+    progress(IndexBuildProgress::new(
+        "writing_graph",
+        0,
+        extraction_count,
+    ));
+    for (position, outcome) in extractions.into_iter().enumerate() {
         match outcome {
             FileOutcome::Extracted {
                 rel_path,
@@ -578,6 +655,11 @@ fn run_full(
                 )?;
             }
         }
+        progress(IndexBuildProgress::new(
+            "writing_graph",
+            position + 1,
+            extraction_count,
+        ));
     }
     // One transaction for ALL files' content (vs one per file before).
     if !content_batch.is_empty() {
@@ -608,6 +690,7 @@ fn run_incremental(
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<std::collections::HashSet<String>> {
     let max_size = max_file_size_bytes();
     let mut changed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -698,9 +781,23 @@ fn run_incremental(
 
     // Re-extract the changed files in parallel, then apply writes serially
     // in inventory order (same determinism contract as the full path).
-    let (extractions, throttled) = parallel_extract(&changed, worker_count);
+    let mut extraction_progress = |completed, total| {
+        progress(IndexBuildProgress::new(
+            "extracting_files",
+            completed,
+            total,
+        ));
+    };
+    let (extractions, throttled) =
+        parallel_extract(&changed, worker_count, &mut extraction_progress);
     report.throttled_for_memory = throttled;
-    for outcome in extractions {
+    let extraction_count = extractions.len();
+    progress(IndexBuildProgress::new(
+        "writing_graph",
+        0,
+        extraction_count,
+    ));
+    for (position, outcome) in extractions.into_iter().enumerate() {
         match outcome {
             FileOutcome::Extracted {
                 rel_path,
@@ -748,6 +845,11 @@ fn run_incremental(
                 )?;
             }
         }
+        progress(IndexBuildProgress::new(
+            "writing_graph",
+            position + 1,
+            extraction_count,
+        ));
     }
 
     // Every persisted file or skip row that survived this run reflects the
@@ -943,8 +1045,10 @@ fn validate_or_degrade(
 fn parallel_extract(
     supported: &[(usize, &InventoryEntry, Language)],
     worker_count: usize,
+    progress: &mut dyn FnMut(usize, usize),
 ) -> (Vec<FileOutcome>, bool) {
     let n = supported.len();
+    progress(0, n);
     if n == 0 {
         return (Vec::new(), false);
     }
@@ -954,7 +1058,12 @@ fn parallel_extract(
     if worker_count <= 1 || n == 1 {
         let out = supported
             .iter()
-            .map(|(_, entry, lang)| extract_one(entry, *lang))
+            .enumerate()
+            .map(|(position, (_, entry, lang))| {
+                let outcome = extract_one(entry, *lang);
+                progress(position + 1, n);
+                outcome
+            })
             .collect();
         return (out, false);
     }
@@ -970,7 +1079,12 @@ fn parallel_extract(
         Err(_) => {
             let out = supported
                 .iter()
-                .map(|(_, entry, lang)| extract_one(entry, *lang))
+                .enumerate()
+                .map(|(position, (_, entry, lang))| {
+                    let outcome = extract_one(entry, *lang);
+                    progress(position + 1, n);
+                    outcome
+                })
                 .collect();
             return (out, false);
         }
@@ -1000,8 +1114,11 @@ fn parallel_extract(
         // parse trees in memory at once.
         if greppy_core::mem_over_budget() {
             throttled = true;
-            for (slot, (_, entry, lang)) in slots[pos..].iter_mut().zip(&supported[pos..]) {
+            for (offset, (slot, (_, entry, lang))) in
+                slots[pos..].iter_mut().zip(&supported[pos..]).enumerate()
+            {
                 *slot = Some(extract_one(entry, *lang));
+                progress(pos + offset + 1, n);
             }
             break;
         }
@@ -1018,6 +1135,7 @@ fn parallel_extract(
             *slot = Some(res);
         }
         pos = end;
+        progress(pos, n);
     }
 
     let out = slots
@@ -3417,6 +3535,35 @@ mod tests {
     }
 
     #[test]
+    fn index_progress_reports_real_file_work_before_embeddings() {
+        let repo = setup_repo("index-progress", "pub fn keep_me() {}\n");
+        fs::write(repo.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let mut events = Vec::new();
+
+        let report = index_with_options_and_progress(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions::default(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(report.files_indexed, 2);
+        assert_eq!(events.first().unwrap().phase, "discovering_files");
+        assert!(events.iter().any(|event| {
+            event.phase == "extracting_files"
+                && event.total_files == 2
+                && event.completed_files == 2
+        }));
+        assert!(events.iter().any(|event| {
+            event.phase == "writing_graph" && event.total_files == 2 && event.completed_files == 2
+        }));
+        assert_eq!(events.last().unwrap().phase, "finalizing_graph");
+    }
+
+    #[test]
     fn index_records_file_state_with_sha256() {
         let repo = setup_repo("fsstate", RUST_SAMPLE);
         let mut store = Store::open_memory().unwrap();
@@ -4686,7 +4833,7 @@ def Widget():
             "need several files to exercise ordering"
         );
 
-        let (out, _throttled) = parallel_extract(&supported, 8);
+        let (out, _throttled) = parallel_extract(&supported, 8, &mut |_, _| {});
         assert_eq!(out.len(), supported.len());
         // Each extracted outcome's rel_path must equal the rel_path of the
         // supported entry at the SAME position (order preserved).

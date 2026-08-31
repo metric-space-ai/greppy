@@ -963,7 +963,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
     allow_deferred_embeddings: bool,
-    background_job: Option<&mut BackgroundJobGuard>,
+    mut background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<Option<IndexSnapshotReport>> {
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     let temp_path = unique_store_sibling(active_path, "next");
@@ -978,15 +978,25 @@ pub(crate) fn index_atomic_snapshot_attempt(
         }
     };
 
-    let report =
-        match greppy_indexer::index_with_options(&mut temp_store, target, project, index_options) {
-            Ok(report) => report,
-            Err(e) => {
-                drop(temp_store);
-                let _ = cleanup_sqlite_family(&temp_path);
-                return Err(e);
-            }
-        };
+    let index_result = if let Some(job) = background_job.as_deref_mut() {
+        greppy_indexer::index_with_options_and_progress(
+            &mut temp_store,
+            target,
+            project,
+            index_options,
+            &mut |progress| job.indexing_progress(progress),
+        )
+    } else {
+        greppy_indexer::index_with_options(&mut temp_store, target, project, index_options)
+    };
+    let report = match index_result {
+        Ok(report) => report,
+        Err(e) => {
+            drop(temp_store);
+            let _ = cleanup_sqlite_family(&temp_path);
+            return Err(e);
+        }
+    };
 
     if !report.is_clean()
         || report.files_skipped_by_file_limit > 0

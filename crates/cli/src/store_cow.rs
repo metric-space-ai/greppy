@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use greppy_core::error::{Error, Result};
-use greppy_store::{BaseStoreIdentity, BaseStoreLayout, VisibilityIndex};
+use greppy_store::{BaseBuilderLease, BaseStoreIdentity, BaseStoreLayout, VisibilityIndex};
 use sha2::{Digest, Sha256};
 
 pub(crate) const ENV_MODE: &str = "GREPPY_AGENT_STORE_MODE";
@@ -17,6 +17,7 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
+const BASE_BUILDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 #[cfg(debug_assertions)]
@@ -451,8 +452,44 @@ fn report_base_phase(path: Option<&Path>, phase: &str) {
     };
     job["state"] = serde_json::json!(phase);
     job["updated_at_unix_secs"] = serde_json::json!(crate::unix_now_secs_cli());
+    job["completed_spans"] = serde_json::json!(0);
+    job["total_spans"] = serde_json::json!(0);
+    job["progress_milli_percent"] = serde_json::json!(0);
+    job["progress_unit"] = serde_json::json!("steps");
+    job["rate_milli_spans_per_second"] = serde_json::Value::Null;
+    job["eta_seconds"] = serde_json::Value::Null;
+    job["eta_minutes"] = serde_json::Value::Null;
+    job["eta_unix_secs"] = serde_json::Value::Null;
     job["last_error"] = serde_json::Value::Null;
     let _ = crate::write_background_job(path, &job);
+}
+
+fn acquire_base_builder(
+    layout: &BaseStoreLayout,
+    identity_hash: &str,
+    progress_path: Option<&Path>,
+    max_wait: std::time::Duration,
+) -> Result<BaseBuilderLease> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(lease) = layout
+            .acquire_builder(true)
+            .map_err(|error| Error::io("acquire Base Store builder lease", error))?
+        {
+            return Ok(lease);
+        }
+        report_base_phase(progress_path, "waiting_for_base_builder");
+        if started.elapsed() >= max_wait {
+            let lock_path = layout
+                .builder_lock_path()
+                .map_err(|error| Error::io("resolve Base builder lock", error))?;
+            return Err(Error::Lock(format!(
+                "another worktree is building immutable Base {identity_hash}; lock {}; wait for that build to publish, then rerun `greppy index`",
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250).min(max_wait));
+    }
 }
 
 /// Prepare an immutable Base from the primary checkout and attach the current
@@ -709,6 +746,9 @@ fn prepare_base_store_paths(
     progress_path: Option<&Path>,
 ) -> Result<PreparedBase> {
     let identity = base_identity_parts(repo_root, base_commit)?;
+    let identity_hash = identity
+        .hash()
+        .map_err(|error| Error::io("hash Base Store identity", error))?;
     let layout = BaseStoreLayout::new(shared_data_root, &identity)
         .map_err(|error| Error::io("construct Base Store layout", error))?;
     if let Ok(manifest) = layout.read_verified_manifest() {
@@ -725,10 +765,12 @@ fn prepare_base_store_paths(
         }
     }
 
-    let builder_lease = layout
-        .acquire_builder(false)
-        .map_err(|error| Error::io("acquire Base Store builder lease", error))?
-        .ok_or_else(|| Error::Lock("blocking Base builder lease returned no guard".into()))?;
+    // Never disappear into a blocking flock behind another worktree's Base
+    // build. That build can legitimately take minutes, but this caller must
+    // remain observable and bounded so agents can retry the completed Base
+    // instead of abandoning Greppy as hung.
+    let builder_lease =
+        acquire_base_builder(&layout, &identity_hash, progress_path, BASE_BUILDER_WAIT)?;
     if let Ok(manifest) = layout.read_verified_manifest() {
         if validate_base_contents(worktree_path, &layout.graph, &identity).is_ok()
             && validate_base_summary_cache(
@@ -746,6 +788,7 @@ fn prepare_base_store_paths(
     layout
         .quarantine_current()
         .map_err(|error| Error::io("quarantine invalid Base Store", error))?;
+    report_base_phase(progress_path, "validating_base_inventory");
     let expected_file_count = validate_workspace_inventory(source_path, worktree_path)?;
 
     std::fs::create_dir_all(shared_data_root)
@@ -1376,6 +1419,59 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn concurrent_base_builder_wait_is_bounded_and_actionable() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let _held = layout.acquire_builder(true).unwrap().unwrap();
+        let progress_path = data_root.path().join("index.job");
+        crate::write_background_job(
+            &progress_path,
+            &serde_json::json!({
+                "schema_version": crate::BACKGROUND_JOB_SCHEMA_VERSION,
+                "kind": "index",
+                "pid": std::process::id(),
+                "started_at_unix_secs": 1,
+                "updated_at_unix_secs": 1,
+                "state": "preparing_base_checkout"
+            }),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = match acquire_base_builder(
+            &layout,
+            &identity_hash,
+            Some(&progress_path),
+            std::time::Duration::from_millis(20),
+        ) {
+            Ok(_) => panic!("second Base builder unexpectedly acquired the held lease"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains("another worktree is building immutable Base"));
+        assert!(message.contains(&identity_hash));
+        assert!(message.contains("rerun `greppy index`"));
+        assert!(message.contains(
+            layout
+                .builder_lock_path()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        ));
+        let progress = crate::read_background_job(&progress_path).unwrap();
+        assert_eq!(progress["state"], "waiting_for_base_builder");
+        assert_eq!(progress["progress_unit"], "steps");
+        assert_eq!(progress["completed_spans"], 0);
+        assert_eq!(progress["total_spans"], 0);
     }
 
     #[test]

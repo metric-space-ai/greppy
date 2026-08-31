@@ -15,6 +15,13 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   foreground phase, completed/total spans and ETA when available. Semantic
   search against an incomplete embedding generation now returns temporary
   exit 75 with an explicit `index status --json` retry condition.
+- Cold graph builds publish real discovery, extraction, graph-write and
+  structural phases with phase-local file/step counts. Active work is no
+  longer mislabeled as stalled at zero percent. A linked worktree waiting on
+  another immutable-Base publisher now stops after a bounded five seconds
+  with exit 75, the exact builder-lock path and retry guidance instead of
+  blocking silently in `flock` under the stale `preparing_base_checkout`
+  phase.
 - First-use graph navigation starts indexing as one observable background job
   and waits at most two seconds for publication. Large repositories therefore
   return retryable exit 75 instead of hiding an unbounded index walk. Job state

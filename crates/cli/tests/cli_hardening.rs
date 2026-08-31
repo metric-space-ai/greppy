@@ -2211,7 +2211,10 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
     let first_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let pid = first_job["pid"].as_u64().expect("background pid") as u32;
-    assert_eq!(first_job["state"], "indexing");
+    assert_eq!(first_job["state"], "finalizing_graph");
+    assert_eq!(first_job["completed_spans"], 1);
+    assert_eq!(first_job["total_spans"], 1);
+    assert_eq!(first_job["progress_unit"], "steps");
 
     let (code, out, err) = run_with_env(
         &[
@@ -2519,7 +2522,10 @@ fn foreground_index_publishes_observable_progress_while_building() {
     assert_eq!(status["status"], "indexing");
     assert_eq!(status["writer_active"], true);
     assert_eq!(status["background_job"]["cause"], "foreground-index");
-    assert_eq!(status["background_job"]["state"], "indexing");
+    assert_eq!(status["background_job"]["state"], "finalizing_graph");
+    assert_eq!(status["background_job"]["completed_spans"], 1);
+    assert_eq!(status["background_job"]["total_spans"], 1);
+    assert_eq!(status["background_job"]["progress_unit"], "steps");
     assert!(status["background_job"]["pid"].as_u64().is_some());
     assert!(
         status["message"]
@@ -2556,7 +2562,7 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
         "query must not wait for the held writer indefinitely"
     );
     assert!(err.contains("waiting up to 2s"), "stderr={err}");
-    assert!(err.contains("phase=indexing"), "stderr={err}");
+    assert!(err.contains("phase=finalizing_graph"), "stderr={err}");
     assert!(err.contains("greppy index status --json"), "stderr={err}");
 }
 
