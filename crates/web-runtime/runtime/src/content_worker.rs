@@ -972,7 +972,12 @@ impl ContentEngine {
     fn load_committed(&self, webview: &WebView, last_js: &mut Instant) -> bool {
         match webview.load_status() {
             LoadStatus::Complete => true,
-            LoadStatus::HeadParsed if last_js.elapsed() >= Duration::from_millis(200) => {
+            // Poll readyState at 25ms, not 200ms. Large documents sit in
+            // HeadParsed for their whole parse; on the release build the
+            // 200ms cadence alone cost ~1.3s of a 2.1s navigation commit
+            // (nav-trace, page 044) while each evaluate costs well under a
+            // millisecond of CPU.
+            LoadStatus::HeadParsed if last_js.elapsed() >= Duration::from_millis(25) => {
                 *last_js = Instant::now();
                 match self.evaluate_until(
                     webview.clone(),
@@ -3289,9 +3294,14 @@ impl ContentEngine {
                 if Instant::now() >= deadline {
                     return Err(timeout_err(&last));
                 }
-                return Err(timeout_err(&format!(
-                    "failed_check=stable; event_loop_stalled; {last}"
-                )));
+                // One missed pump is not a dead event loop: an 80ms evaluate
+                // window can close while the script thread is merely busy,
+                // and the very next attempt succeeds (the first fill after a
+                // fresh page failed exactly this way while a retry took
+                // 295ms). Keep trying until the caller's deadline; only note
+                // the stall for the eventual timeout message.
+                last = format!("event_loop_slow; {last}");
+                continue;
             }
         }
     }
