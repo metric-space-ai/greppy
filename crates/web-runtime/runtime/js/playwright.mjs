@@ -1897,7 +1897,13 @@ class Page {
   async goto(url, options) {
     const timeout = navigationTimeout(this._timeout, options, "Page.goto");
     try {
-      const result = await engineCall("page.goto", { page: this._id, url, timeout });
+      // waitUntil reaches the engine, which returns at HeadParsed for
+      // domcontentloaded. navigationTimeout validated the option but the
+      // call silently dropped it, so every goto waited for load - on a
+      // 7.6MB document that meant sitting through a 30s+ layout the agent
+      // never asked for.
+      const waitUntil = (options && options.waitUntil) || "load";
+      const result = await engineCall("page.goto", { page: this._id, url, timeout, waitUntil });
       this._url = result.url || String(url);
       // Issue the post-navigation state syncs concurrently: the engine
       // handles queued calls back-to-back, so five sequential round trips
@@ -1919,7 +1925,14 @@ class Page {
         headers: result.headers || {},
       });
     } catch (error) {
-      await this._dispatchNetworkUntilSettled();
+      // Best-effort event flush; its own failure must never replace the real
+      // navigation error (a busy engine turned every goto timeout into an
+      // unrelated "timed out after 30000ms" from this very call).
+      try {
+        await this._dispatchNetworkUntilSettled();
+      } catch {
+        // keep the navigation error
+      }
       throw error;
     }
   }
