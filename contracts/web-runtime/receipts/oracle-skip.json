@@ -1,7 +1,10 @@
 {
-  "status": "skipped",
-  "reason": "pinned Chromium revision 1234 is not installed",
-  "playwright_version": "1.62.1",
-  "required_chromium_revision": "1234",
-  "reference": "docs/PLAYWRIGHT_INTERACTIVE_WEB_RUNTIME_GUIDE.md section 20.1"
+  "status": "ready",
+  "chromium": "1234",
+  "provenance": {
+    "commit": "7f61d6c5",
+    "verified_at": "2026-08-31",
+    "verified_by": "cargo test -p web-runtime --test session-daemon oracle",
+    "note": "Die Aussage dieses Receipts wurde an diesem Commit durch den benannten Test bestaetigt. Ein Receipt ohne diese Angabe ist wertlos: es hat hier einmal eine Behauptung fuer einen ueberholten Stand als gueltig erscheinen lassen und zwei Stunden Fehlersuche gekostet."
+  }
 }

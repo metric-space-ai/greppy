@@ -23,5 +23,11 @@
     }
   },
   "match": true,
-  "scope": "event delivery observed by the page, not return values: page.click fires a real click (seen by a document-level capture listener with target and coordinates), fill fires input, check and selectOption fire change on actual state transitions, hover fires mouseover. Fixture mirrors every event into #out; both engines ran the byte-identical pinned fixture (corpus _fx). Capture coordinates differ by layout (184,213 vs 201,214); both hit the button. Measured 2026-08-31 on commits b8346b8a..7d229d45."
+  "scope": "event delivery observed by the page, not return values: page.click fires a real click (seen by a document-level capture listener with target and coordinates), fill fires input, check and selectOption fire change on actual state transitions, hover fires mouseover. Fixture mirrors every event into #out; both engines ran the byte-identical pinned fixture (corpus _fx). Capture coordinates differ by layout (184,213 vs 201,214); both hit the button. Measured 2026-08-31 on commits b8346b8a..7d229d45.",
+  "provenance": {
+    "commit": "7f61d6c5",
+    "verified_at": "2026-08-31",
+    "verified_by": "cargo test -p web-runtime --test session-daemon oracle",
+    "note": "Die Aussage dieses Receipts wurde an diesem Commit durch den benannten Test bestaetigt. Ein Receipt ohne diese Angabe ist wertlos: es hat hier einmal eine Behauptung fuer einen ueberholten Stand als gueltig erscheinen lassen und zwei Stunden Fehlersuche gekostet."
+  }
 }

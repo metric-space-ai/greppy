@@ -14,5 +14,11 @@
     "text": "ok"
   },
   "match": true,
-  "scope": "setContent title/evaluate/innerText only; not full Playwright surface"
+  "scope": "setContent title/evaluate/innerText only; not full Playwright surface",
+  "provenance": {
+    "commit": "7f61d6c5",
+    "verified_at": "2026-08-31",
+    "verified_by": "cargo test -p web-runtime --test session-daemon oracle",
+    "note": "Die Aussage dieses Receipts wurde an diesem Commit durch den benannten Test bestaetigt. Ein Receipt ohne diese Angabe ist wertlos: es hat hier einmal eine Behauptung fuer einen ueberholten Stand als gueltig erscheinen lassen und zwei Stunden Fehlersuche gekostet."
+  }
 }
