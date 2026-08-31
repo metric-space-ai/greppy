@@ -40,6 +40,15 @@ fn transient_freshness_states_never_trigger_reindex() {
     assert!(freshness_state_can_trigger_reindex("drift"));
 }
 
+#[test]
+fn inline_auto_reindex_never_hides_model_loading_or_large_full_rebuilds() {
+    assert!(auto_reindex_inline_allowed(false, 128, false));
+    assert!(!auto_reindex_inline_allowed(false, 129, false));
+    assert!(auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(!auto_reindex_inline_allowed(true, 1, false));
+    assert!(!auto_reindex_inline_allowed(true, 1, true));
+}
+
 struct EnvRestore {
     vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }

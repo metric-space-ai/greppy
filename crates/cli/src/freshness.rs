@@ -184,8 +184,16 @@ pub(crate) fn maybe_reindex_stale(
     let project = project_for(root)?;
     if freshness_is_reindexable_stale(store, root, &project) {
         let rebuilt = try_auto_reindex_inline(root);
-        if !rebuilt && workspace_writer_active(root) {
-            wait_for_active_index_refresh(root);
+        if !rebuilt {
+            let writer_active = workspace_writer_active(root);
+            let started = if writer_active {
+                false
+            } else {
+                spawn_background_index(root, "workspace-drift")
+            };
+            if started || writer_active || workspace_writer_active(root) {
+                wait_for_active_index_refresh(root);
+            }
         }
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
@@ -411,9 +419,15 @@ pub(crate) fn freshness_serve_decision_with_policy(
     });
     if allow_auto_reindex && auto_reindex_enabled() && small_enough {
         let rebuilt = try_auto_reindex_inline(root);
+        let writer_active = workspace_writer_active(root);
+        let started = if rebuilt || writer_active {
+            false
+        } else {
+            spawn_background_index(root, "workspace-drift")
+        };
         return FreshnessServe::Refuse(refresh_state(
             freshness,
-            rebuilt || workspace_writer_active(root),
+            rebuilt || started || writer_active || workspace_writer_active(root),
         ));
     }
     if allow_auto_reindex && auto_reindex_enabled() {
@@ -470,9 +484,20 @@ pub(crate) fn workspace_writer_active(root: Option<&str>) -> bool {
     )
 }
 
-/// Build a small-drift refresh through the same temp-snapshot publication
-/// boundary as an explicit `index`. The current query keeps its old inode and
-/// therefore never observes in-place mutation or a partially rebuilt graph.
+pub(crate) fn auto_reindex_inline_allowed(
+    had_vectors: bool,
+    indexed_files: i64,
+    overlay: bool,
+) -> bool {
+    !had_vectors
+        && (overlay || (0..=AUTO_REINDEX_INLINE_MAX_INDEXED_FILES).contains(&indexed_files))
+}
+
+/// Build a genuinely bounded small-drift refresh through the same
+/// temp-snapshot publication boundary as an explicit `index`. Vector-backed
+/// or large full stores return false so the caller starts one observable
+/// background refresh instead of hiding model loading or a full repository
+/// rebuild inside a navigation command.
 pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     let Ok(effective_root) = resolve_root(root) else {
         return false;
@@ -518,19 +543,11 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         .vector_model_ids(&project)
         .unwrap_or_default()
         .is_empty();
+    let indexed_files = store.file_count(&project).unwrap_or(i64::MAX);
+    if !auto_reindex_inline_allowed(had_vectors, indexed_files, overlay.is_some()) {
+        return false;
+    }
     drop(store);
-    let embedding_cfg = if had_vectors {
-        let no_args = EmbeddingCliArgs {
-            device: None,
-            no_gpu: false,
-        };
-        match embedding_config_optional(no_args) {
-            Ok(Some(cfg)) => Some(cfg),
-            _ => return false,
-        }
-    } else {
-        None
-    };
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
         only_paths: None,
@@ -541,7 +558,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             &effective_root,
             &project,
             overlay,
-            embedding_cfg.as_ref(),
+            None,
             &options,
             false,
             None,
@@ -553,7 +570,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             &store_path,
             &effective_root,
             &project,
-            embedding_cfg.as_ref(),
+            None,
             &options,
             false,
             None,

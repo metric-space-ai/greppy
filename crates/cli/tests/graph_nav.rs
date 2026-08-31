@@ -33,6 +33,30 @@ fn fresh_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn find_graph_db(store_dir: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, found: &mut Option<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("graph.db") {
+                *found = Some(path);
+                return;
+            }
+            if found.is_some() {
+                return;
+            }
+        }
+    }
+
+    let mut found = None;
+    walk(store_dir, &mut found);
+    found
+}
+
 /// Build a git-rooted repo whose `src/lib.rs` exercises all three
 /// cross-file reference edges into `src/helper.rs` / `src/types.rs`:
 ///
@@ -499,7 +523,33 @@ fn default_json_is_answer_only_and_diagnostics_restores_the_envelope() {
 #[test]
 fn first_use_json_is_one_parseable_document_without_progress_noise() {
     let (repo, store) = make_graph_repo("first-use-json");
-    let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    let (mut code, mut out, mut err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    if code == 75 {
+        assert!(
+            out.is_empty()
+                && err.contains("no snapshot is ready yet")
+                && err.contains("greppy index status --json"),
+            "bounded first-use retry must be explicit; stderr={err:?} stdout={out:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (status_code, status_out, status_err) =
+                run(&["index", "status", "--json"], &repo, &store);
+            let healthy = serde_json::from_str::<serde_json::Value>(&status_out)
+                .ok()
+                .and_then(|value| value["healthy"].as_bool())
+                .unwrap_or(false);
+            if status_code == 0 && healthy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first-use background index did not publish; code={status_code} stderr={status_err} stdout={status_out}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
+    }
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
     assert!(
         !err.contains("first use") && !out.contains("greppy: indexing"),
@@ -1049,6 +1099,87 @@ fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
         "indexer failed\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&index_out.stdout),
         String::from_utf8_lossy(&index_out.stderr)
+    );
+}
+
+#[test]
+fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inline() {
+    let (repo, store) = index_fixture("vector-drift-refresh-is-bounded");
+    let db = find_graph_db(&store).expect("indexed graph");
+    let graph = rusqlite::Connection::open(db).expect("open graph for vector fixture");
+    let generation = graph
+        .query_row(
+            "SELECT graph_generation FROM workspace_state LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let mut vector = Vec::new();
+    vector.extend_from_slice(&1.0f32.to_le_bytes());
+    vector.extend_from_slice(&0.0f32.to_le_bytes());
+    graph
+        .execute(
+            "INSERT INTO vector_embeddings
+             (project, model_id, prompt_version, task, node_id, chunk_idx,
+              qualified_name, file_path, start_line, end_line, content_sha256,
+              graph_generation, dim, vector_norm, vector, created_at, vector_i8, i8_scale)
+             VALUES ('repo', 'test-model', ?1, ?2, NULL, 0, 'repo.do_it',
+                     'src/helper.rs', 1, 1, ?3, ?4, 2, 1.0, ?5, 'test', NULL, NULL)",
+            rusqlite::params![
+                greppy_embed_native::PROMPT_VERSION,
+                greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                generation,
+                vector,
+            ],
+        )
+        .unwrap();
+    drop(graph);
+
+    std::fs::write(
+        repo.join("src/helper.rs"),
+        "pub fn do_it() -> u32 {\n    let answer = 84;\n    answer\n}\n",
+    )
+    .unwrap();
+    let ready = repo.parent().unwrap().join("background-refresh-ready");
+    let ready_value = ready.to_string_lossy().into_owned();
+    let started = std::time::Instant::now();
+    let (code, out, err) = run_with_env(
+        &["who-calls", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &[
+            ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
+            ("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready_value),
+            ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "5000"),
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(
+        code, 75,
+        "vector-backed drift must be retryable while its background refresh publishes; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "navigation hid the five-second index build for {elapsed:?}"
+    );
+    assert!(
+        err.contains("graph refresh already running")
+            && err.contains("waiting up to 2s")
+            && (err.contains("graph refresh published")
+                || err.contains("greppy index status --json")),
+        "bounded wait and recovery must be visible; stderr={err:?}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|error| panic!("invalid retry JSON: {error}; stdout={out:?}"));
+    assert_eq!(value["status"], "skipped_stale_index");
+    assert_eq!(value["fresh"], false);
+    assert!(
+        matches!(
+            value["freshness"]["state"].as_str(),
+            Some("refreshing" | "drift")
+        ),
+        "retryable freshness state missing: {value:?}"
     );
 }
 

@@ -39,6 +39,10 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   is published before process launch, immutable-Base child progress is relayed
   under the outer owner PID, and a status record with no update for two minutes
   is marked potentially stalled with bounded recovery guidance.
+- Stale graph navigation no longer hides model loading or a large full-store
+  rebuild inside `read`, `who-calls`, or another query. Vector-backed and large
+  stores start one observable background refresh and return bounded retry
+  guidance; small graph-only edits retain fast inline healing.
 - Background first-use indexers run in an independent OS process group (and a
   detached no-window class on Windows), so an agent runner can return the
   bounded retry response without its process cleanup killing the cache build.

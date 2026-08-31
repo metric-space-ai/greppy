@@ -3571,10 +3571,12 @@ impl FreshnessServe {
     }
 }
 
-/// Auto-reindex cap: an inline atomic snapshot is only attempted when at most
-/// this many files drifted. Above the cap one background refresh starts and
-/// stale indexed results are refused.
+/// Auto-reindex caps: a content refresh is considered only for a small drift,
+/// and a full non-overlay store is rebuilt inline only when the complete
+/// indexed inventory is also small. Vector-backed stores are always refreshed
+/// in the observable background because model loading alone can take minutes.
 const AUTO_REINDEX_MAX_FILES: usize = 10;
+const AUTO_REINDEX_INLINE_MAX_INDEXED_FILES: i64 = 128;
 
 /// Kill switch for automatic inline/background refresh (`0`/`false` disables).
 const ENV_AUTO_REINDEX: &str = "GREPPY_AUTO_REINDEX";
