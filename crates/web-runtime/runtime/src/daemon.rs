@@ -716,6 +716,32 @@ impl Daemon {
                 self.ensure_workers();
             }
         }
+        // Only the web.run handlers filled the metrics; every other operation
+        // answered with zeros, so the paths an agent actually uses -- goto,
+        // click, observe -- reported nothing about what they cost. Time the
+        // dispatch here and fill in whatever the handler left empty.
+        let dispatch_started = Instant::now();
+        let content_before = sample_cpu_ms(self.content.pid());
+        let controller_before = sample_cpu_ms(self.controller.pid());
+        let mut response = self.dispatch_operation(request);
+        if response.metrics.wall_ms == 0 {
+            response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
+        }
+        if response.metrics.peak_rss_bytes == 0 {
+            response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
+        }
+        if response.metrics.content_cpu_ms == 0 {
+            response.metrics.content_cpu_ms =
+                sample_cpu_ms(self.content.pid()).saturating_sub(content_before);
+        }
+        if response.metrics.controller_cpu_ms == 0 {
+            response.metrics.controller_cpu_ms =
+                sample_cpu_ms(self.controller.pid()).saturating_sub(controller_before);
+        }
+        response
+    }
+
+    fn dispatch_operation(&mut self, request: Request) -> Response {
         match request.operation.as_str() {
             "handshake" => self.handshake(&request),
             "web.status" => self.status(&request),
