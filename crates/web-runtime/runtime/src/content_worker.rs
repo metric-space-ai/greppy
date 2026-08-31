@@ -1823,7 +1823,25 @@ impl ContentEngine {
                 // CONNECT-tunneled fetches often never match last_responses, so a
                 // missing recorded status is not proof of failure. The Servo error
                 // shell is already rejected above; accept a rendered document.
-                if http && recorded_status.is_none() && text.trim().is_empty() && html.len() < 500 {
+                //
+                // Empty innerText plus tiny HTML is not proof either: a
+                // <frameset> page has no body at all, so its innerText is
+                // empty and the markup fits in a couple hundred bytes (bench
+                // page 024). Count elements beyond the implied html/head/body
+                // shell before declaring the response missing.
+                let rendered_elements = match self.evaluate(
+                    webview.clone(),
+                    "document.querySelectorAll('*:not(html):not(head):not(body)').length",
+                ) {
+                    Ok(JSValue::Number(count)) => count as u64,
+                    _ => 0,
+                };
+                if http
+                    && recorded_status.is_none()
+                    && text.trim().is_empty()
+                    && html.len() < 500
+                    && rendered_elements == 0
+                {
                     return Err(io::Error::other(format!(
                         "navigation failed: no HTTP response for {url}"
                     )));
