@@ -88,6 +88,29 @@ pub(super) struct CurrentScope {
     pub tab: Option<String>,
 }
 
+/// Drop the remembered session after the runtime says it does not exist.
+///
+/// A stored session belongs to a runtime that may be gone -- after a crash,
+/// a `runtime stop`, a rebuilt binary or a reboot. Passing the dead id on
+/// makes every command fail, including `open`, which is the one command that
+/// should recover. Forgetting it is safe: it is a cache, not the truth.
+pub(super) fn forget_current_session(root: Option<&str>) {
+    let path = current_scope_path(root);
+    let scope = read_current_scope(root);
+    if scope.tab.is_none() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    // Keep an explicitly chosen tab; only the session was stale.
+    let _ = std::fs::write(&path, "{}\n");
+}
+
+/// Did the runtime reject the request because the session is unknown?
+pub(super) fn is_missing_session(error: &ErrorObject) -> bool {
+    error.code == "session_not_found"
+        || error.message.contains("was not found") && error.message.contains("session")
+}
+
 pub(super) fn read_current_scope(root: Option<&str>) -> CurrentScope {
     let path = current_scope_path(root);
     let Ok(text) = std::fs::read_to_string(&path) else {

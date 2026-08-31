@@ -108,7 +108,42 @@ fn goto_url(
     if let Some(tab) = &tab {
         payload["tab_id"] = json!(tab);
     }
-    let code = rpc(root, json, "web.goto", payload, Some(session.clone()))?;
+    // A remembered session may belong to a runtime that is gone. `open` is the
+    // command that must recover from that, so try once, and if the runtime
+    // says the session is unknown, forget it and open a fresh one. Without
+    // this a single stale entry paralyses the whole CLI until someone deletes
+    // the file by hand -- and nothing tells them that is the cure.
+    let response = rpc_response(
+        root,
+        "web.goto",
+        payload.clone(),
+        Some(session.clone()),
+    );
+    let (session, response) = match response {
+        Ok(ref answer)
+            if create
+                && answer
+                    .error
+                    .as_ref()
+                    .is_some_and(is_missing_session) =>
+        {
+            forget_current_session(root);
+            let fresh = match resolve_or_create_session(root, None, json, true) {
+                Ok(fresh) => fresh,
+                Err(code) => return Ok(code),
+            };
+            payload["session_id"] = json!(fresh);
+            (
+                fresh.clone(),
+                rpc_response(root, "web.goto", payload, Some(fresh)),
+            )
+        }
+        other => (session, other),
+    };
+    let code = match response {
+        Ok(response) => emit_response(json, response)?,
+        Err(error) => emit_error(json, error)?,
+    };
     if code == 0 {
         let _ = write_current_scope(root, &session, tab.as_deref());
     }
