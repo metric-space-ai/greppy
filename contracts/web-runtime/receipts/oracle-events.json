@@ -1,0 +1,27 @@
+{
+  "reference": {
+    "engine": "playwright@1.62.1 + chromium-1234 (Chrome for Testing 151.0.7922.34)",
+    "value": {
+      "click": "geklickt",
+      "click_document_capture": "hit:btn@184,213",
+      "fill": "txt:hallo",
+      "check": "chk:true",
+      "selectOption": "sel:b",
+      "hover": "geschwebt"
+    }
+  },
+  "candidate": {
+    "engine": "greppy-web-runtime+servo-0.5.0",
+    "status": "ok",
+    "value": {
+      "click": "geklickt",
+      "click_document_capture": "hit:btn@201,214",
+      "fill": "txt:hallo",
+      "check": "chk:true",
+      "selectOption": "sel:b",
+      "hover": "geschwebt"
+    }
+  },
+  "match": true,
+  "scope": "event delivery observed by the page, not return values: page.click fires a real click (seen by a document-level capture listener with target and coordinates), fill fires input, check and selectOption fire change on actual state transitions, hover fires mouseover. Fixture mirrors every event into #out; both engines ran the byte-identical pinned fixture (corpus _fx). Capture coordinates differ by layout (184,213 vs 201,214); both hit the button. Measured 2026-08-31 on commits b8346b8a..7d229d45."
+}

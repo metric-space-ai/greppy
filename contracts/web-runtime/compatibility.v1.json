@@ -158,12 +158,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-events"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -200,12 +202,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-events"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -387,12 +391,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-events"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -638,12 +644,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-events"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -1107,12 +1115,14 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
-        "page-actions"
+        "page-actions",
+        "oracle-events"
       ],
       "known_differences": [
-        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported"
+        "Page selector form delegates to locator(selector); options other than the locator path remain unsupported",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -6554,14 +6564,16 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "compat-core",
-        "check-select"
+        "check-select",
+        "oracle-events"
       ],
       "known_differences": [
         "sets input.checked; no actionability beyond waitFor",
-        "timeout is accepted; other check options throw unsupported_playwright_operation"
+        "timeout is accepted; other check options throw unsupported_playwright_operation",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -6584,18 +6596,20 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "phase1-spike",
         "hover",
         "actionability",
         "locator-options",
-        "object-disposed"
+        "object-disposed",
+        "oracle-events"
       ],
       "known_differences": [
         "timeout is accepted; force/trial/position and other click options throw unsupported_playwright_operation",
         "visible = non-empty box plus computed display/visibility; hit-target is elementFromPoint at box center (element or descendant); overlay and visibility:hidden time out; not Chromium animation-stability or force",
-        "page default timeout is used when click options omit timeout. Off-screen targets may scrollIntoView nearest then hit-test; not Chromium scroll padding or sticky-header handling"
+        "page default timeout is used when click options omit timeout. Off-screen targets may scrollIntoView nearest then hit-test; not Chromium scroll padding or sticky-header handling",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -6798,12 +6812,14 @@
         "phase1-spike",
         "compat-core",
         "oracle-fill",
-        "actionability"
+        "actionability",
+        "oracle-events"
       ],
       "known_differences": [
         "timeout is accepted; other fill options throw unsupported_playwright_operation",
         "oracle-fill.json covers assigning input.value via locator.fill; force/noWaitAfter stay unsupported",
-        "fill waits for visible enabled non-readonly hit-target; readonly times out"
+        "fill waits for visible enabled non-readonly hit-target; readonly times out",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -7012,14 +7028,16 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "compat-core",
-        "hover"
+        "hover",
+        "oracle-events"
       ],
       "known_differences": [
         "mousemove to box center; no pointer-event guarantees",
-        "timeout is accepted; other hover options throw unsupported_playwright_operation"
+        "timeout is accepted; other hover options throw unsupported_playwright_operation",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -7300,14 +7318,16 @@
       "origin": "parser",
       "schema": "implemented",
       "source": "passing",
-      "behavior": "unverified",
+      "behavior": "passing",
       "tests": [
         "compat-core",
-        "check-select"
+        "check-select",
+        "oracle-events"
       ],
       "known_differences": [
         "assigns select.value; no label/index matching",
-        "timeout is accepted; other selectOption options throw unsupported_playwright_operation"
+        "timeout is accepted; other selectOption options throw unsupported_playwright_operation",
+        "oracle-events.json covers event delivery on the pinned fixture: real click reaches a document capture listener; fill fires input; check/selectOption fire change on transitions; hover fires mouseover"
       ]
     },
     {
@@ -16665,8 +16685,8 @@
     }
   ],
   "behavior_counts": {
-    "unverified": 837,
+    "unverified": 828,
     "unsupported": 500,
-    "passing": 17
+    "passing": 26
   }
 }
