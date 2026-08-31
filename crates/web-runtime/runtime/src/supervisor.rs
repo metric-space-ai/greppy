@@ -17,6 +17,37 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+
+/// Emit one lifecycle line, but only when someone asked for them.
+///
+/// These nine lines per session -- spawn, two handshakes, two readies,
+/// workers-ready, bind-socket, listening, request-ready -- go to stderr, and
+/// stderr is whatever the parent handed over. Under `cargo test` that is a
+/// pipe; a pipe nobody drains fills after 64 KB, and the next write blocks the
+/// supervisor for good. It then answers nothing, including
+/// `web.session.close`, which is how a 1000-cycle run died at cycle 37, 262,
+/// 270 or 74 depending on timing.
+///
+/// Proven by isolation: same driver, stderr to a file 400 cycles clean, stderr
+/// to an unread pipe stalls at 170.
+///
+/// Setting O_NONBLOCK on fd 2 also fixes it and was measured at six times the
+/// runtime -- the flag is process-wide and something retries failed writes. So
+/// the cure is to not write them: diagnostics nobody reads should not exist in
+/// normal operation. `GREPPY_WEB_TRACE_PHASE=1` brings them back.
+fn phase_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GREPPY_WEB_TRACE_PHASE").is_some())
+}
+
+macro_rules! phase {
+    ($($arg:tt)*) => {
+        if crate::supervisor::phase_trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 const STDOUT_LOG_CAP: usize = 256 * 1024;
 
 const OWNED_WORKER_SLOTS: usize = 8;
@@ -391,7 +422,7 @@ pub(crate) fn route_until_script_complete_gated(
     let mut wait_point = "controller:script-complete".to_owned();
     let stale = content.discard_stale_engine_results();
     if stale > 0 {
-        eprintln!("web-runtime: drained {stale} stale content messages before script routing");
+        phase!("web-runtime: drained {stale} stale content messages before script routing");
         gate.note_discarded_count(stale);
     }
     loop {
@@ -420,7 +451,7 @@ pub(crate) fn route_until_script_complete_gated(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            eprintln!("web-runtime: phase run-timeout wait={wait_point}");
+            phase!("web-runtime: phase run-timeout wait={wait_point}");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -452,7 +483,7 @@ pub(crate) fn route_until_script_complete_gated(
                         return Err(io::Error::other(format!("resource_limit: {message}")));
                     }
                     wait_point = format!("content:{method}");
-                    eprintln!("web-runtime: phase run-wait point={wait_point}");
+                    phase!("web-runtime: phase run-wait point={wait_point}");
                     pending.insert(request_id, (method.clone(), params.clone()));
                     content.send_timeout(
                         &Message::engine_call(request_id, method.clone(), params),
@@ -1224,7 +1255,7 @@ fn observe_image(path: &Path, digest: bool) -> io::Result<ImageId> {
         reap_stale_image_digest_caches(&meta);
         prefill_digest_cache_from_dist(&path, &meta);
         if let Some(cached) = load_image_digest_cache(&path, &meta) {
-            eprintln!("web-runtime: phase parent-image cache-hit");
+            phase!("web-runtime: phase parent-image cache-hit");
             cached
         } else {
             let digest = crate::artifacts::hex_sha256_file(&path)?;
@@ -1472,7 +1503,7 @@ impl WorkerProcess {
         self.reaped = true;
         self.input.take();
         self.join_reader_bounded(reader_wait);
-        eprintln!("web-runtime: phase {:?}-reap done pid={pid}", self.worker);
+        phase!("web-runtime: phase {:?}-reap done pid={pid}", self.worker);
     }
 
     pub(crate) fn shutdown_or_kill(&mut self) {
@@ -1645,10 +1676,10 @@ impl WorkerProcess {
                 }
                 Ok(Ok(other)) => {
                     discarded += 1;
-                    eprintln!("web-runtime: discarded leftover content message {other:?}");
+                    phase!("web-runtime: discarded leftover content message {other:?}");
                 }
                 Ok(Err(error)) => {
-                    eprintln!("web-runtime: discarded leftover content read error {error}");
+                    phase!("web-runtime: discarded leftover content read error {error}");
                     break;
                 }
                 Err(_) => break,
