@@ -573,7 +573,10 @@ mod tests {
     fn node_query_quotes_are_only_cli_grouping() {
         assert_eq!(normalize_node_query("css=a b"), "css=a b");
         assert_eq!(normalize_node_query(r#"css="a b""#), "css=a b");
-        assert_eq!(normalize_node_query(r#"text="Save draft""#), "text=Save draft");
+        assert_eq!(
+            normalize_node_query(r#"text="Save draft""#),
+            "text=Save draft"
+        );
     }
 }
 
