@@ -237,11 +237,7 @@ impl Drop for Deadline {
     }
 }
 
-fn arm_deadline(label: &'static str) -> Deadline {
-    arm_deadline_after(label, TEST_DEADLINE)
-}
-
-fn arm_deadline_after(label: &'static str, timeout: Duration) -> Deadline {
+fn arm_deadline_after(label: &'static str, timeout: Duration, process_group: u32) -> Deadline {
     let done = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&done);
     thread::spawn(move || {
@@ -253,8 +249,15 @@ fn arm_deadline_after(label: &'static str, timeout: Duration) -> Deadline {
             thread::sleep(Duration::from_millis(50));
         }
         if !flag.load(Ordering::Relaxed) {
-            eprintln!("session-daemon {label} exceeded {timeout:?}");
-            std::process::abort();
+            eprintln!(
+                "session-daemon {label} exceeded {timeout:?}; terminating supervisor process group {process_group}"
+            );
+            // Breaking the protocol connection makes the blocked request
+            // return an ordinary error, so the Rust test reports its failure
+            // instead of turning a harness deadline into mozalloc SIGSEGV.
+            unsafe {
+                libc::kill(-(process_group as i32), libc::SIGKILL);
+            }
         }
     });
     Deadline(done)
@@ -457,11 +460,12 @@ impl Supervisor {
         let _pass = give_child_attach_token(&mut command, &token).expect("inherit attach token fd");
         register_attach_token(socket, token);
         let child = command.spawn().expect("spawn supervisor daemon");
+        let process_group = child.id();
         let mut supervisor = Self {
             child,
             socket: socket.to_path_buf(),
             run_id: run_id.to_owned(),
-            _deadline: arm_deadline_after("supervisor", deadline),
+            _deadline: arm_deadline_after("supervisor", deadline, process_group),
             kill_group: true,
             _lock: lock,
         };
