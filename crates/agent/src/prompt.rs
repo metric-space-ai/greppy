@@ -1,5 +1,11 @@
 //! System prompt for the built-in greppy coding agent (`greppy -p`).
 
+/// The beta browser block, taken from the shipped prompt file rather than
+/// copied. `assets/prompts/web-beta.md` stays the single source: a copy here
+/// would drift from it silently, and the file has already outlived two claims
+/// that were corrected in one place and not the other.
+const WEB_BETA: &str = include_str!("../../../assets/prompts/web-beta.md");
+
 /// Fixed system prompt for one-shot agent runs. Byte-exact product text.
 pub const SYSTEM_PROMPT: &str = r#"You are the coding agent built into greppy, working autonomously on one task
 in one repository. Finish the task, then stop; your final message is the
@@ -59,9 +65,31 @@ then say precisely what is missing. Never invent APIs, paths, or results: if
 you did not read it or run it, do not claim it.
 "#;
 
+/// The browser block alone, without the editorial header that explains to a
+/// human when to append it. Everything from `BROWSER:` to the end is prompt.
+pub fn browser_prompt() -> &'static str {
+    match WEB_BETA.find("BROWSER:") {
+        Some(start) => WEB_BETA[start..].trim_end(),
+        // A file without the marker is a build-time mistake, not a runtime one;
+        // returning nothing keeps the agent working without browser verbs.
+        None => "",
+    }
+}
+
+/// The system prompt the agent actually runs with: the coding prompt plus the
+/// browser block. Without it the agent has no way to learn that `greppy web`
+/// exists -- it reads no AGENTS.md and takes no prompt argument.
+pub fn system_prompt() -> String {
+    let browser = browser_prompt();
+    if browser.is_empty() {
+        return SYSTEM_PROMPT.to_owned();
+    }
+    format!("{SYSTEM_PROMPT}\n{browser}\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SYSTEM_PROMPT;
+    use super::{browser_prompt, system_prompt, SYSTEM_PROMPT};
 
     #[test]
     fn system_prompt_non_empty_and_under_8_kib() {
@@ -70,6 +98,37 @@ mod tests {
             SYSTEM_PROMPT.len() < 8 * 1024,
             "SYSTEM_PROMPT is {} bytes (limit 8192)",
             SYSTEM_PROMPT.len()
+        );
+    }
+
+    #[test]
+    fn browser_block_is_present_and_whole() {
+        let browser = browser_prompt();
+        assert!(
+            browser.starts_with("BROWSER:"),
+            "browser block must start at the BROWSER: marker"
+        );
+        assert!(
+            browser.ends_with("END BROWSER"),
+            "browser block must run to END BROWSER; got tail {:?}",
+            &browser[browser.len().saturating_sub(40)..]
+        );
+        // The editorial header addresses a human, not the model.
+        assert!(!browser.contains("<!--"));
+    }
+
+    #[test]
+    fn agent_prompt_teaches_the_web_verbs() {
+        let full = system_prompt();
+        // The defect this exists to fix: the shipped prompt never said `web`.
+        for verb in ["greppy web open", "greppy web click", "greppy web extract"] {
+            assert!(full.contains(verb), "system prompt is missing {verb:?}");
+        }
+        assert!(full.starts_with(SYSTEM_PROMPT));
+        assert!(
+            full.len() < 16 * 1024,
+            "composed prompt is {} bytes (limit 16384)",
+            full.len()
         );
     }
 }

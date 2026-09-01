@@ -16,8 +16,9 @@ use greppy_agent::workspace::{CreateOptions, WorkspaceBackend};
 use greppy_agent::{
     run_agent_loop, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
     AgentWorkspace, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
-    SandboxMode, StreamEvent, Usage, WorkspaceError, SYSTEM_PROMPT,
+    SandboxMode, StreamEvent, Usage, WorkspaceError,
 };
+use greppy_agent::system_prompt;
 
 use crate::agent_tui::{
     bounded_pair, compact_messages, messages_from_protocol, new_session_id,
@@ -683,7 +684,7 @@ fn run_agent(
 
     let config = AgentConfig {
         max_turns: args.max_turns,
-        system: Some(SYSTEM_PROMPT.to_string()),
+        system: Some(system_prompt()),
         model: model.clone(),
         deadline,
         deadline_total,
@@ -725,6 +726,36 @@ fn run_agent(
             },
         )
     } else {
+        // The one-shot path needs the same browser wiring as the interactive
+        // one: without a parent-owned attach token on fd 4, every `greppy web`
+        // tool call dies with "requires a parent-owned attach token". The
+        // interactive session sets this up; headless did not, so `greppy -p`
+        // could never drive a browser even once it knew the verbs.
+        //
+        // One deliberate difference: a failure here is NOT fatal. A coding task
+        // that never touches the web must not die because a browser token could
+        // not be claimed — the agent still gets a clear error if it tries.
+        std::env::set_var("GREPPY_RUN_ID", workspace.run_id());
+        match crate::web_attach::claim_persistent_parent() {
+            Ok(_) => {
+                let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
+                    .set(crate::web_attach::inherit_attach_for_agent);
+            }
+            Err(error) => {
+                eprintln!(
+                    "greppy: browser unavailable to the agent                      (could not create the parent-owned attach token: {error})"
+                );
+            }
+        }
+        // A one-shot run must not leave a runtime behind: a long-lived one
+        // degrades until navigation stops working.
+        struct ShutdownWebOnDrop;
+        impl Drop for ShutdownWebOnDrop {
+            fn drop(&mut self) {
+                crate::web::shutdown_if_running();
+            }
+        }
+        let _shutdown_web = ShutdownWebOnDrop;
         run_headless_session(&mut client, &mut env, &config, &task)
     };
     let session = match session {
