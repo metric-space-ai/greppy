@@ -73,15 +73,10 @@ pub(super) fn embed_query_via_daemon_result(
         }
     }
     inference_daemon::record_spawn_failure(&endpoint, spawn_outcome.attempted());
-    // Every arm here means the retry loop saw only NoDaemon: no live daemon
-    // ever answered, so nothing retains model ownership and the in-process
-    // fallback allocates the ONLY instance. Failing instead turned transient
-    // Metal pressure into a repo-wide outage — the bench factory hammered
-    // queries into Spawned-but-dead and Cooldown for twenty minutes and
-    // every one of them errored, while a single in-process load would have
-    // answered each. `Failed` stays reserved for a LIVE daemon that answered
-    // faulted while holding the model (the double-instance case the daemon
-    // design guards against); that arm returns from the loop above.
+    // Never infer from one client's failed probe that it is the only process
+    // on the machine. Parallel agents can all observe the same startup gap;
+    // an in-process fallback at this point creates one multi-gigabyte model
+    // per client. The caller reports the unavailable shared daemon instead.
     match spawn_outcome {
         SpawnOutcome::SpawnFailed | SpawnOutcome::Spawned | SpawnOutcome::Cooldown => {
             EmbedDaemonResult::NoDaemon

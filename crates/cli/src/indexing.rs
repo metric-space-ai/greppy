@@ -1035,6 +1035,9 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }
 
     let embedding_deferred = embedding_config.is_some_and(|cfg| {
+        if let Some(job) = background_job.as_deref_mut() {
+            job.finalization_phase("counting_embeddings");
+        }
         allow_deferred_embeddings
             && greppy_indexer::count_embedding_candidate_nodes(&temp_store, project)
                 .is_ok_and(|count| should_defer_embedding(cfg, count))
@@ -1048,7 +1051,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
                 cfg,
                 &report,
                 active_path.parent().map(std::path::Path::to_path_buf),
-                background_job,
+                background_job.as_deref_mut(),
             ) {
                 Ok(EmbeddingBuildOutcome::Complete(report)) => (Some(report), None),
                 Ok(EmbeddingBuildOutcome::Degraded { report, reason }) => (report, Some(reason)),
@@ -1062,19 +1065,36 @@ pub(crate) fn index_atomic_snapshot_attempt(
             (None, None)
         };
 
-    checkpoint_store(&temp_store, &temp_path)?;
-    temp_store.integrity_check().map_err(|e| {
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("checkpointing_wal");
+    }
+    drop(temp_store);
+    checkpoint_store_path(&temp_path)?;
+
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("checking_integrity");
+    }
+    let integrity_store =
+        greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
+    integrity_store.integrity_check().map_err(|e| {
         Error::Store(format!(
             "temp index integrity_check failed for {}: {e}",
             temp_path.display()
         ))
     })?;
-    drop(temp_store);
+    drop(integrity_store);
+
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("syncing_snapshot");
+    }
     cleanup_sqlite_sidecars(&temp_path)?;
     sync_file(&temp_path)?;
     sync_parent_dir(&temp_path)?;
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
 
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("verifying_freshness");
+    }
     let verify_store =
         greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
     let verification = greppy_freshness::check_files_report_with_ttl(
@@ -1094,6 +1114,9 @@ pub(crate) fn index_atomic_snapshot_attempt(
         return Ok(None);
     }
 
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("publishing_snapshot");
+    }
     publish_store_snapshot(&temp_path, active_path)?;
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     Ok(Some(IndexSnapshotReport {

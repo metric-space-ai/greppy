@@ -4025,6 +4025,19 @@ impl BackgroundJobGuard {
         }
     }
 
+    fn finalization_phase(&mut self, phase: &'static str) {
+        self.progress_phase = Some(phase);
+        self.completed_documents = 0;
+        self.total_documents = 0;
+        self.backend = None;
+        self.device = None;
+        self.eta_seconds = None;
+        self.rate_milli_documents_per_second = None;
+        self.embedding_started = None;
+        self.write_state(phase, None);
+        self.last_progress_write = Some(std::time::Instant::now());
+    }
+
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
@@ -7438,6 +7451,7 @@ fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summari
 struct LoadedEmbeddingModel {
     inner: greppy_embed_native::EmbeddingGemma,
     _model_lease: Option<greppy_core::cache::FileLock>,
+    _runtime_owner: greppy_core::cache::FileLock,
 }
 
 impl std::ops::Deref for LoadedEmbeddingModel {
@@ -7458,12 +7472,24 @@ fn load_embedding_model(
         tokenizer_cache_dir,
     };
     let EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source;
+    let runtime_owner =
+        inference_daemon::acquire_model_owner("embedding", &inference_device_identity(&cfg.device))
+            .map_err(|e| {
+                Error::io(
+                    format!(
+                        "wait for shared EmbeddingGemma owner ({})",
+                        inference_device_identity(&cfg.device)
+                    ),
+                    e,
+                )
+            })?;
     let lease = acquire_cached_model_lease(gguf)?;
     let inner = greppy_embed_native::EmbeddingGemma::load_gguf(gguf, tokenizer, options)
         .map_err(|e| Error::Store(format!("load EmbeddingGemma model {}: {e}", cfg.model_id)))?;
     Ok(LoadedEmbeddingModel {
         inner,
         _model_lease: lease,
+        _runtime_owner: runtime_owner,
     })
 }
 
@@ -7523,8 +7549,10 @@ fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -
     let vector = match daemon_result {
         embed_daemon::EmbedDaemonResult::Embedded(vector) => vector,
         embed_daemon::EmbedDaemonResult::NoDaemon => {
-            let model = load_embedding_model(cfg, store_dir)?;
-            greppy_search::embed_code_query(&model, &normalized)?
+            return Err(Error::Store(
+                "EmbeddingGemma daemon did not become ready; no in-process fallback was started because that can allocate one multi-gigabyte model per agent. Retry shortly or inspect `greppy doctor --json` for daemon state"
+                    .into(),
+            ));
         }
         embed_daemon::EmbedDaemonResult::DaemonBusy => {
             return Err(Error::Store(
@@ -8370,6 +8398,39 @@ fn checkpoint_store(store: &greppy_store::Store, path: &std::path::Path) -> Resu
         .conn()
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|e| Error::Store(format!("checkpoint {}: {e}", path.display())))
+}
+
+/// Checkpoint a completed snapshot only after every writer handle has been
+/// dropped. Running `wal_checkpoint(TRUNCATE)` on the connection that built
+/// the graph can wait indefinitely when SQLite still owns a statement or
+/// transaction. A dedicated maintenance connection gives the checkpoint a
+/// finite busy deadline and exposes SQLite's three result counters.
+fn checkpoint_store_path(path: &std::path::Path) -> Result<(i64, i64, i64)> {
+    use rusqlite::OpenFlags;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| Error::Store(format!("open checkpoint target {}: {e}", path.display())))?;
+    conn.busy_timeout(std::time::Duration::from_secs(15))
+        .map_err(|e| Error::Store(format!("set checkpoint timeout {}: {e}", path.display())))?;
+    let result = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| Error::Store(format!("checkpoint {}: {e}", path.display())))?;
+    if result.0 != 0 {
+        return Err(Error::Store(format!(
+            "checkpoint {} remained busy after 15s (busy={}, log_frames={}, checkpointed_frames={}); no snapshot was published; retry `greppy index` after the competing reader exits",
+            path.display(), result.0, result.1, result.2
+        )));
+    }
+    Ok(result)
 }
 
 fn unique_store_sibling(active_path: &std::path::Path, label: &str) -> std::path::PathBuf {
