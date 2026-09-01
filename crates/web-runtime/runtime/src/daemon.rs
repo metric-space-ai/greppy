@@ -780,11 +780,23 @@ impl Daemon {
         // dispatch raced the client's 15s observe timeout. Recover, then answer
         // the crashed operation without extra engine RPCs.
         if content_died && touches_page {
-            return engine_error(
-                &request,
+            // The call is lost here on purpose: the worker died at an unknown
+            // point, so replaying it could repeat a half-applied action. What
+            // the caller needs is not a retry but the ability to recover
+            // without knowing daemon internals (finding 030): the CLI already
+            // forgets the session on this text, and a direct protocol client -
+            // an SDK, a foreign harness - needs the same signal in a field it
+            // can branch on rather than in prose.
+            let mut error = ErrorObject::new(
+                "worker_restarted",
                 "content worker crashed and was restarted; session pages were reset",
+                request.request_id.clone(),
                 38,
+                "open a new session, then repeat this call",
             );
+            error.session_id = request.session_id.clone();
+            error.retryable = true;
+            return Response::error(&request, error);
         }
         // Only the web.run handlers filled the metrics; every other operation
         // answered with zeros, so the paths an agent actually uses -- goto,
