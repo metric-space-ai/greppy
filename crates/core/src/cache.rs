@@ -20,6 +20,7 @@ pub const DEFAULT_STORE_MAX_GIB: u64 = 10;
 pub const DEFAULT_GC_INTERVAL_SECS: u64 = 10 * 60;
 pub const DEFAULT_QUERY_CACHE_MAX_MIB: u64 = 64;
 pub const DEFAULT_SUMMARY_CACHE_MAX_MIB: u64 = 32;
+pub const DEFAULT_EMBEDDING_CACHE_MAX_MIB: u64 = 2048;
 pub const ORPHAN_GRACE_SECS: u64 = 24 * 60 * 60;
 
 const STORE_MANIFEST_MAGIC: &str = "greppy-workspace-store";
@@ -217,6 +218,13 @@ pub fn agent_base_stores_root() -> PathBuf {
     data_root()
         .join("agent-base-stores")
         .join(format!("v{AGENT_BASE_FORMAT_VERSION}"))
+}
+
+/// User-scoped, content-addressed inference results shared by every workspace.
+/// An explicit `GREPPY_STORE_DIR` deliberately creates an isolated cache root
+/// for hermetic factory and test runs.
+pub fn inference_cache_root() -> PathBuf {
+    data_root().join("inference-cache").join("v1")
 }
 
 pub fn write_agent_base_manifest(

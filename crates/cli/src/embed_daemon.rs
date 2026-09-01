@@ -11,7 +11,7 @@ const ENV_MODEL_TTL: &str = "GREPPY_EMBED_DAEMON_MODEL_TTL_S";
 const ENV_EXIT_TTL: &str = "GREPPY_EMBED_DAEMON_EXIT_TTL_S";
 const DEFAULT_MODEL_TTL_S: u64 = 300;
 const DEFAULT_EXIT_TTL_S: u64 = 1800;
-const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REQUEST_BYTES: usize = 1 << 20;
 const MAX_RESPONSE_BYTES: usize = 4 << 20;
 
@@ -51,13 +51,37 @@ pub(super) fn embed_query_via_daemon_result(
     model_key: &str,
     text: &str,
 ) -> EmbedDaemonResult {
+    let request = serde_json::json!({
+        "op": "query",
+        "pv": greppy_embed_native::PROMPT_VERSION,
+        "mk": model_key,
+        "text": text,
+    });
+    match request_via_daemon(cfg, model_key, request) {
+        RequestOutcome::Response(response) => {
+            let Some(vector) = decode_vector(response.get("v_bits")) else {
+                return EmbedDaemonResult::Failed;
+            };
+            EmbedDaemonResult::Embedded(vector)
+        }
+        RequestOutcome::DaemonBusy => EmbedDaemonResult::DaemonBusy,
+        RequestOutcome::NoDaemon => EmbedDaemonResult::NoDaemon,
+        RequestOutcome::Failed => EmbedDaemonResult::Failed,
+    }
+}
+
+fn request_via_daemon(
+    cfg: &super::EmbeddingModelConfig,
+    model_key: &str,
+    request: serde_json::Value,
+) -> RequestOutcome<serde_json::Value> {
     let Some(endpoint) = endpoint(cfg, model_key) else {
-        return EmbedDaemonResult::NoDaemon;
+        return RequestOutcome::NoDaemon;
     };
-    match request_embedding(&endpoint, model_key, text) {
-        RequestOutcome::Response(vector) => return EmbedDaemonResult::Embedded(vector),
-        RequestOutcome::DaemonBusy => return EmbedDaemonResult::DaemonBusy,
-        RequestOutcome::Failed => return EmbedDaemonResult::Failed,
+    match request_json(&endpoint, request.clone()) {
+        RequestOutcome::Response(response) => return RequestOutcome::Response(response),
+        RequestOutcome::DaemonBusy => return RequestOutcome::DaemonBusy,
+        RequestOutcome::Failed => return RequestOutcome::Failed,
         RequestOutcome::NoDaemon => {}
     }
 
@@ -65,10 +89,10 @@ pub(super) fn embed_query_via_daemon_result(
         inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
     for delay in inference_daemon::retry_delays() {
         std::thread::sleep(delay);
-        match request_embedding(&endpoint, model_key, text) {
-            RequestOutcome::Response(vector) => return EmbedDaemonResult::Embedded(vector),
-            RequestOutcome::DaemonBusy => return EmbedDaemonResult::DaemonBusy,
-            RequestOutcome::Failed => return EmbedDaemonResult::Failed,
+        match request_json(&endpoint, request.clone()) {
+            RequestOutcome::Response(response) => return RequestOutcome::Response(response),
+            RequestOutcome::DaemonBusy => return RequestOutcome::DaemonBusy,
+            RequestOutcome::Failed => return RequestOutcome::Failed,
             RequestOutcome::NoDaemon => {}
         }
     }
@@ -79,18 +103,16 @@ pub(super) fn embed_query_via_daemon_result(
     // per client. The caller reports the unavailable shared daemon instead.
     match spawn_outcome {
         SpawnOutcome::SpawnFailed | SpawnOutcome::Spawned | SpawnOutcome::Cooldown => {
-            EmbedDaemonResult::NoDaemon
+            RequestOutcome::NoDaemon
         }
-        SpawnOutcome::Contended => EmbedDaemonResult::DaemonBusy,
+        SpawnOutcome::Contended => RequestOutcome::DaemonBusy,
     }
 }
 
-fn request_embedding(endpoint: &Endpoint, model_key: &str, text: &str) -> RequestOutcome<Vec<f32>> {
-    let request = serde_json::json!({
-        "pv": greppy_embed_native::PROMPT_VERSION,
-        "mk": model_key,
-        "text": text,
-    });
+fn request_json(
+    endpoint: &Endpoint,
+    request: serde_json::Value,
+) -> RequestOutcome<serde_json::Value> {
     match inference_daemon::request(
         endpoint,
         request,
@@ -102,26 +124,240 @@ fn request_embedding(endpoint: &Endpoint, model_key: &str, text: &str) -> Reques
             if response.get("error").is_some() {
                 return RequestOutcome::Failed;
             }
-            let Some(values) = response.get("v_bits").and_then(serde_json::Value::as_array) else {
-                return RequestOutcome::Failed;
-            };
-            let vector = values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|bits| u32::try_from(bits).ok())
-                        .map(f32::from_bits)
-                })
-                .collect::<Option<Vec<_>>>();
-            match vector {
-                Some(vector) if !vector.is_empty() => RequestOutcome::Response(vector),
-                _ => RequestOutcome::Failed,
-            }
+            RequestOutcome::Response(response)
         }
         RequestOutcome::NoDaemon => RequestOutcome::NoDaemon,
         RequestOutcome::DaemonBusy => RequestOutcome::DaemonBusy,
         RequestOutcome::Failed => RequestOutcome::Failed,
+    }
+}
+
+fn decode_vector(value: Option<&serde_json::Value>) -> Option<Vec<f32>> {
+    let values = value?.as_array()?;
+    let vector = values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|bits| u32::try_from(bits).ok())
+                .map(f32::from_bits)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!vector.is_empty()).then_some(vector)
+}
+
+/// Indexing provider backed exclusively by the user-scoped embedding daemon.
+/// The client never maps or loads model assets itself.
+pub(super) struct DaemonCodeEmbeddingProvider<'a> {
+    cfg: &'a super::EmbeddingModelConfig,
+    model_key: String,
+    cache: Option<greppy_store::EmbeddingContentCache>,
+}
+
+impl<'a> DaemonCodeEmbeddingProvider<'a> {
+    pub(super) fn new(cfg: &'a super::EmbeddingModelConfig) -> Self {
+        Self {
+            cfg,
+            model_key: super::embedding_query_cache_key(cfg),
+            cache: greppy_store::EmbeddingContentCache::open_global().ok(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cache(
+        cfg: &'a super::EmbeddingModelConfig,
+        cache: greppy_store::EmbeddingContentCache,
+    ) -> Self {
+        Self {
+            cfg,
+            model_key: super::embedding_query_cache_key(cfg),
+            cache: Some(cache),
+        }
+    }
+
+    pub(super) fn backend_name(&self) -> String {
+        format!(
+            "shared-daemon:{}",
+            super::inference_device_identity(&self.cfg.device)
+        )
+    }
+
+    fn prompt_input(title: Option<&str>, content: &str) -> String {
+        greppy_embed_native::EmbedTask::document_with_title(title, content)
+    }
+
+    fn cache_key(title: Option<&str>, content: &str) -> String {
+        greppy_store::EmbeddingContentCache::input_sha256(&Self::prompt_input(title, content))
+    }
+
+    fn daemon_error<T>(&self, outcome: RequestOutcome<T>) -> greppy_core::Error {
+        let detail = match outcome {
+            RequestOutcome::DaemonBusy => "shared embedding daemon is busy",
+            RequestOutcome::NoDaemon => "shared embedding daemon is unavailable",
+            RequestOutcome::Failed => "shared embedding daemon request failed",
+            RequestOutcome::Response(_) => "shared embedding daemon returned malformed data",
+        };
+        greppy_core::Error::Store(format!(
+            "{detail}; no in-process model fallback was attempted"
+        ))
+    }
+}
+
+impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
+    fn model_id(&self) -> &str {
+        &self.cfg.model_id
+    }
+
+    fn prompt_version(&self) -> &str {
+        greppy_embed_native::PROMPT_VERSION
+    }
+
+    fn task_profile(&self) -> &str {
+        greppy_embed_native::CODE_RETRIEVAL_PROFILE
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        self.cfg
+            .max_length
+            .unwrap_or(greppy_embed_native::tokenizer::DEFAULT_MAX_LENGTH)
+    }
+
+    fn document_token_len(&self, title: Option<&str>, content: &str) -> greppy_core::Result<usize> {
+        let key = Self::cache_key(title, content);
+        if let Some(hit) = self.cache.as_ref().and_then(|cache| {
+            cache
+                .get(
+                    &self.model_key,
+                    self.prompt_version(),
+                    self.task_profile(),
+                    &key,
+                )
+                .ok()
+                .flatten()
+        }) {
+            return Ok(hit.token_len);
+        }
+        let request = serde_json::json!({
+            "op": "document_token_len",
+            "pv": self.prompt_version(),
+            "mk": self.model_key,
+            "title": title,
+            "text": content,
+        });
+        match request_via_daemon(self.cfg, &self.model_key, request) {
+            RequestOutcome::Response(response) => {
+                let token_len = response
+                    .get("token_len")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+                if let Some(cache) = &self.cache {
+                    let _ = cache.put_token_len(
+                        &self.model_key,
+                        self.prompt_version(),
+                        self.task_profile(),
+                        &key,
+                        token_len,
+                    );
+                }
+                Ok(token_len)
+            }
+            outcome => Err(self.daemon_error(outcome)),
+        }
+    }
+
+    fn embed_code_document(
+        &mut self,
+        title: Option<&str>,
+        content: &str,
+    ) -> greppy_core::Result<Vec<f32>> {
+        self.embed_code_documents(&[(title, content)])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| greppy_core::Error::Store("embedding daemon returned no vector".into()))
+    }
+
+    fn embed_code_documents(
+        &mut self,
+        docs: &[(Option<&str>, &str)],
+    ) -> greppy_core::Result<Vec<Vec<f32>>> {
+        let mut output = vec![None; docs.len()];
+        let mut missing = Vec::new();
+        for (index, (title, content)) in docs.iter().enumerate() {
+            let key = Self::cache_key(*title, content);
+            let hit = self.cache.as_ref().and_then(|cache| {
+                cache
+                    .get(
+                        &self.model_key,
+                        self.prompt_version(),
+                        self.task_profile(),
+                        &key,
+                    )
+                    .ok()
+                    .flatten()
+            });
+            if let Some(vector) = hit.and_then(|hit| hit.vector) {
+                output[index] = Some(vector);
+            } else {
+                missing.push((index, key, *title, *content));
+            }
+        }
+        if !missing.is_empty() {
+            let documents = missing
+                .iter()
+                .map(|(_, _, title, text)| serde_json::json!({"title": title, "text": text}))
+                .collect::<Vec<_>>();
+            let request = serde_json::json!({
+                "op": "documents",
+                "pv": self.prompt_version(),
+                "mk": self.model_key,
+                "documents": documents,
+            });
+            let response = match request_via_daemon(self.cfg, &self.model_key, request) {
+                RequestOutcome::Response(response) => response,
+                outcome => return Err(self.daemon_error(outcome)),
+            };
+            let vectors = response
+                .get("vectors_bits")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+            let token_lens = response
+                .get("token_lens")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+            if vectors.len() != missing.len() || token_lens.len() != missing.len() {
+                return Err(self.daemon_error(RequestOutcome::<()>::Failed));
+            }
+            for (((index, key, _, _), vector), token_len) in
+                missing.into_iter().zip(vectors).zip(token_lens)
+            {
+                let vector = decode_vector(Some(vector))
+                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+                let token_len = token_len
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+                if let Some(cache) = &self.cache {
+                    let _ = cache.put_vector(
+                        &self.model_key,
+                        self.prompt_version(),
+                        self.task_profile(),
+                        &key,
+                        token_len,
+                        &vector,
+                    );
+                }
+                output[index] = Some(vector);
+            }
+        }
+        output
+            .into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    greppy_core::Error::Store("embedding daemon omitted a document vector".into())
+                })
+            })
+            .collect()
     }
 }
 
@@ -181,7 +417,7 @@ pub(super) fn daemon_main(socket: String, cfg: super::EmbeddingModelConfig, prew
         model_ttl: Duration::from_secs(env_secs(ENV_MODEL_TTL, DEFAULT_MODEL_TTL_S)),
         exit_ttl: Duration::from_secs(env_secs(ENV_EXIT_TTL, DEFAULT_EXIT_TTL_S)),
         request_deadline: CLIENT_READ_TIMEOUT,
-        hard_request_timeout: Some(Duration::from_secs(75)),
+        hard_request_timeout: Some(Duration::from_secs(330)),
         max_request_bytes: MAX_REQUEST_BYTES,
         max_response_bytes: MAX_RESPONSE_BYTES,
     };
@@ -208,12 +444,26 @@ fn validate(raw: &str, model_key: &str) -> Result<(), serde_json::Value> {
     if request.get("mk").and_then(serde_json::Value::as_str) != Some(model_key) {
         return Err(serde_json::json!({"error": "model-key mismatch"}));
     }
-    if request
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .is_none()
-    {
-        return Err(serde_json::json!({"error": "missing text"}));
+    match request.get("op").and_then(serde_json::Value::as_str) {
+        Some("query") | Some("document_token_len") => {
+            if request
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                return Err(serde_json::json!({"error": "missing text"}));
+            }
+        }
+        Some("documents") => {
+            if request
+                .get("documents")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|documents| documents.is_empty())
+            {
+                return Err(serde_json::json!({"error": "missing documents"}));
+            }
+        }
+        _ => return Err(serde_json::json!({"error": "unsupported embedding operation"})),
     }
     Ok(())
 }
@@ -240,16 +490,73 @@ fn respond(
     if request.get("mk").and_then(serde_json::Value::as_str) != Some(model_key) {
         return serde_json::json!({"error": "model-key mismatch"});
     }
-    let Some(text) = request.get("text").and_then(serde_json::Value::as_str) else {
-        return serde_json::json!({"error": "missing text"});
-    };
     let Some(loaded) = model.as_ref() else {
         return serde_json::json!({"error": "model unavailable"});
     };
-    match greppy_search::embed_code_query(loaded, text) {
-        Ok(vector) => serde_json::json!({
-            "v_bits": vector.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
-        }),
+    let result = match request.get("op").and_then(serde_json::Value::as_str) {
+        Some("query") => request
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "missing text".to_string())
+            .and_then(|text| {
+                greppy_search::embed_code_query(loaded, text).map_err(|e| e.to_string())
+            })
+            .map(|vector| {
+                serde_json::json!({
+                    "v_bits": vector.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+                })
+            }),
+        Some("document_token_len") => {
+            let title = request.get("title").and_then(serde_json::Value::as_str);
+            request
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "missing text".to_string())
+                .and_then(|text| {
+                    loaded
+                        .document_token_len(title, text)
+                        .map_err(|e| e.to_string())
+                })
+                .map(|token_len| serde_json::json!({"token_len": token_len}))
+        }
+        Some("documents") => {
+            let values = request
+                .get("documents")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "missing documents".to_string());
+            values.and_then(|values| {
+                let docs = values
+                    .iter()
+                    .map(|value| {
+                        let title = value.get("title").and_then(serde_json::Value::as_str);
+                        let text = value
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| "document missing text".to_string())?;
+                        Ok((title, text))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let token_lens = docs
+                    .iter()
+                    .map(|(title, text)| {
+                        loaded
+                            .document_token_len(*title, text)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let vectors = loaded.embed_documents(&docs).map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "vectors_bits": vectors.iter().map(|vector| {
+                        vector.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+                    }).collect::<Vec<_>>(),
+                    "token_lens": token_lens,
+                }))
+            })
+        }
+        _ => Err("unsupported embedding operation".to_string()),
+    };
+    match result {
+        Ok(response) => response,
         Err(error) => {
             *model = None;
             serde_json::json!({"error": format!("embed: {error}")})
@@ -260,6 +567,7 @@ fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greppy_indexer::CodeEmbeddingProvider;
 
     #[test]
     fn default_ttls_cover_agent_session_bursts() {
@@ -286,6 +594,75 @@ mod tests {
         assert_eq!(
             validate(&request.to_string(), "model-key").unwrap_err()["error"],
             "model-key mismatch"
+        );
+    }
+
+    #[test]
+    fn indexing_clients_do_not_load_embedding_models_in_process() {
+        let indexing = include_str!("indexing.rs");
+        let bash_smart = include_str!("bash_smart.rs");
+        assert!(!indexing.contains("load_embedding_model("));
+        assert!(!bash_smart.contains("load_embedding_model("));
+    }
+
+    #[test]
+    fn document_batch_contract_is_validated_before_model_loading() {
+        let request = serde_json::json!({
+            "op": "documents",
+            "pv": greppy_embed_native::PROMPT_VERSION,
+            "mk": "model-key",
+            "documents": [{"title": "src/lib.rs:1 f", "text": "fn f() {}"}],
+        });
+        assert!(validate(&request.to_string(), "model-key").is_ok());
+        let empty = serde_json::json!({
+            "op": "documents",
+            "pv": greppy_embed_native::PROMPT_VERSION,
+            "mk": "model-key",
+            "documents": [],
+        });
+        assert_eq!(
+            validate(&empty.to_string(), "model-key").unwrap_err()["error"],
+            "missing documents"
+        );
+    }
+
+    #[test]
+    fn cached_document_vector_is_reused_without_model_or_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = super::super::EmbeddingModelConfig {
+            model_id: "test-model".into(),
+            source: super::super::EmbeddingModelSource::Gguf {
+                gguf: temp.path().join("deliberately-missing.gguf"),
+                tokenizer: temp.path().join("deliberately-missing-tokenizer.json"),
+            },
+            max_length: Some(128),
+            device: greppy_embed_native::DevicePreference::Cpu,
+        };
+        let cache = greppy_store::EmbeddingContentCache::open(temp.path().join("cache")).unwrap();
+        let title = "src/lib.rs:1-1 f";
+        let content = "fn f() {}";
+        let model_key = super::super::embedding_query_cache_key(&cfg);
+        let input = DaemonCodeEmbeddingProvider::cache_key(Some(title), content);
+        cache
+            .put_vector(
+                &model_key,
+                greppy_embed_native::PROMPT_VERSION,
+                greppy_embed_native::CODE_RETRIEVAL_PROFILE,
+                &input,
+                7,
+                &[0.25, -0.5],
+            )
+            .unwrap();
+        let mut provider = DaemonCodeEmbeddingProvider::with_cache(&cfg, cache);
+        assert_eq!(
+            provider
+                .embed_code_documents(&[(Some(title), content)])
+                .unwrap(),
+            vec![vec![0.25, -0.5]]
+        );
+        assert_eq!(
+            provider.document_token_len(Some(title), content).unwrap(),
+            7
         );
     }
 }

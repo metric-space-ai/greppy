@@ -1452,6 +1452,10 @@ pub(crate) fn semantic_vector_purposes(
             .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
             .and_then(|directory| greppy_store::SummaryCache::open_read_only(&directory).ok())
     });
+    #[cfg(any(unix, windows))]
+    let global_summary_cache = summary_runtime
+        .as_ref()
+        .and_then(|_| greppy_store::SummaryCache::open_global().ok());
     let mut purposes = Vec::new();
     for hit in hits {
         let node = hit
@@ -1498,8 +1502,11 @@ pub(crate) fn semantic_vector_purposes(
                 bullets = summarize_source_cached(
                     cfg,
                     model_key,
-                    summary_cache.as_ref(),
-                    base_summary_cache.as_ref(),
+                    (
+                        summary_cache.as_ref(),
+                        base_summary_cache.as_ref(),
+                        global_summary_cache.as_ref(),
+                    ),
                     file_path,
                     &code,
                     false,

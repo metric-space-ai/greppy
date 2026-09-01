@@ -1,14 +1,13 @@
 //! Shared lifecycle and local transport for the two embedded inference daemons.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-pub(super) const PROTOCOL_VERSION: u32 = 2;
-const ACCEPT_QUEUE_LENGTH: usize = 16;
-const INFERENCE_QUEUE_LENGTH: usize = 8;
+pub(super) const PROTOCOL_VERSION: u32 = 3;
 const READER_WORKERS: usize = 4;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -122,7 +121,7 @@ impl RuntimeScope {
 fn default_runtime_dir() -> std::path::PathBuf {
     #[cfg(unix)]
     {
-        return unix_runtime_dir();
+        unix_runtime_dir()
     }
     #[cfg(windows)]
     {
@@ -256,6 +255,58 @@ struct RequestJob {
     stream: TransportStream,
 }
 
+#[derive(Default)]
+struct FairQueueState {
+    by_client: HashMap<String, VecDeque<RequestJob>>,
+    rotation: VecDeque<String>,
+}
+
+#[derive(Default)]
+struct FairRequestQueue {
+    state: Mutex<FairQueueState>,
+    ready: Condvar,
+}
+
+impl FairRequestQueue {
+    fn push(&self, client_id: String, job: RequestJob) {
+        if let Ok(mut state) = self.state.lock() {
+            let is_new = !state.by_client.contains_key(&client_id);
+            state
+                .by_client
+                .entry(client_id.clone())
+                .or_default()
+                .push_back(job);
+            if is_new {
+                state.rotation.push_back(client_id);
+            }
+            self.ready.notify_one();
+        }
+    }
+
+    fn pop_timeout(&self, timeout: Duration) -> Option<RequestJob> {
+        let mut state = self.state.lock().ok()?;
+        if state.rotation.is_empty() {
+            let waited = self.ready.wait_timeout(state, timeout).ok()?;
+            state = waited.0;
+            if state.rotation.is_empty() {
+                return None;
+            }
+        }
+        let client_id = state.rotation.pop_front()?;
+        let (job, has_more) = {
+            let queue = state.by_client.get_mut(&client_id)?;
+            let job = queue.pop_front();
+            (job, !queue.is_empty())
+        };
+        if has_more {
+            state.rotation.push_back(client_id);
+        } else {
+            state.by_client.remove(&client_id);
+        }
+        job
+    }
+}
+
 pub(super) fn request(
     endpoint: &Endpoint,
     mut value: serde_json::Value,
@@ -270,6 +321,9 @@ pub(super) fn request(
     object
         .entry("request_id")
         .or_insert_with(|| request_id().into());
+    object
+        .entry("client_id")
+        .or_insert_with(|| std::process::id().to_string().into());
 
     let encoded = match serialize_json_frame(&value, max_request_bytes) {
         Ok(encoded) => encoded,
@@ -794,20 +848,19 @@ where
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pending_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
-    let (accepted_tx, accepted_rx) = mpsc::sync_channel(ACCEPT_QUEUE_LENGTH);
-    let (job_tx, job_rx) = mpsc::sync_channel(INFERENCE_QUEUE_LENGTH);
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let job_queue = Arc::new(FairRequestQueue::default());
 
     spawn_accept_loop(
         listener,
         accepted_tx,
-        Arc::clone(&status),
         Arc::clone(&stop),
         Arc::clone(&pending_requests),
         Arc::clone(&last_activity),
     );
     spawn_reader_workers(
         accepted_rx,
-        job_tx,
+        Arc::clone(&job_queue),
         policy,
         Arc::clone(&status),
         Arc::clone(&stop),
@@ -840,65 +893,61 @@ where
     }
 
     loop {
-        match job_rx.recv_timeout(LOOP_INTERVAL) {
-            Ok(mut job) => {
-                if Instant::now() >= job.deadline {
-                    reject(&status);
-                    write_response(
-                        &mut job.stream,
-                        serde_json::json!({"request_id": job.id, "error": "deadline exceeded"}),
-                        policy.max_response_bytes,
-                    );
-                    finish_request(&pending_requests, &last_activity);
-                    continue;
-                }
-                set_active(&status, Some(job.id.clone()));
-                if let Err(mut response) = validate(&job.raw) {
-                    if let Some(object) = response.as_object_mut() {
-                        object
-                            .entry("request_id")
-                            .or_insert_with(|| job.id.clone().into());
-                    }
-                    reject(&status);
-                    set_active(&status, None);
-                    write_response(&mut job.stream, response, policy.max_response_bytes);
-                    finish_request(&pending_requests, &last_activity);
-                    continue;
-                }
-                if model.is_none() {
-                    set_state(&status, LifecycleState::Loading, None);
-                    match load() {
-                        Ok(loaded) => model = Some(loaded),
-                        Err(error) => {
-                            set_state(&status, LifecycleState::Faulted, Some(error.clone()));
-                            set_active(&status, None);
-                            write_response(
-                                &mut job.stream,
-                                serde_json::json!({"request_id": job.id, "error": format!("model load: {error}")}),
-                                policy.max_response_bytes,
-                            );
-                            finish_request(&pending_requests, &last_activity);
-                            continue;
-                        }
-                    }
-                }
-                let mut response = handle(&job.raw, &mut model);
-                let response_error = response
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned);
+        if let Some(mut job) = job_queue.pop_timeout(LOOP_INTERVAL) {
+            if Instant::now() >= job.deadline {
+                reject(&status);
+                write_response(
+                    &mut job.stream,
+                    serde_json::json!({"request_id": job.id, "error": "deadline exceeded"}),
+                    policy.max_response_bytes,
+                );
+                finish_request(&pending_requests, &last_activity);
+                continue;
+            }
+            set_active(&status, Some(job.id.clone()));
+            if let Err(mut response) = validate(&job.raw) {
                 if let Some(object) = response.as_object_mut() {
                     object
                         .entry("request_id")
                         .or_insert_with(|| job.id.clone().into());
                 }
+                reject(&status);
+                set_active(&status, None);
                 write_response(&mut job.stream, response, policy.max_response_bytes);
-                last_model_completed = Instant::now();
-                complete(&status, model.is_some(), response_error);
                 finish_request(&pending_requests, &last_activity);
+                continue;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            if model.is_none() {
+                set_state(&status, LifecycleState::Loading, None);
+                match load() {
+                    Ok(loaded) => model = Some(loaded),
+                    Err(error) => {
+                        set_state(&status, LifecycleState::Faulted, Some(error.clone()));
+                        set_active(&status, None);
+                        write_response(
+                            &mut job.stream,
+                            serde_json::json!({"request_id": job.id, "error": format!("model load: {error}")}),
+                            policy.max_response_bytes,
+                        );
+                        finish_request(&pending_requests, &last_activity);
+                        continue;
+                    }
+                }
+            }
+            let mut response = handle(&job.raw, &mut model);
+            let response_error = response
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            if let Some(object) = response.as_object_mut() {
+                object
+                    .entry("request_id")
+                    .or_insert_with(|| job.id.clone().into());
+            }
+            write_response(&mut job.stream, response, policy.max_response_bytes);
+            last_model_completed = Instant::now();
+            complete(&status, model.is_some(), response_error);
+            finish_request(&pending_requests, &last_activity);
         }
 
         let model_idle = last_model_completed.elapsed();
@@ -925,8 +974,7 @@ where
 
 fn spawn_accept_loop(
     listener: TransportListener,
-    accepted: mpsc::SyncSender<TransportStream>,
-    status: Arc<Mutex<RuntimeStatus>>,
+    accepted: mpsc::Sender<TransportStream>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     pending_requests: Arc<std::sync::atomic::AtomicUsize>,
     last_activity: Arc<Mutex<Instant>>,
@@ -934,24 +982,11 @@ fn spawn_accept_loop(
     std::thread::spawn(move || {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             match listener.accept() {
-                Ok(mut stream) => {
+                Ok(stream) => {
                     pending_requests.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    match accepted.try_send(stream) {
-                        Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(returned)) => {
-                            stream = returned;
-                            reject(&status);
-                            write_response(
-                                &mut stream,
-                                capacity_response(None, "daemon busy"),
-                                4096,
-                            );
-                            finish_request(&pending_requests, &last_activity);
-                        }
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            finish_request(&pending_requests, &last_activity);
-                            break;
-                        }
+                    if accepted.send(stream).is_err() {
+                        finish_request(&pending_requests, &last_activity);
+                        break;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -965,7 +1000,7 @@ fn spawn_accept_loop(
 
 fn spawn_reader_workers(
     accepted: mpsc::Receiver<TransportStream>,
-    jobs: mpsc::SyncSender<RequestJob>,
+    jobs: Arc<FairRequestQueue>,
     policy: ServerPolicy,
     status: Arc<Mutex<RuntimeStatus>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -975,7 +1010,7 @@ fn spawn_reader_workers(
     let accepted = Arc::new(Mutex::new(accepted));
     for _ in 0..READER_WORKERS {
         let accepted = Arc::clone(&accepted);
-        let jobs = jobs.clone();
+        let jobs = Arc::clone(&jobs);
         let status = Arc::clone(&status);
         let stop = Arc::clone(&stop);
         let pending_requests = Arc::clone(&pending_requests);
@@ -1001,7 +1036,7 @@ fn spawn_reader_workers(
 
 fn read_and_queue(
     mut stream: TransportStream,
-    jobs: &mpsc::SyncSender<RequestJob>,
+    jobs: &FairRequestQueue,
     policy: ServerPolicy,
     status: &Arc<Mutex<RuntimeStatus>>,
     pending_requests: &Arc<std::sync::atomic::AtomicUsize>,
@@ -1050,6 +1085,12 @@ fn read_and_queue(
         .filter(|id| !id.is_empty() && id.len() <= 128)
         .map(ToOwned::to_owned)
         .unwrap_or_else(request_id);
+    let client_id = value
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| id.split('-').next().unwrap_or(&id).to_string());
     if value.get("protocol").and_then(serde_json::Value::as_u64)
         != Some(u64::from(PROTOCOL_VERSION))
     {
@@ -1085,26 +1126,15 @@ fn read_and_queue(
         _ => {}
     }
     let deadline = Instant::now() + policy.request_deadline;
-    match jobs.try_send(RequestJob {
-        id: id.clone(),
-        raw,
-        deadline,
-        stream,
-    }) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(mut job)) => {
-            reject(status);
-            write_response(
-                &mut job.stream,
-                capacity_response(Some(&id), "inference queue full"),
-                policy.max_response_bytes,
-            );
-            finish_request(pending_requests, last_activity);
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            finish_request(pending_requests, last_activity);
-        }
-    }
+    jobs.push(
+        client_id,
+        RequestJob {
+            id: id.clone(),
+            raw,
+            deadline,
+            stream,
+        },
+    );
 }
 
 fn status_response(
@@ -1128,11 +1158,12 @@ fn status_response(
         "completed_requests": status.completed_requests,
         "rejected_requests": status.rejected_requests,
         "last_error": status.last_error,
-        "queue_capacity": INFERENCE_QUEUE_LENGTH,
+        "queue_policy": "fair-round-robin-unbounded",
         "pending_requests": pending_requests,
     })
 }
 
+#[cfg(test)]
 fn capacity_response(request_id: Option<&str>, error: &'static str) -> serde_json::Value {
     let mut response = serde_json::json!({
         "error": error,
@@ -2144,6 +2175,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("protocol".into(), PROTOCOL_VERSION.into());
+        framed_value
+            .as_object_mut()
+            .unwrap()
+            .insert("client_id".into(), std::process::id().to_string().into());
         let exact_limit = serialize_json_frame(&framed_value, 4096).unwrap().len();
 
         assert_eq!(
@@ -2566,12 +2601,12 @@ mod tests {
         assert_eq!(model_owners, std::collections::BTreeSet::from([1]));
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         assert_eq!(handled.load(Ordering::SeqCst), 32);
-        assert!(
+        assert_eq!(
             diagnostic(&endpoint)["rejected_requests"]
                 .as_u64()
-                .unwrap_or_default()
-                > 0,
-            "test did not exercise retryable capacity responses"
+                .unwrap_or_default(),
+            0,
+            "accepted concurrent inference must not be rejected for queue capacity"
         );
 
         let evict_deadline = Instant::now() + Duration::from_secs(2);
@@ -2658,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_queue_rejects_work_and_expires_queued_deadlines() {
+    fn concurrent_work_is_accepted_and_processed_without_capacity_rejection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let endpoint = Endpoint::for_identity(
@@ -2677,7 +2712,7 @@ mod tests {
                 ServerPolicy {
                     model_ttl: Duration::from_secs(2),
                     exit_ttl: Duration::from_millis(500),
-                    request_deadline: Duration::from_millis(50),
+                    request_deadline: Duration::from_secs(3),
                     hard_request_timeout: None,
                     max_request_bytes: 4096,
                     max_response_bytes: 4096,
@@ -2689,7 +2724,7 @@ mod tests {
                 },
                 |_| Ok(()),
                 |_raw, model| {
-                    std::thread::sleep(Duration::from_millis(150));
+                    std::thread::sleep(Duration::from_millis(10));
                     serde_json::json!({"ok": model.is_some()})
                 },
                 "queue-test",
@@ -2728,14 +2763,14 @@ mod tests {
                 None => panic!("unexpected queue response: {value}"),
             }
         }
-        assert!(completed >= 1);
-        assert!(deadline_rejections >= 1);
+        assert_eq!(completed, 20);
+        assert_eq!(deadline_rejections, 0);
         assert_eq!(completed + deadline_rejections, 20);
-        assert!(
+        assert_eq!(
             diagnostic(&endpoint)["rejected_requests"]
                 .as_u64()
-                .unwrap_or_default()
-                > 0
+                .unwrap_or_default(),
+            0
         );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         assert_eq!(server.join().expect("queue server"), 0);

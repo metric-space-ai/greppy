@@ -1436,7 +1436,7 @@ pub(crate) fn index_embeddings_into_temp_store(
     project: &str,
     cfg: &EmbeddingModelConfig,
     report: &greppy_indexer::IndexReport,
-    tokenizer_cache_dir: Option<std::path::PathBuf>,
+    _tokenizer_cache_dir: Option<std::path::PathBuf>,
     mut background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<EmbeddingBuildOutcome> {
     #[cfg(debug_assertions)]
@@ -1475,23 +1475,13 @@ pub(crate) fn index_embeddings_into_temp_store(
     if let Some(job) = background_job.as_deref_mut() {
         job.embedding_loading();
     }
-    let model = match load_embedding_model(cfg, tokenizer_cache_dir) {
-        Ok(model) => model,
-        Err(e) => {
-            log_embedding_skip_once("index --embeddings", &e);
-            return Ok(EmbeddingBuildOutcome::Degraded {
-                report: None,
-                reason: format!("embedding model load failed: {e}"),
-            });
-        }
-    };
-    let mut provider = greppy_indexer::EmbeddingGemmaCodeProvider::new(&cfg.model_id, &model);
+    let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
     let options = greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation);
     let embedding_report = if let Some(job) = background_job {
         let total_documents = greppy_indexer::count_code_embedding_documents_for_project(
             store, target, project, &provider, options,
         )?;
-        job.embedding_started(model.backend_name(), total_documents);
+        job.embedding_started(&provider.backend_name(), total_documents);
         let mut progress = |value| job.embedding_progress(value);
         greppy_indexer::index_code_embeddings_for_project_with_progress(
             store,

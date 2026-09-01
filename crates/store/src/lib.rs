@@ -34,6 +34,7 @@
 pub mod base_store;
 pub mod diagnostics;
 pub mod edge;
+pub mod embedding_content_cache;
 pub mod expand_pack;
 pub mod file_content;
 pub mod file_identity;
@@ -62,6 +63,7 @@ pub use base_store::{
 };
 pub use diagnostics::{ProjectDiagnostics, StoreDiagnostics};
 pub use edge::{Edge, NewEdge, NewOverlayEdge};
+pub use embedding_content_cache::{CachedDocumentEmbedding, EmbeddingContentCache};
 pub use expand_pack::{ExpandPack, NewExpandPack, DEFAULT_EXPAND_TTL_SECS};
 pub use file_content::{ContentRow, FileContentHit};
 pub use file_identity::FileIdentity;

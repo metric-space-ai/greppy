@@ -1174,8 +1174,7 @@ fn ten_agents_reuse_published_summary_without_private_duplicates() {
             let actual = summarize_source_cached(
                 &config,
                 model_key,
-                Some(&delta),
-                Some(&base),
+                (Some(&delta), Some(&base), None),
                 file_path,
                 source,
                 false,
@@ -1193,6 +1192,41 @@ fn ten_agents_reuse_published_summary_without_private_duplicates() {
     assert_eq!(base.count().expect("count Base summaries"), 1);
     drop(base);
     std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn global_summary_hit_populates_workspace_without_daemon() {
+    let root = test_tempdir("global-summary-hit");
+    let workspace = greppy_store::SummaryCache::open(&root.join("workspace")).unwrap();
+    let global = greppy_store::SummaryCache::open(&root.join("global")).unwrap();
+    let file_path = "src/lib.rs";
+    let source = "fn shared() -> usize { 42 }";
+    let model_key = "global-summary-model";
+    let complete_model_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
+    let hash = greppy_store::span_hash(file_path, source);
+    let expected = vec!["Returns the shared value.".to_string()];
+    global.put(&complete_model_key, &hash, &expected).unwrap();
+    let config = QwenSummaryConfig {
+        model_id: "missing-model-must-not-load".into(),
+        gguf: root.join("missing.gguf"),
+        tokenizer: root.join("missing-tokenizer.json"),
+        device: greppy_qwen35_native::DevicePreference::Cpu,
+    };
+    let actual = summarize_source_cached(
+        &config,
+        model_key,
+        (Some(&workspace), None, Some(&global)),
+        file_path,
+        source,
+        false,
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        workspace.get(&complete_model_key, &hash).unwrap(),
+        Some(expected)
+    );
 }
 
 #[test]

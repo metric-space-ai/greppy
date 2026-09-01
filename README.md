@@ -60,11 +60,8 @@ greppy -p "add tests for clamp_value"          # uses a private portable CoW wor
 greppy agent --model MODEL                     # full-screen session, same isolated workspace
 greppy agent --continue --model MODEL          # restore this project's most recent session
 
-# In 0.3.2, concurrent agents share an immutable Base index and write private Deltas:
+# In 0.3.4, agents and ordinary linked Git worktrees share immutable Base data:
 greppy index --agent-worktree                  # build or validate the shared Base ahead of time
-greppy -p --private-store "diagnose indexing"  # opt out for one run and use a full private Store
-
-# In 0.3.4, ordinary linked Git worktrees use the same Base+Delta model automatically:
 greppy index .                                 # first worktree creates the Base; later worktrees index only their Delta
 greppy index status --json                     # lock-free phase/progress/readiness, including ETA when known
 ```
@@ -162,8 +159,12 @@ greppy doctor --root . --json     # end-to-end index + backend health
 greppy who-calls SOME_SYMBOL --root . --json   # starts the first index if needed
 ```
 
-The index is built once per repository and reused across sessions and linked
-Git worktrees through an immutable Base plus private Delta. A first graph query
+The graph is built once per repository and reused across sessions and linked
+Git worktrees through an immutable Base plus private Delta. Embeddings and
+summaries additionally use a user-scoped, content-addressed cache bound to the
+exact model, prompt, task profile, and prompt input. An unchanged definition is
+therefore inferred once across repositories and worktrees; only genuine cache
+misses enter the shared inference scheduler. A first graph query
 starts one background index and waits at most two seconds: small repositories
 usually answer immediately; larger ones return temporary exit 75 with the
 exact retry condition. `greppy index status --json` remains nonblocking during
@@ -195,7 +196,7 @@ serde commit — evidence in
 | Release archive | 735–825 MB (models included) |
 | Installed binary | ~1 GB |
 | Graph index build | ~2 s (Apple Silicon), ~4 s (4-core Linux) — queries work immediately |
-| Semantic embeddings | background, one-time per repo: **~15 s with CUDA** (RTX A4500), **~1 min with Metal on an Apple M5**, ~1.5 min on the 3-core virtual M1 CI runner, ~24 min (M-series CPU), ~63 min (4-core Linux CPU) |
+| Semantic embeddings | background on cache misses; exact model/prompt/content hits are reused user-wide: cold serde **~15 s with CUDA** (RTX A4500), **~1 min with Metal on an Apple M5**, ~1.5 min on the 3-core virtual M1 CI runner, ~24 min (M-series CPU), ~63 min (4-core Linux CPU) |
 | Warm query, CUDA | `brief` 0.1 s · `search` 0.2 s |
 | Warm query, Metal | `brief` 0.6–0.7 s · `search` 1.0–1.5 s (M5 / CI runner) |
 | Warm query, CPU only | `brief` 3.6–7 s · `search` 6–16 s |
@@ -465,7 +466,7 @@ repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 - **Standard grep.** Any invocation that isn't one of the extra commands runs real `grep` and returns its output and exit code unchanged.
 - **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USAGE`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches.
 - **Native semantic navigation.** `search` uses Google's embedded **EmbeddingGemma** to find code by meaning. A **Qwen3.5-0.8B (Q4_K_M, MTP) that greppy fine-tuned in-house** — trained by distillation specifically to write code-navigation hints — adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
-- **Bounded warm daemons.** The embedding and summary engines use separate local daemons. A used model remains resident for five idle minutes; the process exits after 30 idle minutes. Failed inference never removes deterministic source or graph output.
+- **Shared fair inference daemons.** Indexing, search, summaries, and `bash-smart` use user-scoped local daemons; client processes never load a heavyweight model as a fallback. Requests are micro-batched and scheduled round-robin by client without a queue-capacity rejection. A model is offloaded after its idle TTL and the daemon exits after extended inactivity. Failed inference never removes deterministic source or graph output.
 - **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
 
 ## What the graph cannot see
@@ -479,7 +480,13 @@ A symbol graph is built from source text. Edges a program wires up at runtime �
 
 Language support is tiered the same way, deliberately: 60+ languages have parser-level support, and graph completeness is certified per language by 12-cell fixture grids — currently Rust, Python, Java, JavaScript, TypeScript, Go, C++, C#, Kotlin, Swift, and Ruby; the remaining procedural languages follow in waves. Certification means the tier is measured, not assumed.
 
-The index is per repository, deliberately: one root, one store, and multi-package workspaces inside that root (Cargo, npm, Go) are already a single relation space. Multiple repositories are queried per root via `--root`; a federated multi-root workspace — one search across registered roots, with dependency-level edges between them — is planned. What is not planned is a central team server: greppy stays local by design. The team answer is index snapshots — build the index once in CI, distribute it as an artifact, and let the per-query freshness checks reconcile local drift.
+The graph namespace is per repository, deliberately: one root, one Base plus
+private Deltas, and multi-package workspaces inside that root (Cargo, npm, Go)
+are already a single relation space. The expensive inference results are not
+per-repository: exact document and summary inputs are reused from the bounded
+user-global content cache. Multiple repositories are queried per root via
+`--root`; a federated multi-root query space is separate future work. Greppy
+remains local rather than adding a central team server.
 
 ## Local data and cleanup
 
@@ -489,14 +496,14 @@ are private to the current user (`0700` on Unix), and cache objects are managed
 only after ownership, type, and path validation. Set `GREPPY_STORE_DIR` to place
 the data on an encrypted or ephemeral volume.
 
-For integrated agents in 0.3.2, unchanged repository data is held once in a
+For agents and linked worktrees in 0.3.4, unchanged repository data is held once in a
 content-identified, immutable Base Store. Each run gets a writable private Delta
 containing only dirty, deleted, renamed, or newly created paths. The Base identity
 includes the Git tree, schema/indexer versions, and summary/embedding model
 contracts; incompatible identities select a new Base instead of migrating one in
 place. Publication is atomic, readers hold eviction leases, and corrupt or
-incomplete Bases are quarantined before a rebuild. `--private-store` disables
-reuse for one agent run. `doctor`, `diagnostics`, and `index status --json` report
+incomplete Bases are quarantined before a rebuild. There is no private full-copy
+fallback. `doctor`, `diagnostics`, and `index status --json` report
 the selected mode, Base and Delta identities, completeness, cache hit, changed
 path counts, and any fallback reason.
 
@@ -505,8 +512,8 @@ summaries, and embeddings. They have the same confidentiality requirements as
 the repository itself. Agent sandboxes can read a published Base but cannot
 write it; writable Delta state remains isolated per run.
 
-The upcoming 0.3.4 agent workspace is a separate layer from the 0.3.2
-Base/Delta index store. `greppy -p` has one workspace contract and no backend
+The 0.3.4 portable agent workspace is a separate layer from the Base/Delta
+index store. `greppy -p` has one workspace contract and no backend
 selector or native fallback: it starts only after the bundled portable adapter
 is mounted and healthy. Run `greppy workspace setup` once after installation,
 then use `greppy workspace doctor --json` to verify provider identity, recovery,

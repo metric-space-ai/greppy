@@ -4784,12 +4784,16 @@ pub(crate) const SUMMARY_CACHE_GENERATION: &str = "sc1";
 fn summarize_source_cached(
     cfg: &QwenSummaryConfig,
     model_key: &str,
-    cache: Option<&greppy_store::SummaryCache>,
-    fallback_cache: Option<&greppy_store::SummaryCache>,
+    caches: (
+        Option<&greppy_store::SummaryCache>,
+        Option<&greppy_store::SummaryCache>,
+        Option<&greppy_store::SummaryCache>,
+    ),
     file_path: &str,
     source: &str,
     unbounded: bool,
 ) -> Option<Vec<String>> {
+    let (cache, fallback_cache, global_cache) = caches;
     let cache_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
     let hash = greppy_store::span_hash(file_path, source);
     if let Some(cache) = cache {
@@ -4799,6 +4803,18 @@ fn summarize_source_cached(
     }
     if let Some(cache) = fallback_cache {
         if let Ok(Some(bullets)) = cache.get(&cache_key, &hash) {
+            return Some(bullets);
+        }
+    }
+    if let Some(global) = global_cache {
+        if let Ok(Some(bullets)) = global.get(&cache_key, &hash) {
+            if let Some(workspace_cache) = cache {
+                let _ = if unbounded {
+                    workspace_cache.put_unbounded(&cache_key, &hash, &bullets)
+                } else {
+                    workspace_cache.put(&cache_key, &hash, &bullets)
+                };
+            }
             return Some(bullets);
         }
     }
@@ -4812,6 +4828,9 @@ fn summarize_source_cached(
         } else {
             cache.put(&cache_key, &hash, &bullets)
         };
+    }
+    if let Some(cache) = global_cache {
+        let _ = cache.put(&cache_key, &hash, &bullets);
     }
     Some(bullets)
 }
@@ -4867,11 +4886,11 @@ fn summarize_definition_span(
             .map(std::path::PathBuf::from)
             .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
             .and_then(|directory| greppy_store::SummaryCache::open_read_only(&directory).ok());
+        let global_cache = greppy_store::SummaryCache::open_global().ok();
         summarize_source_cached(
             &cfg,
             &model_key,
-            cache.as_ref(),
-            base_cache.as_ref(),
+            (cache.as_ref(), base_cache.as_ref(), global_cache.as_ref()),
             file_path,
             source_span,
             false,

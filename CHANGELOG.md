@@ -6,6 +6,20 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ### Worktree indexing and agent feedback fixes
 
+- Embedding and summary results are now cached user-wide by the complete
+  model/prompt/task/input contract. Linked worktrees and portable CoW agents
+  reuse exact content instead of re-embedding it in each private Store; only
+  changed Delta documents consume inference.
+- Indexing and `bash-smart` no longer load EmbeddingGemma inside each client.
+  All heavyweight embedding work goes through one user-scoped daemon endpoint
+  per device/model contract, with document micro-batches, round-robin client
+  scheduling and no queue-capacity rejection. There is no local heavyweight
+  fallback during daemon startup or contention.
+- The inference protocol is versioned into the daemon endpoint identity, so an
+  on-the-fly binary replacement starts a compatible daemon while an older idle
+  daemon drains and exits instead of receiving a request shape it cannot
+  understand.
+
 - Ordinary linked Git worktrees now share one immutable, Git-tree-bound Base
   index and publish only their committed/dirty private Delta. The binding is
   persisted per worktree, stays pinned when the primary checkout advances,

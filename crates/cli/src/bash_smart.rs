@@ -3,6 +3,7 @@
 //! optional embedding novelty, and hash-guarded paged expansion.
 
 use super::*;
+use greppy_indexer::CodeEmbeddingProvider;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -1712,12 +1713,8 @@ fn novelty_lifts(
         if status.get("state").and_then(serde_json::Value::as_str) != Some("ready") {
             return Vec::new();
         }
-        let cache_dir = resolve_root(root)
-            .ok()
-            .map(|path| workspace_locator::store_dir(&path));
-        let Ok(model) = load_embedding_model(&cfg, cache_dir) else {
-            return Vec::new();
-        };
+        let _ = root;
+        let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(&cfg);
         let mut embedded = Vec::<(usize, Vec<f32>)>::new();
         for chunk in groups.chunks(EMBED_BATCH_LINES) {
             let texts = chunk
@@ -1733,7 +1730,7 @@ fn novelty_lifts(
                 continue;
             }
             let docs = valid.iter().map(|(_, doc)| *doc).collect::<Vec<_>>();
-            let Ok(vectors) = model.embed_documents(&docs) else {
+            let Ok(vectors) = provider.embed_code_documents(&docs) else {
                 return Vec::new();
             };
             if vectors.len() != valid.len() {

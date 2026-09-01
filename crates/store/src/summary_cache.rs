@@ -30,11 +30,14 @@ use crate::store_error::{Error, Result};
 pub const SUMMARY_CACHE_DB_FILE: &str = "summary_cache.db";
 pub const SUMMARY_CACHE_MAX_ENTRIES: i64 = 10_000;
 const SUMMARY_CACHE_TRIM_ENTRIES: i64 = 8_000;
+const GLOBAL_SUMMARY_CACHE_MAX_ENTRIES: i64 = 100_000;
+const GLOBAL_SUMMARY_CACHE_TRIM_ENTRIES: i64 = 90_000;
 
 /// Standalone purpose-summary cache connection.
 #[derive(Debug)]
 pub struct SummaryCache {
     conn: Connection,
+    global: bool,
 }
 
 impl SummaryCache {
@@ -61,7 +64,38 @@ impl SummaryCache {
             );",
         )
         .map_err(|e| Error::Store(format!("create summary cache schema: {e}")))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            global: false,
+        })
+    }
+
+    /// Open the user-scoped summary cache shared by every repository and
+    /// worktree. `GREPPY_STORE_DIR` still isolates factory/test runs.
+    pub fn open_global() -> Result<Self> {
+        let store_dir = greppy_core::cache::inference_cache_root();
+        std::fs::create_dir_all(&store_dir)
+            .map_err(|e| Error::Store(format!("create global summary cache dir: {e}")))?;
+        let path = store_dir.join(SUMMARY_CACHE_DB_FILE);
+        let conn = Connection::open(&path).map_err(|e| {
+            Error::Store(format!("open global summary cache {}: {e}", path.display()))
+        })?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))
+            .map_err(|e| Error::Store(format!("global summary cache busy_timeout: {e}")))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS summaries (
+                model_key TEXT NOT NULL,
+                span_hash TEXT NOT NULL,
+                bullets TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_accessed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (model_key, span_hash)
+             );",
+        )
+        .map_err(|e| Error::Store(format!("create global summary cache schema: {e}")))?;
+        Ok(Self { conn, global: true })
     }
 
     /// Open a published immutable Base cache without creating, migrating, or
@@ -81,7 +115,10 @@ impl SummaryCache {
         })?;
         conn.busy_timeout(std::time::Duration::from_millis(200))
             .map_err(|e| Error::Store(format!("summary cache busy_timeout: {e}")))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            global: false,
+        })
     }
 
     /// Look up a cached purpose summary.
@@ -184,17 +221,36 @@ impl SummaryCache {
             .query_row("PRAGMA page_size", [], |r| r.get(0))
             .unwrap_or(4096);
         let bytes = page_count.saturating_mul(page_size);
-        let max_mib = std::env::var("GREPPY_SUMMARY_CACHE_MAX_MIB")
+        let max_mib_env = if self.global {
+            "GREPPY_GLOBAL_SUMMARY_CACHE_MAX_MIB"
+        } else {
+            "GREPPY_SUMMARY_CACHE_MAX_MIB"
+        };
+        let max_mib = std::env::var(max_mib_env)
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(greppy_core::cache::DEFAULT_SUMMARY_CACHE_MAX_MIB as i64);
+            .unwrap_or(if self.global {
+                512
+            } else {
+                greppy_core::cache::DEFAULT_SUMMARY_CACHE_MAX_MIB as i64
+            });
         let max_bytes = max_mib.saturating_mul(1024 * 1024);
-        let over_entries = count > SUMMARY_CACHE_MAX_ENTRIES;
+        let max_entries = if self.global {
+            GLOBAL_SUMMARY_CACHE_MAX_ENTRIES
+        } else {
+            SUMMARY_CACHE_MAX_ENTRIES
+        };
+        let trim_entries = if self.global {
+            GLOBAL_SUMMARY_CACHE_TRIM_ENTRIES
+        } else {
+            SUMMARY_CACHE_TRIM_ENTRIES
+        };
+        let over_entries = count > max_entries;
         let over_bytes = max_bytes > 0 && bytes > max_bytes;
         if !over_entries && !over_bytes {
             return Ok(());
         }
-        let mut keep = SUMMARY_CACHE_TRIM_ENTRIES.min(count);
+        let mut keep = trim_entries.min(count);
         if over_bytes && bytes > 0 {
             let byte_target = count
                 .saturating_mul(max_bytes.saturating_mul(8) / 10)
