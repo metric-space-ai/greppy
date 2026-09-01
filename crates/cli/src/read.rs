@@ -1317,13 +1317,20 @@ pub(crate) fn dispatch_read_files(
     // Keep it usable while a first index is building and avoid opening a
     // query-writer connection that can collide with the indexer's schema
     // publication. The store is needed only for continuation/handle records.
-    let mut store = None;
-    let project = project_for(root)?;
     let root_path = resolve_root(root)?;
-    let path_filters = prepare_query_path_filters(root, "read-file", "", path_filter_args)?;
-    let canonical_root = root_path
-        .canonicalize()
-        .unwrap_or_else(|_| root_path.clone());
+    let path_filters = if path_filter_args.is_empty() {
+        QueryPathFilters::default()
+    } else {
+        prepare_query_path_filters(root, "read-file", "", path_filter_args)?
+    };
+    // `resolve_root` already returns a canonical path. Exact range/all reads
+    // need neither a project identity nor a graph Store; derive both lazily
+    // only for continuation packs or explicit handles. Re-resolving a linked
+    // worktree several times made a plain file read crawl under filesystem
+    // pressure and could leave callers waiting with no output.
+    let canonical_root = root_path.clone();
+    let mut project = None::<String>;
+    let mut store = None;
     let mut failed = false;
     let mut printed = false;
     let mut previous_ended_with_newline = true;
@@ -1350,12 +1357,15 @@ pub(crate) fn dispatch_read_files(
             (1, line_count, None)
         } else {
             let end = READ_FILE_PAGE_LINES;
+            if project.is_none() {
+                project = Some(workspace_locator::project_identity(&root_path));
+            }
             if store.is_none() {
-                store = Some(open_default_store_query_writer(root)?);
+                store = Some(open_default_store_pack_writer(root)?);
             }
             let id = read_insert_file_pack(
                 store.as_ref().expect("read-file store initialized"),
-                &project,
+                project.as_deref().expect("read-file project initialized"),
                 &shown,
                 &content,
                 end + 1,
@@ -1363,11 +1373,14 @@ pub(crate) fn dispatch_read_files(
             (1, end, Some(id))
         };
         if with_handle && store.is_none() {
-            store = Some(open_default_store_query_writer(root)?);
+            if project.is_none() {
+                project = Some(workspace_locator::project_identity(&root_path));
+            }
+            store = Some(open_default_store_pack_writer(root)?);
         }
         let mut group = read_render_file_page(
             store.as_ref(),
-            &project,
+            project.as_deref().unwrap_or(""),
             &shown,
             &content,
             start_line,

@@ -3975,7 +3975,6 @@ struct BackgroundJobGuard {
     eta_seconds: Option<u64>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
-    indexing_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
@@ -4053,7 +4052,6 @@ impl BackgroundJobGuard {
                 .and_then(serde_json::Value::as_u64),
             rate_milli_documents_per_second: None,
             embedding_started: None,
-            indexing_started: None,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
@@ -4083,16 +4081,6 @@ impl BackgroundJobGuard {
         self.kind = "index".into();
         self.started_at_unix_secs = unix_now_secs_cli();
         self.write_state("starting", None);
-    }
-
-    fn embedding_loading(&mut self) {
-        self.completed_documents = 0;
-        self.total_documents = 0;
-        self.rate_milli_documents_per_second = None;
-        self.eta_seconds = None;
-        self.indexing_started = None;
-        self.current_detail = None;
-        self.write_state("loading_model", None);
     }
 
     fn embedding_started(&mut self, backend: &str, total_documents: usize) {

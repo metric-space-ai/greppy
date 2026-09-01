@@ -10,6 +10,11 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   model/prompt/task/input contract. Linked worktrees and portable CoW agents
   reuse exact content instead of re-embedding it in each private Store; only
   changed Delta documents consume inference.
+- Exact token sizing uses the lightweight tokenizer in the indexing client
+  while all heavyweight model inference remains in the shared supervisor.
+  First-use indexing no longer serializes one daemon request per candidate
+  span before its first embedding micro-batch, and status reports
+  `counting_embeddings` instead of freezing at a false `loading_model` 0%.
 - Indexing and `bash-smart` no longer load EmbeddingGemma inside each client.
   All heavyweight embedding work goes through one user-scoped daemon endpoint
   per device/model contract, with document micro-batches, round-robin client
@@ -75,6 +80,10 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 - Exact `read-file --all` and `read-file --lines` operations no longer open or
   migrate the graph store, so they remain available during concurrent first
   indexing and cannot collide with the indexer's schema publication.
+- Paginated `read-file` creates only its small continuation-pack store on a
+  cold repository; it no longer starts a graph build or embedding job merely
+  to return the next-page handle. Exact reads resolve the repository once and
+  derive graph identity lazily, avoiding repeated filesystem walks under load.
 - Linked-worktree root validation is structural on Windows and accepts the
   equivalent long-path/8.3 spellings emitted by the OS without weakening the
   rejection of real partial-subdirectory indexing.
@@ -183,11 +192,13 @@ from a missing index before the first atomic snapshot is published. It reports
 exit 75 instead of the contradictory `no_index` response that told agents to
 start a second indexer.
 
-### Web runtime (0.3.5)
+### Web runtime and next feature line (0.4.0)
 
-Interactive web-runtime work on `codex/grok-web-runtime-prototype` is **0.3.5**.
-It is not part of the 0.3.4 TUI surface. The product label remains an
-experimental web-runtime spike; this is not a Playwright-compatibility claim.
+The 0.3.x line after 0.3.4 is reserved for bounded stability fixes. Interactive
+web-runtime work and subsequent feature development converge on **0.4.0**;
+there is no separate 0.3.5 web feature release. The current source remains an
+experimental web-runtime spike until its own gates below are green; this is
+not a Playwright-compatibility claim.
 
 Local gates landed in this stream (exact tests, not inventory shrink):
 

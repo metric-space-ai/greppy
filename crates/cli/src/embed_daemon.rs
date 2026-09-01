@@ -152,14 +152,34 @@ pub(super) struct DaemonCodeEmbeddingProvider<'a> {
     cfg: &'a super::EmbeddingModelConfig,
     model_key: String,
     cache: Option<greppy_store::EmbeddingContentCache>,
+    // Tokenization is deliberately local: the tokenizer is small and does not
+    // own model weights. Sending one daemon round-trip for every candidate
+    // span made first-use indexing issue tens of thousands of serialized
+    // requests before the first embedding batch could run.
+    tokenizer: Option<greppy_embed_native::PromptTokenizer>,
 }
 
 impl<'a> DaemonCodeEmbeddingProvider<'a> {
     pub(super) fn new(cfg: &'a super::EmbeddingModelConfig) -> Self {
+        let tokenizer = match &cfg.source {
+            super::EmbeddingModelSource::Gguf { tokenizer, .. } => {
+                greppy_embed_native::PromptTokenizer::from_file(
+                    tokenizer,
+                    greppy_embed_native::TokenizerConfig {
+                        max_length: cfg
+                            .max_length
+                            .unwrap_or(greppy_embed_native::tokenizer::DEFAULT_MAX_LENGTH),
+                        ..greppy_embed_native::TokenizerConfig::default()
+                    },
+                )
+                .ok()
+            }
+        };
         Self {
             cfg,
             model_key: super::embedding_query_cache_key(cfg),
             cache: greppy_store::EmbeddingContentCache::open_global().ok(),
+            tokenizer,
         }
     }
 
@@ -172,6 +192,7 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             cfg,
             model_key: super::embedding_query_cache_key(cfg),
             cache: Some(cache),
+            tokenizer: None,
         }
     }
 
@@ -237,33 +258,41 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
         }) {
             return Ok(hit.token_len);
         }
-        let request = serde_json::json!({
-            "op": "document_token_len",
-            "pv": self.prompt_version(),
-            "mk": self.model_key,
-            "title": title,
-            "text": content,
-        });
-        match request_via_daemon(self.cfg, &self.model_key, request) {
-            RequestOutcome::Response(response) => {
-                let token_len = response
+        let token_len = if let Some(tokenizer) = &self.tokenizer {
+            tokenizer
+                .token_len(&Self::prompt_input(title, content))
+                .map_err(|error| {
+                    greppy_core::Error::Store(format!(
+                        "embedding tokenizer failed before daemon inference: {error}"
+                    ))
+                })?
+        } else {
+            let request = serde_json::json!({
+                "op": "document_token_len",
+                "pv": self.prompt_version(),
+                "mk": self.model_key,
+                "title": title,
+                "text": content,
+            });
+            match request_via_daemon(self.cfg, &self.model_key, request) {
+                RequestOutcome::Response(response) => response
                     .get("token_len")
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
-                if let Some(cache) = &self.cache {
-                    let _ = cache.put_token_len(
-                        &self.model_key,
-                        self.prompt_version(),
-                        self.task_profile(),
-                        &key,
-                        token_len,
-                    );
-                }
-                Ok(token_len)
+                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?,
+                outcome => return Err(self.daemon_error(outcome)),
             }
-            outcome => Err(self.daemon_error(outcome)),
+        };
+        if let Some(cache) = &self.cache {
+            let _ = cache.put_token_len(
+                &self.model_key,
+                self.prompt_version(),
+                self.task_profile(),
+                &key,
+                token_len,
+            );
         }
+        Ok(token_len)
     }
 
     fn embed_code_document(
@@ -663,6 +692,44 @@ mod tests {
         assert_eq!(
             provider.document_token_len(Some(title), content).unwrap(),
             7
+        );
+    }
+
+    #[test]
+    fn indexing_token_lengths_do_not_require_a_daemon_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        std::fs::write(
+            &tokenizer_path,
+            r#"{
+                "version":"1.0",
+                "truncation":null,
+                "padding":null,
+                "added_tokens":[],
+                "normalizer":null,
+                "pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,
+                "decoder":null,
+                "model":{"type":"WordLevel","vocab":{"[UNK]":0,"title":1,"text":2,"fn":3,"f":4},"unk_token":"[UNK]"}
+            }"#,
+        )
+        .unwrap();
+        let cfg = super::super::EmbeddingModelConfig {
+            model_id: "test-model".into(),
+            source: super::super::EmbeddingModelSource::Gguf {
+                gguf: temp.path().join("deliberately-missing.gguf"),
+                tokenizer: tokenizer_path,
+            },
+            max_length: Some(128),
+            device: greppy_embed_native::DevicePreference::Cpu,
+        };
+        let provider = DaemonCodeEmbeddingProvider::new(&cfg);
+        assert!(provider.tokenizer.is_some());
+        assert!(
+            provider
+                .document_token_len(Some("src/lib.rs:1-1 f"), "fn f() {}")
+                .unwrap()
+                > 0
         );
     }
 }

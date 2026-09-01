@@ -1437,7 +1437,7 @@ pub(crate) fn index_embeddings_into_temp_store(
     cfg: &EmbeddingModelConfig,
     report: &greppy_indexer::IndexReport,
     _tokenizer_cache_dir: Option<std::path::PathBuf>,
-    mut background_job: Option<&mut BackgroundJobGuard>,
+    background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<EmbeddingBuildOutcome> {
     #[cfg(debug_assertions)]
     if std::env::var_os(ENV_TEST_EMBED_UNAVAILABLE).is_some() {
@@ -1472,12 +1472,13 @@ pub(crate) fn index_embeddings_into_temp_store(
             },
         ));
     }
-    if let Some(job) = background_job.as_deref_mut() {
-        job.embedding_loading();
-    }
     let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
     let options = greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation);
     let embedding_report = if let Some(job) = background_job {
+        // Exact document counting tokenizes candidate spans. It does not load
+        // model weights and must remain observable instead of leaving status
+        // frozen at the misleading `loading_model` phase.
+        job.finalization_phase("counting_embeddings");
         let total_documents = greppy_indexer::count_code_embedding_documents_for_project(
             store, target, project, &provider, options,
         )?;

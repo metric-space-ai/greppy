@@ -713,6 +713,20 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
 }
 
 pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<greppy_store::Store> {
+    open_default_store_writer(root, true)
+}
+
+/// Open the small writable evidence/continuation surface without forcing a
+/// graph build. Exact filesystem reads must remain available before the first
+/// index; their pagination records are not graph-query evidence.
+pub(crate) fn open_default_store_pack_writer(root: Option<&str>) -> Result<greppy_store::Store> {
+    open_default_store_writer(root, false)
+}
+
+fn open_default_store_writer(
+    root: Option<&str>,
+    require_existing_index: bool,
+) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
     let path = workspace_locator::store_path(&effective_root);
     if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
@@ -731,7 +745,7 @@ pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<grep
         return greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)
             .map_err(Into::into);
     }
-    if !path.exists() {
+    if require_existing_index && !path.exists() {
         // Reuse the normal query open to trigger the existing first-use
         // auto-index/error path, then reopen writable for the evidence write.
         drop(open_default_store(root)?);
