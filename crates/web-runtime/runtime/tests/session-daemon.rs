@@ -985,6 +985,15 @@ fn one_thousand_session_create_close_cycles() {
     let _ = std::fs::remove_file(&socket);
     let guard = Supervisor::spawn(&socket, "run_cycles", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
+    // Bind happens before controller/content spawn+handshake. The 5s
+    // create/close budget is for a ready daemon, not for the 400MB image.
+    let ready = unix_request(
+        &socket,
+        &Request::new("run_cycles", "handshake", json!({})),
+        Duration::from_secs(30),
+    )
+    .expect("handshake");
+    assert_eq!(ready.status, "ok", "runtime not request-ready: {ready:?}");
     let mut baseline_rss = 0_u64;
     let mut live = HashSet::new();
 
