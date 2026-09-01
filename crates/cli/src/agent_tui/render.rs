@@ -203,7 +203,7 @@ fn setup_text(app: &App, width: u16) -> Text<'static> {
             ));
             lines.push(Line::from(telemetry.join("  ·  ")));
         } else {
-            let pulse_style = if app.spinner_tick % 2 == 0 {
+            let pulse_style = if app.spinner_tick.is_multiple_of(2) {
                 app.theme.status().add_modifier(Modifier::BOLD)
             } else {
                 app.theme.status().add_modifier(Modifier::DIM)

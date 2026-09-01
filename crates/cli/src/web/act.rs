@@ -108,18 +108,9 @@ pub enum ActCommand {
 
 pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
     match command {
-        ActCommand::Click { target, opts } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.click",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({}),
-        ),
+        ActCommand::Click { target, opts } => {
+            locator_rpc(root, opts, "web.click", &target, json!({}))
+        }
         ActCommand::Fill {
             target,
             value,
@@ -128,83 +119,25 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             opts,
         } => match fill_value(value, from_env, value_stdin, opts.json) {
             Err(code) => Ok(code),
-            Ok(value) => locator_rpc(
-                root,
-                opts.json,
-                opts.session,
-                opts.tab,
-                "web.fill",
-                &target,
-                opts.first,
-                opts.last,
-                opts.nth,
-                json!({ "value": value }),
-            ),
+            Ok(value) => locator_rpc(root, opts, "web.fill", &target, json!({ "value": value })),
         },
-        ActCommand::Type { target, text, opts } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.type",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({ "text": text }),
-        ),
-        ActCommand::Clear { target, opts } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.fill",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({ "value": "" }),
-        ),
+        ActCommand::Type { target, text, opts } => {
+            locator_rpc(root, opts, "web.type", &target, json!({ "text": text }))
+        }
+        ActCommand::Clear { target, opts } => {
+            locator_rpc(root, opts, "web.fill", &target, json!({ "value": "" }))
+        }
         ActCommand::Select {
             target,
             value,
             opts,
-        } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.select",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({ "value": value }),
-        ),
-        ActCommand::Check { target, opts } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.check",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({}),
-        ),
-        ActCommand::Uncheck { target, opts } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.uncheck",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({}),
-        ),
+        } => locator_rpc(root, opts, "web.select", &target, json!({ "value": value })),
+        ActCommand::Check { target, opts } => {
+            locator_rpc(root, opts, "web.check", &target, json!({}))
+        }
+        ActCommand::Uncheck { target, opts } => {
+            locator_rpc(root, opts, "web.uncheck", &target, json!({}))
+        }
         ActCommand::Press {
             target_or_key,
             key,
@@ -230,31 +163,11 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
             }
             rpc(root, opts.json, "web.press", payload, Some(session))
         }
-        ActCommand::Hover { target, opts } => locator_rpc(
-            root,
-            opts.json,
-            opts.session,
-            opts.tab,
-            "web.hover",
-            &target,
-            opts.first,
-            opts.last,
-            opts.nth,
-            json!({}),
-        ),
+        ActCommand::Hover { target, opts } => {
+            locator_rpc(root, opts, "web.hover", &target, json!({}))
+        }
         ActCommand::Scroll { to, by, opts } => match (to, by) {
-            (Some(target), None) => locator_rpc(
-                root,
-                opts.json,
-                opts.session,
-                opts.tab,
-                "web.scroll",
-                &target,
-                opts.first,
-                opts.last,
-                opts.nth,
-                json!({}),
-            ),
+            (Some(target), None) => locator_rpc(root, opts, "web.scroll", &target, json!({})),
             (None, Some(delta)) => {
                 let session = match resolve_session(root, opts.session) {
                     Ok(session) => session,
@@ -290,47 +203,31 @@ pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
                     return emit_error(opts.json, invalid(&format!("web upload: {message}")))
                 }
             };
-            locator_rpc(
-                root,
-                opts.json,
-                opts.session,
-                opts.tab,
-                "web.upload",
-                &target,
-                opts.first,
-                opts.last,
-                opts.nth,
-                json!({ "files": paths }),
-            )
+            locator_rpc(root, opts, "web.upload", &target, json!({ "files": paths }))
         }
     }
 }
 
 fn locator_rpc(
     root: Option<&str>,
-    json_out: bool,
-    session: Option<String>,
-    tab: Option<String>,
+    opts: TargetOpts,
     operation: &str,
     target: &str,
-    first: bool,
-    last: bool,
-    nth: Option<i64>,
     extra: serde_json::Value,
 ) -> Result<i32> {
-    let session = match resolve_session(root, session) {
+    let session = match resolve_session(root, opts.session) {
         Ok(session) => session,
-        Err(error) => return emit_error(json_out, error),
+        Err(error) => return emit_error(opts.json, error),
     };
-    let parsed = match parse_target(target, first, last, nth) {
+    let parsed = match parse_target(target, opts.first, opts.last, opts.nth) {
         Ok(parsed) => parsed,
-        Err(error) => return emit_error(json_out, error),
+        Err(error) => return emit_error(opts.json, error),
     };
     let mut payload = json!({
         "session_id": session,
         "selector": parsed.selector,
     });
-    if let Some(tab) = resolve_tab(root, tab) {
+    if let Some(tab) = resolve_tab(root, opts.tab) {
         payload["tab_id"] = json!(tab);
     }
     if let Some(object) = extra.as_object() {
@@ -340,7 +237,7 @@ fn locator_rpc(
             }
         }
     }
-    rpc(root, json_out, operation, payload, Some(session))
+    rpc(root, opts.json, operation, payload, Some(session))
 }
 
 fn fill_value(

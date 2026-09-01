@@ -4257,6 +4257,7 @@ impl BackgroundJobGuard {
     }
 }
 
+#[cfg(test)]
 fn background_progress_should_publish(
     stage_changed: bool,
     finished: bool,

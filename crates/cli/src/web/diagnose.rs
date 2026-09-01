@@ -96,7 +96,8 @@ fn separate_track(json_out: bool, what: &str, symbols: &str, instead: &str) -> R
             message: format!(
                 "{what} is on a separate release track: {symbols} are `unsupported` \
                  in the compatibility contract"
-            ),
+            )
+            .into_boxed_str(),
             operation_id: String::new(),
             session_id: None,
             retryable: false,

@@ -1205,8 +1205,7 @@ pub(super) fn parse_target(
     if trimmed.is_empty() {
         return Err(query_syntax("target query is empty"));
     }
-    if trimmed.starts_with('@') {
-        let rest = &trimmed[1..];
+    if let Some(rest) = trimmed.strip_prefix('@') {
         if rest.bytes().all(|b| b.is_ascii_digit()) && !rest.is_empty() {
             return Err(query_syntax(
                 "ref @N requires an observe snapshot that stores locator recipes",

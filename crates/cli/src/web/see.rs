@@ -491,6 +491,7 @@ fn run_match(query: &str, count_only: bool, json_out: bool) -> Result<i32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use serde_json::json;

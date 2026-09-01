@@ -35,8 +35,9 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
 /// Installs the parent-owned attach token onto an authorized `greppy web`
 /// child via inherited FD 4. The returned value must be held until after
 /// `spawn` so the CLOEXEC pipe end stays open through fork.
-pub static PREPARE_ATTACH_FD: OnceLock<fn(&mut Command) -> io::Result<Box<dyn Send>>> =
-    OnceLock::new();
+type AttachHold = Box<dyn Send>;
+type PrepareAttachFd = fn(&mut Command) -> io::Result<AttachHold>;
+pub static PREPARE_ATTACH_FD: OnceLock<PrepareAttachFd> = OnceLock::new();
 
 /// Credential / secret env vars stripped from every tool subprocess.
 ///
@@ -324,6 +325,7 @@ struct Captured {
 /// On Unix the child is placed in its own process group so a timeout kill
 /// reaps grandchildren too (e.g. `sh` + `sleep`); otherwise grandchildren keep
 /// the pipes open and the drain threads block until they exit naturally.
+#[cfg(test)]
 fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured, String> {
     run_capture_held(cmd, timeout, None)
 }
@@ -331,7 +333,7 @@ fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured,
 fn run_capture_held(
     cmd: &mut Command,
     timeout: Option<Duration>,
-    attach_hold: Option<Box<dyn Send>>,
+    attach_hold: Option<AttachHold>,
 ) -> Result<Captured, String> {
     #[cfg(unix)]
     {

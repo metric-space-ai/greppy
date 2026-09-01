@@ -83,7 +83,7 @@ impl Response {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorObject {
     pub code: String,
-    pub message: String,
+    pub message: Box<str>,
     pub operation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -102,7 +102,7 @@ impl ErrorObject {
     ) -> Self {
         Self {
             code: code.to_owned(),
-            message: message.into(),
+            message: message.into().into_boxed_str(),
             operation_id: operation_id.into(),
             session_id: None,
             retryable: false,
