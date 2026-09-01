@@ -150,9 +150,8 @@ pub(super) fn write_current_scope(
 ) -> std::result::Result<(), ErrorObject> {
     let path = current_scope_path(root);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            invalid(&format!("cannot create {}: {error}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| invalid(&format!("cannot create {}: {error}", parent.display())))?;
     }
     let mut body = json!({ "session": session });
     if let Some(tab) = tab.filter(|tab| !tab.is_empty()) {
@@ -226,9 +225,7 @@ pub(super) fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Val
         let agent = agent.trim();
         if !agent.is_empty() {
             if let Some(object) = payload.as_object_mut() {
-                object
-                    .entry("agent_id")
-                    .or_insert_with(|| json!(agent));
+                object.entry("agent_id").or_insert_with(|| json!(agent));
             }
         }
     }
@@ -520,7 +517,10 @@ pub(super) fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, E
     Ok(out)
 }
 
-pub(super) fn export_regular_file(dest: &Path, bytes: &[u8]) -> std::result::Result<(), ErrorObject> {
+pub(super) fn export_regular_file(
+    dest: &Path,
+    bytes: &[u8],
+) -> std::result::Result<(), ErrorObject> {
     let dest = lexical_output_path(dest)?;
     let mut cursor = dest.clone();
     loop {
@@ -884,11 +884,7 @@ fn save_attach_cookie(socket: &Path, token: &str) {
     }
 }
 
-fn wait_live_supervisor(
-    socket: &Path,
-    run_id: &str,
-    capability: &str,
-) -> Option<SupervisorCtx> {
+fn wait_live_supervisor(socket: &Path, run_id: &str, capability: &str) -> Option<SupervisorCtx> {
     let started = Instant::now();
     let budget = Duration::from_secs(60);
     loop {
@@ -1110,7 +1106,9 @@ pub(super) fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObj
     images_from_path_env().ok_or_else(|| unavailable("web-runtime distributable is not installed"))
 }
 
-pub(super) fn images_from_dist(dist: &std::path::Path) -> std::result::Result<ResolvedRuntime, ErrorObject> {
+pub(super) fn images_from_dist(
+    dist: &std::path::Path,
+) -> std::result::Result<ResolvedRuntime, ErrorObject> {
     if is_symlink(dist) {
         return Err(unavailable("refusing symlink web-runtime dist"));
     }
@@ -1147,7 +1145,10 @@ pub(super) fn images_from_dist(dist: &std::path::Path) -> std::result::Result<Re
     })
 }
 
-pub(super) fn runtime_from_file(path: &std::path::Path, dist: Option<PathBuf>) -> Option<ResolvedRuntime> {
+pub(super) fn runtime_from_file(
+    path: &std::path::Path,
+    dist: Option<PathBuf>,
+) -> Option<ResolvedRuntime> {
     if is_symlink(path) || !path.is_file() {
         return None;
     }
@@ -1218,9 +1219,7 @@ pub(super) fn parse_target(
         .filter(|flag| *flag)
         .count();
     if nth_count > 1 {
-        return Err(query_syntax(
-            "use only one of --first, --last, or --nth",
-        ));
+        return Err(query_syntax("use only one of --first, --last, or --nth"));
     }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1242,7 +1241,16 @@ pub(super) fn parse_target(
     let mut name = None;
     let mut rest = trimmed;
     while !rest.is_empty() {
-        let (atom, next) = parse_target_atom(rest)?;
+        let (atom, next) = match parse_target_atom(rest) {
+            Ok(pair) => pair,
+            Err(_) if css.is_some() || xpath.is_some() || text.is_some() || role.is_some() => {
+                let token = rest.split_whitespace().next().unwrap_or(rest);
+                return Err(query_syntax(&format!(
+                    "unexpected trailing atom `{token}`; quote the selector: css=\"... {token}\""
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         match atom {
             TargetAtom::Css(value) => assign_once(&mut css, value, "css")?,
             TargetAtom::Xpath(value) => assign_once(&mut xpath, value, "xpath")?,
@@ -1252,10 +1260,15 @@ pub(super) fn parse_target(
         }
         rest = next.trim_start();
     }
-    let kinds = [css.is_some(), xpath.is_some(), text.is_some(), role.is_some()]
-        .into_iter()
-        .filter(|flag| *flag)
-        .count();
+    let kinds = [
+        css.is_some(),
+        xpath.is_some(),
+        text.is_some(),
+        role.is_some(),
+    ]
+    .into_iter()
+    .filter(|flag| *flag)
+    .count();
     if kinds != 1 {
         return Err(query_syntax(
             "target must be one of css=, xpath=, text=, or role=",
@@ -1323,7 +1336,8 @@ fn parse_target_atom(input: &str) -> std::result::Result<(TargetAtom, &str), Err
         ("name=", TargetAtom::Name),
     ] {
         if let Some(rest) = input.strip_prefix(prefix) {
-            let (value, next) = parse_selector_value(rest)?;
+            let allow_spaces = prefix == "css=" || prefix == "xpath=";
+            let (value, next) = parse_selector_value(rest, allow_spaces)?;
             if value.is_empty() {
                 return Err(query_syntax(&format!("{prefix} value is empty")));
             }
@@ -1340,7 +1354,10 @@ fn parse_target_atom(input: &str) -> std::result::Result<(TargetAtom, &str), Err
     ))
 }
 
-fn parse_selector_value(input: &str) -> std::result::Result<(String, &str), ErrorObject> {
+fn parse_selector_value(
+    input: &str,
+    allow_spaces: bool,
+) -> std::result::Result<(String, &str), ErrorObject> {
     if let Some(rest) = input.strip_prefix('"') {
         let mut out = String::new();
         let mut chars = rest.char_indices();
@@ -1364,11 +1381,26 @@ fn parse_selector_value(input: &str) -> std::result::Result<(String, &str), Erro
                 Some((_, escaped)) => out.push(escaped),
                 None => return Err(query_syntax("unterminated escape in target")),
             },
-            c if c.is_whitespace() => return Ok((out, &input[index..])),
+            c if c.is_whitespace() => {
+                if !allow_spaces {
+                    return Ok((out, &input[index..]));
+                }
+                let rest = input[index..].trim_start();
+                if starts_with_target_prefix(rest) {
+                    return Ok((out, &input[index..]));
+                }
+                out.push(c);
+            }
             other => out.push(other),
         }
     }
     Ok((out, ""))
+}
+
+fn starts_with_target_prefix(input: &str) -> bool {
+    ["css=", "xpath=", "text=", "role=", "name="]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -1381,6 +1413,30 @@ mod target_tests {
         assert_eq!(parsed.selector["type"], "css");
         assert_eq!(parsed.selector["value"], "div > a");
         assert_eq!(parsed.selector["nth"], 2);
+    }
+
+    #[test]
+    fn parse_css_descendant_without_quotes() {
+        let parsed = parse_target("css=#start button", false, false, None).unwrap();
+        assert_eq!(parsed.selector["type"], "css");
+        assert_eq!(parsed.selector["value"], "#start button");
+    }
+
+    #[test]
+    fn parse_css_attribute_descendant_without_quotes() {
+        let parsed = parse_target("css=form input[type=checkbox]", false, false, None).unwrap();
+        assert_eq!(parsed.selector["value"], "form input[type=checkbox]");
+    }
+
+    #[test]
+    fn parse_trailing_atom_names_the_atom() {
+        let error = parse_target(r#"css="a" banana"#, false, false, None).unwrap_err();
+        assert_eq!(error.code, "QUERY_SYNTAX");
+        assert!(
+            error.message.contains("unexpected trailing atom `banana`"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -1452,7 +1508,10 @@ mod scope_tests {
             assert_eq!(resolve_session(Some(root), None).unwrap(), "env_sess");
             std::env::remove_var("GREPPY_WEB_SESSION");
             assert_eq!(resolve_session(Some(root), None).unwrap(), "file_sess");
-            assert_eq!(resolve_tab(Some(root), Some("t_flag".into())).as_deref(), Some("t_flag"));
+            assert_eq!(
+                resolve_tab(Some(root), Some("t_flag".into())).as_deref(),
+                Some("t_flag")
+            );
             assert_eq!(resolve_tab(Some(root), None).as_deref(), Some("t_env"));
             std::env::remove_var("GREPPY_WEB_TAB");
             assert_eq!(resolve_tab(Some(root), None).as_deref(), Some("t_file"));
@@ -1475,4 +1534,3 @@ mod scope_tests {
         });
     }
 }
-
