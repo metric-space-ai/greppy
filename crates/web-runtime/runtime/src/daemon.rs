@@ -1292,6 +1292,16 @@ impl Daemon {
             error.session_id = Some(session_id);
             return Response::error(request, error);
         }
+        if !self.controller.is_running() {
+            if let Err(error) = self.recover_controller("controller worker exited before web.run") {
+                return engine_error(request, error, 33);
+            }
+        }
+        if !self.content.is_running() {
+            if let Err(error) = self.recover_content("content worker exited before web.run") {
+                return engine_error(request, error, 33);
+            }
+        }
         if let Some(session) = self.sessions.get_mut(&session_id) {
             if let Err(message) = session.begin_operation(&request.request_id) {
                 return Response::error(
@@ -3011,6 +3021,10 @@ impl Daemon {
         if !self.sessions.contains_key(&session_id) {
             return Err(missing_session(request, &session_id));
         }
+        if !self.content.is_running() {
+            self.recover_content("content worker exited before session operation")
+                .map_err(|error| engine_error(request, error, 33))?;
+        }
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
         let content_pid = self.content.pid();
@@ -3485,30 +3499,29 @@ impl Daemon {
 
     fn recover_content(&mut self, reason: &str) -> Result<(), String> {
         self.replace_content_worker(reason)?;
-        let mut failed = Vec::new();
+        let mut recovered = Vec::new();
         for session in self.sessions.values_mut() {
             session.page_id = None;
             session.pages = 0;
-            if session.state != SessionState::Failed
-                && session.state != SessionState::Closing
-                && session.state != SessionState::Closed
-            {
+            if session.state == SessionState::Busy {
                 let request_id = session.operation_id.clone().unwrap_or_default();
-                let _ = session.transition(SessionState::Failed);
-                failed.push((session.id.clone(), request_id));
+                let _ = session.transition(SessionState::Ready);
+                recovered.push((session.id.clone(), request_id));
+            } else if session.state == SessionState::Ready {
+                recovered.push((session.id.clone(), String::new()));
             }
         }
-        for (session_id, request_id) in failed {
+        for (session_id, request_id) in recovered {
             self.journal(
                 &session_id,
                 &request_id,
-                "session.failed",
+                "session.recovered",
                 json!({ "reason": redact_secrets(reason) }),
             );
             if let Some(session) = self.sessions.get(&session_id) {
                 self.persist_session_snapshot(
                     session,
-                    json!({ "event": "session.failed", "reason": redact_secrets(reason) }),
+                    json!({ "event": "session.recovered", "reason": redact_secrets(reason) }),
                 );
             }
         }
