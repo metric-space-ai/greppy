@@ -529,18 +529,18 @@ fn web_doctor_json_does_not_spawn_runtime() {
 }
 
 #[cfg(unix)]
-fn locate_web_runtime() -> std::path::PathBuf {
+fn locate_web_runtime() -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("GREPPY_WEB_RUNTIME") {
         let path = std::path::PathBuf::from(path);
         if path.is_file() {
-            return path;
+            return Some(path);
         }
     }
     let greppy = std::path::PathBuf::from(bin());
     if let Some(dir) = greppy.parent() {
         let sibling = dir.join("web-runtime");
         if sibling.is_file() {
-            return sibling;
+            return Some(sibling);
         }
     }
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -552,10 +552,10 @@ fn locate_web_runtime() -> std::path::PathBuf {
     ];
     for candidate in candidates {
         if candidate.is_file() {
-            return candidate;
+            return Some(candidate);
         }
     }
-    panic!("web-runtime binary not found for attach CLI proof; build crates/web-runtime/runtime");
+    None
 }
 
 #[cfg(unix)]
@@ -614,7 +614,10 @@ fn parent_owned_attach_authorizes_separate_cli_children_and_denies_others() {
     use serde_json::json;
     use std::os::unix::process::CommandExt;
 
-    let runtime = locate_web_runtime();
+    let Some(runtime) = locate_web_runtime() else {
+        eprintln!("skipping attach CLI proof: optional web-runtime binary is not built");
+        return;
+    };
     let run_id = format!(
         "run_attachcli_{}_{}",
         std::process::id(),
@@ -867,7 +870,10 @@ fn run_scoped(
 #[cfg(unix)]
 #[test]
 fn web_open_observe_goto_observe_share_session_without_flag() {
-    let runtime = locate_web_runtime();
+    let Some(runtime) = locate_web_runtime() else {
+        eprintln!("skipping scoped web proof: optional web-runtime binary is not built");
+        return;
+    };
     let run_id = format!(
         "run_scope_{}_{}",
         std::process::id(),

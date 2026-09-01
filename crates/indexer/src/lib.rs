@@ -2254,9 +2254,51 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
         return Ok(());
     }
     if store.is_overlay() {
-        for edge in edges {
-            store.insert_edge(edge)?;
+        let mut qualified_names: std::collections::HashMap<(String, i64), String> =
+            std::collections::HashMap::new();
+        let mut overlay_edges = Vec::with_capacity(edges.len());
+        {
+            let conn = store.conn();
+            let mut lookup = conn
+                .prepare_cached("SELECT qualified_name FROM nodes WHERE id = ?1 AND project = ?2")
+                .map_err(sqlite_err)?;
+            for edge in edges {
+                let source_key = (edge.project.clone(), edge.source_id);
+                let source_qualified_name = match qualified_names.get(&source_key) {
+                    Some(name) => name.clone(),
+                    None => {
+                        let name: String = lookup
+                            .query_row(rusqlite::params![edge.source_id, edge.project], |row| {
+                                row.get(0)
+                            })
+                            .map_err(sqlite_err)?;
+                        qualified_names.insert(source_key, name.clone());
+                        name
+                    }
+                };
+                let target_key = (edge.project.clone(), edge.target_id);
+                let target_qualified_name = match qualified_names.get(&target_key) {
+                    Some(name) => name.clone(),
+                    None => {
+                        let name: String = lookup
+                            .query_row(rusqlite::params![edge.target_id, edge.project], |row| {
+                                row.get(0)
+                            })
+                            .map_err(sqlite_err)?;
+                        qualified_names.insert(target_key, name.clone());
+                        name
+                    }
+                };
+                overlay_edges.push(NewOverlayEdge {
+                    project: edge.project.clone(),
+                    source_qualified_name,
+                    target_qualified_name,
+                    edge_type: edge.edge_type.clone(),
+                    properties: edge.properties.clone(),
+                });
+            }
         }
+        store.insert_overlay_edges(&overlay_edges)?;
         return Ok(());
     }
     // The store's `Transaction` does not expose its raw connection to other

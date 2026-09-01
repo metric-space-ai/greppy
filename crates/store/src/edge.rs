@@ -36,6 +36,38 @@ pub struct NewOverlayEdge {
 }
 
 impl Store {
+    /// Upsert private overlay edges in one transaction.
+    ///
+    /// Callers resolve database-local node ids to qualified names before
+    /// entering this method. Keeping the whole batch in one transaction
+    /// avoids one fsync/transaction per structural edge in a CoW Delta.
+    pub fn insert_overlay_edges(&mut self, edges: &[NewOverlayEdge]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let tx = self.transaction()?;
+        {
+            let mut stmt = tx.raw().prepare_cached(
+                "INSERT INTO main.overlay_edges
+                   (project, source_qualified_name, target_qualified_name, edge_type, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(project, source_qualified_name, target_qualified_name, edge_type)
+                 DO UPDATE SET properties = excluded.properties",
+            )?;
+            for edge in edges {
+                let properties = serde_json::to_string(&edge.properties)?;
+                stmt.execute(params![
+                    edge.project,
+                    edge.source_qualified_name,
+                    edge.target_qualified_name,
+                    edge.edge_type,
+                    properties,
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Replace all logical Delta edges for one project atomically.
     ///
     /// The composed overlay view resolves qnames to the currently visible
@@ -284,6 +316,7 @@ mod tests {
     use super::*;
     use crate::node::NewNode;
     use crate::project::Project;
+    use crate::{StoreView, VisibilityIndex};
 
     fn setup_graph() -> (Store, i64, i64) {
         let mut s = Store::open_memory().unwrap();
@@ -360,6 +393,75 @@ mod tests {
             .unwrap();
         assert_eq!(e1, e2, "triple-collision must upsert id");
         assert_eq!(s.get_edge(e2).unwrap().unwrap().properties["v"], 2);
+    }
+
+    #[test]
+    fn overlay_edge_batch_connects_base_and_delta_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("base.db");
+        let delta_path = tmp.path().join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "2026-09-01T00:00:00Z".into(),
+                root_path: "/base".into(),
+            })
+            .unwrap();
+            base.insert_node(&NewNode {
+                project: "p".into(),
+                label: "Function".into(),
+                name: "A".into(),
+                qualified_name: "p.A".into(),
+                file_path: "a.rs".into(),
+                start_line: 1,
+                end_line: 2,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        }
+        {
+            let mut delta = Store::open(&delta_path).unwrap();
+            delta
+                .upsert_project(&Project {
+                    name: "p".into(),
+                    indexed_at: "2026-09-01T00:00:00Z".into(),
+                    root_path: "/delta".into(),
+                })
+                .unwrap();
+            delta
+                .insert_node(&NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "B".into(),
+                    qualified_name: "p.B".into(),
+                    file_path: "b.rs".into(),
+                    start_line: 3,
+                    end_line: 4,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+
+        let visibility = VisibilityIndex::new(["b.rs".into()], []).unwrap();
+        let mut view = StoreView::open_overlay(&base_path, &delta_path, visibility).unwrap();
+        let store = view.store_mut();
+        let source = store.get_node_by_qname("p", "p.A").unwrap().unwrap();
+        let target = store.get_node_by_qname("p", "p.B").unwrap().unwrap();
+        store
+            .insert_overlay_edges(&[NewOverlayEdge {
+                project: "p".into(),
+                source_qualified_name: source.qualified_name,
+                target_qualified_name: target.qualified_name,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"line": 7}),
+            }])
+            .unwrap();
+
+        let edges = store.outgoing_edges(source.id, Some("CALLS"), 10).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target_id, target.id);
+        assert_eq!(edges[0].properties["line"], 7);
     }
 
     #[test]

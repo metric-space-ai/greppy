@@ -1,7 +1,9 @@
 //! Shared web-CLI helpers: RPC, supervisor spawn, envelope/error mapping.
 
 use greppy_core::error::{Error, Result};
-use greppy_web_client::{new_request_id, ErrorObject, Handshake, Request, Response, SCHEMA};
+#[cfg(unix)]
+use greppy_web_client::Request;
+use greppy_web_client::{new_request_id, ErrorObject, Handshake, Response, SCHEMA};
 use serde_json::json;
 #[cfg(unix)]
 use std::cell::RefCell;

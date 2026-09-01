@@ -456,6 +456,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_regular_file_writes_and_refuses_symlink_and_directory() {
         let dir = export_sandbox("greppy-web-export");
@@ -501,6 +502,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_regular_file_rejects_relative_path_through_symlinked_ancestor() {
         let _cwd = EXPORT_CWD_LOCK
