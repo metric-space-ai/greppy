@@ -2054,11 +2054,15 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         "SIGKILL simulation should leave stale graph.db.next.* files before recovery"
     );
 
-    let (code, out, err) = run(&["index", "."], &repo, &store);
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
-        "next index should acquire the crash-released lock, clean stale temp snapshots and publish; stdout={out} stderr={err}"
+        "index recover should acquire the crash-released lock, validate and publish the completed snapshot; stdout={out} stderr={err}"
     );
+    let recovery: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|error| panic!("invalid recovery json: {error}; stdout={out:?}"));
+    assert_eq!(recovery["command"], "index-recover");
+    assert_eq!(recovery["status"], "published");
     assert!(
         lock_path.exists(),
         "successful recovery keeps the persistent lock inode"
