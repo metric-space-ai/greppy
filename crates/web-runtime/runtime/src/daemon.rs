@@ -816,7 +816,15 @@ impl Daemon {
             })
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
+        let budget_request = touches_page.then(|| request.clone());
         let mut response = self.dispatch_operation(request);
+        if let Some(budget_request) = budget_request {
+            if response.status == "ok" {
+                if let Some(limited) = self.enforce_session_cpu_budget(&budget_request) {
+                    return limited;
+                }
+            }
+        }
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
         }
@@ -845,6 +853,50 @@ impl Daemon {
             }
         }
         response
+    }
+
+    /// The pre-operation check in `with_session_page` measures the CPU this
+    /// session used BEFORE the operation. Since finding 039 moved the baseline
+    /// from worker lifetime to session start, a fresh session's first call can
+    /// never trip its budget however much it burns, and a `content_cpu_ms: 1`
+    /// limit was silently honoured with `ok`. Check again after the operation
+    /// so the call that spent the budget is the one answered with
+    /// `resource_limit`, and mark the session Failed like the pre-check does.
+    fn enforce_session_cpu_budget(&mut self, request: &Request) -> Option<Response> {
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone())?;
+        let content_pid = self.content.pid();
+        let controller_pid = self.controller.pid();
+        let session = self.sessions.get_mut(&session_id)?;
+        let content_cpu = Duration::from_millis(session_cpu_delta_ms(
+            &mut session.content_cpu_baseline,
+            content_pid,
+        ));
+        let controller_cpu = Duration::from_millis(session_cpu_delta_ms(
+            &mut session.controller_cpu_baseline,
+            controller_pid,
+        ));
+        let message = session
+            .limits
+            .check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")
+            .err()
+            .or_else(|| {
+                session
+                    .limits
+                    .check_cpu_time(
+                        controller_cpu,
+                        session.limits.controller_cpu_time,
+                        "controller",
+                    )
+                    .err()
+            })?;
+        let _ = session.transition(SessionState::Failed);
+        let _ = self.recover_content(&format!("cpu budget exceeded: {message}"));
+        Some(limit_error(request, message))
     }
 
     fn dispatch_operation(&mut self, request: Request) -> Response {
