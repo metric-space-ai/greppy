@@ -230,6 +230,15 @@ there is no separate 0.3.5 web feature release. The current source remains an
 experimental web-runtime spike until its own gates below are green; this is
 not a Playwright-compatibility claim.
 
+- Synthetic pointer input now has an engine receipt for every move, press, and
+  release. A fresh WebView whose display list is not yet available is repainted
+  and retried instead of silently dropping the event; exhausted retries fail
+  the command explicitly. This separately fixes the long-lived-runtime input
+  loss tracked as Fund 034.
+- Pressing Enter in an eligible form field now performs the HTML implicit-submit
+  action through the native input path. This is the distinct Fund 038 fix and
+  is not attributed to the pointer-delivery retry above.
+
 Local gates landed in this stream (exact tests, not inventory shrink):
 
 - Layout actionability pumps the Servo event loop between samples. A moving
