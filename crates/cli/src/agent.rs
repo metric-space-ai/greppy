@@ -1736,11 +1736,14 @@ fn writable_roots_for(
     if std::fs::create_dir_all(&runtime_dir).is_ok() {
         // 0700 up front so the child's own ensure_private_dir finds what it
         // wants and the socket is never group/world reachable.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &runtime_dir,
-            std::fs::Permissions::from_mode(0o700),
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &runtime_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
     }
     roots.push(runtime_dir);
 
