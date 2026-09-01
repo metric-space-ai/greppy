@@ -32,6 +32,8 @@ A bare argument is a CSS selector:
   greppy web inspect TARGET               one element: html, attrs, box, styles
   greppy web dom QUERY                    raw DOM query, html, diff
   greppy web screenshot                   the rendered page as an artifact
+  greppy web screenshot --render-complete wait for complete rendering; use only
+                                          when the final pixels are required
   greppy web events                       what happened since an action
   greppy web console                      page console output
   greppy web network QUERY                requests, status, sizes

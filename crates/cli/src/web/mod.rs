@@ -441,6 +441,7 @@ mod tests {
             "wrs_1",
             "--output",
             "/tmp/shot.png",
+            "--render-complete",
             "--json",
         ])
         .unwrap();
@@ -449,6 +450,7 @@ mod tests {
             Some(Command::Web {
                 command: WebCommand::Results(ResultsCommand::Screenshot {
                     output: Some(path),
+                    render_complete: true,
                     json: true,
                     ..
                 })

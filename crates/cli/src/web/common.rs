@@ -393,13 +393,17 @@ pub(super) fn screenshot(
     root: Option<&str>,
     session: Option<String>,
     output: Option<String>,
+    render_complete: bool,
     json: bool,
 ) -> Result<i32> {
     let session = match resolve_session(root, session) {
         Ok(session) => session,
         Err(error) => return emit_error(json, error),
     };
-    let payload = json!({ "session_id": session });
+    let payload = json!({
+        "session_id": session,
+        "renderComplete": render_complete,
+    });
     match ensure_supervisor(root, &SupervisorSpawn::default()) {
         Err(error) => emit_error(json, error),
         Ok(ctx) => {
