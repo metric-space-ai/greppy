@@ -775,28 +775,12 @@ impl Daemon {
             && request.operation != "web.session.close"
             && request.operation != "web.session.list"
             && request.operation != "web.shutdown";
-        // After a content SIGKILL, the 60s session.networkBytes sample around
-        // dispatch raced the client's 15s observe timeout. Recover, then answer
-        // the crashed operation without extra engine RPCs.
-        if content_died && touches_page {
-            // The call is lost here on purpose: the worker died at an unknown
-            // point, so replaying it could repeat a half-applied action. What
-            // the caller needs is not a retry but the ability to recover
-            // without knowing daemon internals (finding 030): the CLI already
-            // forgets the session on this text, and a direct protocol client -
-            // an SDK, a foreign harness - needs the same signal in a field it
-            // can branch on rather than in prose.
-            let mut error = ErrorObject::new(
-                "worker_restarted",
-                "content worker crashed and was restarted; session pages were reset",
-                request.request_id.clone(),
-                38,
-                "open a new session, then repeat this call",
-            );
-            error.session_id = request.session_id.clone();
-            error.retryable = true;
-            return Response::error(&request, error);
-        }
+        // A content worker that died before this request was recovered above
+        // (pages reset, session kept usable). The call that was actually in
+        // flight when the worker died gets the typed worker_restarted error
+        // from engine_error below; a later call must not be refused just
+        // because a recovery happened earlier (web_run_deadline_is_enforced_externally).
+        let _ = content_died;
         // Only the web.run handlers filled the metrics; every other operation
         // answered with zeros, so the paths an agent actually uses -- goto,
         // click, observe -- reported nothing about what they cost. Time the
@@ -804,6 +788,28 @@ impl Daemon {
         let dispatch_started = Instant::now();
         let content_before = sample_cpu_ms(self.content.pid());
         let controller_before = sample_cpu_ms(self.controller.pid());
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone());
+        if let Some(session) = session_id
+            .as_ref()
+            .and_then(|session_id| self.sessions.get_mut(session_id))
+        {
+            // Start a new session's CPU accounting before any supervisor
+            // preflight. `session.networkBytes` below is real controller work
+            // performed for this request and must not sit outside the budget.
+            let _ = session_cpu_delta_ms(
+                &mut session.content_cpu_baseline,
+                self.content.pid(),
+            );
+            let _ = session_cpu_delta_ms(
+                &mut session.controller_cpu_baseline,
+                self.controller.pid(),
+            );
+        }
         // The engine keeps a running total of bytes relayed through the policy
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
@@ -815,15 +821,8 @@ impl Daemon {
             })
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
-        let budget_request = touches_page.then(|| request.clone());
+        let limit_request = request.clone();
         let mut response = self.dispatch_operation(request);
-        if let Some(budget_request) = budget_request {
-            if response.status == "ok" {
-                if let Some(limited) = self.enforce_session_cpu_budget(&budget_request) {
-                    return limited;
-                }
-            }
-        }
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
         }
@@ -851,51 +850,51 @@ impl Daemon {
                 }
             }
         }
+        // The pre-dispatch check in `with_session_page` protects every later
+        // operation from CPU already consumed by this session. The first
+        // operation starts the per-worker baseline, though, so its actual CPU
+        // can only be judged here. Enforce the same cumulative session budget
+        // before returning success; otherwise a one-shot request can exceed a
+        // 1 ms limit while reporting the overage only in metrics.
+        if response.status == "ok" {
+            if let Some(session_id) = session_id {
+                let content_pid = self.content.pid();
+                let controller_pid = self.controller.pid();
+                let measured_content_cpu_ms = response.metrics.content_cpu_ms;
+                let measured_controller_cpu_ms = response.metrics.controller_cpu_ms;
+                let cpu_limit_error = self.sessions.get_mut(&session_id).and_then(|session| {
+                    let content_cpu = Duration::from_millis(
+                        session_cpu_delta_ms(&mut session.content_cpu_baseline, content_pid)
+                            .max(measured_content_cpu_ms),
+                    );
+                    let controller_cpu = Duration::from_millis(
+                        session_cpu_delta_ms(&mut session.controller_cpu_baseline, controller_pid)
+                            .max(measured_controller_cpu_ms),
+                    );
+                    let error = session
+                        .limits
+                        .check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")
+                        .and_then(|_| {
+                            session.limits.check_cpu_time(
+                                controller_cpu,
+                                session.limits.controller_cpu_time,
+                                "controller",
+                            )
+                        })
+                        .err();
+                    if error.is_some() {
+                        let _ = session.transition(SessionState::Failed);
+                    }
+                    error
+                });
+                if let Some(message) = cpu_limit_error {
+                    let metrics = response.metrics.clone();
+                    response = limit_error(&limit_request, message);
+                    response.metrics = metrics;
+                }
+            }
+        }
         response
-    }
-
-    /// The pre-operation check in `with_session_page` measures the CPU this
-    /// session used BEFORE the operation. Since finding 039 moved the baseline
-    /// from worker lifetime to session start, a fresh session's first call can
-    /// never trip its budget however much it burns, and a `content_cpu_ms: 1`
-    /// limit was silently honoured with `ok`. Check again after the operation
-    /// so the call that spent the budget is the one answered with
-    /// `resource_limit`, and mark the session Failed like the pre-check does.
-    fn enforce_session_cpu_budget(&mut self, request: &Request) -> Option<Response> {
-        let session_id = request
-            .payload
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .or_else(|| request.session_id.clone())?;
-        let content_pid = self.content.pid();
-        let controller_pid = self.controller.pid();
-        let session = self.sessions.get_mut(&session_id)?;
-        let content_cpu = Duration::from_millis(session_cpu_delta_ms(
-            &mut session.content_cpu_baseline,
-            content_pid,
-        ));
-        let controller_cpu = Duration::from_millis(session_cpu_delta_ms(
-            &mut session.controller_cpu_baseline,
-            controller_pid,
-        ));
-        let message = session
-            .limits
-            .check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")
-            .err()
-            .or_else(|| {
-                session
-                    .limits
-                    .check_cpu_time(
-                        controller_cpu,
-                        session.limits.controller_cpu_time,
-                        "controller",
-                    )
-                    .err()
-            })?;
-        let _ = session.transition(SessionState::Failed);
-        let _ = self.recover_content(&format!("cpu budget exceeded: {message}"));
-        Some(limit_error(request, message))
     }
 
     fn dispatch_operation(&mut self, request: Request) -> Response {
@@ -3853,11 +3852,29 @@ fn missing_session(request: &Request, session_id: &str) -> Response {
 }
 
 fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -> Response {
+    let message = message.into();
+    // The call is lost here on purpose: the worker died at an unknown point,
+    // so replaying it could repeat a half-applied action. What the caller
+    // needs is a signal it can branch on (finding 030): the CLI forgets the
+    // session on this text, and a direct protocol client -- an SDK, a
+    // foreign harness -- gets the same in a typed field instead of prose.
+    if message.starts_with("content worker crashed and was restarted") {
+        let mut error = ErrorObject::new(
+            "worker_restarted",
+            redact_secrets(&message),
+            request.request_id.clone(),
+            38,
+            "open a new session, then repeat this call",
+        );
+        error.session_id = request.session_id.clone();
+        error.retryable = true;
+        return Response::error(request, error);
+    }
     Response::error(
         request,
         ErrorObject::new(
             "engine_error",
-            redact_secrets(&message.into()),
+            redact_secrets(&message),
             request.request_id.clone(),
             exit_code,
             "retry the operation or inspect web.doctor",

@@ -6800,21 +6800,17 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
         .as_str()
         .unwrap()
         .to_owned();
-    // The session CPU budget is a delta from the session's own baseline
-    // (finding 039), so the operation that spends controller CPU must be one
-    // that runs controller code: web.read never touches the controller, a
-    // web.run script does.
-    let mut run = Request::new(
-        "run_ctlcpu",
-        "web.run",
-        json!({
-            "session_id": session_id,
-            "script_source": "inline",
-            "script_text": "const page = await browser.newPage(); await page.setContent('<p>ctlcpu</p>'); await page.title();",
-        }),
-    );
-    run.deadline_ms = 30_000;
-    let read = unix_request(&socket, &run, Duration::from_secs(40)).expect("run");
+    let origin = serve_fixture("<p>ctlcpu</p>");
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_ctlcpu",
+            "web.read",
+            json!({ "session_id": session_id, "url": origin }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("read");
     assert_eq!(read.status, "error", "{read:?}");
     assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
     assert!(
