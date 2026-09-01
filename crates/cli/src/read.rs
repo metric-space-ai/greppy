@@ -1386,8 +1386,20 @@ pub(crate) fn dispatch_read_files(
                 end_line + 1
             ));
         }
+        if group.is_empty() {
+            return Err(Error::Store(format!(
+                "read-file produced no output for existing file `{shown}` lines {start_line}:{end_line}; retry the command and report this invariant failure"
+            )));
+        }
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
-        print!("{group}");
+        {
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            std::io::Write::write_all(&mut output, group.as_bytes())
+                .map_err(|error| Error::Store(format!("write read-file output: {error}")))?;
+            std::io::Write::flush(&mut output)
+                .map_err(|error| Error::Store(format!("flush read-file output: {error}")))?;
+        }
         previous_ended_with_newline = group.ends_with('\n');
     }
     Ok(if failed { 1 } else { 0 })

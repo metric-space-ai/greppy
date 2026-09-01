@@ -218,6 +218,43 @@ fn read_file_range_and_all_bypass_pagination() {
 }
 
 #[test]
+fn concurrent_read_file_ranges_never_report_empty_success() {
+    let (repo, store) = fresh_workspace("parallel-range");
+    let content = (1..=128)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("source.txt"), content).unwrap();
+
+    let workers = (0..12)
+        .map(|_| {
+            let repo = repo.clone();
+            let store = store.clone();
+            std::thread::spawn(move || {
+                run(
+                    &repo,
+                    &store,
+                    &["read-file", "source.txt", "--lines", "32:96"],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for worker in workers {
+        let (code, stdout, stderr) = worker.join().expect("read worker");
+        assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.starts_with("source.txt:32-96\nline 32\n"),
+            "{stdout}"
+        );
+        assert!(stdout.ends_with("line 96\n"), "{stdout}");
+        assert!(
+            !stdout.is_empty(),
+            "successful read-file output must not be empty"
+        );
+    }
+}
+
+#[test]
 fn read_file_accepts_explicit_absolute_path_outside_repo_only() {
     let (repo, store) = fresh_workspace("absolute-external");
     let external = repo.parent().unwrap().join("diagnostic.json");
