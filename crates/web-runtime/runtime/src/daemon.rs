@@ -707,6 +707,7 @@ impl Daemon {
             error.session_id = request.session_id.clone();
             return Response::error(&request, error);
         }
+        let content_died = !self.content.is_running();
         if request.operation != "web.shutdown" {
             self.reap_idle_sessions();
             // session.close after a timed-out web.run must not spawn replacement
@@ -720,6 +721,23 @@ impl Daemon {
                 self.ensure_workers();
             }
         }
+        let touches_page = request.operation.starts_with("web.")
+            && request.operation != "web.status"
+            && request.operation != "web.doctor"
+            && request.operation != "web.session.create"
+            && request.operation != "web.session.close"
+            && request.operation != "web.session.list"
+            && request.operation != "web.shutdown";
+        // After a content SIGKILL, the 60s session.networkBytes sample around
+        // dispatch raced the client's 15s observe timeout. Recover, then answer
+        // the crashed operation without extra engine RPCs.
+        if content_died && touches_page {
+            return engine_error(
+                &request,
+                "content worker crashed and was restarted; session pages were reset",
+                38,
+            );
+        }
         // Only the web.run handlers filled the metrics; every other operation
         // answered with zeros, so the paths an agent actually uses -- goto,
         // click, observe -- reported nothing about what they cost. Time the
@@ -731,11 +749,11 @@ impl Daemon {
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
         // never incremented, which is why a 60 MB page showed 4096 bytes.
-        let touches_page = request.operation.starts_with("web.")
-            && request.operation != "web.status"
-            && request.operation != "web.doctor";
-        let bytes_before = touches_page
-            .then(|| self.engine_call("session.networkBytes", json!({})).ok())
+        let bytes_before = (touches_page && self.content.is_running())
+            .then(|| {
+                self.engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                    .ok()
+            })
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
         let mut response = self.dispatch_operation(request);
@@ -755,12 +773,14 @@ impl Daemon {
         }
         if response.metrics.network_bytes == 0 {
             if let Some(before) = bytes_before {
-                if let Some(after) = self
-                    .engine_call("session.networkBytes", json!({}))
-                    .ok()
-                    .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
-                {
-                    response.metrics.network_bytes = after.saturating_sub(before);
+                if self.content.is_running() {
+                    if let Some(after) = self
+                        .engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                        .ok()
+                        .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
+                    {
+                        response.metrics.network_bytes = after.saturating_sub(before);
+                    }
                 }
             }
         }
@@ -3153,7 +3173,13 @@ impl Daemon {
             if remaining.is_zero() {
                 return Err(format!("timed out after {timeout:?} waiting for {method}"));
             }
-            match self.content.recv(remaining) {
+            if !self.content.is_running() {
+                let _ = self.recover_content("content worker exited");
+                return Err(
+                    "content worker crashed and was restarted; session pages were reset".into(),
+                );
+            }
+            match self.content.recv(remaining.min(Duration::from_millis(100))) {
                 Ok(Message::EngineResult {
                     request_id: got,
                     ok,
@@ -3182,7 +3208,7 @@ impl Daemon {
                 Ok(other) => return Err(format!("unexpected content message {other:?}")),
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
-                        return Err(format!("timed out after {timeout:?} waiting for {method}"));
+                        continue;
                     }
                     let message = error.to_string();
                     let _ = self.recover_content(&format!("content worker: {message}"));
