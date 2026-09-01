@@ -468,16 +468,6 @@ impl WebViewDelegate for Delegate {
         self.wake.wake();
     }
 
-    fn notify_input_event_handled(
-        &self,
-        _webview: WebView,
-        event_id: InputEventId,
-        result: InputEventResult,
-    ) {
-        self.input_receipts.borrow_mut().insert(event_id, result);
-        self.wake.wake();
-    }
-
     fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
         let child = request
             .builder(Rc::clone(&self.rendering_context))
