@@ -2649,20 +2649,17 @@ fn oracle_skip_receipt_when_chromium_pin_missing() {
         .join("..")
         .join("scripts")
         .join("oracle-skip.sh");
+    let receipt = std::env::temp_dir().join(format!(
+        "greppy-oracle-skip-{}.json",
+        std::process::id()
+    ));
     let status = Command::new("sh")
         .arg(&script)
+        .arg(&receipt)
         .status()
         .expect("oracle-skip");
     assert!(status.success(), "{status}");
-    let receipt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("contracts/web-runtime/receipts/oracle-skip.json");
-    // CARGO_MANIFEST_DIR is crates/web-runtime/runtime → repo is ../../..
-    let text = std::fs::read_to_string(&receipt).unwrap_or_else(|_| {
-        let alt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../contracts/web-runtime/receipts/oracle-skip.json");
-        std::fs::read_to_string(alt).expect("oracle skip receipt")
-    });
+    let text = std::fs::read_to_string(&receipt).expect("oracle skip receipt");
     assert!(text.contains("skipped") || text.contains("ready"), "{text}");
 }
 
@@ -3693,9 +3690,10 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "candidate failed: {ran:?}");
 
-    let receipts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("contracts/web-runtime/receipts");
+    let receipts_dir = std::env::temp_dir().join(format!(
+        "greppy-oracle-receipts-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&receipts_dir).unwrap();
     let receipt = json!({
         "reference": {

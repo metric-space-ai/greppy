@@ -3,7 +3,7 @@ set -eu
 # Guide oracle is playwright@1.62.1 + Chromium revision 1234.
 # Do not download browsers. Write a skip receipt when the pin is missing.
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-out="$root/contracts/web-runtime/receipts/oracle-skip.json"
+out="${1:-$root/contracts/web-runtime/receipts/oracle-skip.json}"
 mkdir -p "$(dirname "$out")"
 chromium_pin="$HOME/Library/Caches/ms-playwright/chromium-1234"
 if [ -d "$chromium_pin" ]; then
