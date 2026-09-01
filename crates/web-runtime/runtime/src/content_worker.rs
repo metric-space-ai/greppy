@@ -3179,6 +3179,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 click_at(&webview, x, y, 0.0, 0.0, || self.servo.spin_event_loop());
                 self.servo.spin_event_loop();
                 Ok(json!({}))
@@ -3188,6 +3189,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 hover_at(&webview, x, y, 0.0, 0.0);
                 self.servo.spin_event_loop();
                 Ok(json!({}))
@@ -3197,6 +3199,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     MouseButtonAction::Down,
@@ -3212,6 +3215,7 @@ impl ContentEngine {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
                     WheelDelta {
@@ -3230,6 +3234,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     MouseButtonAction::Up,
@@ -3245,6 +3250,27 @@ impl ContentEngine {
         }
     }
 
+    /// Make `target` the only visible webview before delivering synthetic
+    /// input or reading the framebuffer. All live webviews share one
+    /// rendering context and every page ever opened stays shown; input
+    /// delivery then hits whichever stale webview the internal order offers
+    /// and the event dies silently in a dead document (finding 034: the CLI
+    /// verb loop lost 8 of 12 clicks to orphaned sessions, non-monotonically;
+    /// closing the orphans made it 12/12).
+    fn present_exclusively(&self, target: &WebView) {
+        for other in self.live_webviews() {
+            if other.id() != target.id() {
+                other.hide();
+            }
+        }
+        target.show();
+        target.focus();
+        // hide/show travel through the constellation asynchronously; without
+        // a spin the hit test can still see the old visibility and route the
+        // very next input into a hidden webview (2 of 12 clicks still died).
+        self.servo.spin_event_loop();
+    }
+
     fn resolve_actionable(&self, params: &serde_json::Value) -> io::Result<ResolvedNode> {
         let page_id = required_str(params, "page")?;
         let selector = params
@@ -3252,6 +3278,7 @@ impl ContentEngine {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
+        self.present_exclusively(&webview);
         let script = resolve_script(&selector);
         let deadline = Instant::now() + call_timeout(params);
         let mut last = String::from("failed_check=stable");
