@@ -3307,13 +3307,12 @@ impl Daemon {
             if remaining.is_zero() {
                 return Err(format!("timed out after {timeout:?} waiting for {method}"));
             }
-            if !self.content.is_running() {
-                let _ = self.recover_content("content worker exited");
-                return Err(
-                    "content worker crashed and was restarted; session pages were reset".into(),
-                );
-            }
-            match self.content.recv(remaining.min(Duration::from_millis(100))) {
+            // A worker can die immediately after the liveness check above.  Do not
+            // then hold the request hostage for the full engine timeout: poll the
+            // protocol reader in small slices so child death is observed before the
+            // client-side request deadline expires.
+            let poll = remaining.min(Duration::from_millis(50));
+            match self.content.recv(poll) {
                 Ok(Message::EngineResult {
                     request_id: got,
                     ok,
@@ -3342,6 +3341,13 @@ impl Daemon {
                 Ok(other) => return Err(format!("unexpected content message {other:?}")),
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
+                        if !self.content.is_running() {
+                            self.recover_content("content worker exited while handling request")?;
+                            return Err(
+                                "content worker crashed and was restarted; session pages were reset"
+                                    .into(),
+                            );
+                        }
                         continue;
                     }
                     let message = error.to_string();

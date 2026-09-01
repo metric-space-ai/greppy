@@ -465,6 +465,18 @@ pub(crate) fn route_until_script_complete_gated(
             let slice = remaining.min(Duration::from_millis(50));
             match recv_any(controller, content, slice) {
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    if !content.is_running() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "content worker exited while controller script was running",
+                        ));
+                    }
+                    if !controller.is_running() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "controller worker exited while script was running",
+                        ));
+                    }
                     continue;
                 }
                 other => other,

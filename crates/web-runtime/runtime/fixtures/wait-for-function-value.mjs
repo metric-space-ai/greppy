@@ -3,9 +3,10 @@ import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.setContent("<!DOCTYPE html><html><body><div id='app'>boot</div></body></html>");
-await page.evaluate(() => {
+const readyScheduledAt = await page.evaluate(() => {
   window.__waitFinishCount = 0;
   window.__predicateCalls = 0;
+  const scheduledAt = Date.now();
   setTimeout(function () {
     window.__readyValue = { answer: 42, nested: { ok: true } };
   }, 80);
@@ -14,13 +15,13 @@ await page.evaluate(() => {
     console.debug("__greppyWaitDone:00000000000000000000000000000000:timeout");
     console.debug("__greppyWaitDone:not-a-nonce:ok");
   }, 16);
+  return scheduledAt;
 });
-const started = Date.now();
 const value = await page.waitForFunction(() => {
   window.__predicateCalls = (window.__predicateCalls || 0) + 1;
   return window.__readyValue || false;
 });
-const elapsed = Date.now() - started;
+const elapsed = Date.now() - readyScheduledAt;
 if (elapsed < 50) {
   throw new Error("waitForFunction returned before the 80ms JS timer " + elapsed);
 }

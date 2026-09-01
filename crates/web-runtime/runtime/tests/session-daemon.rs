@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
-use greppy_web_client::{unix_request as raw_unix_request, Request, SCHEMA};
+use greppy_web_client::{
+    read_frame, unix_request as raw_unix_request, write_frame, Request, SCHEMA,
+};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
@@ -3546,19 +3548,30 @@ fn observed_refs_drive_locators_and_expire_on_navigation() {
 }
 
 #[test]
-fn project_profile_can_load_a_public_http_host() {
+fn project_profile_can_load_an_allowed_http_host() {
+    let fixture_html: &'static str = Box::leak(
+        format!(
+            "<!DOCTYPE html><html><body><p>PROJECT_OK</p><pre>{}</pre></body></html>",
+            "fixture-data".repeat(128)
+        )
+        .into_boxed_str(),
+    );
+    let fixture = serve_fixture(fixture_html);
     let socket = std::env::temp_dir().join(format!("greppy-web-egress-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-    let _guard = Supervisor::spawn(&socket, "run_egress", |_| {});
+    let fixture_for_spawn = fixture.clone();
+    let _guard = Supervisor::spawn(&socket, "run_egress", move |command| {
+        command.arg("--fixture-url").arg(&fixture_for_spawn);
+    });
     wait_for_socket(&socket, Duration::from_secs(30));
     let source = r#"
 import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
-const resp = await page.goto("http://neverssl.com/");
+const resp = await page.goto(fixtureUrl);
 const url = page.url();
-if (typeof url !== "string" || !url.includes("neverssl.com")) {
-  throw new Error("expected neverssl.com, got " + url);
+if (typeof url !== "string" || url !== fixtureUrl) {
+  throw new Error("expected fixture URL, got " + url);
 }
 if (!resp || typeof resp.status !== "function" || resp.status() !== 200) {
   throw new Error("goto status " + (resp && resp.status && resp.status()));
@@ -3699,9 +3712,10 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "candidate failed: {ran:?}");
 
-    let receipts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("contracts/web-runtime/receipts");
+    let receipts_dir = std::env::temp_dir().join(format!(
+        "greppy-oracle-receipts-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&receipts_dir).unwrap();
     let receipt = json!({
         "reference": {
@@ -4568,18 +4582,39 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
     let session_for_run = session_id.clone();
     let published = Arc::new(Mutex::new(None::<String>));
     let published_for_run = Arc::clone(&published);
+    let early_run_result = Arc::new(Mutex::new(None));
+    let early_run_result_for_run = Arc::clone(&early_run_result);
     let run_thread = thread::spawn(move || {
         let mut run = Request::new(
             "run_cancel",
             "web.run",
             json!({
                 "session_id": session_for_run,
-                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.evaluate(() => new Promise(() => {}));\nawait browser.close();\n"
+                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.waitForFunction(() => false, { timeout: 30000 });\nawait browser.close();\n"
             }),
         );
         run.deadline_ms = 30_000;
+        if let Some(token) = attach_tokens()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&socket_for_run)
+            .cloned()
+        {
+            run.capability = token;
+        }
+        let mut stream = UnixStream::connect(&socket_for_run).map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(40)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(40)))
+            .map_err(|error| error.to_string())?;
+        write_frame(&mut stream, &run).map_err(|error| error.to_string())?;
         *published_for_run.lock().unwrap() = Some(run.request_id.clone());
-        unix_request(&socket_for_run, &run, Duration::from_secs(40))
+        let response: Result<greppy_web_client::Response, String> =
+            read_frame(&mut stream).map_err(|error| error.to_string());
+        *early_run_result_for_run.lock().unwrap() = Some(response.clone());
+        response
     });
     let target = loop {
         if let Some(id) = published.lock().unwrap().clone() {
@@ -4608,7 +4643,7 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             .find(|row| row["session_id"] == session_id)
             .expect("session");
         if row["state"] == "busy"
-            && row["inflight_engine_method"] == "page.evaluate"
+            && row["inflight_engine_method"] == "page.waitForFunction"
             && row["inflight_engine_request_id"].as_u64().is_some()
         {
             inflight_id = row["inflight_engine_request_id"].as_u64();
@@ -4618,8 +4653,13 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             controller_generation_before = row["controller_generation"].as_u64().unwrap_or(0);
             break;
         }
+        if let Some(response) = early_run_result.lock().unwrap().clone() {
+            panic!(
+                "web.run completed before publishing page.waitForFunction: {response:?}; row={row:?}"
+            );
+        }
         if Instant::now() >= barrier {
-            panic!("page.evaluate engine call was not published: {row:?}");
+            panic!("page.waitForFunction engine call was not published: {row:?}");
         }
         thread::sleep(Duration::from_millis(20));
     }
