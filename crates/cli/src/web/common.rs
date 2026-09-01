@@ -1268,25 +1268,6 @@ pub(super) fn parse_target(
         }
         return Err(query_syntax("ref must be @ followed by digits"));
     }
-    for (prefix, kind) in [("css=", "css"), ("xpath=", "xpath"), ("text=", "text")] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let value = parse_complete_selector_value(rest)?;
-            if value.is_empty() {
-                return Err(query_syntax(&format!("{prefix} value is empty")));
-            }
-            let mut selector = json!({ "type": kind, "value": value });
-            if let Some(index) = if first {
-                Some(0)
-            } else if last {
-                Some(-1)
-            } else {
-                nth
-            } {
-                selector["nth"] = json!(index);
-            }
-            return Ok(ParsedTarget { selector });
-        }
-    }
     let mut css = None;
     let mut xpath = None;
     let mut text = None;
