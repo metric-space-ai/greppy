@@ -1390,7 +1390,10 @@ fn content_worker_crash_is_recovered_without_hanging() {
         Duration::from_secs(15),
     )
     .expect("observe after crash");
-    assert_eq!(observed.status, "error", "{observed:?}");
+    assert_eq!(
+        observed.status, "ok",
+        "a recovered content worker must keep the session usable: {observed:?}"
+    );
 
     let status = unix_request(
         &socket,
@@ -1438,10 +1441,7 @@ fn content_worker_crash_is_recovered_without_hanging() {
         snapshot.display()
     );
     let snapshot_body = std::fs::read_to_string(&snapshot).unwrap();
-    assert!(
-        snapshot_body.contains("failed") || snapshot_body.contains("ready"),
-        "session.json {snapshot_body}"
-    );
+    assert!(snapshot_body.contains("ready"), "session.json {snapshot_body}");
 
     let created_again = unix_request(
         &socket,
@@ -5244,6 +5244,23 @@ fn web_run_deadline_is_enforced_externally() {
     assert!(
         !ran.artifacts.is_empty(),
         "timeout must attach a partial artifact, got {ran:?}"
+    );
+    let follow = unix_request(
+        &socket,
+        &Request::new(
+            "run_deadln",
+            "web.run",
+            json!({
+                "session_id": session_id,
+                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto(\"about:blank\");\nawait browser.close();\n"
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("reuse session after timeout");
+    assert_eq!(
+        follow.status, "ok",
+        "an ordinary timeout must not poison the session: {follow:?}"
     );
 }
 
